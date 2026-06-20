@@ -13,3 +13,27 @@ members = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+codegen-units = 256
+
+[profile.dev.build-override]
+debug = false
+codegen-units = 256
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+codegen-units = 256
+
+[profile.test.build-override]
+debug = false
+codegen-units = 256
+
+[profile.test.package."*"]
+debug = false
