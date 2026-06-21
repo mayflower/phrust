@@ -1,0 +1,17 @@
+source: fixtures/semantic/traits/trait-insteadof.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - trait FirstRunTrait
+  - trait SecondRunTrait
+  - class UsesTraitPrecedence
+hir_summary:
+  statements: 2
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 3
+  methods: 2
+  properties: 0

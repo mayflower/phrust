@@ -15,6 +15,8 @@ help:
       '  just verify-phase0  Run Phase 0 verification' \
       '  just verify-phase1  Run Phase 1 verification' \
       '  just verify-phase2  Run Phase 2 verification' \
+      '  just verify-phase3  Run Phase 3 semantic frontend verification' \
+      '  just verify-phase4  Run Phase 4 IR/VM/runtime verification' \
       '  just bootstrap-ref  Clone/pin the PHP reference checkout' \
       '  just verify-ref     Verify PHP reference checkout against lockfile' \
       '  just dump-reference-tokens  Dump PHP T_* constants as JSON' \
@@ -35,6 +37,25 @@ help:
       '  just parser-corpus-smoke  Smoke-test extracted php-src parser corpus' \
       '  just fuzz-parser-smoke  Run parser property/fuzz smoke tests' \
       '  just bench-parser    Run parser performance smoke baseline' \
+      '  just semantic-fixtures  Run semantic fixture harness' \
+      '  just semantic-reference-smoke  Run reference PHP frontend smoke check' \
+      '  just semantic-diff  Compare semantic acceptance with PHP reference' \
+      '  just semantic-diff-strict  Strict semantic acceptance comparison' \
+      '  just frontend-snapshots  Run frontend CLI/API snapshot smoke tests' \
+      '  just semantic-corpus-smoke  Optional semantic corpus smoke gate' \
+      '  just fuzz-frontend-smoke  Optional frontend fuzz/property smoke gate' \
+      '  just bench-frontend  Optional frontend benchmark gate' \
+      '  just bytecode-snapshots  Run Phase 4 bytecode snapshot checks' \
+      '  just vm-smoke  Run Phase 4 VM smoke checks' \
+      '  just vm-trace-smoke  Run Phase 4 VM trace/debug smoke checks' \
+      '  just runtime-fixtures  Run Phase 4 runtime fixture checks' \
+      '  just runtime-corpus-smoke  Run Phase 4 self-contained corpus smoke checks' \
+      '  just runtime-reference-smoke  Run optional Phase 4 PHP reference smoke; skips when REFERENCE_PHP is unset' \
+      '  just runtime-diff  Compare Phase 4 runtime output with PHP reference when REFERENCE_PHP is set' \
+      '  just phpt-smoke  Run selected PHP .phpt smoke checks' \
+      '  just runtime-known-gaps  Validate Phase 4 runtime known-gap catalog' \
+      '  just bench-vm-smoke  Run optional Phase 4 VM benchmark smoke' \
+      '  just fuzz-vm-smoke  Run optional Phase 4 VM fuzz/property smoke' \
       '  just parser-snapshots Update parser CST and diagnostic snapshots' \
       '  just extract-ref-metadata  Extract deterministic PHP reference metadata' \
       '  just build-ref-php  Build optional minimal reference PHP CLI' \
@@ -59,7 +80,7 @@ check:
     @just test
 
 verify:
-    @just verify-phase2
+    @just verify-phase4
 
 verify-foundation:
     @just verify-phase0
@@ -174,3 +195,652 @@ verify-phase1:
 
 verify-phase2:
     scripts/verify-phase2.sh
+
+verify-phase3:
+    scripts/verify-phase3.sh
+
+verify-phase4:
+    scripts/verify-phase4.sh
+
+semantic-fixtures:
+    scripts/run_semantic_fixtures.py
+    scripts/run_semantic_fixtures.py --write-snapshots
+
+semantic-reference-smoke:
+    scripts/reference_php_frontend_json.py --file fixtures/semantic/valid/minimal.php
+
+semantic-diff:
+    scripts/compare_semantic_acceptance.py
+
+semantic-diff-strict:
+    scripts/compare_semantic_acceptance.py --strict
+
+frontend-snapshots:
+    cargo run -p php_frontend_cli -- --help >/dev/null
+    cargo run -p php_frontend_cli -- analyze fixtures/semantic/valid/hello.php --format json >/dev/null
+    cargo run -p php_frontend_cli -- diagnostics fixtures/semantic/functions/duplicate-param-invalid.php --format json >/dev/null
+    cargo run -p php_frontend_cli -- symbols fixtures/semantic/classes/basic.php --format json >/dev/null
+    cargo run -p php_frontend_cli -- scopes fixtures/semantic/scopes/closure-use.php --format json >/dev/null
+    cargo run -p php_frontend_cli -- hir fixtures/semantic/php85/clone-with.php --format json >/dev/null
+    cargo run -p php_frontend_cli -- snapshot fixtures/semantic/valid/minimal.php --output target/frontend-minimal.snap >/dev/null
+    test -s target/frontend-minimal.snap
+
+semantic-corpus-smoke:
+    @printf '%s\n' '[skip] semantic corpus smoke is not configured for Phase 3; curated fixtures are covered by semantic-fixtures.'
+
+fuzz-frontend-smoke:
+    @printf '%s\n' '[skip] frontend fuzz smoke is not configured for Phase 3; parser fuzz smoke remains available via just fuzz-parser-smoke.'
+
+bench-frontend:
+    @printf '%s\n' '[skip] frontend benchmarks are not configured for Phase 3; no benchmark baseline is defined yet.'
+
+bytecode-snapshots:
+    cargo test -p php_ir --test bytecode_snapshots -- --nocapture
+
+vm-smoke:
+    @tmp_dir="$PWD/target/vm-smoke"; \
+    mkdir -p "$tmp_dir"; \
+    cargo run -p php_vm_cli -- compile fixtures/runtime/valid/hello.php --json > "$tmp_dir/hello.json"; \
+    grep -q '"ok":true' "$tmp_dir/hello.json"; \
+    cargo run -p php_vm_cli -- dump-ir fixtures/runtime/valid/hello.php > "$tmp_dir/hello.ir"; \
+    grep -q 'echo r0' "$tmp_dir/hello.ir"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/hello.php > "$tmp_dir/hello.out"; \
+    printf 'hello phase4\n' > "$tmp_dir/hello.expected"; \
+    cmp "$tmp_dir/hello.expected" "$tmp_dir/hello.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/scalars/echo.php > "$tmp_dir/scalar.out"; \
+    printf 'scalar echo\n' > "$tmp_dir/scalar.expected"; \
+    cmp "$tmp_dir/scalar.expected" "$tmp_dir/scalar.out"; \
+    cargo run -p php_vm_cli -- run fixtures/bytecode/lower/valid/empty.php > "$tmp_dir/empty.out"; \
+    test ! -s "$tmp_dir/empty.out"; \
+    printf '%s\n' '[ok] Phase 4 VM smoke fixtures passed.'
+
+vm-trace-smoke:
+    @tmp_dir="$PWD/target/phase4/failures"; \
+    mkdir -p "$tmp_dir"; \
+    cargo run -p php_vm_cli -- run --trace fixtures/runtime/valid/variables/assignment.php > "$tmp_dir/trace-smoke.out" 2> "$tmp_dir/trace-smoke.trace"; \
+    printf '1\n' > "$tmp_dir/trace-smoke.expected"; \
+    cmp "$tmp_dir/trace-smoke.expected" "$tmp_dir/trace-smoke.out"; \
+    grep -q 'vm-trace:' "$tmp_dir/trace-smoke.trace"; \
+    grep -q 'function=main(0)' "$tmp_dir/trace-smoke.trace"; \
+    grep -q 'output_len=' "$tmp_dir/trace-smoke.trace"; \
+    cargo run -p php_vm_cli -- dump-ir fixtures/runtime/valid/variables/assignment.php --with-source > "$tmp_dir/trace-smoke.ir"; \
+    grep -q '^source path=' "$tmp_dir/trace-smoke.ir"; \
+    grep -q '^source 0001:' "$tmp_dir/trace-smoke.ir"; \
+    grep -q '^--- ir ---' "$tmp_dir/trace-smoke.ir"; \
+    printf '%s\n' '[ok] Phase 4 VM trace/debug smoke passed.'
+
+runtime-fixtures:
+    @tmp_dir="target/runtime-fixtures"; \
+    mkdir -p "$tmp_dir"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/hello.php > "$tmp_dir/hello.out"; \
+    printf 'hello phase4\n' > "$tmp_dir/hello.expected"; \
+    cmp "$tmp_dir/hello.expected" "$tmp_dir/hello.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/scalars/echo.php > "$tmp_dir/echo.out"; \
+    printf 'scalar echo\n' > "$tmp_dir/echo.expected"; \
+    cmp "$tmp_dir/echo.expected" "$tmp_dir/echo.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/scalars/expressions.php > "$tmp_dir/expressions.out"; \
+    printf '7|8|ab|1|-1\n' > "$tmp_dir/expressions.expected"; \
+    cmp "$tmp_dir/expressions.expected" "$tmp_dir/expressions.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/scalars/comparisons.php > "$tmp_dir/comparisons.out"; \
+    printf '1|1|1|1|-1\n' > "$tmp_dir/comparisons.expected"; \
+    cmp "$tmp_dir/comparisons.expected" "$tmp_dir/comparisons.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/scalars/casts.php > "$tmp_dir/casts.out"; \
+    printf '12|1|\n' > "$tmp_dir/casts.expected"; \
+    cmp "$tmp_dir/casts.expected" "$tmp_dir/casts.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/variables/assignment.php > "$tmp_dir/variables-assignment.out"; \
+    printf '1\n' > "$tmp_dir/variables-assignment.expected"; \
+    cmp "$tmp_dir/variables-assignment.expected" "$tmp_dir/variables-assignment.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/variables/compound.php > "$tmp_dir/variables-compound.out"; \
+    printf '3x\n' > "$tmp_dir/variables-compound.expected"; \
+    cmp "$tmp_dir/variables-compound.expected" "$tmp_dir/variables-compound.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/variables/inc-dec.php > "$tmp_dir/variables-inc-dec.out"; \
+    printf '1|3|3|1\n' > "$tmp_dir/variables-inc-dec.expected"; \
+    cmp "$tmp_dir/variables-inc-dec.expected" "$tmp_dir/variables-inc-dec.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/superglobals/argc.php > "$tmp_dir/superglobals-argc.out"; \
+    printf '1\n' > "$tmp_dir/superglobals-argc.expected"; \
+    cmp "$tmp_dir/superglobals-argc.expected" "$tmp_dir/superglobals-argc.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/superglobals/argv.php -- alpha beta > "$tmp_dir/superglobals-argv.out"; \
+    printf '3|alpha|beta\n' > "$tmp_dir/superglobals-argv.expected"; \
+    cmp "$tmp_dir/superglobals-argv.expected" "$tmp_dir/superglobals-argv.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/superglobals/server-argv.php -- red > "$tmp_dir/superglobals-server-argv.out"; \
+    printf '2|red\n' > "$tmp_dir/superglobals-server-argv.expected"; \
+    cmp "$tmp_dir/superglobals-server-argv.expected" "$tmp_dir/superglobals-server-argv.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/superglobals/empty-superglobals.php > "$tmp_dir/superglobals-empty.out"; \
+    printf 'get-empty|post-empty|request-empty|env-empty\n' > "$tmp_dir/superglobals-empty.expected"; \
+    cmp "$tmp_dir/superglobals-empty.expected" "$tmp_dir/superglobals-empty.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/references/by-value.php > "$tmp_dir/references-by-value.out"; \
+    printf '12\n' > "$tmp_dir/references-by-value.expected"; \
+    cmp "$tmp_dir/references-by-value.expected" "$tmp_dir/references-by-value.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/references/local-alias.php > "$tmp_dir/references-local-alias.out"; \
+    printf '23\n' > "$tmp_dir/references-local-alias.expected"; \
+    cmp "$tmp_dir/references-local-alias.expected" "$tmp_dir/references-local-alias.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/constants/global.php > "$tmp_dir/constants-global.out"; \
+    printf '42|phase4\n' > "$tmp_dir/constants-global.expected"; \
+    cmp "$tmp_dir/constants-global.expected" "$tmp_dir/constants-global.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/constants/builtin.php > "$tmp_dir/constants-builtin.out"; \
+    printf '8.5.7\n' > "$tmp_dir/constants-builtin.expected"; \
+    cmp "$tmp_dir/constants-builtin.expected" "$tmp_dir/constants-builtin.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/constants/magic-top-level.php > "$tmp_dir/constants-magic-top.out"; \
+    printf '%s\n%s\n4||||\n' "$PWD/fixtures/runtime/valid/constants/magic-top-level.php" "$PWD/fixtures/runtime/valid/constants" > "$tmp_dir/constants-magic-top.expected"; \
+    cmp "$tmp_dir/constants-magic-top.expected" "$tmp_dir/constants-magic-top.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/constants/magic-function.php > "$tmp_dir/constants-magic-function.out"; \
+    printf 'prompt24_magic_function|3||prompt24_magic_function|\n' > "$tmp_dir/constants-magic-function.expected"; \
+    cmp "$tmp_dir/constants-magic-function.expected" "$tmp_dir/constants-magic-function.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/constants/magic-method.php > "$tmp_dir/constants-magic-method.out"; \
+    printf 'Prompt24MagicMethod|Prompt24MagicMethod::show\n' > "$tmp_dir/constants-magic-method.expected"; \
+    cmp "$tmp_dir/constants-magic-method.expected" "$tmp_dir/constants-magic-method.out"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/constants/undefined.php > "$tmp_dir/constants-undefined.out" 2> "$tmp_dir/constants-undefined.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_RUNTIME_UNDEFINED_CONSTANT' "$tmp_dir/constants-undefined.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/variables/undefined.php > "$tmp_dir/variables-undefined.out" 2> "$tmp_dir/variables-undefined.err"; \
+    printf 'x\n' > "$tmp_dir/variables-undefined.expected"; \
+    cmp "$tmp_dir/variables-undefined.expected" "$tmp_dir/variables-undefined.out"; \
+    grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/variables-undefined.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/errors/warning-continuation.php > "$tmp_dir/errors-warning-continuation.out" 2> "$tmp_dir/errors-warning-continuation.err"; \
+    printf 'ok\n' > "$tmp_dir/errors-warning-continuation.expected"; \
+    cmp "$tmp_dir/errors-warning-continuation.expected" "$tmp_dir/errors-warning-continuation.out"; \
+    grep -q 'runtime-diagnostic:' "$tmp_dir/errors-warning-continuation.err"; \
+    grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/errors-warning-continuation.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/if-true-false.php > "$tmp_dir/control-if.out"; \
+    printf 'tf\n' > "$tmp_dir/control-if.expected"; \
+    cmp "$tmp_dir/control-if.expected" "$tmp_dir/control-if.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/nested-if.php > "$tmp_dir/control-nested-if.out"; \
+    printf 'nested\n' > "$tmp_dir/control-nested-if.expected"; \
+    cmp "$tmp_dir/control-nested-if.expected" "$tmp_dir/control-nested-if.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/while-counter.php > "$tmp_dir/control-while.out"; \
+    printf '012\n' > "$tmp_dir/control-while.expected"; \
+    cmp "$tmp_dir/control-while.expected" "$tmp_dir/control-while.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/do-while-once.php > "$tmp_dir/control-do.out"; \
+    printf 'once\n' > "$tmp_dir/control-do.expected"; \
+    cmp "$tmp_dir/control-do.expected" "$tmp_dir/control-do.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/for-loop.php > "$tmp_dir/control-for.out"; \
+    printf '012\n' > "$tmp_dir/control-for.expected"; \
+    cmp "$tmp_dir/control-for.expected" "$tmp_dir/control-for.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/break.php > "$tmp_dir/control-break.out"; \
+    printf '12\n' > "$tmp_dir/control-break.expected"; \
+    cmp "$tmp_dir/control-break.expected" "$tmp_dir/control-break.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/continue.php > "$tmp_dir/control-continue.out"; \
+    printf '134\n' > "$tmp_dir/control-continue.expected"; \
+    cmp "$tmp_dir/control-continue.expected" "$tmp_dir/control-continue.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/short-circuit.php > "$tmp_dir/control-short-circuit.out"; \
+    printf 'ok0|ok0\n' > "$tmp_dir/control-short-circuit.expected"; \
+    cmp "$tmp_dir/control-short-circuit.expected" "$tmp_dir/control-short-circuit.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/ternary.php > "$tmp_dir/control-ternary.out"; \
+    printf 'yes|fallback|kept\n' > "$tmp_dir/control-ternary.expected"; \
+    cmp "$tmp_dir/control-ternary.expected" "$tmp_dir/control-ternary.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/null-coalesce.php > "$tmp_dir/control-null-coalesce.out"; \
+    printf 'fallback|value\n' > "$tmp_dir/control-null-coalesce.expected"; \
+    cmp "$tmp_dir/control-null-coalesce.expected" "$tmp_dir/control-null-coalesce.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/switch-fallthrough.php > "$tmp_dir/control-switch.out"; \
+    printf 'zeroone\n' > "$tmp_dir/control-switch.expected"; \
+    cmp "$tmp_dir/control-switch.expected" "$tmp_dir/control-switch.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/match-success.php > "$tmp_dir/control-match.out"; \
+    printf 'one\n' > "$tmp_dir/control-match.expected"; \
+    cmp "$tmp_dir/control-match.expected" "$tmp_dir/control-match.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/control_flow/return.php > "$tmp_dir/control-return.out"; \
+    printf 'before\n' > "$tmp_dir/control-return.expected"; \
+    cmp "$tmp_dir/control-return.expected" "$tmp_dir/control-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/simple.php > "$tmp_dir/functions-simple.out"; \
+    printf 'hi\n' > "$tmp_dir/functions-simple.expected"; \
+    cmp "$tmp_dir/functions-simple.expected" "$tmp_dir/functions-simple.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/two-args.php > "$tmp_dir/functions-two-args.out"; \
+    printf '5\n' > "$tmp_dir/functions-two-args.expected"; \
+    cmp "$tmp_dir/functions-two-args.expected" "$tmp_dir/functions-two-args.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/local-scope.php > "$tmp_dir/functions-local-scope.out"; \
+    printf '2|10\n' > "$tmp_dir/functions-local-scope.expected"; \
+    cmp "$tmp_dir/functions-local-scope.expected" "$tmp_dir/functions-local-scope.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/factorial.php > "$tmp_dir/functions-factorial.out"; \
+    printf '120\n' > "$tmp_dir/functions-factorial.expected"; \
+    cmp "$tmp_dir/functions-factorial.expected" "$tmp_dir/functions-factorial.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/return-no-value.php > "$tmp_dir/functions-return-no-value.out"; \
+    printf 'x\n' > "$tmp_dir/functions-return-no-value.expected"; \
+    cmp "$tmp_dir/functions-return-no-value.expected" "$tmp_dir/functions-return-no-value.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/defaults.php > "$tmp_dir/functions-defaults.out"; \
+    printf 'hi world!|hi php?\n' > "$tmp_dir/functions-defaults.expected"; \
+    cmp "$tmp_dir/functions-defaults.expected" "$tmp_dir/functions-defaults.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/variadic-sum.php > "$tmp_dir/functions-variadic-sum.out"; \
+    printf '5\n' > "$tmp_dir/functions-variadic-sum.expected"; \
+    cmp "$tmp_dir/functions-variadic-sum.expected" "$tmp_dir/functions-variadic-sum.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/return-types.php > "$tmp_dir/functions-return-types.out"; \
+    printf 'ok|4|x\n' > "$tmp_dir/functions-return-types.expected"; \
+    cmp "$tmp_dir/functions-return-types.expected" "$tmp_dir/functions-return-types.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/closure-simple.php > "$tmp_dir/functions-closure-simple.out"; \
+    printf '3\n' > "$tmp_dir/functions-closure-simple.expected"; \
+    cmp "$tmp_dir/functions-closure-simple.expected" "$tmp_dir/functions-closure-simple.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/closure-use.php > "$tmp_dir/functions-closure-use.out"; \
+    printf '5\n' > "$tmp_dir/functions-closure-use.expected"; \
+    cmp "$tmp_dir/functions-closure-use.expected" "$tmp_dir/functions-closure-use.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/arrow-capture.php > "$tmp_dir/functions-arrow-capture.out"; \
+    printf '7\n' > "$tmp_dir/functions-arrow-capture.expected"; \
+    cmp "$tmp_dir/functions-arrow-capture.expected" "$tmp_dir/functions-arrow-capture.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/closure-return.php > "$tmp_dir/functions-closure-return.out"; \
+    printf '9\n' > "$tmp_dir/functions-closure-return.expected"; \
+    cmp "$tmp_dir/functions-closure-return.expected" "$tmp_dir/functions-closure-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/php85/pipe-user-function.php > "$tmp_dir/php85-pipe-user-function.out"; \
+    printf '3\n' > "$tmp_dir/php85-pipe-user-function.expected"; \
+    cmp "$tmp_dir/php85-pipe-user-function.expected" "$tmp_dir/php85-pipe-user-function.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/php85/pipe-closure.php > "$tmp_dir/php85-pipe-closure.out"; \
+    printf '4\n' > "$tmp_dir/php85-pipe-closure.expected"; \
+    cmp "$tmp_dir/php85-pipe-closure.expected" "$tmp_dir/php85-pipe-closure.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/php85/pipe-builtin.php > "$tmp_dir/php85-pipe-builtin.out"; \
+    printf 'a|2|HI\n' > "$tmp_dir/php85-pipe-builtin.expected"; \
+    cmp "$tmp_dir/php85-pipe-builtin.expected" "$tmp_dir/php85-pipe-builtin.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/php85/pipe-side-effects.php > "$tmp_dir/php85-pipe-side-effects.out"; \
+    printf '7|7\n' > "$tmp_dir/php85-pipe-side-effects.expected"; \
+    cmp "$tmp_dir/php85-pipe-side-effects.expected" "$tmp_dir/php85-pipe-side-effects.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/builtins/print.php > "$tmp_dir/builtins-print.out"; \
+    printf 'x1\n' > "$tmp_dir/builtins-print.expected"; \
+    cmp "$tmp_dir/builtins-print.expected" "$tmp_dir/builtins-print.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/builtins/gettype.php > "$tmp_dir/builtins-gettype.out"; \
+    printf 'NULL|integer|boolean|string\n' > "$tmp_dir/builtins-gettype.expected"; \
+    cmp "$tmp_dir/builtins-gettype.expected" "$tmp_dir/builtins-gettype.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/builtins/is-types.php > "$tmp_dir/builtins-is-types.out"; \
+    printf '1111\n' > "$tmp_dir/builtins-is-types.expected"; \
+    cmp "$tmp_dir/builtins-is-types.expected" "$tmp_dir/builtins-is-types.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/builtins/var-dump-scalars.php > "$tmp_dir/builtins-var-dump-scalars.out"; \
+    printf 'NULL\nbool(true)\nint(7)\nstring(2) "hi"\n' > "$tmp_dir/builtins-var-dump-scalars.expected"; \
+    cmp "$tmp_dir/builtins-var-dump-scalars.expected" "$tmp_dir/builtins-var-dump-scalars.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/builtins/var-dump-array.php > "$tmp_dir/builtins-var-dump-array.out"; \
+    printf 'array(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) "x"\n}\n' > "$tmp_dir/builtins-var-dump-array.expected"; \
+    cmp "$tmp_dir/builtins-var-dump-array.expected" "$tmp_dir/builtins-var-dump-array.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/indexed.php > "$tmp_dir/arrays-indexed.out"; \
+    printf '1|2|3\n' > "$tmp_dir/arrays-indexed.expected"; \
+    cmp "$tmp_dir/arrays-indexed.expected" "$tmp_dir/arrays-indexed.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/string-keys.php > "$tmp_dir/arrays-string-keys.out"; \
+    printf '1|2\n' > "$tmp_dir/arrays-string-keys.expected"; \
+    cmp "$tmp_dir/arrays-string-keys.expected" "$tmp_dir/arrays-string-keys.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/append-overwrite.php > "$tmp_dir/arrays-append-overwrite.out"; \
+    printf '1|5|7\n' > "$tmp_dir/arrays-append-overwrite.expected"; \
+    cmp "$tmp_dir/arrays-append-overwrite.expected" "$tmp_dir/arrays-append-overwrite.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/nested-fetch.php > "$tmp_dir/arrays-nested-fetch.out"; \
+    printf '4|8\n' > "$tmp_dir/arrays-nested-fetch.expected"; \
+    cmp "$tmp_dir/arrays-nested-fetch.expected" "$tmp_dir/arrays-nested-fetch.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/missing-key.php > "$tmp_dir/arrays-missing-key.out" 2> "$tmp_dir/arrays-missing-key.err"; \
+    printf 'x\n' > "$tmp_dir/arrays-missing-key.expected"; \
+    cmp "$tmp_dir/arrays-missing-key.expected" "$tmp_dir/arrays-missing-key.out"; \
+    grep -q 'E_PHP_RUNTIME_UNDEFINED_ARRAY_KEY_WARNING' "$tmp_dir/arrays-missing-key.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/isset-empty-unset.php > "$tmp_dir/arrays-isset-empty-unset.out"; \
+    printf '1|111|\n' > "$tmp_dir/arrays-isset-empty-unset.expected"; \
+    cmp "$tmp_dir/arrays-isset-empty-unset.expected" "$tmp_dir/arrays-isset-empty-unset.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/arrays/var-dump-mixed.php > "$tmp_dir/arrays-var-dump-mixed.out"; \
+    printf 'array(3) {\n  [0]=>\n  int(1)\n  ["name"]=>\n  string(3) "php"\n  [4]=>\n  bool(true)\n}\n' > "$tmp_dir/arrays-var-dump-mixed.expected"; \
+    cmp "$tmp_dir/arrays-var-dump-mixed.expected" "$tmp_dir/arrays-var-dump-mixed.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/foreach/values.php > "$tmp_dir/foreach-values.out"; \
+    printf '123\n' > "$tmp_dir/foreach-values.expected"; \
+    cmp "$tmp_dir/foreach-values.expected" "$tmp_dir/foreach-values.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/foreach/key-value.php > "$tmp_dir/foreach-key-value.out"; \
+    printf 'a:1;4:2;b:3;\n' > "$tmp_dir/foreach-key-value.expected"; \
+    cmp "$tmp_dir/foreach-key-value.expected" "$tmp_dir/foreach-key-value.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/foreach/break-continue.php > "$tmp_dir/foreach-break-continue.out"; \
+    printf '13\n' > "$tmp_dir/foreach-break-continue.expected"; \
+    cmp "$tmp_dir/foreach-break-continue.expected" "$tmp_dir/foreach-break-continue.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/foreach/nested.php > "$tmp_dir/foreach-nested.out"; \
+    printf 'a1;a2;b1;b2;\n' > "$tmp_dir/foreach-nested.expected"; \
+    cmp "$tmp_dir/foreach-nested.expected" "$tmp_dir/foreach-nested.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/foreach/snapshot-mutation.php > "$tmp_dir/foreach-snapshot-mutation.out"; \
+    printf '12|1299\n' > "$tmp_dir/foreach-snapshot-mutation.expected"; \
+    cmp "$tmp_dir/foreach-snapshot-mutation.expected" "$tmp_dir/foreach-snapshot-mutation.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/includes/include-return.php > "$tmp_dir/includes-return.out"; \
+    printf 'before|child:value|after\n' > "$tmp_dir/includes-return.expected"; \
+    cmp "$tmp_dir/includes-return.expected" "$tmp_dir/includes-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/includes/share-variable.php > "$tmp_dir/includes-share-variable.out"; \
+    printf 'parent|included\n' > "$tmp_dir/includes-share-variable.expected"; \
+    cmp "$tmp_dir/includes-share-variable.expected" "$tmp_dir/includes-share-variable.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/includes/include-once.php > "$tmp_dir/includes-once.out"; \
+    printf '1\n' > "$tmp_dir/includes-once.expected"; \
+    cmp "$tmp_dir/includes-once.expected" "$tmp_dir/includes-once.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/includes/include-missing.php > "$tmp_dir/includes-missing.out" 2> "$tmp_dir/includes-missing.err"; \
+    printf 'before|after\n' > "$tmp_dir/includes-missing.expected"; \
+    cmp "$tmp_dir/includes-missing.expected" "$tmp_dir/includes-missing.out"; \
+    grep -q 'E_PHP_VM_INCLUDE_MISSING' "$tmp_dir/includes-missing.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/instantiate.php > "$tmp_dir/objects-instantiate.out"; \
+    printf 'object\n' > "$tmp_dir/objects-instantiate.expected"; \
+    cmp "$tmp_dir/objects-instantiate.expected" "$tmp_dir/objects-instantiate.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/constructor-property.php > "$tmp_dir/objects-constructor-property.out"; \
+    printf '7\n' > "$tmp_dir/objects-constructor-property.expected"; \
+    cmp "$tmp_dir/objects-constructor-property.expected" "$tmp_dir/objects-constructor-property.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/property-read-write.php > "$tmp_dir/objects-property-read-write.out"; \
+    printf '3\n' > "$tmp_dir/objects-property-read-write.expected"; \
+    cmp "$tmp_dir/objects-property-read-write.expected" "$tmp_dir/objects-property-read-write.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/two-objects.php > "$tmp_dir/objects-two-objects.out"; \
+    printf '1|2\n' > "$tmp_dir/objects-two-objects.expected"; \
+    cmp "$tmp_dir/objects-two-objects.expected" "$tmp_dir/objects-two-objects.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/method-call.php > "$tmp_dir/objects-method-call.out"; \
+    printf '5\n' > "$tmp_dir/objects-method-call.expected"; \
+    cmp "$tmp_dir/objects-method-call.expected" "$tmp_dir/objects-method-call.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/method-return.php > "$tmp_dir/objects-method-return.out"; \
+    printf '42\n' > "$tmp_dir/objects-method-return.expected"; \
+    cmp "$tmp_dir/objects-method-return.expected" "$tmp_dir/objects-method-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/this-property-method.php > "$tmp_dir/objects-this-property-method.out"; \
+    printf '7|12\n' > "$tmp_dir/objects-this-property-method.expected"; \
+    cmp "$tmp_dir/objects-this-property-method.expected" "$tmp_dir/objects-this-property-method.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/static-method.php > "$tmp_dir/objects-static-method.out"; \
+    printf 'static-ok\n' > "$tmp_dir/objects-static-method.expected"; \
+    cmp "$tmp_dir/objects-static-method.expected" "$tmp_dir/objects-static-method.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/clone-object.php > "$tmp_dir/objects-clone-object.out"; \
+    printf '1|1\n' > "$tmp_dir/objects-clone-object.expected"; \
+    cmp "$tmp_dir/objects-clone-object.expected" "$tmp_dir/objects-clone-object.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/clone-independent.php > "$tmp_dir/objects-clone-independent.out"; \
+    printf '1|2\n' > "$tmp_dir/objects-clone-independent.expected"; \
+    cmp "$tmp_dir/objects-clone-independent.expected" "$tmp_dir/objects-clone-independent.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/objects/clone-with.php > "$tmp_dir/objects-clone-with.out"; \
+    printf 'old:1|new:2\n' > "$tmp_dir/objects-clone-with.expected"; \
+    cmp "$tmp_dir/objects-clone-with.expected" "$tmp_dir/objects-clone-with.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/exceptions/catch-exception.php > "$tmp_dir/exceptions-catch-exception.out"; \
+    printf 'caught\n' > "$tmp_dir/exceptions-catch-exception.expected"; \
+    cmp "$tmp_dir/exceptions-catch-exception.expected" "$tmp_dir/exceptions-catch-exception.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/exceptions/finally-return.php > "$tmp_dir/exceptions-finally-return.out"; \
+    printf 'finally|body\n' > "$tmp_dir/exceptions-finally-return.expected"; \
+    cmp "$tmp_dir/exceptions-finally-return.expected" "$tmp_dir/exceptions-finally-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/exceptions/catch-finally.php > "$tmp_dir/exceptions-catch-finally.out"; \
+    printf 'catch|finally\n' > "$tmp_dir/exceptions-catch-finally.expected"; \
+    cmp "$tmp_dir/exceptions-catch-finally.expected" "$tmp_dir/exceptions-catch-finally.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/runtime_types/param-int.php > "$tmp_dir/runtime-types-param-int.out"; \
+    printf '5\n' > "$tmp_dir/runtime-types-param-int.expected"; \
+    cmp "$tmp_dir/runtime-types-param-int.expected" "$tmp_dir/runtime-types-param-int.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/runtime_types/return-string.php > "$tmp_dir/runtime-types-return-string.out"; \
+    printf 'ok\n' > "$tmp_dir/runtime-types-return-string.expected"; \
+    cmp "$tmp_dir/runtime-types-return-string.expected" "$tmp_dir/runtime-types-return-string.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/runtime_types/void-return.php > "$tmp_dir/runtime-types-void-return.out"; \
+    printf 'before||after\n' > "$tmp_dir/runtime-types-void-return.expected"; \
+    cmp "$tmp_dir/runtime-types-void-return.expected" "$tmp_dir/runtime-types-void-return.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/runtime_types/nullable-simple.php > "$tmp_dir/runtime-types-nullable-simple.out"; \
+    printf 'none|ok\n' > "$tmp_dir/runtime-types-nullable-simple.expected"; \
+    cmp "$tmp_dir/runtime-types-nullable-simple.expected" "$tmp_dir/runtime-types-nullable-simple.out"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/runtime_types/property-type.php > "$tmp_dir/runtime-types-property-type.out"; \
+    printf '7\n' > "$tmp_dir/runtime-types-property-type.expected"; \
+    cmp "$tmp_dir/runtime-types-property-type.expected" "$tmp_dir/runtime-types-property-type.out"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/unknown-class.php > "$tmp_dir/objects-unknown-class.out" 2> "$tmp_dir/objects-unknown-class.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNKNOWN_CLASS' "$tmp_dir/objects-unknown-class.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/private-property.php > "$tmp_dir/objects-private-property.out" 2> "$tmp_dir/objects-private-property.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-private-property.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/private-method.php > "$tmp_dir/objects-private-method.out" 2> "$tmp_dir/objects-private-method.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_METHOD_MODIFIER' "$tmp_dir/objects-private-method.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/this-outside-method.php > "$tmp_dir/objects-this-outside-method.out" 2> "$tmp_dir/objects-this-outside-method.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_THIS_OUTSIDE_METHOD' "$tmp_dir/objects-this-outside-method.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/static-property.php > "$tmp_dir/objects-static-property.out" 2> "$tmp_dir/objects-static-property.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-static-property.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/clone-with-private.php > "$tmp_dir/objects-clone-with-private.out" 2> "$tmp_dir/objects-clone-with-private.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-private.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/clone-with-readonly.php > "$tmp_dir/objects-clone-with-readonly.out" 2> "$tmp_dir/objects-clone-with-readonly.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-readonly.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/exceptions/throw-uncaught.php > "$tmp_dir/exceptions-throw-uncaught.out" 2> "$tmp_dir/exceptions-throw-uncaught.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNCAUGHT_EXCEPTION' "$tmp_dir/exceptions-throw-uncaught.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/exceptions/finally-throw.php > "$tmp_dir/exceptions-finally-throw.out" 2> "$tmp_dir/exceptions-finally-throw.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    printf 'finally\n' > "$tmp_dir/exceptions-finally-throw.expected"; \
+    cmp "$tmp_dir/exceptions-finally-throw.expected" "$tmp_dir/exceptions-finally-throw.out"; \
+    grep -q 'E_PHP_VM_UNCAUGHT_EXCEPTION' "$tmp_dir/exceptions-finally-throw.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/exceptions/rethrow.php > "$tmp_dir/exceptions-rethrow.out" 2> "$tmp_dir/exceptions-rethrow.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    printf 'catch\n' > "$tmp_dir/exceptions-rethrow.expected"; \
+    cmp "$tmp_dir/exceptions-rethrow.expected" "$tmp_dir/exceptions-rethrow.out"; \
+    grep -q 'E_PHP_VM_UNCAUGHT_EXCEPTION' "$tmp_dir/exceptions-rethrow.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/runtime_types/param-int-fail.php > "$tmp_dir/runtime-types-param-int-fail.out" 2> "$tmp_dir/runtime-types-param-int-fail.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_PARAM_TYPE_MISMATCH' "$tmp_dir/runtime-types-param-int-fail.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/runtime_types/return-string-fail.php > "$tmp_dir/runtime-types-return-string-fail.out" 2> "$tmp_dir/runtime-types-return-string-fail.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_RETURN_TYPE_MISMATCH' "$tmp_dir/runtime-types-return-string-fail.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/runtime_types/void-return-value.php > "$tmp_dir/runtime-types-void-return-value.out" 2> "$tmp_dir/runtime-types-void-return-value.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_RETURN_VALUE_FROM_VOID_FUNCTION' "$tmp_dir/runtime-types-void-return-value.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/runtime_types/property-type-fail.php > "$tmp_dir/runtime-types-property-type-fail.out" 2> "$tmp_dir/runtime-types-property-type-fail.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_PROPERTY_TYPE_MISMATCH' "$tmp_dir/runtime-types-property-type-fail.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/exceptions/catch-type.php > "$tmp_dir/exceptions-catch-type.out" 2> "$tmp_dir/exceptions-catch-type.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_CATCH_TYPE' "$tmp_dir/exceptions-catch-type.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/includes/require-missing.php > "$tmp_dir/includes-require-missing.out" 2> "$tmp_dir/includes-require-missing.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    printf 'before|' > "$tmp_dir/includes-require-missing.expected"; \
+    cmp "$tmp_dir/includes-require-missing.expected" "$tmp_dir/includes-require-missing.out"; \
+    grep -q 'E_PHP_VM_INCLUDE_MISSING' "$tmp_dir/includes-require-missing.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/foreach/by-ref.php > "$tmp_dir/foreach-by-ref.out" 2> "$tmp_dir/foreach-by-ref.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' "$tmp_dir/foreach-by-ref.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/by-ref-param.php > "$tmp_dir/references-by-ref-param.out" 2> "$tmp_dir/references-by-ref-param.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER' "$tmp_dir/references-by-ref-param.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/by-ref-return.php > "$tmp_dir/references-by-ref-return.out" 2> "$tmp_dir/references-by-ref-return.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_RETURN' "$tmp_dir/references-by-ref-return.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/array-element-ref.php > "$tmp_dir/references-array-element-ref.out" 2> "$tmp_dir/references-array-element-ref.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE' "$tmp_dir/references-array-element-ref.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/division-by-zero.php > "$tmp_dir/division.out" 2> "$tmp_dir/division.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'runtime_error: division by zero' "$tmp_dir/division.err"; \
+    grep -q 'E_PHP_RUNTIME_DIVISION_BY_ZERO' "$tmp_dir/division.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/errors/undefined-function.php > "$tmp_dir/errors-undefined-function.out" 2> "$tmp_dir/errors-undefined-function.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'runtime_error: undefined function phase4_missing_function' "$tmp_dir/errors-undefined-function.err"; \
+    grep -q 'E_PHP_RUNTIME_UNDEFINED_FUNCTION' "$tmp_dir/errors-undefined-function.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/type-error.php > "$tmp_dir/type.out" 2> "$tmp_dir/type.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'modulo is only implemented for integer operands' "$tmp_dir/type.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/match-no-arm.php > "$tmp_dir/match-no-arm.out" 2> "$tmp_dir/match-no-arm.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNHANDLED_MATCH: match expression did not match any arm' "$tmp_dir/match-no-arm.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/call-stack-error.php > "$tmp_dir/functions-call-stack.out" 2> "$tmp_dir/functions-call-stack.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'runtime_error: division by zero' "$tmp_dir/functions-call-stack.err"; \
+    grep -q 'call_stack:' "$tmp_dir/functions-call-stack.err"; \
+    grep -q 'at boom' "$tmp_dir/functions-call-stack.err"; \
+    grep -q 'at wrap' "$tmp_dir/functions-call-stack.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/missing-arg.php > "$tmp_dir/functions-missing-arg.out" 2> "$tmp_dir/functions-missing-arg.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_TOO_FEW_ARGS' "$tmp_dir/functions-missing-arg.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/extra-arg.php > "$tmp_dir/functions-extra-arg.out" 2> "$tmp_dir/functions-extra-arg.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_TOO_MANY_ARGS' "$tmp_dir/functions-extra-arg.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/return-type-error.php > "$tmp_dir/functions-return-type-error.out" 2> "$tmp_dir/functions-return-type-error.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_RETURN_TYPE_MISMATCH' "$tmp_dir/functions-return-type-error.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/by-ref-capture.php > "$tmp_dir/functions-by-ref-capture.out" 2> "$tmp_dir/functions-by-ref-capture.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE' "$tmp_dir/functions-by-ref-capture.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/php85/pipe-not-callable.php > "$tmp_dir/php85-pipe-not-callable.out" 2> "$tmp_dir/php85-pipe-not-callable.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_PIPE_RHS_NOT_CALLABLE' "$tmp_dir/php85-pipe-not-callable.err"; \
+    set +e; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/generators/yield.php > "$tmp_dir/generator-gap.out" 2> "$tmp_dir/generator-gap.err"; \
+    code=$?; \
+    set -e; \
+    test "$code" -eq 2; \
+    grep -q 'E_PHP_IR_UNSUPPORTED_GENERATOR' "$tmp_dir/generator-gap.err"; \
+    printf '%s\n' '[ok] Phase 4 runtime fixtures passed.'
+
+runtime-corpus-smoke:
+    scripts/runtime-corpus-smoke.sh
+
+runtime-reference-smoke:
+    cargo test -p php_testkit runtime_reference_smoke -- --nocapture
+
+runtime-diff:
+    cargo build -p php_vm_cli -p php_testkit --bin compare-runtime
+    cargo run -p php_testkit --bin compare-runtime -- --fixtures fixtures/runtime --out target/phase4/runtime-diff --rust-vm target/debug/php-vm
+
+phpt-smoke:
+    cargo build -p php_vm_cli -p php_testkit --bin run-phpt-smoke
+    cargo run -p php_testkit --bin run-phpt-smoke -- --fixtures fixtures/phpt_smoke --out target/phase4/phpt-smoke --rust-vm target/debug/php-vm
+
+runtime-known-gaps:
+    test -s docs/phase4-known-gaps.md
+    grep -q 'E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_GENERATOR' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_YIELD_FROM' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_FIBER' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_EVAL' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_AUTOLOAD' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_REFLECTION' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_RETURN' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_RUNTIME_SUPERGLOBALS_FULL_MATRIX' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_RUNTIME_GLOBALS_ALIAS_MATRIX' docs/phase4-known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_CATCH_TYPE' docs/phase4-known-gaps.md
+    test -f fixtures/runtime/known_gaps/generators/yield.php
+    test -f fixtures/runtime/known_gaps/generators/yield-from.php
+    test -f fixtures/runtime/known_gaps/fibers/fiber.php
+    test -f fixtures/runtime/known_gaps/eval/eval.php
+    test -f fixtures/runtime/known_gaps/autoload/spl-autoload-register.php
+    test -f fixtures/runtime/known_gaps/reflection/reflection-class.php
+    test -f fixtures/runtime/known_gaps/traits/trait-use.php
+    test -f fixtures/runtime/known_gaps/enums/unit-enum.php
+    test -f fixtures/runtime/known_gaps/property_hooks/get-hook.php
+    test -f fixtures/runtime/known_gaps/references/by-ref-param.php
+    test -f fixtures/runtime/known_gaps/references/by-ref-return.php
+    test -f fixtures/runtime/known_gaps/references/array-element-ref.php
+    test -f fixtures/runtime/known_gaps/foreach/by-ref.php
+    test -f fixtures/runtime/known_gaps/superglobals/globals-alias.php
+    test -f fixtures/runtime/known_gaps/objects/clone-with-private.php
+    test -f fixtures/runtime/known_gaps/objects/clone-with-readonly.php
+    test -f fixtures/runtime/known_gaps/exceptions/catch-type.php
+
+    @tmp_dir="target/runtime-known-gaps"; \
+    mkdir -p "$tmp_dir"; \
+    for fixture_id in \
+      "fixtures/runtime/known_gaps/generators/yield.php:E_PHP_IR_UNSUPPORTED_GENERATOR:generator-yield" \
+      "fixtures/runtime/known_gaps/generators/yield-from.php:E_PHP_IR_UNSUPPORTED_YIELD_FROM:generator-yield-from" \
+      "fixtures/runtime/known_gaps/fibers/fiber.php:E_PHP_IR_UNSUPPORTED_FIBER:fiber" \
+      "fixtures/runtime/known_gaps/eval/eval.php:E_PHP_IR_UNSUPPORTED_EVAL:eval" \
+      "fixtures/runtime/known_gaps/autoload/spl-autoload-register.php:E_PHP_IR_UNSUPPORTED_AUTOLOAD:autoload" \
+      "fixtures/runtime/known_gaps/reflection/reflection-class.php:E_PHP_IR_UNSUPPORTED_REFLECTION:reflection" \
+      "fixtures/runtime/known_gaps/traits/trait-use.php:E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME:trait-use" \
+      "fixtures/runtime/known_gaps/enums/unit-enum.php:E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME:enum" \
+      "fixtures/runtime/known_gaps/property_hooks/get-hook.php:E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS:property-hooks" \
+      "fixtures/runtime/known_gaps/references/by-ref-param.php:E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER:by-ref-param" \
+      "fixtures/runtime/known_gaps/references/by-ref-return.php:E_PHP_IR_UNSUPPORTED_BY_REF_RETURN:by-ref-return" \
+      "fixtures/runtime/known_gaps/references/array-element-ref.php:E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE:array-element-ref" \
+      "fixtures/runtime/known_gaps/foreach/by-ref.php:E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH:foreach-by-ref" \
+      "fixtures/runtime/known_gaps/superglobals/globals-alias.php:E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE:globals-alias" \
+      "fixtures/runtime/known_gaps/objects/clone-with-private.php:E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER:clone-with-private" \
+      "fixtures/runtime/known_gaps/objects/clone-with-readonly.php:E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER:clone-with-readonly" \
+      "fixtures/runtime/known_gaps/exceptions/catch-type.php:E_PHP_IR_UNSUPPORTED_CATCH_TYPE:catch-type"; do \
+      IFS=':' read -r fixture diagnostic name <<< "$fixture_id"; \
+      set +e; \
+      cargo run -p php_vm_cli -- run "$fixture" > "$tmp_dir/$name.out" 2> "$tmp_dir/$name.err"; \
+      code=$?; \
+      set -e; \
+      test "$code" -eq 2; \
+      grep -q "$diagnostic" "$tmp_dir/$name.err"; \
+    done; \
+    printf '%s\n' '[ok] Phase 4 runtime known-gap catalog and reference fixtures passed.'
+
+bench-vm-smoke:
+    cargo build -p php_vm_cli
+    mkdir -p target/phase4/bench-vm-smoke
+    rustc --edition=2024 tools/bench_vm_smoke.rs -o target/phase4/bench-vm-smoke/bench-vm-smoke
+    target/phase4/bench-vm-smoke/bench-vm-smoke
+
+fuzz-vm-smoke:
+    cargo build -p php_vm_cli
+    mkdir -p target/phase4/fuzz-vm-smoke
+    rustc --edition=2024 tools/fuzz_vm_smoke.rs -o target/phase4/fuzz-vm-smoke/fuzz-vm-smoke
+    target/phase4/fuzz-vm-smoke/fuzz-vm-smoke

@@ -286,6 +286,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_static_class_context_forms_without_recovery() {
+        let source = "<?php class B {} class C extends B { public function f(): static { static::make(); return new static(); } }";
+        let parse = parse_source_file(source);
+        let debug = parse.debug_tree();
+
+        assert!(
+            !parse.has_errors(),
+            "unexpected parser diagnostics: {:?}",
+            parse.diagnostics()
+        );
+        assert!(debug.contains("STATIC_ACCESS_EXPR"));
+        assert!(debug.contains("NEW_EXPR"));
+        assert_eq!(parse.reconstructed_text(), source);
+    }
+
+    #[test]
     fn source_file_grammar_models_php_and_html_segments() {
         let source = "<p>A</p><?php echo 1; ?><?= $b ?><p>C</p>";
         let parse = parse_source_file(source);

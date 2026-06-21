@@ -60,6 +60,10 @@ fn parse_expression_bp(parser: &mut Parser<'_>, min_bp: u8) -> bool {
             parse_static_access_tail(parser);
             continue;
         }
+        if parser.at(named(TokenName::Inc)) || parser.at(named(TokenName::Dec)) {
+            parse_postfix_update_tail(parser);
+            continue;
+        }
 
         if parser.at(symbol(b'?')) {
             if TERNARY_BP < min_bp {
@@ -91,7 +95,12 @@ fn parse_expression_bp(parser: &mut Parser<'_>, min_bp: u8) -> bool {
         binary = true;
         assignment |= is_assignment_operator(parser.current());
         pipe |= php85::is_pipe_operator(parser.current());
+        let is_plain_assignment = parser.at(symbol(b'='));
         parser.bump();
+        if is_plain_assignment && has_by_ref_marker_after_trivia(parser) {
+            bump_trivia(parser);
+            parser.bump();
+        }
         if !parse_expression_bp(parser, operator.right_bp) {
             parser.error_expected("expected expression after binary operator", &["expression"]);
             break;
@@ -113,6 +122,15 @@ fn parse_expression_bp(parser: &mut Parser<'_>, min_bp: u8) -> bool {
     };
     let _completed = expr.complete(parser, SyntaxKind::Node(kind));
     true
+}
+
+fn has_by_ref_marker_after_trivia(parser: &Parser<'_>) -> bool {
+    let mut index = 0;
+    while parser.nth(index).is_trivia() {
+        index += 1;
+    }
+    parser.nth(index) == named(TokenName::AmpersandFollowedByVarOrVararg)
+        || parser.nth(index) == named(TokenName::AmpersandNotFollowedByVarOrVararg)
 }
 
 fn parse_prefix_or_primary(parser: &mut Parser<'_>) -> bool {
@@ -189,6 +207,13 @@ fn parse_primary(parser: &mut Parser<'_>) -> bool {
         let literal = parser.start();
         parser.bump();
         let _completed = literal.complete(parser, SyntaxKind::Node(SyntaxNodeKind::Literal));
+        return true;
+    }
+
+    if at_static_class_context_name(parser) {
+        let name = parser.start();
+        parser.bump();
+        let _completed = name.complete(parser, SyntaxKind::Node(SyntaxNodeKind::Name));
         return true;
     }
 
@@ -386,7 +411,7 @@ fn parse_new_expression(parser: &mut Parser<'_>) {
 
     if parser.at(named(TokenName::Class)) {
         classes::parse_anonymous_class(parser);
-    } else if names::parse_name(parser) {
+    } else if names::parse_name(parser) || parse_static_class_name(parser) {
         bump_trivia(parser);
         if parser.at(symbol(b'(')) {
             parse_call_tail(parser);
@@ -399,6 +424,16 @@ fn parse_new_expression(parser: &mut Parser<'_>) {
     }
 
     let _completed = new_expr.complete(parser, SyntaxKind::Node(SyntaxNodeKind::NewExpr));
+}
+
+fn parse_static_class_name(parser: &mut Parser<'_>) -> bool {
+    if !parser.at(named(TokenName::Static)) {
+        return false;
+    }
+    let name = parser.start();
+    parser.bump();
+    let _completed = name.complete(parser, SyntaxKind::Node(SyntaxNodeKind::Name));
+    true
 }
 
 fn parse_clone_expression(parser: &mut Parser<'_>) {
@@ -421,22 +456,73 @@ fn parse_clone_expression(parser: &mut Parser<'_>) {
 fn parse_call_tail(parser: &mut Parser<'_>) {
     let call = parser.start();
     parser.bump();
-    let mut depth = 1usize;
-    while !parser.is_eof() && depth > 0 {
-        if parser.at(symbol(b'(')) {
-            depth += 1;
+
+    while !parser.is_eof() && !parser.at(symbol(b')')) {
+        bump_trivia(parser);
+        if parser.at(symbol(b')')) {
+            break;
+        }
+        if parser.at(symbol(b',')) {
             parser.bump();
-        } else if parser.at(symbol(b')')) {
-            depth -= 1;
+            continue;
+        }
+
+        parse_argument(parser);
+
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
             parser.bump();
-        } else {
-            parser.bump();
+        } else if !parser.at(symbol(b')')) {
+            parser.error_expected("expected `,` or `)` in argument list", &[",", ")"]);
+            recover_to_argument_boundary(parser);
+            if parser.at(symbol(b',')) {
+                parser.bump();
+            }
         }
     }
-    if depth > 0 {
+
+    if parser.at(symbol(b')')) {
+        parser.bump();
+    } else {
         parser.error_expected("expected `)` to close argument list", &[")"]);
     }
     let _completed = call.complete(parser, SyntaxKind::Node(SyntaxNodeKind::CallExpr));
+}
+
+fn parse_argument(parser: &mut Parser<'_>) {
+    if at_named_argument_label(parser) {
+        parser.bump();
+        bump_trivia(parser);
+        parser.bump();
+        bump_trivia(parser);
+    }
+
+    if parser.at(named(TokenName::Ellipsis)) {
+        parser.bump();
+        bump_trivia(parser);
+        if parser.at(symbol(b')')) {
+            return;
+        }
+    }
+
+    if parser.at(named(TokenName::AmpersandFollowedByVarOrVararg))
+        || parser.at(named(TokenName::AmpersandNotFollowedByVarOrVararg))
+        || parser.at(symbol(b'&'))
+    {
+        parser.bump();
+        bump_trivia(parser);
+    }
+
+    if !parse_expression_bp(parser, 0) {
+        parser.error_expected("expected argument expression", &["expression"]);
+        recover_to_argument_boundary(parser);
+    }
+}
+
+fn parse_postfix_update_tail(parser: &mut Parser<'_>) {
+    let postfix = parser.start();
+    parser.bump();
+    let _completed = postfix.complete(parser, SyntaxKind::Node(SyntaxNodeKind::PostfixExpr));
 }
 
 fn parse_property_fetch_tail(parser: &mut Parser<'_>) {
@@ -492,6 +578,8 @@ fn at_prefix_operator(parser: &Parser<'_>) -> bool {
         || parser.at(symbol(b'!'))
         || parser.at(symbol(b'~'))
         || parser.at(symbol(b'@'))
+        || parser.at(named(TokenName::Inc))
+        || parser.at(named(TokenName::Dec))
         || parser.at(named(TokenName::IntCast))
         || parser.at(named(TokenName::DoubleCast))
         || parser.at(named(TokenName::StringCast))
@@ -500,6 +588,37 @@ fn at_prefix_operator(parser: &Parser<'_>) -> bool {
         || parser.at(named(TokenName::BoolCast))
         || parser.at(named(TokenName::UnsetCast))
         || parser.at(named(TokenName::VoidCast))
+}
+
+fn at_named_argument_label(parser: &Parser<'_>) -> bool {
+    parser.at(named(TokenName::String)) && nth_non_trivia_is(parser, 1, symbol(b':'))
+}
+
+fn at_static_class_context_name(parser: &Parser<'_>) -> bool {
+    parser.at(named(TokenName::Static))
+        && nth_non_trivia_is(parser, 1, named(TokenName::DoubleColon))
+}
+
+fn recover_to_argument_boundary(parser: &mut Parser<'_>) {
+    while !parser.is_eof()
+        && !parser.at(symbol(b','))
+        && !parser.at(symbol(b')'))
+        && !parser.at(named(TokenName::CloseTag))
+    {
+        parser.bump();
+    }
+}
+
+fn nth_non_trivia_is(parser: &Parser<'_>, start: usize, expected: SyntaxKind) -> bool {
+    let mut index = start;
+    loop {
+        let kind = parser.nth(index);
+        if kind.is_trivia() {
+            index += 1;
+            continue;
+        }
+        return kind == expected;
+    }
 }
 
 fn at_literal(parser: &Parser<'_>) -> bool {

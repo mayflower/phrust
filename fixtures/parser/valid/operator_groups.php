@@ -5,6 +5,7 @@ $math = $a * $b / $c % $d + $e - $f;
 $concat = $a . $b;
 $shift = $a << $b >> $c;
 $compare = $a < $b;
+$type_check = $a instanceof Foo\Bar;
 $spaceship = $a <=> $b;
 $equality = $a === $b || $a !== $c;
 $bits = ($a & $b) ^ ($c | $d);

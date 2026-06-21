@@ -1,0 +1,15 @@
+source: fixtures/semantic/classes/extends-implements.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class Worker
+hir_summary:
+  statements: 0
+  expressions: 3
+  types: 0
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 0

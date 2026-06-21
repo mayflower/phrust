@@ -1,0 +1,18 @@
+source: fixtures/semantic/attributes/invalid-argument-call.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_ATTRIBUTE_ARGUMENT_NOT_CONST_EXPR
+    severity: error
+    phase: const_expression
+    span: 34..50
+symbols:
+  - class InvalidAttributeArgumentTarget
+hir_summary:
+  statements: 0
+  expressions: 5
+  types: 0
+  const_exprs: 1
+  class_likes: 1
+  methods: 0
+  properties: 0

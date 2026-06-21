@@ -1,0 +1,18 @@
+source: fixtures/semantic/classes/self-outside-class-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_CLASS_CONTEXT_NAME
+    severity: error
+    phase: class_like_validation
+    span: 52..56
+symbols:
+  - function prompt26_self_outside
+hir_summary:
+  statements: 2
+  expressions: 5
+  types: 1
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

@@ -21,14 +21,18 @@ SOURCE_FILE @0..620
             T_FUNCTION @39..47 line=4 text="function"
             T_WHITESPACE @47..48 line=4 text=" "
             T_STRING @48..51 line=4 text="run"
-            ( @51..52 line=4 text="("
-            ) @52..53 line=4 text=")"
+            PARAM_LIST @51..53
+              ( @51..52 line=4 text="("
+              ) @52..53 line=4 text=")"
             : @53..54 line=4 text=":"
             T_WHITESPACE @54..55 line=4 text=" "
-            T_STRING @55..59 line=4 text="void"
-            T_WHITESPACE @59..60 line=4 text=" "
-            { @60..61 line=4 text="{"
-            } @61..62 line=4 text="}"
+            TYPE @55..60
+              NAME @55..60
+                T_STRING @55..59 line=4 text="void"
+                T_WHITESPACE @59..60 line=4 text=" "
+            BLOCK_STMT @60..62
+              { @60..61 line=4 text="{"
+              } @61..62 line=4 text="}"
           T_WHITESPACE @62..63 line=4 text="\n"
           } @63..64 line=5 text="}"
       T_WHITESPACE @64..66 line=5 text="\n\n"
@@ -46,14 +50,18 @@ SOURCE_FILE @0..620
             T_FUNCTION @100..108 line=8 text="function"
             T_WHITESPACE @108..109 line=8 text=" "
             T_STRING @109..112 line=8 text="run"
-            ( @112..113 line=8 text="("
-            ) @113..114 line=8 text=")"
+            PARAM_LIST @112..114
+              ( @112..113 line=8 text="("
+              ) @113..114 line=8 text=")"
             : @114..115 line=8 text=":"
             T_WHITESPACE @115..116 line=8 text=" "
-            T_STRING @116..120 line=8 text="void"
-            T_WHITESPACE @120..121 line=8 text=" "
-            { @121..122 line=8 text="{"
-            } @122..123 line=8 text="}"
+            TYPE @116..121
+              NAME @116..121
+                T_STRING @116..120 line=8 text="void"
+                T_WHITESPACE @120..121 line=8 text=" "
+            BLOCK_STMT @121..123
+              { @121..122 line=8 text="{"
+              } @122..123 line=8 text="}"
           T_WHITESPACE @123..124 line=8 text="\n"
           } @124..125 line=9 text="}"
       T_WHITESPACE @125..127 line=9 text="\n\n"
@@ -72,20 +80,26 @@ SOURCE_FILE @0..620
             T_WHITESPACE @169..170 line=12 text=" "
             T_CONST @170..175 line=12 text="const"
             T_WHITESPACE @175..176 line=12 text=" "
-            T_STRING @176..182 line=12 text="string"
-            T_WHITESPACE @182..183 line=12 text=" "
+            TYPE @176..183
+              NAME @176..183
+                T_STRING @176..182 line=12 text="string"
+                T_WHITESPACE @182..183 line=12 text=" "
             T_STRING @183..187 line=12 text="KIND"
             T_WHITESPACE @187..188 line=12 text=" "
             = @188..189 line=12 text="="
-            T_WHITESPACE @189..190 line=12 text=" "
-            T_CONSTANT_ENCAPSED_STRING @190..198 line=12 text="\"member\""
+            EXPR @189..198
+              T_WHITESPACE @189..190 line=12 text=" "
+              STRING @190..198
+                T_CONSTANT_ENCAPSED_STRING @190..198 line=12 text="\"member\""
             , @198..199 line=12 text=","
             T_WHITESPACE @199..200 line=12 text=" "
             T_STRING @200..205 line=12 text="OTHER"
             T_WHITESPACE @205..206 line=12 text=" "
             = @206..207 line=12 text="="
-            T_WHITESPACE @207..208 line=12 text=" "
-            T_CONSTANT_ENCAPSED_STRING @208..215 line=12 text="\"other\""
+            EXPR @207..215
+              T_WHITESPACE @207..208 line=12 text=" "
+              STRING @208..215
+                T_CONSTANT_ENCAPSED_STRING @208..215 line=12 text="\"other\""
             ; @215..216 line=12 text=";"
           T_WHITESPACE @216..221 line=12 text="\n    "
           PROPERTY_DECL @221..251
@@ -98,8 +112,10 @@ SOURCE_FILE @0..620
             T_VARIABLE @240..246 line=13 text="$count"
             T_WHITESPACE @246..247 line=13 text=" "
             = @247..248 line=13 text="="
-            T_WHITESPACE @248..249 line=13 text=" "
-            T_LNUMBER @249..250 line=13 text="0"
+            EXPR @248..250
+              T_WHITESPACE @248..249 line=13 text=" "
+              LITERAL @249..250
+                T_LNUMBER @249..250 line=13 text="0"
             ; @250..251 line=13 text=";"
           T_WHITESPACE @251..256 line=13 text="\n    "
           PROPERTY_DECL @256..289
@@ -120,17 +136,21 @@ SOURCE_FILE @0..620
             T_VARIABLE @310..316 line=15 text="$items"
             T_WHITESPACE @316..317 line=15 text=" "
             = @317..318 line=15 text="="
-            T_WHITESPACE @318..319 line=15 text=" "
-            [ @319..320 line=15 text="["
-            ] @320..321 line=15 text="]"
+            EXPR @318..321
+              T_WHITESPACE @318..319 line=15 text=" "
+              ARRAY_EXPR @319..321
+                [ @319..320 line=15 text="["
+                ] @320..321 line=15 text="]"
             , @321..322 line=15 text=","
             T_WHITESPACE @322..323 line=15 text=" "
             T_VARIABLE @323..333 line=15 text="$moreItems"
             T_WHITESPACE @333..334 line=15 text=" "
             = @334..335 line=15 text="="
-            T_WHITESPACE @335..336 line=15 text=" "
-            [ @336..337 line=15 text="["
-            ] @337..338 line=15 text="]"
+            EXPR @335..338
+              T_WHITESPACE @335..336 line=15 text=" "
+              ARRAY_EXPR @336..338
+                [ @336..337 line=15 text="["
+                ] @337..338 line=15 text="]"
             ; @338..339 line=15 text=";"
           T_WHITESPACE @339..345 line=15 text="\n\n    "
           TRAIT_USE_DECL @345..482
@@ -171,23 +191,33 @@ SOURCE_FILE @0..620
             T_FUNCTION @501..509 line=22 text="function"
             T_WHITESPACE @509..510 line=22 text=" "
             T_STRING @510..516 line=22 text="method"
-            ( @516..517 line=22 text="("
-            T_STRING @517..523 line=22 text="string"
-            T_WHITESPACE @523..524 line=22 text=" "
-            T_VARIABLE @524..530 line=22 text="$value"
-            ) @530..531 line=22 text=")"
+            PARAM_LIST @516..531
+              ( @516..517 line=22 text="("
+              PARAM @517..530
+                TYPE @517..524
+                  NAME @517..524
+                    T_STRING @517..523 line=22 text="string"
+                    T_WHITESPACE @523..524 line=22 text=" "
+                T_VARIABLE @524..530 line=22 text="$value"
+              ) @530..531 line=22 text=")"
             : @531..532 line=22 text=":"
             T_WHITESPACE @532..533 line=22 text=" "
-            T_STRING @533..537 line=22 text="void"
-            T_WHITESPACE @537..538 line=22 text=" "
-            { @538..539 line=22 text="{"
-            T_WHITESPACE @539..548 line=22 text="\n        "
-            T_ECHO @548..552 line=23 text="echo"
-            T_WHITESPACE @552..553 line=23 text=" "
-            T_VARIABLE @553..559 line=23 text="$value"
-            ; @559..560 line=23 text=";"
-            T_WHITESPACE @560..565 line=23 text="\n    "
-            } @565..566 line=24 text="}"
+            TYPE @533..538
+              NAME @533..538
+                T_STRING @533..537 line=22 text="void"
+                T_WHITESPACE @537..538 line=22 text=" "
+            BLOCK_STMT @538..566
+              { @538..539 line=22 text="{"
+              T_WHITESPACE @539..548 line=22 text="\n        "
+              ECHO_STMT @548..560
+                T_ECHO @548..552 line=23 text="echo"
+                EXPR @552..559
+                  T_WHITESPACE @552..553 line=23 text=" "
+                  VARIABLE @553..559
+                    T_VARIABLE @553..559 line=23 text="$value"
+                ; @559..560 line=23 text=";"
+              T_WHITESPACE @560..565 line=23 text="\n    "
+              } @565..566 line=24 text="}"
           T_WHITESPACE @566..572 line=24 text="\n\n    "
           METHOD_DECL @572..617
             T_ABSTRACT @572..580 line=26 text="abstract"
@@ -197,11 +227,14 @@ SOURCE_FILE @0..620
             T_FUNCTION @591..599 line=26 text="function"
             T_WHITESPACE @599..600 line=26 text=" "
             T_STRING @600..608 line=26 text="deferred"
-            ( @608..609 line=26 text="("
-            ) @609..610 line=26 text=")"
+            PARAM_LIST @608..610
+              ( @608..609 line=26 text="("
+              ) @609..610 line=26 text=")"
             : @610..611 line=26 text=":"
             T_WHITESPACE @611..612 line=26 text=" "
-            T_STRING @612..616 line=26 text="void"
+            TYPE @612..616
+              NAME @612..616
+                T_STRING @612..616 line=26 text="void"
             ; @616..617 line=26 text=";"
           T_WHITESPACE @617..618 line=26 text="\n"
           } @618..619 line=27 text="}"

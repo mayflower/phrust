@@ -1,6 +1,8 @@
 //! Declaration grammar.
 
-use crate::grammar::{attributes, classes, functions, named, names, statements, symbol};
+use crate::grammar::{
+    attributes, classes, expressions, functions, named, names, statements, symbol,
+};
 use crate::parser::core::Parser;
 use crate::recovery;
 use crate::{SyntaxKind, SyntaxNodeKind};
@@ -52,6 +54,55 @@ pub(crate) fn parse_attributed_declaration(parser: &mut Parser<'_>) {
 /// Parses a class-like declaration.
 pub(crate) fn parse_class_like_declaration(parser: &mut Parser<'_>) {
     classes::parse_class_like_declaration(parser);
+}
+
+/// Parses a namespace-level `const` declaration.
+pub(crate) fn parse_const_declaration(parser: &mut Parser<'_>) {
+    let const_decl = parser.start();
+    parser.bump();
+
+    loop {
+        bump_trivia(parser);
+        if parser.at(named(TokenName::String)) {
+            parser.bump();
+        } else {
+            parser.error_expected("expected constant name", &["T_STRING"]);
+            recovery::recover_to_statement_boundary(parser);
+            break;
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b'=')) {
+            parser.bump();
+            if !expressions::parse_expression(parser) {
+                parser.error_expected("expected constant value expression", &["expression"]);
+            }
+        } else {
+            parser.error_expected("expected `=` in const declaration", &["="]);
+            recovery::recover_to_statement_boundary(parser);
+            break;
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
+            parser.bump();
+            continue;
+        }
+        break;
+    }
+
+    bump_trivia(parser);
+    if parser.at(symbol(b';')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `;` after const declaration", &[";"]);
+        recovery::recover_to_statement_boundary(parser);
+        if parser.at(symbol(b';')) {
+            parser.bump();
+        }
+    }
+
+    let _completed = const_decl.complete(parser, SyntaxKind::Node(SyntaxNodeKind::ConstDecl));
 }
 
 /// Parses a namespace declaration.

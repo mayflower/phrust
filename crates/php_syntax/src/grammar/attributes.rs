@@ -1,6 +1,6 @@
 //! Attribute grammar helpers.
 
-use crate::grammar::{named, names, symbol};
+use crate::grammar::{expressions, named, names, symbol};
 use crate::parser::core::Parser;
 use crate::{SyntaxKind, SyntaxNodeKind, SyntaxTokenKind};
 use php_lexer::TokenName;
@@ -60,22 +60,92 @@ fn parse_attribute(parser: &mut Parser<'_>) {
 
     bump_trivia(parser);
     if parser.at(symbol(b'(')) {
-        parse_balanced_argument_list(parser);
+        parse_attribute_argument_list(parser);
     }
     let _completed = attribute.complete(parser, SyntaxKind::Node(SyntaxNodeKind::Attribute));
 }
 
-fn parse_balanced_argument_list(parser: &mut Parser<'_>) {
+fn parse_attribute_argument_list(parser: &mut Parser<'_>) {
+    parser.bump();
+
+    while !parser.is_eof()
+        && !parser.at(symbol(b')'))
+        && !parser.at(symbol(b']'))
+        && !at_attribute_argument_recovery_end(parser)
+    {
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
+            parser.bump();
+            continue;
+        }
+        if parser.at(symbol(b')')) || parser.at(symbol(b']')) {
+            break;
+        }
+
+        if at_named_argument_label(parser) {
+            parser.bump();
+            bump_trivia(parser);
+            parser.bump();
+            bump_trivia(parser);
+        }
+
+        if !expressions::parse_expression(parser) {
+            parser.error_expected("expected attribute argument expression", &["expression"]);
+            recover_to_attribute_argument_boundary(parser);
+        }
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
+            parser.bump();
+        } else if !parser.at(symbol(b')')) && !parser.at(symbol(b']')) {
+            parser.error_expected(
+                "expected `,` or `)` in attribute argument list",
+                &[",", ")"],
+            );
+            recover_to_attribute_argument_boundary(parser);
+            if parser.at(symbol(b',')) {
+                parser.bump();
+            }
+        }
+    }
+
+    if parser.at(symbol(b')')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `)` to close attribute argument list", &[")"]);
+    }
+}
+
+fn at_named_argument_label(parser: &Parser<'_>) -> bool {
+    parser.current_keyword_context().is_some() && next_non_trivia_is(parser, 1, symbol(b':'))
+}
+
+fn next_non_trivia_is(parser: &Parser<'_>, start: usize, expected: SyntaxKind) -> bool {
+    let mut index = start;
+    loop {
+        let kind = parser.nth(index);
+        if kind.is_trivia() {
+            index += 1;
+            continue;
+        }
+        return kind == expected;
+    }
+}
+
+fn recover_to_attribute_argument_boundary(parser: &mut Parser<'_>) {
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
     let mut brace_depth = 0usize;
-    parser.bump();
-    paren_depth += 1;
-
-    while !parser.is_eof() && paren_depth > 0 {
+    while !parser.is_eof() {
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (parser.at(symbol(b',')) || parser.at(symbol(b')')) || parser.at(symbol(b']')))
+        {
+            return;
+        }
         if parser.at(symbol(b'(')) {
             paren_depth += 1;
-        } else if parser.at(symbol(b')')) {
+        } else if parser.at(symbol(b')')) && paren_depth > 0 {
             paren_depth -= 1;
         } else if parser.at(symbol(b'[')) {
             bracket_depth += 1;
@@ -85,18 +155,8 @@ fn parse_balanced_argument_list(parser: &mut Parser<'_>) {
             brace_depth += 1;
         } else if parser.at(symbol(b'}')) && brace_depth > 0 {
             brace_depth -= 1;
-        } else if paren_depth == 1
-            && bracket_depth == 0
-            && brace_depth == 0
-            && parser.at(symbol(b']'))
-        {
-            break;
         }
         parser.bump();
-    }
-
-    if paren_depth > 0 {
-        parser.error_expected("expected `)` to close attribute argument list", &[")"]);
     }
 }
 
@@ -163,6 +223,10 @@ fn at_attribute_recovery_end(parser: &Parser<'_>) -> bool {
     is_attribute_recovery_kind(parser.current())
 }
 
+fn at_attribute_argument_recovery_end(parser: &Parser<'_>) -> bool {
+    is_attribute_argument_recovery_kind(parser.current())
+}
+
 fn is_attribute_recovery_kind(kind: SyntaxKind) -> bool {
     kind == named(TokenName::Function)
         || kind == named(TokenName::Class)
@@ -179,6 +243,22 @@ fn is_attribute_recovery_kind(kind: SyntaxKind) -> bool {
         || kind == named(TokenName::CloseTag)
         || kind == symbol(b')')
         || kind == symbol(b'{')
+        || kind == symbol(b'}')
+        || kind == symbol(b';')
+}
+
+fn is_attribute_argument_recovery_kind(kind: SyntaxKind) -> bool {
+    kind == named(TokenName::Class)
+        || kind == named(TokenName::Interface)
+        || kind == named(TokenName::Trait)
+        || kind == named(TokenName::Enum)
+        || kind == named(TokenName::Public)
+        || kind == named(TokenName::Protected)
+        || kind == named(TokenName::Private)
+        || kind == named(TokenName::Readonly)
+        || kind == named(TokenName::Variable)
+        || kind == named(TokenName::CloseTag)
+        || kind == symbol(b')')
         || kind == symbol(b'}')
         || kind == symbol(b';')
 }

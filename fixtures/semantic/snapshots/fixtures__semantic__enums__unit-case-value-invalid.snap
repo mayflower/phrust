@@ -1,0 +1,18 @@
+source: fixtures/semantic/enums/unit-case-value-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_ENUM_CASE_VALUE_ON_UNIT_ENUM
+    severity: error
+    phase: class_like_validation
+    span: 26..39
+symbols:
+  - enum BadUnit
+hir_summary:
+  statements: 0
+  expressions: 1
+  types: 1
+  const_exprs: 1
+  class_likes: 1
+  methods: 0
+  properties: 0

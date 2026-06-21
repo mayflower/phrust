@@ -1,0 +1,18 @@
+source: fixtures/semantic/invalid/recovery/broken-expression.php
+parse_ok: false
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_HIR_MISSING_CHILD
+    severity: error
+    phase: hir_lowering
+    span: 14..20
+symbols:
+  []
+hir_summary:
+  statements: 2
+  expressions: 6
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

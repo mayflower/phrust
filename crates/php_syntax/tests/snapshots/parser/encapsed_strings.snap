@@ -67,8 +67,10 @@ SOURCE_FILE @0..201
                     T_VARIABLE @86..91 line=6 text="$prop"
                     T_WHITESPACE @91..92 line=6 text=" "
                     = @92..93 line=6 text="="
-                    T_WHITESPACE @93..94 line=6 text=" "
-                    T_CONSTANT_ENCAPSED_STRING @94..104 line=6 text="\"property\""
+                    EXPR @93..104
+                      T_WHITESPACE @93..94 line=6 text=" "
+                      STRING @94..104
+                        T_CONSTANT_ENCAPSED_STRING @94..104 line=6 text="\"property\""
                     ; @104..105 line=6 text=";"
                   T_WHITESPACE @105..106 line=6 text="\n"
                   } @106..107 line=7 text="}"
@@ -99,14 +101,16 @@ SOURCE_FILE @0..201
               T_ENCAPSED_AND_WHITESPACE @151..152 line=9 text=" "
               EXPR @152..165
                 T_CURLY_OPEN @152..153 line=9 text="{"
-                T_VARIABLE @153..157 line=9 text="$arr"
-                [ @157..158 line=9 text="["
-                T_ENCAPSED_AND_WHITESPACE @158..164 line=9 text="\'key\']"
+                VARIABLE @153..164
+                  T_VARIABLE @153..157 line=9 text="$arr"
+                  [ @157..158 line=9 text="["
+                  T_ENCAPSED_AND_WHITESPACE @158..164 line=9 text="\'key\']"
                 } @164..165 line=9 text="}"
               T_ENCAPSED_AND_WHITESPACE @165..166 line=9 text=" "
               EXPR @166..173
                 T_DOLLAR_OPEN_CURLY_BRACES @166..168 line=9 text="${"
-                T_STRING_VARNAME @168..172 line=9 text="name"
+                VARIABLE @168..172
+                  T_STRING_VARNAME @168..172 line=9 text="name"
                 } @172..173 line=9 text="}"
               " @173..174 line=9 text="\""
         ; @174..175 line=9 text=";"

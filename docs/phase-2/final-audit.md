@@ -25,6 +25,7 @@ binary was available at `third_party/php-src/sapi/cli/php` and reported PHP
 | `nix develop -c just parser-fixtures` | pass | PHP lint oracle checked 65 parser fixtures with the pinned local reference. Invalid fixtures were rejected by PHP as expected. |
 | `nix develop -c just parser-diff` | pass | Compared 65 parser fixtures; `allowed gaps=0`. |
 | `nix develop -c just cst-roundtrip` | pass | All committed parser fixtures reconstructed exactly from CST tokens. |
+| `nix develop -c just parser-corpus-smoke` | pass | Optional smoke checked 50 pinned php-src samples; remaining 9 deviations are semantic modifier rejections by PHP lint, not parser fixture gaps. |
 
 ## Scope Audit
 
@@ -45,14 +46,17 @@ binary was available at `third_party/php-src/sapi/cli/php` and reported PHP
 
 ## Residual Gaps
 
-P1: Complex interpolation internals remain shallow CST structure. The parser
-preserves and groups encapsed string and heredoc tokens losslessly, but the
-lexer-mode token stream does not yet expose every interpolation body as normal
+P1: Arbitrary complex interpolation internals remain shallow CST structure. The
+parser preserves and groups encapsed string and heredoc tokens losslessly, and
+braced variable interpolation now receives variable CST structure. The
+lexer-mode token stream still does not expose every interpolation body as normal
 expression-mode syntax.
 
 P2: Optional php-src corpus smoke still reports exploratory deviations outside
-the curated fixture contract. These are not accepted gaps. Any real issue should
-be reduced into a committed fixture before adding an allowlist entry.
+the curated fixture contract. These are not accepted gaps. The current remaining
+deviations are PHP lint semantic modifier checks deferred to Phase 3. Any future
+syntax issue should be reduced into a committed fixture before adding an
+allowlist entry.
 
 P2: Incremental reparsing is prepared through byte ranges and optional source
 identity, but no stable node identity or subtree reuse implementation exists.

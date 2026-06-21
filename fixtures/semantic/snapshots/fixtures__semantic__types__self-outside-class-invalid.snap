@@ -1,0 +1,22 @@
+source: fixtures/semantic/types/self-outside-class-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_TYPE_SELF_CONTEXT
+    severity: error
+    phase: type_lowering
+    span: 29..33
+  - id: E_PHP_INVALID_CLASS_CONTEXT_NAME
+    severity: error
+    phase: class_like_validation
+    span: 29..33
+symbols:
+  - function invalid_self
+hir_summary:
+  statements: 1
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

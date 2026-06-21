@@ -1,0 +1,19 @@
+source: fixtures/semantic/types/dnf-types.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - interface Reader
+  - interface Writer
+  - interface Seekable
+  - interface Buffer
+  - function dnf
+hir_summary:
+  statements: 2
+  expressions: 7
+  types: 10
+  const_exprs: 0
+  class_likes: 4
+  methods: 0
+  properties: 0

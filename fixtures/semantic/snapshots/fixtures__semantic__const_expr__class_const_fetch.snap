@@ -1,0 +1,16 @@
+source: fixtures/semantic/const_expr/class_const_fetch.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class ConstExprClassFetch
+  - function const_expr_class_fetch
+hir_summary:
+  statements: 2
+  expressions: 15
+  types: 4
+  const_exprs: 5
+  class_likes: 1
+  methods: 1
+  properties: 1

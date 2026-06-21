@@ -1,0 +1,15 @@
+source: fixtures/semantic/invalid/recovery/missing-name.php
+parse_ok: false
+semantic_ok: false
+diagnostics:
+  []
+symbols:
+  - function prompt33_missing_name
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

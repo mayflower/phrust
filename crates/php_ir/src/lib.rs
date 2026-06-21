@@ -1,0 +1,121 @@
+//! Phase 4 bytecode/IR boundary.
+//!
+//! The IR is register-based and organized into basic blocks. It is the stable
+//! handoff shape between Phase 3 HIR and the Phase 4 VM. This crate does not
+//! lower HIR yet.
+
+pub mod block;
+pub mod builder;
+pub mod constants;
+pub mod display;
+pub mod function;
+pub mod ids;
+pub mod instruction;
+pub mod lower;
+pub mod module;
+pub mod operand;
+pub mod source_map;
+pub mod verify;
+
+pub use block::{BasicBlock, Terminator};
+pub use builder::IrBuilder;
+pub use constants::IrConstant;
+pub use function::{FunctionFlags, IrCapture, IrFunction, IrParam, IrReturnType};
+pub use ids::{BlockId, ClassId, ConstId, FileId, FunctionId, InstrId, LocalId, RegId, UnitId};
+pub use instruction::{
+    BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, Instruction,
+    InstructionKind, UnaryOp,
+};
+pub use lower::{
+    LoweringContext, LoweringDiagnostic, LoweringOptions, LoweringResult, UnsupportedFeature,
+    lower_frontend_result,
+};
+pub use module::{
+    ClassEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
+    ClassPropertyFlags, FileEntry, FunctionEntry, GlobalConstantEntry, IR_VERSION, IrUnit,
+};
+pub use operand::Operand;
+pub use source_map::{IrSourceMap, IrSourceMapEntry, IrSourceMapTarget, IrSpan};
+pub use verify::{VerificationError, VerificationErrorCode, verify_unit};
+
+/// Stable status string used by early wiring tests.
+#[must_use]
+pub const fn ir_skeleton_status() -> &'static str {
+    "phase4-ir-core-model"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan, Operand, RegId,
+        UnitId, ir_skeleton_status,
+    };
+
+    #[test]
+    fn ids_are_stable_newtypes() {
+        assert_eq!(UnitId::new(7).index(), 7);
+        assert_eq!(RegId::new(3).index(), 3);
+        assert_eq!(format!("{:?}", RegId::new(3)), "RegId(3)");
+        assert_eq!(
+            php_testkit::reference_checkout_path(),
+            "third_party/php-src"
+        );
+    }
+
+    #[test]
+    fn builder_constructs_simple_ir() {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("fixtures/runtime/valid/scalars/echo.php");
+        let entry = builder.start_function(
+            "main",
+            FunctionFlags {
+                is_top_level: true,
+                ..FunctionFlags::default()
+            },
+            IrSpan::new(file, 0, 5),
+        );
+        let block = builder.append_block(entry);
+        let c0 = builder.add_constant(IrConstant::Int(1));
+        let c1 = builder.add_constant(IrConstant::Int(2));
+        let r0 = builder.alloc_register(entry);
+        let r1 = builder.alloc_register(entry);
+        let r2 = builder.alloc_register(entry);
+        builder.emit_load_const(entry, block, r0, c0, IrSpan::new(file, 6, 7));
+        builder.emit_load_const(entry, block, r1, c1, IrSpan::new(file, 10, 11));
+        builder.emit(
+            entry,
+            block,
+            InstructionKind::Binary {
+                dst: r2,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(r0),
+                rhs: Operand::Register(r1),
+            },
+            IrSpan::new(file, 6, 11),
+        );
+        builder.terminate_return(
+            entry,
+            block,
+            Some(Operand::Register(r2)),
+            IrSpan::new(file, 6, 11),
+        );
+        builder.set_entry(entry);
+
+        let unit = builder.finish();
+        assert_eq!(unit.entry, entry);
+        assert_eq!(unit.constants.len(), 2);
+        assert_eq!(unit.functions[entry.index()].register_count, 3);
+        assert_eq!(
+            unit.functions[entry.index()].blocks[block.index()]
+                .instructions
+                .len(),
+            3
+        );
+        assert!(format!("{unit:#?}").contains("IrUnit"));
+    }
+
+    #[test]
+    fn status_reflects_core_model() {
+        assert_eq!(ir_skeleton_status(), "phase4-ir-core-model");
+    }
+}

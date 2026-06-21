@@ -1,0 +1,17 @@
+source: fixtures/semantic/types/return-types.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - function done
+  - function fail
+  - function maybe_result
+hir_summary:
+  statements: 5
+  expressions: 10
+  types: 4
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

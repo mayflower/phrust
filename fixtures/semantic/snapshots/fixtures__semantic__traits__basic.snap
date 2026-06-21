@@ -1,0 +1,15 @@
+source: fixtures/semantic/traits/basic.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - trait LogsMessages
+hir_summary:
+  statements: 1
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 1
+  methods: 1
+  properties: 0

@@ -1,0 +1,18 @@
+source: fixtures/semantic/functions/return-void-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_RETURN_VALUE_FROM_VOID_FUNCTION
+    severity: error
+    phase: control_flow_validation
+    span: 50..59
+symbols:
+  - function return_void_invalid
+hir_summary:
+  statements: 2
+  expressions: 2
+  types: 1
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

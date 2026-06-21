@@ -24,6 +24,10 @@ result-*
 
 # Generated reports and extracted corpora
 /target/
+/target/phase4/
+/target/runtime-fixtures/
+/target/runtime-known-gaps/
+/target/vm-smoke/
 /reports/
 /tmp/
 /tmp_*/

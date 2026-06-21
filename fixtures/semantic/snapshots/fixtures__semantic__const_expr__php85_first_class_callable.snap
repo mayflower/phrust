@@ -1,0 +1,16 @@
+source: fixtures/semantic/const_expr/php85_first_class_callable.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - function const_expr_php85_first_class_callable
+  - class ConstExprPhp85FirstClassCallableTarget
+hir_summary:
+  statements: 1
+  expressions: 8
+  types: 1
+  const_exprs: 2
+  class_likes: 1
+  methods: 0
+  properties: 0

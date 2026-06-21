@@ -15,6 +15,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "php_ast"
+version = "0.1.0"
+dependencies = [
+ "php_source",
+ "php_syntax",
+]
+
+[[package]]
+name = "php_frontend_cli"
+version = "0.1.0"
+dependencies = [
+ "php_semantics",
+]
+
+[[package]]
+name = "php_ir"
+version = "0.0.0"
+dependencies = [
+ "php_semantics",
+ "php_source",
+ "php_testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "php_lexer"
 version = "0.1.0"
 dependencies = [
@@ -38,6 +64,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "php_runtime"
+version = "0.0.0"
+dependencies = [
+ "php_source",
+ "php_testkit",
+]
+
+[[package]]
+name = "php_semantics"
+version = "0.1.0"
+dependencies = [
+ "php_ast",
+ "php_source",
+ "php_syntax",
+]
+
+[[package]]
 name = "php_source"
 version = "0.0.0"
 
@@ -55,6 +98,29 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "php_vm"
+version = "0.0.0"
+dependencies = [
+ "php_ir",
+ "php_runtime",
+ "php_semantics",
+ "php_source",
+ "php_testkit",
+]
+
+[[package]]
+name = "php_vm_cli"
+version = "0.0.0"
+dependencies = [
+ "php_ir",
+ "php_runtime",
+ "php_semantics",
+ "php_source",
+ "php_testkit",
+ "php_vm",
 ]
 
 [[package]]

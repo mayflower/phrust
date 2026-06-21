@@ -1,0 +1,2 @@
+<?php
+echo PROMPT24_MISSING_CONSTANT;

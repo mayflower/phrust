@@ -1,0 +1,16 @@
+source: fixtures/semantic/traits/trait-use.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - trait LogsActivity
+  - class UsesTrait
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 2
+  methods: 1
+  properties: 0

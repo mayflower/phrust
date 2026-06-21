@@ -1,0 +1,16 @@
+source: fixtures/semantic/namespaces/unbraced.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant VALUE
+  - function value
+hir_summary:
+  statements: 2
+  expressions: 3
+  types: 1
+  const_exprs: 1
+  class_likes: 0
+  methods: 0
+  properties: 0

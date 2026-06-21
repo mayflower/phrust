@@ -96,6 +96,13 @@ fn parse_simple_interpolation(parser: &mut Parser<'_>) {
 fn parse_complex_interpolation(parser: &mut Parser<'_>) {
     let expression = parser.start();
     parser.bump();
+    if parser.at(named(TokenName::StringVarName)) {
+        let variable = parser.start();
+        parser.bump();
+        let _completed = variable.complete(parser, SyntaxKind::Node(SyntaxNodeKind::Variable));
+    } else if parser.at(named(TokenName::Variable)) {
+        parse_simple_interpolation(parser);
+    }
     while !parser.is_eof() && !parser.at(symbol(b'}')) {
         parser.bump();
     }

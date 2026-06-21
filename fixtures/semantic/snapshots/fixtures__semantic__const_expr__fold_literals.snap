@@ -1,0 +1,19 @@
+source: fixtures/semantic/const_expr/fold_literals.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_FOLD_NULL
+  - constant CONST_EXPR_FOLD_BOOL
+  - constant CONST_EXPR_FOLD_INT
+  - constant CONST_EXPR_FOLD_NEGATIVE_INT
+  - constant CONST_EXPR_FOLD_STRING
+hir_summary:
+  statements: 0
+  expressions: 6
+  types: 0
+  const_exprs: 5
+  class_likes: 0
+  methods: 0
+  properties: 0

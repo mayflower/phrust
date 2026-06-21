@@ -1,0 +1,18 @@
+source: fixtures/semantic/namespaces/mixed-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_MIXED_NAMESPACE_DECLARATIONS
+    severity: error
+    phase: declaration_collection
+    span: 22..62
+symbols:
+  - class Service
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 0
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 0

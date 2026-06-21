@@ -1,0 +1,18 @@
+source: fixtures/semantic/deferred/include-literal.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 16..32
+symbols:
+  []
+hir_summary:
+  statements: 1
+  expressions: 6
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

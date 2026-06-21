@@ -1,0 +1,16 @@
+source: fixtures/semantic/declarations/functions.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - function run
+  - function helper
+hir_summary:
+  statements: 3
+  expressions: 3
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

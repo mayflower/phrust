@@ -1,0 +1,18 @@
+source: fixtures/semantic/classes/parent-without-parent.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_CLASS_CONTEXT_NAME
+    severity: error
+    phase: class_like_validation
+    span: 79..85
+symbols:
+  - class Prompt26NoParent
+hir_summary:
+  statements: 2
+  expressions: 5
+  types: 1
+  const_exprs: 0
+  class_likes: 1
+  methods: 1
+  properties: 0

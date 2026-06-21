@@ -1,0 +1,19 @@
+source: fixtures/semantic/declarations/duplicate-function-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_DUPLICATE_DECLARATION
+    severity: error
+    phase: declaration_collection
+    span: 61..70
+symbols:
+  - function duplicate
+  - function duplicate
+hir_summary:
+  statements: 2
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

@@ -1,0 +1,18 @@
+source: fixtures/semantic/declare/strict-types-not-first.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_STRICT_TYPES_DECLARE_NOT_FIRST
+    severity: error
+    phase: declaration_collection
+    span: 22..36
+symbols:
+  - function prompt27_strict_types_late
+hir_summary:
+  statements: 4
+  expressions: 4
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

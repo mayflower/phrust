@@ -75,8 +75,9 @@ executable acceptance gaps.
 ## Corpus Smoke Observation
 
 A local run on 2026-06-20 extracted 50 syntax-focused files from the pinned
-`php-src` checkout and reported 11 exploratory deviations. These are not
-accepted fixture gaps. The dominant category was PHP lint rejecting
+`php-src` checkout and reported 9 exploratory deviations. These are not
+accepted fixture gaps. All remaining deviations were PHP lint rejecting
 semantic class/member modifier cases that the syntax parser intentionally
-accepts; a smaller category was richer expression-heavy corpus files needing
-reduced fixtures before promotion.
+accepts. Earlier reference-accepted corpus reductions for namespace-level
+`const`, prefix/postfix update expressions, structured call arguments, and
+`instanceof` are covered by committed fixtures.

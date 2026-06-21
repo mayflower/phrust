@@ -1,0 +1,18 @@
+source: fixtures/semantic/classes/promotion-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_PROPERTY_PROMOTION
+    severity: error
+    phase: hir_lowering
+    span: 81..86
+symbols:
+  - class InvalidPromotion
+hir_summary:
+  statements: 1
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 1
+  methods: 1
+  properties: 0

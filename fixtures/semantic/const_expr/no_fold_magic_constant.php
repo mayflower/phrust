@@ -1,0 +1,3 @@
+<?php
+
+const CONST_EXPR_NO_FOLD_MAGIC_CONSTANT = __DIR__;

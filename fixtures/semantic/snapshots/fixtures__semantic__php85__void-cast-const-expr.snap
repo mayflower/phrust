@@ -1,0 +1,22 @@
+source: fixtures/semantic/php85/void-cast-const-expr.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_VOID_CAST
+    severity: error
+    phase: hir_lowering
+    span: 33..41
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 33..41
+symbols:
+  - constant PROMPT32_VOID_CAST
+hir_summary:
+  statements: 0
+  expressions: 2
+  types: 0
+  const_exprs: 1
+  class_likes: 0
+  methods: 0
+  properties: 0

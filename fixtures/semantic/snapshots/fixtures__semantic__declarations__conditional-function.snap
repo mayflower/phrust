@@ -1,0 +1,16 @@
+source: fixtures/semantic/declarations/conditional-function.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - conditional_function conditional_helper
+  - conditional_class_like ConditionalService
+hir_summary:
+  statements: 2
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 0

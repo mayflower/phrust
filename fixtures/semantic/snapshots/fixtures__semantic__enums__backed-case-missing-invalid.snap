@@ -1,0 +1,18 @@
+source: fixtures/semantic/enums/backed-case-missing-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_ENUM_CASE_MISSING_VALUE_ON_BACKED_ENUM
+    severity: error
+    phase: class_like_validation
+    span: 36..43
+symbols:
+  - enum BadBacked
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 3
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 0

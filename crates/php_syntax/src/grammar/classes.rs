@@ -1,10 +1,10 @@
 //! Class-like declaration surface grammar.
 
-use crate::grammar::{attributes, named, symbol};
+use crate::grammar::{attributes, expressions, functions, named, symbol, types};
 use crate::parser::core::Parser;
 use crate::recovery;
-use crate::{SyntaxKind, SyntaxNodeKind};
-use php_lexer::TokenName;
+use crate::{SyntaxKind, SyntaxNodeKind, SyntaxTokenKind};
+use php_lexer::{TokenKind, TokenName};
 
 /// Returns true when the current token begins a class-like declaration.
 pub(crate) fn at_class_like_declaration(parser: &Parser<'_>) -> bool {
@@ -98,10 +98,10 @@ fn parse_member(parser: &mut Parser<'_>) {
     parse_modifiers(parser);
 
     if parser.at(named(TokenName::Function)) {
-        consume_member_with_optional_body(parser);
+        functions::parse_method_member_body(parser);
         let _completed = member.complete(parser, SyntaxKind::Node(SyntaxNodeKind::MethodDecl));
     } else if parser.at(named(TokenName::Const)) {
-        consume_member_until_semicolon(parser);
+        parse_class_const_member(parser);
         let _completed = member.complete(parser, SyntaxKind::Node(SyntaxNodeKind::ClassConstDecl));
     } else if parser.at(named(TokenName::Use)) {
         consume_member_with_optional_body(parser);
@@ -110,6 +110,96 @@ fn parse_member(parser: &mut Parser<'_>) {
         consume_property_member(parser);
         let _completed = member.complete(parser, SyntaxKind::Node(SyntaxNodeKind::PropertyDecl));
     }
+}
+
+fn parse_class_const_member(parser: &mut Parser<'_>) {
+    parser.bump();
+    bump_trivia(parser);
+    if at_typed_class_const(parser) {
+        types::parse_type(parser);
+    }
+
+    loop {
+        bump_trivia(parser);
+        if at_contextual_identifier(parser) {
+            parser.bump();
+        } else {
+            parser.error_expected("expected class constant name", &["T_STRING"]);
+            recover_to_class_const_boundary(parser);
+            break;
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b'=')) {
+            parser.bump();
+            if !expressions::parse_expression(parser) {
+                parser.error_expected("expected class constant value expression", &["expression"]);
+                recover_to_class_const_boundary(parser);
+            }
+        } else {
+            parser.error_expected("expected `=` in class constant declaration", &["="]);
+            recover_to_class_const_boundary(parser);
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
+            parser.bump();
+            continue;
+        }
+        break;
+    }
+
+    if parser.at(symbol(b';')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `;` after class constant declaration", &[";"]);
+        recovery::recover_to_statement_boundary(parser);
+        if parser.at(symbol(b';')) {
+            parser.bump();
+        }
+    }
+}
+
+fn at_typed_class_const(parser: &Parser<'_>) -> bool {
+    if !types::at_type_start(parser) {
+        return false;
+    }
+
+    let mut index = 0;
+    let mut significant = Vec::new();
+    loop {
+        let kind = parser.nth(index);
+        if kind.is_trivia() {
+            index += 1;
+            continue;
+        }
+        if kind == symbol(b'=') {
+            break;
+        }
+        if kind == symbol(b',')
+            || kind == symbol(b';')
+            || kind == SyntaxKind::from_token_kind(TokenKind::Eof)
+        {
+            return false;
+        }
+        significant.push(kind);
+        index += 1;
+    }
+
+    significant.len() >= 2 && significant.last().copied().is_some_and(is_identifier_kind)
+}
+
+fn at_contextual_identifier(parser: &Parser<'_>) -> bool {
+    parser.current_keyword_context().is_some()
+}
+
+fn is_identifier_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Token(SyntaxTokenKind::Named(
+            TokenName::String | TokenName::Match | TokenName::Readonly | TokenName::Include
+        ))
+    )
 }
 
 fn parse_modifiers(parser: &mut Parser<'_>) {
@@ -144,43 +234,6 @@ fn consume_until_class_body(parser: &mut Parser<'_>) {
     }
 }
 
-fn consume_member_until_semicolon(parser: &mut Parser<'_>) {
-    let mut paren_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut brace_depth = 0usize;
-    while !parser.is_eof() && !parser.at(named(TokenName::CloseTag)) {
-        if parser.at(symbol(b'(')) {
-            paren_depth += 1;
-        } else if parser.at(symbol(b')')) && paren_depth > 0 {
-            paren_depth -= 1;
-        } else if parser.at(symbol(b'[')) {
-            bracket_depth += 1;
-        } else if parser.at(symbol(b']')) && bracket_depth > 0 {
-            bracket_depth -= 1;
-        } else if parser.at(symbol(b'{')) {
-            brace_depth += 1;
-        } else if parser.at(symbol(b'}')) {
-            if brace_depth == 0 {
-                break;
-            }
-            brace_depth -= 1;
-        } else if parser.at(symbol(b';'))
-            && paren_depth == 0
-            && bracket_depth == 0
-            && brace_depth == 0
-        {
-            break;
-        }
-        parser.bump();
-    }
-    if parser.at(symbol(b';')) {
-        parser.bump();
-    } else if !parser.at(symbol(b'}')) {
-        parser.error_expected("expected `;` after class member", &[";"]);
-        recovery::recover_to_statement_boundary(parser);
-    }
-}
-
 fn consume_property_member(parser: &mut Parser<'_>) {
     while !parser.is_eof()
         && !parser.at(symbol(b';'))
@@ -188,7 +241,15 @@ fn consume_property_member(parser: &mut Parser<'_>) {
         && !parser.at(symbol(b'}'))
         && !parser.at(named(TokenName::CloseTag))
     {
-        parser.bump();
+        if parser.at(symbol(b'=')) {
+            parser.bump();
+            if !expressions::parse_expression(parser) {
+                parser.error_expected("expected property default expression", &["expression"]);
+                recover_to_property_boundary(parser);
+            }
+        } else {
+            parser.bump();
+        }
     }
     if parser.at(symbol(b';')) {
         parser.bump();
@@ -197,6 +258,29 @@ fn consume_property_member(parser: &mut Parser<'_>) {
     } else if !parser.at(symbol(b'}')) {
         parser.error_expected("expected `;` or property hook body", &[";", "{"]);
         recovery::recover_to_statement_boundary(parser);
+    }
+}
+
+fn recover_to_class_const_boundary(parser: &mut Parser<'_>) {
+    while !parser.is_eof()
+        && !parser.at(symbol(b','))
+        && !parser.at(symbol(b';'))
+        && !parser.at(symbol(b'}'))
+        && !parser.at(named(TokenName::CloseTag))
+    {
+        parser.bump();
+    }
+}
+
+fn recover_to_property_boundary(parser: &mut Parser<'_>) {
+    while !parser.is_eof()
+        && !parser.at(symbol(b','))
+        && !parser.at(symbol(b';'))
+        && !parser.at(symbol(b'{'))
+        && !parser.at(symbol(b'}'))
+        && !parser.at(named(TokenName::CloseTag))
+    {
+        parser.bump();
     }
 }
 

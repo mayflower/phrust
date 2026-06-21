@@ -1,0 +1,22 @@
+source: fixtures/semantic/php85/void-cast.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_VOID_CAST
+    severity: error
+    phase: hir_lowering
+    span: 17..49
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 17..49
+symbols:
+  []
+hir_summary:
+  statements: 1
+  expressions: 6
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

@@ -1,0 +1,18 @@
+source: fixtures/semantic/types/void-property-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_TYPE_VOID_CONTEXT
+    severity: error
+    phase: type_lowering
+    span: 46..50
+symbols:
+  - class InvalidVoidProperty
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 1
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 1

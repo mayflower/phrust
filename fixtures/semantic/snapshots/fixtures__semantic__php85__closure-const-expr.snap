@@ -1,0 +1,15 @@
+source: fixtures/semantic/php85/closure-const-expr.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant PROMPT32_CLOSURE
+hir_summary:
+  statements: 2
+  expressions: 2
+  types: 1
+  const_exprs: 1
+  class_likes: 0
+  methods: 0
+  properties: 0

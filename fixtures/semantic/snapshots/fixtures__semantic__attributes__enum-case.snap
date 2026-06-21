@@ -1,0 +1,15 @@
+source: fixtures/semantic/attributes/enum-case.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - enum AttributeEnumTarget
+hir_summary:
+  statements: 0
+  expressions: 3
+  types: 3
+  const_exprs: 2
+  class_likes: 1
+  methods: 0
+  properties: 0

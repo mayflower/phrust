@@ -7,7 +7,12 @@
 pub mod diff;
 pub mod fixtures;
 pub mod lexer_reference;
+pub mod normalize_output;
 pub mod parser_reference;
+pub mod phpt;
+pub mod runtime_fixture;
+pub mod runtime_reference;
+pub mod semantic_reference;
 
 /// Returns the expected local checkout path for the pinned PHP reference.
 #[must_use]

@@ -1,0 +1,19 @@
+source: fixtures/semantic/traits/trait-adaptation-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_TRAIT_ADAPTATION_INVALID_SHAPE
+    severity: error
+    phase: class_like_validation
+    span: 158..164
+symbols:
+  - trait InvalidAdaptationSource
+  - class UsesInvalidAdaptation
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 2
+  methods: 1
+  properties: 0

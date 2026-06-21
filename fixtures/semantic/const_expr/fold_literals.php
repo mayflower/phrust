@@ -1,0 +1,7 @@
+<?php
+
+const CONST_EXPR_FOLD_NULL = null;
+const CONST_EXPR_FOLD_BOOL = true;
+const CONST_EXPR_FOLD_INT = 42;
+const CONST_EXPR_FOLD_NEGATIVE_INT = -42;
+const CONST_EXPR_FOLD_STRING = "phrust";

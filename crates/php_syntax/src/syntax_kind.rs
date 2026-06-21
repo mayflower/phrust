@@ -144,6 +144,8 @@ pub enum SyntaxNodeKind {
     NamespaceStmt,
     /// Use declaration.
     UseDecl,
+    /// Namespace-level constant declaration.
+    ConstDecl,
     /// Function declaration.
     FunctionDecl,
     /// Parameter list.
@@ -194,6 +196,8 @@ pub enum SyntaxNodeKind {
     ParenthesizedExpr,
     /// Prefix expression.
     PrefixExpr,
+    /// Postfix expression.
+    PostfixExpr,
     /// PHP 8.5 void-cast expression.
     VoidCastExpr,
     /// Binary expression.
@@ -277,6 +281,7 @@ impl SyntaxNodeKind {
             Self::LabelStmt => "LABEL_STMT",
             Self::NamespaceStmt => "NAMESPACE_STMT",
             Self::UseDecl => "USE_DECL",
+            Self::ConstDecl => "CONST_DECL",
             Self::FunctionDecl => "FUNCTION_DECL",
             Self::ParamList => "PARAM_LIST",
             Self::Param => "PARAM",
@@ -302,6 +307,7 @@ impl SyntaxNodeKind {
             Self::Variable => "VARIABLE",
             Self::ParenthesizedExpr => "PARENTHESIZED_EXPR",
             Self::PrefixExpr => "PREFIX_EXPR",
+            Self::PostfixExpr => "POSTFIX_EXPR",
             Self::VoidCastExpr => "VOID_CAST_EXPR",
             Self::BinaryExpr => "BINARY_EXPR",
             Self::AssignExpr => "ASSIGN_EXPR",

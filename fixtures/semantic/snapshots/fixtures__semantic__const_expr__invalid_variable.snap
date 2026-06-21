@@ -1,0 +1,18 @@
+source: fixtures/semantic/const_expr/invalid_variable.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_CONST_EXPR
+    severity: error
+    phase: const_expression
+    span: 42..49
+symbols:
+  - constant CONST_EXPR_INVALID_VARIABLE
+hir_summary:
+  statements: 0
+  expressions: 1
+  types: 0
+  const_exprs: 1
+  class_likes: 0
+  methods: 0
+  properties: 0

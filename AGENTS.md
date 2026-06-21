@@ -56,6 +56,38 @@ Do not automatically update the target PHP version without a new ADR.
 - New tools should prefer existing source maps, token kinds, CST ranges, and
   fixture harnesses over adding parallel representations.
 
+## Phase 3 Semantic Frontend Boundaries
+
+- Phase 3 work starts from `docs/phase-3/phase-3-definition-of-done.md`.
+- Add typed AST views in a dedicated `php_ast` layer, not in `php_syntax`.
+- Add HIR, declarations, scopes, name resolution, type lowering,
+  constant-expression validation, attribute metadata, and semantic diagnostics
+  in `php_semantics`.
+- Keep `php_frontend_cli` as a consumer of `php_semantics`; do not add a second
+  parser inside the CLI.
+- Include, require, eval, function lookup fallback, attribute instantiation, and
+  autoload-sensitive behavior must be represented as deferred metadata or known
+  gaps, not executed.
+- Every semantic diagnostic ID needs a fixture or an explicit reserved/known-gap
+  note before it is considered complete.
+- Phase 3 must preserve Phase 0, Phase 1, and Phase 2 validation commands.
+
+## Phase 4 Runtime and VM Boundaries
+
+- Phase 4 work starts from `docs/phase4-runtime-contract.md`.
+- Bytecode/IR, VM, and runtime work must consume Phase 3 HIR and semantic
+  metadata through `php_semantics`; do not add a second lexer, parser, or
+  semantic frontend.
+- Keep `php_syntax` and `php_semantics` responsible for syntax and compile-time
+  frontend diagnostics. Runtime diagnostics must live in the Phase 4 runtime/VM
+  layer.
+- Do not implement a full PHP standard library, Zend extension ABI, FPM/SAPI,
+  Opcache, quickening, inline caches, or JIT in Phase 4.
+- Unsupported runtime features must produce deterministic diagnostics or known
+  gaps. Do not silently return plausible but incorrect results.
+- Phase 4 must preserve Phase 0, Phase 1, Phase 2, and Phase 3 validation
+  commands.
+
 ## Validation Commands
 
 - Use the narrowest relevant check while iterating.
@@ -63,6 +95,15 @@ Do not automatically update the target PHP version without a new ADR.
 - Before finishing foundation, reference-tooling, lexer, parser, or CST work,
   run the strongest relevant verification target available in `just help`.
 - Parser fixture, diff, and roundtrip gates should be run when available.
+- Before finishing Phase 3 work, run `nix develop -c just verify-phase3` once
+  that target exists. Until then, run the strongest implemented gates for the
+  current slice and clearly report missing Phase 3 targets.
+- For Phase 3 semantic changes, also prefer the narrow relevant gate first:
+  `just semantic-fixtures`, `just semantic-diff`, or
+  `just frontend-snapshots`.
+- Before finishing Phase 4 work, run `nix develop -c just verify-phase4` once
+  that target exists. Until then, run the strongest implemented gates for the
+  current slice and clearly report missing Phase 4 targets.
 
 ## Codex Operating Profile
 

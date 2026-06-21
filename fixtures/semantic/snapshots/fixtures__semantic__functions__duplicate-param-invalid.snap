@@ -1,0 +1,18 @@
+source: fixtures/semantic/functions/duplicate-param-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_DUPLICATE_PARAMETER
+    severity: error
+    phase: hir_lowering
+    span: 40..50
+symbols:
+  - function duplicate_param
+hir_summary:
+  statements: 1
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

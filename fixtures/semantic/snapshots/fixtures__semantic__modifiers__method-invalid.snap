@@ -1,0 +1,26 @@
+source: fixtures/semantic/modifiers/method-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 51..56
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 101..108
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 139..147
+symbols:
+  - class MethodInvalid
+hir_summary:
+  statements: 1
+  expressions: 3
+  types: 3
+  const_exprs: 0
+  class_likes: 1
+  methods: 3
+  properties: 0

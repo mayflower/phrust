@@ -1,0 +1,16 @@
+source: fixtures/semantic/const_expr/php85_cast.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_PHP85_CAST
+  - function const_expr_php85_cast
+hir_summary:
+  statements: 1
+  expressions: 5
+  types: 1
+  const_exprs: 2
+  class_likes: 0
+  methods: 0
+  properties: 0

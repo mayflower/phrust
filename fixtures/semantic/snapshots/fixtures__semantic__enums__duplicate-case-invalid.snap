@@ -1,0 +1,18 @@
+source: fixtures/semantic/enums/duplicate-case-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_DUPLICATE_CLASS_MEMBER
+    severity: error
+    phase: class_like_validation
+    span: 44..51
+symbols:
+  - enum DuplicateCase
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 2
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 0

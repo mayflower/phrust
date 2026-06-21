@@ -8,3 +8,11 @@ rust-version.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[[bin]]
+name = "compare-runtime"
+path = "src/bin/compare_runtime.rs"
+
+[[bin]]
+name = "run-phpt-smoke"
+path = "src/bin/run_phpt_smoke.rs"

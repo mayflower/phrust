@@ -69,8 +69,8 @@ fn parse_statement(parser: &mut Parser<'_>) {
         parse_declare_statement(parser);
     } else if parser.at(named(TokenName::Global)) {
         parse_misc_until_semicolon_statement(parser, SyntaxNodeKind::GlobalStmt);
-    } else if parser.at(named(TokenName::Static)) {
-        parse_misc_until_semicolon_statement(parser, SyntaxNodeKind::StaticStmt);
+    } else if parser.at(named(TokenName::Static)) && static_statement_follows(parser) {
+        parse_static_statement(parser);
     } else if parser.at(named(TokenName::Unset)) {
         parse_parenthesized_construct_statement(parser, SyntaxNodeKind::UnsetStmt);
     } else if parser.at(named(TokenName::Goto)) {
@@ -83,6 +83,8 @@ fn parse_statement(parser: &mut Parser<'_>) {
         declarations::parse_namespace_declaration(parser);
     } else if parser.at(named(TokenName::Use)) {
         declarations::parse_use_declaration(parser);
+    } else if parser.at(named(TokenName::Const)) {
+        declarations::parse_const_declaration(parser);
     } else if parser.at(named(TokenName::Function)) {
         declarations::parse_function_declaration(parser);
     } else if crate::grammar::classes::at_class_like_declaration(parser) {
@@ -91,6 +93,18 @@ fn parse_statement(parser: &mut Parser<'_>) {
         parse_block_statement(parser);
     } else {
         parse_expression_statement(parser);
+    }
+}
+
+fn static_statement_follows(parser: &Parser<'_>) -> bool {
+    let mut index = 1;
+    loop {
+        let kind = parser.nth(index);
+        if kind.is_trivia() {
+            index += 1;
+            continue;
+        }
+        return kind == named(TokenName::Variable);
     }
 }
 
@@ -114,7 +128,7 @@ fn parse_echo_statement(parser: &mut Parser<'_>) {
 fn parse_if_statement(parser: &mut Parser<'_>) {
     let statement = parser.start();
     parser.bump();
-    parse_parenthesized_header(parser, "if condition");
+    parse_parenthesized_expression_header(parser, "if condition");
 
     bump_trivia(parser);
     if parser.at(symbol(b':')) {
@@ -122,7 +136,7 @@ fn parse_if_statement(parser: &mut Parser<'_>) {
         parse_statements_until(parser, at_if_alternative_boundary);
         while parser.at(named(TokenName::ElseIf)) {
             parser.bump();
-            parse_parenthesized_header(parser, "elseif condition");
+            parse_parenthesized_expression_header(parser, "elseif condition");
             bump_trivia(parser);
             if parser.at(symbol(b':')) {
                 parser.bump();
@@ -147,7 +161,7 @@ fn parse_if_statement(parser: &mut Parser<'_>) {
         bump_trivia(parser);
         while parser.at(named(TokenName::ElseIf)) {
             parser.bump();
-            parse_parenthesized_header(parser, "elseif condition");
+            parse_parenthesized_expression_header(parser, "elseif condition");
             parse_control_body(parser);
             bump_trivia(parser);
         }
@@ -177,13 +191,12 @@ fn parse_loop_statement(
 ) {
     let statement = parser.start();
     parser.bump();
-    let label = match start_keyword {
-        TokenName::For => "for header",
-        TokenName::Foreach => "foreach header",
-        TokenName::While => "while condition",
-        _ => "loop header",
-    };
-    parse_parenthesized_header(parser, label);
+    match start_keyword {
+        TokenName::For => parse_for_header(parser),
+        TokenName::While => parse_parenthesized_expression_header(parser, "while condition"),
+        TokenName::Foreach => parse_foreach_header(parser),
+        _ => parse_parenthesized_header(parser, "loop header"),
+    }
 
     bump_trivia(parser);
     if parser.at(symbol(b':')) {
@@ -205,7 +218,7 @@ fn parse_do_while_statement(parser: &mut Parser<'_>) {
     bump_trivia(parser);
     if parser.at(named(TokenName::While)) {
         parser.bump();
-        parse_parenthesized_header(parser, "do-while condition");
+        parse_parenthesized_expression_header(parser, "do-while condition");
         consume_statement_terminator(parser);
     } else {
         parser.error_expected("expected `while` after do body", &["T_WHILE"]);
@@ -217,7 +230,7 @@ fn parse_do_while_statement(parser: &mut Parser<'_>) {
 fn parse_switch_statement(parser: &mut Parser<'_>) {
     let statement = parser.start();
     parser.bump();
-    parse_parenthesized_header(parser, "switch expression");
+    parse_parenthesized_expression_header(parser, "switch expression");
 
     bump_trivia(parser);
     if parser.at(symbol(b':')) {
@@ -319,6 +332,42 @@ fn parse_misc_until_semicolon_statement(parser: &mut Parser<'_>, kind: SyntaxNod
     }
     consume_statement_terminator(parser);
     let _completed = statement.complete(parser, SyntaxKind::Node(kind));
+}
+
+fn parse_static_statement(parser: &mut Parser<'_>) {
+    let statement = parser.start();
+    parser.bump();
+
+    loop {
+        bump_trivia(parser);
+        if parser.at(named(TokenName::Variable)) {
+            parser.bump();
+        } else if parser.at(symbol(b';')) || parser.at(symbol(b'}')) {
+            break;
+        } else {
+            parser.error_expected("expected static local variable", &["T_VARIABLE"]);
+            recover_to_static_boundary(parser);
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b'=')) {
+            parser.bump();
+            if !expressions::parse_expression(parser) {
+                parser.error_expected("expected static local initializer", &["expression"]);
+                recover_to_static_boundary(parser);
+            }
+        }
+
+        bump_trivia(parser);
+        if parser.at(symbol(b',')) {
+            parser.bump();
+            continue;
+        }
+        break;
+    }
+
+    consume_statement_terminator(parser);
+    let _completed = statement.complete(parser, SyntaxKind::Node(SyntaxNodeKind::StaticStmt));
 }
 
 fn parse_parenthesized_construct_statement(parser: &mut Parser<'_>, kind: SyntaxNodeKind) {
@@ -471,6 +520,173 @@ fn parse_parenthesized_header(parser: &mut Parser<'_>, context: &str) {
     }
 }
 
+fn parse_parenthesized_expression_header(parser: &mut Parser<'_>, context: &str) {
+    bump_trivia(parser);
+    if !parser.at(symbol(b'(')) {
+        parser.error_expected(format!("expected `(` to start {context}"), &["("]);
+        return;
+    }
+
+    parser.bump();
+    bump_trivia(parser);
+    if !parser.at(symbol(b')')) && !expressions::parse_expression(parser) {
+        parser.error_expected(format!("expected expression in {context}"), &["expression"]);
+    }
+    bump_trivia(parser);
+    if parser.at(symbol(b')')) {
+        parser.bump();
+    } else {
+        parser.error_expected(format!("expected `)` to close {context}"), &[")"]);
+        recover_parenthesized_header(parser);
+    }
+}
+
+fn parse_foreach_header(parser: &mut Parser<'_>) {
+    bump_trivia(parser);
+    if !parser.at(symbol(b'(')) {
+        parser.error_expected("expected `(` to start foreach header", &["("]);
+        return;
+    }
+
+    parser.bump();
+    bump_trivia(parser);
+    if !expressions::parse_expression(parser) {
+        parser.error_expected("expected foreach expression", &["expression"]);
+        recover_parenthesized_header(parser);
+        return;
+    }
+
+    bump_trivia(parser);
+    if parser.at(named(TokenName::As)) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `as` in foreach header", &["T_AS"]);
+        recover_parenthesized_header(parser);
+        return;
+    }
+
+    bump_trivia(parser);
+    if parser.at(named(TokenName::AmpersandFollowedByVarOrVararg))
+        || parser.at(named(TokenName::AmpersandNotFollowedByVarOrVararg))
+    {
+        parser.bump();
+        bump_trivia(parser);
+    }
+    if !expressions::parse_expression(parser) {
+        parser.error_expected("expected foreach value target", &["expression"]);
+        recover_parenthesized_header(parser);
+        return;
+    }
+
+    bump_trivia(parser);
+    if parser.at(named(TokenName::DoubleArrow)) {
+        parser.bump();
+        bump_trivia(parser);
+        if parser.at(named(TokenName::AmpersandFollowedByVarOrVararg))
+            || parser.at(named(TokenName::AmpersandNotFollowedByVarOrVararg))
+        {
+            parser.bump();
+            bump_trivia(parser);
+        }
+        if !expressions::parse_expression(parser) {
+            parser.error_expected("expected foreach value target after `=>`", &["expression"]);
+            recover_parenthesized_header(parser);
+            return;
+        }
+    }
+
+    bump_trivia(parser);
+    if parser.at(symbol(b')')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `)` to close foreach header", &[")"]);
+        recover_parenthesized_header(parser);
+    }
+}
+
+fn parse_for_header(parser: &mut Parser<'_>) {
+    bump_trivia(parser);
+    if !parser.at(symbol(b'(')) {
+        parser.error_expected("expected `(` to start for header", &["("]);
+        return;
+    }
+
+    parser.bump();
+    parse_for_header_section(parser, "for initializer");
+    consume_for_header_separator(parser, "expected `;` after for initializer");
+    parse_for_header_section(parser, "for condition");
+    consume_for_header_separator(parser, "expected `;` after for condition");
+    parse_for_header_section(parser, "for update");
+    bump_trivia(parser);
+    if parser.at(symbol(b')')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `)` to close for header", &[")"]);
+        recover_parenthesized_header(parser);
+    }
+}
+
+fn parse_for_header_section(parser: &mut Parser<'_>, context: &str) {
+    bump_trivia(parser);
+    if parser.at(symbol(b';')) || parser.at(symbol(b')')) {
+        return;
+    }
+    if !expressions::parse_expression(parser) {
+        parser.error_expected(format!("expected expression in {context}"), &["expression"]);
+        recover_for_header_section(parser);
+        return;
+    }
+    bump_trivia(parser);
+    while parser.at(symbol(b',')) {
+        parser.bump();
+        bump_trivia(parser);
+        if parser.at(symbol(b';')) || parser.at(symbol(b')')) {
+            parser.error_expected(format!("expected expression in {context}"), &["expression"]);
+            break;
+        }
+        if !expressions::parse_expression(parser) {
+            parser.error_expected(format!("expected expression in {context}"), &["expression"]);
+            recover_for_header_section(parser);
+            break;
+        }
+        bump_trivia(parser);
+    }
+}
+
+fn consume_for_header_separator(parser: &mut Parser<'_>, message: &str) {
+    bump_trivia(parser);
+    if parser.at(symbol(b';')) {
+        parser.bump();
+    } else {
+        parser.error_expected(message, &[";"]);
+        recover_for_header_section(parser);
+    }
+}
+
+fn recover_for_header_section(parser: &mut Parser<'_>) {
+    while !parser.is_eof() && !parser.at(symbol(b';')) && !parser.at(symbol(b')')) {
+        parser.bump();
+    }
+}
+
+fn recover_parenthesized_header(parser: &mut Parser<'_>) {
+    let mut depth = 0usize;
+    while !parser.is_eof() {
+        if parser.at(symbol(b'(')) {
+            depth += 1;
+            parser.bump();
+        } else if parser.at(symbol(b')')) {
+            parser.bump();
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else {
+            parser.bump();
+        }
+    }
+}
+
 fn parse_statements_until(parser: &mut Parser<'_>, at_end: impl Fn(&Parser<'_>) -> bool + Copy) {
     while !parser.is_eof() && !parser.at(named(TokenName::CloseTag)) && !at_end(parser) {
         if parser.current().is_trivia() {
@@ -508,6 +724,17 @@ fn at_simple_statement_end(parser: &Parser<'_>) -> bool {
 
 fn at_label_statement(parser: &Parser<'_>) -> bool {
     parser.at(named(TokenName::String)) && parser.nth(1) == symbol(b':')
+}
+
+fn recover_to_static_boundary(parser: &mut Parser<'_>) {
+    while !parser.is_eof()
+        && !parser.at(symbol(b','))
+        && !parser.at(symbol(b';'))
+        && !parser.at(symbol(b'}'))
+        && !parser.at(named(TokenName::CloseTag))
+    {
+        parser.bump();
+    }
 }
 
 fn bump_trivia(parser: &mut Parser<'_>) {

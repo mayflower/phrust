@@ -1,0 +1,19 @@
+source: fixtures/semantic/const_expr/scalars.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_SCALAR_INT
+  - constant CONST_EXPR_SCALAR_STRING
+  - constant CONST_EXPR_SCALAR_BOOL
+  - function const_expr_scalar_default
+  - function const_expr_static_local
+hir_summary:
+  statements: 3
+  expressions: 7
+  types: 2
+  const_exprs: 5
+  class_likes: 0
+  methods: 0
+  properties: 0

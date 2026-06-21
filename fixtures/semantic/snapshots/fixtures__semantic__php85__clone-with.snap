@@ -1,0 +1,15 @@
+source: fixtures/semantic/php85/clone-with.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class Prompt29CloneWithSubject
+hir_summary:
+  statements: 2
+  expressions: 14
+  types: 1
+  const_exprs: 1
+  class_likes: 1
+  methods: 1
+  properties: 0

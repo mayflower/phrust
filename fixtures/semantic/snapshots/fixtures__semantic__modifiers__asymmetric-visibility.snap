@@ -1,0 +1,22 @@
+source: fixtures/semantic/modifiers/asymmetric-visibility.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 144..155
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 183..195
+symbols:
+  - class AsymmetricVisibility
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 5
+  const_exprs: 0
+  class_likes: 1
+  methods: 1
+  properties: 4

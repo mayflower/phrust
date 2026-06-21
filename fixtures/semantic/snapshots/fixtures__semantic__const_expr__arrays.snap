@@ -1,0 +1,16 @@
+source: fixtures/semantic/const_expr/arrays.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_ARRAY
+  - function const_expr_array_default
+hir_summary:
+  statements: 1
+  expressions: 23
+  types: 1
+  const_exprs: 2
+  class_likes: 0
+  methods: 0
+  properties: 0

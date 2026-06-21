@@ -1,0 +1,17 @@
+ir version=1 unit=0 entry=function:0
+files:
+  file:0 "fixtures/runtime/valid/scalars/echo.php"
+constants:
+  const:0 int 1
+  const:1 int 2
+constant_table:
+classes:
+function_table:
+functions:
+  function "main" params=0 locals=0 regs=3 flags=top_level span=file:0@0..5
+    block:0
+      instr:0 span=file:0@6..7 load_const r0 const:0
+      instr:1 span=file:0@10..11 load_const r1 const:1
+      instr:2 span=file:0@6..11 binary r2 add r0 r1
+      term span=file:0@6..11 return r2
+source_map:

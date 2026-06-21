@@ -1,0 +1,16 @@
+source: fixtures/semantic/const_expr/no_fold_class_const.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class ConstExprNoFoldClassConst
+  - constant CONST_EXPR_NO_FOLD_CLASS_CONST
+hir_summary:
+  statements: 0
+  expressions: 4
+  types: 0
+  const_exprs: 2
+  class_likes: 1
+  methods: 0
+  properties: 0

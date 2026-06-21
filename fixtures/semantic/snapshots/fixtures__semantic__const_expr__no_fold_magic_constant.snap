@@ -1,0 +1,15 @@
+source: fixtures/semantic/const_expr/no_fold_magic_constant.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_NO_FOLD_MAGIC_CONSTANT
+hir_summary:
+  statements: 0
+  expressions: 1
+  types: 0
+  const_exprs: 1
+  class_likes: 0
+  methods: 0
+  properties: 0

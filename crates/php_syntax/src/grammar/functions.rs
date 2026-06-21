@@ -15,7 +15,7 @@ pub(crate) fn parse_function_declaration(parser: &mut Parser<'_>) {
     bump_trivia(parser);
     parse_optional_ampersand(parser);
     bump_trivia(parser);
-    if parser.at(named(TokenName::String)) {
+    if at_contextual_identifier(parser) {
         parser.bump();
     } else {
         parser.error_expected("expected function name", &["T_STRING"]);
@@ -24,6 +24,23 @@ pub(crate) fn parse_function_declaration(parser: &mut Parser<'_>) {
     types::parse_optional_return_type(parser);
     parse_optional_function_body(parser, "function declaration");
     let _completed = function.complete(parser, SyntaxKind::Node(SyntaxNodeKind::FunctionDecl));
+}
+
+/// Parses a method declaration after class member attributes and modifiers.
+pub(crate) fn parse_method_member_body(parser: &mut Parser<'_>) {
+    bump_trivia(parser);
+    expect_function_keyword(parser);
+    bump_trivia(parser);
+    parse_optional_ampersand(parser);
+    bump_trivia(parser);
+    if at_contextual_identifier(parser) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected method name", &["T_STRING"]);
+    }
+    parse_parameter_list(parser);
+    types::parse_optional_return_type(parser);
+    parse_optional_function_body(parser, "method declaration");
 }
 
 /// Parses a closure expression when the current tokens form one.
@@ -97,6 +114,10 @@ fn at_arrow_function_start(parser: &Parser<'_>) -> bool {
             && nth_non_trivia_is(parser, 1, named(TokenName::Fn)))
         || (parser.at(named(TokenName::Attribute))
             && attributes::first_token_after_attribute_groups(parser) == named(TokenName::Fn))
+}
+
+fn at_contextual_identifier(parser: &Parser<'_>) -> bool {
+    parser.current_keyword_context().is_some()
 }
 
 fn parse_parameter_list(parser: &mut Parser<'_>) {

@@ -1,0 +1,15 @@
+source: fixtures/semantic/const_expr/enum_case.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - enum ConstExprBacked
+hir_summary:
+  statements: 0
+  expressions: 2
+  types: 4
+  const_exprs: 2
+  class_likes: 1
+  methods: 0
+  properties: 0

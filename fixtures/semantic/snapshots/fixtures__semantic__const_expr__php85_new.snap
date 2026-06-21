@@ -1,0 +1,17 @@
+source: fixtures/semantic/const_expr/php85_new.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant CONST_EXPR_PHP85_NEW
+  - function const_expr_php85_new
+  - class ConstExprPhp85NewTarget
+hir_summary:
+  statements: 1
+  expressions: 14
+  types: 1
+  const_exprs: 3
+  class_likes: 1
+  methods: 0
+  properties: 0

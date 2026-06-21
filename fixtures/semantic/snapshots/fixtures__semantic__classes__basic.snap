@@ -1,0 +1,15 @@
+source: fixtures/semantic/classes/basic.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class User
+hir_summary:
+  statements: 2
+  expressions: 6
+  types: 2
+  const_exprs: 1
+  class_likes: 1
+  methods: 1
+  properties: 1

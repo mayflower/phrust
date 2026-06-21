@@ -1,0 +1,18 @@
+source: fixtures/semantic/control_flow/continue-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_CONTINUE_NOT_IN_LOOP_OR_SWITCH
+    severity: error
+    phase: control_flow_validation
+    span: 34..43
+symbols:
+  []
+hir_summary:
+  statements: 1
+  expressions: 0
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

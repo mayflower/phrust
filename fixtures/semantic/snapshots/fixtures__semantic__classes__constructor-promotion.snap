@@ -1,0 +1,15 @@
+source: fixtures/semantic/classes/constructor-promotion.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class PromotedSignature
+hir_summary:
+  statements: 1
+  expressions: 5
+  types: 4
+  const_exprs: 2
+  class_likes: 1
+  methods: 1
+  properties: 0

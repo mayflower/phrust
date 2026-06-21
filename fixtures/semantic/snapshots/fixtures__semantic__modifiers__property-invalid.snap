@@ -1,0 +1,30 @@
+source: fixtures/semantic/modifiers/property-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 42..49
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 70..78
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 114..119
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 166..174
+symbols:
+  - class PropertyInvalid
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 4
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 4

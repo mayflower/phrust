@@ -119,6 +119,7 @@ fn is_comparison_operator(kind: SyntaxKind) -> bool {
         kind,
         kind if kind == symbol(b'<')
             || kind == symbol(b'>')
+            || kind == named(TokenName::Instanceof)
             || kind == named(TokenName::IsSmallerOrEqual)
             || kind == named(TokenName::IsGreaterOrEqual)
             || kind == named(TokenName::Spaceship)

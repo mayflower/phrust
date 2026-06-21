@@ -1,0 +1,17 @@
+source: fixtures/semantic/types/intersection-types.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - interface Reader
+  - interface Writer
+  - function both
+hir_summary:
+  statements: 2
+  expressions: 5
+  types: 6
+  const_exprs: 0
+  class_likes: 2
+  methods: 0
+  properties: 0

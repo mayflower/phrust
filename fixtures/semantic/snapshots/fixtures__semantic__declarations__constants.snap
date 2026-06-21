@@ -1,0 +1,16 @@
+source: fixtures/semantic/declarations/constants.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - constant VALUE
+  - constant OTHER_VALUE
+hir_summary:
+  statements: 0
+  expressions: 2
+  types: 0
+  const_exprs: 2
+  class_likes: 0
+  methods: 0
+  properties: 0

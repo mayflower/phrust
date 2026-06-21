@@ -1,0 +1,18 @@
+source: fixtures/semantic/declare/strict-types-invalid-value.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_STRICT_TYPES_DECLARE
+    severity: error
+    phase: declaration_collection
+    span: 27..28
+symbols:
+  - function prompt27_strict_types_invalid
+hir_summary:
+  statements: 3
+  expressions: 3
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

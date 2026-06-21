@@ -1,0 +1,18 @@
+source: fixtures/semantic/functions/variadic-not-last-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_VARIADIC_PARAMETER_NOT_LAST
+    severity: error
+    phase: hir_lowering
+    span: 34..43
+symbols:
+  - function variadic_not_last
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

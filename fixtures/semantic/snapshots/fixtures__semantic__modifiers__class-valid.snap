@@ -1,0 +1,17 @@
+source: fixtures/semantic/modifiers/class-valid.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class AbstractBase
+  - class FinalConcrete
+  - class ReadonlyValue
+hir_summary:
+  statements: 1
+  expressions: 1
+  types: 1
+  const_exprs: 0
+  class_likes: 3
+  methods: 1
+  properties: 0

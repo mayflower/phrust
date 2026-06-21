@@ -1,0 +1,19 @@
+source: fixtures/semantic/declarations/duplicate-class-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_DUPLICATE_DECLARATION
+    severity: error
+    phase: declaration_collection
+    span: 47..56
+symbols:
+  - class Duplicate
+  - class Duplicate
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 0
+  const_exprs: 0
+  class_likes: 2
+  methods: 0
+  properties: 0

@@ -43,6 +43,7 @@
             ripgrep
             fd
             tree
+            shellcheck
 
             autoconf
             automake
@@ -72,7 +73,6 @@
           linuxPackages = with pkgs; [
             gdb
             mold
-            valgrind
           ];
 
           darwinPackages = with pkgs; [

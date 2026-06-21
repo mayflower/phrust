@@ -1,5 +1,7 @@
 <?php
 
+const EXCEPTION_CODE_ERROR = 0, EXCEPTION_PARAM_MSG = "message";
+
 global $a, $b;
 static $count = 0, $name;
 

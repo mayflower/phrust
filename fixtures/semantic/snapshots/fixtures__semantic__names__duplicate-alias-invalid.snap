@@ -1,0 +1,18 @@
+source: fixtures/semantic/names/duplicate-alias-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_DUPLICATE_USE_ALIAS
+    severity: error
+    phase: declaration_collection
+    span: 61..90
+symbols:
+  []
+hir_summary:
+  statements: 0
+  expressions: 2
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

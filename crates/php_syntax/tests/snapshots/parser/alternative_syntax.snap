@@ -11,7 +11,9 @@ SOURCE_FILE @0..382
         T_IF @7..9 line=3 text="if"
         T_WHITESPACE @9..10 line=3 text=" "
         ( @10..11 line=3 text="("
-        T_VARIABLE @11..17 line=3 text="$ready"
+        EXPR @11..17
+          VARIABLE @11..17
+            T_VARIABLE @11..17 line=3 text="$ready"
         ) @17..18 line=3 text=")"
         : @18..19 line=3 text=":"
         T_WHITESPACE @19..24 line=3 text="\n    "
@@ -26,7 +28,9 @@ SOURCE_FILE @0..382
         T_ELSEIF @38..44 line=5 text="elseif"
         T_WHITESPACE @44..45 line=5 text=" "
         ( @45..46 line=5 text="("
-        T_VARIABLE @46..52 line=5 text="$other"
+        EXPR @46..52
+          VARIABLE @46..52
+            T_VARIABLE @46..52 line=5 text="$other"
         ) @52..53 line=5 text=")"
         : @53..54 line=5 text=":"
         T_WHITESPACE @54..59 line=5 text="\n    "
@@ -56,11 +60,15 @@ SOURCE_FILE @0..382
         T_WHILE @104..109 line=11 text="while"
         T_WHITESPACE @109..110 line=11 text=" "
         ( @110..111 line=11 text="("
-        T_VARIABLE @111..117 line=11 text="$count"
-        T_WHITESPACE @117..118 line=11 text=" "
-        < @118..119 line=11 text="<"
-        T_WHITESPACE @119..120 line=11 text=" "
-        T_LNUMBER @120..121 line=11 text="2"
+        BINARY_EXPR @111..121
+          VARIABLE @111..117
+            T_VARIABLE @111..117 line=11 text="$count"
+          T_WHITESPACE @117..118 line=11 text=" "
+          < @118..119 line=11 text="<"
+          EXPR @119..121
+            T_WHITESPACE @119..120 line=11 text=" "
+            LITERAL @120..121
+              T_LNUMBER @120..121 line=11 text="2"
         ) @121..122 line=11 text=")"
         : @122..123 line=11 text=":"
         T_WHITESPACE @123..128 line=11 text="\n    "
@@ -89,29 +97,43 @@ SOURCE_FILE @0..382
         T_FOR @160..163 line=15 text="for"
         T_WHITESPACE @163..164 line=15 text=" "
         ( @164..165 line=15 text="("
-        T_VARIABLE @165..167 line=15 text="$i"
-        T_WHITESPACE @167..168 line=15 text=" "
-        = @168..169 line=15 text="="
-        T_WHITESPACE @169..170 line=15 text=" "
-        T_LNUMBER @170..171 line=15 text="0"
+        ASSIGN_EXPR @165..171
+          VARIABLE @165..167
+            T_VARIABLE @165..167 line=15 text="$i"
+          T_WHITESPACE @167..168 line=15 text=" "
+          = @168..169 line=15 text="="
+          EXPR @169..171
+            T_WHITESPACE @169..170 line=15 text=" "
+            LITERAL @170..171
+              T_LNUMBER @170..171 line=15 text="0"
         ; @171..172 line=15 text=";"
         T_WHITESPACE @172..173 line=15 text=" "
-        T_VARIABLE @173..175 line=15 text="$i"
-        T_WHITESPACE @175..176 line=15 text=" "
-        < @176..177 line=15 text="<"
-        T_WHITESPACE @177..178 line=15 text=" "
-        T_LNUMBER @178..179 line=15 text="2"
+        BINARY_EXPR @173..179
+          VARIABLE @173..175
+            T_VARIABLE @173..175 line=15 text="$i"
+          T_WHITESPACE @175..176 line=15 text=" "
+          < @176..177 line=15 text="<"
+          EXPR @177..179
+            T_WHITESPACE @177..178 line=15 text=" "
+            LITERAL @178..179
+              T_LNUMBER @178..179 line=15 text="2"
         ; @179..180 line=15 text=";"
         T_WHITESPACE @180..181 line=15 text=" "
-        T_VARIABLE @181..183 line=15 text="$i"
-        T_WHITESPACE @183..184 line=15 text=" "
-        = @184..185 line=15 text="="
-        T_WHITESPACE @185..186 line=15 text=" "
-        T_VARIABLE @186..188 line=15 text="$i"
-        T_WHITESPACE @188..189 line=15 text=" "
-        + @189..190 line=15 text="+"
-        T_WHITESPACE @190..191 line=15 text=" "
-        T_LNUMBER @191..192 line=15 text="1"
+        ASSIGN_EXPR @181..192
+          VARIABLE @181..183
+            T_VARIABLE @181..183 line=15 text="$i"
+          T_WHITESPACE @183..184 line=15 text=" "
+          = @184..185 line=15 text="="
+          BINARY_EXPR @185..192
+            T_WHITESPACE @185..186 line=15 text=" "
+            VARIABLE @186..188
+              T_VARIABLE @186..188 line=15 text="$i"
+            T_WHITESPACE @188..189 line=15 text=" "
+            + @189..190 line=15 text="+"
+            EXPR @190..192
+              T_WHITESPACE @190..191 line=15 text=" "
+              LITERAL @191..192
+                T_LNUMBER @191..192 line=15 text="1"
         ) @192..193 line=15 text=")"
         : @193..194 line=15 text=":"
         T_WHITESPACE @194..199 line=15 text="\n    "
@@ -130,16 +152,26 @@ SOURCE_FILE @0..382
         T_FOREACH @217..224 line=19 text="foreach"
         T_WHITESPACE @224..225 line=19 text=" "
         ( @225..226 line=19 text="("
-        [ @226..227 line=19 text="["
-        T_LNUMBER @227..228 line=19 text="1"
-        , @228..229 line=19 text=","
-        T_WHITESPACE @229..230 line=19 text=" "
-        T_LNUMBER @230..231 line=19 text="2"
-        ] @231..232 line=19 text="]"
-        T_WHITESPACE @232..233 line=19 text=" "
+        EXPR @226..233
+          ARRAY_EXPR @226..232
+            [ @226..227 line=19 text="["
+            ARRAY_PAIR @227..228
+              EXPR @227..228
+                LITERAL @227..228
+                  T_LNUMBER @227..228 line=19 text="1"
+            , @228..229 line=19 text=","
+            T_WHITESPACE @229..230 line=19 text=" "
+            ARRAY_PAIR @230..231
+              EXPR @230..231
+                LITERAL @230..231
+                  T_LNUMBER @230..231 line=19 text="2"
+            ] @231..232 line=19 text="]"
+          T_WHITESPACE @232..233 line=19 text=" "
         T_AS @233..235 line=19 text="as"
         T_WHITESPACE @235..236 line=19 text=" "
-        T_VARIABLE @236..241 line=19 text="$item"
+        EXPR @236..241
+          VARIABLE @236..241
+            T_VARIABLE @236..241 line=19 text="$item"
         ) @241..242 line=19 text=")"
         : @242..243 line=19 text=":"
         T_WHITESPACE @243..248 line=19 text="\n    "
@@ -158,7 +190,9 @@ SOURCE_FILE @0..382
         T_SWITCH @273..279 line=23 text="switch"
         T_WHITESPACE @279..280 line=23 text=" "
         ( @280..281 line=23 text="("
-        T_VARIABLE @281..286 line=23 text="$item"
+        EXPR @281..286
+          VARIABLE @281..286
+            T_VARIABLE @281..286 line=23 text="$item"
         ) @286..287 line=23 text=")"
         : @287..288 line=23 text=":"
         T_WHITESPACE @288..293 line=23 text="\n    "

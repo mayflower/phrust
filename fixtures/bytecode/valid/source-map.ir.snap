@@ -1,0 +1,25 @@
+ir version=1 unit=0 entry=function:0
+files:
+  file:0 "fixtures/bytecode/literals/valid/echo-source-map.php"
+constants:
+  const:0 null
+  const:1 bool true
+constant_table:
+classes:
+function_table:
+functions:
+  function "main" params=0 locals=0 regs=2 flags=top_level span=file:0@0..22
+    block:0
+      instr:0 span=file:0@11..15 load_const r0 const:0
+      instr:1 span=file:0@11..15 echo r0
+      instr:2 span=file:0@17..21 load_const r1 const:1
+      instr:3 span=file:0@17..21 echo r1
+      term span=file:0@0..22 return const:0
+source_map:
+  function:0 <= hir:module:0 span=file:0@0..22
+  block function:0 block:0 <= hir:module:0 span=file:0@0..22
+  instr function:0 block:0 instr:0 <= hir:expr:0 span=file:0@11..15
+  instr function:0 block:0 instr:1 <= hir:expr:0 span=file:0@11..15
+  instr function:0 block:0 instr:2 <= hir:expr:1 span=file:0@17..21
+  instr function:0 block:0 instr:3 <= hir:expr:1 span=file:0@17..21
+  term function:0 block:0 <= hir:module:0 span=file:0@0..22

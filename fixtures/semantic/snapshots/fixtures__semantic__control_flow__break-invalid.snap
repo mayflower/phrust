@@ -1,0 +1,18 @@
+source: fixtures/semantic/control_flow/break-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_BREAK_NOT_IN_LOOP_OR_SWITCH
+    severity: error
+    phase: control_flow_validation
+    span: 34..40
+symbols:
+  []
+hir_summary:
+  statements: 1
+  expressions: 0
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

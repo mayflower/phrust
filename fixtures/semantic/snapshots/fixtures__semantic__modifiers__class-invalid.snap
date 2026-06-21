@@ -1,0 +1,33 @@
+source: fixtures/semantic/modifiers/class-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 16..21
+  - id: E_PHP_DUPLICATE_MODIFIER
+    severity: error
+    phase: modifier_validation
+    span: 58..66
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 96..104
+  - id: E_PHP_INCOMPATIBLE_MODIFIERS
+    severity: error
+    phase: modifier_validation
+    span: 137..142
+symbols:
+  - class ImpossibleClass
+  - class DuplicateAbstract
+  - interface ReadonlyContract
+  - trait FinalTrait
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 0
+  const_exprs: 0
+  class_likes: 4
+  methods: 0
+  properties: 0

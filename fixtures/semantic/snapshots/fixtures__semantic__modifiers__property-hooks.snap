@@ -1,0 +1,15 @@
+source: fixtures/semantic/modifiers/property-hooks.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class PropertyHooks
+hir_summary:
+  statements: 0
+  expressions: 0
+  types: 1
+  const_exprs: 0
+  class_likes: 1
+  methods: 0
+  properties: 1

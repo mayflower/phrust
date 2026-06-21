@@ -1,0 +1,26 @@
+source: fixtures/semantic/expressions/constructs.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 74..87
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 101..119
+  - id: N_PHP_RUNTIME_CHECK_DEFERRED
+    severity: note
+    phase: hir_lowering
+    span: 134..151
+symbols:
+  []
+hir_summary:
+  statements: 6
+  expressions: 22
+  types: 0
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

@@ -1,0 +1,15 @@
+source: fixtures/semantic/classes/anonymous.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - conditional_class_like BaseThing
+hir_summary:
+  statements: 1
+  expressions: 3
+  types: 1
+  const_exprs: 0
+  class_likes: 1
+  methods: 1
+  properties: 0

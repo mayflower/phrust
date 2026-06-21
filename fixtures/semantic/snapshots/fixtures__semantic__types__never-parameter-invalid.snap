@@ -1,0 +1,18 @@
+source: fixtures/semantic/types/never-parameter-invalid.php
+parse_ok: true
+semantic_ok: false
+diagnostics:
+  - id: E_PHP_INVALID_TYPE_NEVER_CONTEXT
+    severity: error
+    phase: type_lowering
+    span: 30..35
+symbols:
+  - function invalid_never
+hir_summary:
+  statements: 1
+  expressions: 2
+  types: 2
+  const_exprs: 0
+  class_likes: 0
+  methods: 0
+  properties: 0

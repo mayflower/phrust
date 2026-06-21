@@ -1,0 +1,16 @@
+source: fixtures/semantic/classes/self-parent-static-valid.php
+parse_ok: true
+semantic_ok: true
+diagnostics:
+  []
+symbols:
+  - class Prompt26Base
+  - class Prompt26Child
+hir_summary:
+  statements: 7
+  expressions: 18
+  types: 3
+  const_exprs: 0
+  class_likes: 2
+  methods: 3
+  properties: 0
