@@ -101,8 +101,21 @@ pub struct ClosureCaptureArg {
     pub name: String,
     /// Source operand evaluated in the enclosing frame.
     pub src: Operand,
-    /// By-reference scaffold bit. VM rejects this until references exist.
+    /// True when the closure captures the source local's reference cell.
     pub by_ref: bool,
+}
+
+/// One lowered PHP call argument.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct IrCallArg {
+    /// Optional named-argument label without trailing `:`.
+    pub name: Option<String>,
+    /// Evaluated value operand.
+    pub value: Operand,
+    /// True when this argument came from `...`.
+    pub unpack: bool,
+    /// Caller local when this argument can satisfy a by-reference parameter.
+    pub by_ref_local: Option<LocalId>,
 }
 
 /// Callable kind encoded in IR before VM resolution/execution.
@@ -151,8 +164,35 @@ pub enum InstructionKind {
     LoadLocalQuiet { dst: RegId, local: LocalId },
     /// `local = src`.
     StoreLocal { local: LocalId, src: Operand },
-    /// `target =& source` for the simple local-reference MVP.
+    /// `target =& source` for local references.
     BindReference { target: LocalId, source: LocalId },
+    /// `local =& $GLOBALS[name]` for `global $name`.
+    BindGlobal { local: LocalId, name: String },
+    /// `local[dims...] =& source` or `local[dims...][] =& source`.
+    BindReferenceDim {
+        local: LocalId,
+        dims: Vec<Operand>,
+        append: bool,
+        source: LocalId,
+    },
+    /// `target =& local[dims...]`.
+    BindReferenceFromDim {
+        target: LocalId,
+        local: LocalId,
+        dims: Vec<Operand>,
+    },
+    /// `target =& function(args...)` for by-reference function returns.
+    BindReferenceFromCall {
+        target: LocalId,
+        name: String,
+        args: Vec<IrCallArg>,
+    },
+    /// Binds a local to persistent function-local static storage.
+    InitStaticLocal {
+        local: LocalId,
+        name: String,
+        default: Operand,
+    },
     /// `dst = op(lhs, rhs)`.
     Binary {
         dst: RegId,
@@ -166,6 +206,12 @@ pub enum InstructionKind {
         op: CompareOp,
         lhs: Operand,
         rhs: Operand,
+    },
+    /// `object instanceof class_name`, resolved through VM class/interface metadata.
+    InstanceOf {
+        dst: RegId,
+        object: Operand,
+        class_name: String,
     },
     /// `dst = op(src)`.
     Unary {
@@ -183,25 +229,33 @@ pub enum InstructionKind {
     Discard { src: Operand },
     /// Emit a value to stdout.
     Echo { src: Operand },
+    /// Suspend a generator with an optional key and yielded value.
+    Yield {
+        dst: RegId,
+        key: Option<Operand>,
+        value: Option<Operand>,
+    },
+    /// Delegate generator iteration to an array or generator source.
+    YieldFrom { dst: RegId, source: Operand },
     /// Direct user-function call with positional arguments.
     CallFunction {
         dst: RegId,
         name: String,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// Public instance method call with positional arguments.
     CallMethod {
         dst: RegId,
         object: Operand,
         method: String,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// Public static method call with positional arguments.
     CallStaticMethod {
         dst: RegId,
         class_name: String,
         method: String,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// Shallow-clone an object into a new object identity.
     CloneObject { dst: RegId, object: Operand },
@@ -214,6 +268,7 @@ pub enum InstructionKind {
     /// Push an MVP exception handler for a try statement.
     EnterTry {
         catch: Option<BlockId>,
+        catch_types: Vec<String>,
         finally: Option<BlockId>,
         after: BlockId,
         exception_local: Option<LocalId>,
@@ -224,8 +279,12 @@ pub enum InstructionKind {
     EndFinally { after: BlockId },
     /// Throw a throwable MVP object.
     Throw { value: Operand },
-    /// Build the VM-internal MVP Exception object.
-    MakeException { dst: RegId, message: Operand },
+    /// Build a VM-internal MVP throwable object.
+    MakeException {
+        dst: RegId,
+        class_name: String,
+        message: Operand,
+    },
     /// Create a closure value from a synthesized closure function and captures.
     MakeClosure {
         dst: RegId,
@@ -236,7 +295,7 @@ pub enum InstructionKind {
     CallClosure {
         dst: RegId,
         callee: Operand,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// Resolve a callable descriptor into a runtime callable value.
     ResolveCallable { dst: RegId, callable: CallableKind },
@@ -244,7 +303,7 @@ pub enum InstructionKind {
     CallCallable {
         dst: RegId,
         callee: Operand,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// PHP 8.5 pipe operator MVP: call `callable(input)`.
     Pipe {
@@ -259,11 +318,14 @@ pub enum InstructionKind {
         kind: IncludeKind,
         path: Operand,
     },
+    /// Runtime eval operation. The VM compiles the evaluated code string
+    /// through the same frontend and IR pipeline using a synthetic source file.
+    Eval { dst: RegId, code: Operand },
     /// Creates a new object and invokes its constructor when one is declared.
     NewObject {
         dst: RegId,
         class_name: String,
-        args: Vec<Operand>,
+        args: Vec<IrCallArg>,
     },
     /// Fetches an instance property by static property name.
     FetchProperty {
@@ -271,10 +333,43 @@ pub enum InstructionKind {
         object: Operand,
         property: String,
     },
+    /// Tests whether an instance property exists and is not null.
+    IssetProperty {
+        dst: RegId,
+        object: Operand,
+        property: String,
+    },
+    /// Tests PHP empty() for an instance property.
+    EmptyProperty {
+        dst: RegId,
+        object: Operand,
+        property: String,
+    },
+    /// Unsets an instance property slot.
+    UnsetProperty { object: Operand, property: String },
+    /// Fetches a static property by class and static property name.
+    FetchStaticProperty {
+        dst: RegId,
+        class_name: String,
+        property: String,
+    },
+    /// Fetches a class constant by class and constant name.
+    FetchClassConstant {
+        dst: RegId,
+        class_name: String,
+        constant: String,
+    },
     /// Assigns an instance property by static property name.
     AssignProperty {
         dst: RegId,
         object: Operand,
+        property: String,
+        value: Operand,
+    },
+    /// Assigns a static property by class and static property name.
+    AssignStaticProperty {
+        dst: RegId,
+        class_name: String,
         property: String,
         value: Operand,
     },
@@ -336,6 +431,15 @@ pub enum InstructionKind {
         key: Option<RegId>,
         value: RegId,
     },
+    /// Creates a by-reference foreach iterator from a local array variable.
+    ForeachInitRef { iterator: RegId, local: LocalId },
+    /// Advances a by-reference foreach iterator and binds the value local.
+    ForeachNextRef {
+        has_value: RegId,
+        iterator: RegId,
+        key: Option<RegId>,
+        value_local: LocalId,
+    },
     /// Packed-array fetch used by the variadic-argument MVP.
     ArrayGet {
         dst: RegId,
@@ -368,7 +472,10 @@ pub enum TerminatorKind {
         if_false: BlockId,
     },
     /// Return from the current function.
-    Return { value: Option<Operand> },
+    Return {
+        value: Option<Operand>,
+        by_ref_local: Option<LocalId>,
+    },
 }
 
 /// A terminator plus source span.

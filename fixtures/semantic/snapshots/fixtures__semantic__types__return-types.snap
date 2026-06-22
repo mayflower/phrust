@@ -9,7 +9,7 @@ symbols:
   - function maybe_result
 hir_summary:
   statements: 5
-  expressions: 10
+  expressions: 8
   types: 4
   const_exprs: 0
   class_likes: 0

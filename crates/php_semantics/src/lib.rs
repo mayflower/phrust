@@ -1182,9 +1182,16 @@ fn push_properties_json(out: &mut String, result: &FrontendResult) {
                 if hook_index > 0 {
                     out.push(',');
                 }
-                out.push('"');
+                out.push_str("{\"kind\":\"");
                 out.push_str(&escape_json(hook.kind()));
-                out.push('"');
+                out.push_str("\",\"body\":\"");
+                out.push_str(match hook.body() {
+                    hir::HirPropertyHookBody::Expression => "expression",
+                    hir::HirPropertyHookBody::Block => "block",
+                });
+                out.push_str("\",\"span\":");
+                push_span_json(out, hook.span());
+                out.push('}');
             }
             out.push_str("],\"attributes\":");
             push_attribute_ids_json(out, property.attributes());
@@ -1555,13 +1562,13 @@ fn push_expression_kind_json(out: &mut String, kind: &hir::HirExprKind) {
             out.push_str(",\"callee\":");
             push_optional_expr_id_json(out, *callee);
             out.push_str(",\"args\":");
-            push_expr_ids_json(out, args);
+            push_call_args_json(out, args);
         }
         hir::HirExprKind::BuiltinCall { name, args } => {
             out.push_str(",\"name\":\"");
             out.push_str(&escape_json(name));
             out.push_str("\",\"args\":");
-            push_expr_ids_json(out, args);
+            push_call_args_json(out, args);
         }
         hir::HirExprKind::MethodCall {
             receiver,
@@ -1574,7 +1581,7 @@ fn push_expression_kind_json(out: &mut String, kind: &hir::HirExprKind) {
             out.push_str(",\"method\":");
             push_optional_expr_id_json(out, *method);
             out.push_str(",\"args\":");
-            push_expr_ids_json(out, args);
+            push_call_args_json(out, args);
             out.push_str(",\"nullsafe\":");
             out.push_str(if *nullsafe { "true" } else { "false" });
         }
@@ -1626,7 +1633,7 @@ fn push_expression_kind_json(out: &mut String, kind: &hir::HirExprKind) {
             out.push_str(",\"class\":");
             push_optional_expr_id_json(out, *class);
             out.push_str(",\"args\":");
-            push_expr_ids_json(out, args);
+            push_call_args_json(out, args);
         }
         hir::HirExprKind::CloneWith { expr, replacements } => {
             out.push_str(",\"expr\":");
@@ -1723,6 +1730,30 @@ fn push_expr_ids_json(out: &mut String, ids: &[hir::ExprId]) {
             out.push(',');
         }
         out.push_str(&id.raw().to_string());
+    }
+    out.push(']');
+}
+
+fn push_call_args_json(out: &mut String, args: &[hir::HirCallArg]) {
+    out.push('[');
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        out.push_str("\"value\":");
+        out.push_str(&arg.value.raw().to_string());
+        out.push_str(",\"name\":");
+        if let Some(name) = &arg.name {
+            out.push('"');
+            out.push_str(&escape_json(name));
+            out.push('"');
+        } else {
+            out.push_str("null");
+        }
+        out.push_str(",\"unpack\":");
+        out.push_str(if arg.unpack { "true" } else { "false" });
+        out.push('}');
     }
     out.push(']');
 }

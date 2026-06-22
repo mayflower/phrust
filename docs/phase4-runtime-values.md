@@ -41,13 +41,15 @@ Fixture proof: `fixtures/runtime/valid/scalars/echo.php`,
 ## Numbers and Conversions
 
 Integers are `i64`. Floats preserve their `f64` bits through `FloatValue`.
-Phase 4 implements the scalar conversion paths needed by green fixtures:
-truthiness, scalar casts, arithmetic, concat, selected comparisons, and simple
-runtime type-family checks.
+Phase 5 centralizes scalar conversion through `php_runtime::numeric_string` and
+`php_runtime::convert`: truthiness, scalar casts, arithmetic, concat, selected
+comparisons, and simple runtime type-family checks all use the shared
+conversion API. Numeric strings are classified as int-string, float-string,
+leading-numeric, or non-numeric in the committed fixture range.
 
-Full PHP numeric-string compatibility is a known gap. In particular, leading
-numeric substrings, INF/NAN edge cases, warning wording, overflow matrices, and
-weak/strict coercion details are not treated as complete.
+Full PHP numeric-string compatibility is still a known gap. INF/NAN edge cases,
+warning wording, overflow matrices, resources, extension-specific conversions,
+and weak/strict coercion details are not treated as complete.
 
 Fixture proof: `fixtures/runtime/valid/scalars/expressions.php`,
 `fixtures/runtime/valid/scalars/comparisons.php`,
@@ -79,7 +81,7 @@ Fixture proof: `fixtures/runtime/valid/arrays/indexed.php`,
 `fixtures/runtime/valid/arrays/append-overwrite.php`,
 `fixtures/runtime/valid/arrays/isset-empty-unset.php`,
 `fixtures/runtime/valid/foreach/snapshot-mutation.php`, and
-`fixtures/runtime/known_gaps/references/array-element-ref.php`.
+`fixtures/runtime/valid/references/array-element-ref.php`.
 
 ## Objects
 
@@ -108,15 +110,16 @@ Fixture proof: `fixtures/runtime/valid/objects/instantiate.php`,
 `Value` or a reference to a `ReferenceCell`; reads and writes dereference slots
 so simple local aliases observe each other.
 
-Only simple local alias assignment is executable in Phase 4. By-reference
-parameters, by-reference returns, by-reference closure captures, array-element
-references, by-reference foreach, and complete copy-on-write remain explicit
-known gaps.
+Simple local alias assignment, plain user-function by-reference parameters,
+local/static-local by-reference returns, array-element references, and
+by-reference closure captures are executable. By-reference foreach and complete
+copy-on-write matrix coverage remain explicit known gaps.
 
 Fixture proof: `fixtures/runtime/valid/references/local-alias.php`,
-`fixtures/runtime/known_gaps/references/by-ref-param.php`,
-`fixtures/runtime/known_gaps/references/by-ref-return.php`,
-`fixtures/runtime/known_gaps/references/array-element-ref.php`, and
+`fixtures/runtime/valid/references/by-ref-param.php`,
+`fixtures/runtime/valid/references/by-ref-return.php`,
+`fixtures/runtime/valid/functions/by-ref-capture.php`,
+`fixtures/runtime/valid/references/array-element-ref.php`, and
 `fixtures/runtime/known_gaps/foreach/by-ref.php`.
 
 ## Callables

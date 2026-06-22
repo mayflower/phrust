@@ -10,10 +10,10 @@ use crate::hir::{
     AttributeId, ClassLikeId, ClassLikeKind, ClassLikeMember, ClassLikeMemberId,
     ClassLikeMemberKind, ConstExprContext, ConstExprId, ConstId, EnumCaseId, FullyQualifiedName,
     HirClassConst, HirClassLike, HirEnumCase, HirMethod, HirNameResolution, HirProperty,
-    HirPropertyHook, HirPropertyItem, HirTraitAdaptation, HirTraitAdaptationKind,
-    HirTraitMethodRef, HirTraitUse, MagicMethodKind, MethodId, Modifier, ModifierOccurrence,
-    ModifierSet, ModuleId, NamePart, NamespaceName, PropertyId, QualifiedName, SignatureKind,
-    TraitUseId, TypeContext, TypeId,
+    HirPropertyHook, HirPropertyHookBody, HirPropertyItem, HirTraitAdaptation,
+    HirTraitAdaptationKind, HirTraitMethodRef, HirTraitUse, MagicMethodKind, MethodId, Modifier,
+    ModifierOccurrence, ModifierSet, ModuleId, NamePart, NamespaceName, PropertyId, QualifiedName,
+    SignatureKind, TraitUseId, TypeContext, TypeId,
 };
 use crate::lower::types::{
     TypeLoweringScope, TypeToken, enum_backing_type_tokens, lower_type_tokens,
@@ -23,7 +23,7 @@ use crate::symbols::resolution::{NameResolver, ResolveContext, ResolvedName};
 use php_ast::{
     AstNode, AstToken, ClassConstDecl, ClassDecl, EnumCase, EnumDecl, InterfaceDecl, MemberDecl,
     MethodDecl, PropertyDecl, TokenView, TraitDecl, TraitUseDecl, descendant_nodes,
-    descendant_tokens, modifier_tokens, syntax_child_tokens,
+    descendant_tokens, modifier_tokens, syntax_child_nodes, syntax_child_tokens,
 };
 use php_source::TextRange;
 use php_syntax::SyntaxNode;
@@ -643,10 +643,16 @@ impl ClassLikeLowerer<'_> {
             .database
             .module(self.module_id)
             .expect("module allocated before class-like lowering");
-        module.types().iter().find_map(|(id, ty)| {
-            let span = self.database.source_map().span(id)?;
-            (ty.context() == context && contains_range(node.text_range(), span)).then_some(id)
-        })
+        module
+            .types()
+            .iter()
+            .filter_map(|(id, ty)| {
+                let span = self.database.source_map().span(id)?;
+                (ty.context() == context && contains_range(node.text_range(), span))
+                    .then_some((id, span))
+            })
+            .max_by_key(|(_, span)| span.end().to_usize() - span.start().to_usize())
+            .map(|(id, _)| id)
     }
 
     fn const_expr_id_in_node(
@@ -996,22 +1002,18 @@ fn is_modifier_type_token(token: &TypeToken) -> bool {
 
 fn property_hooks(node: &SyntaxNode) -> Vec<HirPropertyHook> {
     let mut hooks = Vec::new();
-    let mut depth = 0usize;
-    for token in syntax_child_tokens(node).filter(|token| !token.kind().is_trivia()) {
-        match token.text() {
-            "{" => {
-                depth += 1;
+    for hook in syntax_child_nodes(node).filter(|node| node.kind().name() == "PROPERTY_HOOK_DECL") {
+        let mut kind = None;
+        let mut body = HirPropertyHookBody::Block;
+        for token in syntax_child_tokens(hook).filter(|token| !token.kind().is_trivia()) {
+            match token.text() {
+                "get" | "set" if kind.is_none() => kind = Some(token.text().to_owned()),
+                "=>" => body = HirPropertyHookBody::Expression,
+                _ => {}
             }
-            "}" => {
-                depth = depth.saturating_sub(1);
-            }
-            "get" if depth == 1 => {
-                hooks.push(HirPropertyHook::new("get"));
-            }
-            "set" if depth == 1 => {
-                hooks.push(HirPropertyHook::new("set"));
-            }
-            _ => {}
+        }
+        if let Some(kind) = kind {
+            hooks.push(HirPropertyHook::new(kind, hook.text_range(), body));
         }
     }
     hooks

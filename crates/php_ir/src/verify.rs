@@ -236,6 +236,36 @@ fn verify_instruction(
             verify_local(*target, function.local_count, errors);
             verify_local(*source, function.local_count, errors);
         }
+        InstructionKind::BindGlobal { local, .. } => {
+            verify_local(*local, function.local_count, errors);
+        }
+        InstructionKind::BindReferenceDim {
+            local,
+            dims,
+            source,
+            ..
+        } => {
+            verify_local(*local, function.local_count, errors);
+            verify_local(*source, function.local_count, errors);
+            for dim in dims {
+                verify_operand(dim, function, unit, errors);
+            }
+        }
+        InstructionKind::BindReferenceFromDim {
+            target,
+            local,
+            dims,
+        } => {
+            verify_local(*target, function.local_count, errors);
+            verify_local(*local, function.local_count, errors);
+            for dim in dims {
+                verify_operand(dim, function, unit, errors);
+            }
+        }
+        InstructionKind::InitStaticLocal { local, default, .. } => {
+            verify_local(*local, function.local_count, errors);
+            verify_operand(default, function, unit, errors);
+        }
         InstructionKind::Binary { dst, lhs, rhs, .. } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(lhs, function, unit, errors);
@@ -246,16 +276,45 @@ fn verify_instruction(
             verify_operand(lhs, function, unit, errors);
             verify_operand(rhs, function, unit, errors);
         }
+        InstructionKind::InstanceOf { dst, object, .. } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(object, function, unit, errors);
+        }
         InstructionKind::Unary { dst, src, .. } | InstructionKind::Cast { dst, src, .. } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(src, function, unit, errors);
         }
         InstructionKind::Discard { src } => verify_operand(src, function, unit, errors),
         InstructionKind::Echo { src } => verify_operand(src, function, unit, errors),
+        InstructionKind::Yield { dst, key, value } => {
+            verify_register(*dst, function.register_count, errors);
+            if let Some(key) = key {
+                verify_operand(key, function, unit, errors);
+            }
+            if let Some(value) = value {
+                verify_operand(value, function, unit, errors);
+            }
+        }
+        InstructionKind::YieldFrom { dst, source } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(source, function, unit, errors);
+        }
+        InstructionKind::BindReferenceFromCall { target, args, .. } => {
+            verify_local(*target, function.local_count, errors);
+            for arg in args {
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
+            }
+        }
         InstructionKind::CallFunction { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::CallMethod {
@@ -264,13 +323,19 @@ fn verify_instruction(
             verify_register(*dst, function.register_count, errors);
             verify_operand(object, function, unit, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::CallStaticMethod { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::CloneObject { dst, object } => {
@@ -288,6 +353,7 @@ fn verify_instruction(
         }
         InstructionKind::EnterTry {
             catch,
+            catch_types: _,
             finally,
             after,
             exception_local,
@@ -306,7 +372,11 @@ fn verify_instruction(
         InstructionKind::LeaveTry => {}
         InstructionKind::EndFinally { after } => verify_block_target(*after, function, errors),
         InstructionKind::Throw { value } => verify_operand(value, function, unit, errors),
-        InstructionKind::MakeException { dst, message } => {
+        InstructionKind::MakeException {
+            dst,
+            class_name: _,
+            message,
+        } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(message, function, unit, errors);
         }
@@ -333,7 +403,10 @@ fn verify_instruction(
             verify_register(*dst, function.register_count, errors);
             verify_operand(callee, function, unit, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::ResolveCallable { dst, .. } => {
@@ -343,7 +416,10 @@ fn verify_instruction(
             verify_register(*dst, function.register_count, errors);
             verify_operand(callee, function, unit, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::Pipe {
@@ -359,21 +435,44 @@ fn verify_instruction(
             verify_register(*dst, function.register_count, errors);
             verify_operand(path, function, unit, errors);
         }
+        InstructionKind::Eval { dst, code } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(code, function, unit, errors);
+        }
         InstructionKind::NewObject { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
             for arg in args {
-                verify_operand(arg, function, unit, errors);
+                verify_operand(&arg.value, function, unit, errors);
+                if let Some(local) = arg.by_ref_local {
+                    verify_local(local, function.local_count, errors);
+                }
             }
         }
         InstructionKind::FetchProperty { dst, object, .. } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(object, function, unit, errors);
         }
+        InstructionKind::IssetProperty { dst, object, .. }
+        | InstructionKind::EmptyProperty { dst, object, .. } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(object, function, unit, errors);
+        }
+        InstructionKind::UnsetProperty { object, .. } => {
+            verify_operand(object, function, unit, errors);
+        }
+        InstructionKind::FetchStaticProperty { dst, .. }
+        | InstructionKind::FetchClassConstant { dst, .. } => {
+            verify_register(*dst, function.register_count, errors);
+        }
         InstructionKind::AssignProperty {
             dst, object, value, ..
         } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(object, function, unit, errors);
+            verify_operand(value, function, unit, errors);
+        }
+        InstructionKind::AssignStaticProperty { dst, value, .. } => {
+            verify_register(*dst, function.register_count, errors);
             verify_operand(value, function, unit, errors);
         }
         InstructionKind::NewArray { dst } => {
@@ -450,6 +549,23 @@ fn verify_instruction(
             }
             verify_register(*value, function.register_count, errors);
         }
+        InstructionKind::ForeachInitRef { iterator, local } => {
+            verify_register(*iterator, function.register_count, errors);
+            verify_local(*local, function.local_count, errors);
+        }
+        InstructionKind::ForeachNextRef {
+            has_value,
+            iterator,
+            key,
+            value_local,
+        } => {
+            verify_register(*has_value, function.register_count, errors);
+            verify_register(*iterator, function.register_count, errors);
+            if let Some(key) = key {
+                verify_register(*key, function.register_count, errors);
+            }
+            verify_local(*value_local, function.local_count, errors);
+        }
         InstructionKind::ArrayGet { dst, array, index } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(array, function, unit, errors);
@@ -481,9 +597,15 @@ fn verify_terminator(
             verify_block_target(*if_true, function, errors);
             verify_block_target(*if_false, function, errors);
         }
-        TerminatorKind::Return { value } => {
+        TerminatorKind::Return {
+            value,
+            by_ref_local,
+        } => {
             if let Some(value) = value {
                 verify_operand(value, function, unit, errors);
+            }
+            if let Some(local) = by_ref_local {
+                verify_local(*local, function.local_count, errors);
             }
         }
     }

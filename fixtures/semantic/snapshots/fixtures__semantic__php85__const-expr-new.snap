@@ -7,7 +7,7 @@ symbols:
   - constant PROMPT29_CONST_EXPR_NEW
 hir_summary:
   statements: 0
-  expressions: 4
+  expressions: 2
   types: 0
   const_exprs: 1
   class_likes: 0

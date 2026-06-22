@@ -121,6 +121,8 @@ The Phase 4 instruction set is:
 - `UnsetDim { local, dims }`
 - `ForeachInit { iterator, source }`
 - `ForeachNext { has_value, iterator, key, value }`
+- `ForeachInitRef { iterator, local }`
+- `ForeachNextRef { has_value, iterator, key, value_local }`
 - `ArrayGet { dst, array, index }`
 - `Unsupported { diagnostic_id }`
 - `RuntimeError { diagnostic_id, message }`
@@ -155,10 +157,11 @@ callables are explicit known gaps.
 
 Array instructions (`NewArray`, `ArrayInsert`, `FetchDim`, `AssignDim`,
 `AppendDim`, `IssetLocal`, `EmptyLocal`, `IssetDim`, `EmptyDim`, `UnsetDim`,
-`ForeachInit`, `ForeachNext`, `ArrayGet`) cover literal arrays, scalar
+`ForeachInit`, `ForeachNext`, `ForeachInitRef`, `ForeachNextRef`, `ArrayGet`) cover literal arrays, scalar
 dimension fetch/assign/append, query operations, unset, variadic packed access,
-and by-value foreach snapshots. By-reference foreach and array-element
-references remain known gaps.
+array-element reference binding, by-value foreach snapshots, and local-array
+by-reference foreach binding. Temporary by-reference foreach sources remain a
+known gap.
 
 Object instructions (`NewObject`, `FetchProperty`, `AssignProperty`,
 `CallMethod`, `CallStaticMethod`, `CloneObject`, `CloneWith`) cover concrete
@@ -337,10 +340,10 @@ assigned into the closure function's capture locals before parameter binding
 when the VM enters the closure frame.
 
 `use (&$x)` is detected and preserved as `by_ref=true` in the IR and snapshot
-format, but runtime execution rejects it with
-`E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE` rather than silently copying. Full
-`Closure::bind`, `$this` binding, first-class callable compatibility, and
-string/array callable fallback remain outside this Prompt 16 MVP.
+format. Runtime execution captures the source local's reference cell so later
+mutations and writes through the closure observe the same storage. Full
+`Closure::bind`, first-class callable compatibility, and string/array callable
+fallback remain outside this Prompt 16 MVP.
 
 Prompt 17 supports first-class callable names in the actual Phase 3 HIR shape
 for pipe RHS (`HirExprKind::FirstClassCallable { callee: Name }`) and closure
@@ -371,7 +374,6 @@ Unsupported-feature diagnostic IDs are stable strings such as:
 - `E_PHP_IR_UNSUPPORTED_CLASSLIKE_OBJECT`
 - `E_PHP_IR_UNSUPPORTED_OBJECT_METHOD_MODIFIER`
 - `E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER`
-- `E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE`
 - `E_PHP_VM_CALL_NON_CLOSURE`
 - `E_PHP_VM_PIPE_RHS_NOT_CALLABLE`
 - `E_PHP_VM_UNRESOLVED_CALLABLE`

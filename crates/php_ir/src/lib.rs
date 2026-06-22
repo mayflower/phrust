@@ -31,8 +31,9 @@ pub use lower::{
     lower_frontend_result,
 };
 pub use module::{
-    ClassEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
-    ClassPropertyFlags, FileEntry, FunctionEntry, GlobalConstantEntry, IR_VERSION, IrUnit,
+    AttributeEntry, ClassEntry, ClassEnumBackingType, ClassEnumCaseEntry, ClassFlags,
+    ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry, ClassPropertyFlags, ClassPropertyHooks,
+    FileEntry, FunctionEntry, GlobalConstantEntry, IR_VERSION, IrUnit,
 };
 pub use operand::Operand;
 pub use source_map::{IrSourceMap, IrSourceMapEntry, IrSourceMapTarget, IrSpan};

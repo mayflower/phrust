@@ -1,4 +1,4 @@
-//! Selected PHPT smoke runner for Phase 4.
+//! Selected PHPT smoke runner for Phase 4 and Phase 5.
 
 use php_testkit::phpt::{PhptDisposition, PhptExpectation, PhptFile, expectf_matches};
 use serde::Serialize;
@@ -13,6 +13,7 @@ struct Options {
     out_dir: PathBuf,
     rust_vm: Option<PathBuf>,
     extra_phpt: Vec<PathBuf>,
+    allowlist: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -22,14 +23,33 @@ enum PhptStatus {
     Fail,
     Skipped,
     KnownGap,
+    ExpectedFail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AllowlistDisposition {
+    Run,
+    Skip,
+    KnownGap,
+    ExpectedFail,
+}
+
+#[derive(Clone, Debug)]
+struct PhptCase {
+    path: PathBuf,
+    category: Option<String>,
+    disposition: AllowlistDisposition,
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
 struct PhptSmokeResult {
     path: String,
+    category: Option<String>,
     test: Option<String>,
     status: PhptStatus,
     message: Option<String>,
+    reason: Option<String>,
     generated_file: Option<String>,
     exit_code: Option<i32>,
     stdout: Option<String>,
@@ -39,11 +59,13 @@ struct PhptSmokeResult {
 #[derive(Serialize)]
 struct PhptSmokeReport {
     fixtures_root: String,
+    allowlist: Option<String>,
     total: usize,
     pass: usize,
     fail: usize,
     skipped: usize,
     known_gap: usize,
+    expected_fail: usize,
     results: Vec<PhptSmokeResult>,
 }
 
@@ -72,13 +94,17 @@ fn run() -> Result<PhptSmokeReport, String> {
             options.out_dir.display()
         )
     })?;
-    let fixtures = discover_phpt_files(&options.fixtures_root, &options.extra_phpt)?;
+    let fixtures = discover_phpt_files(&options)?;
     let mut results = Vec::new();
-    for path in fixtures {
-        results.push(run_fixture(&path, &options));
+    for case in fixtures {
+        results.push(run_fixture(&case, &options));
     }
     let report = PhptSmokeReport {
         fixtures_root: options.fixtures_root.display().to_string(),
+        allowlist: options
+            .allowlist
+            .as_ref()
+            .map(|path| path.display().to_string()),
         total: results.len(),
         pass: results
             .iter()
@@ -96,6 +122,10 @@ fn run() -> Result<PhptSmokeReport, String> {
             .iter()
             .filter(|result| result.status == PhptStatus::KnownGap)
             .count(),
+        expected_fail: results
+            .iter()
+            .filter(|result| result.status == PhptStatus::ExpectedFail)
+            .count(),
         results,
     };
     let report_json = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
@@ -103,12 +133,13 @@ fn run() -> Result<PhptSmokeReport, String> {
     fs::write(&report_path, report_json)
         .map_err(|error| format!("failed to write PHPT smoke report: {error}"))?;
     println!(
-        "[ok] PHPT smoke report: total={} pass={} fail={} skip={} known_gap={} path={}",
+        "[ok] PHPT smoke report: total={} pass={} fail={} skip={} known_gap={} expected_fail={} path={}",
         report.total,
         report.pass,
         report.fail,
         report.skipped,
         report.known_gap,
+        report.expected_fail,
         report_path.display()
     );
     Ok(report)
@@ -119,6 +150,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
     let mut out_dir = PathBuf::from("target/phase4/phpt-smoke");
     let mut rust_vm = env::var_os("PHP_VM_CLI").map(PathBuf::from);
     let mut extra_phpt = Vec::new();
+    let mut allowlist = None;
     let args = args.into_iter().collect::<Vec<_>>();
     let mut index = 0;
     while index < args.len() {
@@ -151,9 +183,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
                         .ok_or_else(|| "--extra-phpt requires a path".to_string())?,
                 ));
             }
+            "--allowlist" => {
+                index += 1;
+                allowlist = Some(PathBuf::from(
+                    args.get(index)
+                        .ok_or_else(|| "--allowlist requires a path".to_string())?,
+                ));
+            }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: run-phpt-smoke [--fixtures fixtures/phpt_smoke] [--out target/phase4/phpt-smoke] [--rust-vm target/debug/php-vm] [--extra-phpt path]"
+                    "Usage: run-phpt-smoke [--fixtures fixtures/phpt_smoke] [--out target/phase4/phpt-smoke] [--rust-vm target/debug/php-vm] [--extra-phpt path] [--allowlist fixtures/phase5/phpt_allowlist.toml]"
                         .to_string(),
                 );
             }
@@ -166,13 +205,18 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
         out_dir,
         rust_vm,
         extra_phpt,
+        allowlist,
     })
 }
 
-fn discover_phpt_files(root: &Path, extra: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+fn discover_phpt_files(options: &Options) -> Result<Vec<PhptCase>, String> {
+    if let Some(allowlist) = &options.allowlist {
+        return read_allowlist(allowlist);
+    }
+
     let mut paths = Vec::new();
-    collect_phpt_files(root, &mut paths)?;
-    for path in extra {
+    collect_phpt_files(&options.fixtures_root, &mut paths)?;
+    for path in &options.extra_phpt {
         if path.is_dir() {
             collect_phpt_files(path, &mut paths)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("phpt") {
@@ -186,7 +230,15 @@ fn discover_phpt_files(root: &Path, extra: &[PathBuf]) -> Result<Vec<PathBuf>, S
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    Ok(paths
+        .into_iter()
+        .map(|path| PhptCase {
+            path,
+            category: None,
+            disposition: AllowlistDisposition::Run,
+            reason: None,
+        })
+        .collect())
 }
 
 fn collect_phpt_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -202,12 +254,162 @@ fn collect_phpt_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> 
     Ok(())
 }
 
-fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
+fn read_allowlist(path: &Path) -> Result<Vec<PhptCase>, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read PHPT allowlist {}: {error}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut entries = Vec::new();
+    let mut current = AllowlistRecord::default();
+    let mut in_entry = false;
+
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line = raw_line
+            .split_once('#')
+            .map_or(raw_line, |(head, _)| head)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[test]]" {
+            if in_entry {
+                entries.push(current.into_case(base)?);
+                current = AllowlistRecord::default();
+            }
+            in_entry = true;
+            continue;
+        }
+        if !in_entry {
+            return Err(format!(
+                "{}:{}: expected [[test]] before key",
+                path.display(),
+                line_index + 1
+            ));
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "{}:{}: expected `key = \"value\"`",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        current.set(
+            key.trim(),
+            parse_toml_string(value.trim(), path, line_index + 1)?,
+        )?;
+    }
+
+    if in_entry {
+        entries.push(current.into_case(base)?);
+    }
+    if entries.is_empty() {
+        return Err(format!(
+            "PHPT allowlist {} has no [[test]] entries",
+            path.display()
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+#[derive(Default)]
+struct AllowlistRecord {
+    path: Option<String>,
+    category: Option<String>,
+    disposition: Option<String>,
+    reason: Option<String>,
+}
+
+impl AllowlistRecord {
+    fn set(&mut self, key: &str, value: String) -> Result<(), String> {
+        match key {
+            "path" => self.path = Some(value),
+            "category" => self.category = Some(value),
+            "disposition" => self.disposition = Some(value),
+            "reason" => self.reason = Some(value),
+            other => return Err(format!("unsupported PHPT allowlist key `{other}`")),
+        }
+        Ok(())
+    }
+
+    fn into_case(self, base: &Path) -> Result<PhptCase, String> {
+        let path = self
+            .path
+            .ok_or_else(|| "PHPT allowlist entry is missing `path`".to_string())?;
+        let category = self
+            .category
+            .ok_or_else(|| format!("PHPT allowlist entry `{path}` is missing `category`"))?;
+        let disposition = match self.disposition.as_deref().unwrap_or("run") {
+            "run" => AllowlistDisposition::Run,
+            "skip" => AllowlistDisposition::Skip,
+            "known_gap" => AllowlistDisposition::KnownGap,
+            "expected_fail" => AllowlistDisposition::ExpectedFail,
+            other => {
+                return Err(format!(
+                    "PHPT allowlist entry `{path}` has unsupported disposition `{other}`"
+                ));
+            }
+        };
+        if disposition != AllowlistDisposition::Run
+            && self.reason.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(format!(
+                "PHPT allowlist entry `{path}` must include a reason for non-run disposition"
+            ));
+        }
+        let path = PathBuf::from(path);
+        Ok(PhptCase {
+            path: if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            },
+            category: Some(category),
+            disposition,
+            reason: self.reason,
+        })
+    }
+}
+
+fn parse_toml_string(value: &str, path: &Path, line: usize) -> Result<String, String> {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(format!(
+            "{}:{line}: expected a double-quoted string value",
+            path.display()
+        ));
+    };
+    Ok(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn run_fixture(case: &PhptCase, options: &Options) -> PhptSmokeResult {
+    let path = &case.path;
+    match case.disposition {
+        AllowlistDisposition::Skip => {
+            return base_result(
+                case,
+                None,
+                PhptStatus::Skipped,
+                Some("allowlist skip".to_string()),
+            );
+        }
+        AllowlistDisposition::KnownGap => {
+            return base_result(
+                case,
+                None,
+                PhptStatus::KnownGap,
+                Some("allowlist known gap".to_string()),
+            );
+        }
+        AllowlistDisposition::Run | AllowlistDisposition::ExpectedFail => {}
+    }
+
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
             return base_result(
-                path,
+                case,
                 None,
                 PhptStatus::Fail,
                 Some(format!("failed to read PHPT fixture: {error}")),
@@ -219,16 +421,16 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
     match phpt.disposition() {
         PhptDisposition::Run => {}
         PhptDisposition::Skip(reason) => {
-            return base_result(path, test, PhptStatus::Skipped, Some(reason));
+            return base_result(case, test, PhptStatus::Skipped, Some(reason));
         }
         PhptDisposition::KnownGap(reason) => {
-            return base_result(path, test, PhptStatus::KnownGap, Some(reason));
+            return base_result(case, test, PhptStatus::KnownGap, Some(reason));
         }
     }
 
     let Some(file_body) = phpt.file_body() else {
         return base_result(
-            path,
+            case,
             test,
             PhptStatus::Fail,
             Some("missing required --FILE-- section".to_string()),
@@ -236,7 +438,7 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
     };
     let Some(expectation) = phpt.expectation() else {
         return base_result(
-            path,
+            case,
             test,
             PhptStatus::Fail,
             Some("expected exactly one of --EXPECT-- or --EXPECTF--".to_string()),
@@ -251,7 +453,7 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
         && let Err(error) = fs::create_dir_all(parent)
     {
         return base_result(
-            path,
+            case,
             test,
             PhptStatus::Fail,
             Some(format!("failed to create generated fixture dir: {error}")),
@@ -259,7 +461,7 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
     }
     if let Err(error) = fs::write(&generated_file, file_body) {
         return base_result(
-            path,
+            case,
             test,
             PhptStatus::Fail,
             Some(format!("failed to write generated PHP file: {error}")),
@@ -271,9 +473,11 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
         Err(error) => {
             return PhptSmokeResult {
                 path: path.display().to_string(),
+                category: case.category.clone(),
                 test,
                 status: PhptStatus::Fail,
                 message: Some(error),
+                reason: case.reason.clone(),
                 generated_file: Some(generated_file.display().to_string()),
                 exit_code: None,
                 stdout: None,
@@ -289,21 +493,29 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
         PhptExpectation::Format(pattern) => expectf_matches(pattern, actual),
     };
     let success = output.status.success() && matched;
+    let status = match (&case.disposition, success) {
+        (AllowlistDisposition::ExpectedFail, false) => PhptStatus::ExpectedFail,
+        (AllowlistDisposition::ExpectedFail, true) => PhptStatus::Fail,
+        (_, true) => PhptStatus::Pass,
+        (_, false) => PhptStatus::Fail,
+    };
     PhptSmokeResult {
         path: path.display().to_string(),
+        category: case.category.clone(),
         test,
-        status: if success {
-            PhptStatus::Pass
-        } else {
-            PhptStatus::Fail
-        },
-        message: if success {
+        status,
+        message: if case.disposition == AllowlistDisposition::ExpectedFail && !success {
+            Some("expected failure matched allowlist".to_string())
+        } else if case.disposition == AllowlistDisposition::ExpectedFail && success {
+            Some("PHPT unexpectedly passed; remove expected_fail or update coverage".to_string())
+        } else if success {
             None
         } else if !output.status.success() {
             Some("Rust VM exited with non-zero status".to_string())
         } else {
             Some("PHPT expectation did not match Rust VM stdout".to_string())
         },
+        reason: case.reason.clone(),
         generated_file: Some(generated_file.display().to_string()),
         exit_code: output.status.code(),
         stdout: Some(stdout),
@@ -312,16 +524,18 @@ fn run_fixture(path: &Path, options: &Options) -> PhptSmokeResult {
 }
 
 fn base_result(
-    path: &Path,
+    case: &PhptCase,
     test: Option<String>,
     status: PhptStatus,
     message: Option<String>,
 ) -> PhptSmokeResult {
     PhptSmokeResult {
-        path: path.display().to_string(),
+        path: case.path.display().to_string(),
+        category: case.category.clone(),
         test,
         status,
         message,
+        reason: case.reason.clone(),
         generated_file: None,
         exit_code: None,
         stdout: None,

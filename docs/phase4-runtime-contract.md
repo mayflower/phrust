@@ -56,12 +56,12 @@ The Phase 4 MVP should execute:
 | Expressions | arithmetic, comparisons, casts, truthiness, concatenation | scalar MVP implemented |
 | Control flow | if/elseif/else, loops, break, continue, switch, match, return | implemented for the Phase 4 scalar subset |
 | Functions | user functions, parameters, defaults, variadics, recursion | named declarations, positional by-value params, folded scalar defaults, packed-list variadics, scalar/nullable parameter checks, scalar/nullable/void return checks, frames, returns, recursion implemented |
-| Closures | by-value capture and arrow functions | closure values, `use ($x)`, arrow by-value capture, closure returns, and closure calls implemented; by-reference capture is an explicit known gap |
-| Arrays | ordered int/string-key map, literals, fetch, assign, append, foreach | literals, local dim operations, and by-value array foreach implemented; foreach snapshots insertion-ordered entries at loop entry; array-element references, by-reference foreach, and Traversable objects are known gaps |
+| Closures | by-value/by-reference capture and arrow functions | closure values, `use ($x)`, `use (&$x)`, arrow by-value capture, closure returns, static closure locals, and closure calls implemented; full `Closure::bind` compatibility remains a known gap |
+| Arrays | ordered int/string-key map, literals, fetch, assign, append, foreach | literals, local dim operations, array-element references, by-value array foreach, and local-array by-reference foreach implemented; by-value foreach snapshots insertion-ordered entries at loop entry; temporary by-reference sources and Traversable objects are known gaps |
 | Constants | user constants and MVP magic constants | global `const` declarations with folded Phase 3 const-expression values, `FetchConst`, `PHP_VERSION`, undefined-constant runtime errors, and top-level/function/method magic constants implemented; `define()` and the full predefined constants matrix remain gaps |
 | Includes | local include/require loader without stream-wrapper compatibility | root-constrained local file loader implemented for `include`, `include_once`, `require`, and `require_once` |
 | Runtime context | deterministic CLI argv/env context and controlled superglobals | `RuntimeContext` carries `cwd`, `argv`, controlled `env`, `include_path`, ini-like placeholders, error_reporting placeholder, and strict_types metadata placeholders; `$argc`, `$argv`, `$_SERVER['argc']`, `$_SERVER['argv']`, explicit sorted `$_ENV`, empty request-style arrays, and placeholder `GLOBALS` are seeded for top-level fixtures |
-| Objects | class table, `new`, public properties, constructor `$this`, public instance methods, simple public static methods, shallow clone | implemented for Prompt 30 object/method/clone/typecheck MVP; simple public typed-property writes are checked at runtime; visibility dispatch, late static binding, static properties, readonly/private clone-with, property hooks, and magic methods remain known gaps |
+| Objects | class table, `new`, public properties, constructor `$this`, public instance methods, simple public static methods, shallow clone | implemented for Prompt 30 object/method/clone/typecheck MVP; simple public typed-property writes are checked at runtime; Phase 5 adds visibility dispatch, late static binding, static properties, readonly basics, magic methods, clone magic, public clone-with replacements, and fixture-covered property hooks; private/protected/readonly/static/full-hook clone-with matrices remain known gaps |
 | Exceptions | throw, try, catch, finally, uncaught exception exit behavior | Prompt 29 implements VM-internal `Exception` objects, `throw`, `catch (Exception $e)`/`Throwable`, uncaught exception diagnostics, rethrow, and `finally` on normal return or thrown control-flow; full Throwable hierarchy, typed catch matching beyond the MVP, stacktrace wording, and catch-throw-through-finally compatibility remain known gaps |
 | PHP 8.5 | pipe operator, `(void)` discard, clone-with MVP | pipe MVP implemented; clone-with executes for public untyped object properties; `(void)` IR discard modeled while executable `(void)` programs remain a frontend/runtime gap |
 
@@ -216,9 +216,9 @@ Prompt 23 `BindReference` instruction can bind two local slots to one
 `fixtures/runtime/known_gaps/variables/undefined.php` locks this MVP behavior;
 full PHP warning text and variable names remain outside the current subset.
 
-By-reference parameters, by-reference returns, array-element references, and
-by-reference foreach are distinct known gaps. IR lowering emits stable IDs for
-those cases rather than executing copied values with PHP-incompatible aliasing.
+Object-property references and by-reference foreach over temporary sources are
+distinct known gaps. IR lowering emits stable IDs for those cases rather than
+executing copied values with PHP-incompatible aliasing.
 
 `Echo` writes to `php_runtime::OutputBuffer`. Prompt 08 string conversion is
 limited to scalars: null and false emit no bytes, true emits `1`, integers and
@@ -293,11 +293,11 @@ excluding arrow parameters. Closure functions have independent local/register
 storage, so ordinary local writes inside the closure do not mutate the caller's
 local slots in this MVP.
 
-`use (&$x)` is preserved in IR capture metadata but rejected at execution with
-`E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE`. Calling a non-closure variable through
-the closure-call path produces `E_PHP_VM_CALL_NON_CLOSURE`. `Closure::bind`,
-`$this` binding, string callable fallback, array callable fallback, and full
-first-class-callable compatibility are not implemented.
+`use (&$x)` is preserved in IR capture metadata and captures the source local's
+reference cell at execution. Calling a non-closure variable through the
+closure-call path produces `E_PHP_VM_CALL_NON_CLOSURE`. `Closure::bind`, string
+callable fallback, array callable fallback, and full first-class-callable
+compatibility are not implemented.
 
 ## Callable And Pipe MVP
 
@@ -391,18 +391,18 @@ the VM execution state so a file is executed at most once per VM execution.
 
 ## Scalar Conversion MVP
 
-`php_runtime::convert` centralizes Prompt 10 conversion behavior for the VM:
+`php_runtime::convert` centralizes Prompt 11 conversion behavior for the VM:
 
-- truthiness for null, bool, int, float, and string;
+- truthiness for null, bool, int, float, string, arrays, and objects;
 - scalar-to-string for echo, casts, and concatenation;
-- scalar-to-number for null, bool, int, float, and plain decimal numeric
-  strings;
+- scalar-to-int and scalar-to-float for explicit casts;
+- scalar-to-number for null, bool, int, float, int-string, float-string, and
+  leading-numeric strings;
 - strict identity and loose scalar comparison for safe MVP cases.
 
-Numeric strings are intentionally limited to plain decimal integer or float
-forms. PHP's full numeric-string matrix, leading numeric substrings, warnings,
-INF/NAN spelling, and other edge cases are documented known gaps rather than
-silently emulated.
+Numeric strings now share the Phase 5 classifier. PHP's full warning channel,
+INF/NAN spelling, resource conversions, object `__toString`, and extension
+cases are documented known gaps rather than silently emulated.
 
 ## CLI Pipeline
 

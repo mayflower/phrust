@@ -178,6 +178,11 @@ const BUILTINS: &[BuiltinEntry] = &[
         compatibility: BuiltinCompatibility::Php,
     },
     BuiltinEntry {
+        name: "serialize",
+        function: builtin_serialize_gap,
+        compatibility: BuiltinCompatibility::Php,
+    },
+    BuiltinEntry {
         name: "strlen",
         function: builtin_strlen,
         compatibility: BuiltinCompatibility::Php,
@@ -193,8 +198,18 @@ const BUILTINS: &[BuiltinEntry] = &[
         compatibility: BuiltinCompatibility::Php,
     },
     BuiltinEntry {
+        name: "unserialize",
+        function: builtin_unserialize_gap,
+        compatibility: BuiltinCompatibility::Php,
+    },
+    BuiltinEntry {
         name: "var_dump",
         function: builtin_var_dump,
+        compatibility: BuiltinCompatibility::Php,
+    },
+    BuiltinEntry {
+        name: "var_export",
+        function: builtin_var_export_gap,
         compatibility: BuiltinCompatibility::Php,
     },
 ];
@@ -347,6 +362,45 @@ fn builtin_var_dump(
     Ok(Value::Null)
 }
 
+fn builtin_serialize_gap(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("serialize", &args, 1)?;
+    Err(serialization_gap("serialize"))
+}
+
+fn builtin_unserialize_gap(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("unserialize", &args, 1)?;
+    Err(serialization_gap("unserialize"))
+}
+
+fn builtin_var_export_gap(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(1..=2).contains(&args.len()) {
+        return Err(BuiltinError::new(
+            "E_PHP_RUNTIME_BUILTIN_ARITY",
+            "builtin var_export expects one or two argument(s)",
+        ));
+    }
+    Err(serialization_gap("var_export"))
+}
+
+fn serialization_gap(name: &str) -> BuiltinError {
+    BuiltinError::new(
+        "E_PHP_RUNTIME_SERIALIZATION_PHASE6_GAP",
+        format!("{name} and serialization magic hooks are deferred to Phase 6"),
+    )
+}
+
 fn type_error(name: &str, expected: &str, actual: &Value) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_TYPE",
@@ -365,7 +419,7 @@ fn php_gettype(value: &Value) -> &'static str {
         Value::Float(_) => "double",
         Value::String(_) => "string",
         Value::Array(_) => "array",
-        Value::Object(_) => "object",
+        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => "object",
         Value::Callable(_) => "object",
         Value::Reference(_) => "reference",
         Value::Uninitialized => "NULL",
@@ -380,7 +434,7 @@ fn runtime_type_name(value: &Value) -> &'static str {
         Value::Float(_) => "float",
         Value::String(_) => "string",
         Value::Array(_) => "array",
-        Value::Object(_) => "object",
+        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => "object",
         Value::Callable(_) => "callable",
         Value::Reference(_) => "reference",
         Value::Uninitialized => "uninitialized",
@@ -418,6 +472,8 @@ fn write_var_dump_value(output: &mut OutputBuffer, value: &Value, indent: usize)
         Value::Object(object) => {
             output.write_test_str(&format!("object({})\n", object.class_name()))
         }
+        Value::Fiber(_) => output.write_test_str("object(Fiber)\n"),
+        Value::Generator(_) => output.write_test_str("object(Generator)\n"),
         Value::Callable(_) => output.write_test_str("object(Closure)#0 (0) {\n}\n"),
         Value::Reference(_) => output.write_test_str("reference(<placeholder>)\n"),
     }
@@ -515,5 +571,24 @@ mod tests {
             output.to_string_lossy(),
             "NULL\nbool(true)\nint(7)\nstring(2) \"hi\"\narray(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) \"x\"\n}\n"
         );
+    }
+
+    #[test]
+    fn serialization_builtins_report_phase6_gap() {
+        for (name, args) in [
+            ("serialize", vec![Value::Int(1)]),
+            ("unserialize", vec![Value::string("i:1;")]),
+            ("var_export", vec![Value::Int(1)]),
+        ] {
+            let entry = BuiltinRegistry::new().get(name).expect("builtin exists");
+            let mut output = OutputBuffer::new();
+            let mut context = BuiltinContext::new(&mut output);
+            let error = (entry.function())(&mut context, args, RuntimeSourceSpan::default())
+                .expect_err("serialization is a Phase 6 gap");
+            assert_eq!(
+                error.diagnostic_id(),
+                "E_PHP_RUNTIME_SERIALIZATION_PHASE6_GAP"
+            );
+        }
     }
 }

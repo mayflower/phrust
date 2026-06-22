@@ -7,8 +7,9 @@ use crate::diagnostics::{
     DiagnosticId, DiagnosticPhase, DiagnosticReporter, DiagnosticSeverity, SemanticDiagnostic,
 };
 use crate::hir::{
-    DeferredEffects, ExprId, HirCatchClause, HirExpr, HirExprKind, HirIfBranch, HirMatchArm,
-    HirNameResolution, HirStmt, HirStmtKind, HirSwitchCase, ModuleId, QualifiedName, StmtId,
+    DeferredEffects, ExprId, HirCallArg, HirCatchClause, HirExpr, HirExprKind, HirIfBranch,
+    HirMatchArm, HirNameResolution, HirStmt, HirStmtKind, HirSwitchCase, ModuleId, QualifiedName,
+    StmtId,
 };
 use crate::lower::types::TypeLoweringScope;
 use crate::symbols::resolution::{ResolveContext, ResolvedName};
@@ -16,7 +17,7 @@ use php_ast::{
     AstToken, ExprNode, Stmt, TokenView, descendant_tokens, syntax_child_nodes, syntax_child_tokens,
 };
 use php_source::TextRange;
-use php_syntax::{SyntaxNode, SyntaxToken};
+use php_syntax::{SyntaxElement, SyntaxNode, SyntaxToken};
 
 /// Lowers statements and expressions inside one top-level node.
 pub fn collect_hir_in_node(
@@ -236,8 +237,8 @@ impl HirLowerer<'_> {
                         current = previous_child
                             .map(|node| self.lower_expr(node, ResolveContext::FunctionCall));
                     }
-                    let args = self.expr_children(child);
-                    let is_first_class = has_descendant_token_text(child, "...");
+                    let args = self.call_args(child);
+                    let is_first_class = is_first_class_call_expr(child);
                     let kind = if is_first_class {
                         HirExprKind::FirstClassCallable { callee: current }
                     } else if current_node_kind.as_deref() == Some("PROPERTY_FETCH_EXPR") {
@@ -290,11 +291,9 @@ impl HirLowerer<'_> {
                     let member = self
                         .first_expr_child(child, false)
                         .or_else(|| self.static_member_literal(child));
+                    let target = current.or_else(|| self.static_reserved_target_name(child));
                     current = Some(self.alloc_expr(
-                        HirExprKind::StaticAccess {
-                            target: current,
-                            member,
-                        },
+                        HirExprKind::StaticAccess { target, member },
                         cover_child_span(node, child),
                     ));
                     current_node_kind = Some("STATIC_ACCESS_EXPR".to_owned());
@@ -318,6 +317,82 @@ impl HirLowerer<'_> {
             }
         }
         current.unwrap_or_else(|| self.missing_expr(node, "missing expression child"))
+    }
+
+    fn pipe_input_expr(&mut self, node: &SyntaxNode) -> Option<ExprId> {
+        let expressions = self.expr_children(node);
+        let (first, rest) = expressions.split_first()?;
+        let Some((_last, callables)) = rest.split_last() else {
+            return Some(*first);
+        };
+        let mut input = *first;
+        for callable in callables {
+            input = self.alloc_expr(
+                HirExprKind::Pipe {
+                    input: Some(input),
+                    callable: Some(*callable),
+                },
+                node.text_range(),
+            );
+        }
+        Some(input)
+    }
+
+    fn pipe_last_callable_expr(&mut self, node: &SyntaxNode) -> Option<ExprId> {
+        self.expr_children(node).into_iter().last()
+    }
+
+    fn binary_expr_kind(&mut self, node: &SyntaxNode) -> HirExprKind {
+        let operands = self.expr_operands(node, ResolveContext::ConstantFetch);
+        if operands.len() <= 2 {
+            return HirExprKind::Binary {
+                operator: first_operator_text(node).unwrap_or_else(|| "binary".to_owned()),
+                left: operands
+                    .first()
+                    .copied()
+                    .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
+                right: operands
+                    .get(1)
+                    .copied()
+                    .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
+            };
+        }
+
+        let operators = operator_texts(node);
+        let mut left = operands[0];
+        for (index, right) in operands.iter().copied().enumerate().skip(1) {
+            let operator = operators
+                .get(index - 1)
+                .or_else(|| operators.first())
+                .cloned()
+                .unwrap_or_else(|| "binary".to_owned());
+            let span = TextRange::new(
+                self.frontend_span(left)
+                    .map(|span| span.start().to_usize())
+                    .unwrap_or_else(|| node.text_range().start().to_usize()),
+                self.frontend_span(right)
+                    .map(|span| span.end().to_usize())
+                    .unwrap_or_else(|| node.text_range().end().to_usize()),
+            );
+            left = self.alloc_expr(
+                HirExprKind::Binary {
+                    operator,
+                    left: Some(left),
+                    right: Some(right),
+                },
+                span,
+            );
+        }
+
+        self.database
+            .module(self.module_id)
+            .and_then(|module| module.expressions().get(left))
+            .map(|expr| expr.kind().clone())
+            .unwrap_or(HirExprKind::Binary {
+                operator: first_operator_text(node).unwrap_or_else(|| "binary".to_owned()),
+                left: operands.first().copied(),
+                right: operands.get(1).copied(),
+            })
     }
 
     fn expr_kind(&mut self, node: &SyntaxNode, context: ResolveContext) -> HirExprKind {
@@ -363,11 +438,7 @@ impl HirLowerer<'_> {
                     expr: self.first_expr_child(node, true),
                 }
             }
-            Some(ExprNode::Binary(_)) => HirExprKind::Binary {
-                operator: first_operator_text(node).unwrap_or_else(|| "binary".to_owned()),
-                left: self.nth_expr_child(node, 0, true),
-                right: self.nth_expr_child(node, 1, true),
-            },
+            Some(ExprNode::Binary(_)) => self.binary_expr_kind(node),
             Some(ExprNode::Assign(_)) => HirExprKind::Assign {
                 operator: first_assignment_operator_text(node).unwrap_or_else(|| "=".to_owned()),
                 left: self.nth_expr_child(node, 0, true),
@@ -375,12 +446,12 @@ impl HirLowerer<'_> {
             },
             Some(ExprNode::Ternary(_)) => self.ternary_expr_kind(node),
             Some(ExprNode::Call(_)) => {
-                if has_descendant_token_text(node, "...") {
+                if is_first_class_call_expr(node) {
                     HirExprKind::FirstClassCallable { callee: None }
                 } else {
                     HirExprKind::Call {
                         callee: None,
-                        args: self.expr_children(node),
+                        args: self.call_args(node),
                     }
                 }
             }
@@ -398,7 +469,9 @@ impl HirLowerer<'_> {
                 nullsafe: has_descendant_token_text(node, "?->"),
             },
             Some(ExprNode::StaticAccess(_)) => HirExprKind::StaticAccess {
-                target: self.first_expr_child(node, false),
+                target: self
+                    .first_expr_child(node, false)
+                    .or_else(|| self.static_reserved_target_name(node)),
                 member: self
                     .nth_expr_child(node, 1, false)
                     .or_else(|| self.static_member_literal(node)),
@@ -459,7 +532,7 @@ impl HirLowerer<'_> {
             },
             Some(ExprNode::New(_)) => HirExprKind::New {
                 class: self.first_expr_child_with_context(node, ResolveContext::ClassLike),
-                args: self.expr_children(node).into_iter().skip(1).collect(),
+                args: self.new_call_args(node),
             },
             Some(ExprNode::Clone(_)) => HirExprKind::Clone {
                 expr: self.first_expr_child(node, true),
@@ -469,8 +542,8 @@ impl HirLowerer<'_> {
                 replacements: self.expr_children(node).into_iter().skip(1).collect(),
             },
             Some(ExprNode::Pipe(_)) => HirExprKind::Pipe {
-                input: self.nth_expr_child(node, 0, true),
-                callable: self.nth_expr_child(node, 1, true),
+                input: self.pipe_input_expr(node),
+                callable: self.pipe_last_callable_expr(node),
             },
             Some(ExprNode::Expr(_)) => HirExprKind::Unlowered {
                 syntax_kind: node.kind().name(),
@@ -503,7 +576,7 @@ impl HirLowerer<'_> {
                     "eval may define symbols and mutate the current runtime scope",
                 );
                 HirExprKind::Eval {
-                    expr: self.first_expr_child_or_placeholder(node),
+                    expr: Some(self.construct_operand_expr(node)),
                     deferred_effects: DeferredEffects::eval(),
                 }
             }
@@ -512,11 +585,15 @@ impl HirLowerer<'_> {
             },
             "print" => HirExprKind::BuiltinCall {
                 name: keyword,
-                args: self.expr_children(node),
+                args: self.call_args(node),
             },
             "isset" | "empty" => HirExprKind::BuiltinCall {
                 name: keyword,
-                args: vec![self.construct_operand_expr(node)],
+                args: vec![HirCallArg {
+                    name: None,
+                    value: self.construct_operand_expr(node),
+                    unpack: false,
+                }],
             },
             _ => HirExprKind::Unlowered {
                 syntax_kind: node.kind().name(),
@@ -861,6 +938,14 @@ impl HirLowerer<'_> {
         let open = source.find('(')?;
         let close = source.rfind(')')?;
         let mut rest = source[open + 1..close].trim();
+        if is_quoted_construct_operand(rest) {
+            return Some(self.alloc_expr(
+                HirExprKind::Literal {
+                    text: rest.to_owned(),
+                },
+                node.text_range(),
+            ));
+        }
         if !rest.starts_with('$') {
             return None;
         }
@@ -878,25 +963,57 @@ impl HirLowerer<'_> {
             node.text_range(),
         );
         rest = rest[variable_len..].trim();
-        while let Some(after_open) = rest.strip_prefix('[') {
-            let close = after_open.find(']')?;
-            let dim_text = after_open[..close].trim();
-            let dim = (!dim_text.is_empty()).then(|| {
-                self.alloc_expr(
-                    HirExprKind::Literal {
-                        text: dim_text.to_owned(),
+        loop {
+            if let Some(after_open) = rest.strip_prefix('[') {
+                let close = after_open.find(']')?;
+                let dim_text = after_open[..close].trim();
+                let dim = (!dim_text.is_empty()).then(|| {
+                    self.alloc_expr(
+                        HirExprKind::Literal {
+                            text: dim_text.to_owned(),
+                        },
+                        node.text_range(),
+                    )
+                });
+                current = self.alloc_expr(
+                    HirExprKind::DimFetch {
+                        receiver: Some(current),
+                        dim,
                     },
                     node.text_range(),
-                )
-            });
-            current = self.alloc_expr(
-                HirExprKind::DimFetch {
-                    receiver: Some(current),
-                    dim,
-                },
-                node.text_range(),
-            );
-            rest = after_open[close + 1..].trim();
+                );
+                rest = after_open[close + 1..].trim();
+                continue;
+            }
+            if let Some(after_arrow) = rest.strip_prefix("->") {
+                let property_len = after_arrow
+                    .char_indices()
+                    .find_map(|(index, ch)| {
+                        (index > 0 && !(ch == '_' || ch.is_ascii_alphanumeric())).then_some(index)
+                    })
+                    .unwrap_or(after_arrow.len());
+                let property = after_arrow[..property_len].trim();
+                if property.is_empty() {
+                    return None;
+                }
+                let property = self.alloc_expr(
+                    HirExprKind::Literal {
+                        text: property.to_owned(),
+                    },
+                    node.text_range(),
+                );
+                current = self.alloc_expr(
+                    HirExprKind::PropertyFetch {
+                        receiver: Some(current),
+                        property: Some(property),
+                        nullsafe: false,
+                    },
+                    node.text_range(),
+                );
+                rest = after_arrow[property_len..].trim();
+                continue;
+            }
+            break;
         }
         rest.is_empty().then_some(current)
     }
@@ -915,6 +1032,20 @@ impl HirLowerer<'_> {
                     HirExprKind::DimFetch {
                         receiver: *current,
                         dim,
+                    },
+                    node.text_range(),
+                ));
+                return;
+            }
+            "PROPERTY_FETCH_EXPR" => {
+                let property = self
+                    .first_expr_child(node, false)
+                    .or_else(|| self.property_name_literal(node));
+                *current = Some(self.alloc_expr(
+                    HirExprKind::PropertyFetch {
+                        receiver: *current,
+                        property,
+                        nullsafe: has_descendant_token_text(node, "?->"),
                     },
                     node.text_range(),
                 ));
@@ -944,6 +1075,56 @@ impl HirLowerer<'_> {
         syntax_child_nodes(node)
             .filter(|child| ExprNode::cast(child).is_some())
             .map(|child| self.lower_expr(child, ResolveContext::ConstantFetch))
+            .collect()
+    }
+
+    fn call_args(&mut self, node: &SyntaxNode) -> Vec<HirCallArg> {
+        let children = node.children();
+        let mut args = Vec::new();
+        let mut pending_name = None;
+        let mut pending_unpack = false;
+
+        for (index, child) in children.iter().enumerate() {
+            match child {
+                SyntaxElement::Token(token) if token.kind().is_trivia() => {}
+                SyntaxElement::Token(token) if token.text() == "..." => pending_unpack = true,
+                SyntaxElement::Token(token)
+                    if token.kind().name() == "T_STRING"
+                        && next_significant_direct_token_text(children, index + 1).as_deref()
+                            == Some(":") =>
+                {
+                    pending_name = Some(token.text().to_owned());
+                }
+                SyntaxElement::Token(_) => {}
+                SyntaxElement::Node(child) if ExprNode::cast(child).is_some() => {
+                    args.push(HirCallArg {
+                        name: pending_name.take(),
+                        value: self.lower_expr(child, ResolveContext::ConstantFetch),
+                        unpack: pending_unpack,
+                    });
+                    pending_unpack = false;
+                }
+                SyntaxElement::Node(_) => {}
+            }
+        }
+
+        args
+    }
+
+    fn new_call_args(&mut self, node: &SyntaxNode) -> Vec<HirCallArg> {
+        if let Some(call) =
+            syntax_child_nodes(node).find(|child| child.kind().name() == "CALL_EXPR")
+        {
+            return self.call_args(call);
+        }
+        self.expr_children(node)
+            .into_iter()
+            .skip(1)
+            .map(|value| HirCallArg {
+                name: None,
+                value,
+                unpack: false,
+            })
             .collect()
     }
 
@@ -1063,6 +1244,35 @@ impl HirLowerer<'_> {
                 out.push(id);
                 continue;
             }
+            if child.kind().name() == "STATIC_ACCESS_EXPR"
+                && let Some(target) = out.last().copied()
+                && self
+                    .database
+                    .source_map()
+                    .span(target)
+                    .is_some_and(|span| span.end() == child.text_range().start())
+            {
+                let Some(target) = out.pop() else {
+                    continue;
+                };
+                let member = self
+                    .first_expr_child(child, false)
+                    .or_else(|| self.static_member_literal(child));
+                let span = TextRange::new(
+                    self.frontend_span(target)
+                        .map(|span| span.start().to_usize())
+                        .unwrap_or_else(|| child.text_range().start().to_usize()),
+                    child.text_range().end().to_usize(),
+                );
+                out.push(self.alloc_expr(
+                    HirExprKind::StaticAccess {
+                        target: Some(target),
+                        member,
+                    },
+                    span,
+                ));
+                continue;
+            }
             if child.kind().name() == "CALL_EXPR"
                 && let Some(callee) = out.last().copied()
                 && self
@@ -1074,7 +1284,7 @@ impl HirLowerer<'_> {
                 let Some(previous) = out.pop() else {
                     continue;
                 };
-                let args = self.expr_children(child);
+                let args = self.call_args(child);
                 let current_kind = self
                     .database
                     .module(self.module_id)
@@ -1138,6 +1348,38 @@ impl HirLowerer<'_> {
                     token.text_range(),
                 ));
             }
+        }
+        None
+    }
+
+    fn static_reserved_target_name(&mut self, node: &SyntaxNode) -> Option<ExprId> {
+        let mut previous = None::<TokenView<'_>>;
+        for token in
+            descendant_tokens::<TokenView<'_>>(node).filter(|token| !token.kind().is_trivia())
+        {
+            if token.text() == "::" {
+                let token = previous?;
+                let text = token.text();
+                if text.eq_ignore_ascii_case("self")
+                    || text.eq_ignore_ascii_case("parent")
+                    || text.eq_ignore_ascii_case("static")
+                {
+                    return Some(self.alloc_expr(
+                        HirExprKind::Name {
+                            resolution: HirNameResolution::new(
+                                text,
+                                ResolveContext::ConstantFetch.as_str(),
+                                "fully_qualified",
+                                Some(text.to_ascii_lowercase()),
+                                None,
+                            ),
+                        },
+                        token.text_range(),
+                    ));
+                }
+                return None;
+            }
+            previous = Some(token);
         }
         None
     }
@@ -1229,6 +1471,16 @@ fn source_text_no_trivia(node: &SyntaxNode) -> String {
         .join("")
 }
 
+fn is_quoted_construct_operand(text: &str) -> bool {
+    let Some(first) = text.chars().next() else {
+        return false;
+    };
+    if first != '\'' && first != '"' {
+        return false;
+    }
+    text.len() >= 2 && text.ends_with(first)
+}
+
 fn foreach_header_is_by_ref(node: &SyntaxNode) -> bool {
     let mut after_as = false;
     for token in syntax_child_tokens(node).filter(|token| !token.kind().is_trivia()) {
@@ -1259,6 +1511,19 @@ fn first_significant_token_text(node: &SyntaxNode) -> Option<String> {
         .map(|token| token.text().to_owned())
 }
 
+fn next_significant_direct_token_text(children: &[SyntaxElement], start: usize) -> Option<String> {
+    children.iter().skip(start).find_map(|child| match child {
+        SyntaxElement::Token(token) if token.kind().is_trivia() => None,
+        SyntaxElement::Token(token) => Some(token.text().to_owned()),
+        SyntaxElement::Node(_) => None,
+    })
+}
+
+fn is_first_class_call_expr(node: &SyntaxNode) -> bool {
+    let has_argument_expr = syntax_child_nodes(node).any(|child| ExprNode::cast(child).is_some());
+    !has_argument_expr && syntax_child_tokens(node).any(|token| token.text() == "...")
+}
+
 fn first_string_token_after_keyword(node: &SyntaxNode) -> Option<String> {
     syntax_child_tokens(node)
         .filter(|token| !token.kind().is_trivia())
@@ -1270,11 +1535,18 @@ fn first_string_token_after_keyword(node: &SyntaxNode) -> Option<String> {
 fn first_operator_text(node: &SyntaxNode) -> Option<String> {
     syntax_child_tokens(node)
         .filter(|token| !token.kind().is_trivia())
-        .find(|token| {
-            is_operator_token_text(token.text()) || token.kind().name().ends_with("_CAST")
-        })
+        .find(|token| is_operator_token(token))
         .map(SyntaxToken::text)
         .map(str::to_owned)
+}
+
+fn operator_texts(node: &SyntaxNode) -> Vec<String> {
+    syntax_child_tokens(node)
+        .filter(|token| !token.kind().is_trivia())
+        .filter(|token| is_operator_token(token))
+        .map(SyntaxToken::text)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn first_assignment_operator_text(node: &SyntaxNode) -> Option<String> {
@@ -1309,6 +1581,7 @@ fn is_operator_token_text(text: &str) -> bool {
             | "and"
             | "or"
             | "xor"
+            | "instanceof"
             | "!"
             | "~"
             | "=="
@@ -1326,6 +1599,12 @@ fn is_operator_token_text(text: &str) -> bool {
             | "++"
             | "--"
     )
+}
+
+fn is_operator_token(token: &SyntaxToken) -> bool {
+    is_operator_token_text(token.text())
+        || token.kind().name().ends_with("_CAST")
+        || token.kind().name() == "T_INSTANCEOF"
 }
 
 fn has_descendant_token_text(node: &SyntaxNode, text: &str) -> bool {

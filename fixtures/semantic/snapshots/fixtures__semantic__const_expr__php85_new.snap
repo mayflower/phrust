@@ -9,7 +9,7 @@ symbols:
   - class ConstExprPhp85NewTarget
 hir_summary:
   statements: 1
-  expressions: 14
+  expressions: 8
   types: 1
   const_exprs: 3
   class_likes: 1

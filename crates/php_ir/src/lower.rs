@@ -2,26 +2,29 @@
 
 use crate::builder::IrBuilder;
 use crate::constants::IrConstant;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::function::{FunctionFlags, IrCapture, IrParam, IrReturnType};
 use crate::ids::{BlockId, FileId, FunctionId, LocalId, UnitId};
 use crate::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, InstructionKind,
-    UnaryOp,
+    IrCallArg, UnaryOp,
 };
 use crate::module::{
-    ClassEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
-    ClassPropertyFlags, IrUnit,
+    AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
+    ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
+    ClassPropertyFlags, ClassPropertyHooks, IrUnit,
 };
 use crate::operand::Operand;
 use crate::source_map::{IrSourceMapTarget, IrSpan};
 use crate::verify::{VerificationError, verify_unit};
 use php_semantics::hir::{
-    BuiltinType, ClassLikeKind, ClassLikeMemberId, ConstExprContext, ConstValue, ExprId,
-    FunctionSignature, HirCatchClause, HirExprKind, HirIfBranch, HirMatchArm, HirStmtKind,
-    HirSwitchCase, HirTypeKind, MagicMethodKind, NameKind, Parameter, ReturnType, SignatureKind,
-    StmtId, TopLevelItemKind, TypeId, Visibility,
+    AttributeId, AttributeTarget, BuiltinType, ClassLikeId, ClassLikeKind, ClassLikeMemberId,
+    ConstExprContext, ConstExprId, ConstValue, DeclareValue, ExprId, FunctionSignature, HirCallArg,
+    HirCatchClause, HirExprKind, HirIfBranch, HirMatchArm, HirModule, HirNameResolution,
+    HirProperty, HirPropertyHookBody, HirStmtKind, HirSwitchCase, HirTraitAdaptationKind,
+    HirTypeKind, MagicMethodKind, ModifierSet, NameKind, Parameter, ParameterAttribute, ReturnType,
+    SignatureKind, StmtId, TopLevelItemKind, TypeId, Visibility,
 };
 use php_semantics::scopes::CaptureMode;
 use php_semantics::symbols::declarations::DeclarationKind;
@@ -74,6 +77,8 @@ pub enum UnsupportedFeature {
     ByReferenceForeach,
     /// References to array elements require full PHP reference/COW semantics.
     ArrayElementReference,
+    /// References to object properties require property slot/lvalue plumbing.
+    ObjectPropertyReference,
     /// Method calls require a statically-known object and method target.
     MethodCall,
     /// Static method calls require an explicit class name in the MVP.
@@ -121,6 +126,7 @@ impl UnsupportedFeature {
             Self::ArraySpread => "E_PHP_IR_UNSUPPORTED_ARRAY_SPREAD",
             Self::ByReferenceForeach => "E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH",
             Self::ArrayElementReference => "E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE",
+            Self::ObjectPropertyReference => "E_PHP_IR_UNSUPPORTED_PROPERTY_REFERENCE",
             Self::MethodCall => "E_PHP_IR_UNSUPPORTED_METHOD_CALL",
             Self::LateStaticBinding => "E_PHP_IR_UNSUPPORTED_LATE_STATIC_BINDING",
             Self::StaticProperty => "E_PHP_IR_UNSUPPORTED_STATIC_PROPERTY",
@@ -257,6 +263,12 @@ struct CaptureSpec {
     by_ref: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StaticLocalSpec {
+    name: String,
+    initializer: Option<ExprId>,
+}
+
 #[derive(Clone, Debug)]
 struct DimAssignmentTarget {
     local: LocalId,
@@ -271,6 +283,18 @@ struct PropertyAssignmentTarget {
 }
 
 #[derive(Clone, Debug)]
+struct StaticPropertyTarget {
+    class_name: String,
+    property: String,
+}
+
+#[derive(Clone, Debug)]
+struct ClassConstantTarget {
+    class_name: String,
+    constant: String,
+}
+
+#[derive(Clone, Debug)]
 struct MethodCallTarget {
     receiver: ExprId,
     method: String,
@@ -282,6 +306,56 @@ struct StaticMethodCallTarget {
     method: String,
 }
 
+#[derive(Clone, Debug)]
+struct TraitMethodCandidate {
+    trait_name: String,
+    display_trait_name: String,
+    method_name: String,
+    display_method_name: String,
+    signature: FunctionSignature,
+    flags: ClassMethodFlags,
+}
+
+#[derive(Clone, Debug)]
+struct TraitAliasSpec {
+    trait_name: Option<String>,
+    method_name: String,
+    alias: Option<String>,
+    visibility: Option<TraitVisibility>,
+}
+
+struct TraitCompositionInput<'a> {
+    module: &'a HirModule,
+    trait_class_likes: &'a HashMap<String, (ClassLikeId, php_semantics::hir::HirClassLike)>,
+    class_like_id: ClassLikeId,
+    class_like: &'a php_semantics::hir::HirClassLike,
+    class_name: &'a str,
+    display_class_name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraitVisibility {
+    Public,
+    Protected,
+    Private,
+}
+
+impl TraitVisibility {
+    fn from_text(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "public" => Some(Self::Public),
+            "protected" => Some(Self::Protected),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
+
+    fn apply(self, flags: &mut ClassMethodFlags) {
+        flags.is_private = self == Self::Private;
+        flags.is_protected = self == Self::Protected;
+    }
+}
+
 /// Lowers a Phase 3 frontend result into a minimal Phase 4 IR unit.
 #[must_use]
 pub fn lower_frontend_result(
@@ -289,6 +363,12 @@ pub fn lower_frontend_result(
     options: LoweringOptions,
 ) -> LoweringResult {
     let mut builder = IrBuilder::new(options.unit_id);
+    let strict_types = frontend
+        .database()
+        .module(frontend.module().module_id())
+        .and_then(|module| module.file_directives().strict_types())
+        .is_some_and(|directive| matches!(directive.value(), DeclareValue::Int(1)));
+    builder.set_strict_types(strict_types);
     let file = builder.add_file(options.source_path.clone());
     let module_span = frontend
         .database()
@@ -420,10 +500,37 @@ impl LoweringContext<'_> {
             .iter()
             .map(|(id, class_like)| (id, class_like.clone()))
             .collect::<Vec<_>>();
+        let trait_class_likes = class_likes
+            .iter()
+            .filter(|(_, class_like)| class_like.kind() == ClassLikeKind::Trait)
+            .filter_map(|(id, class_like)| {
+                let name = class_like
+                    .fqn()
+                    .map(|name| name.canonical(NameKind::ClassLike))
+                    .or_else(|| class_like.name().map(normalize_class_name))?;
+                Some((name, (*id, class_like.clone())))
+            })
+            .collect::<HashMap<_, _>>();
+        let declared_class_likes = class_likes
+            .iter()
+            .filter_map(|(_, class_like)| {
+                class_like
+                    .fqn()
+                    .map(|name| name.canonical(NameKind::ClassLike))
+                    .or_else(|| class_like.name().map(normalize_class_name))
+                    .map(|name| normalize_class_name(&name))
+            })
+            .collect::<HashSet<_>>();
+        self.push_internal_interfaces(builder, &declared_class_likes);
         for (class_like_id, class_like) in class_likes {
-            if class_like.kind() != ClassLikeKind::Class {
+            if !matches!(
+                class_like.kind(),
+                ClassLikeKind::Class | ClassLikeKind::Interface | ClassLikeKind::Enum
+            ) {
+                if class_like.kind() == ClassLikeKind::Trait {
+                    continue;
+                }
                 let feature = match class_like.kind() {
-                    ClassLikeKind::Trait => UnsupportedFeature::TraitRuntime,
                     ClassLikeKind::Enum => UnsupportedFeature::EnumRuntime,
                     _ => UnsupportedFeature::ClassLikeObject,
                 };
@@ -460,9 +567,84 @@ impl LoweringContext<'_> {
                 self.file,
                 self.span_for(SourceMappedId::from(class_like_id)),
             );
+            let parent = class_like.extends().first().map(|name| {
+                normalize_class_name(
+                    name.resolved()
+                        .or_else(|| name.fallback())
+                        .unwrap_or_else(|| name.source()),
+                )
+            });
+            let parent = (class_like.kind() == ClassLikeKind::Class)
+                .then_some(parent)
+                .flatten();
+            let mut interfaces: Vec<String> = if class_like.kind() == ClassLikeKind::Interface {
+                class_like
+                    .extends()
+                    .iter()
+                    .map(interface_resolution_name)
+                    .collect()
+            } else {
+                class_like
+                    .implements()
+                    .iter()
+                    .map(interface_resolution_name)
+                    .collect()
+            };
+            if class_like.kind() == ClassLikeKind::Enum {
+                interfaces.push(normalize_class_name("UnitEnum"));
+                if class_like.backing_type().is_some() {
+                    interfaces.push(normalize_class_name("BackedEnum"));
+                }
+            }
             let mut methods = Vec::new();
             let mut properties = Vec::new();
+            let mut constants = Vec::new();
+            let mut enum_cases = Vec::new();
+            let enum_backing_type = self.lower_enum_backing_type(&class_like);
+            if class_like.kind() == ClassLikeKind::Enum {
+                properties.push(ClassPropertyEntry {
+                    name: "name".to_owned(),
+                    default: None,
+                    type_: Some(IrReturnType::String),
+                    flags: ClassPropertyFlags {
+                        is_readonly: true,
+                        is_typed: true,
+                        ..ClassPropertyFlags::default()
+                    },
+                    hooks: ClassPropertyHooks::default(),
+                    attributes: Vec::new(),
+                });
+                if let Some(backing_type) = enum_backing_type {
+                    properties.push(ClassPropertyEntry {
+                        name: "value".to_owned(),
+                        default: None,
+                        type_: Some(match backing_type {
+                            ClassEnumBackingType::Int => IrReturnType::Int,
+                            ClassEnumBackingType::String => IrReturnType::String,
+                        }),
+                        flags: ClassPropertyFlags {
+                            is_readonly: true,
+                            is_typed: true,
+                            ..ClassPropertyFlags::default()
+                        },
+                        hooks: ClassPropertyHooks::default(),
+                        attributes: Vec::new(),
+                    });
+                }
+            }
             let mut constructor = None;
+            self.compose_trait_methods(
+                builder,
+                TraitCompositionInput {
+                    module,
+                    trait_class_likes: &trait_class_likes,
+                    class_like_id,
+                    class_like: &class_like,
+                    class_name: &name,
+                    display_class_name: &display_class_name,
+                },
+                &mut methods,
+            );
             for member in class_like.members() {
                 match member.id() {
                     Some(ClassLikeMemberId::Method(method_id)) => {
@@ -476,15 +658,14 @@ impl LoweringContext<'_> {
                             .name()
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| method_name.clone());
-                        if method.modifiers().visibility().is_some_and(|visibility| {
-                            matches!(visibility, Visibility::Private | Visibility::Protected)
-                        }) || method.modifiers().is_abstract()
+                        if method.modifiers().is_abstract()
+                            && class_like.kind() != ClassLikeKind::Interface
                         {
                             self.unsupported(
                                 UnsupportedFeature::ObjectMethodModifier,
                                 self.span_for(SourceMappedId::from(method_id)),
                                 format!(
-                                    "method `{method_name}` uses visibility or abstract modifiers outside the Prompt 27 public method MVP"
+                                    "method `{method_name}` is abstract outside the Prompt 16 concrete method MVP"
                                 ),
                             );
                         }
@@ -522,8 +703,10 @@ impl LoweringContext<'_> {
                         if method.magic_kind() == Some(MagicMethodKind::Construct) {
                             constructor = Some(function);
                         }
+                        methods.retain(|entry| normalize_method_name(&entry.name) != method_name);
                         methods.push(ClassMethodEntry {
                             name: method_name,
+                            origin_class: name.clone(),
                             function,
                             flags: ClassMethodFlags {
                                 is_static: method.modifiers().is_static(),
@@ -536,37 +719,30 @@ impl LoweringContext<'_> {
                                     .visibility()
                                     .is_some_and(|visibility| visibility == Visibility::Protected),
                                 is_abstract: method.modifiers().is_abstract(),
+                                is_final: method.modifiers().is_final(),
                             },
+                            attributes: self.lower_attribute_ids(builder, method.attributes()),
                         });
                     }
                     Some(ClassLikeMemberId::Property(property_id)) => {
                         let Some(property) = module.properties().get(property_id) else {
                             continue;
                         };
-                        if property.modifiers().is_static()
-                            || property.modifiers().is_readonly()
-                            || property.modifiers().visibility().is_some_and(|visibility| {
-                                matches!(visibility, Visibility::Private | Visibility::Protected)
-                            })
-                        {
-                            self.unsupported(
-                                UnsupportedFeature::ObjectPropertyModifier,
-                                self.span_for(SourceMappedId::from(property_id)),
-                                "property uses modifiers outside the Prompt 30 public instance-property MVP",
-                            );
-                        }
-                        if !property.hooks().is_empty() {
-                            self.unsupported(
-                                UnsupportedFeature::PropertyHooks,
-                                self.span_for(SourceMappedId::from(property_id)),
-                                "property hooks are not executable in the Prompt 31 known-gap layer",
-                            );
-                        }
                         let property_type = self.lower_runtime_type(property.type_id());
+                        let hooks = self.lower_property_hooks(
+                            builder,
+                            &name,
+                            &display_class_name,
+                            property,
+                        );
+                        let set_visibility = property.modifiers().set_visibility();
                         for item in property.items() {
+                            let default = self
+                                .lower_property_default(item.default())
+                                .map(|constant| builder.intern_constant(constant));
                             properties.push(ClassPropertyEntry {
                                 name: local_name(item.name()).to_owned(),
-                                default: None,
+                                default,
                                 type_: property_type.clone(),
                                 flags: ClassPropertyFlags {
                                     is_static: property.modifiers().is_static(),
@@ -576,41 +752,130 @@ impl LoweringContext<'_> {
                                     is_protected: property.modifiers().visibility().is_some_and(
                                         |visibility| visibility == Visibility::Protected,
                                     ),
+                                    set_is_private: set_visibility.is_some_and(|visibility| {
+                                        visibility == Visibility::Private
+                                    }),
+                                    set_is_protected: set_visibility.is_some_and(|visibility| {
+                                        visibility == Visibility::Protected
+                                    }),
                                     is_readonly: property.modifiers().is_readonly(),
                                     is_typed: property.type_id().is_some(),
                                 },
+                                hooks: hooks.clone(),
+                                attributes: self
+                                    .lower_attribute_ids(builder, property.attributes()),
                             });
                         }
                     }
-                    Some(ClassLikeMemberId::TraitUse(trait_use_id)) => {
-                        self.unsupported(
-                            UnsupportedFeature::TraitRuntime,
-                            self.span_for(SourceMappedId::from(trait_use_id)),
-                            "trait use composition is not executable in the Prompt 31 known-gap layer",
-                        );
+                    Some(ClassLikeMemberId::ClassConstant(const_id)) => {
+                        let Some(constant) = module.class_consts().get(const_id) else {
+                            continue;
+                        };
+                        let Some(constant_name) = constant.name().map(ToOwned::to_owned) else {
+                            continue;
+                        };
+                        let value = self
+                            .lower_class_constant_value(constant.value())
+                            .map(|constant| builder.intern_constant(constant));
+                        constants.push(ClassConstantEntry {
+                            name: constant_name,
+                            value,
+                            flags: ClassConstantFlags {
+                                is_private: constant
+                                    .modifiers()
+                                    .visibility()
+                                    .is_some_and(|visibility| visibility == Visibility::Private),
+                                is_protected: constant
+                                    .modifiers()
+                                    .visibility()
+                                    .is_some_and(|visibility| visibility == Visibility::Protected),
+                            },
+                            attributes: self.lower_attribute_ids(builder, constant.attributes()),
+                        });
                     }
+                    Some(ClassLikeMemberId::TraitUse(_trait_use_id)) => {}
                     Some(ClassLikeMemberId::EnumCase(enum_case_id)) => {
-                        self.unsupported(
-                            UnsupportedFeature::EnumRuntime,
-                            self.span_for(SourceMappedId::from(enum_case_id)),
-                            "enum cases are not executable in the Prompt 31 known-gap layer",
-                        );
+                        let Some(enum_case) = module.enum_cases().get(enum_case_id) else {
+                            continue;
+                        };
+                        let Some(case_name) = enum_case.name().map(ToOwned::to_owned) else {
+                            continue;
+                        };
+                        let value = self
+                            .lower_enum_case_value(enum_case.value())
+                            .map(|constant| builder.intern_constant(constant));
+                        enum_cases.push(ClassEnumCaseEntry {
+                            name: case_name,
+                            value,
+                            attributes: self.lower_attribute_ids(builder, enum_case.attributes()),
+                        });
                     }
                     _ => {}
                 }
             }
+            let attributes = self.lower_attribute_ids(builder, class_like.attributes());
             builder.push_class(ClassEntry {
                 id: crate::ids::ClassId::new(0),
                 name,
+                display_name: display_class_name,
+                parent,
+                interfaces,
                 methods,
                 properties,
+                constants,
+                enum_cases,
+                attributes,
+                enum_backing_type,
                 constructor,
                 flags: ClassFlags {
                     is_abstract: class_like.modifiers().is_abstract(),
-                    is_final: class_like.modifiers().is_final(),
+                    is_final: class_like.modifiers().is_final()
+                        || class_like.kind() == ClassLikeKind::Enum,
                     is_readonly: class_like.modifiers().is_readonly(),
+                    is_interface: class_like.kind() == ClassLikeKind::Interface,
+                    is_enum: class_like.kind() == ClassLikeKind::Enum,
                 },
                 span,
+            });
+        }
+    }
+
+    fn push_internal_interfaces(&mut self, builder: &mut IrBuilder, declared: &HashSet<String>) {
+        for (name, interfaces) in [
+            ("Traversable", Vec::new()),
+            ("Iterator", vec!["traversable".to_owned()]),
+            ("IteratorAggregate", vec!["traversable".to_owned()]),
+            ("ArrayAccess", Vec::new()),
+            ("Throwable", Vec::new()),
+            ("UnitEnum", Vec::new()),
+            ("BackedEnum", Vec::new()),
+            ("Stringable", Vec::new()),
+        ] {
+            let normalized = normalize_class_name(name);
+            if declared.contains(&normalized) {
+                continue;
+            }
+            builder.push_class(ClassEntry {
+                id: crate::ids::ClassId::new(0),
+                name: normalized,
+                display_name: name.to_owned(),
+                parent: None,
+                interfaces,
+                methods: Vec::new(),
+                properties: Vec::new(),
+                constants: Vec::new(),
+                enum_cases: Vec::new(),
+                attributes: Vec::new(),
+                enum_backing_type: None,
+                constructor: None,
+                flags: ClassFlags {
+                    is_abstract: true,
+                    is_final: false,
+                    is_readonly: false,
+                    is_interface: true,
+                    is_enum: false,
+                },
+                span: IrSpan::default(),
             });
         }
     }
@@ -633,6 +898,12 @@ impl LoweringContext<'_> {
             },
             span,
         );
+        let attributes = self.lower_attributes_for_target_span(
+            builder,
+            AttributeTarget::Method,
+            signature.span(),
+        );
+        builder.set_function_attributes(function, attributes);
         self.class_names
             .insert(function, display_class_name.to_owned());
         self.method_names
@@ -666,6 +937,7 @@ impl LoweringContext<'_> {
                     "method parameter default is not a folded Phase 3 constant expression",
                 );
             }
+            let attributes = self.lower_parameter_attributes(builder, param.attributes());
             builder.push_param(
                 function,
                 IrParam {
@@ -676,6 +948,7 @@ impl LoweringContext<'_> {
                     type_: self.lower_runtime_type(param.type_id()),
                     by_ref: param.flags().is_by_ref(),
                     variadic: param.flags().is_variadic(),
+                    attributes,
                 },
             );
         }
@@ -695,6 +968,358 @@ impl LoweringContext<'_> {
             builder.terminate_return(function, current, None, span);
         }
         function
+    }
+
+    fn lower_property_hooks(
+        &mut self,
+        builder: &mut IrBuilder,
+        class_name: &str,
+        display_class_name: &str,
+        property: &HirProperty,
+    ) -> ClassPropertyHooks {
+        let mut hooks = ClassPropertyHooks {
+            backed: self.property_hooks_use_backing_storage(property),
+            ..ClassPropertyHooks::default()
+        };
+        for hook in property.hooks() {
+            let span = span_from_range(self.file, hook.span());
+            let function = builder.start_function(
+                format!(
+                    "{class_name}::${}::{}",
+                    property.items()[0].name(),
+                    hook.kind()
+                ),
+                FunctionFlags {
+                    is_method: true,
+                    ..FunctionFlags::default()
+                },
+                span,
+            );
+            self.class_names
+                .insert(function, display_class_name.to_owned());
+            self.method_names.insert(
+                function,
+                format!("${}::{}", property.items()[0].name(), hook.kind()),
+            );
+            self.function_names.insert(
+                function,
+                format!(
+                    "{display_class_name}::${}::{}",
+                    property.items()[0].name(),
+                    hook.kind()
+                ),
+            );
+            builder.intern_local(function, "this");
+            if hook.kind() == "set" {
+                let local = builder.intern_local(function, "value");
+                builder.push_param(
+                    function,
+                    IrParam {
+                        name: "value".to_owned(),
+                        local,
+                        required: true,
+                        default: None,
+                        type_: self.lower_runtime_type(property.type_id()),
+                        by_ref: false,
+                        variadic: false,
+                        attributes: Vec::new(),
+                    },
+                );
+            } else {
+                builder.set_return_type(function, self.lower_runtime_type(property.type_id()));
+            }
+            builder.add_source_map(
+                IrSourceMapTarget::Function { function },
+                format!(
+                    "hir:property-hook:{class_name}::${}:{}",
+                    property.items()[0].name(),
+                    hook.kind()
+                ),
+                span,
+            );
+            let block = builder.append_block(function);
+            builder.add_source_map(
+                IrSourceMapTarget::Block { function, block },
+                format!(
+                    "hir:property-hook:{class_name}::${}:{}:body",
+                    property.items()[0].name(),
+                    hook.kind()
+                ),
+                span,
+            );
+            let current = match hook.body() {
+                HirPropertyHookBody::Expression => {
+                    if let Some(expr) = self.outermost_expr_inside(hook.span()) {
+                        if hook.kind() == "get" {
+                            if let Some(value) =
+                                self.lower_expr_to_register(builder, function, block, expr)
+                            {
+                                builder.terminate_return(
+                                    function,
+                                    value.block,
+                                    Some(Operand::Register(value.register)),
+                                    span,
+                                );
+                                value.block
+                            } else {
+                                block
+                            }
+                        } else {
+                            self.lower_expr_stmt(builder, function, block, expr)
+                        }
+                    } else {
+                        block
+                    }
+                }
+                HirPropertyHookBody::Block => self.lower_stmt_list(
+                    builder,
+                    function,
+                    block,
+                    self.statement_ids_inside(hook.span()),
+                ),
+            };
+            if !builder.is_terminated(function, current) {
+                builder.terminate_return(function, current, None, span);
+            }
+            match hook.kind() {
+                "get" => hooks.get = Some(function),
+                "set" => hooks.set = Some(function),
+                _ => {}
+            }
+        }
+        hooks
+    }
+
+    fn compose_trait_methods(
+        &mut self,
+        builder: &mut IrBuilder,
+        input: TraitCompositionInput<'_>,
+        methods: &mut Vec<ClassMethodEntry>,
+    ) {
+        let TraitCompositionInput {
+            module,
+            trait_class_likes,
+            class_like_id,
+            class_like,
+            class_name,
+            display_class_name,
+        } = input;
+        let mut candidates = Vec::<TraitMethodCandidate>::new();
+        let mut removed = HashSet::<(String, String)>::new();
+        let mut aliases = Vec::<TraitAliasSpec>::new();
+
+        for member in class_like.members() {
+            let Some(ClassLikeMemberId::TraitUse(trait_use_id)) = member.id() else {
+                continue;
+            };
+            let Some(trait_use) = module.trait_uses().get(trait_use_id) else {
+                continue;
+            };
+            for trait_name in trait_use.traits() {
+                let trait_name = trait_resolution_name(trait_name);
+                let Some((_trait_id, trait_class_like)) = trait_class_likes.get(&trait_name) else {
+                    self.unsupported(
+                        UnsupportedFeature::TraitRuntime,
+                        self.span_for(SourceMappedId::from(trait_use_id)),
+                        format!(
+                            "E_PHP_IR_TRAIT_NOT_FOUND: trait {trait_name} used by {class_name} is not declared"
+                        ),
+                    );
+                    continue;
+                };
+                self.collect_trait_method_candidates(
+                    module,
+                    trait_class_like,
+                    &trait_name,
+                    &mut candidates,
+                );
+            }
+            for adaptation in trait_use.adaptations() {
+                let method_name = normalize_method_name(adaptation.method().method());
+                let trait_name = adaptation.method().trait_name().map(trait_resolution_name);
+                match adaptation.kind() {
+                    HirTraitAdaptationKind::Precedence { instead_of } => {
+                        for excluded in instead_of {
+                            removed.insert((trait_resolution_name(excluded), method_name.clone()));
+                        }
+                    }
+                    HirTraitAdaptationKind::Alias { alias, visibility } => {
+                        aliases.push(TraitAliasSpec {
+                            trait_name,
+                            method_name,
+                            alias: alias.clone(),
+                            visibility: visibility.as_deref().and_then(TraitVisibility::from_text),
+                        });
+                    }
+                }
+            }
+        }
+
+        for alias in &aliases {
+            if alias.alias.is_none() {
+                for candidate in &mut candidates {
+                    if trait_alias_matches(alias, candidate)
+                        && !removed.contains(&(
+                            normalize_class_name(&candidate.trait_name),
+                            normalize_method_name(&candidate.method_name),
+                        ))
+                        && let Some(visibility) = alias.visibility
+                    {
+                        visibility.apply(&mut candidate.flags);
+                    }
+                }
+            }
+        }
+
+        let mut composed = candidates
+            .into_iter()
+            .filter(|candidate| {
+                !removed.contains(&(
+                    normalize_class_name(&candidate.trait_name),
+                    normalize_method_name(&candidate.method_name),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        for alias in aliases.into_iter().filter(|alias| alias.alias.is_some()) {
+            let alias_name = alias.alias.clone().unwrap_or_default();
+            let matching = composed
+                .iter()
+                .filter(|candidate| trait_alias_matches(&alias, candidate))
+                .cloned()
+                .collect::<Vec<_>>();
+            for mut candidate in matching {
+                candidate.method_name = normalize_method_name(&alias_name);
+                candidate.display_method_name = alias_name.clone();
+                if let Some(visibility) = alias.visibility {
+                    visibility.apply(&mut candidate.flags);
+                }
+                composed.push(candidate);
+            }
+        }
+
+        let mut method_to_origins = HashMap::<String, Vec<String>>::new();
+        for candidate in &composed {
+            method_to_origins
+                .entry(normalize_method_name(&candidate.method_name))
+                .or_default()
+                .push(candidate.trait_name.clone());
+        }
+        for (method, origins) in method_to_origins {
+            let unique_origins = origins
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if unique_origins.len() > 1 {
+                self.unsupported(
+                    UnsupportedFeature::TraitRuntime,
+                    self.span_for(SourceMappedId::from(class_like_id)),
+                    format!(
+                        "E_PHP_IR_TRAIT_METHOD_CONFLICT: method {method} is provided by {}",
+                        unique_origins.join(", ")
+                    ),
+                );
+                composed
+                    .retain(|candidate| normalize_method_name(&candidate.method_name) != method);
+            }
+        }
+
+        for candidate in composed {
+            let function = self.lower_method_function(
+                builder,
+                class_name,
+                &candidate.method_name,
+                display_class_name,
+                &candidate.display_method_name,
+                &candidate.signature,
+            );
+            let attributes = self.lower_attributes_for_target_span(
+                builder,
+                AttributeTarget::Method,
+                candidate.signature.span(),
+            );
+            methods.push(ClassMethodEntry {
+                name: candidate.method_name,
+                origin_class: candidate.display_trait_name,
+                function,
+                flags: candidate.flags,
+                attributes,
+            });
+        }
+    }
+
+    fn collect_trait_method_candidates(
+        &mut self,
+        module: &HirModule,
+        trait_class_like: &php_semantics::hir::HirClassLike,
+        trait_name: &str,
+        candidates: &mut Vec<TraitMethodCandidate>,
+    ) {
+        let display_trait_name = trait_class_like
+            .name()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| trait_name.to_owned());
+        for member in trait_class_like.members() {
+            match member.id() {
+                Some(ClassLikeMemberId::Method(method_id)) => {
+                    let Some(method) = module.methods().get(method_id).cloned() else {
+                        continue;
+                    };
+                    let Some(method_name) = method.name().map(normalize_method_name) else {
+                        continue;
+                    };
+                    let Some(signature) = method
+                        .signature_index()
+                        .and_then(|index| module.signatures().get(index))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    if signature.flags().is_generator() {
+                        self.unsupported(
+                            UnsupportedFeature::Generator,
+                            signature.span(),
+                            "generator trait methods are not executable in the Prompt 19 trait MVP",
+                        );
+                        continue;
+                    }
+                    candidates.push(TraitMethodCandidate {
+                        trait_name: normalize_class_name(trait_name),
+                        display_trait_name: display_trait_name.clone(),
+                        method_name,
+                        display_method_name: method
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| member.name().unwrap_or("method").to_owned()),
+                        signature,
+                        flags: class_method_flags_from_modifiers(method.modifiers()),
+                    });
+                }
+                Some(ClassLikeMemberId::Property(property_id)) => {
+                    self.unsupported(
+                        UnsupportedFeature::TraitRuntime,
+                        self.span_for(SourceMappedId::from(property_id)),
+                        "trait properties are not executable in the Prompt 19 trait-method composition layer",
+                    );
+                }
+                Some(ClassLikeMemberId::ClassConstant(const_id)) => {
+                    self.unsupported(
+                        UnsupportedFeature::TraitRuntime,
+                        self.span_for(SourceMappedId::from(const_id)),
+                        "trait constants are not executable in the Prompt 19 trait-method composition layer",
+                    );
+                }
+                Some(ClassLikeMemberId::TraitUse(trait_use_id)) => {
+                    self.unsupported(
+                        UnsupportedFeature::TraitRuntime,
+                        self.span_for(SourceMappedId::from(trait_use_id)),
+                        "nested trait uses are not executable in the Prompt 19 trait-method composition layer",
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     fn global_const_initializers(&self) -> Vec<Option<IrConstant>> {
@@ -741,35 +1366,31 @@ impl LoweringContext<'_> {
             let Some(name) = signature.name() else {
                 continue;
             };
-            if signature.flags().is_generator() {
-                continue;
-            }
-            if signature.by_ref_return() {
-                self.unsupported(
-                    UnsupportedFeature::ByReferenceReturn,
-                    signature.span(),
-                    "by-reference returns are recorded but rejected by the Prompt 23 VM",
-                );
-                continue;
-            }
             let span = span_from_range(self.file, signature.span());
-            let function = builder.start_function(name, FunctionFlags::default(), span);
+            let function = builder.start_function(
+                name,
+                FunctionFlags {
+                    is_generator: signature.flags().is_generator(),
+                    ..FunctionFlags::default()
+                },
+                span,
+            );
+            let attributes = self.lower_attributes_for_target_span(
+                builder,
+                AttributeTarget::Function,
+                signature.span(),
+            );
+            builder.set_function_attributes(function, attributes);
             self.function_names.insert(function, name.to_string());
             builder.register_function_name(normalize_function_name(name), function);
             builder.set_return_type(function, self.lower_return_type(signature.return_type()));
+            builder.set_returns_by_ref(function, signature.by_ref_return());
             builder.add_source_map(
                 IrSourceMapTarget::Function { function },
                 format!("hir:function:{name}"),
                 span,
             );
             for param in signature.parameters() {
-                if param.flags().is_by_ref() {
-                    self.unsupported(
-                        UnsupportedFeature::ByReferenceParameter,
-                        param.span(),
-                        "by-reference parameters are recorded but rejected by the Prompt 15 VM",
-                    );
-                }
                 let local_name = local_name(param.name()).to_owned();
                 let local = builder.intern_local(function, &local_name);
                 let default = self.lower_param_default(param);
@@ -780,6 +1401,7 @@ impl LoweringContext<'_> {
                         "parameter default is not a folded Phase 3 constant expression",
                     );
                 }
+                let attributes = self.lower_parameter_attributes(builder, param.attributes());
                 builder.push_param(
                     function,
                     IrParam {
@@ -790,6 +1412,7 @@ impl LoweringContext<'_> {
                         type_: self.lower_runtime_type(param.type_id()),
                         by_ref: param.flags().is_by_ref(),
                         variadic: param.flags().is_variadic(),
+                        attributes,
                     },
                 );
             }
@@ -815,25 +1438,213 @@ impl LoweringContext<'_> {
             .frontend
             .database()
             .module(self.frontend.module().module_id())?;
-        module.const_exprs().iter().find_map(|(id, const_expr)| {
-            if const_expr.context() != ConstExprContext::ParameterDefault
+        module
+            .const_exprs()
+            .iter()
+            .find_map(|(id, const_expr)| {
+                if const_expr.context() != ConstExprContext::ParameterDefault
+                    || !const_expr.is_allowed()
+                {
+                    return None;
+                }
+                let span = self.frontend.database().source_map().span(id)?;
+                if !range_contains(default.span(), span) {
+                    return None;
+                }
+                if let Some(value) = const_expr.folded_value() {
+                    return ir_constant_from_const_value(value);
+                }
+                let expr = module.expressions().get(const_expr.expr_id())?;
+                match expr.kind() {
+                    HirExprKind::Literal { text } => literal_constant(text),
+                    _ => None,
+                }
+            })
+            .or_else(|| {
+                self.source_text
+                    .as_str()
+                    .get(default.span().start().to_usize()..default.span().end().to_usize())
+                    .and_then(literal_constant)
+            })
+    }
+
+    fn lower_property_default(&self, default: Option<ConstExprId>) -> Option<IrConstant> {
+        let default = default?;
+        self.lower_const_expr_value(default, |context| {
+            matches!(
+                context,
+                ConstExprContext::PropertyDefault | ConstExprContext::PromotedPropertyDefault
+            )
+        })
+    }
+
+    fn lower_class_constant_value(&self, value: Option<ConstExprId>) -> Option<IrConstant> {
+        let value = value?;
+        self.lower_const_expr_value(value, |context| {
+            matches!(context, ConstExprContext::ClassConstInitializer)
+        })
+    }
+
+    fn lower_enum_case_value(&self, value: Option<ConstExprId>) -> Option<IrConstant> {
+        let value = value?;
+        self.lower_const_expr_value(value, |context| {
+            matches!(context, ConstExprContext::EnumCaseBackingValue)
+        })
+    }
+
+    fn lower_enum_backing_type(
+        &self,
+        class_like: &php_semantics::hir::HirClassLike,
+    ) -> Option<ClassEnumBackingType> {
+        let type_id = class_like.backing_type()?;
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let ty = module.types().get(type_id)?;
+        match ty.kind() {
+            HirTypeKind::Builtin(BuiltinType::Int) => Some(ClassEnumBackingType::Int),
+            HirTypeKind::Builtin(BuiltinType::String) => Some(ClassEnumBackingType::String),
+            _ => None,
+        }
+    }
+
+    fn lower_attribute_ids(
+        &self,
+        builder: &mut IrBuilder,
+        ids: &[AttributeId],
+    ) -> Vec<AttributeEntry> {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter_map(|id| {
+                let attribute = module.attributes().get(*id)?;
+                let span = span_from_range(self.file, self.span_for(SourceMappedId::from(*id)));
+                let arguments = attribute
+                    .args()
+                    .iter()
+                    .filter_map(|expr| self.lower_attribute_argument(*expr))
+                    .map(|constant| builder.intern_constant(constant))
+                    .collect();
+                Some(AttributeEntry {
+                    name: attribute.name().source().to_owned(),
+                    resolved_name: attribute.name().resolved().map(ToOwned::to_owned),
+                    fallback_name: attribute.name().fallback().map(ToOwned::to_owned),
+                    arguments,
+                    repeated_on_target: attribute.is_repeated_on_target(),
+                    span,
+                })
+            })
+            .collect()
+    }
+
+    fn lower_parameter_attributes(
+        &self,
+        builder: &mut IrBuilder,
+        parameter_attributes: &[ParameterAttribute],
+    ) -> Vec<AttributeEntry> {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return Vec::new();
+        };
+        let ids: Vec<_> = module
+            .attributes()
+            .iter()
+            .filter_map(|(id, attribute)| {
+                if attribute.target() != AttributeTarget::Parameter {
+                    return None;
+                }
+                let span = self.frontend.database().source_map().span(id)?;
+                parameter_attributes
+                    .iter()
+                    .any(|parameter_attribute| range_contains(parameter_attribute.span(), span))
+                    .then_some(id)
+            })
+            .collect();
+        self.lower_attribute_ids(builder, &ids)
+    }
+
+    fn lower_attributes_for_target_span(
+        &self,
+        builder: &mut IrBuilder,
+        target: AttributeTarget,
+        span: TextRange,
+    ) -> Vec<AttributeEntry> {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return Vec::new();
+        };
+        let ids: Vec<_> = module
+            .attributes()
+            .iter()
+            .filter_map(|(id, attribute)| {
+                if attribute.target() != target {
+                    return None;
+                }
+                let attribute_span = self.frontend.database().source_map().span(id)?;
+                range_contains(span, attribute_span).then_some(id)
+            })
+            .collect();
+        self.lower_attribute_ids(builder, &ids)
+    }
+
+    fn lower_attribute_argument(&self, expr_id: ExprId) -> Option<IrConstant> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        module.const_exprs().iter().find_map(|(_, const_expr)| {
+            if const_expr.context() != ConstExprContext::AttributeArgument
+                || const_expr.expr_id() != expr_id
                 || !const_expr.is_allowed()
             {
-                return None;
-            }
-            let span = self.frontend.database().source_map().span(id)?;
-            if !range_contains(default.span(), span) {
                 return None;
             }
             if let Some(value) = const_expr.folded_value() {
                 return ir_constant_from_const_value(value);
             }
-            let expr = module.expressions().get(const_expr.expr_id())?;
+            let expr = module.expressions().get(expr_id)?;
             match expr.kind() {
                 HirExprKind::Literal { text } => literal_constant(text),
                 _ => None,
             }
         })
+    }
+
+    fn lower_const_expr_value(
+        &self,
+        const_expr_id: ConstExprId,
+        accepts_context: impl Fn(ConstExprContext) -> bool,
+    ) -> Option<IrConstant> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let const_expr = module.const_exprs().get(const_expr_id)?;
+        if !accepts_context(const_expr.context()) || !const_expr.is_allowed() {
+            return None;
+        }
+        let constant = if let Some(value) = const_expr.folded_value() {
+            ir_constant_from_const_value(value)?
+        } else {
+            let expr = module.expressions().get(const_expr.expr_id())?;
+            match expr.kind() {
+                HirExprKind::Literal { text } => literal_constant(text)?,
+                _ => return None,
+            }
+        };
+        Some(constant)
     }
 
     fn lower_return_type(&self, return_type: Option<&ReturnType>) -> Option<IrReturnType> {
@@ -854,10 +1665,14 @@ impl LoweringContext<'_> {
             HirTypeKind::Builtin(BuiltinType::Bool) => Some(IrReturnType::Bool),
             HirTypeKind::Builtin(BuiltinType::Array) => Some(IrReturnType::Array),
             HirTypeKind::Builtin(BuiltinType::Callable) => Some(IrReturnType::Callable),
+            HirTypeKind::Builtin(BuiltinType::Iterable) => Some(IrReturnType::Iterable),
             HirTypeKind::Builtin(BuiltinType::Object) => Some(IrReturnType::Object),
             HirTypeKind::Null => Some(IrReturnType::Null),
             HirTypeKind::Void => Some(IrReturnType::Void),
             HirTypeKind::Mixed => Some(IrReturnType::Mixed),
+            HirTypeKind::Never => Some(IrReturnType::Never),
+            HirTypeKind::False => Some(IrReturnType::False),
+            HirTypeKind::True => Some(IrReturnType::True),
             HirTypeKind::Named { name, .. } => Some(IrReturnType::Class {
                 name: name.original().to_owned(),
             }),
@@ -885,8 +1700,24 @@ impl LoweringContext<'_> {
                     inner: Box::new(inner),
                 })
             }
+            HirTypeKind::Union { members, .. } => Some(IrReturnType::Union {
+                members: self.lower_runtime_type_members(members)?,
+            }),
+            HirTypeKind::Intersection { members } => Some(IrReturnType::Intersection {
+                members: self.lower_runtime_type_members(members)?,
+            }),
+            HirTypeKind::Dnf { members } => Some(IrReturnType::Dnf {
+                members: self.lower_runtime_type_members(members)?,
+            }),
             _ => None,
         }
+    }
+
+    fn lower_runtime_type_members(&self, members: &[TypeId]) -> Option<Vec<IrReturnType>> {
+        members
+            .iter()
+            .map(|member| self.lower_runtime_type(Some(*member)))
+            .collect()
     }
 
     fn lower_top_level(
@@ -902,16 +1733,6 @@ impl LoweringContext<'_> {
         else {
             return block;
         };
-
-        for signature in module.signatures() {
-            if signature.flags().is_generator() {
-                self.unsupported(
-                    UnsupportedFeature::Generator,
-                    signature.span(),
-                    "generator functions are not lowered to IR yet",
-                );
-            }
-        }
 
         for namespace in module.namespaces().values() {
             for item in namespace.items() {
@@ -929,44 +1750,6 @@ impl LoweringContext<'_> {
             }
             if builder.is_terminated(function, block) {
                 break;
-            }
-        }
-
-        for (expr_id, expression) in module.expressions().iter() {
-            let span = self.span_for(SourceMappedId::from(expr_id));
-            match expression.kind() {
-                HirExprKind::Yield { .. } => self.unsupported(
-                    UnsupportedFeature::Generator,
-                    span,
-                    "yield expressions are not lowered to IR yet",
-                ),
-                HirExprKind::YieldFrom { .. } => self.unsupported(
-                    UnsupportedFeature::YieldFrom,
-                    span,
-                    "yield from delegation is not lowered to IR yet",
-                ),
-                HirExprKind::Eval { .. } => self.unsupported(
-                    UnsupportedFeature::Eval,
-                    span,
-                    "eval is runtime-sensitive and is not lowered to IR",
-                ),
-                HirExprKind::New { class, .. } if self.is_reflection_class_name(*class) => {
-                    self.unsupported(
-                        UnsupportedFeature::Reflection,
-                        span,
-                        "Reflection objects are not lowered to IR",
-                    );
-                }
-                HirExprKind::New { class, .. } | HirExprKind::Call { callee: class, .. }
-                    if self.is_fiber_name(*class) =>
-                {
-                    self.unsupported(
-                        UnsupportedFeature::Fiber,
-                        span,
-                        "Fiber construction or calls are not lowered to IR",
-                    );
-                }
-                _ => {}
             }
         }
 
@@ -1107,6 +1890,12 @@ impl LoweringContext<'_> {
             HirStmtKind::Unset { expressions } => {
                 self.lower_unset_stmt(builder, function, block, stmt_id, expressions)
             }
+            HirStmtKind::Static { variables } => {
+                self.lower_static_stmt(builder, function, block, stmt_id, variables)
+            }
+            HirStmtKind::Global { variables } => {
+                self.lower_global_stmt(builder, function, block, stmt_id, variables)
+            }
             kind => {
                 let span = self.span_for(SourceMappedId::from(stmt_id));
                 self.unsupported(
@@ -1117,6 +1906,129 @@ impl LoweringContext<'_> {
                 block
             }
         }
+    }
+
+    fn lower_global_stmt(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+        stmt_id: StmtId,
+        variables: Vec<ExprId>,
+    ) -> BlockId {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return block;
+        };
+        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+        let names = if variables.is_empty() {
+            self.global_names_from_stmt_source(stmt_id)
+        } else {
+            variables
+                .into_iter()
+                .filter_map(|variable| {
+                    let expression = module.expressions().get(variable)?;
+                    let HirExprKind::Variable { name } = expression.kind() else {
+                        self.unsupported(
+                            UnsupportedFeature::HirStatement,
+                            self.span_for(SourceMappedId::from(variable)),
+                            "dynamic global variables are not lowered to IR in Phase 5",
+                        );
+                        return None;
+                    };
+                    Some(local_name(name).to_owned())
+                })
+                .collect()
+        };
+        for name in names {
+            let local = builder.intern_local(function, &name);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::BindGlobal { local, name },
+                span,
+            );
+        }
+        block
+    }
+
+    fn global_names_from_stmt_source(&mut self, stmt_id: StmtId) -> Vec<String> {
+        let range = self.span_for(SourceMappedId::from(stmt_id));
+        let Some(source) = self.source_text.slice(range) else {
+            return Vec::new();
+        };
+        let source = source.to_owned();
+        let Some(rest) = source.trim().strip_prefix("global") else {
+            return Vec::new();
+        };
+        rest.trim_end_matches(';')
+            .split(',')
+            .filter_map(|item| {
+                let name = item.trim();
+                let name = name.strip_prefix('$')?;
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+                {
+                    self.unsupported(
+                        UnsupportedFeature::HirStatement,
+                        range,
+                        "dynamic global variables are not lowered to IR in Phase 5",
+                    );
+                    return None;
+                }
+                Some(name.to_owned())
+            })
+            .collect()
+    }
+
+    fn lower_static_stmt(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+        stmt_id: StmtId,
+        variables: Vec<ExprId>,
+    ) -> BlockId {
+        let specs = self.static_local_specs(stmt_id, &variables);
+        let mut current = block;
+        for spec in specs {
+            let local = builder.intern_local(function, &spec.name);
+            let (default, next_block) = if let Some(initializer) = spec.initializer {
+                if let Some(value) =
+                    self.lower_expr_to_register(builder, function, current, initializer)
+                {
+                    (Operand::Register(value.register), value.block)
+                } else {
+                    (
+                        Operand::Constant(builder.intern_constant(IrConstant::Null)),
+                        current,
+                    )
+                }
+            } else {
+                (
+                    Operand::Constant(builder.intern_constant(IrConstant::Null)),
+                    current,
+                )
+            };
+            current = next_block;
+            let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+            builder.emit(
+                function,
+                current,
+                InstructionKind::InitStaticLocal {
+                    local,
+                    name: spec.name,
+                    default,
+                },
+                span,
+            );
+        }
+        current
     }
 
     fn lower_echo_expr(
@@ -1150,7 +2062,8 @@ impl LoweringContext<'_> {
         stmt_id: StmtId,
         parts: IfParts,
     ) -> BlockId {
-        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+        let range = self.span_for(SourceMappedId::from(stmt_id));
+        let span = span_from_range(self.file, range);
         let IfParts {
             condition,
             body,
@@ -1219,7 +2132,8 @@ impl LoweringContext<'_> {
         condition: Option<ExprId>,
         body: Vec<StmtId>,
     ) -> BlockId {
-        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+        let range = self.span_for(SourceMappedId::from(stmt_id));
+        let span = span_from_range(self.file, range);
         let condition_block = builder.append_block(function);
         let after_block = builder.append_block(function);
         let body_block = builder.append_block(function);
@@ -1357,14 +2271,6 @@ impl LoweringContext<'_> {
         body: Vec<StmtId>,
     ) -> BlockId {
         let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
-        if by_ref {
-            self.unsupported(
-                UnsupportedFeature::ByReferenceForeach,
-                self.span_for(SourceMappedId::from(stmt_id)),
-                "by-reference foreach is a known gap until references/COW are implemented",
-            );
-            return block;
-        }
         let Some(source) = source else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
@@ -1402,6 +2308,74 @@ impl LoweringContext<'_> {
         } else {
             None
         };
+
+        if by_ref {
+            let Some(source_local) = self.variable_local(builder, function, source) else {
+                self.unsupported(
+                    UnsupportedFeature::ByReferenceForeach,
+                    self.span_for(SourceMappedId::from(source)),
+                    "by-reference foreach source must be a simple local array variable",
+                );
+                return block;
+            };
+            let iterator = builder.alloc_register(function);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::ForeachInitRef {
+                    iterator,
+                    local: source_local,
+                },
+                span,
+            );
+
+            let condition_block = builder.append_block(function);
+            let body_block = builder.append_block(function);
+            let after_block = builder.append_block(function);
+            self.jump_if_open(builder, function, block, condition_block, span);
+
+            let has_value = builder.alloc_register(function);
+            let key_reg = key_local.map(|_| builder.alloc_register(function));
+            builder.emit(
+                function,
+                condition_block,
+                InstructionKind::ForeachNextRef {
+                    has_value,
+                    iterator,
+                    key: key_reg,
+                    value_local,
+                },
+                span,
+            );
+            builder.terminate_jump_if(
+                function,
+                condition_block,
+                Operand::Register(has_value),
+                body_block,
+                after_block,
+                span,
+            );
+
+            if let (Some(key_local), Some(key_reg)) = (key_local, key_reg) {
+                builder.emit(
+                    function,
+                    body_block,
+                    InstructionKind::StoreLocal {
+                        local: key_local,
+                        src: Operand::Register(key_reg),
+                    },
+                    span,
+                );
+            }
+            self.loop_stack.push(LoopTargets {
+                break_block: after_block,
+                continue_block: condition_block,
+            });
+            let body_end = self.lower_stmt_list(builder, function, body_block, body);
+            self.loop_stack.pop();
+            self.jump_if_open(builder, function, body_end, condition_block, span);
+            return after_block;
+        }
 
         let Some(source_value) = self.lower_expr_to_register(builder, function, block, source)
         else {
@@ -1513,11 +2487,36 @@ impl LoweringContext<'_> {
         stmt_id: StmtId,
         expr: Option<ExprId>,
     ) -> BlockId {
-        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+        let range = self.span_for(SourceMappedId::from(stmt_id));
+        let span = span_from_range(self.file, range);
         let Some(expr) = expr else {
             builder.terminate_return(function, block, None, span);
             return block;
         };
+        if builder.returns_by_ref(function)
+            && let Some(local) = self.variable_local(builder, function, expr)
+        {
+            builder.terminate_return_ref(function, block, local, span);
+            return block;
+        }
+        if builder.returns_by_ref(function) && self.contains_dim_fetch_expr(expr) {
+            self.unsupported(
+                UnsupportedFeature::ArrayElementReference,
+                range,
+                "array-element by-reference returns are a known gap until full reference/COW semantics exist",
+            );
+            builder.terminate_return(function, block, None, span);
+            return block;
+        }
+        if builder.returns_by_ref(function) && self.contains_property_fetch_expr(expr) {
+            self.unsupported(
+                UnsupportedFeature::ObjectPropertyReference,
+                range,
+                "object-property by-reference returns are a known gap until property slots participate in reference/COW semantics",
+            );
+            builder.terminate_return(function, block, None, span);
+            return block;
+        }
         let Some(value) = self.lower_expr_to_register(builder, function, block, expr) else {
             builder.terminate_return(function, block, None, span);
             return block;
@@ -1594,12 +2593,24 @@ impl LoweringContext<'_> {
                 );
             }
         }
+        let catch_types = parts
+            .catches
+            .first()
+            .map(|catch| {
+                catch
+                    .types
+                    .iter()
+                    .map(|ty| normalize_class_name(ty))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         builder.emit(
             function,
             block,
             InstructionKind::EnterTry {
                 catch: catch_block,
+                catch_types,
                 finally: finally_block,
                 after: after_block,
                 exception_local: catch_local,
@@ -1805,11 +2816,29 @@ impl LoweringContext<'_> {
                 );
                 continue;
             }
+            if let Some(target) = self.property_assignment_target(expr) {
+                let Some(object) =
+                    self.lower_expr_to_register(builder, function, current, target.receiver)
+                else {
+                    continue;
+                };
+                current = object.block;
+                builder.emit(
+                    function,
+                    current,
+                    InstructionKind::UnsetProperty {
+                        object: Operand::Register(object.register),
+                        property: target.property,
+                    },
+                    span,
+                );
+                continue;
+            }
             let Some(target) = self.dim_assignment_target(builder, function, expr) else {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     self.span_for(SourceMappedId::from(expr)),
-                    "unset only supports locals and local array dimensions in the Phase 4 MVP",
+                    "unset only supports locals, properties, and local array dimensions in Phase 5",
                 );
                 continue;
             };
@@ -2062,6 +3091,32 @@ impl LoweringContext<'_> {
                     return None;
                 };
                 let lhs = self.lower_expr_to_register(builder, function, block, left)?;
+                if operator == "instanceof" {
+                    let Some(class_name) = self.instanceof_class_name(right) else {
+                        self.unsupported(
+                            UnsupportedFeature::ClassLikeObject,
+                            range,
+                            "dynamic instanceof targets are not executable in the Prompt 20 interface layer",
+                        );
+                        return None;
+                    };
+                    let dst = builder.alloc_register(function);
+                    let instruction = builder.emit(
+                        function,
+                        lhs.block,
+                        InstructionKind::InstanceOf {
+                            dst,
+                            object: Operand::Register(lhs.register),
+                            class_name,
+                        },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, lhs.block, instruction, expr, span);
+                    return Some(LoweredExpr {
+                        register: dst,
+                        block: lhs.block,
+                    });
+                }
                 let rhs = self.lower_expr_to_register(builder, function, lhs.block, right)?;
                 let dst = builder.alloc_register(function);
                 let kind = if let Some(op) = binary_op(&operator) {
@@ -2140,6 +3195,7 @@ impl LoweringContext<'_> {
             HirExprKind::Include { kind, expr, .. } => {
                 self.lower_include_to_register(builder, site, &kind, expr)
             }
+            HirExprKind::Eval { expr, .. } => self.lower_eval_to_register(builder, site, expr),
             HirExprKind::FirstClassCallable { callee } => {
                 self.lower_callable_expr_to_register(builder, site, callee)
             }
@@ -2175,13 +3231,12 @@ impl LoweringContext<'_> {
             } => {
                 self.lower_method_call_to_register(builder, site, receiver, method, args, nullsafe)
             }
-            HirExprKind::StaticAccess { .. } => {
-                self.unsupported(
-                    UnsupportedFeature::StaticProperty,
-                    range,
-                    "static property access is a known gap in the Prompt 27 object MVP",
-                );
-                None
+            HirExprKind::StaticAccess { .. } => self.lower_static_access_to_register(builder, site),
+            HirExprKind::Yield { key, value } => {
+                self.lower_yield_to_register(builder, site, key, value)
+            }
+            HirExprKind::YieldFrom { expr } => {
+                self.lower_yield_from_to_register(builder, site, expr)
             }
             kind => {
                 self.unsupported(
@@ -2197,21 +3252,98 @@ impl LoweringContext<'_> {
         }
     }
 
+    fn lower_yield_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        mut key: Option<ExprId>,
+        mut value: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        if value.is_none() {
+            value = key.take();
+        }
+        let mut current = site.block;
+        let key = if let Some(key) = key {
+            let lowered = self.lower_expr_to_register(builder, site.function, current, key)?;
+            current = lowered.block;
+            Some(Operand::Register(lowered.register))
+        } else {
+            None
+        };
+        let value = if let Some(value) = value {
+            let lowered = self.lower_expr_to_register(builder, site.function, current, value)?;
+            current = lowered.block;
+            Some(Operand::Register(lowered.register))
+        } else {
+            None
+        };
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            current,
+            InstructionKind::Yield { dst, key, value },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            current,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: current,
+        })
+    }
+
+    fn lower_yield_from_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        expr: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(expr) = expr else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                self.span_for(SourceMappedId::from(site.expr)),
+                "yield from source expression is missing",
+            );
+            return None;
+        };
+        let source = self.lower_expr_to_register(builder, site.function, site.block, expr)?;
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            source.block,
+            InstructionKind::YieldFrom {
+                dst,
+                source: Operand::Register(source.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            source.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: source.block,
+        })
+    }
+
     fn lower_new_object_to_register(
         &mut self,
         builder: &mut IrBuilder,
         site: LowerSite,
         class: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     ) -> Option<LoweredExpr> {
-        if self.is_reflection_class_name(class) {
-            self.unsupported(
-                UnsupportedFeature::Reflection,
-                site.range,
-                "Reflection objects are not executable in the Prompt 31 known-gap layer",
-            );
-            return None;
-        }
         let Some(class_name) = class.and_then(|class| self.static_class_name(class)) else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
@@ -2220,9 +3352,9 @@ impl LoweringContext<'_> {
             );
             return None;
         };
-        let args = self.flatten_new_args(args);
-        if normalize_class_name(&class_name) == "exception" {
-            let message = args.first().copied();
+        let normalized_class_name = normalize_class_name(&class_name);
+        if is_internal_throwable_class(&normalized_class_name) {
+            let message = args.first().map(|arg| arg.value);
             let (current, message) = if let Some(message) = message {
                 let value =
                     self.lower_expr_to_register(builder, site.function, site.block, message)?;
@@ -2237,7 +3369,11 @@ impl LoweringContext<'_> {
             let instruction = builder.emit(
                 site.function,
                 current,
-                InstructionKind::MakeException { dst, message },
+                InstructionKind::MakeException {
+                    dst,
+                    class_name: normalized_class_name,
+                    message,
+                },
                 site.span,
             );
             self.add_expr_source_map(
@@ -2253,13 +3389,7 @@ impl LoweringContext<'_> {
                 block: current,
             });
         }
-        let mut current = site.block;
-        let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg)?;
-            current = value.block;
-            operands.push(Operand::Register(value.register));
-        }
+        let (operands, current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
@@ -2334,6 +3464,103 @@ impl LoweringContext<'_> {
         Some(LoweredExpr {
             register: dst,
             block: object.block,
+        })
+    }
+
+    fn lower_static_access_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+    ) -> Option<LoweredExpr> {
+        if let Some(target) = self.static_property_target(site.expr) {
+            return self.lower_static_property_fetch_to_register(builder, site, target);
+        }
+        if let Some(target) = self.class_constant_target(site.expr) {
+            let normalized_class_name = normalize_class_name(&target.class_name);
+            if target.constant.eq_ignore_ascii_case("class")
+                && !matches!(normalized_class_name.as_str(), "self" | "static" | "parent")
+            {
+                let dst = builder.alloc_register(site.function);
+                let constant = builder.intern_constant(IrConstant::String(target.class_name));
+                let instruction = builder.emit(
+                    site.function,
+                    site.block,
+                    InstructionKind::LoadConst { dst, constant },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    site.block,
+                    instruction,
+                    site.expr,
+                    site.span,
+                );
+                return Some(LoweredExpr {
+                    register: dst,
+                    block: site.block,
+                });
+            }
+            let dst = builder.alloc_register(site.function);
+            let instruction = builder.emit(
+                site.function,
+                site.block,
+                InstructionKind::FetchClassConstant {
+                    dst,
+                    class_name: target.class_name,
+                    constant: target.constant,
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                site.block,
+                instruction,
+                site.expr,
+                site.span,
+            );
+            return Some(LoweredExpr {
+                register: dst,
+                block: site.block,
+            });
+        }
+        self.unsupported(
+            UnsupportedFeature::StaticProperty,
+            site.range,
+            "static access target or member is not statically known",
+        );
+        None
+    }
+
+    fn lower_static_property_fetch_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: StaticPropertyTarget,
+    ) -> Option<LoweredExpr> {
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            site.block,
+            InstructionKind::FetchStaticProperty {
+                dst,
+                class_name: target.class_name,
+                property: target.property,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            site.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: site.block,
         })
     }
 
@@ -2461,21 +3688,36 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_call_args(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        args: &[HirCallArg],
+    ) -> Option<(Vec<IrCallArg>, BlockId)> {
+        let mut current = site.block;
+        let mut operands = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.lower_expr_to_register(builder, site.function, current, arg.value)?;
+            current = value.block;
+            operands.push(IrCallArg {
+                name: arg.name.clone(),
+                value: Operand::Register(value.register),
+                unpack: arg.unpack,
+                by_ref_local: (!arg.unpack)
+                    .then(|| self.variable_local(builder, site.function, arg.value))
+                    .flatten(),
+            });
+        }
+        Some((operands, current))
+    }
+
     fn lower_call_to_register(
         &mut self,
         builder: &mut IrBuilder,
         site: LowerSite,
         callee: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     ) -> Option<LoweredExpr> {
-        if self.is_autoload_function_name(callee) {
-            self.unsupported(
-                UnsupportedFeature::Autoload,
-                site.range,
-                "autoload registration is not executable in the Prompt 31 known-gap layer",
-            );
-            return None;
-        }
         if self.is_reflection_function_name(callee) {
             self.unsupported(
                 UnsupportedFeature::Reflection,
@@ -2490,13 +3732,7 @@ impl LoweringContext<'_> {
             let target = self.static_method_call_target(callee)?;
             return self.lower_static_method_call_to_register(builder, site, target, args);
         }
-        let mut current = site.block;
-        let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg)?;
-            current = value.block;
-            operands.push(Operand::Register(value.register));
-        }
+        let (operands, mut current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
         let kind =
             if let Some(name) = callee.and_then(|callee| self.static_function_call_name(callee)) {
@@ -2509,7 +3745,7 @@ impl LoweringContext<'_> {
                 let callee_value =
                     self.lower_expr_to_register(builder, site.function, current, callee)?;
                 current = callee_value.block;
-                InstructionKind::CallClosure {
+                InstructionKind::CallCallable {
                     dst,
                     callee: Operand::Register(callee_value.register),
                     args: operands,
@@ -2543,7 +3779,7 @@ impl LoweringContext<'_> {
         site: LowerSite,
         receiver: Option<ExprId>,
         method: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
         nullsafe: bool,
     ) -> Option<LoweredExpr> {
         if nullsafe {
@@ -2564,13 +3800,11 @@ impl LoweringContext<'_> {
         };
         let object =
             self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
-        let mut current = object.block;
-        let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg)?;
-            current = value.block;
-            operands.push(Operand::Register(value.register));
-        }
+        let site = LowerSite {
+            block: object.block,
+            ..site
+        };
+        let (operands, current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
@@ -2602,15 +3836,9 @@ impl LoweringContext<'_> {
         builder: &mut IrBuilder,
         site: LowerSite,
         target: StaticMethodCallTarget,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     ) -> Option<LoweredExpr> {
-        let mut current = site.block;
-        let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg)?;
-            current = value.block;
-            operands.push(Operand::Register(value.register));
-        }
+        let (operands, current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
@@ -2727,18 +3955,12 @@ impl LoweringContext<'_> {
         builder: &mut IrBuilder,
         site: LowerSite,
         name: &str,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     ) -> Option<LoweredExpr> {
         if matches!(name, "isset" | "empty") {
             return self.lower_isset_empty_to_register(builder, site, name, args);
         }
-        let mut current = site.block;
-        let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg)?;
-            current = value.block;
-            operands.push(Operand::Register(value.register));
-        }
+        let (operands, current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
@@ -2769,7 +3991,7 @@ impl LoweringContext<'_> {
         builder: &mut IrBuilder,
         site: LowerSite,
         name: &str,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     ) -> Option<LoweredExpr> {
         if args.len() != 1 {
             self.unsupported(
@@ -2779,7 +4001,7 @@ impl LoweringContext<'_> {
             );
             return None;
         }
-        let arg = args[0];
+        let arg = args[0].value;
         let dst = builder.alloc_register(site.function);
         let kind = if let Some(local) = self.variable_local(builder, site.function, arg) {
             if name == "isset" {
@@ -2830,11 +4052,42 @@ impl LoweringContext<'_> {
                 register: dst,
                 block: current,
             });
+        } else if let Some(target) = self.property_assignment_target(arg) {
+            let object =
+                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let instruction = if name == "isset" {
+                InstructionKind::IssetProperty {
+                    dst,
+                    object: Operand::Register(object.register),
+                    property: target.property,
+                }
+            } else {
+                InstructionKind::EmptyProperty {
+                    dst,
+                    object: Operand::Register(object.register),
+                    property: target.property,
+                }
+            };
+            let emitted = builder.emit(site.function, object.block, instruction, site.span);
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                object.block,
+                emitted,
+                site.expr,
+                site.span,
+            );
+            return Some(LoweredExpr {
+                register: dst,
+                block: object.block,
+            });
         } else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                format!("{name} only supports locals and local array dimensions in Phase 4"),
+                format!(
+                    "{name} only supports locals, properties, and local array dimensions in Phase 5"
+                ),
             );
             return None;
         };
@@ -2948,6 +4201,45 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_eval_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        expr: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(code_expr) = expr else {
+            self.unsupported(
+                UnsupportedFeature::Eval,
+                site.range,
+                "eval expression is missing its code operand",
+            );
+            return None;
+        };
+        let code = self.lower_expr_to_register(builder, site.function, site.block, code_expr)?;
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            code.block,
+            InstructionKind::Eval {
+                dst,
+                code: Operand::Register(code.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            code.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: code.block,
+        })
+    }
+
     fn lower_pipe_callable_to_register(
         &mut self,
         builder: &mut IrBuilder,
@@ -3011,8 +4303,13 @@ impl LoweringContext<'_> {
         kind: SignatureKind,
         arrow_body: Option<ExprId>,
     ) -> Option<LoweredExpr> {
-        let signature = self.signature_for_expr(site.range, kind)?.clone();
-        let captures = match kind {
+        let Some(signature) = self.signature_for_expr(site.range, kind).cloned() else {
+            if kind == SignatureKind::Closure {
+                return self.lower_signatureless_closure_to_register(builder, site);
+            }
+            return None;
+        };
+        let mut captures = match kind {
             SignatureKind::Closure => self.explicit_capture_specs(signature.span()),
             SignatureKind::ArrowFunction => self.implicit_arrow_capture_specs(
                 arrow_body.or_else(|| self.expr_id_for_span(signature.arrow_body()?)),
@@ -3020,6 +4317,17 @@ impl LoweringContext<'_> {
             ),
             _ => Vec::new(),
         };
+        if matches!(kind, SignatureKind::Closure | SignatureKind::ArrowFunction)
+            && !signature.flags().is_static()
+            && builder.local_id(site.function, "this").is_some()
+            && self.function_like_uses_variable(signature.span(), "$this")
+            && !captures.iter().any(|capture| capture.name == "this")
+        {
+            captures.push(CaptureSpec {
+                name: "this".to_owned(),
+                by_ref: false,
+            });
+        }
         let closure_function =
             self.lower_closure_function(builder, site.expr, &signature, arrow_body, &captures);
         let dst = builder.alloc_register(site.function);
@@ -3058,6 +4366,109 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_signatureless_closure_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+    ) -> Option<LoweredExpr> {
+        let mut captures = self.explicit_capture_specs(site.range);
+        if builder.local_id(site.function, "this").is_some()
+            && self.function_like_uses_variable(site.range, "$this")
+            && !captures.iter().any(|capture| capture.name == "this")
+        {
+            captures.push(CaptureSpec {
+                name: "this".to_owned(),
+                by_ref: false,
+            });
+        }
+        let closure_function =
+            self.lower_signatureless_closure_function(builder, site.expr, site.range, &captures);
+        let dst = builder.alloc_register(site.function);
+        let capture_args = captures
+            .iter()
+            .map(|capture| {
+                let local = builder.intern_local(site.function, &capture.name);
+                ClosureCaptureArg {
+                    name: capture.name.clone(),
+                    src: Operand::Local(local),
+                    by_ref: capture.by_ref,
+                }
+            })
+            .collect();
+        let instruction = builder.emit(
+            site.function,
+            site.block,
+            InstructionKind::MakeClosure {
+                dst,
+                function: closure_function,
+                captures: capture_args,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            site.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: site.block,
+        })
+    }
+
+    fn lower_signatureless_closure_function(
+        &mut self,
+        builder: &mut IrBuilder,
+        expr: ExprId,
+        range: TextRange,
+        captures: &[CaptureSpec],
+    ) -> FunctionId {
+        if let Some(function) = self.closure_functions.get(&expr) {
+            return *function;
+        }
+        let span = span_from_range(self.file, range);
+        let function = builder.start_function(
+            format!("closure@{}", range.start().to_usize()),
+            FunctionFlags {
+                is_closure: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        self.closure_functions.insert(expr, function);
+        builder.add_source_map(
+            IrSourceMapTarget::Function { function },
+            format!("hir:closure:{}", range.start().to_usize()),
+            span,
+        );
+        for capture in captures {
+            let local = builder.intern_local(function, &capture.name);
+            builder.push_capture(
+                function,
+                IrCapture {
+                    name: capture.name.clone(),
+                    local,
+                    by_ref: capture.by_ref,
+                },
+            );
+        }
+        let block = builder.append_block(function);
+        builder.add_source_map(
+            IrSourceMapTarget::Block { function, block },
+            format!("hir:closure:{}:body", function.raw()),
+            span,
+        );
+        let current =
+            self.lower_stmt_list(builder, function, block, self.statement_ids_inside(range));
+        if !builder.is_terminated(function, current) {
+            builder.terminate_return(function, current, None, span);
+        }
+        function
+    }
+
     fn lower_closure_function(
         &mut self,
         builder: &mut IrBuilder,
@@ -3084,6 +4495,12 @@ impl LoweringContext<'_> {
             },
             span,
         );
+        let attributes = self.lower_attributes_for_target_span(
+            builder,
+            AttributeTarget::Closure,
+            signature.span(),
+        );
+        builder.set_function_attributes(function, attributes);
         self.closure_functions.insert(expr, function);
         builder.set_return_type(function, self.lower_return_type(signature.return_type()));
         builder.add_source_map(
@@ -3111,7 +4528,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::ByReferenceParameter,
                     param.span(),
-                    "by-reference parameters are recorded but rejected by the Prompt 15 VM",
+                    "by-reference closure parameters are deferred until closure call-frame aliasing is modeled",
                 );
             }
             let local_name = local_name(param.name()).to_owned();
@@ -3124,6 +4541,7 @@ impl LoweringContext<'_> {
                     "parameter default is not a folded Phase 3 constant expression",
                 );
             }
+            let attributes = self.lower_parameter_attributes(builder, param.attributes());
             builder.push_param(
                 function,
                 IrParam {
@@ -3134,6 +4552,7 @@ impl LoweringContext<'_> {
                     type_: self.lower_runtime_type(param.type_id()),
                     by_ref: param.flags().is_by_ref(),
                     variadic: param.flags().is_variadic(),
+                    attributes,
                 },
             );
         }
@@ -3759,6 +5178,12 @@ impl LoweringContext<'_> {
         }
         if operator == "="
             && let Some(left) = left
+            && let Some(target) = self.static_property_target(left)
+        {
+            return self.lower_static_property_assign_to_register(builder, site, target, right);
+        }
+        if operator == "="
+            && let Some(left) = left
             && let Some(target) = self.dim_assignment_target(builder, site.function, left)
             && (target.append || !target.dims.is_empty())
         {
@@ -3897,6 +5322,48 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_static_property_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: StaticPropertyTarget,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(right) = right else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "static property assignment is missing its right operand",
+            );
+            return None;
+        };
+        let value = self.lower_expr_to_register(builder, site.function, site.block, right)?;
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            value.block,
+            InstructionKind::AssignStaticProperty {
+                dst,
+                class_name: target.class_name,
+                property: target.property,
+                value: Operand::Register(value.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            value.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: value.block,
+        })
+    }
+
     fn lower_reference_assign_to_register(
         &mut self,
         builder: &mut IrBuilder,
@@ -3904,15 +5371,152 @@ impl LoweringContext<'_> {
         left: Option<ExprId>,
         right: Option<ExprId>,
     ) -> Option<LoweredExpr> {
-        if left.is_some_and(|left| self.is_dim_fetch_expr(left))
-            || right.is_some_and(|right| self.is_dim_fetch_expr(right))
+        if left.is_some_and(|left| self.contains_property_fetch_expr(left))
+            || right.is_some_and(|right| self.contains_property_fetch_expr(right))
         {
             self.unsupported(
-                UnsupportedFeature::ArrayElementReference,
+                UnsupportedFeature::ObjectPropertyReference,
                 site.range,
-                "array-element references are a known gap until full reference/COW semantics exist",
+                "object-property references are a known gap until property slots participate in reference/COW semantics",
             );
             return None;
+        }
+        let left_dim = left
+            .and_then(|left| self.dim_assignment_target(builder, site.function, left))
+            .filter(|target| target.append || !target.dims.is_empty());
+        let right_dim = right
+            .and_then(|right| self.dim_assignment_target(builder, site.function, right))
+            .filter(|target| target.append || !target.dims.is_empty());
+        match (left_dim, right_dim) {
+            (Some(target), None) if target.append || !target.dims.is_empty() => {
+                let Some(source) =
+                    right.and_then(|right| self.variable_local(builder, site.function, right))
+                else {
+                    self.unsupported(
+                        UnsupportedFeature::HirStatement,
+                        site.range,
+                        "array-dimension by-reference assignment source must be a simple local variable",
+                    );
+                    return None;
+                };
+                let mut current = site.block;
+                let mut dims = Vec::with_capacity(target.dims.len());
+                for dim in target.dims {
+                    let dim_value =
+                        self.lower_expr_to_register(builder, site.function, current, dim)?;
+                    current = dim_value.block;
+                    dims.push(Operand::Register(dim_value.register));
+                }
+                let bind = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::BindReferenceDim {
+                        local: target.local,
+                        dims,
+                        append: target.append,
+                        source,
+                    },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    bind,
+                    site.expr,
+                    site.span,
+                );
+                let dst = builder.alloc_register(site.function);
+                let load = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::LoadLocal { dst, local: source },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    load,
+                    site.expr,
+                    site.span,
+                );
+                return Some(LoweredExpr {
+                    register: dst,
+                    block: current,
+                });
+            }
+            (None, Some(source_target))
+                if !source_target.append
+                    && left
+                        .and_then(|left| self.variable_local(builder, site.function, left))
+                        .is_some() =>
+            {
+                let target =
+                    left.and_then(|left| self.variable_local(builder, site.function, left))?;
+                let mut current = site.block;
+                let mut dims = Vec::with_capacity(source_target.dims.len());
+                for dim in source_target.dims {
+                    let dim_value =
+                        self.lower_expr_to_register(builder, site.function, current, dim)?;
+                    current = dim_value.block;
+                    dims.push(Operand::Register(dim_value.register));
+                }
+                let bind = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::BindReferenceFromDim {
+                        target,
+                        local: source_target.local,
+                        dims,
+                    },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    bind,
+                    site.expr,
+                    site.span,
+                );
+                let dst = builder.alloc_register(site.function);
+                let load = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::LoadLocal { dst, local: target },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    load,
+                    site.expr,
+                    site.span,
+                );
+                return Some(LoweredExpr {
+                    register: dst,
+                    block: current,
+                });
+            }
+            (Some(_), Some(_)) => {
+                self.unsupported(
+                    UnsupportedFeature::ArrayElementReference,
+                    site.range,
+                    "array-dimension to array-dimension reference binding is not implemented yet",
+                );
+                return None;
+            }
+            (_, Some(source_target)) if source_target.append => {
+                self.unsupported(
+                    UnsupportedFeature::ArrayElementReference,
+                    site.range,
+                    "append dimension cannot be used as a by-reference source",
+                );
+                return None;
+            }
+            _ => {}
         }
         let Some(target) = left.and_then(|left| self.variable_local(builder, site.function, left))
         else {
@@ -3923,6 +5527,31 @@ impl LoweringContext<'_> {
             );
             return None;
         };
+        if let Some((name, args)) = right.and_then(|right| self.direct_function_call_parts(right)) {
+            let (operands, current) = self.lower_call_args(builder, site, &args)?;
+            let bind = builder.emit(
+                site.function,
+                current,
+                InstructionKind::BindReferenceFromCall {
+                    target,
+                    name,
+                    args: operands,
+                },
+                site.span,
+            );
+            self.add_expr_source_map(builder, site.function, current, bind, site.expr, site.span);
+            let dst = builder.alloc_register(site.function);
+            builder.emit(
+                site.function,
+                current,
+                InstructionKind::LoadLocal { dst, local: target },
+                site.span,
+            );
+            return Some(LoweredExpr {
+                register: dst,
+                block: current,
+            });
+        }
         let Some(source) =
             right.and_then(|right| self.variable_local(builder, site.function, right))
         else {
@@ -3968,7 +5597,7 @@ impl LoweringContext<'_> {
         })
     }
 
-    fn is_dim_fetch_expr(&self, expr: ExprId) -> bool {
+    fn contains_dim_fetch_expr(&self, expr: ExprId) -> bool {
         let Some(module) = self
             .frontend
             .database()
@@ -3976,10 +5605,156 @@ impl LoweringContext<'_> {
         else {
             return false;
         };
-        module
-            .expressions()
-            .get(expr)
-            .is_some_and(|expression| matches!(expression.kind(), HirExprKind::DimFetch { .. }))
+        self.expr_contains(module, expr, |kind| {
+            matches!(kind, HirExprKind::DimFetch { .. })
+        })
+    }
+
+    fn contains_property_fetch_expr(&self, expr: ExprId) -> bool {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        self.expr_contains(module, expr, |kind| {
+            matches!(kind, HirExprKind::PropertyFetch { .. })
+        })
+    }
+
+    fn instanceof_class_name(&self, expr: ExprId) -> Option<String> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        match expression.kind() {
+            HirExprKind::Name { resolution } => Some(interface_resolution_name(resolution)),
+            HirExprKind::Variable { .. } => None,
+            HirExprKind::Unary { operator, expr } if operator == "parenthesized" => {
+                expr.and_then(|expr| self.instanceof_class_name(expr))
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_contains(
+        &self,
+        module: &php_semantics::hir::HirModule,
+        expr: ExprId,
+        predicate: impl Copy + Fn(&HirExprKind) -> bool,
+    ) -> bool {
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        let kind = expression.kind();
+        if predicate(kind) {
+            return true;
+        }
+        match kind {
+            HirExprKind::Array { elements } | HirExprKind::List { elements } => elements
+                .iter()
+                .copied()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Closure { body } => body
+                .iter()
+                .copied()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::CloneWith { replacements, .. } => replacements
+                .iter()
+                .copied()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::ArrayPair { key, value, .. } => [*key, *value]
+                .into_iter()
+                .flatten()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Unary { expr, .. }
+            | HirExprKind::ArrowFunction { expr }
+            | HirExprKind::Clone { expr }
+            | HirExprKind::YieldFrom { expr }
+            | HirExprKind::Include { expr, .. }
+            | HirExprKind::Eval { expr, .. }
+            | HirExprKind::Exit { expr }
+            | HirExprKind::Cast { expr, .. }
+            | HirExprKind::FirstClassCallable { callee: expr } => {
+                expr.is_some_and(|child| self.expr_contains(module, child, predicate))
+            }
+            HirExprKind::Binary { left, right, .. }
+            | HirExprKind::Assign { left, right, .. }
+            | HirExprKind::StaticAccess {
+                target: left,
+                member: right,
+            }
+            | HirExprKind::DimFetch {
+                receiver: left,
+                dim: right,
+            }
+            | HirExprKind::PropertyFetch {
+                receiver: left,
+                property: right,
+                ..
+            }
+            | HirExprKind::Pipe {
+                input: left,
+                callable: right,
+            } => [*left, *right]
+                .into_iter()
+                .flatten()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Ternary {
+                condition,
+                if_true,
+                if_false,
+            } => [*condition, *if_true, *if_false]
+                .into_iter()
+                .flatten()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Call { callee, args } => callee
+                .iter()
+                .copied()
+                .chain(args.iter().map(|arg| arg.value))
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::BuiltinCall { args, .. } => args
+                .iter()
+                .map(|arg| arg.value)
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => receiver
+                .iter()
+                .copied()
+                .chain(method.iter().copied())
+                .chain(args.iter().map(|arg| arg.value))
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::New { class, args } => class
+                .iter()
+                .copied()
+                .chain(args.iter().map(|arg| arg.value))
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Match { subject, arms } => subject
+                .iter()
+                .copied()
+                .chain(arms.iter().flat_map(|arm| {
+                    arm.conditions
+                        .iter()
+                        .copied()
+                        .chain(arm.result.iter().copied())
+                }))
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Yield { key, value } => [*key, *value]
+                .into_iter()
+                .flatten()
+                .any(|child| self.expr_contains(module, child, predicate)),
+            HirExprKind::Missing
+            | HirExprKind::Literal { .. }
+            | HirExprKind::Variable { .. }
+            | HirExprKind::Name { .. }
+            | HirExprKind::Unlowered { .. } => false,
+        }
     }
 
     fn lower_dim_assign_to_register(
@@ -4051,6 +5826,84 @@ impl LoweringContext<'_> {
             );
             return None;
         };
+        if let Some(target) = self.dim_assignment_target(builder, site.function, inner)
+            && !target.append
+            && !target.dims.is_empty()
+        {
+            let old = self.lower_expr_to_register(builder, site.function, site.block, inner)?;
+            let one = builder.intern_constant(IrConstant::Int(1));
+            let one_reg = builder.alloc_register(site.function);
+            let load_one =
+                builder.emit_load_const(site.function, old.block, one_reg, one, site.span);
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                old.block,
+                load_one,
+                site.expr,
+                site.span,
+            );
+            let new = builder.alloc_register(site.function);
+            let op = if operator == "++" {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Sub
+            };
+            let arithmetic = builder.emit(
+                site.function,
+                old.block,
+                InstructionKind::Binary {
+                    dst: new,
+                    op,
+                    lhs: Operand::Register(old.register),
+                    rhs: Operand::Register(one_reg),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                old.block,
+                arithmetic,
+                site.expr,
+                site.span,
+            );
+            let mut current = old.block;
+            let mut dims = Vec::with_capacity(target.dims.len());
+            for dim in target.dims {
+                let dim_value =
+                    self.lower_expr_to_register(builder, site.function, current, dim)?;
+                current = dim_value.block;
+                dims.push(Operand::Register(dim_value.register));
+            }
+            let assign_result = builder.alloc_register(site.function);
+            let assign = builder.emit(
+                site.function,
+                current,
+                InstructionKind::AssignDim {
+                    dst: assign_result,
+                    local: target.local,
+                    dims,
+                    value: Operand::Register(new),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                current,
+                assign,
+                site.expr,
+                site.span,
+            );
+
+            let inner_range = self.span_for(SourceMappedId::from(inner));
+            let is_prefix = inner_range.end() == site.range.end();
+            return Some(LoweredExpr {
+                register: if is_prefix { new } else { old.register },
+                block: current,
+            });
+        }
         let Some(local) = self.variable_local(builder, site.function, inner) else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
@@ -4171,6 +6024,23 @@ impl LoweringContext<'_> {
         }
     }
 
+    fn direct_function_call_parts(&self, expr: ExprId) -> Option<(String, Vec<HirCallArg>)> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        let HirExprKind::Call {
+            callee: Some(callee),
+            args,
+        } = expression.kind()
+        else {
+            return None;
+        };
+        let name = self.static_function_call_name(*callee)?;
+        Some((normalize_function_name(&name), args.clone()))
+    }
+
     fn static_class_name(&self, expr: ExprId) -> Option<String> {
         let module = self
             .frontend
@@ -4196,7 +6066,65 @@ impl LoweringContext<'_> {
         match expression.kind() {
             HirExprKind::Literal { text } => Some(local_name(text).to_owned()),
             HirExprKind::Name { resolution } => Some(local_name(resolution.source()).to_owned()),
+            HirExprKind::Variable { name } => Some(local_name(name).to_owned()),
             _ => None,
+        }
+    }
+
+    fn static_property_target(&self, expr: ExprId) -> Option<StaticPropertyTarget> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        let HirExprKind::StaticAccess { target, member } = expression.kind() else {
+            return None;
+        };
+        let member_expr = (*member)?;
+        if !self.static_member_is_property(member_expr) {
+            return None;
+        }
+        Some(StaticPropertyTarget {
+            class_name: self.static_class_name((*target)?)?,
+            property: self.static_property_name(member_expr)?,
+        })
+    }
+
+    fn class_constant_target(&self, expr: ExprId) -> Option<ClassConstantTarget> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        let HirExprKind::StaticAccess { target, member } = expression.kind() else {
+            return None;
+        };
+        let member_expr = (*member)?;
+        if self.static_member_is_property(member_expr) {
+            return None;
+        }
+        Some(ClassConstantTarget {
+            class_name: self.static_class_name((*target)?)?,
+            constant: self.static_property_name(member_expr)?,
+        })
+    }
+
+    fn static_member_is_property(&self, expr: ExprId) -> bool {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        match expression.kind() {
+            HirExprKind::Variable { .. } => true,
+            HirExprKind::Literal { text } => text.starts_with('$'),
+            HirExprKind::Name { resolution } => resolution.source().starts_with('$'),
+            _ => false,
         }
     }
 
@@ -4248,14 +6176,6 @@ impl LoweringContext<'_> {
             return None;
         };
         let class_name = self.static_class_name(target)?;
-        if is_late_static_binding_name(&class_name) {
-            self.unsupported(
-                UnsupportedFeature::LateStaticBinding,
-                self.span_for(SourceMappedId::from(expr)),
-                format!("static method call through `{class_name}` is deferred"),
-            );
-            return None;
-        }
         Some(StaticMethodCallTarget {
             class_name,
             method: self.static_property_name(member)?,
@@ -4274,23 +6194,6 @@ impl LoweringContext<'_> {
             .expressions()
             .get(expr)
             .is_some_and(|expression| matches!(expression.kind(), HirExprKind::StaticAccess { .. }))
-    }
-
-    fn flatten_new_args(&self, args: Vec<ExprId>) -> Vec<ExprId> {
-        let Some(module) = self
-            .frontend
-            .database()
-            .module(self.frontend.module().module_id())
-        else {
-            return args;
-        };
-        if args.len() == 1
-            && let Some(expression) = module.expressions().get(args[0])
-            && let HirExprKind::Call { callee: None, args } = expression.kind()
-        {
-            return args.clone();
-        }
-        args
     }
 
     fn clone_with_operands(
@@ -4312,7 +6215,7 @@ impl LoweringContext<'_> {
         if let HirExprKind::Call { callee: None, args } = expression.kind()
             && let [object, replacements] = args.as_slice()
         {
-            return Some((*object, *replacements));
+            return Some((object.value, replacements.value));
         }
         None
     }
@@ -4366,7 +6269,17 @@ impl LoweringContext<'_> {
         statements.sort_by_key(|(stmt_span, _)| {
             (stmt_span.start().to_usize(), stmt_span.end().to_usize())
         });
-        statements.into_iter().map(|(_, stmt_id)| stmt_id).collect()
+        let mut outermost = Vec::new();
+        for (stmt_span, stmt_id) in statements {
+            if outermost
+                .iter()
+                .any(|(outer_span, _)| range_contains(*outer_span, stmt_span))
+            {
+                continue;
+            }
+            outermost.push((stmt_span, stmt_id));
+        }
+        outermost.into_iter().map(|(_, stmt_id)| stmt_id).collect()
     }
 
     fn method_body_statement_ids(&self, signature: &FunctionSignature) -> Vec<StmtId> {
@@ -4426,6 +6339,37 @@ impl LoweringContext<'_> {
             .map(|(_, expr_id)| expr_id)
     }
 
+    fn outermost_expr_inside(&self, span: TextRange) -> Option<ExprId> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        module
+            .expressions()
+            .iter()
+            .filter_map(|(expr_id, _)| {
+                let expr_span = self.span_for(SourceMappedId::from(expr_id));
+                (expr_span != span && range_contains(span, expr_span)).then_some((
+                    expr_span.end().to_usize() - expr_span.start().to_usize(),
+                    expr_id,
+                ))
+            })
+            .max_by_key(|(width, _)| *width)
+            .map(|(_, expr_id)| expr_id)
+    }
+
+    fn property_hooks_use_backing_storage(&self, property: &HirProperty) -> bool {
+        let Some(item) = property.items().first() else {
+            return false;
+        };
+        let needle = format!("->{}", local_name(item.name()));
+        property.hooks().iter().any(|hook| {
+            self.source_text
+                .slice(hook.span())
+                .is_some_and(|source| source.contains(&needle))
+        })
+    }
+
     fn signature_for_expr(
         &self,
         span: TextRange,
@@ -4440,10 +6384,34 @@ impl LoweringContext<'_> {
             .iter()
             .find(|signature| signature.kind() == kind && signature.span() == span)
             .or_else(|| {
-                module.signatures().iter().find(|signature| {
-                    signature.kind() == kind && range_contains(span, signature.span())
-                })
+                module
+                    .signatures()
+                    .iter()
+                    .filter(|signature| {
+                        signature.kind() == kind
+                            && (range_contains(span, signature.span())
+                                || range_contains(signature.span(), span)
+                                || ranges_overlap(span, signature.span()))
+                    })
+                    .min_by_key(|signature| {
+                        signature.span().end().to_usize() - signature.span().start().to_usize()
+                    })
             })
+    }
+
+    fn function_like_uses_variable(&self, span: TextRange, variable_name: &str) -> bool {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        module.expressions().iter().any(|(expr_id, expr)| {
+            let expr_span = self.span_for(SourceMappedId::from(expr_id));
+            range_contains(span, expr_span)
+                && matches!(expr.kind(), HirExprKind::Variable { name } if name == variable_name)
+        })
     }
 
     fn explicit_capture_specs(&self, span: TextRange) -> Vec<CaptureSpec> {
@@ -4523,6 +6491,52 @@ impl LoweringContext<'_> {
             .collect()
     }
 
+    fn static_local_specs(&self, stmt_id: StmtId, initializers: &[ExprId]) -> Vec<StaticLocalSpec> {
+        let stmt_span = self.span_for(SourceMappedId::from(stmt_id));
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return Vec::new();
+        };
+        let mut variables = module
+            .scopes()
+            .iter()
+            .flat_map(|(_, scope)| scope.statics().iter())
+            .filter_map(|binding| {
+                let variable = binding.variable();
+                range_contains(stmt_span, variable.span()).then(|| {
+                    (
+                        local_name(variable.name()).to_owned(),
+                        variable.span().start().to_usize(),
+                        variable.span().end().to_usize(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        variables.sort_by_key(|(_, start, _)| *start);
+        variables
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _, end))| {
+                let next_start = variables
+                    .get(index + 1)
+                    .map(|(_, start, _)| *start)
+                    .unwrap_or_else(|| stmt_span.end().to_usize());
+                let initializer = initializers.iter().copied().find(|expr| {
+                    let span = self.span_for(SourceMappedId::from(*expr));
+                    let start = span.start().to_usize();
+                    start >= *end && start < next_start
+                });
+                StaticLocalSpec {
+                    name: name.clone(),
+                    initializer,
+                }
+            })
+            .collect()
+    }
+
     fn loop_control_level(&mut self, expr: Option<ExprId>) -> Option<usize> {
         let Some(expr) = expr else {
             return Some(1);
@@ -4588,31 +6602,7 @@ impl LoweringContext<'_> {
             .unwrap_or_else(|| TextRange::new(0, self.frontend.module().source_bytes()))
     }
 
-    fn is_fiber_name(&self, expr: Option<php_semantics::hir::ExprId>) -> bool {
-        self.static_source_or_resolved_name(expr)
-            .is_some_and(|name| name.eq_ignore_ascii_case("fiber"))
-    }
-
-    fn is_autoload_function_name(&self, expr: Option<php_semantics::hir::ExprId>) -> bool {
-        self.static_source_or_resolved_name(expr)
-            .is_some_and(|name| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "spl_autoload_register"
-                        | "spl_autoload_unregister"
-                        | "spl_autoload_call"
-                        | "spl_autoload_functions"
-                        | "__autoload"
-                )
-            })
-    }
-
     fn is_reflection_function_name(&self, expr: Option<php_semantics::hir::ExprId>) -> bool {
-        self.static_source_or_resolved_name(expr)
-            .is_some_and(|name| name.to_ascii_lowercase().starts_with("reflection"))
-    }
-
-    fn is_reflection_class_name(&self, expr: Option<php_semantics::hir::ExprId>) -> bool {
         self.static_source_or_resolved_name(expr)
             .is_some_and(|name| name.to_ascii_lowercase().starts_with("reflection"))
     }
@@ -4724,6 +6714,44 @@ fn local_name(name: &str) -> &str {
     name.strip_prefix('$').unwrap_or(name)
 }
 
+fn trait_resolution_name(name: &HirNameResolution) -> String {
+    normalize_class_name(
+        name.resolved()
+            .or_else(|| name.fallback())
+            .unwrap_or_else(|| name.source()),
+    )
+}
+
+fn interface_resolution_name(name: &HirNameResolution) -> String {
+    normalize_class_name(
+        name.resolved()
+            .or_else(|| name.fallback())
+            .unwrap_or_else(|| name.source()),
+    )
+}
+
+fn trait_alias_matches(alias: &TraitAliasSpec, candidate: &TraitMethodCandidate) -> bool {
+    normalize_method_name(&alias.method_name) == normalize_method_name(&candidate.method_name)
+        && alias
+            .trait_name
+            .as_deref()
+            .is_none_or(|trait_name| normalize_class_name(trait_name) == candidate.trait_name)
+}
+
+fn class_method_flags_from_modifiers(modifiers: &ModifierSet) -> ClassMethodFlags {
+    ClassMethodFlags {
+        is_static: modifiers.is_static(),
+        is_private: modifiers
+            .visibility()
+            .is_some_and(|visibility| visibility == Visibility::Private),
+        is_protected: modifiers
+            .visibility()
+            .is_some_and(|visibility| visibility == Visibility::Protected),
+        is_abstract: modifiers.is_abstract(),
+        is_final: modifiers.is_final(),
+    }
+}
+
 fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
@@ -4736,19 +6764,25 @@ fn catch_types_supported(catch: &HirCatchClause) -> bool {
     catch.types.is_empty()
         || catch.types.iter().all(|ty| {
             let normalized = normalize_class_name(ty);
-            normalized == "exception" || normalized == "throwable"
+            is_internal_throwable_class(&normalized)
         })
+}
+
+fn is_internal_throwable_class(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "throwable"
+            | "exception"
+            | "error"
+            | "typeerror"
+            | "valueerror"
+            | "argumentcounterror"
+            | "fibererror"
+    )
 }
 
 fn normalize_method_name(name: &str) -> String {
     name.to_ascii_lowercase()
-}
-
-fn is_late_static_binding_name(name: &str) -> bool {
-    matches!(
-        name.trim_start_matches('\\').to_ascii_lowercase().as_str(),
-        "self" | "static" | "parent"
-    )
 }
 
 fn language_constant(name: &str) -> Option<IrConstant> {
@@ -4778,6 +6812,10 @@ fn span_from_range(file: FileId, range: TextRange) -> IrSpan {
 fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start().to_usize() <= inner.start().to_usize()
         && outer.end().to_usize() >= inner.end().to_usize()
+}
+
+fn ranges_overlap(lhs: TextRange, rhs: TextRange) -> bool {
+    lhs.start().to_usize() < rhs.end().to_usize() && rhs.start().to_usize() < lhs.end().to_usize()
 }
 
 fn ir_constant_from_const_value(value: &ConstValue) -> Option<IrConstant> {
@@ -5078,7 +7116,7 @@ mod tests {
         assert!(snapshot.contains("function:1"));
         assert!(snapshot.contains("\"x\"=local:0 by_ref=false"));
         assert!(snapshot.contains("capture \"x\" local:0 by_ref=false"));
-        assert!(snapshot.contains("call_closure r"));
+        assert!(snapshot.contains("call_callable r"));
     }
 
     #[test]
@@ -5103,30 +7141,28 @@ mod tests {
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(
-                    |diagnostic| diagnostic.feature == UnsupportedFeature::Generator
-                        && diagnostic.id == "E_PHP_IR_UNSUPPORTED_GENERATOR"
-                )
-        );
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(result.unit.to_snapshot_text().contains("yield r"));
     }
 
     #[test]
-    fn lower_eval_known_gap_is_machine_readable() {
+    fn lower_yield_from_to_ir_instruction() {
+        let frontend = analyze_source("<?php function gen($items) { yield from $items; }");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(result.unit.to_snapshot_text().contains("yield_from r"));
+    }
+
+    #[test]
+    fn lower_eval_to_ir_instruction() {
         let frontend = analyze_source("<?php eval('echo 1;');");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.feature == UnsupportedFeature::Eval
-                    && diagnostic.id == "E_PHP_IR_UNSUPPORTED_EVAL")
-        );
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(result.unit.to_snapshot_text().contains("eval r"));
     }
 
     #[test]
@@ -5174,46 +7210,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_prompt31_constructs_get_specific_diagnostics() {
+    fn former_prompt31_constructs_lower_without_unsupported_diagnostics() {
         let cases = [
-            (
-                "<?php function gen() { yield from []; }",
-                UnsupportedFeature::YieldFrom,
-                "E_PHP_IR_UNSUPPORTED_YIELD_FROM",
-            ),
-            (
-                "<?php new Fiber(function () {});",
-                UnsupportedFeature::Fiber,
-                "E_PHP_IR_UNSUPPORTED_FIBER",
-            ),
-            (
-                "<?php spl_autoload_register(function ($class) {});",
-                UnsupportedFeature::Autoload,
-                "E_PHP_IR_UNSUPPORTED_AUTOLOAD",
-            ),
-            (
-                "<?php new ReflectionClass('stdClass');",
-                UnsupportedFeature::Reflection,
-                "E_PHP_IR_UNSUPPORTED_REFLECTION",
-            ),
-            (
-                "<?php trait T { public function f() {} } class C { use T; }",
-                UnsupportedFeature::TraitRuntime,
-                "E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME",
-            ),
-            (
-                "<?php enum E { case A; }",
-                UnsupportedFeature::EnumRuntime,
-                "E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME",
-            ),
-            (
-                "<?php class C { public string $name { get { return 'x'; } } }",
-                UnsupportedFeature::PropertyHooks,
-                "E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS",
-            ),
+            "<?php function gen() { yield from []; }",
+            "<?php spl_autoload_register(function ($class) {});",
+            "<?php trait T { public function f() {} } class C { use T; }",
+            "<?php class C { public string $name { get { return 'x'; } } }",
         ];
 
-        for (source, feature, diagnostic_id) in cases {
+        for source in cases {
             let frontend = analyze_source(source);
             let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
@@ -5222,11 +7227,34 @@ mod tests {
                 result
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.feature == feature
-                        && diagnostic.id == diagnostic_id),
+                    .all(|diagnostic| !diagnostic.id.starts_with("E_PHP_IR_UNSUPPORTED_")),
                 "{source}: {:#?}",
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn enums_lower_runtime_metadata_and_case_table() {
+        let frontend = analyze_source("<?php enum Priority: string { case High = 'H'; }");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let class = result
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == "priority")
+            .expect("enum class entry");
+        assert_eq!(class.display_name, "Priority");
+        assert!(class.flags.is_enum);
+        assert!(class.flags.is_final);
+        assert_eq!(class.enum_backing_type, Some(ClassEnumBackingType::String));
+        assert_eq!(class.enum_cases.len(), 1);
+        assert_eq!(class.enum_cases[0].name, "High");
+        assert!(class.enum_cases[0].value.is_some());
+        assert!(class.interfaces.iter().any(|name| name == "unitenum"));
+        assert!(class.interfaces.iter().any(|name| name == "backedenum"));
     }
 }

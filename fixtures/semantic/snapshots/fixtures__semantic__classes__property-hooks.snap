@@ -6,8 +6,8 @@ diagnostics:
 symbols:
   - class HookedProperty
 hir_summary:
-  statements: 0
-  expressions: 0
+  statements: 1
+  expressions: 3
   types: 1
   const_exprs: 0
   class_likes: 1

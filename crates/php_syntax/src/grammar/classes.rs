@@ -254,10 +254,72 @@ fn consume_property_member(parser: &mut Parser<'_>) {
     if parser.at(symbol(b';')) {
         parser.bump();
     } else if parser.at(symbol(b'{')) {
-        consume_balanced_block(parser);
+        parse_property_hook_list(parser);
     } else if !parser.at(symbol(b'}')) {
         parser.error_expected("expected `;` or property hook body", &[";", "{"]);
         recovery::recover_to_statement_boundary(parser);
+    }
+}
+
+fn parse_property_hook_list(parser: &mut Parser<'_>) {
+    parser.bump();
+    while !parser.is_eof() && !parser.at(symbol(b'}')) {
+        if parser.current().is_trivia() || parser.at(symbol(b';')) {
+            parser.bump();
+            continue;
+        }
+        let hook = parser.start();
+        parse_modifiers(parser);
+        bump_trivia(parser);
+        if at_contextual_identifier(parser) {
+            parser.bump();
+        } else {
+            parser.error_expected("expected property hook name", &["get", "set"]);
+            recover_to_property_hook_boundary(parser);
+        }
+        bump_trivia(parser);
+        if parser.at(symbol(b'{')) {
+            parser.bump();
+            crate::grammar::statements::parse_statement_list_contents(parser);
+            if parser.at(symbol(b'}')) {
+                parser.bump();
+            } else {
+                parser.error_expected("expected `}` to close property hook body", &["}"]);
+            }
+        } else if parser.at(named(TokenName::DoubleArrow)) {
+            parser.bump();
+            if !crate::grammar::expressions::parse_expression(parser) {
+                parser.error_expected("expected property hook expression", &["expression"]);
+            }
+            if parser.at(symbol(b';')) {
+                parser.bump();
+            } else {
+                parser.error_expected("expected `;` after property hook expression", &[";"]);
+                recover_to_property_hook_boundary(parser);
+            }
+        } else {
+            parser.error_expected("expected property hook body", &["{", "=>"]);
+            recover_to_property_hook_boundary(parser);
+        }
+        let _completed = hook.complete(parser, SyntaxKind::Node(SyntaxNodeKind::PropertyHookDecl));
+    }
+    if parser.at(symbol(b'}')) {
+        parser.bump();
+    } else {
+        parser.error_expected("expected `}` to close property hook list", &["}"]);
+    }
+}
+
+fn recover_to_property_hook_boundary(parser: &mut Parser<'_>) {
+    while !parser.is_eof()
+        && !parser.at(symbol(b';'))
+        && !parser.at(symbol(b'}'))
+        && !parser.at(named(TokenName::CloseTag))
+    {
+        parser.bump();
+    }
+    if parser.at(symbol(b';')) {
+        parser.bump();
     }
 }
 

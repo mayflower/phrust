@@ -1,8 +1,9 @@
-//! Opaque ordered PHP array storage for Phase 4.
+//! Opaque ordered PHP array storage for Phase 5.
 
 use crate::{PhpString, Value};
+use std::rc::{Rc, Weak};
 
-/// PHP array key after MVP key normalization.
+/// PHP array key after Phase 5 key normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArrayKey {
     /// Integer array key.
@@ -12,7 +13,7 @@ pub enum ArrayKey {
 }
 
 impl ArrayKey {
-    /// Converts a runtime value into an MVP PHP array key.
+    /// Converts a runtime value into a Phase 5 PHP array key.
     ///
     /// Supported conversions:
     /// - `int` remains an integer key;
@@ -32,7 +33,12 @@ impl ArrayKey {
             Value::Float(value) => Some(Self::Int(value.to_f64() as i64)),
             Value::String(value) => Some(Self::from_php_string(value.clone())),
             Value::Uninitialized => Some(Self::String(PhpString::from_bytes(Vec::new()))),
-            Value::Array(_) | Value::Object(_) | Value::Callable(_) | Value::Reference(_) => None,
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Fiber(_)
+            | Value::Generator(_)
+            | Value::Callable(_)
+            | Value::Reference(_) => None,
         }
     }
 
@@ -88,18 +94,52 @@ impl ArrayEntry {
 /// vector, but callers interact through key/value APIs that can later route to
 /// packed or mixed representations without changing the VM boundary.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PhpArray {
+struct ArrayStorage {
     entries: Vec<ArrayEntry>,
-    next_append_key: i64,
+    next_append_key: Option<i64>,
+}
+
+/// Copy-on-write ordered PHP array facade.
+///
+/// Cloning a `PhpArray` shares immutable storage. Mutating methods call
+/// `separate_for_write` through `storage_mut`, so by-value assignment shares
+/// until the first write while true PHP references still write through their
+/// owning slot/reference cell.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PhpArray {
+    storage: Rc<ArrayStorage>,
+}
+
+/// Weak debug handle to array storage for GC tests.
+#[derive(Clone, Debug)]
+pub struct WeakArrayHandle {
+    id: usize,
+    storage: Weak<ArrayStorage>,
+}
+
+impl WeakArrayHandle {
+    /// Returns the process-local debug ID for this handle.
+    #[must_use]
+    pub const fn id(&self) -> usize {
+        self.id
+    }
+
+    /// Returns true when the array storage is still alive.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.storage.strong_count() > 0
+    }
 }
 
 impl PhpArray {
     /// Creates an empty array.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            next_append_key: 0,
+            storage: Rc::new(ArrayStorage {
+                entries: Vec::new(),
+                next_append_key: None,
+            }),
         }
     }
 
@@ -116,31 +156,68 @@ impl PhpArray {
     /// Number of entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.storage.entries.len()
     }
 
     /// Returns true when no entries are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.storage.entries.is_empty()
+    }
+
+    /// Returns true when this array shares storage with at least one clone.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        Rc::strong_count(&self.storage) > 1
+    }
+
+    /// Returns a process-local storage identity for GC debug snapshots.
+    ///
+    /// This is not a PHP-visible handle and must only be used by runtime tests
+    /// and diagnostics.
+    #[must_use]
+    pub fn gc_debug_id(&self) -> usize {
+        Rc::as_ptr(&self.storage).cast::<()>() as usize
+    }
+
+    /// Returns the current `Rc` strong count for GC debug metadata.
+    #[must_use]
+    pub fn gc_refcount_estimate(&self) -> usize {
+        Rc::strong_count(&self.storage)
+    }
+
+    /// Returns a weak debug handle for GC tests.
+    #[must_use]
+    pub fn weak_handle(&self) -> WeakArrayHandle {
+        WeakArrayHandle {
+            id: self.gc_debug_id(),
+            storage: Rc::downgrade(&self.storage),
+        }
+    }
+
+    /// Ensures this array has unique storage before mutation.
+    pub fn separate_for_write(&mut self) {
+        let _ = self.storage_mut();
     }
 
     /// Inserts or overwrites a key. Existing-key overwrites preserve insertion
     /// order.
     pub fn insert(&mut self, key: ArrayKey, value: Value) -> Option<Value> {
-        self.bump_append_key(&key);
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+        let storage = self.storage_mut();
+        bump_append_key(storage, &key);
+        if let Some(entry) = storage.entries.iter_mut().find(|entry| entry.key == key) {
             return Some(std::mem::replace(&mut entry.value, value));
         }
-        self.entries.push(ArrayEntry { key, value });
+        storage.entries.push(ArrayEntry { key, value });
         None
     }
 
     /// Appends with the next integer key.
     pub fn append(&mut self, value: Value) -> ArrayKey {
-        let key = ArrayKey::Int(self.next_append_key);
-        self.next_append_key = self.next_append_key.saturating_add(1);
-        self.entries.push(ArrayEntry {
+        let storage = self.storage_mut();
+        let key = ArrayKey::Int(storage.next_append_key.unwrap_or(0));
+        bump_append_key(storage, &key);
+        storage.entries.push(ArrayEntry {
             key: key.clone(),
             value,
         });
@@ -150,7 +227,8 @@ impl PhpArray {
     /// Returns a value by normalized key.
     #[must_use]
     pub fn get(&self, key: &ArrayKey) -> Option<&Value> {
-        self.entries
+        self.storage
+            .entries
             .iter()
             .find(|entry| &entry.key == key)
             .map(ArrayEntry::value)
@@ -158,7 +236,8 @@ impl PhpArray {
 
     /// Returns a mutable value by normalized key without exposing storage.
     pub fn get_mut(&mut self, key: &ArrayKey) -> Option<&mut Value> {
-        self.entries
+        self.storage_mut()
+            .entries
             .iter_mut()
             .find(|entry| &entry.key == key)
             .map(|entry| &mut entry.value)
@@ -166,15 +245,18 @@ impl PhpArray {
 
     /// Removes a value by normalized key.
     pub fn remove(&mut self, key: &ArrayKey) -> Option<Value> {
-        self.entries
+        let storage = self.storage_mut();
+        storage
+            .entries
             .iter()
             .position(|entry| &entry.key == key)
-            .map(|index| self.entries.remove(index).value)
+            .map(|index| storage.entries.remove(index).value)
     }
 
     /// Iterates in insertion order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&ArrayKey, &Value)> {
-        self.entries
+        self.storage
+            .entries
             .iter()
             .map(|entry| (entry.key(), entry.value()))
     }
@@ -182,8 +264,8 @@ impl PhpArray {
     /// Returns packed elements only when the keys are exactly `0..len`.
     #[must_use]
     pub fn packed_elements(&self) -> Option<Vec<&Value>> {
-        let mut elements = Vec::with_capacity(self.entries.len());
-        for (index, entry) in self.entries.iter().enumerate() {
+        let mut elements = Vec::with_capacity(self.storage.entries.len());
+        for (index, entry) in self.storage.entries.iter().enumerate() {
             if entry.key != ArrayKey::Int(index as i64) {
                 return None;
             }
@@ -192,11 +274,16 @@ impl PhpArray {
         Some(elements)
     }
 
-    fn bump_append_key(&mut self, key: &ArrayKey) {
-        if let ArrayKey::Int(value) = key
-            && *value >= self.next_append_key
-        {
-            self.next_append_key = value.saturating_add(1);
+    fn storage_mut(&mut self) -> &mut ArrayStorage {
+        Rc::make_mut(&mut self.storage)
+    }
+}
+
+fn bump_append_key(storage: &mut ArrayStorage, key: &ArrayKey) {
+    if let ArrayKey::Int(value) = key {
+        let next = value.saturating_add(1);
+        if storage.next_append_key.is_none_or(|current| next > current) {
+            storage.next_append_key = Some(next);
         }
     }
 }
@@ -261,6 +348,20 @@ mod tests {
     }
 
     #[test]
+    fn array_append_key_tracks_negative_integer_keys() {
+        let mut array = PhpArray::new();
+        array.insert(ArrayKey::Int(-5), Value::Int(1));
+        assert_eq!(array.append(Value::Int(2)), ArrayKey::Int(-4));
+
+        let mut array = PhpArray::new();
+        array.insert(ArrayKey::Int(-1), Value::Int(1));
+        assert_eq!(array.append(Value::Int(2)), ArrayKey::Int(0));
+
+        array.insert(ArrayKey::Int(-10), Value::Int(3));
+        assert_eq!(array.append(Value::Int(4)), ArrayKey::Int(1));
+    }
+
+    #[test]
     fn array_remove_and_get_mut_do_not_expose_storage() {
         let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
         *array.get_mut(&ArrayKey::Int(1)).expect("entry") = Value::Int(5);
@@ -269,6 +370,55 @@ mod tests {
         assert_eq!(array.remove(&ArrayKey::Int(0)), Some(Value::Int(1)));
         assert_eq!(array.len(), 1);
         assert_eq!(array.get(&ArrayKey::Int(0)), None);
+    }
+
+    #[test]
+    fn foreach_snapshot_keys_keep_insertion_order_after_mutation() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        let keys = array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+
+        array.remove(&ArrayKey::Int(0));
+        array.append(Value::Int(3));
+
+        assert_eq!(keys, vec![ArrayKey::Int(0), ArrayKey::Int(1)]);
+        assert_eq!(
+            array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+            vec![ArrayKey::Int(1), ArrayKey::Int(2)]
+        );
+    }
+
+    #[test]
+    fn foreach_dynamic_key_reads_include_appended_entries() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        let first_keys = array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        assert_eq!(first_keys, vec![ArrayKey::Int(0), ArrayKey::Int(1)]);
+
+        array.append(Value::Int(3));
+        let second_keys = array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            second_keys,
+            vec![ArrayKey::Int(0), ArrayKey::Int(1), ArrayKey::Int(2)]
+        );
+    }
+
+    #[test]
+    fn cow_array_assignment_shares_until_write() {
+        let original = PhpArray::from_packed(vec![Value::Int(1)]);
+        let mut copy = original.clone();
+
+        assert!(original.is_shared());
+        assert!(copy.is_shared());
+
+        copy.append(Value::Int(2));
+
+        assert_eq!(
+            original.packed_elements().expect("packed original").len(),
+            1
+        );
+        assert_eq!(copy.packed_elements().expect("packed copy").len(), 2);
+        assert_eq!(original.get(&ArrayKey::Int(1)), None);
+        assert_eq!(copy.get(&ArrayKey::Int(1)), Some(&Value::Int(2)));
+        assert!(!copy.is_shared());
     }
 
     #[test]
@@ -300,6 +450,18 @@ mod tests {
         assert_eq!(
             ArrayKey::from_value_mvp(&Value::String(PhpString::from("+42"))),
             Some(ArrayKey::String(PhpString::from("+42")))
+        );
+        assert_eq!(
+            ArrayKey::from_value_mvp(&Value::String(PhpString::from("-42"))),
+            Some(ArrayKey::Int(-42))
+        );
+        assert_eq!(
+            ArrayKey::from_value_mvp(&Value::String(PhpString::from("-0"))),
+            Some(ArrayKey::String(PhpString::from("-0")))
+        );
+        assert_eq!(
+            ArrayKey::from_value_mvp(&Value::String(PhpString::from("9223372036854775808"))),
+            Some(ArrayKey::String(PhpString::from("9223372036854775808")))
         );
     }
 

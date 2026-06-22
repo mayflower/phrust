@@ -1,18 +1,18 @@
 //! Stack frame and register storage for the first VM core.
 
 use php_ir::ids::{FunctionId, LocalId, RegId};
-use php_runtime::{ReferenceCell, Value, ValueSlot};
+use php_runtime::{ReferenceCell, Slot, TempValue, Value};
 
 /// Register storage with checked accessors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisterFile {
-    registers: Vec<Value>,
+    registers: Vec<TempValue>,
 }
 
 /// Local storage with checked accessors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalFile {
-    locals: Vec<ValueSlot>,
+    locals: Vec<Slot>,
 }
 
 impl LocalFile {
@@ -20,23 +20,23 @@ impl LocalFile {
     #[must_use]
     pub fn new(count: u32) -> Self {
         Self {
-            locals: vec![ValueSlot::uninitialized(); count as usize],
+            locals: vec![Slot::uninitialized(); count as usize],
         }
     }
 
     /// Reads a local without panicking.
     #[must_use]
     pub fn get(&self, id: LocalId) -> Option<Value> {
-        self.locals.get(id.index()).map(ValueSlot::read)
+        self.locals.get(id.index()).map(Slot::read)
     }
 
     /// Iterates over local slots in stable slot order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (usize, &ValueSlot)> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (usize, &Slot)> {
         self.locals.iter().enumerate()
     }
 
     /// Reads a local slot mutably without panicking.
-    pub fn get_slot_mut(&mut self, id: LocalId) -> Option<&mut ValueSlot> {
+    pub fn get_slot_mut(&mut self, id: LocalId) -> Option<&mut Slot> {
         self.locals.get_mut(id.index())
     }
 
@@ -46,6 +46,15 @@ impl LocalFile {
             return Err(format!("invalid local local:{}", id.raw()));
         };
         slot.write(value);
+        Ok(())
+    }
+
+    /// Unsets a local name without writing through a referenced alias cell.
+    pub fn unset(&mut self, id: LocalId) -> Result<(), String> {
+        let Some(slot) = self.locals.get_mut(id.index()) else {
+            return Err(format!("invalid local local:{}", id.raw()));
+        };
+        *slot = Slot::uninitialized();
         Ok(())
     }
 
@@ -65,6 +74,23 @@ impl LocalFile {
         target_slot.bind_reference(cell);
         Ok(())
     }
+
+    /// Converts a local to a reference cell and returns that shared cell.
+    pub fn ensure_reference_cell(&mut self, id: LocalId) -> Result<ReferenceCell, String> {
+        let Some(slot) = self.locals.get_mut(id.index()) else {
+            return Err(format!("invalid local local:{}", id.raw()));
+        };
+        Ok(slot.ensure_reference_cell())
+    }
+
+    /// Binds a local to an existing reference cell.
+    pub fn bind_reference_cell(&mut self, id: LocalId, cell: ReferenceCell) -> Result<(), String> {
+        let Some(slot) = self.locals.get_mut(id.index()) else {
+            return Err(format!("invalid local local:{}", id.raw()));
+        };
+        slot.bind_reference(cell);
+        Ok(())
+    }
 }
 
 impl RegisterFile {
@@ -72,7 +98,7 @@ impl RegisterFile {
     #[must_use]
     pub fn new(count: u32) -> Self {
         Self {
-            registers: vec![Value::Uninitialized; count as usize],
+            registers: vec![TempValue::uninitialized(); count as usize],
         }
     }
 
@@ -91,17 +117,20 @@ impl RegisterFile {
     /// Reads a register without panicking.
     #[must_use]
     pub fn get(&self, id: RegId) -> Option<&Value> {
-        self.registers.get(id.index())
+        self.registers.get(id.index()).map(TempValue::value)
     }
 
     /// Iterates over registers in stable register order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (usize, &Value)> {
-        self.registers.iter().enumerate()
+        self.registers
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index, value.value()))
     }
 
     /// Reads a register mutably without panicking.
     pub fn get_mut(&mut self, id: RegId) -> Option<&mut Value> {
-        self.registers.get_mut(id.index())
+        self.registers.get_mut(id.index()).map(TempValue::value_mut)
     }
 
     /// Writes a register without panicking.
@@ -109,7 +138,7 @@ impl RegisterFile {
         let Some(slot) = self.registers.get_mut(id.index()) else {
             return Err(format!("invalid register r{}", id.raw()));
         };
-        *slot = value;
+        slot.set(value);
         Ok(())
     }
 }
@@ -119,6 +148,12 @@ impl RegisterFile {
 pub struct Frame {
     /// Function being executed.
     pub function: FunctionId,
+    /// Class scope used for `self::`, visibility, and private member lookup.
+    pub scope_class: Option<String>,
+    /// Late-static-binding called class used for `static::`.
+    pub called_class: Option<String>,
+    /// Class that declares the selected method body.
+    pub declaring_class: Option<String>,
     /// Registers for the function.
     pub registers: RegisterFile,
     /// PHP local variable slots for the function.
@@ -131,6 +166,29 @@ impl Frame {
     pub fn new(function: FunctionId, register_count: u32, local_count: u32) -> Self {
         Self {
             function,
+            scope_class: None,
+            called_class: None,
+            declaring_class: None,
+            registers: RegisterFile::new(register_count),
+            locals: LocalFile::new(local_count),
+        }
+    }
+
+    /// Creates a frame for a class method with explicit class metadata.
+    #[must_use]
+    pub fn new_with_class_context(
+        function: FunctionId,
+        register_count: u32,
+        local_count: u32,
+        scope_class: Option<String>,
+        called_class: Option<String>,
+        declaring_class: Option<String>,
+    ) -> Self {
+        Self {
+            function,
+            scope_class,
+            called_class,
+            declaring_class,
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
         }

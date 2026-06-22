@@ -40,7 +40,7 @@ classified as known gaps.
 Fixture proof: `fixtures/runtime/valid/functions/local-scope.php`,
 `fixtures/runtime/valid/functions/factorial.php`,
 `fixtures/runtime/valid/references/local-alias.php`, and
-`fixtures/runtime/known_gaps/references/by-ref-param.php`.
+`fixtures/runtime/valid/references/by-ref-param.php`.
 
 ## Call Stack
 

@@ -161,6 +161,7 @@ where
         include_loader: include_loader_for(path).ok(),
         runtime_context: RuntimeContext::controlled_cli(path, run_options.script_args),
         trace: run_options.trace,
+        trace_runtime: run_options.trace_runtime,
         ..VmOptions::default()
     });
     let result = vm.execute(pipeline.lowering.unit.clone());
@@ -168,7 +169,7 @@ where
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
     write_runtime_diagnostics(stderr, path, &result.diagnostics)?;
-    if run_options.trace {
+    if run_options.trace || run_options.trace_runtime {
         write_trace(stderr, &result.trace)?;
     }
     match result.status.exit_status() {
@@ -451,6 +452,7 @@ struct RunOptions<'a> {
     path: &'a str,
     script_args: Vec<String>,
     trace: bool,
+    trace_runtime: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -489,10 +491,12 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
 
     let mut path = None;
     let mut trace = false;
+    let mut trace_runtime = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--trace" => trace = true,
+            "--trace-runtime" => trace_runtime = true,
             "--" => {
                 let Some(path) = path else {
                     return Err("run requires <path.php> before `--`".to_string());
@@ -501,6 +505,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     path,
                     script_args: args[index + 1..].to_vec(),
                     trace,
+                    trace_runtime,
                 });
             }
             arg if path.is_none() => path = Some(arg),
@@ -519,6 +524,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         path,
         script_args: Vec::new(),
         trace,
+        trace_runtime,
     })
 }
 
@@ -562,7 +568,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm run [--trace] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm run [--trace] [--trace-runtime] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -1146,6 +1152,28 @@ mod tests {
         assert!(stderr.contains("vm-trace:"), "{stderr}");
         assert!(stderr.contains("function=main(0)"), "{stderr}");
         assert!(stderr.contains("output_len="), "{stderr}");
+    }
+
+    #[test]
+    fn run_trace_runtime_writes_stderr_without_changing_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--trace-runtime".to_string(),
+                fixture("fixtures/runtime/valid/references/array-element-ref.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(!stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("vm-trace:"), "{stderr}");
+        assert!(stderr.contains("runtime lvalue"), "{stderr}");
+        assert!(!stderr.contains("0x"), "{stderr}");
     }
 
     #[test]

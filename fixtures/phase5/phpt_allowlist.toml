@@ -1,0 +1,56 @@
+# Curated Phase 5 PHPT smoke matrix.
+#
+# Paths are relative to this file. The matrix intentionally references a small
+# set of pinned php-src tests instead of vendoring the upstream PHPT suite.
+
+[[test]]
+path = "../../third_party/php-src/tests/lang/001.phpt"
+category = "language"
+disposition = "run"
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/array_append_COW.phpt"
+category = "references_cow"
+disposition = "run"
+
+[[test]]
+path = "../../third_party/php-src/tests/lang/foreachLoop.001.phpt"
+category = "foreach"
+disposition = "expected_fail"
+reason = "Uses current(), which is outside the Phase 5 stdlib subset; keeps foreach PHPT coverage visible without requiring Phase 6 stdlib."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/traits/language001.phpt"
+category = "traits"
+disposition = "expected_fail"
+reason = "The upstream test calls error_reporting(E_ALL); E_ALL is not modeled in the Phase 5 runtime constants subset."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/enum/magic-constants.phpt"
+category = "enums"
+disposition = "expected_fail"
+reason = "Backed enum case values from magic constants are tracked as a Phase 5 enum constant-expression gap."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/generators/generator_with_keys.phpt"
+category = "generators"
+disposition = "expected_fail"
+reason = "The test depends on current()/end()/prev() and complex generator loop lowering beyond the curated Phase 5 generator smoke subset."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/fibers/suspend-outside-fiber.phpt"
+category = "fibers"
+disposition = "expected_fail"
+reason = "Rust VM emits the deterministic Phase 5 fiber diagnostic; PHP-formatted fatal error output is not normalized yet."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/property_hooks/get_by_ref.phpt"
+category = "property_hooks"
+disposition = "expected_fail"
+reason = "By-reference property hook access remains a documented Phase 5 property/reference known gap."
+
+[[test]]
+path = "../../third_party/php-src/Zend/tests/enum/reflectionclass.phpt"
+category = "reflection"
+disposition = "expected_fail"
+reason = "Enum reflection metadata is intentionally partial in Phase 5 and returns an incomplete constant table."

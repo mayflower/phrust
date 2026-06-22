@@ -5,7 +5,9 @@ use crate::constants::IrConstant;
 use crate::function::{FunctionFlags, IrCapture, IrFunction, IrParam, IrReturnType};
 use crate::ids::{BlockId, ConstId, FileId, FunctionId, InstrId, LocalId, RegId, UnitId};
 use crate::instruction::{Instruction, InstructionKind, Terminator, TerminatorKind};
-use crate::module::{ClassEntry, FileEntry, FunctionEntry, GlobalConstantEntry, IrUnit};
+use crate::module::{
+    AttributeEntry, ClassEntry, FileEntry, FunctionEntry, GlobalConstantEntry, IrUnit,
+};
 use crate::operand::Operand;
 use crate::source_map::{IrSourceMapTarget, IrSpan};
 
@@ -110,6 +112,26 @@ impl IrBuilder {
         self.function_mut(function).return_type = return_type;
     }
 
+    /// Sets whether the function returns by reference.
+    pub fn set_returns_by_ref(&mut self, function: FunctionId, returns_by_ref: bool) {
+        self.function_mut(function).returns_by_ref = returns_by_ref;
+    }
+
+    /// Sets function-like attribute metadata.
+    pub fn set_function_attributes(
+        &mut self,
+        function: FunctionId,
+        attributes: Vec<AttributeEntry>,
+    ) {
+        self.function_mut(function).attributes = attributes;
+    }
+
+    /// Returns whether a function was declared to return by reference.
+    #[must_use]
+    pub fn returns_by_ref(&self, function: FunctionId) -> bool {
+        self.unit.functions[function.index()].returns_by_ref
+    }
+
     /// Compatibility helper for early manual IR tests.
     pub fn push_required_param(
         &mut self,
@@ -125,6 +147,7 @@ impl IrBuilder {
             type_: None,
             by_ref: false,
             variadic: false,
+            attributes: Vec::new(),
         });
     }
 
@@ -160,6 +183,18 @@ impl IrBuilder {
         function.locals.push(name.to_owned());
         function.local_count += 1;
         id
+    }
+
+    /// Returns the local slot for an existing named PHP local.
+    #[must_use]
+    pub fn local_id(&self, function: FunctionId, name: &str) -> Option<LocalId> {
+        self.unit.functions[function.index()]
+            .locals
+            .iter()
+            .enumerate()
+            .find_map(|(index, existing)| {
+                (existing.as_str() == name).then(|| LocalId::new(index as u32))
+            })
     }
 
     /// Emits `LoadConst`.
@@ -218,7 +253,27 @@ impl IrBuilder {
     ) {
         self.block_mut(function, block).terminator = Some(Terminator {
             span,
-            kind: TerminatorKind::Return { value },
+            kind: TerminatorKind::Return {
+                value,
+                by_ref_local: None,
+            },
+        });
+    }
+
+    /// Sets a return terminator that returns a local slot by reference.
+    pub fn terminate_return_ref(
+        &mut self,
+        function: FunctionId,
+        block: BlockId,
+        local: LocalId,
+        span: IrSpan,
+    ) {
+        self.block_mut(function, block).terminator = Some(Terminator {
+            span,
+            kind: TerminatorKind::Return {
+                value: Some(Operand::Local(local)),
+                by_ref_local: Some(local),
+            },
         });
     }
 
@@ -289,6 +344,11 @@ impl IrBuilder {
     /// Sets the entry function.
     pub fn set_entry(&mut self, function: FunctionId) {
         self.unit.entry = function;
+    }
+
+    /// Sets file-level `declare(strict_types=1)` metadata for this IR unit.
+    pub fn set_strict_types(&mut self, strict_types: bool) {
+        self.unit.strict_types = strict_types;
     }
 
     /// Finishes the unit.

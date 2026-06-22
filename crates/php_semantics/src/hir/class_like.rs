@@ -609,13 +609,23 @@ impl HirPropertyItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HirPropertyHook {
     kind: String,
+    span: php_source::TextRange,
+    body: HirPropertyHookBody,
 }
 
 impl HirPropertyHook {
     /// Creates a property hook summary.
     #[must_use]
-    pub fn new(kind: impl Into<String>) -> Self {
-        Self { kind: kind.into() }
+    pub fn new(
+        kind: impl Into<String>,
+        span: php_source::TextRange,
+        body: HirPropertyHookBody,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            span,
+            body,
+        }
     }
 
     /// Returns the hook kind.
@@ -623,6 +633,27 @@ impl HirPropertyHook {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+
+    /// Returns the hook declaration span.
+    #[must_use]
+    pub const fn span(&self) -> php_source::TextRange {
+        self.span
+    }
+
+    /// Returns the hook body shape.
+    #[must_use]
+    pub const fn body(&self) -> HirPropertyHookBody {
+        self.body
+    }
+}
+
+/// Property hook body shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HirPropertyHookBody {
+    /// Hook uses `=> expr;`.
+    Expression,
+    /// Hook uses `{ statements }`.
+    Block,
 }
 
 /// Lowered class-constant declaration record.

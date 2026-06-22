@@ -208,8 +208,7 @@ pub fn validate_const_expr_allowed_forms(
                 .all(|child| validate_const_expr_allowed_forms(module, child, context).allowed);
             let args_allowed = args
                 .iter()
-                .copied()
-                .all(|arg| validate_new_argument_allowed(module, arg, context));
+                .all(|arg| validate_new_argument_allowed(module, arg.value, context));
             ConstExprValidation {
                 kind: ConstExprKind::New,
                 allowed: class_allowed && args_allowed,
@@ -383,12 +382,10 @@ fn validate_new_argument_allowed(
     match module.expressions()[expr_id].kind() {
         HirExprKind::Call { callee: None, args } => args
             .iter()
-            .copied()
-            .all(|arg| validate_const_expr_allowed_forms(module, arg, context).allowed),
+            .all(|arg| validate_const_expr_allowed_forms(module, arg.value, context).allowed),
         HirExprKind::BuiltinCall { args, .. } => args
             .iter()
-            .copied()
-            .all(|arg| validate_const_expr_allowed_forms(module, arg, context).allowed),
+            .all(|arg| validate_const_expr_allowed_forms(module, arg.value, context).allowed),
         _ => validate_const_expr_allowed_forms(module, expr_id, context).allowed,
     }
 }

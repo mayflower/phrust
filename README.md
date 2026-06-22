@@ -109,6 +109,51 @@ nix develop -c just runtime-fixtures
 nix develop -c just runtime-diff
 ```
 
+## Phase 5 Runtime Semantics Scope
+
+Phase 5 starts from [the runtime semantics contract](docs/phase5-runtime-contract.md)
+and the imported [Phase 5 known-gap catalog](docs/phase5-known-gaps.md). The
+final audit is tracked in [the Phase 5 final audit](docs/phase5-final-audit.md),
+[coverage matrix](docs/phase5-coverage-matrix.md), and
+[Phase 6 handoff](docs/phase6-handoff.md). It keeps the same pipeline
+introduced by earlier phases:
+
+```text
+php_lexer -> php_syntax -> php_ast -> php_semantics/HIR -> php_ir -> php_runtime -> php_vm -> php_vm_cli
+```
+
+Do not add a second frontend pipeline for Phase 5. Runtime work should use
+`nix develop -c ...` validation commands and compare observable behavior against
+the pinned PHP 8.5.7 reference through `REFERENCE_PHP` whenever a differential
+gate exists.
+
+Phase 5 commands:
+
+```bash
+nix develop -c just verify-phase5
+nix develop -c just phase5-fixtures
+nix develop -c just phase5-diff
+nix develop -c just phase5-toolchain-audit
+nix develop -c just runtime-hardening-lints
+```
+
+Optional hardening probes are available through `just phase5-miri-smoke` and
+`just phase5-sanitizer-smoke`; they skip clearly unless the host toolchain
+supports them. The unsafe/hardening status is documented in
+[the Phase 5 unsafe audit](docs/phase5-unsafe-audit.md).
+
+Additional optional Phase 5 probes are available for local investigation and
+are not part of `verify-phase5`:
+
+```bash
+nix develop -c just phase5-fuzz-smoke
+nix develop -c just phase5-bench-smoke
+nix develop -c just phase5-composer-smoke
+```
+
+`phase5-composer-smoke` skips unless `PHPRUST_COMPOSER_FIXTURE_DIR` points at
+an existing local fixture project.
+
 ## CI
 
 CI uses Nix. The parser and semantic frontend workflows run the same commands

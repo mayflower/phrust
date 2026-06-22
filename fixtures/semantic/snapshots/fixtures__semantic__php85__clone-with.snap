@@ -7,7 +7,7 @@ symbols:
   - class Prompt29CloneWithSubject
 hir_summary:
   statements: 2
-  expressions: 14
+  expressions: 12
   types: 1
   const_exprs: 1
   class_likes: 1

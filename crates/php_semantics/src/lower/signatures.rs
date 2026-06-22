@@ -299,6 +299,11 @@ impl SignatureLowerer<'_> {
         });
         let default = raw_default_value_ref(tokens, true);
         let promoted_property = promoted_property_info_from_tokens(&tokens[..variable_index]);
+        let attributes = token_range(tokens)
+            .map(ParameterAttribute::new)
+            .into_iter()
+            .collect();
+        let span = token_range(tokens).unwrap_or(variable.range);
         Some(Parameter::new(
             variable.text.clone(),
             type_id,
@@ -310,8 +315,8 @@ impl SignatureLowerer<'_> {
                 promoted_property,
             ),
             default,
-            Vec::new(),
-            variable.range,
+            attributes,
+            span,
         ))
     }
 
@@ -572,7 +577,23 @@ fn raw_by_ref_return(tokens: &[TypeToken]) -> bool {
 }
 
 fn raw_method_parameter_tokens(tokens: &[TypeToken]) -> Vec<Vec<TypeToken>> {
-    let Some(open) = tokens.iter().position(|token| token.text == "(") else {
+    let Some(function) = tokens.iter().position(|token| token.kind == "T_FUNCTION") else {
+        return Vec::new();
+    };
+    let Some(name) = tokens
+        .iter()
+        .enumerate()
+        .skip(function + 1)
+        .find_map(|(index, token)| (token.kind == "T_STRING").then_some(index))
+    else {
+        return Vec::new();
+    };
+    let Some(open) = tokens
+        .iter()
+        .enumerate()
+        .skip(name + 1)
+        .find_map(|(index, token)| (token.text == "(").then_some(index))
+    else {
         return Vec::new();
     };
     let mut depth = 0usize;

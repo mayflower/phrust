@@ -3,6 +3,7 @@
 use crate::block::BasicBlock;
 use crate::constants::IrConstant;
 use crate::ids::LocalId;
+use crate::module::AttributeEntry;
 use crate::source_map::IrSpan;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,8 @@ pub enum IrReturnType {
     Array,
     /// `callable`
     Callable,
+    /// `iterable`
+    Iterable,
     /// `object`
     Object,
     /// `bool`
@@ -30,11 +33,23 @@ pub enum IrReturnType {
     Void,
     /// `mixed`
     Mixed,
+    /// `never`
+    Never,
+    /// Literal `false` type.
+    False,
+    /// Literal `true` type.
+    True,
     /// Class-like return type. Runtime object checking is a known gap until
     /// object storage exists.
     Class { name: String },
     /// Nullable simple type from `?T` or normalized `T|null`.
     Nullable { inner: Box<IrReturnType> },
+    /// Union type in source order.
+    Union { members: Vec<IrReturnType> },
+    /// Intersection type in source order.
+    Intersection { members: Vec<IrReturnType> },
+    /// Disjunctive-normal-form type in source order.
+    Dnf { members: Vec<IrReturnType> },
 }
 
 /// Function parameter metadata.
@@ -50,11 +65,12 @@ pub struct IrParam {
     pub default: Option<IrConstant>,
     /// Optional Phase-3 lowered runtime type enforced by the VM MVP.
     pub type_: Option<IrReturnType>,
-    /// By-reference scaffold bit. The VM rejects by-ref parameters until
-    /// references exist.
+    /// True when the callee aliases the caller argument into this parameter.
     pub by_ref: bool,
     /// True when this parameter collects remaining positional arguments.
     pub variadic: bool,
+    /// Attribute metadata attached to this parameter declaration.
+    pub attributes: Vec<AttributeEntry>,
 }
 
 /// Closure capture metadata stored on a synthesized closure function.
@@ -64,8 +80,7 @@ pub struct IrCapture {
     pub name: String,
     /// Local slot initialized from the closure value before parameters.
     pub local: LocalId,
-    /// By-reference capture scaffold bit. The VM rejects this until references
-    /// exist instead of silently copying the value.
+    /// True when the closure capture aliases the source local's reference cell.
     pub by_ref: bool,
 }
 
@@ -78,6 +93,8 @@ pub struct FunctionFlags {
     pub is_closure: bool,
     /// True for methods.
     pub is_method: bool,
+    /// True when the function body contains `yield` or `yield from`.
+    pub is_generator: bool,
 }
 
 /// IR function body.
@@ -101,8 +118,12 @@ pub struct IrFunction {
     pub flags: FunctionFlags,
     /// Optional declared return type enforced by the VM MVP.
     pub return_type: Option<IrReturnType>,
+    /// True when the function declaration uses `function &name()`.
+    pub returns_by_ref: bool,
     /// Closure capture locals in deterministic declaration/discovery order.
     pub captures: Vec<IrCapture>,
+    /// Attribute metadata attached to this function-like declaration.
+    pub attributes: Vec<AttributeEntry>,
 }
 
 impl IrFunction {
@@ -119,7 +140,9 @@ impl IrFunction {
             span,
             flags,
             return_type: None,
+            returns_by_ref: false,
             captures: Vec::new(),
+            attributes: Vec::new(),
         }
     }
 }

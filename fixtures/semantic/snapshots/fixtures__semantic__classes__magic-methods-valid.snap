@@ -7,7 +7,7 @@ symbols:
   - class Prompt26MagicValid
 hir_summary:
   statements: 26
-  expressions: 32
+  expressions: 30
   types: 27
   const_exprs: 0
   class_likes: 1

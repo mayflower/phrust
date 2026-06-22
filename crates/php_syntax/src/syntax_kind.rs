@@ -166,6 +166,8 @@ pub enum SyntaxNodeKind {
     MethodDecl,
     /// Property declaration.
     PropertyDecl,
+    /// Property hook declaration.
+    PropertyHookDecl,
     /// Class constant declaration.
     ClassConstDecl,
     /// Trait use declaration.
@@ -292,6 +294,7 @@ impl SyntaxNodeKind {
             Self::ClassMemberList => "CLASS_MEMBER_LIST",
             Self::MethodDecl => "METHOD_DECL",
             Self::PropertyDecl => "PROPERTY_DECL",
+            Self::PropertyHookDecl => "PROPERTY_HOOK_DECL",
             Self::ClassConstDecl => "CLASS_CONST_DECL",
             Self::TraitUseDecl => "TRAIT_USE_DECL",
             Self::AttributeGroup => "ATTRIBUTE_GROUP",

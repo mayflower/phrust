@@ -1,6 +1,6 @@
 //! Minimal runtime value model for early VM execution.
 
-use crate::{ObjectRef, PhpArray, ReferenceCell, string::PhpString};
+use crate::{FiberRef, GeneratorRef, ObjectRef, PhpArray, ReferenceCell, string::PhpString};
 use std::fmt;
 
 /// Runtime callable values.
@@ -41,8 +41,45 @@ pub enum CallableValue {
 pub struct ClosureCaptureValue {
     /// Captured variable name without `$`.
     pub name: String,
-    /// Captured value.
-    pub value: Value,
+    /// Captured by-value snapshot. `None` means this capture aliases
+    /// `reference`.
+    pub value: Option<Value>,
+    /// Captured by-reference cell. `None` means this capture uses `value`.
+    pub reference: Option<ReferenceCell>,
+}
+
+impl ClosureCaptureValue {
+    /// Creates a by-value closure capture.
+    #[must_use]
+    pub fn by_value(name: String, value: Value) -> Self {
+        Self {
+            name,
+            value: Some(value),
+            reference: None,
+        }
+    }
+
+    /// Creates a by-reference closure capture.
+    #[must_use]
+    pub fn by_reference(name: String, reference: ReferenceCell) -> Self {
+        Self {
+            name,
+            value: None,
+            reference: Some(reference),
+        }
+    }
+
+    /// Returns a by-value snapshot.
+    #[must_use]
+    pub fn value(&self) -> Option<&Value> {
+        self.value.as_ref()
+    }
+
+    /// Returns a by-reference cell.
+    #[must_use]
+    pub fn reference(&self) -> Option<ReferenceCell> {
+        self.reference.clone()
+    }
 }
 
 /// Runtime value carried by the VM.
@@ -64,6 +101,10 @@ pub enum Value {
     Array(PhpArray),
     /// Runtime object reference.
     Object(ObjectRef),
+    /// Internal fiber object.
+    Fiber(FiberRef),
+    /// Internal generator object.
+    Generator(GeneratorRef),
     /// Callable placeholder.
     Callable(CallableValue),
     /// Reference cell exposed as a value only for explicit future reference
@@ -211,6 +252,16 @@ impl fmt::Debug for Value {
                 .field("id", &object.id())
                 .field("class_name", &object.class_name())
                 .finish(),
+            Self::Fiber(fiber) => f
+                .debug_struct("Fiber")
+                .field("id", &fiber.id())
+                .field("state", &fiber.state())
+                .finish(),
+            Self::Generator(generator) => f
+                .debug_struct("Generator")
+                .field("id", &generator.id())
+                .field("state", &generator.state())
+                .finish(),
             Self::Callable(CallableValue::UserFunction { name }) => f
                 .debug_struct("Callable")
                 .field("kind", &"user_function")
@@ -259,6 +310,8 @@ impl fmt::Display for Value {
             Self::Uninitialized => f.write_str("<uninitialized>"),
             Self::Array(_) => f.write_str("<array>"),
             Self::Object(object) => f.write_str(&format!("object({})", object.class_name())),
+            Self::Fiber(_) => f.write_str("object(Fiber)"),
+            Self::Generator(_) => f.write_str("object(Generator)"),
             Self::Callable(_) => f.write_str("<callable>"),
             Self::Reference(_) => f.write_str("<reference>"),
         }

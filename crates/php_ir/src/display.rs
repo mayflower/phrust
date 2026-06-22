@@ -2,7 +2,9 @@
 
 use crate::constants::IrConstant;
 use crate::function::IrReturnType;
-use crate::instruction::{BinaryOp, CastKind, CompareOp, InstructionKind, TerminatorKind, UnaryOp};
+use crate::instruction::{
+    BinaryOp, CastKind, CompareOp, InstructionKind, IrCallArg, TerminatorKind, UnaryOp,
+};
 use crate::module::IrUnit;
 use crate::operand::Operand;
 use crate::source_map::{IrSourceMapTarget, IrSpan};
@@ -42,9 +44,11 @@ impl IrUnit {
         for class in &self.classes {
             let _ = writeln!(
                 out,
-                "  class:{} {:?} methods={} properties={} constructor={} flags=abstract:{} final:{} readonly:{} span={}",
+                "  class:{} {:?} parent={:?} interfaces={:?} methods={} properties={} constructor={} flags=abstract:{} final:{} readonly:{} interface:{} span={}",
                 class.id.raw(),
                 class.name,
+                class.parent,
+                class.interfaces,
                 class.methods.len(),
                 class.properties.len(),
                 class
@@ -54,18 +58,21 @@ impl IrUnit {
                 class.flags.is_abstract,
                 class.flags.is_final,
                 class.flags.is_readonly,
+                class.flags.is_interface,
                 format_span(class.span)
             );
             for method in &class.methods {
                 let _ = writeln!(
                     out,
-                    "    method {:?} => function:{} static:{} private:{} protected:{} abstract:{}",
+                    "    method {:?} => function:{} static:{} private:{} protected:{} abstract:{} final:{} origin:{:?}",
                     method.name,
                     method.function.raw(),
                     method.flags.is_static,
                     method.flags.is_private,
                     method.flags.is_protected,
-                    method.flags.is_abstract
+                    method.flags.is_abstract,
+                    method.flags.is_final,
+                    method.origin_class
                 );
             }
             for property in &class.properties {
@@ -230,13 +237,35 @@ fn format_return_type(return_type: &IrReturnType) -> String {
         IrReturnType::String => "string".to_string(),
         IrReturnType::Array => "array".to_string(),
         IrReturnType::Callable => "callable".to_string(),
+        IrReturnType::Iterable => "iterable".to_string(),
         IrReturnType::Object => "object".to_string(),
         IrReturnType::Bool => "bool".to_string(),
         IrReturnType::Null => "null".to_string(),
         IrReturnType::Void => "void".to_string(),
         IrReturnType::Mixed => "mixed".to_string(),
+        IrReturnType::Never => "never".to_string(),
+        IrReturnType::False => "false".to_string(),
+        IrReturnType::True => "true".to_string(),
         IrReturnType::Class { name } => format!("class {name:?}"),
         IrReturnType::Nullable { inner } => format!("?{}", format_return_type(inner)),
+        IrReturnType::Union { members } => members
+            .iter()
+            .map(format_return_type)
+            .collect::<Vec<_>>()
+            .join("|"),
+        IrReturnType::Intersection { members } => members
+            .iter()
+            .map(format_return_type)
+            .collect::<Vec<_>>()
+            .join("&"),
+        IrReturnType::Dnf { members } => members
+            .iter()
+            .map(|member| match member {
+                IrReturnType::Intersection { .. } => format!("({})", format_return_type(member)),
+                _ => format_return_type(member),
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
     }
 }
 
@@ -260,6 +289,29 @@ fn format_operand(operand: &Operand) -> String {
         Operand::Local(id) => format!("local:{}", id.raw()),
         Operand::Constant(id) => format!("const:{}", id.raw()),
     }
+}
+
+fn format_call_args(args: &[IrCallArg]) -> String {
+    args.iter()
+        .map(format_call_arg)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_call_arg(arg: &IrCallArg) -> String {
+    let mut out = String::new();
+    if let Some(name) = &arg.name {
+        out.push_str(name);
+        out.push(':');
+    }
+    if arg.unpack {
+        out.push_str("...");
+    }
+    out.push_str(&format_operand(&arg.value));
+    if let Some(local) = arg.by_ref_local {
+        out.push_str(&format!(" by_ref=local:{}", local.raw()));
+    }
+    out
 }
 
 fn format_unary_op(op: UnaryOp) -> &'static str {
@@ -337,6 +389,64 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 source.raw()
             )
         }
+        InstructionKind::BindGlobal { local, name } => {
+            format!("bind_global local:{} {:?}", local.raw(), name)
+        }
+        InstructionKind::BindReferenceDim {
+            local,
+            dims,
+            append,
+            source,
+        } => {
+            let dims = dims
+                .iter()
+                .map(format_operand)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "bind_reference_dim local:{} [{}] append:{} local:{}",
+                local.raw(),
+                dims,
+                append,
+                source.raw()
+            )
+        }
+        InstructionKind::BindReferenceFromDim {
+            target,
+            local,
+            dims,
+        } => {
+            let dims = dims
+                .iter()
+                .map(format_operand)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "bind_reference_from_dim local:{} local:{} [{}]",
+                target.raw(),
+                local.raw(),
+                dims
+            )
+        }
+        InstructionKind::BindReferenceFromCall { target, name, args } => {
+            let args = format_call_args(args);
+            format!(
+                "bind_reference_call local:{} {}({})",
+                target.raw(),
+                name,
+                args
+            )
+        }
+        InstructionKind::InitStaticLocal {
+            local,
+            name,
+            default,
+        } => format!(
+            "init_static_local local:{} {:?} {}",
+            local.raw(),
+            name,
+            format_operand(default)
+        ),
         InstructionKind::Binary { dst, op, lhs, rhs } => format!(
             "binary r{} {} {} {}",
             dst.raw(),
@@ -350,6 +460,16 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_compare_op(*op),
             format_operand(lhs),
             format_operand(rhs)
+        ),
+        InstructionKind::InstanceOf {
+            dst,
+            object,
+            class_name,
+        } => format!(
+            "instanceof r{} {} {:?}",
+            dst.raw(),
+            format_operand(object),
+            class_name
         ),
         InstructionKind::Unary { dst, op, src } => format!(
             "unary r{} {} {}",
@@ -365,12 +485,20 @@ fn format_instruction(kind: &InstructionKind) -> String {
         ),
         InstructionKind::Discard { src } => format!("discard {}", format_operand(src)),
         InstructionKind::Echo { src } => format!("echo {}", format_operand(src)),
+        InstructionKind::Yield { dst, key, value } => {
+            let key = key
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), format_operand);
+            let value = value
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), format_operand);
+            format!("yield r{} key={} value={}", dst.raw(), key, value)
+        }
+        InstructionKind::YieldFrom { dst, source } => {
+            format!("yield_from r{} {}", dst.raw(), format_operand(source))
+        }
         InstructionKind::CallFunction { dst, name, args } => {
-            let args = args
-                .iter()
-                .map(format_operand)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let args = format_call_args(args);
             format!("call_function r{} {:?} [{}]", dst.raw(), name, args)
         }
         InstructionKind::CallMethod {
@@ -379,11 +507,7 @@ fn format_instruction(kind: &InstructionKind) -> String {
             method,
             args,
         } => {
-            let args = args
-                .iter()
-                .map(format_operand)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let args = format_call_args(args);
             format!(
                 "call_method r{} {} {:?} [{}]",
                 dst.raw(),
@@ -398,11 +522,7 @@ fn format_instruction(kind: &InstructionKind) -> String {
             method,
             args,
         } => {
-            let args = args
-                .iter()
-                .map(format_operand)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let args = format_call_args(args);
             format!(
                 "call_static_method r{} {:?}::{:?} [{}]",
                 dst.raw(),
@@ -426,14 +546,16 @@ fn format_instruction(kind: &InstructionKind) -> String {
         ),
         InstructionKind::EnterTry {
             catch,
+            catch_types,
             finally,
             after,
             exception_local,
         } => format!(
-            "enter_try catch={} finally={} after=block:{} exception_local={}",
+            "enter_try catch={} catch_types=[{}] finally={} after=block:{} exception_local={}",
             catch
                 .map(|block| format!("block:{}", block.raw()))
                 .unwrap_or_else(|| "none".to_owned()),
+            catch_types.join(","),
             finally
                 .map(|block| format!("block:{}", block.raw()))
                 .unwrap_or_else(|| "none".to_owned()),
@@ -447,8 +569,17 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format!("end_finally after=block:{}", after.raw())
         }
         InstructionKind::Throw { value } => format!("throw {}", format_operand(value)),
-        InstructionKind::MakeException { dst, message } => {
-            format!("make_exception r{} {}", dst.raw(), format_operand(message))
+        InstructionKind::MakeException {
+            dst,
+            class_name,
+            message,
+        } => {
+            format!(
+                "make_exception r{} {} {}",
+                dst.raw(),
+                class_name,
+                format_operand(message)
+            )
         }
         InstructionKind::MakeClosure {
             dst,
@@ -475,11 +606,7 @@ fn format_instruction(kind: &InstructionKind) -> String {
             )
         }
         InstructionKind::CallClosure { dst, callee, args } => {
-            let args = args
-                .iter()
-                .map(format_operand)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let args = format_call_args(args);
             format!(
                 "call_closure r{} {} [{}]",
                 dst.raw(),
@@ -495,11 +622,7 @@ fn format_instruction(kind: &InstructionKind) -> String {
             )
         }
         InstructionKind::CallCallable { dst, callee, args } => {
-            let args = args
-                .iter()
-                .map(format_operand)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let args = format_call_args(args);
             format!(
                 "call_callable r{} {} [{}]",
                 dst.raw(),
@@ -523,6 +646,9 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_include_kind(*kind),
             format_operand(path)
         ),
+        InstructionKind::Eval { dst, code } => {
+            format!("eval r{} {}", dst.raw(), format_operand(code))
+        }
         InstructionKind::NewObject {
             dst,
             class_name,
@@ -532,7 +658,7 @@ fn format_instruction(kind: &InstructionKind) -> String {
             dst.raw(),
             class_name,
             args.iter()
-                .map(format_operand)
+                .map(format_call_arg)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -546,6 +672,49 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_operand(object),
             property
         ),
+        InstructionKind::IssetProperty {
+            dst,
+            object,
+            property,
+        } => format!(
+            "isset_property r{} {} ${}",
+            dst.raw(),
+            format_operand(object),
+            property
+        ),
+        InstructionKind::EmptyProperty {
+            dst,
+            object,
+            property,
+        } => format!(
+            "empty_property r{} {} ${}",
+            dst.raw(),
+            format_operand(object),
+            property
+        ),
+        InstructionKind::UnsetProperty { object, property } => {
+            format!("unset_property {} ${}", format_operand(object), property)
+        }
+        InstructionKind::FetchStaticProperty {
+            dst,
+            class_name,
+            property,
+        } => format!(
+            "fetch_static_property r{} {}::${}",
+            dst.raw(),
+            class_name,
+            property
+        ),
+        InstructionKind::FetchClassConstant {
+            dst,
+            class_name,
+            constant,
+        } => format!(
+            "fetch_class_constant r{} {}::{}",
+            dst.raw(),
+            class_name,
+            constant
+        ),
         InstructionKind::AssignProperty {
             dst,
             object,
@@ -555,6 +724,18 @@ fn format_instruction(kind: &InstructionKind) -> String {
             "assign_property r{} {} ${} {}",
             dst.raw(),
             format_operand(object),
+            property,
+            format_operand(value)
+        ),
+        InstructionKind::AssignStaticProperty {
+            dst,
+            class_name,
+            property,
+            value,
+        } => format!(
+            "assign_static_property r{} {}::${} {}",
+            dst.raw(),
+            class_name,
             property,
             format_operand(value)
         ),
@@ -655,6 +836,30 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 value.raw()
             )
         }
+        InstructionKind::ForeachInitRef { iterator, local } => {
+            format!(
+                "foreach_init_ref iter:r{} local:{}",
+                iterator.raw(),
+                local.raw()
+            )
+        }
+        InstructionKind::ForeachNextRef {
+            has_value,
+            iterator,
+            key,
+            value_local,
+        } => {
+            let key = key
+                .map(|key| format!("r{}", key.raw()))
+                .unwrap_or_else(|| "none".to_string());
+            format!(
+                "foreach_next_ref has=r{} iter:r{} key={} value=local:{}",
+                has_value.raw(),
+                iterator.raw(),
+                key,
+                value_local.raw()
+            )
+        }
         InstructionKind::ArrayGet { dst, array, index } => format!(
             "array_get r{} {} {}",
             dst.raw(),
@@ -733,9 +938,16 @@ fn format_terminator(kind: &TerminatorKind) -> String {
                 if_false.raw()
             )
         }
-        TerminatorKind::Return { value } => match value {
-            Some(value) => format!("return {}", format_operand(value)),
-            None => "return".to_string(),
+        TerminatorKind::Return {
+            value,
+            by_ref_local,
+        } => match (value, by_ref_local) {
+            (Some(value), Some(local)) => {
+                format!("return_ref {} local:{}", format_operand(value), local.raw())
+            }
+            (Some(value), None) => format!("return {}", format_operand(value)),
+            (None, Some(local)) => format!("return_ref local:{}", local.raw()),
+            (None, None) => "return".to_string(),
         },
     }
 }
@@ -850,7 +1062,10 @@ mod tests {
         }
         block.terminator = Some(Terminator {
             span,
-            kind: TerminatorKind::Return { value: None },
+            kind: TerminatorKind::Return {
+                value: None,
+                by_ref_local: None,
+            },
         });
         function.blocks.push(block);
         unit.functions.push(function);

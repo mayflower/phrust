@@ -328,8 +328,8 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeSeverity, RuntimeStackFrame, division_by_zero_mvp, undefined_function,
-        undefined_variable_warning,
+        RuntimeDiagnostic, RuntimeSeverity, RuntimeStackFrame, division_by_zero_mvp,
+        undefined_function, undefined_variable_warning,
     };
     use crate::RuntimeSourceSpan;
 
@@ -363,5 +363,30 @@ mod tests {
         let division = division_by_zero_mvp(RuntimeSourceSpan::default(), Vec::new());
         assert_eq!(division.id(), "E_PHP_RUNTIME_DIVISION_BY_ZERO");
         assert_eq!(division.message(), "division by zero");
+    }
+
+    #[test]
+    fn exception_diagnostics_preserve_severity_and_source_mapping() {
+        let span = RuntimeSourceSpan {
+            file: Some("fixtures/phase5/errors/type-error-uncaught.php".to_owned()),
+            start: 12,
+            end: 21,
+        };
+        let warning = undefined_variable_warning("missing", span.clone(), Vec::new());
+        let fatal = RuntimeDiagnostic::new(
+            "E_PHP_VM_UNCAUGHT_EXCEPTION",
+            RuntimeSeverity::FatalError,
+            "Uncaught TypeError: bad".to_owned(),
+            span.clone(),
+            vec![RuntimeStackFrame::new("main")],
+            None,
+        );
+
+        assert_eq!(warning.severity(), RuntimeSeverity::Warning);
+        assert_eq!(fatal.severity(), RuntimeSeverity::FatalError);
+        let json = fatal.to_json();
+        assert!(json.contains("type-error-uncaught.php"));
+        assert!(json.contains("\"start\":12"));
+        assert!(json.contains("\"end\":21"));
     }
 }

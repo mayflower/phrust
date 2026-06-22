@@ -1,0 +1,2 @@
+<?php
+$message = $message . "|included";

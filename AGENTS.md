@@ -88,6 +88,28 @@ Do not automatically update the target PHP version without a new ADR.
 - Phase 4 must preserve Phase 0, Phase 1, Phase 2, and Phase 3 validation
   commands.
 
+## Phase 5 Runtime Semantics Boundaries
+
+- Phase 5 work starts from `docs/phase5-runtime-contract.md`.
+- Keep the only input pipeline as `php_lexer` -> `php_syntax` -> `php_ast` ->
+  `php_semantics`/HIR -> `php_ir` -> `php_runtime` -> `php_vm` ->
+  `php_vm_cli`.
+- Do not add a second lexer, parser, AST, semantic frontend, or source
+  string-matching execution path.
+- Phase 5 focuses on references, Copy-on-Write, arrays, calls, objects, traits,
+  enums, magic methods, generators, fibers, reflection, include/require/eval,
+  autoload, globals, destructors, GC, diagnostics, and differential runtime
+  fixtures.
+- Every new runtime semantic behavior needs a focused fixture against
+  `REFERENCE_PHP` when reference execution is available. Every unsupported
+  language-semantics area needs a stable ID, fixture or concrete example, and
+  `docs/phase5-known-gaps.md` coverage.
+- Closing Phase 5 requires `docs/phase5-final-audit.md`,
+  `docs/phase5-coverage-matrix.md`, and `docs/phase6-handoff.md` to agree with
+  the fixture harness, known-gap catalog, README, and CI workflow.
+- Phase 5 still does not implement a complete standard library, SPL, Zend
+  extension ABI, FPM/SAPI, Opcache, quickening, inline caches, or JIT.
+
 ## Validation Commands
 
 - Use the narrowest relevant check while iterating.
@@ -104,6 +126,9 @@ Do not automatically update the target PHP version without a new ADR.
 - Before finishing Phase 4 work, run `nix develop -c just verify-phase4` once
   that target exists. Until then, run the strongest implemented gates for the
   current slice and clearly report missing Phase 4 targets.
+- Before finishing Phase 5 work, run `nix develop -c just verify-phase5` once
+  that target exists. For final Phase 5 closure, also run the Phase 0 through
+  Phase 4 gates and `nix develop -c cargo test --workspace`.
 
 ## Codex Operating Profile
 

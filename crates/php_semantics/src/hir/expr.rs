@@ -75,15 +75,15 @@ pub enum HirExprKind {
     /// Function-like call.
     Call {
         callee: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     },
     /// Function-like builtin construct with no explicit source name node.
-    BuiltinCall { name: String, args: Vec<ExprId> },
+    BuiltinCall { name: String, args: Vec<HirCallArg> },
     /// Object method call.
     MethodCall {
         receiver: Option<ExprId>,
         method: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
         nullsafe: bool,
     },
     /// Object property fetch.
@@ -109,7 +109,7 @@ pub enum HirExprKind {
     /// Object creation.
     New {
         class: Option<ExprId>,
-        args: Vec<ExprId>,
+        args: Vec<HirCallArg>,
     },
     /// Clone expression.
     Clone { expr: Option<ExprId> },
@@ -154,6 +154,17 @@ pub enum HirExprKind {
     FirstClassCallable { callee: Option<ExprId> },
     /// Placeholder for a CST expression that is intentionally only categorized.
     Unlowered { syntax_kind: String },
+}
+
+/// One PHP call argument after HIR lowering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HirCallArg {
+    /// Optional named-argument label without trailing `:`.
+    pub name: Option<String>,
+    /// Argument value expression.
+    pub value: ExprId,
+    /// True when the argument was introduced by `...`.
+    pub unpack: bool,
 }
 
 /// One arm in a PHP `match` expression.

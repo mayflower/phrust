@@ -28,7 +28,9 @@ fn lowered_single_literal_snapshot_is_stable() {
         "<?php echo 1;",
         "fixtures/bytecode/literals/valid/echo-int.php",
     );
-    let expected = include_str!("../../../fixtures/bytecode/valid/literals-single.ir.snap");
+    let expected = lowered_expected(include_str!(
+        "../../../fixtures/bytecode/valid/literals-single.ir.snap"
+    ));
     assert_eq!(actual, expected);
 }
 
@@ -38,7 +40,9 @@ fn lowered_multiple_literals_snapshot_is_stable() {
         "<?php echo 1, \"x\";",
         "fixtures/bytecode/literals/valid/echo-multiple.php",
     );
-    let expected = include_str!("../../../fixtures/bytecode/valid/literals-multiple.ir.snap");
+    let expected = lowered_expected(include_str!(
+        "../../../fixtures/bytecode/valid/literals-multiple.ir.snap"
+    ));
     assert_eq!(actual, expected);
 }
 
@@ -48,7 +52,9 @@ fn lowered_source_map_snapshot_is_stable() {
         "<?php echo null, true;",
         "fixtures/bytecode/literals/valid/echo-source-map.php",
     );
-    let expected = include_str!("../../../fixtures/bytecode/valid/source-map.ir.snap");
+    let expected = lowered_expected(include_str!(
+        "../../../fixtures/bytecode/valid/source-map.ir.snap"
+    ));
     assert_eq!(actual, expected);
 }
 
@@ -56,7 +62,9 @@ fn lowered_source_map_snapshot_is_stable() {
 fn lowered_foreach_snapshot_is_stable() {
     let source = include_str!("../../../fixtures/bytecode/lower/valid/foreach.php");
     let actual = lowered_snapshot(source, "fixtures/bytecode/lower/valid/foreach.php");
-    let expected = include_str!("../../../fixtures/bytecode/valid/foreach.ir.snap");
+    let expected = lowered_expected(include_str!(
+        "../../../fixtures/bytecode/valid/foreach.ir.snap"
+    ));
     assert_eq!(actual, expected);
 }
 
@@ -64,8 +72,28 @@ fn lowered_foreach_snapshot_is_stable() {
 fn lowered_include_snapshot_is_stable() {
     let source = include_str!("../../../fixtures/bytecode/lower/valid/include.php");
     let actual = lowered_snapshot(source, "fixtures/bytecode/lower/valid/include.php");
-    let expected = include_str!("../../../fixtures/bytecode/valid/include.ir.snap");
+    let expected = lowered_expected(include_str!(
+        "../../../fixtures/bytecode/valid/include.ir.snap"
+    ));
     assert_eq!(actual, expected);
+}
+
+const PHASE5_INTERNAL_CLASS_SNAPSHOT: &str = concat!(
+    "  class:0 \"traversable\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:1 \"iterator\" parent=None interfaces=[\"traversable\"] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:2 \"iteratoraggregate\" parent=None interfaces=[\"traversable\"] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:3 \"arrayaccess\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:4 \"throwable\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:5 \"unitenum\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:6 \"backedenum\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+    "  class:7 \"stringable\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
+);
+
+fn lowered_expected(snapshot: &str) -> String {
+    snapshot.replace(
+        "classes:\nfunction_table:",
+        &format!("classes:\n{PHASE5_INTERNAL_CLASS_SNAPSHOT}function_table:"),
+    )
 }
 
 fn manual_basic_unit() -> php_ir::IrUnit {

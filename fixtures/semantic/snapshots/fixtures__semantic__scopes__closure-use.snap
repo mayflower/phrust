@@ -7,7 +7,7 @@ symbols:
   - function make_closure
 hir_summary:
   statements: 5
-  expressions: 8
+  expressions: 10
   types: 0
   const_exprs: 0
   class_likes: 0

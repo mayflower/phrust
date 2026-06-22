@@ -149,6 +149,7 @@ impl ControlContextChecker {
             || MethodDecl::cast(node).is_some()
             || ClosureExpr::cast(node).is_some()
             || ArrowFunctionExpr::cast(node).is_some()
+            || node.kind().name() == "PROPERTY_HOOK_DECL"
         {
             self.with_function_like_unit(node);
         } else if ClassDecl::cast(node).is_some()

@@ -1,0 +1,180 @@
+//! Internal generator runtime state for Phase 5.
+
+use crate::Value;
+use std::cell::RefCell;
+use std::fmt;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GENERATOR_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generator lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorState {
+    /// Function call returned a generator object but the body has not run.
+    Created,
+    /// Generator body is currently executing.
+    Running,
+    /// Generator stopped at a `yield`.
+    Suspended,
+    /// Generator completed normally or was closed by the VM.
+    Closed,
+    /// Generator errored while executing.
+    Errored,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GeneratorStorage {
+    function: u32,
+    args: Vec<Value>,
+    state: GeneratorState,
+    current_key: Option<Value>,
+    current_value: Option<Value>,
+    return_value: Option<Value>,
+}
+
+/// Internal reference to generator state.
+#[derive(Clone)]
+pub struct GeneratorRef {
+    id: u64,
+    storage: Rc<RefCell<GeneratorStorage>>,
+}
+
+impl GeneratorRef {
+    /// Creates a generator in the `Created` state.
+    #[must_use]
+    pub fn new(function: u32, args: Vec<Value>) -> Self {
+        Self {
+            id: NEXT_GENERATOR_ID.fetch_add(1, Ordering::Relaxed),
+            storage: Rc::new(RefCell::new(GeneratorStorage {
+                function,
+                args,
+                state: GeneratorState::Created,
+                current_key: None,
+                current_value: None,
+                return_value: None,
+            })),
+        }
+    }
+
+    /// Stable debug identity.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Raw IR function ID.
+    #[must_use]
+    pub fn function(&self) -> u32 {
+        self.storage.borrow().function
+    }
+
+    /// Positional argument snapshots.
+    #[must_use]
+    pub fn args(&self) -> Vec<Value> {
+        self.storage.borrow().args.clone()
+    }
+
+    /// Current lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> GeneratorState {
+        self.storage.borrow().state
+    }
+
+    /// Sets the lifecycle state.
+    pub fn set_state(&self, state: GeneratorState) {
+        self.storage.borrow_mut().state = state;
+    }
+
+    /// Records the current yielded key/value and marks the generator suspended.
+    pub fn suspend(&self, key: Option<Value>, value: Value) {
+        let mut storage = self.storage.borrow_mut();
+        storage.current_key = key;
+        storage.current_value = Some(value);
+        storage.state = GeneratorState::Suspended;
+    }
+
+    /// Marks the generator as completed.
+    pub fn close(&self, return_value: Option<Value>) {
+        let mut storage = self.storage.borrow_mut();
+        storage.current_key = None;
+        storage.current_value = None;
+        storage.return_value = return_value;
+        storage.state = GeneratorState::Closed;
+    }
+
+    /// Current yielded key/value, if any.
+    #[must_use]
+    pub fn current(&self) -> Option<(Option<Value>, Value)> {
+        let storage = self.storage.borrow();
+        storage
+            .current_value
+            .clone()
+            .map(|value| (storage.current_key.clone(), value))
+    }
+
+    /// Current yielded key, if any.
+    #[must_use]
+    pub fn current_key(&self) -> Option<Value> {
+        self.storage.borrow().current_key.clone()
+    }
+
+    /// Current yielded value, if any.
+    #[must_use]
+    pub fn current_value(&self) -> Option<Value> {
+        self.storage.borrow().current_value.clone()
+    }
+
+    /// Return value recorded after normal completion.
+    #[must_use]
+    pub fn return_value(&self) -> Option<Value> {
+        self.storage.borrow().return_value.clone()
+    }
+}
+
+impl fmt::Debug for GeneratorRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratorRef")
+            .field("id", &self.id)
+            .field("function", &self.function())
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl PartialEq for GeneratorRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for GeneratorRef {}
+
+#[cfg(test)]
+mod tests {
+    use super::{GeneratorRef, GeneratorState};
+    use crate::Value;
+
+    #[test]
+    fn generator_state_transitions_are_explicit() {
+        let generator = GeneratorRef::new(7, vec![Value::Int(1)]);
+
+        assert_eq!(generator.state(), GeneratorState::Created);
+        assert_eq!(generator.args(), vec![Value::Int(1)]);
+
+        generator.set_state(GeneratorState::Running);
+        assert_eq!(generator.state(), GeneratorState::Running);
+
+        generator.suspend(Some(Value::Int(2)), Value::string(b"value".to_vec()));
+        assert_eq!(generator.state(), GeneratorState::Suspended);
+        assert_eq!(
+            generator.current(),
+            Some((Some(Value::Int(2)), Value::string(b"value".to_vec())))
+        );
+
+        generator.close(Some(Value::Int(9)));
+        assert_eq!(generator.state(), GeneratorState::Closed);
+        assert_eq!(generator.current(), None);
+        assert_eq!(generator.return_value(), Some(Value::Int(9)));
+    }
+}

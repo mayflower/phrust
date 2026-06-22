@@ -8,7 +8,7 @@ symbols:
   - class Prompt26Child
 hir_summary:
   statements: 7
-  expressions: 18
+  expressions: 16
   types: 3
   const_exprs: 0
   class_likes: 2

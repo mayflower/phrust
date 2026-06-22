@@ -6,39 +6,60 @@
 //! first VM slices.
 
 pub mod array;
+pub mod autoload;
 pub mod builtins;
 pub mod context;
 pub mod convert;
 pub mod diagnostic;
+pub mod fiber;
+pub mod gc;
+pub mod generator;
+pub mod globals;
+pub mod numeric_string;
 pub mod object;
 pub mod output;
 pub mod reference;
 pub mod status;
 pub mod string;
 pub mod todo_phase4;
+pub mod types;
 pub mod value;
 
-pub use array::{ArrayEntry, ArrayKey, PhpArray};
+pub use array::{ArrayEntry, ArrayKey, PhpArray, WeakArrayHandle};
+pub use autoload::AutoloadRegistry;
 pub use builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinRegistry,
     BuiltinResult, InternalFunction, RuntimeSourceSpan,
 };
 pub use context::{ErrorReporting, RuntimeContext, RuntimeIniOptions, StrictTypesInfo};
-pub use convert::{NumericValue, compare, equal, identical, to_bool, to_number, to_string};
+pub use convert::{
+    NumericValue, compare, equal, identical, to_bool, to_float, to_int, to_number, to_string,
+};
 pub use diagnostic::{
     PhpReferenceClassification, RuntimeDiagnostic, RuntimeError, RuntimeSeverity,
     RuntimeStackFrame, division_by_zero_mvp, type_error_mvp, undefined_function,
     undefined_variable_warning, unsupported_feature,
 };
+pub use fiber::{FiberRef, FiberState};
+pub use gc::{
+    GcCollectResult, GcCollectedEntity, GcCycleCandidate, GcEntityId, GcEntityKind, GcNode, GcRoot,
+    GcRootKind, GcSnapshot, GcTrackedHeap, scan_roots,
+};
+pub use generator::{GeneratorRef, GeneratorState};
+pub use globals::GlobalSymbolTable;
 pub use object::{
-    ClassEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
-    ClassPropertyFlags, ObjectRef, RuntimeType,
+    AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
+    ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
+    ClassPropertyFlags, ClassPropertyHooks, ObjectRef, RuntimeType, WeakObjectHandle,
 };
 pub use output::OutputBuffer;
-pub use reference::{ReferenceCell, ReferencePlaceholder, ValueSlot};
+pub use reference::{
+    ReferenceCell, ReferencePlaceholder, Slot, TempValue, ValueSlot, WeakReferenceHandle,
+};
 pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
 pub use todo_phase4::{Phase4RuntimeTodo, runtime_skeleton_status};
+pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
 pub use value::{CallableValue, ClosureCaptureValue, Value};
 
 #[cfg(test)]
@@ -145,11 +166,18 @@ mod tests {
     }
 
     #[test]
-    fn callable_values_cover_prompt17_mvp_variants() {
+    fn callable_values_cover_prompt15_creation_variants() {
         let user = Value::user_function_callable("foo");
         let builtin = Value::internal_builtin_callable("trim");
         let method = Value::method_callable_placeholder("C::m");
         let unresolved = Value::unresolved_callable("$dynamic");
+        let closure = Value::closure(
+            7,
+            vec![crate::ClosureCaptureValue::by_value(
+                "x".to_owned(),
+                Value::Int(3),
+            )],
+        );
 
         assert!(matches!(
             user,
@@ -158,5 +186,9 @@ mod tests {
         assert!(format!("{builtin:?}").contains("internal_builtin"));
         assert!(format!("{method:?}").contains("method_placeholder"));
         assert!(format!("{unresolved:?}").contains("unresolved_dynamic"));
+        assert!(matches!(
+            closure.as_closure(),
+            Some((7, captures)) if captures.len() == 1
+        ));
     }
 }

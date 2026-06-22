@@ -1,7 +1,155 @@
 # Phase 5 Handoff
 
-This handoff records the Phase 4 closeout status for the PHP engine work. It is
-an audit document, not a compatibility claim.
+For the final Phase 5 closure state, use `docs/phase5-final-audit.md`,
+`docs/phase5-coverage-matrix.md`, and `docs/phase6-handoff.md`. This document
+remains the Phase 4-to-Phase 5 and intra-Phase 5 working handoff record.
+
+This handoff records the Phase 5 closeout position for the PHP engine work. It
+is an audit document and Phase 6 backlog, not a compatibility claim.
+
+## Phase 5 Position
+
+Phase 5 moved the executable core from the Phase 4 MVP toward PHP runtime
+semantics: references, Copy-on-Write, arrays, foreach, calls, objects, traits,
+interfaces, enums, attributes, Reflection metadata, generators, fibers,
+include/eval/autoload/globals, diagnostics, destructors, GC debug hooks,
+runtime tracing, regression minimization, and real-world smoke fixtures.
+
+The source pipeline remains single-path:
+
+```text
+php_lexer -> php_syntax -> php_ast -> php_semantics -> php_ir -> php_runtime -> php_vm
+```
+
+No Phase 5 feature should be considered complete unless it has a fixture,
+known-gap entry where appropriate, and validation through the relevant
+`just` gate. Current topic docs are:
+
+| Area | Document |
+| --- | --- |
+| Runtime contract and public APIs | `docs/phase5-runtime-contract.md` |
+| References and COW | `docs/phase5-reference-cow.md` |
+| Arrays and foreach | `docs/phase5-array-semantics.md`, `docs/phase5-foreach-semantics.md` |
+| Objects, traits, enums, hooks | `docs/phase5-object-semantics.md` |
+| Generators and fibers | `docs/phase5-generators-fibers.md` |
+| Reflection and attributes | `docs/phase5-reflection-attributes.md` |
+| Specific unsupported behavior | `docs/phase5-known-gaps.md` |
+
+## Phase 5 Decision Record
+
+| Decision | ADR |
+| --- | --- |
+| Destructor queue | `docs/adr/0025-phase5-destructor-queue.md` |
+| GC skeleton and root tracking | `docs/adr/0026-phase5-gc-skeleton.md` |
+| Slot/reference/COW model | `docs/adr/0027-phase5-slot-reference-cow.md` |
+| Array element references and foreach | `docs/adr/0028-phase5-array-element-reference-foreach.md` |
+| Object model, traits, enums, hooks | `docs/adr/0029-phase5-object-model-traits-enums-hooks.md` |
+| Generator/fiber control flow | `docs/adr/0030-phase5-generator-fiber-control-flow.md` |
+
+## Phase 6 Public API Starting Points
+
+Phase 6 should reuse the public Rust surface already documented in
+`docs/phase5-runtime-contract.md`:
+
+- `php_vm::Vm`, `VmOptions`, `VmResult`, `CompiledUnit`, and `IncludeLoader`;
+- `php_runtime::Value`, `Slot`, `ReferenceCell`, `PhpArray`, `PhpString`,
+  `ObjectRef`, `CallableValue`, `GeneratorRef`, `FiberRef`, and
+  `RuntimeDiagnostic`;
+- `ClassEntry`, member metadata entries, `RuntimeType`, `AttributeEntry`,
+  `GlobalSymbolTable`, `AutoloadRegistry`, `BuiltinRegistry`, and GC debug
+  root APIs.
+
+VM frame internals, continuation structs, GC debug IDs, and trace formatting
+are implementation details unless a Phase 6 ADR stabilizes them.
+
+## Phase 6 Handoff Backlog
+
+### Standard Library
+
+- Build a compatibility matrix for common framework and Composer helpers:
+  `count`, `array_map`, `array_filter`, `array_values`, `array_key_exists`,
+  `in_array`, `is_subclass_of`, `class_parents`, `class_implements`,
+  string/path helpers, JSON helpers, date/time basics, and error/exception
+  helper functions.
+- Replace ad hoc builtin gaps with arity/type/error fixtures and reference
+  diffs for each supported builtin.
+- Keep serialization explicit: implement `serialize`, `unserialize`,
+  `var_export`, `__serialize`, `__unserialize`, `__sleep`, `__wakeup`,
+  `Serializable`, enum serialization, references, cycles, and allowed-class
+  options together rather than one partial string format at a time.
+
+### Streams and Filesystem
+
+- Specify include-path, cwd, realpath cache, stream wrapper, file URL, and
+  warning-channel behavior before broadening include/require.
+- Add root-constrained test fixtures for local filesystem reads and writes
+  before any Composer or framework smoke depends on them.
+- Keep remote/network wrappers out of scope unless a later ADR explicitly adds
+  them.
+
+### SPL and Iteration
+
+- Expand the current Iterator/IteratorAggregate metadata MVP into real SPL
+  interface and class surfaces.
+- Implement `ArrayAccess` offset reads/writes/isset/unset before claiming
+  collection-library compatibility.
+- Add fixture matrices for public-property foreach, Iterator,
+  IteratorAggregate, ArrayAccess, mutation during iteration, and exception
+  ordering.
+
+### Reflection Full Expansion
+
+- Add `ReflectionClass::newInstanceArgs`, constructor invocation, method and
+  function invocation APIs, full enum APIs, doc comments, parameter defaults,
+  attributes with `newInstance()`, and autoload-sensitive Reflection behavior.
+- Ensure Reflection output uses source spelling while runtime lookup continues
+  to use normalized names.
+- Diff framework-style dependency-injection patterns that rely on Reflection
+  before calling the Reflection surface complete.
+
+### Composer and Framework Smokes
+
+- Keep committed smokes offline and handwritten. Do not vendor Composer
+  projects into the repo.
+- Use `just phase5-local-composer-smoke <path>` or a Phase 6 successor for
+  user-provided local projects.
+- Prioritize PSR-4 autoloading, class existence probes, Reflection-driven
+  containers, enum-backed configuration, attributes, closures, and common
+  stdlib helpers before attempting a full framework boot.
+
+### Extensions and ABI
+
+- Zend extension ABI, resources, FFI, FPM/SAPI, Opcache, quickening, inline
+  caches, and JIT remain out of scope until a new phase explicitly adds them.
+- If resources are introduced for stdlib compatibility, model them as a
+  bounded runtime type first and keep extension ABI compatibility as a separate
+  decision.
+
+### Performance
+
+- Measure before optimizing. Likely hot paths are array append and COW
+  separation, reference-cell writes, foreach snapshots, object method/property
+  lookup, Reflection metadata construction, callable resolution,
+  include/eval/autoload recompilation, generator/fiber continuation cloning,
+  numeric-string classification, and GC root scanning.
+- Any cache must be invalidated by include/eval/autoload additions to request
+  symbol tables.
+- Performance work must keep fixture output, side-effect order, diagnostics,
+  and known-gap behavior unchanged.
+
+## Regression and Debug Workflow
+
+Runtime tracing is opt-in with `php-vm run --trace-runtime`. Diff failures
+should be minimized with `scripts/minimize_phase5_failure.py` and retained in
+`fixtures/phase5/regressions/pass/` or
+`fixtures/phase5/regressions/known_gaps/` with the required inline metadata.
+`just regression-fixtures` is part of `just phase5-fixtures` and therefore part
+of `just verify-phase5`.
+
+## Historical Phase 4 Baseline
+
+The remaining sections preserve the Phase 4 closeout context that Phase 5
+started from.
 
 ## Validation Results
 
@@ -46,12 +194,12 @@ Phase 4 decisions are captured in these ADRs:
 | Arithmetic, concat, comparisons, casts | yes | yes | yes | partial | numeric-string edge cases differ | `E_PHP_RUNTIME_NUMERIC_STRING_MATRIX` |
 | Direct user functions | yes | yes | yes | yes | green curated fixtures | none |
 | Defaults, variadics, returns | yes | yes | yes | partial | PHP type/coercion wording differs | `E_PHP_RUNTIME_WEAK_STRICT_TYPES_COERCION` |
-| Closures and arrow functions | yes | yes | yes | partial | by-value captures only | `E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE` |
+| Closures and arrow functions | yes | yes | yes | partial | by-value/by-reference captures, static closure locals, and arrow by-value captures execute; full Closure binding remains deferred | `E_PHP_RUNTIME_UNSUPPORTED_CLOSURE_BINDING` |
 | Dynamic function/callable forms | yes | partial | partial | partial | not PHP-compatible | `E_PHP_IR_UNSUPPORTED_DYNAMIC_FUNCTION_CALL` |
 | PHP 8.5 pipe MVP | yes | yes | yes | partial | simple callables only | `E_PHP_VM_PIPE_RHS_NOT_CALLABLE` |
 | Selected builtins | yes | yes | yes | partial | strict MVP only | `E_PHP_RUNTIME_UNSUPPORTED_STDLIB` |
 | Arrays | yes | yes | yes | partial | key/COW/reference edges differ | `E_PHP_RUNTIME_ARRAY_REFERENCE_COW` |
-| By-value foreach over arrays | yes | yes | yes | partial | arrays only, snapshot MVP | `E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE` |
+| Foreach over arrays | yes | yes | yes | partial | by-value snapshots and local-array by-reference foreach execute; non-array and Traversable sources deferred | `E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE` |
 | References | yes | partial | partial | partial | simple local alias only | `E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS` |
 | Global and magic constants | yes | partial | partial | partial | limited predefined constants | `E_PHP_RUNTIME_PREDEFINED_CONSTANT_MATRIX` |
 | Include/require | yes | yes | yes | partial | root-constrained local model | `E_PHP_RUNTIME_INCLUDE_SCOPE_MATRIX` |
@@ -118,8 +266,9 @@ Phase 4 decisions are captured in these ADRs:
     `E_PHP_IR_UNSUPPORTED_EVAL`.
 16. Reflection/SPL metadata: reflection is classified as unsupported and SPL
     behavior is absent. ID: `E_PHP_IR_UNSUPPORTED_REFLECTION`.
-17. Foreach beyond arrays: Traversable objects and by-reference foreach are
-    not executable. IDs: `E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE`,
+17. Foreach beyond arrays: Traversable objects and temporary by-reference
+    foreach sources are not executable. IDs:
+    `E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE`,
     `E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH`.
 18. Constants: runtime `define()`, complete predefined constants, and full
     constant-expression behavior are incomplete. IDs:
@@ -186,6 +335,14 @@ work on that behavior.
    iterator interfaces, core SPL containers, and autoload-sensitive behavior.
 8. PHPT expansion: grow local PHPT smoke coverage, classify skips and known
    gaps explicitly, and run reference comparisons where stable.
+9. Composer/framework smoke handoff: Phase 5 has offline, hand-written
+   real-world fixtures in `fixtures/phase5/real_world/`, but real Composer
+   package execution remains Phase 6 work. Required Phase 6 pieces include
+   broader predefined constants, common stdlib helpers (`array_map`, `count`,
+   `is_subclass_of`, string/path helpers), Composer PSR-style autoload
+   behavior through `class_exists` and unresolved type references, richer
+   Reflection construction APIs such as `ReflectionClass::newInstanceArgs`,
+   fuller SPL interfaces/classes, and exact warning/fatal text compatibility.
 
 ## Handoff Position
 

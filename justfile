@@ -17,6 +17,7 @@ help:
       '  just verify-phase2  Run Phase 2 verification' \
       '  just verify-phase3  Run Phase 3 semantic frontend verification' \
       '  just verify-phase4  Run Phase 4 IR/VM/runtime verification' \
+      '  just verify-phase5  Run Phase 5 runtime semantics verification' \
       '  just bootstrap-ref  Clone/pin the PHP reference checkout' \
       '  just verify-ref     Verify PHP reference checkout against lockfile' \
       '  just dump-reference-tokens  Dump PHP T_* constants as JSON' \
@@ -56,6 +57,22 @@ help:
       '  just runtime-known-gaps  Validate Phase 4 runtime known-gap catalog' \
       '  just bench-vm-smoke  Run optional Phase 4 VM benchmark smoke' \
       '  just fuzz-vm-smoke  Run optional Phase 4 VM fuzz/property smoke' \
+      '  just phase5-fixtures  Run Phase 5 runtime semantics fixture gates' \
+      '  just phase5-diff  Run Phase 5 differential smoke gate' \
+      '  just phase5-toolchain-audit  Check Phase 5 devshell tools' \
+      '  just runtime-hardening-lints  Run runtime/VM hardening lints' \
+      '  just phase5-miri-smoke  Opt-in Miri smoke for runtime/VM model tests' \
+      '  just phase5-sanitizer-smoke  Opt-in sanitizer smoke when supported' \
+      '  just phase5-fuzz-smoke  Opt-in deterministic fuzz smoke for refs, COW arrays, and foreach' \
+      '  just phase5-bench-smoke  Opt-in local microbenchmark smoke for Phase 5 categories' \
+      '  just phase5-composer-smoke  Opt-in local Composer fixture smoke via PHPRUST_COMPOSER_FIXTURE_DIR' \
+      '  just refs-cow-fixtures  Run Phase 5 references/COW fixture gate' \
+      '  just object-semantics-fixtures  Run Phase 5 object semantics fixture gate' \
+      '  just generator-fiber-fixtures  Run Phase 5 generator/fiber fixture gate' \
+      '  just real-world-fixtures  Run Phase 5 offline real-world fixture gate' \
+      '  just regression-fixtures  Run Phase 5 minimized regression fixture gate' \
+      '  just phase5-local-composer-smoke <paths>  Opt-in local Composer-style smoke over user-provided paths' \
+      '  just phase5-phpt-smoke  Run Phase 5 PHPT smoke gate' \
       '  just parser-snapshots Update parser CST and diagnostic snapshots' \
       '  just extract-ref-metadata  Extract deterministic PHP reference metadata' \
       '  just build-ref-php  Build optional minimal reference PHP CLI' \
@@ -67,6 +84,9 @@ fmt:
 
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+
+runtime-hardening-lints:
+    cargo clippy -p php_runtime -p php_vm --all-targets -- -D warnings -D unsafe-code
 
 test:
     cargo test --workspace
@@ -201,6 +221,9 @@ verify-phase3:
 
 verify-phase4:
     scripts/verify-phase4.sh
+
+verify-phase5:
+    scripts/verify-phase5.sh
 
 semantic-fixtures:
     scripts/run_semantic_fixtures.py
@@ -563,14 +586,14 @@ runtime-fixtures:
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/private-property.php > "$tmp_dir/objects-private-property.out" 2> "$tmp_dir/objects-private-property.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-private-property.err"; \
+    test "$code" -eq 0; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/private-method.php > "$tmp_dir/objects-private-method.out" 2> "$tmp_dir/objects-private-method.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_METHOD_MODIFIER' "$tmp_dir/objects-private-method.err"; \
+    test "$code" -eq 0; \
+    printf '1\n' > "$tmp_dir/objects-private-method.expected"; \
+    cmp "$tmp_dir/objects-private-method.expected" "$tmp_dir/objects-private-method.out"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/objects/this-outside-method.php > "$tmp_dir/objects-this-outside-method.out" 2> "$tmp_dir/objects-this-outside-method.err"; \
     code=$?; \
@@ -581,20 +604,21 @@ runtime-fixtures:
     cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/static-property.php > "$tmp_dir/objects-static-property.out" 2> "$tmp_dir/objects-static-property.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-static-property.err"; \
+    test "$code" -eq 0; \
+    printf '1\n' > "$tmp_dir/objects-static-property.expected"; \
+    cmp "$tmp_dir/objects-static-property.expected" "$tmp_dir/objects-static-property.out"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/clone-with-private.php > "$tmp_dir/objects-clone-with-private.out" 2> "$tmp_dir/objects-clone-with-private.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-private.err"; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-private.err"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/objects/clone-with-readonly.php > "$tmp_dir/objects-clone-with-readonly.out" 2> "$tmp_dir/objects-clone-with-readonly.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-readonly.err"; \
+    test "$code" -eq 3; \
+    grep -q 'E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER' "$tmp_dir/objects-clone-with-readonly.err"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/exceptions/throw-uncaught.php > "$tmp_dir/exceptions-throw-uncaught.out" 2> "$tmp_dir/exceptions-throw-uncaught.err"; \
     code=$?; \
@@ -662,23 +686,26 @@ runtime-fixtures:
     test "$code" -eq 2; \
     grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' "$tmp_dir/foreach-by-ref.err"; \
     set +e; \
-    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/by-ref-param.php > "$tmp_dir/references-by-ref-param.out" 2> "$tmp_dir/references-by-ref-param.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/references/by-ref-param.php > "$tmp_dir/references-by-ref-param.out" 2> "$tmp_dir/references-by-ref-param.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER' "$tmp_dir/references-by-ref-param.err"; \
+    test "$code" -eq 0; \
+    printf '2' > "$tmp_dir/references-by-ref-param.expected"; \
+    cmp "$tmp_dir/references-by-ref-param.expected" "$tmp_dir/references-by-ref-param.out"; \
     set +e; \
-    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/by-ref-return.php > "$tmp_dir/references-by-ref-return.out" 2> "$tmp_dir/references-by-ref-return.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/references/by-ref-return.php > "$tmp_dir/references-by-ref-return.out" 2> "$tmp_dir/references-by-ref-return.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_RETURN' "$tmp_dir/references-by-ref-return.err"; \
+    test "$code" -eq 0; \
+    printf '1' > "$tmp_dir/references-by-ref-return.expected"; \
+    cmp "$tmp_dir/references-by-ref-return.expected" "$tmp_dir/references-by-ref-return.out"; \
     set +e; \
-    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/references/array-element-ref.php > "$tmp_dir/references-array-element-ref.out" 2> "$tmp_dir/references-array-element-ref.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/references/array-element-ref.php > "$tmp_dir/references-array-element-ref.out" 2> "$tmp_dir/references-array-element-ref.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE' "$tmp_dir/references-array-element-ref.err"; \
+    test "$code" -eq 0; \
+    printf '2' > "$tmp_dir/references-array-element-ref.expected"; \
+    cmp "$tmp_dir/references-array-element-ref.expected" "$tmp_dir/references-array-element-ref.out"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/division-by-zero.php > "$tmp_dir/division.out" 2> "$tmp_dir/division.err"; \
     code=$?; \
@@ -698,7 +725,7 @@ runtime-fixtures:
     code=$?; \
     set -e; \
     test "$code" -eq 3; \
-    grep -q 'modulo is only implemented for integer operands' "$tmp_dir/type.err"; \
+    grep -q 'E_PHP_RUNTIME_NON_NUMERIC_STRING' "$tmp_dir/type.err"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/match-no-arm.php > "$tmp_dir/match-no-arm.out" 2> "$tmp_dir/match-no-arm.err"; \
     code=$?; \
@@ -733,23 +760,21 @@ runtime-fixtures:
     test "$code" -eq 3; \
     grep -q 'E_PHP_VM_RETURN_TYPE_MISMATCH' "$tmp_dir/functions-return-type-error.err"; \
     set +e; \
-    cargo run -p php_vm_cli -- run fixtures/runtime/invalid/functions/by-ref-capture.php > "$tmp_dir/functions-by-ref-capture.out" 2> "$tmp_dir/functions-by-ref-capture.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/functions/by-ref-capture.php > "$tmp_dir/functions-by-ref-capture.out" 2> "$tmp_dir/functions-by-ref-capture.err"; \
     code=$?; \
     set -e; \
-    test "$code" -eq 3; \
-    grep -q 'E_PHP_VM_UNSUPPORTED_BY_REF_CAPTURE' "$tmp_dir/functions-by-ref-capture.err"; \
+    test "$code" -eq 0; \
+    printf '3' > "$tmp_dir/functions-by-ref-capture.expected"; \
+    cmp "$tmp_dir/functions-by-ref-capture.expected" "$tmp_dir/functions-by-ref-capture.out"; \
     set +e; \
     cargo run -p php_vm_cli -- run fixtures/runtime/invalid/php85/pipe-not-callable.php > "$tmp_dir/php85-pipe-not-callable.out" 2> "$tmp_dir/php85-pipe-not-callable.err"; \
     code=$?; \
     set -e; \
     test "$code" -eq 3; \
     grep -q 'E_PHP_VM_PIPE_RHS_NOT_CALLABLE' "$tmp_dir/php85-pipe-not-callable.err"; \
-    set +e; \
-    cargo run -p php_vm_cli -- run fixtures/runtime/known_gaps/generators/yield.php > "$tmp_dir/generator-gap.out" 2> "$tmp_dir/generator-gap.err"; \
-    code=$?; \
-    set -e; \
-    test "$code" -eq 2; \
-    grep -q 'E_PHP_IR_UNSUPPORTED_GENERATOR' "$tmp_dir/generator-gap.err"; \
+    cargo run -p php_vm_cli -- run fixtures/runtime/valid/generators/yield.php > "$tmp_dir/generator-gap.out" 2> "$tmp_dir/generator-gap.err"; \
+    printf '1' > "$tmp_dir/generator-gap.expected"; \
+    cmp "$tmp_dir/generator-gap.expected" "$tmp_dir/generator-gap.out"; \
     printf '%s\n' '[ok] Phase 4 runtime fixtures passed.'
 
 runtime-corpus-smoke:
@@ -778,27 +803,23 @@ runtime-known-gaps:
     grep -q 'E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME' docs/phase4-known-gaps.md
     grep -q 'E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME' docs/phase4-known-gaps.md
     grep -q 'E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS' docs/phase4-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER' docs/phase4-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_RETURN' docs/phase4-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE' docs/phase4-known-gaps.md
     grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' docs/phase4-known-gaps.md
     grep -q 'E_PHP_RUNTIME_SUPERGLOBALS_FULL_MATRIX' docs/phase4-known-gaps.md
     grep -q 'E_PHP_RUNTIME_GLOBALS_ALIAS_MATRIX' docs/phase4-known-gaps.md
     grep -q 'E_PHP_IR_UNSUPPORTED_CATCH_TYPE' docs/phase4-known-gaps.md
-    test -f fixtures/runtime/known_gaps/generators/yield.php
-    test -f fixtures/runtime/known_gaps/generators/yield-from.php
-    test -f fixtures/runtime/known_gaps/fibers/fiber.php
-    test -f fixtures/runtime/known_gaps/eval/eval.php
+    test -f fixtures/runtime/valid/generators/yield.php
+    test -f fixtures/runtime/valid/generators/yield-from.php
+    test -f fixtures/runtime/valid/fibers/fiber.php
+    test -f fixtures/runtime/valid/eval/eval.php
     test -f fixtures/runtime/known_gaps/autoload/spl-autoload-register.php
     test -f fixtures/runtime/known_gaps/reflection/reflection-class.php
-    test -f fixtures/runtime/known_gaps/traits/trait-use.php
-    test -f fixtures/runtime/known_gaps/enums/unit-enum.php
-    test -f fixtures/runtime/known_gaps/property_hooks/get-hook.php
-    test -f fixtures/runtime/known_gaps/references/by-ref-param.php
-    test -f fixtures/runtime/known_gaps/references/by-ref-return.php
-    test -f fixtures/runtime/known_gaps/references/array-element-ref.php
+    test -f fixtures/runtime/valid/traits/trait-use.php
+    test -f fixtures/runtime/valid/enums/unit-enum.php
+    test -f fixtures/runtime/valid/property_hooks/get-hook.php
+    test -f fixtures/runtime/valid/references/by-ref-return.php
+    test -f fixtures/runtime/valid/references/array-element-ref.php
     test -f fixtures/runtime/known_gaps/foreach/by-ref.php
-    test -f fixtures/runtime/known_gaps/superglobals/globals-alias.php
+    test -f fixtures/runtime/valid/superglobals/globals-alias.php
     test -f fixtures/runtime/known_gaps/objects/clone-with-private.php
     test -f fixtures/runtime/known_gaps/objects/clone-with-readonly.php
     test -f fixtures/runtime/known_gaps/exceptions/catch-type.php
@@ -806,22 +827,7 @@ runtime-known-gaps:
     @tmp_dir="target/runtime-known-gaps"; \
     mkdir -p "$tmp_dir"; \
     for fixture_id in \
-      "fixtures/runtime/known_gaps/generators/yield.php:E_PHP_IR_UNSUPPORTED_GENERATOR:generator-yield" \
-      "fixtures/runtime/known_gaps/generators/yield-from.php:E_PHP_IR_UNSUPPORTED_YIELD_FROM:generator-yield-from" \
-      "fixtures/runtime/known_gaps/fibers/fiber.php:E_PHP_IR_UNSUPPORTED_FIBER:fiber" \
-      "fixtures/runtime/known_gaps/eval/eval.php:E_PHP_IR_UNSUPPORTED_EVAL:eval" \
-      "fixtures/runtime/known_gaps/autoload/spl-autoload-register.php:E_PHP_IR_UNSUPPORTED_AUTOLOAD:autoload" \
-      "fixtures/runtime/known_gaps/reflection/reflection-class.php:E_PHP_IR_UNSUPPORTED_REFLECTION:reflection" \
-      "fixtures/runtime/known_gaps/traits/trait-use.php:E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME:trait-use" \
-      "fixtures/runtime/known_gaps/enums/unit-enum.php:E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME:enum" \
-      "fixtures/runtime/known_gaps/property_hooks/get-hook.php:E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS:property-hooks" \
-      "fixtures/runtime/known_gaps/references/by-ref-param.php:E_PHP_IR_UNSUPPORTED_BY_REF_PARAMETER:by-ref-param" \
-      "fixtures/runtime/known_gaps/references/by-ref-return.php:E_PHP_IR_UNSUPPORTED_BY_REF_RETURN:by-ref-return" \
-      "fixtures/runtime/known_gaps/references/array-element-ref.php:E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE:array-element-ref" \
       "fixtures/runtime/known_gaps/foreach/by-ref.php:E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH:foreach-by-ref" \
-      "fixtures/runtime/known_gaps/superglobals/globals-alias.php:E_PHP_IR_UNSUPPORTED_ARRAY_ELEMENT_REFERENCE:globals-alias" \
-      "fixtures/runtime/known_gaps/objects/clone-with-private.php:E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER:clone-with-private" \
-      "fixtures/runtime/known_gaps/objects/clone-with-readonly.php:E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER:clone-with-readonly" \
       "fixtures/runtime/known_gaps/exceptions/catch-type.php:E_PHP_IR_UNSUPPORTED_CATCH_TYPE:catch-type"; do \
       IFS=':' read -r fixture diagnostic name <<< "$fixture_id"; \
       set +e; \
@@ -829,6 +835,19 @@ runtime-known-gaps:
       code=$?; \
       set -e; \
       test "$code" -eq 2; \
+      grep -q "$diagnostic" "$tmp_dir/$name.err"; \
+    done; \
+    for fixture_id in \
+      "fixtures/runtime/known_gaps/autoload/spl-autoload-register.php:E_PHP_VM_UNKNOWN_CLASS:autoload" \
+      "fixtures/runtime/known_gaps/reflection/reflection-class.php:E_PHP_VM_REFLECTION_UNKNOWN_CLASS:reflection" \
+      "fixtures/runtime/known_gaps/objects/clone-with-private.php:E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER:clone-with-private" \
+      "fixtures/runtime/known_gaps/objects/clone-with-readonly.php:E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER:clone-with-readonly"; do \
+      IFS=':' read -r fixture diagnostic name <<< "$fixture_id"; \
+      set +e; \
+      cargo run -p php_vm_cli -- run "$fixture" > "$tmp_dir/$name.out" 2> "$tmp_dir/$name.err"; \
+      code=$?; \
+      set -e; \
+      test "$code" -eq 3; \
       grep -q "$diagnostic" "$tmp_dir/$name.err"; \
     done; \
     printf '%s\n' '[ok] Phase 4 runtime known-gap catalog and reference fixtures passed.'
@@ -844,3 +863,109 @@ fuzz-vm-smoke:
     mkdir -p target/phase4/fuzz-vm-smoke
     rustc --edition=2024 tools/fuzz_vm_smoke.rs -o target/phase4/fuzz-vm-smoke/fuzz-vm-smoke
     target/phase4/fuzz-vm-smoke/fuzz-vm-smoke
+
+phase5-fixtures:
+    @just refs-cow-fixtures
+    @just object-semantics-fixtures
+    @just generator-fiber-fixtures
+    @just real-world-fixtures
+    @just regression-fixtures
+    @printf '%s\n' '[ok] Phase 5 fixture gates complete.'
+
+phase5-diff *args:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py {{args}}
+
+phase5-toolchain-audit:
+    @for tool in cargo rustc rustfmt cargo-clippy just jq python3 rg shellcheck clang sccache; do \
+      if ! command -v "$tool" >/dev/null 2>&1; then \
+        printf '%s\n' "[missing] required Phase 5 devshell tool: $tool" >&2; \
+        exit 1; \
+      fi; \
+    done; \
+    test "${PHP_REF_SERIES:-}" = "8.5"; \
+    test "${PHP_REF_VERSION:-}" = "8.5.7"; \
+    test "${PHP_REF_TAG:-}" = "php-8.5.7"; \
+    test -n "${CARGO_TARGET_DIR:-}"; \
+    test -n "${SCCACHE_DIR:-}"; \
+    printf '%s\n' '[ok] Phase 5 devshell toolchain audit passed'
+
+phase5-miri-smoke:
+    @if ! command -v cargo-miri >/dev/null 2>&1 && ! cargo miri --version >/dev/null 2>&1; then \
+      printf '%s\n' '[skip] cargo-miri is not available in this toolchain; install a Miri-capable Rust toolchain to run this opt-in smoke.'; \
+      exit 0; \
+    fi; \
+    if ! cargo miri --version >/dev/null 2>&1; then \
+      printf '%s\n' '[skip] cargo-miri is present but not usable for the active toolchain; this opt-in smoke is not part of verify-phase5.'; \
+      exit 0; \
+    fi; \
+    cargo miri test -p php_runtime reference::tests::slot_alias_and_copy_semantics_are_distinct
+
+phase5-sanitizer-smoke:
+    @if [[ "${PHRUST_RUN_SANITIZER:-0}" != "1" ]]; then \
+      printf '%s\n' '[skip] set PHRUST_RUN_SANITIZER=1 to run the opt-in sanitizer smoke.'; \
+      exit 0; \
+    fi; \
+    if [[ "$$(uname -s)" != "Linux" ]]; then \
+      printf '%s\n' '[skip] sanitizer smoke is currently supported only on Linux devshells.'; \
+      exit 0; \
+    fi; \
+    if ! command -v clang >/dev/null 2>&1; then \
+      printf '%s\n' '[skip] clang is required for sanitizer smoke.'; \
+      exit 0; \
+    fi; \
+    if ! rustc --version | grep -qi nightly; then \
+      printf '%s\n' '[skip] sanitizer smoke requires a nightly Rust toolchain with -Zsanitizer support.'; \
+      exit 0; \
+    fi; \
+    RUSTFLAGS="-Zsanitizer=address" cargo test -p php_runtime gc::tests::gc_scans_roots_and_refcount_metadata_without_panics
+
+phase5-fuzz-smoke:
+    cargo build -p php_vm_cli
+    scripts/phase5_fuzz_smoke.py
+
+phase5-bench-smoke:
+    cargo build -p php_vm_cli
+    scripts/phase5_bench_smoke.py
+
+phase5-composer-smoke:
+    @if [ -z "${PHPRUST_COMPOSER_FIXTURE_DIR:-}" ]; then \
+        scripts/phase5_composer_smoke.py; \
+    else \
+        cargo build -p php_vm_cli; \
+        scripts/phase5_composer_smoke.py; \
+    fi
+
+refs-cow-fixtures:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py --category refs --category cow --out target/phase5/refs-cow
+
+object-semantics-fixtures:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py --category objects --category traits --category enums --category magic --category properties --category property_hooks --category clone_with --out target/phase5/object-semantics
+
+generator-fiber-fixtures:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py --category generators --category fibers --out target/phase5/generator-fiber
+
+real-world-fixtures:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py --category real_world --out target/phase5/real-world
+
+regression-fixtures:
+    cargo build -p php_vm_cli
+    scripts/phase5_diff.py --category regressions --out target/phase5/regressions
+
+phase5-local-composer-smoke *paths:
+    @if [ -z "{{paths}}" ]; then \
+        printf '%s\n' '[skip] provide one or more local Composer project paths: just phase5-local-composer-smoke path/to/project'; \
+        exit 0; \
+    fi; \
+    cargo build -p php_vm_cli; \
+    args=''; \
+    for path in {{paths}}; do args="$$args --dir $$path"; done; \
+    scripts/phase5_diff.py $$args --out target/phase5/local-composer-smoke
+
+phase5-phpt-smoke:
+    cargo build -p php_vm_cli -p php_testkit --bin run-phpt-smoke
+    cargo run -p php_testkit --bin run-phpt-smoke -- --fixtures /private/tmp/phrust-empty-phpt-smoke --out target/phase5/phpt-smoke --rust-vm target/debug/php-vm --allowlist fixtures/phase5/phpt_allowlist.toml

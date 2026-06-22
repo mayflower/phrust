@@ -7,7 +7,7 @@ symbols:
   - class CloneSubject
 hir_summary:
   statements: 6
-  expressions: 36
+  expressions: 35
   types: 1
   const_exprs: 1
   class_likes: 1

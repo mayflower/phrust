@@ -5,7 +5,7 @@ diagnostics:
   - id: E_PHP_INVALID_PROPERTY_PROMOTION
     severity: error
     phase: hir_lowering
-    span: 81..86
+    span: 67..86
 symbols:
   - class InvalidPromotion
 hir_summary:

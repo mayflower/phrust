@@ -19,13 +19,14 @@ pub use arena::Arena;
 pub use attributes::{AttributeTarget, HirAttribute};
 pub use class_like::{
     ClassLikeKind, ClassLikeMember, ClassLikeMemberId, ClassLikeMemberKind, HirClassConst,
-    HirClassLike, HirEnumCase, HirMethod, HirProperty, HirPropertyHook, HirPropertyItem,
-    HirTraitAdaptation, HirTraitAdaptationKind, HirTraitMethodRef, HirTraitUse, MagicMethodKind,
+    HirClassLike, HirEnumCase, HirMethod, HirProperty, HirPropertyHook, HirPropertyHookBody,
+    HirPropertyItem, HirTraitAdaptation, HirTraitAdaptationKind, HirTraitMethodRef, HirTraitUse,
+    MagicMethodKind,
 };
 pub use const_expr::{ConstExpr, ConstExprContext, ConstExprKind, ConstValue};
 pub use decl::{HirDecl, HirDeclKind};
 pub use declare::{DeclareDirective, DeclareValue, FileDirectives, HirDeclare};
-pub use expr::{DeferredEffects, HirExpr, HirExprKind, HirMatchArm, HirNameResolution};
+pub use expr::{DeferredEffects, HirCallArg, HirExpr, HirExprKind, HirMatchArm, HirNameResolution};
 pub use ids::{
     AttributeId, ClassLikeId, ConstExprId, ConstId, DeclId, EnumCaseId, ExprId, FunctionId, HirId,
     MethodId, ModuleId, NameId, NamespaceId, ParamId, PropertyId, ScopeId, StmtId, SymbolId,
