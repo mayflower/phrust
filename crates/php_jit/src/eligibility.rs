@@ -10,6 +10,38 @@ use php_ir::{
     IrFunction, IrParam, IrReturnType, IrUnit, Operand, UnaryOp,
 };
 
+/// Stable candidate kind assigned by the Phase 7 eligibility analyzer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JitCandidateKind {
+    /// A conservative leaf function containing only int-local operations.
+    IntLeafCandidate,
+    /// A typed packed-array `$xs[$i]` read-only fetch candidate.
+    PackedArrayFetchCandidate,
+    /// A packed-array by-value foreach integer reduction candidate.
+    PackedForeachIntSumCandidate,
+    /// A guarded fast path for exact known internal calls.
+    KnownCallCandidate,
+    /// A guarded fast path for two-string concatenation.
+    StringConcatCandidate,
+    /// A guarded fast path for a monomorphic property load.
+    PropertyLoadCandidate,
+}
+
+impl JitCandidateKind {
+    /// Stable report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntLeafCandidate => "IntLeafCandidate",
+            Self::PackedArrayFetchCandidate => "PackedArrayFetchCandidate",
+            Self::PackedForeachIntSumCandidate => "PackedForeachIntSumCandidate",
+            Self::KnownCallCandidate => "KnownCallCandidate",
+            Self::StringConcatCandidate => "StringConcatCandidate",
+            Self::PropertyLoadCandidate => "PropertyLoadCandidate",
+        }
+    }
+}
+
 /// Eligibility state for one JIT candidate region.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JitEligibility {
@@ -97,6 +129,8 @@ pub struct JitEligibilityReport {
     pub function_name: Option<String>,
     /// Final eligibility state.
     pub eligibility: JitEligibility,
+    /// Candidate kind assigned when the function is eligible.
+    pub candidate_kind: Option<JitCandidateKind>,
     /// All collected reasons, with the first reason mirrored in `eligibility`.
     pub reasons: Vec<JitEligibilityReason>,
     /// Analysis counters for this report.
@@ -110,6 +144,73 @@ impl JitEligibilityReport {
     #[must_use]
     pub fn debug_output(&self) -> String {
         self.debug.join("\n")
+    }
+
+    /// Returns a stable compact JSON report for CLI output and fixtures.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut json = String::new();
+        json.push('{');
+        json.push_str("\"function_id\":");
+        json.push_str(&self.function.raw().to_string());
+        json.push_str(",\"function_name\":");
+        match &self.function_name {
+            Some(name) => {
+                json.push('"');
+                json.push_str(&escape_json(name));
+                json.push('"');
+            }
+            None => json.push_str("null"),
+        }
+        json.push_str(",\"status\":\"");
+        json.push_str(self.eligibility.as_str());
+        json.push('"');
+        json.push_str(",\"candidate_kind\":");
+        match self.candidate_kind {
+            Some(kind) => {
+                json.push('"');
+                json.push_str(kind.as_str());
+                json.push('"');
+            }
+            None => json.push_str("null"),
+        }
+        json.push_str(",\"stats\":{");
+        json.push_str("\"functions_analyzed\":");
+        json.push_str(&self.stats.functions_analyzed.to_string());
+        json.push_str(",\"blocks_analyzed\":");
+        json.push_str(&self.stats.blocks_analyzed.to_string());
+        json.push_str(",\"instructions_analyzed\":");
+        json.push_str(&self.stats.instructions_analyzed.to_string());
+        json.push_str(",\"eligible\":");
+        json.push_str(&self.stats.eligible.to_string());
+        json.push_str(",\"rejected\":");
+        json.push_str(&self.stats.rejected.to_string());
+        json.push_str(",\"unknown\":");
+        json.push_str(&self.stats.unknown.to_string());
+        json.push_str("},\"reasons\":[");
+        for (index, reason) in self.reasons.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push('{');
+            json.push_str("\"code\":\"");
+            json.push_str(reason.code);
+            json.push_str("\",\"detail\":\"");
+            json.push_str(&escape_json(&reason.detail));
+            json.push_str("\",\"block\":");
+            match reason.block {
+                Some(block) => json.push_str(&block.to_string()),
+                None => json.push_str("null"),
+            }
+            json.push_str(",\"instruction\":");
+            match reason.instruction {
+                Some(instruction) => json.push_str(&instruction.to_string()),
+                None => json.push_str("null"),
+            }
+            json.push('}');
+        }
+        json.push_str("]}");
+        json
     }
 }
 
@@ -127,10 +228,11 @@ pub fn analyze_jit_eligibility(unit: &IrUnit, function: FunctionId) -> JitEligib
         return unknown_report(function, None, reason);
     };
 
-    analyze_function(function, ir_function, &unit.constants)
+    analyze_function(unit, function, ir_function, &unit.constants)
 }
 
 fn analyze_function(
+    unit: &IrUnit,
     function_id: FunctionId,
     function: &IrFunction,
     constants: &[IrConstant],
@@ -140,6 +242,142 @@ fn analyze_function(
         blocks_analyzed: function.blocks.len() as u64,
         ..JitEligibilityStats::default()
     };
+    stats.instructions_analyzed = function
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len() as u64)
+        .sum();
+
+    if packed_foreach_int_sum_candidate_is_eligible(function, constants).is_ok() {
+        stats.eligible = 1;
+        let eligibility = JitEligibility::Eligible;
+        let debug = vec![
+            format!(
+                "jit-eligibility function={} status={}",
+                function.name,
+                eligibility.as_str()
+            ),
+            format!(
+                "jit-eligibility stats functions={} blocks={} instructions={}",
+                stats.functions_analyzed, stats.blocks_analyzed, stats.instructions_analyzed
+            ),
+            "jit-eligibility candidate=PackedForeachIntSumCandidate".to_owned(),
+        ];
+        return JitEligibilityReport {
+            function: function_id,
+            function_name: Some(function.name.clone()),
+            eligibility,
+            candidate_kind: Some(JitCandidateKind::PackedForeachIntSumCandidate),
+            reasons: Vec::new(),
+            stats,
+            debug,
+        };
+    }
+
+    if packed_array_fetch_candidate_is_eligible(function).is_ok() {
+        stats.eligible = 1;
+        let eligibility = JitEligibility::Eligible;
+        let debug = vec![
+            format!(
+                "jit-eligibility function={} status={}",
+                function.name,
+                eligibility.as_str()
+            ),
+            format!(
+                "jit-eligibility stats functions={} blocks={} instructions={}",
+                stats.functions_analyzed, stats.blocks_analyzed, stats.instructions_analyzed
+            ),
+            "jit-eligibility candidate=PackedArrayFetchCandidate".to_owned(),
+        ];
+        return JitEligibilityReport {
+            function: function_id,
+            function_name: Some(function.name.clone()),
+            eligibility,
+            candidate_kind: Some(JitCandidateKind::PackedArrayFetchCandidate),
+            reasons: Vec::new(),
+            stats,
+            debug,
+        };
+    }
+
+    if known_call_candidate_is_eligible(unit, function).is_ok() {
+        stats.eligible = 1;
+        let eligibility = JitEligibility::Eligible;
+        let debug = vec![
+            format!(
+                "jit-eligibility function={} status={}",
+                function.name,
+                eligibility.as_str()
+            ),
+            format!(
+                "jit-eligibility stats functions={} blocks={} instructions={}",
+                stats.functions_analyzed, stats.blocks_analyzed, stats.instructions_analyzed
+            ),
+            "jit-eligibility candidate=KnownCallCandidate".to_owned(),
+        ];
+        return JitEligibilityReport {
+            function: function_id,
+            function_name: Some(function.name.clone()),
+            eligibility,
+            candidate_kind: Some(JitCandidateKind::KnownCallCandidate),
+            reasons: Vec::new(),
+            stats,
+            debug,
+        };
+    }
+
+    if string_concat_candidate_is_eligible(function).is_ok() {
+        stats.eligible = 1;
+        let eligibility = JitEligibility::Eligible;
+        let debug = vec![
+            format!(
+                "jit-eligibility function={} status={}",
+                function.name,
+                eligibility.as_str()
+            ),
+            format!(
+                "jit-eligibility stats functions={} blocks={} instructions={}",
+                stats.functions_analyzed, stats.blocks_analyzed, stats.instructions_analyzed
+            ),
+            "jit-eligibility candidate=StringConcatCandidate".to_owned(),
+        ];
+        return JitEligibilityReport {
+            function: function_id,
+            function_name: Some(function.name.clone()),
+            eligibility,
+            candidate_kind: Some(JitCandidateKind::StringConcatCandidate),
+            reasons: Vec::new(),
+            stats,
+            debug,
+        };
+    }
+
+    if property_load_candidate_is_eligible(unit, function).is_ok() {
+        stats.eligible = 1;
+        let eligibility = JitEligibility::Eligible;
+        let debug = vec![
+            format!(
+                "jit-eligibility function={} status={}",
+                function.name,
+                eligibility.as_str()
+            ),
+            format!(
+                "jit-eligibility stats functions={} blocks={} instructions={}",
+                stats.functions_analyzed, stats.blocks_analyzed, stats.instructions_analyzed
+            ),
+            "jit-eligibility candidate=PropertyLoadCandidate".to_owned(),
+        ];
+        return JitEligibilityReport {
+            function: function_id,
+            function_name: Some(function.name.clone()),
+            eligibility,
+            candidate_kind: Some(JitCandidateKind::PropertyLoadCandidate),
+            reasons: Vec::new(),
+            stats,
+            debug,
+        };
+    }
+
     let mut rejected = Vec::new();
     let mut unknown = Vec::new();
 
@@ -148,7 +386,6 @@ fn analyze_function(
     for block in &function.blocks {
         let block_index = block.id.raw();
         for instruction in &block.instructions {
-            stats.instructions_analyzed += 1;
             check_instruction(
                 instruction,
                 block_index,
@@ -214,11 +451,904 @@ fn analyze_function(
     JitEligibilityReport {
         function: function_id,
         function_name: Some(function.name.clone()),
+        candidate_kind: matches!(eligibility, JitEligibility::Eligible)
+            .then_some(JitCandidateKind::IntLeafCandidate),
         eligibility,
         reasons,
         stats,
         debug,
     }
+}
+
+fn packed_foreach_int_sum_candidate_is_eligible(
+    function: &IrFunction,
+    constants: &[IrConstant],
+) -> Result<(), JitEligibilityReason> {
+    if function.flags.is_top_level
+        || function.flags.is_closure
+        || function.flags.is_method
+        || function.flags.is_generator
+        || function.returns_by_ref
+        || !function.captures.is_empty()
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_SHAPE",
+            "packed foreach sum candidate requires an ordinary leaf function",
+        ));
+    }
+    if function.return_type.as_ref() != Some(&IrReturnType::Int) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+            "packed foreach sum candidate requires declared int return",
+        ));
+    }
+    let [array_param] = function.params.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_PARAMS",
+            "packed foreach sum candidate requires one array param",
+        ));
+    };
+    if array_param.by_ref || array_param.variadic || array_param.default.is_some() {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_PARAMS",
+            "packed foreach sum array parameter must be required by-value",
+        ));
+    }
+    if array_param.type_.as_ref() != Some(&IrReturnType::Array) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_PARAMS",
+            "packed foreach sum parameter must be declared array",
+        ));
+    }
+    let [entry, condition, body, after] = function.blocks.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+            "packed foreach sum requires entry, condition, body, and return blocks",
+        ));
+    };
+
+    let [
+        init_value,
+        store_sum,
+        discard_init,
+        load_array,
+        foreach_init,
+    ] = entry.instructions.as_slice()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum entry block has unexpected instructions",
+        ));
+    };
+    let InstructionKind::LoadConst {
+        dst: zero_reg,
+        constant,
+    } = init_value.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum must initialize accumulator with a constant",
+        ));
+    };
+    if constants.get(constant.index()) != Some(&IrConstant::Int(0)) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum accumulator must start at integer zero",
+        ));
+    }
+    let InstructionKind::StoreLocal {
+        local: sum_local,
+        src: Operand::Register(store_reg),
+    } = store_sum.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum must store zero into an accumulator local",
+        ));
+    };
+    if store_reg != zero_reg {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach accumulator store must use initialized zero register",
+        ));
+    }
+    match discard_init.kind.clone() {
+        InstructionKind::Discard {
+            src: Operand::Register(reg),
+        } if reg == zero_reg => {}
+        _ => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+                "packed foreach sum entry must discard the initializer result",
+            ));
+        }
+    }
+    let InstructionKind::LoadLocal {
+        dst: array_reg,
+        local,
+    } = load_array.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum must load the array parameter",
+        ));
+    };
+    if local != array_param.local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum source must be the array parameter",
+        ));
+    }
+    let InstructionKind::ForeachInit {
+        iterator,
+        source: Operand::Register(source_reg),
+    } = foreach_init.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach sum must use by-value foreach init",
+        ));
+    };
+    if source_reg != array_reg {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_ENTRY",
+            "packed foreach init source must be the array parameter load",
+        ));
+    }
+    match &entry.terminator {
+        Some(terminator) => match terminator.kind.clone() {
+            TerminatorKind::Jump { target } if target == condition.id => {}
+            _ => {
+                return Err(JitEligibilityReason::function(
+                    "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                    "packed foreach entry must jump to the condition block",
+                ));
+            }
+        },
+        None => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                "packed foreach entry requires a terminator",
+            ));
+        }
+    }
+
+    let [foreach_next] = condition.instructions.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONDITION",
+            "packed foreach condition must contain one foreach_next",
+        ));
+    };
+    let InstructionKind::ForeachNext {
+        has_value,
+        iterator: next_iterator,
+        key: None,
+        value,
+    } = foreach_next.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONDITION",
+            "packed foreach sum must be by-value without key binding",
+        ));
+    };
+    if next_iterator != iterator {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONDITION",
+            "foreach_next iterator does not match foreach_init",
+        ));
+    }
+    match &condition.terminator {
+        Some(terminator) => match terminator.kind.clone() {
+            TerminatorKind::JumpIf {
+                condition: Operand::Register(condition_reg),
+                if_true,
+                if_false,
+            } if condition_reg == has_value && if_true == body.id && if_false == after.id => {}
+            _ => {
+                return Err(JitEligibilityReason::function(
+                    "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                    "packed foreach condition must branch to body or return block",
+                ));
+            }
+        },
+        None => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                "packed foreach condition requires a terminator",
+            ));
+        }
+    }
+
+    let [
+        store_value,
+        load_sum,
+        load_value,
+        add,
+        store_accumulator,
+        discard_add,
+    ] = body.instructions.as_slice()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must contain only element store and int accumulation",
+        ));
+    };
+    let InstructionKind::StoreLocal {
+        local: value_local,
+        src: Operand::Register(stored_value_reg),
+    } = store_value.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must store the current element local",
+        ));
+    };
+    if stored_value_reg != value {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body value local must come from foreach_next",
+        ));
+    }
+    let InstructionKind::LoadLocal {
+        dst: loaded_sum,
+        local: loaded_sum_local,
+    } = load_sum.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must load the accumulator",
+        ));
+    };
+    if loaded_sum_local != sum_local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must accumulate into the initialized local",
+        ));
+    }
+    let InstructionKind::LoadLocal {
+        dst: loaded_value,
+        local: loaded_value_local,
+    } = load_value.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must load the current element",
+        ));
+    };
+    if loaded_value_local != value_local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must add the current element local",
+        ));
+    }
+    let InstructionKind::Binary {
+        dst: add_result,
+        op: BinaryOp::Add,
+        lhs: Operand::Register(add_lhs),
+        rhs: Operand::Register(add_rhs),
+    } = add.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body must be a single addition",
+        ));
+    };
+    if add_lhs != loaded_sum || add_rhs != loaded_value {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+            "packed foreach body addition must use accumulator plus current element",
+        ));
+    }
+    match store_accumulator.kind.clone() {
+        InstructionKind::StoreLocal {
+            local,
+            src: Operand::Register(reg),
+        } if local == sum_local && reg == add_result => {}
+        _ => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+                "packed foreach body must store the addition result to the accumulator",
+            ));
+        }
+    }
+    match discard_add.kind.clone() {
+        InstructionKind::Discard {
+            src: Operand::Register(reg),
+        } if reg == add_result => {}
+        _ => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_BODY",
+                "packed foreach body must discard the addition result",
+            ));
+        }
+    }
+    match &body.terminator {
+        Some(terminator) => match terminator.kind.clone() {
+            TerminatorKind::Jump { target } if target == condition.id => {}
+            _ => {
+                return Err(JitEligibilityReason::function(
+                    "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                    "packed foreach body must loop back to the condition block",
+                ));
+            }
+        },
+        None => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_CONTROL_FLOW",
+                "packed foreach body requires a terminator",
+            ));
+        }
+    }
+
+    let [return_load] = after.instructions.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+            "packed foreach return block must load the accumulator",
+        ));
+    };
+    let InstructionKind::LoadLocal {
+        dst: return_reg,
+        local: return_local,
+    } = return_load.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+            "packed foreach return block must load the accumulator",
+        ));
+    };
+    if return_local != sum_local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+            "packed foreach return must read the accumulator local",
+        ));
+    }
+    match &after.terminator {
+        Some(terminator) => match terminator.kind.clone() {
+            TerminatorKind::Return {
+                value: Some(Operand::Register(reg)),
+                by_ref_local: None,
+            } if reg == return_reg => Ok(()),
+            _ => Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+                "packed foreach sum must return the accumulator by value",
+            )),
+        },
+        None => Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+            "packed foreach return block requires a terminator",
+        )),
+    }
+}
+
+fn packed_array_fetch_candidate_is_eligible(
+    function: &IrFunction,
+) -> Result<(), JitEligibilityReason> {
+    if function.flags.is_top_level
+        || function.flags.is_closure
+        || function.flags.is_method
+        || function.flags.is_generator
+        || function.returns_by_ref
+        || !function.captures.is_empty()
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_SHAPE",
+            "packed-array fetch candidate requires an ordinary leaf function",
+        ));
+    }
+    if function.return_type.as_ref() != Some(&IrReturnType::Int) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_RETURN",
+            "packed-array fetch candidate requires declared int return",
+        ));
+    }
+    let [array_param, index_param] = function.params.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_PARAMS",
+            "packed-array fetch candidate requires array and int params",
+        ));
+    };
+    check_packed_fetch_param_shape(array_param, IrReturnType::Array, "array")?;
+    check_packed_fetch_param_shape(index_param, IrReturnType::Int, "index")?;
+    let [block] = function.blocks.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_CONTROL_FLOW",
+            "packed-array fetch candidate requires one basic block",
+        ));
+    };
+
+    let mut array_reg = None;
+    let mut index_reg = None;
+    let mut fetch_reg = None;
+    for instruction in &block.instructions {
+        match &instruction.kind {
+            InstructionKind::LoadLocal { dst, local } if *local == array_param.local => {
+                array_reg = Some(*dst);
+            }
+            InstructionKind::LoadLocal { dst, local } if *local == index_param.local => {
+                index_reg = Some(*dst);
+            }
+            InstructionKind::FetchDim {
+                dst,
+                array,
+                key,
+                quiet: false,
+            } => {
+                if *array
+                    != Operand::Register(array_reg.ok_or_else(|| {
+                        JitEligibilityReason::function(
+                            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_SHAPE",
+                            "fetch_dim appears before array param load",
+                        )
+                    })?)
+                    || *key
+                        != Operand::Register(index_reg.ok_or_else(|| {
+                            JitEligibilityReason::function(
+                                "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_SHAPE",
+                                "fetch_dim appears before index param load",
+                            )
+                        })?)
+                {
+                    return Err(JitEligibilityReason::function(
+                        "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_SHAPE",
+                        "fetch_dim operands do not match array and index params",
+                    ));
+                }
+                fetch_reg = Some(*dst);
+            }
+            _ => {
+                return Err(JitEligibilityReason::function(
+                    "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_OPCODE",
+                    "instruction is outside the packed-array fetch subset",
+                ));
+            }
+        }
+    }
+
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(Operand::Register(return_reg)),
+                by_ref_local: None,
+            } if Some(*return_reg) == fetch_reg => Ok(()),
+            _ => Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_TERMINATOR",
+                "packed-array fetch candidate must return the fetched value by value",
+            )),
+        },
+        None => Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_TERMINATOR",
+            "packed-array fetch candidate requires a return terminator",
+        )),
+    }
+}
+
+fn check_packed_fetch_param_shape(
+    param: &IrParam,
+    expected: IrReturnType,
+    role: &'static str,
+) -> Result<(), JitEligibilityReason> {
+    if param.by_ref || param.variadic || param.default.is_some() {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_PARAMS",
+            format!("packed-array fetch {role} parameter must be required by-value"),
+        ));
+    }
+    if param.type_.as_ref() != Some(&expected) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PACKED_FETCH_PARAMS",
+            format!("packed-array fetch {role} parameter has wrong type"),
+        ));
+    }
+    Ok(())
+}
+
+fn known_call_candidate_is_eligible(
+    unit: &IrUnit,
+    function: &IrFunction,
+) -> Result<(), JitEligibilityReason> {
+    if function.flags.is_top_level
+        || function.flags.is_closure
+        || function.flags.is_method
+        || function.flags.is_generator
+        || function.returns_by_ref
+        || !function.captures.is_empty()
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_SHAPE",
+            "known-call candidate requires an ordinary leaf function",
+        ));
+    }
+    if function.return_type.as_ref() != Some(&IrReturnType::Int) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_RETURN",
+            "known-call candidate requires declared int return",
+        ));
+    }
+    let [param] = function.params.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_PARAMS",
+            "known-call candidate requires exactly one parameter",
+        ));
+    };
+    if param.by_ref || param.variadic || param.default.is_some() {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_PARAMS",
+            "known-call parameter must be required by-value",
+        ));
+    }
+    let [block] = function.blocks.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_CONTROL_FLOW",
+            "known-call candidate requires one basic block",
+        ));
+    };
+    let [load, call] = block.instructions.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_INSTRUCTIONS",
+            "known-call candidate expects load-local then call",
+        ));
+    };
+    let InstructionKind::LoadLocal {
+        dst: loaded,
+        local: loaded_local,
+    } = load.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_LOAD",
+            "known-call candidate must load the sole parameter",
+        ));
+    };
+    if loaded_local != param.local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_LOAD",
+            "known-call load must read the sole parameter local",
+        ));
+    }
+    let InstructionKind::CallFunction { dst, name, args } = &call.kind else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_OPCODE",
+            "known-call candidate expects a direct function call",
+        ));
+    };
+    let expected_type = match name.as_str() {
+        "strlen" => IrReturnType::String,
+        "count" => IrReturnType::Array,
+        _ => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_TARGET",
+                "known-call candidate only supports strlen and count",
+            ));
+        }
+    };
+    if unit
+        .function_table
+        .iter()
+        .any(|entry| entry.name.eq_ignore_ascii_case(name))
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_OVERRIDE",
+            "known-call candidate rejected a user function override ambiguity",
+        ));
+    }
+    let [arg] = args.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_ARITY",
+            "known-call candidate requires exactly one call argument",
+        ));
+    };
+    if arg.name.is_some() || arg.unpack {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_ARGUMENT_MODE",
+            "known-call candidate rejects named and unpacked arguments",
+        ));
+    }
+    if arg.value != Operand::Register(loaded) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_ARGUMENT",
+            "known-call argument must be the loaded parameter",
+        ));
+    }
+    let param_type_supported = match param.type_.as_ref() {
+        None => true,
+        Some(type_) => type_ == &expected_type,
+    };
+    if !param_type_supported {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_PARAM_TYPE",
+            "known-call parameter type is incompatible with the builtin guard",
+        ));
+    }
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(Operand::Register(return_reg)),
+                by_ref_local: None,
+            } if return_reg == dst => Ok(()),
+            _ => Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_RETURN",
+                "known-call candidate must return the call result by value",
+            )),
+        },
+        None => Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_KNOWN_CALL_RETURN",
+            "known-call candidate requires a return terminator",
+        )),
+    }
+}
+
+fn string_concat_candidate_is_eligible(function: &IrFunction) -> Result<(), JitEligibilityReason> {
+    if function.flags.is_top_level
+        || function.flags.is_closure
+        || function.flags.is_method
+        || function.flags.is_generator
+        || function.returns_by_ref
+        || !function.captures.is_empty()
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_SHAPE",
+            "string-concat candidate requires an ordinary leaf function",
+        ));
+    }
+    if function.return_type.as_ref() != Some(&IrReturnType::String) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_RETURN",
+            "string-concat candidate requires declared string return",
+        ));
+    }
+    let [lhs_param, rhs_param] = function.params.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_PARAMS",
+            "string-concat candidate requires exactly two parameters",
+        ));
+    };
+    for param in [lhs_param, rhs_param] {
+        if param.by_ref || param.variadic || param.default.is_some() {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_PARAMS",
+                "string-concat parameters must be required by-value",
+            ));
+        }
+        if param.type_.as_ref() != Some(&IrReturnType::String) {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_PARAM_TYPE",
+                "string-concat operands must be declared strings",
+            ));
+        }
+    }
+    let [block] = function.blocks.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_CONTROL_FLOW",
+            "string-concat candidate requires one basic block",
+        ));
+    };
+    let [load_lhs, load_rhs, concat] = block.instructions.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_INSTRUCTIONS",
+            "string-concat candidate expects load, load, concat",
+        ));
+    };
+    let InstructionKind::LoadLocal {
+        dst: loaded_lhs,
+        local: loaded_lhs_local,
+    } = load_lhs.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_LOAD",
+            "string-concat candidate must load the left parameter",
+        ));
+    };
+    if loaded_lhs_local != lhs_param.local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_LOAD",
+            "left concat operand must load the left parameter",
+        ));
+    }
+    let InstructionKind::LoadLocal {
+        dst: loaded_rhs,
+        local: loaded_rhs_local,
+    } = load_rhs.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_LOAD",
+            "string-concat candidate must load the right parameter",
+        ));
+    };
+    if loaded_rhs_local != rhs_param.local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_LOAD",
+            "right concat operand must load the right parameter",
+        ));
+    }
+    let InstructionKind::Binary {
+        dst,
+        op: BinaryOp::Concat,
+        lhs: Operand::Register(lhs_reg),
+        rhs: Operand::Register(rhs_reg),
+    } = concat.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_OPCODE",
+            "string-concat candidate expects a binary concat",
+        ));
+    };
+    if lhs_reg != loaded_lhs || rhs_reg != loaded_rhs {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_OPERANDS",
+            "string-concat operands must be the loaded parameters",
+        ));
+    }
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(Operand::Register(return_reg)),
+                by_ref_local: None,
+            } if *return_reg == dst => Ok(()),
+            _ => Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_RETURN",
+                "string-concat candidate must return the concat result",
+            )),
+        },
+        None => Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_STRING_CONCAT_RETURN",
+            "string-concat candidate requires a return terminator",
+        )),
+    }
+}
+
+fn property_load_candidate_is_eligible(
+    unit: &IrUnit,
+    function: &IrFunction,
+) -> Result<(), JitEligibilityReason> {
+    if function.flags.is_top_level
+        || function.flags.is_closure
+        || function.flags.is_method
+        || function.flags.is_generator
+        || function.returns_by_ref
+        || !function.captures.is_empty()
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_SHAPE",
+            "property-load candidate requires an ordinary leaf function",
+        ));
+    }
+    if matches!(
+        function.return_type.as_ref(),
+        None | Some(IrReturnType::Void | IrReturnType::Never)
+    ) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_RETURN",
+            "property-load candidate requires a value return type",
+        ));
+    }
+    let [param] = function.params.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_PARAMS",
+            "property-load candidate requires exactly one object parameter",
+        ));
+    };
+    if param.by_ref || param.variadic || param.default.is_some() {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_PARAMS",
+            "property-load parameter must be required by-value",
+        ));
+    }
+    let Some(IrReturnType::Class { name }) = param.type_.as_ref() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_PARAM_TYPE",
+            "property-load parameter must have a class type",
+        ));
+    };
+    let Some(class) = unit
+        .classes
+        .iter()
+        .find(|class| normalize_class_name(&class.name) == normalize_class_name(name))
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_CLASS",
+            "property-load parameter class is not present in the IR unit",
+        ));
+    };
+    let [block] = function.blocks.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_CONTROL_FLOW",
+            "property-load candidate requires one straight-line block",
+        ));
+    };
+    let [load, fetch] = block.instructions.as_slice() else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_INSTRUCTIONS",
+            "property-load candidate expects load-local then fetch-property",
+        ));
+    };
+    let InstructionKind::LoadLocal {
+        dst: loaded,
+        local: loaded_local,
+    } = load.kind.clone()
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_LOAD",
+            "property-load candidate must load the object parameter",
+        ));
+    };
+    if loaded_local != param.local {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_LOAD",
+            "property-load load must read the object parameter local",
+        ));
+    }
+    let InstructionKind::FetchProperty {
+        dst,
+        object: Operand::Register(object_reg),
+        property,
+    } = &fetch.kind
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_OPCODE",
+            "property-load candidate expects a direct property fetch",
+        ));
+    };
+    if *object_reg != loaded {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_OBJECT",
+            "property-load fetch must use the loaded object parameter",
+        ));
+    }
+    let Some(property_entry) = class
+        .properties
+        .iter()
+        .find(|entry| entry.name == *property)
+    else {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_DECLARED",
+            "property-load fast path requires a declared property",
+        ));
+    };
+    if property_entry.flags.is_static
+        || property_entry.flags.is_private
+        || property_entry.flags.is_protected
+    {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_VISIBILITY",
+            "property-load fast path requires a visible instance property",
+        ));
+    }
+    if property_entry.hooks.get.is_some() || property_entry.hooks.set.is_some() {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_HOOK",
+            "property-load fast path rejects property hooks",
+        ));
+    }
+    if class.methods.iter().any(|method| {
+        method.name.eq_ignore_ascii_case("__get")
+            && !method.flags.is_static
+            && !method.flags.is_private
+            && !method.flags.is_protected
+    }) {
+        return Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_MAGIC_GET",
+            "property-load fast path rejects public __get",
+        ));
+    }
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(Operand::Register(return_reg)),
+                by_ref_local: None,
+            } if return_reg == dst => Ok(()),
+            _ => Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_RETURN",
+                "property-load candidate must return the fetched property by value",
+            )),
+        },
+        None => Err(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_RETURN",
+            "property-load candidate requires a return terminator",
+        )),
+    }
+}
+
+fn normalize_class_name(name: &str) -> String {
+    name.trim_start_matches('\\').to_ascii_lowercase()
 }
 
 fn check_function_shape(
@@ -275,8 +1405,15 @@ fn check_param(param: &IrParam, rejected: &mut Vec<JitEligibilityReason>) {
             format!("parameter `${}` is variadic", param.name),
         ));
     }
-    if let Some(type_) = &param.type_ {
-        check_type(type_, "parameter type", rejected);
+    match &param.type_ {
+        Some(type_) => check_type(type_, "parameter type", rejected),
+        None => rejected.push(JitEligibilityReason::function(
+            "JIT_ELIGIBILITY_REJECT_UNTYPED_PARAM",
+            format!(
+                "parameter `${}` is not declared int and no stable int profile is available",
+                param.name
+            ),
+        )),
     }
 }
 
@@ -294,13 +1431,10 @@ fn check_type(
     context: &'static str,
     rejected: &mut Vec<JitEligibilityReason>,
 ) {
-    if !matches!(
-        type_,
-        IrReturnType::Int | IrReturnType::Bool | IrReturnType::False | IrReturnType::True
-    ) {
+    if !matches!(type_, IrReturnType::Int) {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_NON_PRIMITIVE_TYPE",
-            format!("{context} is not an int/bool primitive"),
+            format!("{context} is not an int"),
         ));
     }
 }
@@ -316,14 +1450,19 @@ fn check_instruction(
     match &instruction.kind {
         InstructionKind::Nop
         | InstructionKind::LoadLocal { .. }
-        | InstructionKind::LoadLocalQuiet { .. }
         | InstructionKind::StoreLocal { .. }
         | InstructionKind::Move { .. }
-        | InstructionKind::Discard { .. }
-        | InstructionKind::IssetLocal { .. }
-        | InstructionKind::EmptyLocal { .. } => {
+        | InstructionKind::Discard { .. } => {
             check_instruction_operands(instruction, block, constants, rejected, unknown);
         }
+        InstructionKind::LoadLocalQuiet { .. }
+        | InstructionKind::IssetLocal { .. }
+        | InstructionKind::EmptyLocal { .. } => rejected.push(JitEligibilityReason::instruction(
+            "JIT_ELIGIBILITY_REJECT_DYNAMIC_LOCAL_OPCODE",
+            "dynamic local existence checks are outside the int leaf subset",
+            block,
+            id,
+        )),
         InstructionKind::LoadConst { constant, .. } => {
             check_constant(*constant, block, id, constants, rejected, unknown);
         }
@@ -608,6 +1747,7 @@ fn unknown_report(
         eligibility: JitEligibility::Unknown {
             reason: reason.clone(),
         },
+        candidate_kind: None,
         reasons: vec![reason.clone()],
         stats: JitEligibilityStats {
             functions_analyzed: 0,
@@ -629,4 +1769,20 @@ fn unknown_report(
 pub fn call_args_are_jit_primitive(args: &[IrCallArg]) -> bool {
     args.iter()
         .all(|arg| arg.name.is_none() && !arg.unpack && arg.by_ref_local.is_none())
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }

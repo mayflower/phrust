@@ -9,7 +9,8 @@ use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source};
 use php_source::TextRange;
 use php_vm::{
-    IncludeLoader, InlineCacheMode, JitMode, QuickeningMode, TieringOptions, Vm, VmOptions,
+    IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode, QuickeningMode, TieringOptions, Vm,
+    VmOptions,
 };
 use std::env;
 use std::fs;
@@ -65,6 +66,7 @@ where
     match command {
         "compile" => compile_command(&args[1..], stdout, stderr),
         "dump-ir" => dump_ir_command(&args[1..], stdout, stderr),
+        "dump-cranelift-clif" => dump_cranelift_clif_command(&args[1..], stdout, stderr),
         "run" => run_command(&args[1..], stdout, stderr),
         "report" => report_command(&args[1..], stdout, stderr),
         "compare" => {
@@ -77,6 +79,64 @@ where
         }
         _ => Err(format!("unknown php-vm command `{command}`")),
     }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn dump_cranelift_clif_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    _stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    if !args.is_empty() {
+        return Err("dump-cranelift-clif does not accept arguments".to_string());
+    }
+    let result = php_jit::build_trivial_add_clif_smoke().map_err(|error| error.to_string())?;
+    let output_dir = workspace_relative_path("target/phase7/cranelift");
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        format!(
+            "{}: failed to create CLIF output directory: {error}",
+            output_dir.display()
+        )
+    })?;
+    let output_path = output_dir.join("trivial_add.clif");
+    fs::write(&output_path, &result.clif)
+        .map_err(|error| format!("{}: {error}", output_path.display()))?;
+    writeln!(
+        stdout,
+        "ok backend=cranelift-experiment function={} verified={} blocks={} instructions={} path={}",
+        result.function_name,
+        result.stats.verified,
+        result.stats.blocks_lowered,
+        result.stats.instructions_lowered,
+        output_path.display()
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(EXIT_SUCCESS)
+}
+
+#[cfg(not(feature = "jit-cranelift"))]
+fn dump_cranelift_clif_command<W, E>(
+    args: &[String],
+    _stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    if !args.is_empty() {
+        return Err("dump-cranelift-clif does not accept arguments".to_string());
+    }
+    writeln!(
+        stderr,
+        "dump-cranelift-clif requires the jit-cranelift feature"
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(EXIT_UNSUPPORTED)
 }
 
 fn compile_command<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32, String>
@@ -151,6 +211,14 @@ where
     E: Write,
 {
     let run_options = parse_run_args(args)?;
+    if run_options.jit.requires_cranelift() && !cfg!(feature = "jit-cranelift") {
+        writeln!(
+            stderr,
+            "run --jit=cranelift requires the jit-cranelift feature"
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
     let path = run_options.path;
     let mut cache_stats = BytecodeCacheStats::new(run_options.bytecode_cache.mode);
     let cache_context = prepare_bytecode_cache(path, &run_options, &mut cache_stats)?;
@@ -186,19 +254,22 @@ where
     let include_loader = include_loader_for(path).ok();
     let runtime_context = runtime_context_for(
         path,
-        run_options.script_args,
-        run_options.env,
+        run_options.script_args.clone(),
+        run_options.env.clone(),
         include_loader.as_ref(),
     );
+    let jit_eligibility_json = build_jit_eligibility_json(&unit, run_options.jit);
     let vm = Vm::with_options(VmOptions {
         include_loader,
         runtime_context,
         trace: run_options.trace,
         trace_runtime: run_options.trace_runtime,
-        collect_counters: run_options.counters_json.is_some(),
+        collect_counters: run_options.counters_json.is_some() || run_options.jit_stats.is_json(),
         quickening: run_options.quickening,
         inline_caches: run_options.inline_caches,
         jit: run_options.jit,
+        jit_threshold: run_options.jit_threshold,
+        jit_blacklist: run_options.jit_blacklist,
         tiering: run_options.tiering.clone(),
         ..VmOptions::default()
     });
@@ -210,11 +281,18 @@ where
     if run_options.trace || run_options.trace_runtime {
         write_trace(stderr, &result.trace)?;
     }
-    if let Some(path) = run_options.counters_json {
+    if let Some(path) = &run_options.counters_json {
         let Some(counters) = &result.counters else {
             return Err("counters were requested but not collected".to_string());
         };
-        write_counters_json(path, counters)?;
+        write_counters_json(path.clone(), counters)?;
+    }
+    if run_options.jit_stats.is_json() && result.counters.is_some() {
+        let counters = result
+            .counters
+            .as_ref()
+            .expect("checked is_some before writing jit stats");
+        write_jit_stats_json(stderr, counters, &run_options, &jit_eligibility_json)?;
     }
     if let Some(path) = run_options.tiering_stats_json {
         let Some(stats) = &result.tiering_stats else {
@@ -561,6 +639,10 @@ struct RunOptions<'a> {
     quickening: QuickeningMode,
     inline_caches: InlineCacheMode,
     jit: JitMode,
+    jit_threshold: u64,
+    jit_blacklist: JitBlacklistMode,
+    jit_dump_clif: Option<String>,
+    jit_stats: JitStatsMode,
     tiering: TieringOptions,
     tiering_stats_json: Option<String>,
 }
@@ -650,6 +732,19 @@ enum ReportFormat {
     Html,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum JitStatsMode {
+    #[default]
+    Off,
+    Json,
+}
+
+impl JitStatsMode {
+    fn is_json(self) -> bool {
+        matches!(self, Self::Json)
+    }
+}
+
 struct ReportOptions<'a> {
     path: &'a str,
     format: ReportFormat,
@@ -688,8 +783,13 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let mut quickening = QuickeningMode::Off;
     let mut inline_caches = InlineCacheMode::Off;
     let mut jit = JitMode::Off;
+    let mut jit_threshold = TieringOptions::default().function_entry_threshold;
+    let mut jit_blacklist = JitBlacklistMode::On;
+    let mut jit_dump_clif = None;
+    let mut jit_stats = JitStatsMode::Off;
     let mut tiering = TieringOptions::default();
     let mut tiering_stats_json = None;
+    let mut tiering_function_threshold_explicit = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -752,12 +852,85 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
             "--jit" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return Err("run --jit requires off or on".to_string());
+                    return Err("run --jit requires off, noop, or cranelift".to_string());
                 };
                 jit = parse_jit_mode(value)?;
             }
             arg if let Some(value) = arg.strip_prefix("--jit=") => {
                 jit = parse_jit_mode(value)?;
+            }
+            "--jit-threshold" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-threshold requires <count>".to_string());
+                };
+                jit_threshold = parse_u64_option(value, "jit-threshold")?;
+                if !tiering_function_threshold_explicit {
+                    tiering.function_entry_threshold = jit_threshold;
+                }
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-threshold=") => {
+                jit_threshold = parse_u64_option(value, "jit-threshold")?;
+                if !tiering_function_threshold_explicit {
+                    tiering.function_entry_threshold = jit_threshold;
+                }
+            }
+            "--jit-max-compile-us" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-max-compile-us requires <microseconds>".to_string());
+                };
+                tiering.jit_max_compile_us = parse_u64_option(value, "jit-max-compile-us")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-max-compile-us=") => {
+                tiering.jit_max_compile_us = parse_u64_option(value, "jit-max-compile-us")?;
+            }
+            "--jit-max-functions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-max-functions requires <count>".to_string());
+                };
+                tiering.jit_max_functions = parse_u64_option(value, "jit-max-functions")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-max-functions=") => {
+                tiering.jit_max_functions = parse_u64_option(value, "jit-max-functions")?;
+            }
+            "--jit-eager" => {
+                tiering.jit_eager = true;
+                jit_threshold = 1;
+                if !tiering_function_threshold_explicit {
+                    tiering.function_entry_threshold = 1;
+                }
+            }
+            "--jit-blacklist" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-blacklist requires off or on".to_string());
+                };
+                jit_blacklist = parse_jit_blacklist_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-blacklist=") => {
+                jit_blacklist = parse_jit_blacklist_mode(value)?;
+            }
+            "--jit-dump-clif" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-dump-clif requires <path>".to_string());
+                };
+                jit_dump_clif = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-dump-clif=") => {
+                jit_dump_clif = Some(value.to_owned());
+            }
+            "--jit-stats" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit-stats requires json".to_string());
+                };
+                jit_stats = parse_jit_stats_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit-stats=") => {
+                jit_stats = parse_jit_stats_mode(value)?;
             }
             "--tiering" => {
                 index += 1;
@@ -774,10 +947,12 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 let Some(value) = args.get(index) else {
                     return Err("run --tiering-function-threshold requires <count>".to_string());
                 };
+                tiering_function_threshold_explicit = true;
                 tiering.function_entry_threshold =
                     parse_u64_option(value, "tiering-function-threshold")?;
             }
             arg if let Some(value) = arg.strip_prefix("--tiering-function-threshold=") => {
+                tiering_function_threshold_explicit = true;
                 tiering.function_entry_threshold =
                     parse_u64_option(value, "tiering-function-threshold")?;
             }
@@ -867,6 +1042,10 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     quickening,
                     inline_caches,
                     jit,
+                    jit_threshold,
+                    jit_blacklist,
+                    jit_dump_clif,
+                    jit_stats,
                     tiering,
                     tiering_stats_json,
                 });
@@ -895,6 +1074,10 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         quickening,
         inline_caches,
         jit,
+        jit_threshold,
+        jit_blacklist,
+        jit_dump_clif,
+        jit_stats,
         tiering,
         tiering_stats_json,
     })
@@ -908,6 +1091,14 @@ fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {
             "unsupported {flag} mode `{value}`; expected off or on"
         )),
     }
+}
+
+fn parse_jit_blacklist_mode(value: &str) -> Result<JitBlacklistMode, String> {
+    Ok(if parse_on_off(value, "jit-blacklist")? {
+        JitBlacklistMode::On
+    } else {
+        JitBlacklistMode::Off
+    })
 }
 
 fn parse_u64_option(value: &str, flag: &str) -> Result<u64, String> {
@@ -945,9 +1136,20 @@ fn parse_inline_cache_mode(value: &str) -> Result<InlineCacheMode, String> {
 fn parse_jit_mode(value: &str) -> Result<JitMode, String> {
     match value {
         "off" => Ok(JitMode::Off),
+        "noop" => Ok(JitMode::Noop),
+        "cranelift" => Ok(JitMode::Cranelift),
         "on" => Ok(JitMode::On),
         _ => Err(format!(
-            "unsupported jit mode `{value}`; expected off or on"
+            "unsupported jit mode `{value}`; expected off, noop, or cranelift"
+        )),
+    }
+}
+
+fn parse_jit_stats_mode(value: &str) -> Result<JitStatsMode, String> {
+    match value {
+        "json" => Ok(JitStatsMode::Json),
+        _ => Err(format!(
+            "unsupported jit stats mode `{value}`; expected json"
         )),
     }
 }
@@ -1179,6 +1381,149 @@ fn write_counters_json(path: String, counters: &php_vm::VmCounters) -> Result<()
     fs::write(path, counters.to_json()).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+fn write_jit_stats_json<W: Write>(
+    stderr: &mut W,
+    counters: &php_vm::VmCounters,
+    options: &RunOptions<'_>,
+    eligibility_json: &str,
+) -> Result<(), String> {
+    let dump_clif = options.jit_dump_clif.as_deref().unwrap_or("");
+    let side_exit_reasons = write_string_u64_map_json(&counters.jit_side_exit_reasons);
+    let blacklist_reasons = write_string_u64_map_json(&counters.jit_blacklist_reasons);
+    writeln!(
+        stderr,
+        "{{\"jit\":{{\"mode\":\"{}\",\"threshold\":{},\"eager\":{},\"max_compile_us\":{},\"max_functions\":{},\"blacklist\":\"{}\",\"dump_clif\":\"{}\",\"compile_attempts\":{},\"compiled\":{},\"executed\":{},\"bailouts\":{},\"code_bytes\":{},\"compile_time_nanos\":{},\"side_exits\":{},\"side_exit_reasons\":{},\"guard_failures\":{},\"blacklisted_regions\":{},\"blacklist_reasons\":{},\"tiering_cold_functions\":{},\"tiering_hot_functions\":{},\"tiering_eager_functions\":{},\"tiering_blacklist_rejections\":{},\"tiering_budget_rejections\":{},\"helper_calls\":{},\"fast_path_hits\":{},\"packed_fetch_fast_hits\":{},\"packed_fetch_bounds_exits\":{},\"packed_fetch_layout_exits\":{},\"packed_foreach_sum_fast_hits\":{},\"packed_foreach_sum_layout_exits\":{},\"packed_foreach_sum_overflow_exits\":{},\"known_call_fast_hits\":{},\"known_call_guard_exits\":{},\"known_call_slow_calls\":{},\"direct_call_hits\":{},\"direct_call_fallbacks\":{},\"property_load_fast_hits\":{},\"property_load_guard_exits\":{},\"property_load_layout_exits\":{},\"property_load_uninitialized_exits\":{},\"property_load_slow_calls\":{},\"string_concat_fast_path_hits\":{},\"string_concat_fast_path_misses\":{},\"overflow_exits\":{},\"slow_path_calls\":{},\"compile_cache_hits\":{},\"compile_cache_misses\":{},\"compile_cache_invalidations\":{},\"eligibility\":{}}}}}",
+        options.jit.as_str(),
+        options.jit_threshold,
+        options.tiering.jit_eager,
+        options.tiering.jit_max_compile_us,
+        options.tiering.jit_max_functions,
+        options.jit_blacklist.as_str(),
+        escape_json(dump_clif),
+        counters.jit_compile_attempts,
+        counters.jit_compiled,
+        counters.jit_executed,
+        counters.jit_bailouts,
+        counters.jit_code_bytes,
+        counters.jit_compile_time_nanos,
+        counters.jit_side_exits,
+        side_exit_reasons,
+        counters.jit_guard_failures,
+        counters.jit_blacklisted_regions,
+        blacklist_reasons,
+        counters.jit_tiering_cold_functions,
+        counters.jit_tiering_hot_functions,
+        counters.jit_tiering_eager_functions,
+        counters.jit_tiering_blacklist_rejections,
+        counters.jit_tiering_budget_rejections,
+        counters.jit_helper_calls,
+        counters.jit_fast_path_hits,
+        counters.packed_fetch_fast_hits,
+        counters.packed_fetch_bounds_exits,
+        counters.packed_fetch_layout_exits,
+        counters.packed_foreach_sum_fast_hits,
+        counters.packed_foreach_sum_layout_exits,
+        counters.packed_foreach_sum_overflow_exits,
+        counters.known_call_fast_hits,
+        counters.known_call_guard_exits,
+        counters.known_call_slow_calls,
+        counters.direct_call_hits,
+        counters.direct_call_fallbacks,
+        counters.property_load_fast_hits,
+        counters.property_load_guard_exits,
+        counters.property_load_layout_exits,
+        counters.property_load_uninitialized_exits,
+        counters.property_load_slow_calls,
+        counters.string_concat_fast_path_hits,
+        counters.string_concat_fast_path_misses,
+        counters.jit_overflow_exits,
+        counters.jit_slow_path_calls,
+        counters.jit_compile_cache_hits,
+        counters.jit_compile_cache_misses,
+        counters.jit_compile_cache_invalidations,
+        eligibility_json
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn write_string_u64_map_json(values: &std::collections::BTreeMap<String, u64>) -> String {
+    let mut json = String::from("{");
+    for (index, (key, value)) in values.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(&escape_json(key));
+        json.push_str("\":");
+        json.push_str(&value.to_string());
+    }
+    json.push('}');
+    json
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn build_jit_eligibility_json(unit: &php_ir::IrUnit, jit: JitMode) -> String {
+    let mut reports = Vec::new();
+    if jit.requires_cranelift() {
+        for index in 0..unit.functions.len() {
+            reports.push(php_jit::analyze_jit_eligibility(
+                unit,
+                php_ir::FunctionId::new(index as u32),
+            ));
+        }
+    }
+    write_jit_eligibility_reports_json(&reports)
+}
+
+#[cfg(not(feature = "jit-cranelift"))]
+fn build_jit_eligibility_json(_unit: &php_ir::IrUnit, _jit: JitMode) -> String {
+    write_empty_jit_eligibility_json()
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn write_jit_eligibility_reports_json(reports: &[php_jit::JitEligibilityReport]) -> String {
+    let considered = reports.len();
+    let eligible = reports
+        .iter()
+        .filter(|report| matches!(report.eligibility, php_jit::JitEligibility::Eligible))
+        .count();
+    let rejected = reports
+        .iter()
+        .filter(|report| matches!(report.eligibility, php_jit::JitEligibility::Rejected { .. }))
+        .count();
+    let unknown = reports
+        .iter()
+        .filter(|report| matches!(report.eligibility, php_jit::JitEligibility::Unknown { .. }))
+        .count();
+    let mut json = String::new();
+    json.push('{');
+    json.push_str("\"considered\":");
+    json.push_str(&considered.to_string());
+    json.push_str(",\"eligible\":");
+    json.push_str(&eligible.to_string());
+    json.push_str(",\"non_eligible\":");
+    json.push_str(&(rejected + unknown).to_string());
+    json.push_str(",\"rejected\":");
+    json.push_str(&rejected.to_string());
+    json.push_str(",\"unknown\":");
+    json.push_str(&unknown.to_string());
+    json.push_str(",\"reports\":[");
+    for (index, report) in reports.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&report.to_json());
+    }
+    json.push_str("]}");
+    json
+}
+
+#[cfg(not(feature = "jit-cranelift"))]
+fn write_empty_jit_eligibility_json() -> String {
+    "{\"considered\":0,\"eligible\":0,\"non_eligible\":0,\"rejected\":0,\"unknown\":0,\"reports\":[]}"
+        .to_owned()
+}
+
 fn write_tiering_stats_json(path: String, stats: &php_vm::TieringStats) -> Result<(), String> {
     let path = Path::new(&path);
     if let Some(parent) = path.parent()
@@ -1239,7 +1584,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--quickening off|on] [--inline-caches off|on] [--jit off|on] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -1596,14 +1941,24 @@ fn path_exists(path: &str) -> bool {
     Path::new(path).exists()
 }
 
+#[cfg(feature = "jit-cranelift")]
+fn workspace_relative_path(path: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("crate should be under workspace crates directory")
+        .join(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, OptimizationLevel,
-        QuickeningMode, cache_file_for, compile_pipeline_with_optimization, parse_run_args, run,
+        BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, JitStatsMode,
+        OptimizationLevel, QuickeningMode, cache_file_for, compile_pipeline_with_optimization,
+        parse_run_args, run,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
-    use php_vm::{InlineCacheMode, JitMode};
+    use php_vm::{InlineCacheMode, JitBlacklistMode, JitMode};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1616,6 +1971,50 @@ mod tests {
         assert_eq!(code, EXIT_SUCCESS);
         assert!(stderr.is_empty());
         assert!(String::from_utf8(stdout).unwrap().contains("dump-ir"));
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn dump_cranelift_clif_writes_verified_standalone_smoke() {
+        let output = workspace_root().join("target/phase7/cranelift/trivial_add.clif");
+        let _ = fs::remove_file(&output);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            ["dump-cranelift-clif".to_string()],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("backend=cranelift-experiment"));
+        assert!(stdout.contains("verified=true"));
+        let clif = fs::read_to_string(output).expect("CLIF smoke dump should be written");
+        assert!(clif.contains("function u0:0(i64, i64) -> i64"));
+        assert!(clif.contains("iadd"));
+        assert!(clif.contains("return"));
+    }
+
+    #[cfg(not(feature = "jit-cranelift"))]
+    #[test]
+    fn dump_cranelift_clif_reports_feature_requirement_when_disabled() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            ["dump-cranelift-clif".to_string()],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, super::EXIT_UNSUPPORTED);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("requires the jit-cranelift feature")
+        );
     }
 
     #[test]
@@ -1750,6 +2149,30 @@ mod tests {
         assert!(error.contains("expected off or on"));
     }
 
+    #[cfg(not(feature = "jit-cranelift"))]
+    #[test]
+    fn cranelift_jit_mode_without_feature_is_unsupported() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--jit=cranelift".to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, super::EXIT_UNSUPPORTED);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("requires the jit-cranelift feature")
+        );
+    }
+
     #[test]
     fn invalid_inline_cache_mode_is_rejected() {
         let args = vec![
@@ -1777,7 +2200,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("expected off or on"));
+        assert!(error.contains("expected off, noop, or cranelift"));
     }
 
     #[test]
@@ -1834,8 +2257,147 @@ mod tests {
         let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
         let _ = std::fs::remove_file(&path);
         assert!(json.contains("\"instructions_executed\""));
+        assert!(json.contains("\"jit_mode\": \"off\""));
+        assert!(json.contains("\"jit_threshold\": 8"));
         assert!(json.contains("\"echo\": 1"));
         assert!(json.contains("\"guard_failures\": 0"));
+    }
+
+    #[test]
+    fn run_jit_noop_mode_is_visible_in_counter_json() {
+        let path = std::env::temp_dir().join(format!(
+            "phrust-vm-jit-noop-counters-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--jit=noop".to_string(),
+                "--jit-threshold=7".to_string(),
+                "--counters-json".to_string(),
+                path.display().to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello phase4\n");
+        assert!(stderr.is_empty());
+        let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
+        let _ = std::fs::remove_file(&path);
+        assert!(json.contains("\"jit_mode\": \"noop\""));
+        assert!(json.contains("\"jit_threshold\": 7"));
+        assert!(json.contains("\"jit_compile_attempts\": 0"));
+    }
+
+    #[test]
+    fn run_jit_stats_json_writes_compact_report_to_stderr() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--jit=noop".to_string(),
+                "--jit-threshold=5".to_string(),
+                "--jit-dump-clif=target/phase7/cranelift/noop.clif".to_string(),
+                "--jit-stats=json".to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello phase4\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("\"mode\":\"noop\""));
+        assert!(stderr.contains("\"threshold\":5"));
+        assert!(stderr.contains("\"eager\":false"));
+        assert!(stderr.contains("\"max_compile_us\":18446744073709551615"));
+        assert!(stderr.contains("\"max_functions\":18446744073709551615"));
+        assert!(stderr.contains("\"blacklist\":\"on\""));
+        assert!(stderr.contains("\"dump_clif\":\"target/phase7/cranelift/noop.clif\""));
+        assert!(stderr.contains("\"side_exit_reasons\":{}"));
+        assert!(stderr.contains("\"blacklisted_regions\":0"));
+        assert!(stderr.contains("\"blacklist_reasons\":{}"));
+        assert!(stderr.contains("\"tiering_cold_functions\":0"));
+        assert!(stderr.contains("\"tiering_hot_functions\":0"));
+        assert!(stderr.contains("\"tiering_eager_functions\":0"));
+        assert!(stderr.contains("\"tiering_blacklist_rejections\":0"));
+        assert!(stderr.contains("\"tiering_budget_rejections\":0"));
+        assert!(stderr.contains("\"fast_path_hits\":0"));
+        assert!(stderr.contains("\"packed_fetch_fast_hits\":0"));
+        assert!(stderr.contains("\"packed_fetch_bounds_exits\":0"));
+        assert!(stderr.contains("\"packed_fetch_layout_exits\":0"));
+        assert!(stderr.contains("\"packed_foreach_sum_fast_hits\":0"));
+        assert!(stderr.contains("\"packed_foreach_sum_layout_exits\":0"));
+        assert!(stderr.contains("\"packed_foreach_sum_overflow_exits\":0"));
+        assert!(stderr.contains("\"known_call_fast_hits\":0"));
+        assert!(stderr.contains("\"known_call_guard_exits\":0"));
+        assert!(stderr.contains("\"known_call_slow_calls\":0"));
+        assert!(stderr.contains("\"direct_call_hits\":0"));
+        assert!(stderr.contains("\"direct_call_fallbacks\":0"));
+        assert!(stderr.contains("\"property_load_fast_hits\":0"));
+        assert!(stderr.contains("\"property_load_guard_exits\":0"));
+        assert!(stderr.contains("\"property_load_layout_exits\":0"));
+        assert!(stderr.contains("\"property_load_uninitialized_exits\":0"));
+        assert!(stderr.contains("\"property_load_slow_calls\":0"));
+        assert!(stderr.contains("\"string_concat_fast_path_hits\":0"));
+        assert!(stderr.contains("\"string_concat_fast_path_misses\":0"));
+        assert!(stderr.contains("\"overflow_exits\":0"));
+        assert!(stderr.contains("\"slow_path_calls\":0"));
+        assert!(stderr.contains("\"compile_cache_hits\":0"));
+        assert!(stderr.contains("\"compile_cache_misses\":0"));
+        assert!(stderr.contains("\"compile_cache_invalidations\":0"));
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_jit_stats_reports_eligibility_json_for_fixtures() {
+        let fixtures = [
+            (
+                "tests/fixtures/phase7/cranelift/eligibility/eligible-int-leaf.php",
+                "\"candidate_kind\":\"IntLeafCandidate\"",
+            ),
+            (
+                "tests/fixtures/phase7/cranelift/eligibility/rejected-array-op.php",
+                "JIT_ELIGIBILITY_REJECT_ARRAY_OPCODE",
+            ),
+            (
+                "tests/fixtures/phase7/cranelift/eligibility/rejected-call.php",
+                "JIT_ELIGIBILITY_REJECT_CALL_OPCODE",
+            ),
+            (
+                "tests/fixtures/phase7/cranelift/eligibility/rejected-untyped-param.php",
+                "JIT_ELIGIBILITY_REJECT_UNTYPED_PARAM",
+            ),
+        ];
+
+        for (fixture_path, expected_json) in fixtures {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run(
+                [
+                    "run".to_string(),
+                    "--jit=cranelift".to_string(),
+                    "--jit-stats=json".to_string(),
+                    fixture(fixture_path),
+                ],
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(stderr.contains("\"eligibility\":{\"considered\":"));
+            assert!(stderr.contains("\"reports\":["));
+            assert!(stderr.contains(expected_json), "{stderr}");
+        }
     }
 
     #[test]
@@ -1902,6 +2464,7 @@ mod tests {
         assert_eq!(options.quickening, QuickeningMode::Off);
         assert_eq!(options.inline_caches, InlineCacheMode::Off);
         assert_eq!(options.jit, JitMode::Off);
+        assert_eq!(options.jit_blacklist, JitBlacklistMode::On);
         assert!(options.tiering.enabled);
         assert!(!options.tiering.collect_stats);
         assert_eq!(options.tiering_stats_json, None);
@@ -1925,7 +2488,15 @@ mod tests {
             "--opt-level=1".to_string(),
             "--quickening=on".to_string(),
             "--inline-caches=on".to_string(),
-            "--jit=on".to_string(),
+            "--jit=cranelift".to_string(),
+            "--jit-threshold=9".to_string(),
+            "--jit-max-compile-us=1000".to_string(),
+            "--jit-max-functions".to_string(),
+            "2".to_string(),
+            "--jit-eager".to_string(),
+            "--jit-blacklist=off".to_string(),
+            "--jit-dump-clif=target/phase7/cranelift/run.clif".to_string(),
+            "--jit-stats=json".to_string(),
             "--tiering=off".to_string(),
             "--tiering-function-threshold=3".to_string(),
             "--tiering-loop-threshold".to_string(),
@@ -1949,9 +2520,19 @@ mod tests {
         assert_eq!(options.opt_level, OptimizationLevel::O1);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
-        assert_eq!(options.jit, JitMode::On);
+        assert_eq!(options.jit, JitMode::Cranelift);
+        assert_eq!(options.jit_threshold, 1);
+        assert_eq!(options.jit_blacklist, JitBlacklistMode::Off);
+        assert_eq!(
+            options.jit_dump_clif,
+            Some("target/phase7/cranelift/run.clif".to_string())
+        );
+        assert_eq!(options.jit_stats, JitStatsMode::Json);
         assert!(!options.tiering.enabled);
         assert!(options.tiering.collect_stats);
+        assert!(options.tiering.jit_eager);
+        assert_eq!(options.tiering.jit_max_compile_us, 1000);
+        assert_eq!(options.tiering.jit_max_functions, 2);
         assert_eq!(options.tiering.function_entry_threshold, 3);
         assert_eq!(options.tiering.loop_backedge_threshold, 4);
         assert_eq!(options.tiering.ic_stability_threshold, 5);

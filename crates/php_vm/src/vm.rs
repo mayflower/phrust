@@ -4,7 +4,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::compiled_unit::CompiledUnit;
-use crate::counters::VmCounters;
+use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservation, VmCounters};
 use crate::frame::{CallStack, Frame};
 use crate::include::{IncludeLoader, include_path_file_fingerprint};
 use crate::inline_cache::{
@@ -58,7 +58,199 @@ use std::path::{Path, PathBuf};
 
 const MAX_EVAL_DEPTH: usize = 16;
 #[cfg(feature = "jit-cranelift")]
-const JIT_WARMUP_THRESHOLD: u64 = 1;
+const JIT_BLACKLIST_SIDE_EXIT_THRESHOLD: u64 = 2;
+#[cfg(feature = "jit-cranelift")]
+const JIT_BLACKLIST_GUARD_FAILURE_THRESHOLD: u64 = 2;
+#[cfg(feature = "jit-cranelift")]
+const JIT_BLACKLIST_COMPILE_ERROR_THRESHOLD: u64 = 1;
+#[cfg(feature = "jit-cranelift")]
+const JIT_BLACKLIST_ABI_MISMATCH_THRESHOLD: u64 = 1;
+#[cfg(feature = "jit-cranelift")]
+const JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT: i32 = 21;
+#[cfg(feature = "jit-cranelift")]
+const JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT: i32 = 22;
+#[cfg(feature = "jit-cranelift")]
+const JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT: i32 = 23;
+#[cfg(feature = "jit-cranelift")]
+const JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT: i32 = 24;
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_array_len_abi(value_ptr: usize, out: *mut i64) -> i32 {
+    if value_ptr == 0 || out.is_null() {
+        return php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT;
+    }
+    // SAFETY: Cranelift passes a pointer to a `PreparedArg.value` owned by the
+    // active VM call frame and invokes this helper synchronously.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    let mut length = 0_usize;
+    let status = php_runtime::php_jit_array_len(value, &mut length);
+    if status != php_runtime::PHP_JIT_ARRAY_STATUS_OK {
+        return php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT;
+    }
+    let Ok(length) = i64::try_from(length) else {
+        return php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT;
+    };
+    // SAFETY: The pointer was checked for null and points to the native caller's
+    // stack-owned output slot for the duration of this synchronous helper call.
+    unsafe {
+        *out = length;
+    }
+    php_runtime::PHP_JIT_ARRAY_STATUS_OK
+}
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_array_fetch_int_slow_abi(value_ptr: usize, index: i64, out: *mut i64) -> i32 {
+    if value_ptr == 0 || out.is_null() {
+        return php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT;
+    }
+    let Ok(index) = usize::try_from(index) else {
+        return php_runtime::PHP_JIT_ARRAY_STATUS_BOUNDS_EXIT;
+    };
+    // SAFETY: Cranelift passes a pointer to a `PreparedArg.value` owned by the
+    // active VM call frame and invokes this helper synchronously.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    // SAFETY: Native handles allocate the out slot on the Rust stack and pass a
+    // non-null pointer for the duration of this call.
+    let out = unsafe { &mut *out };
+    php_runtime::php_jit_array_fetch_int_slow(value, index, out)
+}
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_strlen_known_abi(value_ptr: usize, out: *mut i64) -> i32 {
+    if value_ptr == 0 || out.is_null() {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    }
+    // SAFETY: Cranelift passes a pointer to a `PreparedArg.value` owned by the
+    // active VM call frame and invokes this helper synchronously.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    let effective = match value {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let Value::String(string) = effective else {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    };
+    let Ok(length) = i64::try_from(string.len()) else {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    };
+    // SAFETY: The pointer was checked for null and points to the native caller's
+    // stack-owned output slot for the duration of this synchronous helper call.
+    unsafe {
+        *out = length;
+    }
+    php_jit::JIT_HELPER_STATUS_OK
+}
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_count_known_abi(value_ptr: usize, out: *mut i64) -> i32 {
+    if value_ptr == 0 || out.is_null() {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    }
+    // SAFETY: Cranelift passes a pointer to a `PreparedArg.value` owned by the
+    // active VM call frame and invokes this helper synchronously.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    let effective = match value {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let Value::Array(array) = effective else {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    };
+    let Ok(length) = i64::try_from(array.len()) else {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    };
+    // SAFETY: The pointer was checked for null and points to the native caller's
+    // stack-owned output slot for the duration of this synchronous helper call.
+    unsafe {
+        *out = length;
+    }
+    php_jit::JIT_HELPER_STATUS_OK
+}
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_concat_string_string_fast(
+    lhs_ptr: usize,
+    rhs_ptr: usize,
+    out: *mut usize,
+) -> i32 {
+    if lhs_ptr == 0 || rhs_ptr == 0 || out.is_null() {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    }
+    // SAFETY: Cranelift passes pointers to `PreparedArg.value` slots owned by
+    // the active VM call frame and invokes this helper synchronously.
+    let lhs = unsafe { &*(lhs_ptr as *const Value) };
+    // SAFETY: Same as above for the right operand.
+    let rhs = unsafe { &*(rhs_ptr as *const Value) };
+    let lhs = match lhs {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let rhs = match rhs {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs) else {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    };
+    let Some(capacity) = lhs.len().checked_add(rhs.len()) else {
+        return php_jit::JIT_HELPER_STATUS_OVERFLOW;
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(capacity).is_err() {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    }
+    bytes.extend_from_slice(lhs.as_bytes());
+    bytes.extend_from_slice(rhs.as_bytes());
+    let result = Box::new(Value::String(PhpString::from_bytes(bytes)));
+    // SAFETY: The out pointer was checked for null and points to the native
+    // caller's stack-owned output slot. The VM reclaims the boxed value
+    // immediately after the native call returns successfully.
+    unsafe {
+        *out = Box::into_raw(result) as usize;
+    }
+    php_jit::JIT_HELPER_STATUS_OK
+}
+
+#[cfg(feature = "jit-cranelift")]
+extern "C" fn jit_property_load_monomorphic_fast(
+    value_ptr: usize,
+    metadata_ptr: usize,
+    out: *mut usize,
+) -> i32 {
+    if value_ptr == 0 || metadata_ptr == 0 || out.is_null() {
+        return php_jit::JIT_HELPER_STATUS_FALLBACK;
+    }
+    // SAFETY: Cranelift passes a pointer to a `PreparedArg.value` owned by the
+    // active VM call frame and invokes this helper synchronously.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    // SAFETY: The VM passes a pointer to the handle-owned metadata for the
+    // duration of this synchronous native invocation.
+    let metadata = unsafe { &*(metadata_ptr as *const php_jit::JitPropertyLoadMetadata) };
+    let effective = match value {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let Value::Object(object) = effective else {
+        return JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT;
+    };
+    if normalize_class_name(&object.class_name()) != metadata.receiver_class {
+        return JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT;
+    }
+    let Some(value) = object.get_property(&metadata.storage_name) else {
+        return JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT;
+    };
+    if value.is_uninitialized() {
+        return JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT;
+    }
+    let result = Box::new(value);
+    // SAFETY: The out pointer was checked for null and points to the native
+    // caller's stack-owned output slot. The VM reclaims the boxed value
+    // immediately after the native call returns successfully.
+    unsafe {
+        *out = Box::into_raw(result) as usize;
+    }
+    php_jit::JIT_HELPER_STATUS_OK
+}
 
 fn output_preallocation_hint(unit: &IrUnit) -> usize {
     unit.functions
@@ -218,6 +410,10 @@ pub struct VmOptions {
     pub inline_caches: InlineCacheMode,
     /// Enable the experimental Phase 7 JIT tier for eligible hot leaf functions.
     pub jit: JitMode,
+    /// Hot-call threshold requested by the CLI for JIT compilation.
+    pub jit_threshold: u64,
+    /// Process-local JIT blacklist policy.
+    pub jit_blacklist: JitBlacklistMode,
     /// Request-local adaptive tiering policy and stats configuration.
     pub tiering: TieringOptions,
     /// Use conservative fast paths for simple runtime type checks.
@@ -239,6 +435,8 @@ impl Default for VmOptions {
             quickening: QuickeningMode::Off,
             inline_caches: InlineCacheMode::Off,
             jit: JitMode::Off,
+            jit_threshold: TieringOptions::default().function_entry_threshold,
+            jit_blacklist: JitBlacklistMode::On,
             tiering: TieringOptions::default(),
             typecheck_fast_paths: true,
             internal_function_dispatch_cache: true,
@@ -252,13 +450,60 @@ pub enum JitMode {
     /// Keep all execution on the interpreter.
     #[default]
     Off,
-    /// Allow feature-gated hot leaf functions to use the JIT tier.
-    On,
+    /// Accept JIT plumbing flags but keep execution on the interpreter.
+    Noop,
+    /// Select the Cranelift backend for reports without enabling PHP-code JIT execution yet.
+    Cranelift,
+    /// Compatibility mode for the pre-addendum `--jit=on` smoke path.
+    #[doc(hidden)]
+    LegacyOn,
 }
 
 impl JitMode {
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    fn enabled(self) -> bool {
+    /// Compatibility alias for pre-addendum Phase 7 scripts and tests.
+    #[allow(non_upper_case_globals)]
+    pub const On: Self = Self::LegacyOn;
+
+    /// Stable report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Noop => "noop",
+            Self::Cranelift | Self::LegacyOn => "cranelift",
+        }
+    }
+
+    /// Returns true when this mode needs the Cranelift feature to have effect.
+    #[must_use]
+    pub const fn requires_cranelift(self) -> bool {
+        matches!(self, Self::Cranelift | Self::LegacyOn)
+    }
+}
+
+/// Process-local JIT blacklist switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JitBlacklistMode {
+    /// Keep attempting eligible regions even after repeated failures.
+    Off,
+    /// Disable unstable regions after deterministic failure thresholds.
+    #[default]
+    On,
+}
+
+impl JitBlacklistMode {
+    /// Stable CLI/report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Returns true when unstable regions should be suppressed.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
 }
@@ -269,16 +514,168 @@ struct JitFunctionKey {
     function: FunctionId,
 }
 
+#[cfg(feature = "jit-cranelift")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct JitCompileCacheKey {
+    function: u32,
+    ir_fingerprint: u64,
+    abi_hash: u64,
+    config_hash: u64,
+    target_isa: String,
+}
+
+#[cfg(feature = "jit-cranelift")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JitCompileCacheEntry {
+    handle: php_jit::JitFunctionHandle,
+    runtime_layout_epoch: u64,
+}
+
+#[cfg(feature = "jit-cranelift")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JitCompileCacheLookup {
+    Hit(php_jit::JitFunctionHandle),
+    Miss,
+    Invalidated,
+}
+
+#[cfg(feature = "jit-cranelift")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JitBlacklistReason {
+    TooManySideExits,
+    GuardFailureRate,
+    CompileErrors,
+    AbiMismatch,
+}
+
+#[cfg(feature = "jit-cranelift")]
+impl JitBlacklistReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooManySideExits => "too_many_side_exits",
+            Self::GuardFailureRate => "guard_failure_rate",
+            Self::CompileErrors => "compile_errors",
+            Self::AbiMismatch => "abi_mismatch",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct JitFunctionState {
     calls: u64,
     compiled: bool,
     disabled: bool,
+    side_exits: u64,
+    guard_failures: u64,
+    compile_errors: u64,
+    abi_mismatches: u64,
+    blacklisted: bool,
+    #[cfg(feature = "jit-cranelift")]
+    blacklist_reason: Option<JitBlacklistReason>,
+    #[cfg(feature = "jit-cranelift")]
+    handle: Option<php_jit::JitFunctionHandle>,
+}
+
+impl JitFunctionState {
+    #[cfg(feature = "jit-cranelift")]
+    fn blacklist(&mut self, reason: JitBlacklistReason) -> bool {
+        if self.blacklisted {
+            return false;
+        }
+        self.blacklisted = true;
+        self.disabled = true;
+        self.blacklist_reason = Some(reason);
+        true
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_compile_error(&mut self) -> Option<JitBlacklistReason> {
+        self.compile_errors = self.compile_errors.saturating_add(1);
+        if self.compile_errors >= JIT_BLACKLIST_COMPILE_ERROR_THRESHOLD
+            && self.blacklist(JitBlacklistReason::CompileErrors)
+        {
+            return Some(JitBlacklistReason::CompileErrors);
+        }
+        None
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_side_exit(&mut self, reason: php_jit::SideExitReason) -> Option<JitBlacklistReason> {
+        self.side_exits = self.side_exits.saturating_add(1);
+        match reason {
+            php_jit::SideExitReason::AbiMismatch => {
+                self.abi_mismatches = self.abi_mismatches.saturating_add(1);
+                if self.abi_mismatches >= JIT_BLACKLIST_ABI_MISMATCH_THRESHOLD
+                    && self.blacklist(JitBlacklistReason::AbiMismatch)
+                {
+                    return Some(JitBlacklistReason::AbiMismatch);
+                }
+            }
+            php_jit::SideExitReason::GuardFailed => {
+                self.guard_failures = self.guard_failures.saturating_add(1);
+                if self.guard_failures >= JIT_BLACKLIST_GUARD_FAILURE_THRESHOLD
+                    && self.blacklist(JitBlacklistReason::GuardFailureRate)
+                {
+                    return Some(JitBlacklistReason::GuardFailureRate);
+                }
+            }
+            _ => {}
+        }
+        if self.side_exits >= JIT_BLACKLIST_SIDE_EXIT_THRESHOLD
+            && self.blacklist(JitBlacklistReason::TooManySideExits)
+        {
+            return Some(JitBlacklistReason::TooManySideExits);
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct JitRuntimeState {
     functions: HashMap<JitFunctionKey, JitFunctionState>,
+    #[cfg(feature = "jit-cranelift")]
+    compile_cache: HashMap<JitCompileCacheKey, JitCompileCacheEntry>,
+}
+
+#[cfg(feature = "jit-cranelift")]
+impl JitRuntimeState {
+    fn lookup_compile_cache(
+        &mut self,
+        key: &JitCompileCacheKey,
+        runtime_layout_epoch: u64,
+    ) -> JitCompileCacheLookup {
+        let Some(entry) = self.compile_cache.get(key) else {
+            return JitCompileCacheLookup::Miss;
+        };
+        if entry.runtime_layout_epoch != runtime_layout_epoch {
+            self.compile_cache.remove(key);
+            return JitCompileCacheLookup::Invalidated;
+        }
+        JitCompileCacheLookup::Hit(entry.handle.clone())
+    }
+
+    fn insert_compile_cache(
+        &mut self,
+        key: JitCompileCacheKey,
+        handle: php_jit::JitFunctionHandle,
+        runtime_layout_epoch: u64,
+    ) {
+        self.compile_cache.insert(
+            key,
+            JitCompileCacheEntry {
+                handle,
+                runtime_layout_epoch,
+            },
+        );
+    }
+
+    fn invalidate_compile_cache_for_function(&mut self, function: FunctionId) -> u64 {
+        let before = self.compile_cache.len();
+        self.compile_cache
+            .retain(|key, _| key.function != function.raw());
+        before.saturating_sub(self.compile_cache.len()) as u64
+    }
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -293,10 +690,24 @@ fn jit_leaf_call_shape_is_supported(
         && !function.flags.is_method
         && !function.flags.is_generator
         && !function.returns_by_ref
-        && function.return_type.is_none()
+        && matches!(
+            function.return_type.as_ref(),
+            None | Some(IrReturnType::Int | IrReturnType::String)
+        )
         && function.captures.is_empty()
         && function.params.iter().all(|param| {
-            !param.by_ref && !param.variadic && param.default.is_none() && param.type_.is_none()
+            !param.by_ref
+                && !param.variadic
+                && param.default.is_none()
+                && matches!(
+                    param.type_.as_ref(),
+                    None | Some(
+                        IrReturnType::Int
+                            | IrReturnType::String
+                            | IrReturnType::Array
+                            | IrReturnType::Class { .. }
+                    )
+                )
         })
         && args.iter().all(|arg| arg.reference.is_none())
 }
@@ -922,7 +1333,11 @@ impl Vm {
         *self.jit.borrow_mut() = JitRuntimeState::default();
         *self.tiering.borrow_mut() = TieringState::new(self.options.tiering.clone());
         self.internal_function_dispatch_cache.borrow_mut().clear();
-        *self.counters.borrow_mut() = self.options.collect_counters.then(VmCounters::default);
+        *self.counters.borrow_mut() = self.options.collect_counters.then(|| {
+            let mut counters = VmCounters::default();
+            counters.set_jit_config(self.options.jit.as_str(), self.options.jit_threshold);
+            counters
+        });
         if self.options.collect_counters {
             php_runtime::numeric_string::reset_cache_and_stats();
         }
@@ -1051,6 +1466,24 @@ impl Vm {
         }
     }
 
+    fn record_counter_property_fetch_profile(&self, observation: PropertyFetchProfileObservation) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_fetch_profile(observation);
+        }
+    }
+
+    fn record_counter_method_call_profile(&self, observation: MethodCallProfileObservation) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_call_profile(observation);
+        }
+    }
+
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     fn record_counter_jit_compile_attempt(&self) {
         if !self.options.collect_counters {
@@ -1069,6 +1502,102 @@ impl Vm {
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_jit_compiled();
         }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_compile_metadata(&self, code_bytes: u64, compile_time_nanos: u64) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_compile_metadata(code_bytes, compile_time_nanos);
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_compile_cache_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_compile_cache_hit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_compile_cache_miss(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_compile_cache_miss();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_compile_cache_invalidations(&self, count: u64) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for _ in 0..count {
+                counters.record_jit_compile_cache_invalidation();
+            }
+        }
+    }
+
+    fn record_counter_jit_tiering_decision(&self, tier: ExecutionTier) {
+        if !self.options.collect_counters || !matches!(self.options.jit, JitMode::Cranelift) {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            match tier {
+                ExecutionTier::Interpreter => counters.record_jit_tiering_cold_function(),
+                ExecutionTier::Jit if self.options.tiering.jit_eager => {
+                    counters.record_jit_tiering_eager_function();
+                }
+                ExecutionTier::Jit => counters.record_jit_tiering_hot_function(),
+                ExecutionTier::Quickened => {}
+            }
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_tiering_blacklist_rejection(&self) {
+        self.tiering.borrow_mut().record_jit_blacklist_rejection();
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_tiering_blacklist_rejection();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_tiering_budget_rejection(&self) {
+        self.tiering
+            .borrow_mut()
+            .record_jit_compile_budget_rejection();
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_tiering_budget_rejection();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn jit_compile_budget_allows_attempt(&self) -> bool {
+        let tiering = self.tiering.borrow();
+        tiering.jit_compiled_functions() < self.options.tiering.jit_max_functions
+            && tiering.jit_compile_budget_used_us() < self.options.tiering.jit_max_compile_us
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_jit_compile_budget_spent(&self, compile_time_nanos: u64) {
+        self.tiering
+            .borrow_mut()
+            .record_jit_compiled_function(compile_time_nanos);
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -1091,6 +1620,288 @@ impl Vm {
         }
     }
 
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_side_exit(&self, reason: php_jit::SideExitReason) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_side_exit(reason.as_str());
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_guard_failure(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_guard_failure();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_blacklisted_region(&self, reason: JitBlacklistReason) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_blacklisted_region(reason.as_str());
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_helper_calls(&self, count: u64) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for _ in 0..count {
+                counters.record_jit_helper_call();
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_fast_path_hits(&self, count: u64) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for _ in 0..count {
+                counters.record_jit_fast_path_hit();
+            }
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_jit_overflow_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_overflow_exit();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_slow_path_call(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_slow_path_call();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_fetch_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_fetch_fast_hit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_fetch_bounds_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_fetch_bounds_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_fetch_layout_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_fetch_layout_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_foreach_sum_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_foreach_sum_fast_hit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_foreach_sum_layout_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_foreach_sum_layout_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_packed_foreach_sum_overflow_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_foreach_sum_overflow_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_known_call_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_known_call_fast_hit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_known_call_guard_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_known_call_guard_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_known_call_slow_call(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_known_call_slow_call();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_direct_call_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_direct_call_hit();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_direct_call_fallback(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_direct_call_fallback();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_property_load_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_load_fast_hit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_property_load_guard_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_load_guard_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_property_load_layout_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_load_layout_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_property_load_uninitialized_exit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_load_uninitialized_exit();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_counter_property_load_slow_call(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_load_slow_call();
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_jit_compile_failure_for_key(&self, key: JitFunctionKey) {
+        if !self.options.jit_blacklist.enabled() {
+            return;
+        }
+        let (blacklist_reason, invalidations) = {
+            let mut jit = self.jit.borrow_mut();
+            let entry = jit.functions.entry(key).or_default();
+            let reason = entry.record_compile_error();
+            let invalidations = if reason.is_some() {
+                jit.invalidate_compile_cache_for_function(key.function)
+            } else {
+                0
+            };
+            (reason, invalidations)
+        };
+        self.record_counter_jit_compile_cache_invalidations(invalidations);
+        if let Some(reason) = blacklist_reason {
+            self.record_counter_jit_blacklisted_region(reason);
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn record_jit_side_exit_for_key(&self, key: JitFunctionKey, side_exit: php_jit::JitSideExit) {
+        self.record_counter_jit_side_exit(side_exit.reason);
+        if side_exit.reason == php_jit::SideExitReason::GuardFailed {
+            self.record_counter_jit_guard_failure();
+        }
+        if !self.options.jit_blacklist.enabled() {
+            return;
+        }
+        let (blacklist_reason, invalidations) = {
+            let mut jit = self.jit.borrow_mut();
+            let entry = jit.functions.entry(key).or_default();
+            let reason = entry.record_side_exit(side_exit.reason);
+            let invalidations = if reason.is_some() {
+                jit.invalidate_compile_cache_for_function(key.function)
+            } else {
+                0
+            };
+            (reason, invalidations)
+        };
+        self.record_counter_jit_compile_cache_invalidations(invalidations);
+        if let Some(reason) = blacklist_reason {
+            self.record_counter_jit_blacklisted_region(reason);
+        }
+    }
+
     fn record_inline_cache_event(&self, observation: InlineCacheObservation) {
         self.record_counter_inline_cache(observation);
     }
@@ -1103,7 +1914,10 @@ impl Vm {
         instruction_id: php_ir::ids::InstrId,
         kind: &InstructionKind,
     ) {
-        if !self.options.tiering.enabled || !self.options.inline_caches.enabled() {
+        if !self.options.tiering.enabled
+            || (!self.options.inline_caches.enabled()
+                && !self.cranelift_method_direct_call_path_enabled(kind))
+        {
             return;
         }
         let Some(cache_kind) = crate::inline_cache::inline_cache_kind_for_instruction(kind) else {
@@ -1117,6 +1931,15 @@ impl Vm {
             cache_kind,
         );
         self.record_counter_inline_cache(observation);
+    }
+
+    fn cranelift_method_direct_call_path_enabled(&self, kind: &InstructionKind) -> bool {
+        matches!(self.options.jit, JitMode::Cranelift)
+            && matches!(kind, InstructionKind::CallMethod { .. })
+    }
+
+    fn method_call_inline_cache_enabled(&self) -> bool {
+        self.options.inline_caches.enabled() || matches!(self.options.jit, JitMode::Cranelift)
     }
 
     fn lookup_function_call_inline_cache(
@@ -1177,9 +2000,12 @@ impl Vm {
         receiver_class: &str,
         scope: Option<&str>,
         epoch: InvalidationEpoch,
-    ) -> Option<MethodCallCacheTarget> {
-        if !self.options.inline_caches.enabled() {
-            return None;
+    ) -> (
+        Option<MethodCallCacheTarget>,
+        Option<InlineCacheObservation>,
+    ) {
+        if !self.method_call_inline_cache_enabled() {
+            return (None, None);
         }
         let (target, observation) = self.inline_caches.borrow_mut().lookup_method_call(
             compiled_unit_cache_key(compiled),
@@ -1192,7 +2018,7 @@ impl Vm {
             epoch,
         );
         self.record_inline_cache_event(observation);
-        target
+        (target, Some(observation))
     }
 
     fn install_method_call_inline_cache(
@@ -1207,7 +2033,7 @@ impl Vm {
         epoch: InvalidationEpoch,
         target: MethodCallCacheTarget,
     ) {
-        if !self.options.inline_caches.enabled() {
+        if !self.method_call_inline_cache_enabled() {
             return;
         }
         self.inline_caches.borrow_mut().install_method_call(
@@ -1951,6 +2777,7 @@ impl Vm {
     fn try_execute_jit_leaf(
         &self,
         _compiled: &CompiledUnit,
+        _state: &ExecutionState,
         _function_id: FunctionId,
         _function: &IrFunction,
         _tier: ExecutionTier,
@@ -1964,6 +2791,7 @@ impl Vm {
     fn try_execute_jit_leaf(
         &self,
         compiled: &CompiledUnit,
+        state: &ExecutionState,
         function_id: FunctionId,
         function: &IrFunction,
         tier: ExecutionTier,
@@ -1972,12 +2800,452 @@ impl Vm {
     ) -> Option<Value> {
         if tier != ExecutionTier::Jit
             || !self.options.tiering.enabled
-            || !self.options.jit.enabled()
             || !jit_leaf_call_shape_is_supported(function, call_shape_supported, args)
         {
             return None;
         }
+        match self.options.jit {
+            JitMode::LegacyOn => {
+                return self.try_execute_legacy_jit_leaf(compiled, function_id, function, args);
+            }
+            JitMode::Cranelift => {}
+            JitMode::Off | JitMode::Noop => return None,
+        }
 
+        let key = JitFunctionKey {
+            unit: compiled_unit_cache_key(compiled),
+            function: function_id,
+        };
+        let cache_key = jit_compile_cache_key(function_id, function, &self.options);
+        let runtime_layout_epoch = state.lookup_epoch().raw();
+        {
+            let mut jit = self.jit.borrow_mut();
+            let entry = jit.functions.entry(key).or_default();
+            if (self.options.jit_blacklist.enabled() && entry.blacklisted) || entry.disabled {
+                self.record_counter_jit_tiering_blacklist_rejection();
+                return None;
+            }
+            entry.calls = entry.calls.saturating_add(1);
+        }
+
+        let cache_lookup = self
+            .jit
+            .borrow_mut()
+            .lookup_compile_cache(&cache_key, runtime_layout_epoch);
+        let handle = match cache_lookup {
+            JitCompileCacheLookup::Hit(handle) => {
+                self.record_counter_jit_compile_cache_hit();
+                if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
+                    entry.compiled = true;
+                    entry.handle = Some(handle.clone());
+                }
+                handle
+            }
+            JitCompileCacheLookup::Invalidated => {
+                self.record_counter_jit_compile_cache_invalidations(1);
+                self.record_counter_jit_compile_cache_miss();
+                if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
+                    entry.compiled = false;
+                    entry.handle = None;
+                }
+                self.compile_cranelift_jit_leaf(
+                    compiled,
+                    function_id,
+                    function,
+                    key,
+                    cache_key,
+                    runtime_layout_epoch,
+                )?
+            }
+            JitCompileCacheLookup::Miss => {
+                self.record_counter_jit_compile_cache_miss();
+                self.compile_cranelift_jit_leaf(
+                    compiled,
+                    function_id,
+                    function,
+                    key,
+                    cache_key,
+                    runtime_layout_epoch,
+                )?
+            }
+        };
+
+        if handle.expects_value_metadata() {
+            let [object_arg] = args else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                self.record_counter_property_load_guard_exit();
+                self.record_counter_property_load_slow_call();
+                return None;
+            };
+            let Some(metadata) = handle.property_load_metadata() else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::GuardFailed),
+                );
+                self.record_counter_jit_guard_failure();
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                self.record_counter_property_load_guard_exit();
+                self.record_counter_property_load_slow_call();
+                return None;
+            };
+            if let Some(status) =
+                property_load_pre_guard_status(compiled, state, &object_arg.value, metadata)
+            {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::GuardFailed)
+                        .with_status(status),
+                );
+                self.record_counter_jit_guard_failure();
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                self.record_counter_property_load_guard_exit();
+                self.record_counter_property_load_slow_call();
+                if status == JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT {
+                    self.record_counter_property_load_layout_exit();
+                }
+                return None;
+            }
+            let value_ptr = &object_arg.value as *const Value as usize;
+            let metadata_ptr = metadata as *const php_jit::JitPropertyLoadMetadata as usize;
+            match handle.invoke_value_metadata(
+                value_ptr,
+                metadata_ptr,
+                php_jit::JIT_RUNTIME_ABI_HASH,
+            ) {
+                Ok(value_ptr) if value_ptr != 0 => {
+                    // SAFETY: Successful property-load helpers return a pointer
+                    // created with `Box::into_raw(Box<Value>)` specifically for
+                    // this synchronous VM call.
+                    let value = unsafe { *Box::from_raw(value_ptr as *mut Value) };
+                    self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
+                    self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                    self.record_counter_property_load_fast_hit();
+                    self.record_counter_jit_executed();
+                    return Some(value);
+                }
+                Ok(_) => {
+                    self.record_jit_side_exit_for_key(
+                        key,
+                        php_jit::JitSideExit::new(php_jit::SideExitReason::HelperStatus),
+                    );
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    self.record_counter_property_load_guard_exit();
+                    self.record_counter_property_load_slow_call();
+                    return None;
+                }
+                Err(error) => {
+                    let status = error.native_status();
+                    let side_exit = match status {
+                        Some(
+                            JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT
+                            | JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT
+                            | JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT
+                            | JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT,
+                        ) => php_jit::JitSideExit::new(php_jit::SideExitReason::GuardFailed)
+                            .with_status(status.unwrap()),
+                        _ => error.side_exit(),
+                    };
+                    self.record_jit_side_exit_for_key(key, side_exit);
+                    self.record_counter_jit_guard_failure();
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    self.record_counter_property_load_guard_exit();
+                    self.record_counter_property_load_slow_call();
+                    if status == Some(JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT) {
+                        self.record_counter_property_load_layout_exit();
+                    }
+                    if status == Some(JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT) {
+                        self.record_counter_property_load_uninitialized_exit();
+                    }
+                    return None;
+                }
+            }
+        }
+
+        if handle.expects_value() {
+            let [array_arg] = args else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                return None;
+            };
+            let value_ptr = &array_arg.value as *const Value as usize;
+            match handle.invoke_value(value_ptr, php_jit::JIT_RUNTIME_ABI_HASH) {
+                Ok(value) => {
+                    self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
+                    self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                    match handle.specialization() {
+                        php_jit::JitNativeSpecialization::PackedForeachIntSum => {
+                            self.record_counter_packed_foreach_sum_fast_hit();
+                        }
+                        php_jit::JitNativeSpecialization::KnownCallStrlen
+                        | php_jit::JitNativeSpecialization::KnownCallCount => {
+                            self.record_counter_known_call_fast_hit();
+                        }
+                        php_jit::JitNativeSpecialization::StringConcat => {}
+                        php_jit::JitNativeSpecialization::PropertyLoad => {}
+                        php_jit::JitNativeSpecialization::Generic => {}
+                    }
+                    self.record_counter_jit_executed();
+                    return Some(Value::Int(value));
+                }
+                Err(error) => {
+                    let side_exit = error.side_exit();
+                    match handle.specialization() {
+                        php_jit::JitNativeSpecialization::PackedForeachIntSum => {
+                            match error.native_status() {
+                                Some(status) if status == php_jit::JIT_HELPER_STATUS_OVERFLOW => {
+                                    self.record_counter_jit_overflow_exit();
+                                    self.record_counter_packed_foreach_sum_overflow_exit();
+                                }
+                                Some(status)
+                                    if status == php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT
+                                        || status == php_runtime::PHP_JIT_ARRAY_STATUS_FALLBACK =>
+                                {
+                                    self.record_counter_packed_foreach_sum_layout_exit();
+                                }
+                                _ => {}
+                            }
+                        }
+                        php_jit::JitNativeSpecialization::KnownCallStrlen
+                        | php_jit::JitNativeSpecialization::KnownCallCount => {
+                            self.record_counter_known_call_guard_exit();
+                            self.record_counter_known_call_slow_call();
+                        }
+                        php_jit::JitNativeSpecialization::StringConcat => {}
+                        php_jit::JitNativeSpecialization::PropertyLoad => {}
+                        php_jit::JitNativeSpecialization::Generic => {}
+                    }
+                    self.record_jit_side_exit_for_key(key, side_exit);
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    return None;
+                }
+            }
+        }
+
+        if handle.expects_value_value() {
+            let [lhs_arg, rhs_arg] = args else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                self.record_counter_string_concat_fast_path(false);
+                return None;
+            };
+            let lhs_ptr = &lhs_arg.value as *const Value as usize;
+            let rhs_ptr = &rhs_arg.value as *const Value as usize;
+            match handle.invoke_value_value(lhs_ptr, rhs_ptr, php_jit::JIT_RUNTIME_ABI_HASH) {
+                Ok(value_ptr) if value_ptr != 0 => {
+                    // SAFETY: Successful string-concat helpers return a pointer
+                    // created with `Box::into_raw(Box<Value>)` specifically for
+                    // this synchronous VM call.
+                    let value = unsafe { *Box::from_raw(value_ptr as *mut Value) };
+                    self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
+                    self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                    self.record_counter_string_concat_fast_path(true);
+                    self.record_counter_jit_executed();
+                    return Some(value);
+                }
+                Ok(_) => {
+                    self.record_jit_side_exit_for_key(
+                        key,
+                        php_jit::JitSideExit::new(php_jit::SideExitReason::HelperStatus),
+                    );
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    self.record_counter_string_concat_fast_path(false);
+                    return None;
+                }
+                Err(error) => {
+                    let side_exit = error.side_exit();
+                    self.record_jit_side_exit_for_key(key, side_exit);
+                    if matches!(
+                        error.native_status(),
+                        Some(status) if status == php_jit::JIT_HELPER_STATUS_OVERFLOW
+                    ) {
+                        self.record_counter_jit_overflow_exit();
+                    }
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    self.record_counter_string_concat_fast_path(false);
+                    return None;
+                }
+            }
+        }
+
+        if handle.expects_value_i64() {
+            let [array_arg, index_arg] = args else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                return None;
+            };
+            let Value::Int(index) = index_arg.value else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                return None;
+            };
+            let value_ptr = &array_arg.value as *const Value as usize;
+            match handle.invoke_value_i64(value_ptr, index, php_jit::JIT_RUNTIME_ABI_HASH) {
+                Ok(value) => {
+                    self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
+                    self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                    self.record_counter_packed_fetch_fast_hit();
+                    self.record_counter_jit_executed();
+                    return Some(Value::Int(value));
+                }
+                Err(error) => {
+                    let mut side_exit = error.side_exit();
+                    match error.native_status() {
+                        Some(status) if status == php_runtime::PHP_JIT_ARRAY_STATUS_BOUNDS_EXIT => {
+                            self.record_counter_packed_fetch_bounds_exit();
+                            side_exit =
+                                php_jit::JitSideExit::new(php_jit::SideExitReason::HelperStatus)
+                                    .with_status(status);
+                        }
+                        Some(status) if status == php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT => {
+                            self.record_counter_packed_fetch_layout_exit();
+                        }
+                        _ => {}
+                    }
+                    self.record_jit_side_exit_for_key(key, side_exit);
+                    self.record_counter_jit_bailout();
+                    self.record_counter_jit_slow_path_call();
+                    return None;
+                }
+            }
+        }
+
+        let native_args = match args
+            .iter()
+            .map(|arg| value_as_jit_int(&arg.value))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(args) => args,
+            Err(()) => {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                return None;
+            }
+        };
+        match handle.invoke_i64(&native_args, php_jit::JIT_RUNTIME_ABI_HASH) {
+            Ok(value) => {
+                self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
+                self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                self.record_counter_jit_executed();
+                Some(Value::Int(value))
+            }
+            Err(error) => {
+                let side_exit = error.side_exit();
+                if side_exit.reason == php_jit::SideExitReason::Overflow {
+                    self.record_counter_jit_overflow_exit();
+                }
+                self.record_jit_side_exit_for_key(key, side_exit);
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn compile_cranelift_jit_leaf(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        function: &IrFunction,
+        key: JitFunctionKey,
+        cache_key: JitCompileCacheKey,
+        runtime_layout_epoch: u64,
+    ) -> Option<php_jit::JitFunctionHandle> {
+        if !self.jit_compile_budget_allows_attempt() {
+            self.record_counter_jit_tiering_budget_rejection();
+            return None;
+        }
+        self.record_counter_jit_compile_attempt();
+        let mut engine = php_jit::JitEngine::with_options(php_jit::JitOptions {
+            enabled: true,
+            allow_native_execution: true,
+        });
+        let compile_result = engine.compile_function_with_runtime_helpers(
+            compiled.unit(),
+            function_id,
+            php_jit::JitCompileRequest::new(format!("function.{}", function.name))
+                .with_function_name(function.name.clone())
+                .with_ir_fingerprint(format!("{:016x}", cache_key.ir_fingerprint)),
+            php_jit::JitRuntimeHelperAddresses {
+                packed_array_len: jit_array_len_abi as *const () as usize,
+                packed_array_fetch_int_slow: jit_array_fetch_int_slow_abi as *const () as usize,
+                known_strlen: jit_strlen_known_abi as *const () as usize,
+                known_count: jit_count_known_abi as *const () as usize,
+                string_concat: jit_concat_string_string_fast as *const () as usize,
+                property_load: jit_property_load_monomorphic_fast as *const () as usize,
+            },
+        );
+        match compile_result {
+            Ok(result) if result.status == php_jit::JitCompileStatus::Compiled => {
+                let Some(handle) = result.handle else {
+                    self.record_jit_compile_failure_for_key(key);
+                    self.record_counter_jit_bailout();
+                    return None;
+                };
+                {
+                    let mut jit = self.jit.borrow_mut();
+                    if let Some(entry) = jit.functions.get_mut(&key) {
+                        entry.compiled = true;
+                        entry.handle = Some(handle.clone());
+                    }
+                    jit.insert_compile_cache(cache_key, handle.clone(), runtime_layout_epoch);
+                }
+                self.record_counter_jit_compiled();
+                self.record_counter_jit_compile_metadata(
+                    result.stats.native_code_bytes,
+                    result.stats.native_compile_time_nanos,
+                );
+                self.record_jit_compile_budget_spent(result.stats.native_compile_time_nanos);
+                Some(handle)
+            }
+            Ok(_) | Err(_) => {
+                self.record_jit_compile_failure_for_key(key);
+                self.record_counter_jit_bailout();
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn try_execute_legacy_jit_leaf(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        function: &IrFunction,
+        args: &[PreparedArg],
+    ) -> Option<Value> {
         let key = JitFunctionKey {
             unit: compiled_unit_cache_key(compiled),
             function: function_id,
@@ -1986,16 +3254,18 @@ impl Vm {
             let mut jit = self.jit.borrow_mut();
             let entry = jit.functions.entry(key).or_default();
             if entry.disabled {
+                self.record_counter_jit_tiering_blacklist_rejection();
                 return None;
             }
             entry.calls = entry.calls.saturating_add(1);
-            if entry.calls < JIT_WARMUP_THRESHOLD {
-                return None;
-            }
             !entry.compiled
         };
 
         if should_compile {
+            if !self.jit_compile_budget_allows_attempt() {
+                self.record_counter_jit_tiering_budget_rejection();
+                return None;
+            }
             self.record_counter_jit_compile_attempt();
             match php_jit::lower_function_to_cranelift(compiled.unit(), function_id) {
                 Ok(_) => {
@@ -2003,6 +3273,7 @@ impl Vm {
                         entry.compiled = true;
                     }
                     self.record_counter_jit_compiled();
+                    self.record_jit_compile_budget_spent(0);
                 }
                 Err(_) => {
                     if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
@@ -2044,6 +3315,7 @@ impl Vm {
             self.options.quickening,
             self.options.jit,
         );
+        self.record_counter_jit_tiering_decision(function_tier);
         let mut diagnostics = Vec::new();
         let mut block_id;
         let mut start_instruction_index = 0usize;
@@ -2174,6 +3446,7 @@ impl Vm {
             }
             if let Some(value) = self.try_execute_jit_leaf(
                 compiled,
+                state,
                 function_id,
                 function,
                 function_tier,
@@ -3550,6 +4823,13 @@ impl Vm {
                         let normalized_scope = scope.as_deref().map(normalize_class_name);
                         let receiver_class = normalize_class_name(&object.class_name());
                         let lookup_epoch = state.lookup_epoch();
+                        let property_callsite = property_fetch_callsite(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                        );
+                        let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
                         if let Some(target) = self.lookup_property_fetch_inline_cache(
                             compiled,
                             function_id,
@@ -3590,6 +4870,23 @@ impl Vm {
                             Ok(Some(resolved)) => resolved,
                             Ok(None) => {
                                 if let Some(value) = object.get_property(property) {
+                                    self.record_counter_property_fetch_profile(
+                                        property_fetch_profile_observation(
+                                            &property_callsite,
+                                            property,
+                                            &receiver_class,
+                                            &class,
+                                            None,
+                                            normalized_scope.as_deref(),
+                                            lookup_epoch,
+                                            receiver_has_magic_get,
+                                            false,
+                                            true,
+                                            false,
+                                            false,
+                                            Vec::new(),
+                                        ),
+                                    );
                                     if let Err(message) = stack
                                         .current_mut()
                                         .expect("frame was pushed")
@@ -3601,6 +4898,23 @@ impl Vm {
                                     }
                                     continue;
                                 }
+                                self.record_counter_property_fetch_profile(
+                                    property_fetch_profile_observation(
+                                        &property_callsite,
+                                        property,
+                                        &receiver_class,
+                                        &class,
+                                        None,
+                                        normalized_scope.as_deref(),
+                                        lookup_epoch,
+                                        receiver_has_magic_get,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                        Vec::new(),
+                                    ),
+                                );
                                 match self.call_magic_property_method(
                                     compiled,
                                     object.clone(),
@@ -3659,6 +4973,28 @@ impl Vm {
                             resolved.class,
                             resolved.property,
                         ) {
+                            self.record_counter_property_fetch_profile(
+                                property_fetch_profile_observation(
+                                    &property_callsite,
+                                    property,
+                                    &receiver_class,
+                                    &class,
+                                    Some((resolved.class, resolved.property)),
+                                    normalized_scope.as_deref(),
+                                    lookup_epoch,
+                                    receiver_has_magic_get,
+                                    property_has_hooks_or_active(
+                                        state,
+                                        &object,
+                                        resolved.class,
+                                        resolved.property,
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                    vec!["not_visible"],
+                                ),
+                            );
                             match self.call_magic_property_method(
                                 compiled,
                                 object.clone(),
@@ -3689,6 +5025,12 @@ impl Vm {
                                 Err(result) => return result,
                             }
                         }
+                        let resolved_has_property_hook = property_has_hooks_or_active(
+                            state,
+                            &object,
+                            resolved.class,
+                            resolved.property,
+                        );
                         if !property_hook_is_active(
                             state,
                             &object,
@@ -3696,6 +5038,23 @@ impl Vm {
                             resolved.property,
                         ) && let Some(function) = resolved.property.hooks.get
                         {
+                            self.record_counter_property_fetch_profile(
+                                property_fetch_profile_observation(
+                                    &property_callsite,
+                                    property,
+                                    &receiver_class,
+                                    &class,
+                                    Some((resolved.class, resolved.property)),
+                                    normalized_scope.as_deref(),
+                                    lookup_epoch,
+                                    receiver_has_magic_get,
+                                    resolved_has_property_hook,
+                                    false,
+                                    true,
+                                    false,
+                                    Vec::new(),
+                                ),
+                            );
                             match self.call_property_hook(
                                 compiled,
                                 object.clone(),
@@ -3738,6 +5097,23 @@ impl Vm {
                             }
                         };
                         if matches!(value, Value::Uninitialized) {
+                            self.record_counter_property_fetch_profile(
+                                property_fetch_profile_observation(
+                                    &property_callsite,
+                                    property,
+                                    &receiver_class,
+                                    &class,
+                                    Some((resolved.class, resolved.property)),
+                                    normalized_scope.as_deref(),
+                                    lookup_epoch,
+                                    receiver_has_magic_get,
+                                    resolved_has_property_hook,
+                                    false,
+                                    true,
+                                    true,
+                                    Vec::new(),
+                                ),
+                            );
                             return self.runtime_error(
                                 output,
                                 compiled,
@@ -3748,6 +5124,23 @@ impl Vm {
                                 ),
                             );
                         }
+                        self.record_counter_property_fetch_profile(
+                            property_fetch_profile_observation(
+                                &property_callsite,
+                                property,
+                                &receiver_class,
+                                &class,
+                                Some((resolved.class, resolved.property)),
+                                normalized_scope.as_deref(),
+                                lookup_epoch,
+                                receiver_has_magic_get,
+                                resolved_has_property_hook,
+                                false,
+                                true,
+                                false,
+                                Vec::new(),
+                            ),
+                        );
                         if !resolved.property.flags.is_static
                             && !resolved.property.flags.is_protected
                             && resolved.property.hooks.get.is_none()
@@ -5851,57 +7244,8 @@ impl Vm {
                         let lowered_method = normalize_method_name(method);
                         let scope = current_scope_class(compiled, stack);
                         let epoch = state.lookup_epoch();
-                        if let Some(target) = self.lookup_method_call_inline_cache(
-                            compiled,
-                            function_id,
-                            block_id,
-                            instruction.id,
-                            &lowered_method,
-                            &receiver_class,
-                            scope.as_deref(),
-                            epoch,
-                        ) {
-                            let result = self.execute_method_call_target(
-                                compiled,
-                                target,
-                                object.clone(),
-                                values,
-                                output,
-                                stack,
-                                state,
-                                &running_fiber,
-                            );
-                            if !result.status.is_success() {
-                                return result;
-                            }
-                            if result.fiber_suspension.is_some() {
-                                return self.propagate_fiber_suspension(
-                                    result,
-                                    compiled,
-                                    *dst,
-                                    block_id,
-                                    instruction_index + 1,
-                                    &foreach_iterators,
-                                    &exception_handlers,
-                                    &pending_control,
-                                    output,
-                                    stack,
-                                );
-                            }
-                            diagnostics.extend(result.diagnostics);
-                            let return_value = result.return_value.unwrap_or(Value::Null);
-                            if let Err(message) = stack
-                                .current_mut()
-                                .expect("caller frame is active")
-                                .registers
-                                .set(*dst, return_value)
-                            {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                            continue;
-                        }
-                        let dynamic_owner = dynamic_owner_index
-                            .and_then(|unit_index| state.dynamic_units.get(unit_index).cloned());
+                        let method_callsite =
+                            method_call_callsite(compiled, function_id, block_id, instruction.id);
                         let class =
                             match lookup_class_in_state(compiled, state, &object.class_name()) {
                                 Some(class) => class,
@@ -5917,6 +7261,80 @@ impl Vm {
                                     );
                                 }
                             };
+                        let (cached_target, cache_observation) = self
+                            .lookup_method_call_inline_cache(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                &lowered_method,
+                                &receiver_class,
+                                scope.as_deref(),
+                                epoch,
+                            );
+                        if let Some(target) = cached_target {
+                            if !matches!(self.options.jit, JitMode::Cranelift)
+                                || method_direct_call_target_is_eligible(
+                                    compiled,
+                                    state,
+                                    &target,
+                                    &class,
+                                    &receiver_class,
+                                    args,
+                                )
+                            {
+                                if matches!(self.options.jit, JitMode::Cranelift) {
+                                    self.record_counter_direct_call_hit();
+                                }
+                                let result = self.execute_method_call_target(
+                                    compiled,
+                                    target,
+                                    object.clone(),
+                                    values,
+                                    output,
+                                    stack,
+                                    state,
+                                    &running_fiber,
+                                );
+                                if !result.status.is_success() {
+                                    return result;
+                                }
+                                if result.fiber_suspension.is_some() {
+                                    return self.propagate_fiber_suspension(
+                                        result,
+                                        compiled,
+                                        *dst,
+                                        block_id,
+                                        instruction_index + 1,
+                                        &foreach_iterators,
+                                        &exception_handlers,
+                                        &pending_control,
+                                        output,
+                                        stack,
+                                    );
+                                }
+                                diagnostics.extend(result.diagnostics);
+                                let return_value = result.return_value.unwrap_or(Value::Null);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, return_value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            if matches!(self.options.jit, JitMode::Cranelift) {
+                                self.record_counter_direct_call_fallback();
+                            }
+                        } else if cache_observation.is_some()
+                            && matches!(self.options.jit, JitMode::Cranelift)
+                        {
+                            self.record_counter_direct_call_fallback();
+                        }
+                        let dynamic_owner = dynamic_owner_index
+                            .and_then(|unit_index| state.dynamic_units.get(unit_index).cloned());
                         let class_owner = dynamic_owner.unwrap_or_else(|| compiled.clone());
                         let resolved = match lookup_method_in_hierarchy(
                             &class_owner,
@@ -5926,6 +7344,24 @@ impl Vm {
                         ) {
                             Ok(Some(method)) => method,
                             Ok(None) => {
+                                self.record_counter_method_call_profile(
+                                    method_call_profile_observation(
+                                        &method_callsite,
+                                        &lowered_method,
+                                        &receiver_class,
+                                        &class,
+                                        None,
+                                        scope.as_deref(),
+                                        epoch,
+                                        class_has_public_magic_call(&class_owner, &class),
+                                        true,
+                                        method_call_args_are_simple_positional(args),
+                                        method_call_has_by_ref_argument(args, None, None),
+                                        false,
+                                        false,
+                                        vec!["missing_declared_method"],
+                                    ),
+                                );
                                 let result = match self.call_magic_instance_method(
                                     compiled,
                                     object.clone(),
@@ -5972,7 +7408,37 @@ impl Vm {
                         };
                         let method_entry = resolved.method;
                         let declaring_class = resolved.class;
+                        let simple_positional_arguments =
+                            method_call_args_are_simple_positional(args);
+                        let has_by_ref_argument = method_call_has_by_ref_argument(
+                            args,
+                            Some(&class_owner),
+                            Some(method_entry.function),
+                        );
+                        let callee_jit_eligible = method_callee_shape_is_jit_eligible(
+                            &class_owner,
+                            method_entry.function,
+                        );
+                        let has_magic_call = class_has_public_magic_call(&class_owner, &class);
                         if method_entry.flags.is_static {
+                            self.record_counter_method_call_profile(
+                                method_call_profile_observation(
+                                    &method_callsite,
+                                    &lowered_method,
+                                    &receiver_class,
+                                    &class,
+                                    Some((&class_owner, declaring_class, method_entry)),
+                                    scope.as_deref(),
+                                    epoch,
+                                    has_magic_call,
+                                    false,
+                                    simple_positional_arguments,
+                                    has_by_ref_argument,
+                                    callee_jit_eligible,
+                                    false,
+                                    vec!["static_method"],
+                                ),
+                            );
                             return self.runtime_error(
                                 output,
                                 compiled,
@@ -5983,6 +7449,22 @@ impl Vm {
                                 ),
                             );
                         }
+                        self.record_counter_method_call_profile(method_call_profile_observation(
+                            &method_callsite,
+                            &lowered_method,
+                            &receiver_class,
+                            &class,
+                            Some((&class_owner, declaring_class, method_entry)),
+                            scope.as_deref(),
+                            epoch,
+                            has_magic_call,
+                            false,
+                            simple_positional_arguments,
+                            has_by_ref_argument,
+                            callee_jit_eligible,
+                            false,
+                            Vec::new(),
+                        ));
                         if let Err(message) = validate_method_callable(
                             &class_owner,
                             stack,
@@ -6027,27 +7509,38 @@ impl Vm {
                         let target = dynamic_owner_index.map_or_else(
                             || MethodCallCacheTarget::CurrentUnit {
                                 receiver_class: receiver_class.clone(),
+                                receiver_class_id: class.id.raw(),
                                 declaring_class: declaring_class.name.clone(),
                                 function: method_entry.function,
                             },
                             |unit_index| MethodCallCacheTarget::DynamicUnit {
                                 unit_index,
                                 receiver_class: receiver_class.clone(),
+                                receiver_class_id: class.id.raw(),
                                 declaring_class: declaring_class.name.clone(),
                                 function: method_entry.function,
                             },
                         );
-                        self.install_method_call_inline_cache(
-                            compiled,
-                            function_id,
-                            block_id,
-                            instruction.id,
-                            &lowered_method,
-                            &receiver_class,
-                            scope.as_deref(),
-                            epoch,
-                            target,
-                        );
+                        let direct_call_cacheable = simple_positional_arguments
+                            && !has_by_ref_argument
+                            && !has_magic_call
+                            && !method_entry.flags.is_static;
+                        if self.options.inline_caches.enabled()
+                            || !matches!(self.options.jit, JitMode::Cranelift)
+                            || direct_call_cacheable
+                        {
+                            self.install_method_call_inline_cache(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                &lowered_method,
+                                &receiver_class,
+                                scope.as_deref(),
+                                epoch,
+                                target,
+                            );
+                        }
                         let result = self.execute_function(
                             &class_owner,
                             method_entry.function,
@@ -8692,12 +10185,14 @@ impl Vm {
         let (owner, declaring_class_name, function) = match target {
             MethodCallCacheTarget::CurrentUnit {
                 receiver_class: _,
+                receiver_class_id: _,
                 declaring_class,
                 function,
             } => (compiled.clone(), declaring_class, function),
             MethodCallCacheTarget::DynamicUnit {
                 unit_index,
                 receiver_class: _,
+                receiver_class_id: _,
                 declaring_class,
                 function,
             } => {
@@ -12639,6 +14134,46 @@ fn compiled_unit_cache_key(compiled: &CompiledUnit) -> u64 {
     std::ptr::from_ref(compiled.unit()) as usize as u64
 }
 
+#[cfg(feature = "jit-cranelift")]
+fn jit_compile_cache_key(
+    function_id: FunctionId,
+    function: &IrFunction,
+    options: &VmOptions,
+) -> JitCompileCacheKey {
+    JitCompileCacheKey {
+        function: function_id.raw(),
+        ir_fingerprint: stable_hash_bytes(format!("{function:?}").as_bytes()),
+        abi_hash: php_jit::JIT_RUNTIME_ABI_HASH,
+        config_hash: jit_config_hash(options),
+        target_isa: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn jit_config_hash(options: &VmOptions) -> u64 {
+    let config = format!(
+        "jit={};quickening={};inline_caches={};blacklist={};typecheck={};threshold={};loop_threshold={}",
+        options.jit.as_str(),
+        options.quickening.enabled(),
+        options.inline_caches.enabled(),
+        options.jit_blacklist.as_str(),
+        options.typecheck_fast_paths,
+        options.tiering.function_entry_threshold,
+        options.tiering.loop_backedge_threshold
+    );
+    stable_hash_bytes(config.as_bytes())
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn stable_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn reflection_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
         name: name.to_owned(),
@@ -15408,6 +16943,308 @@ fn property_storage_name(
     } else {
         property.name.clone()
     }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn property_load_pre_guard_status(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+    metadata: &php_jit::JitPropertyLoadMetadata,
+) -> Option<i32> {
+    if state.lookup_epoch().raw() != metadata.layout_version {
+        return Some(JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT);
+    }
+    let effective = match value {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let Value::Object(object) = effective else {
+        return Some(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    };
+    if normalize_class_name(&object.class_name()) != metadata.receiver_class {
+        return Some(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    }
+    let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
+        return Some(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    };
+    if class.id.raw() != metadata.class_id {
+        return Some(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    }
+    None
+}
+
+fn property_fetch_callsite(
+    compiled: &CompiledUnit,
+    function: FunctionId,
+    block: BlockId,
+    instruction: InstrId,
+) -> String {
+    let unit = compiled.unit();
+    let function_name = unit
+        .functions
+        .get(function.index())
+        .map(|entry| entry.name.as_str())
+        .unwrap_or("<unknown>");
+    format!(
+        "unit{}:{}:b{}:i{}",
+        unit.id.raw(),
+        function_name,
+        block.raw(),
+        instruction.raw()
+    )
+}
+
+fn method_call_callsite(
+    compiled: &CompiledUnit,
+    function: FunctionId,
+    block: BlockId,
+    instruction: InstrId,
+) -> String {
+    let unit = compiled.unit();
+    let function_name = unit
+        .functions
+        .get(function.index())
+        .map(|entry| entry.name.as_str())
+        .unwrap_or("<unknown>");
+    format!(
+        "unit{}:{}:b{}:i{}",
+        unit.id.raw(),
+        function_name,
+        block.raw(),
+        instruction.raw()
+    )
+}
+
+fn class_has_public_magic_get(compiled: &CompiledUnit, class: &php_ir::module::ClassEntry) -> bool {
+    lookup_method_in_hierarchy(compiled, class, "__get", None)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| {
+            !resolved.method.flags.is_static
+                && !resolved.method.flags.is_private
+                && !resolved.method.flags.is_protected
+        })
+}
+
+fn class_has_public_magic_call(
+    compiled: &CompiledUnit,
+    class: &php_ir::module::ClassEntry,
+) -> bool {
+    lookup_method_in_hierarchy(compiled, class, "__call", None)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| {
+            !resolved.method.flags.is_static
+                && !resolved.method.flags.is_private
+                && !resolved.method.flags.is_protected
+        })
+}
+
+fn property_has_hooks_or_active(
+    state: &ExecutionState,
+    object: &ObjectRef,
+    class: &php_ir::module::ClassEntry,
+    property: &php_ir::module::ClassPropertyEntry,
+) -> bool {
+    property.hooks.get.is_some()
+        || property.hooks.set.is_some()
+        || property_hook_is_active(state, object, class, property)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn property_fetch_profile_observation(
+    callsite: &str,
+    property: &str,
+    receiver_class: &str,
+    class: &php_ir::module::ClassEntry,
+    declared_property: Option<(
+        &php_ir::module::ClassEntry,
+        &php_ir::module::ClassPropertyEntry,
+    )>,
+    visibility_context: Option<&str>,
+    layout_version: InvalidationEpoch,
+    has_magic_get: bool,
+    has_property_hook: bool,
+    dynamic_property_fallback: bool,
+    declared_visible_property: bool,
+    uninitialized_typed_property: bool,
+    non_eligible_reasons: Vec<&'static str>,
+) -> PropertyFetchProfileObservation {
+    let (declared_property_name, property_slot_index) =
+        declared_property.map_or((None, None), |(declaring_class, property)| {
+            (
+                Some(property.name.clone()),
+                declaring_class
+                    .properties
+                    .iter()
+                    .position(|entry| entry.name == property.name),
+            )
+        });
+    PropertyFetchProfileObservation {
+        callsite: callsite.to_owned(),
+        property: property.to_owned(),
+        receiver_class: receiver_class.to_owned(),
+        class_id: class.id.raw(),
+        declared_property_name,
+        visibility_context: visibility_context.map(str::to_owned),
+        property_slot_index,
+        class_layout_version: layout_version.raw(),
+        has_magic_get,
+        has_property_hook,
+        dynamic_property_fallback,
+        declared_visible_property,
+        uninitialized_typed_property,
+        non_eligible_reasons,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn method_call_profile_observation(
+    callsite: &str,
+    method: &str,
+    receiver_class: &str,
+    class: &php_ir::module::ClassEntry,
+    resolved_method: Option<(
+        &CompiledUnit,
+        &php_ir::module::ClassEntry,
+        &php_ir::module::ClassMethodEntry,
+    )>,
+    visibility_context: Option<&str>,
+    layout_version: InvalidationEpoch,
+    has_magic_call: bool,
+    magic_call_fallback: bool,
+    simple_positional_arguments: bool,
+    has_by_ref_argument: bool,
+    callee_jit_eligible: bool,
+    direct_vm_call_helper_available: bool,
+    non_eligible_reasons: Vec<&'static str>,
+) -> MethodCallProfileObservation {
+    let (
+        declaring_class,
+        method_id,
+        method_slot_index,
+        method_is_final,
+        method_is_private,
+        method_is_static,
+    ) = resolved_method.map_or(
+        (None, None, None, false, false, false),
+        |(_owner, declaring_class, method_entry)| {
+            (
+                Some(declaring_class.name.clone()),
+                Some(method_entry.function.raw()),
+                declaring_class.methods.iter().position(|entry| {
+                    entry.name == method_entry.name && entry.function == method_entry.function
+                }),
+                method_entry.flags.is_final,
+                method_entry.flags.is_private,
+                method_entry.flags.is_static,
+            )
+        },
+    );
+    MethodCallProfileObservation {
+        callsite: callsite.to_owned(),
+        method: method.to_owned(),
+        receiver_class: receiver_class.to_owned(),
+        class_id: class.id.raw(),
+        declaring_class,
+        method_id,
+        method_slot_index,
+        visibility_context: visibility_context.map(str::to_owned),
+        override_layout_version: layout_version.raw(),
+        method_is_final,
+        method_is_private,
+        method_is_static,
+        has_magic_call,
+        magic_call_fallback,
+        simple_positional_arguments,
+        has_by_ref_argument,
+        callee_jit_eligible,
+        direct_vm_call_helper_available,
+        non_eligible_reasons,
+    }
+}
+
+fn method_call_args_are_simple_positional(args: &[IrCallArg]) -> bool {
+    args.iter().all(|arg| arg.name.is_none() && !arg.unpack)
+}
+
+fn method_call_has_by_ref_argument(
+    _args: &[IrCallArg],
+    owner: Option<&CompiledUnit>,
+    function: Option<FunctionId>,
+) -> bool {
+    let Some((owner, function)) = owner.zip(function) else {
+        return false;
+    };
+    owner
+        .unit()
+        .functions
+        .get(function.index())
+        .is_some_and(|callee| callee.params.iter().any(|param| param.by_ref))
+}
+
+fn method_direct_call_target_is_eligible(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    target: &MethodCallCacheTarget,
+    class: &php_ir::module::ClassEntry,
+    receiver_class: &str,
+    args: &[IrCallArg],
+) -> bool {
+    if target.receiver_class_id() != class.id.raw() || target.receiver_class() != receiver_class {
+        return false;
+    }
+    if !method_call_args_are_simple_positional(args) {
+        return false;
+    }
+    let owner = match target {
+        MethodCallCacheTarget::CurrentUnit { .. } => Some(compiled),
+        MethodCallCacheTarget::DynamicUnit { unit_index, .. } => {
+            state.dynamic_units.get(*unit_index)
+        }
+    };
+    let Some(owner) = owner else {
+        return false;
+    };
+    !method_call_has_by_ref_argument(args, Some(owner), Some(target.function()))
+}
+
+fn method_callee_shape_is_jit_eligible(owner: &CompiledUnit, function: FunctionId) -> bool {
+    owner
+        .unit()
+        .functions
+        .get(function.index())
+        .is_some_and(|callee| {
+            !callee.flags.is_top_level
+                && !callee.flags.is_closure
+                && !callee.flags.is_generator
+                && !callee.returns_by_ref
+                && matches!(
+                    callee.return_type.as_ref(),
+                    None | Some(
+                        IrReturnType::Int
+                            | IrReturnType::String
+                            | IrReturnType::Bool
+                            | IrReturnType::Null
+                    )
+                )
+                && callee.captures.is_empty()
+                && callee.params.iter().all(|param| {
+                    !param.by_ref
+                        && !param.variadic
+                        && param.default.is_none()
+                        && matches!(
+                            param.type_.as_ref(),
+                            None | Some(
+                                IrReturnType::Int
+                                    | IrReturnType::String
+                                    | IrReturnType::Bool
+                                    | IrReturnType::Null
+                            )
+                        )
+                })
+        })
 }
 
 fn property_hook_is_active(
@@ -19714,6 +21551,28 @@ mod tests {
     };
     use php_runtime::ExitStatus;
 
+    fn property_fetch_profile<'a>(
+        counters: &'a VmCounters,
+        property: &str,
+    ) -> &'a crate::counters::PropertyFetchProfile {
+        counters
+            .property_fetch_profiles
+            .values()
+            .find(|profile| profile.property == property)
+            .unwrap_or_else(|| panic!("missing property fetch profile for ${property}"))
+    }
+
+    fn method_call_profile<'a>(
+        counters: &'a VmCounters,
+        method: &str,
+    ) -> &'a crate::counters::MethodCallProfile {
+        counters
+            .method_call_profiles
+            .values()
+            .find(|profile| profile.method == method)
+            .unwrap_or_else(|| panic!("missing method call profile for {method}()"))
+    }
+
     #[test]
     fn vm_core_returns_null_from_manual_ir() {
         let unit = manual_return_unit(IrConstant::Null);
@@ -21306,7 +23165,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_int_leaf_hot_loop_executes_after_warmup() {
-        let source = "<?php function phase7_jit_add($a, $b) { return $a + $b; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + phase7_jit_add($i, 2); } echo $sum;";
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + phase7_jit_add($i, 2); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -21327,8 +23186,838 @@ mod tests {
 
     #[cfg(feature = "jit-cranelift")]
     #[test]
+    fn cranelift_default_tiering_keeps_cold_function_interpreted() {
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(1, 2);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"3");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 0, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 0, "{counters:?}");
+        assert!(counters.jit_tiering_cold_functions > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_threshold_tiering_compiles_hot_function() {
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 4; $i++) { $sum += phase7_jit_add($i, 2); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                jit_threshold: 2,
+                tiering: TieringOptions {
+                    function_entry_threshold: 2,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"14");
+        let counters = result.counters.expect("counters");
+        assert!(counters.jit_compile_attempts > 0, "{counters:?}");
+        assert!(counters.jit_compiled > 0, "{counters:?}");
+        assert!(counters.jit_tiering_cold_functions > 0, "{counters:?}");
+        assert!(counters.jit_tiering_hot_functions > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_eager_tiering_compiles_first_call_for_tests() {
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(5, 7);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                jit_threshold: 1,
+                tiering: TieringOptions {
+                    jit_eager: true,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"12");
+        let counters = result.counters.expect("counters");
+        assert!(counters.jit_compile_attempts > 0, "{counters:?}");
+        assert!(counters.jit_compiled > 0, "{counters:?}");
+        assert!(counters.jit_tiering_eager_functions > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_compile_budget_rejection_falls_back_to_interpreter() {
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(5, 7);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                jit_threshold: 1,
+                tiering: TieringOptions {
+                    jit_eager: true,
+                    jit_max_functions: 0,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"12");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 0, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 0, "{counters:?}");
+        assert!(counters.jit_tiering_budget_rejections > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_inline_arithmetic_executes_native_and_counts_fast_paths() {
+        let source = "<?php function phase7_jit_add_mul(int $a): int { return ($a + 2) * 3; } echo phase7_jit_add_mul(4);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"18");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
+        assert_eq!(counters.jit_helper_calls, 0, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 2, "{counters:?}");
+        assert_eq!(counters.jit_overflow_exits, 0, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 0, "{counters:?}");
+        assert!(counters.jit_code_bytes > 0, "{counters:?}");
+        assert!(counters.jit_compile_time_nanos > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_array_fetch_executes_native_and_counts_fast_hit() {
+        let source = "<?php function phase7_packed_fetch(array $xs, int $i): int { return $xs[$i]; } $xs = [10, 20, 30]; echo phase7_packed_fetch($xs, 1);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"20");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_fast_hits, 1, "{counters:?}");
+        assert_eq!(counters.packed_fetch_bounds_exits, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_layout_exits, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_array_fetch_bounds_exit_falls_back_to_interpreter() {
+        let source = "<?php function phase7_packed_fetch_bounds(array $xs, int $i): int { return $xs[$i]; } echo phase7_packed_fetch_bounds([10], 4);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_fast_hits, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_bounds_exits, 1, "{counters:?}");
+        assert_eq!(counters.packed_fetch_layout_exits, 0, "{counters:?}");
+        assert_eq!(counters.jit_side_exit_reasons.get("overflow"), None);
+        assert_eq!(
+            counters.jit_side_exit_reasons.get("helper_status"),
+            Some(&1)
+        );
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_array_fetch_layout_exit_falls_back_for_mixed_array() {
+        let source = "<?php function phase7_packed_fetch_mixed(array $xs, int $i): int { return $xs[$i]; } $xs = [0 => 11, 'name' => 12]; echo phase7_packed_fetch_mixed($xs, 0);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_fast_hits, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_bounds_exits, 0, "{counters:?}");
+        assert_eq!(counters.packed_fetch_layout_exits, 1, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_foreach_sum_executes_native_and_counts_fast_hit() {
+        let source = "<?php function phase7_packed_foreach_sum(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum([10, 20, 30]);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"60");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 1, "{counters:?}");
+        assert_eq!(counters.jit_helper_calls, 0, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_fast_hits, 1, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_layout_exits, 0, "{counters:?}");
+        assert_eq!(
+            counters.packed_foreach_sum_overflow_exits, 0,
+            "{counters:?}"
+        );
+        assert_eq!(counters.jit_slow_path_calls, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_foreach_sum_layout_exit_falls_back_for_mixed_element() {
+        let source = "<?php function phase7_packed_foreach_sum_mixed(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum_mixed([10, \"20\", 30]);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 1, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_fast_hits, 0, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_layout_exits, 1, "{counters:?}");
+        assert_eq!(
+            counters.packed_foreach_sum_overflow_exits, 0,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.jit_side_exit_reasons.get("helper_status"),
+            Some(&1)
+        );
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_packed_foreach_sum_overflow_exit_falls_back_to_interpreter() {
+        let source = "<?php function phase7_packed_foreach_sum_overflow(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum_overflow([9223372036854775807, 1]);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 1, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_fast_hits, 0, "{counters:?}");
+        assert_eq!(counters.packed_foreach_sum_layout_exits, 0, "{counters:?}");
+        assert_eq!(
+            counters.packed_foreach_sum_overflow_exits, 1,
+            "{counters:?}"
+        );
+        assert_eq!(counters.jit_overflow_exits, 1, "{counters:?}");
+        assert_eq!(counters.jit_side_exit_reasons.get("overflow"), Some(&1));
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_known_strlen_executes_native_and_counts_fast_hit() {
+        let source = "<?php function phase7_known_strlen(string $s): int { return strlen($s); } echo phase7_known_strlen(\"hello\");";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"5");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_helper_calls, 1, "{counters:?}");
+        assert_eq!(counters.known_call_fast_hits, 1, "{counters:?}");
+        assert_eq!(counters.known_call_guard_exits, 0, "{counters:?}");
+        assert_eq!(counters.known_call_slow_calls, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_known_strlen_guard_exit_preserves_type_error() {
+        let source = "<?php function phase7_known_strlen_guard($s): int { return strlen($s); } try { echo phase7_known_strlen_guard([]); } catch (TypeError $e) { echo \"type-error\"; }";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.known_call_fast_hits, 0, "{counters:?}");
+        assert_eq!(counters.known_call_guard_exits, 1, "{counters:?}");
+        assert_eq!(counters.known_call_slow_calls, 1, "{counters:?}");
+        assert_eq!(
+            counters.jit_side_exit_reasons.get("helper_status"),
+            Some(&1)
+        );
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_known_count_executes_for_packed_and_mixed_arrays() {
+        let source = "<?php function phase7_known_count(array $xs): int { return count($xs); } echo phase7_known_count([10, 20, 30]), \":\", phase7_known_count([\"a\" => 1, 4 => 2]);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"3:2");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 2, "{counters:?}");
+        assert_eq!(counters.jit_helper_calls, 2, "{counters:?}");
+        assert_eq!(counters.known_call_fast_hits, 2, "{counters:?}");
+        assert_eq!(counters.known_call_guard_exits, 0, "{counters:?}");
+        assert_eq!(counters.known_call_slow_calls, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_string_concat_executes_native_and_counts_fast_hit() {
+        let source = "<?php function phase7_string_concat(string $a, string $b): string { return $a . $b; } echo phase7_string_concat(\"hello\", \"-world\");";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"hello-world");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_helper_calls, 1, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 1, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_hits, 1, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_misses, 0, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_string_concat_rejects_string_int_without_fast_hit() {
+        let source = "<?php function phase7_string_int_concat(string $a, int $b): string { return $a . $b; } echo phase7_string_int_concat(\"id-\", 42);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        assert_eq!(on.output.as_bytes(), b"id-42");
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 0, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_hits, 0, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_misses, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_string_concat_rejects_object_to_string_without_fast_hit() {
+        let source = "<?php class Phase7ConcatObject { public function __toString(): string { return 'object'; } } function phase7_object_concat($a, $b): string { return $a . $b; } echo phase7_object_concat(new Phase7ConcatObject(), '-tail');";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        assert_eq!(on.output.as_bytes(), b"object-tail");
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 0, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_hits, 0, "{counters:?}");
+        assert_eq!(counters.string_concat_fast_path_misses, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_helper_overflow_status_falls_back_to_interpreter() {
+        let source = "<?php function phase7_jit_overflow(int $a): int { return $a + 1; } echo phase7_jit_overflow(9223372036854775807);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert!(counters.jit_bailouts > 0, "{counters:?}");
+        assert_eq!(counters.jit_side_exits, 1, "{counters:?}");
+        assert_eq!(
+            counters.jit_side_exit_reasons.get("overflow"),
+            Some(&1),
+            "{counters:?}"
+        );
+        assert_eq!(counters.jit_overflow_exits, 1, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 1, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_type_switch_side_exits_blacklist_unstable_candidate() {
+        let source = r#"<?php
+function phase7_jit_unstable_types(int $a): int { return $a + 1; }
+echo phase7_jit_unstable_types(1), "\n";
+echo phase7_jit_unstable_types("2"), "\n";
+echo phase7_jit_unstable_types("3"), "\n";
+echo phase7_jit_unstable_types(4), "\n";
+"#;
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 1, "{counters:?}");
+        assert_eq!(counters.jit_side_exits, 2, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 2, "{counters:?}");
+        assert_eq!(
+            counters.jit_side_exit_reasons.get("type_mismatch"),
+            Some(&2),
+            "{counters:?}"
+        );
+        assert_eq!(counters.jit_blacklisted_regions, 1, "{counters:?}");
+        assert_eq!(
+            counters.jit_blacklist_reasons.get("too_many_side_exits"),
+            Some(&1),
+            "{counters:?}"
+        );
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_blacklist_can_be_disabled_for_debugging() {
+        let source = r#"<?php
+function phase7_jit_unstable_types_debug(int $a): int { return $a + 1; }
+echo phase7_jit_unstable_types_debug(1), "\n";
+echo phase7_jit_unstable_types_debug("2"), "\n";
+echo phase7_jit_unstable_types_debug("3"), "\n";
+echo phase7_jit_unstable_types_debug(4), "\n";
+"#;
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                jit_blacklist: JitBlacklistMode::Off,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2\n3\n4\n5\n");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 2, "{counters:?}");
+        assert_eq!(counters.jit_fast_path_hits, 2, "{counters:?}");
+        assert_eq!(counters.jit_side_exits, 2, "{counters:?}");
+        assert_eq!(counters.jit_slow_path_calls, 2, "{counters:?}");
+        assert_eq!(counters.jit_blacklisted_regions, 0, "{counters:?}");
+        assert!(counters.jit_blacklist_reasons.is_empty(), "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_constant_return_executes_native_after_abi_check() {
+        let source = "<?php function phase7_const(): int { return 42; } echo phase7_const();";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"42");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 1, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
+        assert!(counters.jit_code_bytes > 0, "{counters:?}");
+        assert!(counters.jit_compile_time_nanos > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_compile_cache_reuses_same_function() {
+        let source = "<?php function phase7_const(): int { return 42; } echo phase7_const(); echo phase7_const(); echo phase7_const();";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    jit_eager: true,
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"424242");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 1, "{counters:?}");
+        assert_eq!(counters.jit_executed, 3, "{counters:?}");
+        assert_eq!(counters.jit_compile_cache_misses, 1, "{counters:?}");
+        assert_eq!(counters.jit_compile_cache_hits, 2, "{counters:?}");
+        assert_eq!(counters.jit_compile_cache_invalidations, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_compile_cache_rejects_changed_ir_and_abi() {
+        let mut cache = JitRuntimeState::default();
+        let function = FunctionId::new(0);
+        let base = JitCompileCacheKey {
+            function: function.raw(),
+            ir_fingerprint: 11,
+            abi_hash: php_jit::JIT_RUNTIME_ABI_HASH,
+            config_hash: 22,
+            target_isa: "test-target".to_owned(),
+        };
+        let handle = php_jit::JitFunctionHandle::metadata_only(
+            1,
+            "function.phase7_const".to_owned(),
+            php_jit::JitBackend::CraneliftExperiment,
+        );
+        cache.insert_compile_cache(base.clone(), handle, 1);
+
+        assert!(matches!(
+            cache.lookup_compile_cache(&base, 1),
+            JitCompileCacheLookup::Hit(_)
+        ));
+
+        let mut changed_ir = base.clone();
+        changed_ir.ir_fingerprint = 12;
+        assert_eq!(
+            cache.lookup_compile_cache(&changed_ir, 1),
+            JitCompileCacheLookup::Miss
+        );
+
+        let mut changed_abi = base.clone();
+        changed_abi.abi_hash = php_jit::JIT_RUNTIME_ABI_HASH.wrapping_add(1);
+        assert_eq!(
+            cache.lookup_compile_cache(&changed_abi, 1),
+            JitCompileCacheLookup::Miss
+        );
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_compile_cache_invalidates_runtime_layout_mismatch() {
+        let mut cache = JitRuntimeState::default();
+        let function = FunctionId::new(0);
+        let key = JitCompileCacheKey {
+            function: function.raw(),
+            ir_fingerprint: 11,
+            abi_hash: php_jit::JIT_RUNTIME_ABI_HASH,
+            config_hash: 22,
+            target_isa: "test-target".to_owned(),
+        };
+        let handle = php_jit::JitFunctionHandle::metadata_only(
+            1,
+            "function.phase7_const".to_owned(),
+            php_jit::JitBackend::CraneliftExperiment,
+        );
+        cache.insert_compile_cache(key.clone(), handle, 1);
+
+        assert_eq!(
+            cache.lookup_compile_cache(&key, 2),
+            JitCompileCacheLookup::Invalidated
+        );
+        assert_eq!(
+            cache.lookup_compile_cache(&key, 2),
+            JitCompileCacheLookup::Miss
+        );
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
     fn jit_rejected_leaf_falls_back_to_interpreter() {
-        let source = "<?php function phase7_jit_reject($value) { return strlen($value); } $sum = 0; for ($i = 0; $i < 8; $i++) { $sum = $sum + phase7_jit_reject('abcd'); } echo $sum;";
+        let source = "<?php function phase7_jit_reject($value): int { return strlen($value); } $sum = 0; for ($i = 0; $i < 8; $i++) { $sum = $sum + phase7_jit_reject('abcd'); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -21350,7 +24039,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_on_off_output_is_identical() {
-        let source = "<?php function phase7_jit_add($a, $b) { return $a + $b; } $sum = 0; for ($i = 0; $i < 10; $i++) { $sum = $sum + phase7_jit_add($i, 3); } echo $sum;";
+        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 10; $i++) { $sum = $sum + phase7_jit_add($i, 3); } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -21675,6 +24364,196 @@ mod tests {
     }
 
     #[test]
+    fn method_call_profiles_declared_monomorphic_final_method() {
+        let source = "<?php class Phase7MethodProfileFinal { final public function value(): int { return 7; } } $object = new Phase7MethodProfileFinal(); $sum = 0; for ($i = 0; $i < 4; $i++) { $sum = $sum + $object->value(); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"28");
+        let counters = result.counters.expect("counters");
+        let profile = method_call_profile(&counters, "value");
+        assert_eq!(profile.receiver_classes.len(), 1, "{profile:?}");
+        assert_eq!(
+            profile
+                .method_slot_indexes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(profile.saw_final_method, "{profile:?}");
+        assert!(profile.simple_positional_arguments, "{profile:?}");
+        assert!(!profile.saw_by_ref_argument, "{profile:?}");
+        assert!(profile.saw_callee_jit_eligible, "{profile:?}");
+        assert!(profile.non_eligible_reasons.is_empty(), "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"method_call_profiles\": ["), "{json}");
+        assert!(json.contains("\"state\": \"monomorphic\""), "{json}");
+        assert!(json.contains("\"fast_path_eligible\": true"), "{json}");
+    }
+
+    #[test]
+    fn method_call_profiles_subclass_override_is_not_monomorphic() {
+        let source = "<?php class Phase7MethodProfileBase { public function value(): int { return 1; } } class Phase7MethodProfileChild extends Phase7MethodProfileBase { public function value(): int { return 2; } } function phase7_method_profile_value(Phase7MethodProfileBase $object): int { return $object->value(); } echo phase7_method_profile_value(new Phase7MethodProfileBase()), phase7_method_profile_value(new Phase7MethodProfileChild());";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"12");
+        let counters = result.counters.expect("counters");
+        let profile = method_call_profile(&counters, "value");
+        assert_eq!(profile.receiver_classes.len(), 2, "{profile:?}");
+        assert_eq!(profile.method_ids.len(), 2, "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"state\": \"polymorphic\""), "{json}");
+        assert!(json.contains("\"polymorphic_receiver\""), "{json}");
+        assert!(json.contains("\"unstable_method_slot\""), "{json}");
+    }
+
+    #[test]
+    fn method_call_profiles_magic_call_fallback() {
+        let source = "<?php class Phase7MethodProfileMagic { public function __call($name, $args): int { return 42; } } $object = new Phase7MethodProfileMagic(); echo $object->missing(1, 2);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"42");
+        let counters = result.counters.expect("counters");
+        let profile = method_call_profile(&counters, "missing");
+        assert!(profile.has_magic_call, "{profile:?}");
+        assert!(profile.magic_call_fallback, "{profile:?}");
+        assert!(profile.method_ids.is_empty(), "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"magic_call_fallback\""), "{json}");
+        assert!(json.contains("\"missing_declared_method\""), "{json}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_method_direct_call_hits_after_initial_fallback() {
+        let source = "<?php class Phase7DirectMethodTest { public function value(int $x): int { return $x + 2; } } $object = new Phase7DirectMethodTest(); $sum = 0; for ($i = 0; $i < 8; $i++) { $sum += $object->value($i); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"44");
+        let counters = result.counters.expect("counters");
+        assert!(counters.direct_call_hits > 0, "{counters:?}");
+        assert!(counters.direct_call_fallbacks > 0, "{counters:?}");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_method_direct_call_subclass_receiver_falls_back() {
+        let source = "<?php class Phase7DirectBaseTest { public function value(int $x): int { return $x + 1; } } class Phase7DirectChildTest extends Phase7DirectBaseTest { public function value(int $x): int { return $x + 10; } } $objects = [new Phase7DirectBaseTest(), new Phase7DirectChildTest(), new Phase7DirectBaseTest()]; $sum = 0; foreach ($objects as $i => $object) { $sum += $object->value($i); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"15");
+        let counters = result.counters.expect("counters");
+        assert!(counters.direct_call_hits > 0, "{counters:?}");
+        assert!(counters.direct_call_fallbacks > 0, "{counters:?}");
+        assert!(counters.method_ic_guard_failures > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_method_direct_call_magic_path_stays_fallback() {
+        let source = "<?php class Phase7DirectMagicTest { public function __call(string $name, array $args): int { return strlen($name) + $args[0]; } } $object = new Phase7DirectMagicTest(); echo $object->missing(5);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"12");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.direct_call_hits, 0, "{counters:?}");
+        assert!(counters.direct_call_fallbacks > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn cranelift_method_direct_call_propagates_callee_exception() {
+        let source = "<?php class Phase7DirectThrowerTest { public int $calls = 0; public function fail(): int { $this->calls = $this->calls + 1; if ($this->calls > 1) { throw new Exception(\"phase7-direct-method\"); } return $this->calls; } } $object = new Phase7DirectThrowerTest(); for ($i = 0; $i < 2; $i++) { echo $object->fail(), \"\\n\"; }";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(result.output.as_bytes(), b"1\n");
+        assert!(
+            result
+                .status
+                .message()
+                .is_some_and(|message| message.contains("phase7-direct-method")),
+            "{:?}",
+            result.status
+        );
+        let counters = result.counters.expect("counters");
+        assert!(counters.direct_call_hits > 0, "{counters:?}");
+        assert!(counters.direct_call_fallbacks > 0, "{counters:?}");
+    }
+
+    #[test]
     fn property_fetch_inline_cache_records_public_hot_loop_hits() {
         let source = "<?php class Phase7PropertyHot { public $value = 3; } $object = new Phase7PropertyHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
         let off = execute_source_with_options(
@@ -21702,6 +24581,38 @@ mod tests {
         assert!(counters.property_ic_hits > 0, "{counters:?}");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
         assert_eq!(counters.property_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn property_fetch_profiles_declared_monomorphic_property() {
+        let source = "<?php class Phase7PropertyProfileHot { public $value = 3; } $object = new Phase7PropertyProfileHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"36");
+        let counters = result.counters.expect("counters");
+        let profile = property_fetch_profile(&counters, "value");
+        assert_eq!(profile.receiver_classes.len(), 1, "{profile:?}");
+        assert!(profile.saw_declared_visible_property, "{profile:?}");
+        assert_eq!(
+            profile
+                .property_slot_indexes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(profile.non_eligible_reasons.is_empty(), "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"state\": \"monomorphic\""), "{json}");
+        assert!(json.contains("\"fast_path_eligible\": true"), "{json}");
     }
 
     #[test]
@@ -21764,6 +24675,43 @@ mod tests {
     }
 
     #[test]
+    fn property_fetch_profiles_polymorphic_and_megamorphic_receivers() {
+        let polymorphic = execute_source_with_options(
+            "<?php class Phase7ProfilePolyA { public $value = 'A'; } class Phase7ProfilePolyB { public $value = 'B'; } function phase7_profile_read($object) { return $object->value; } echo phase7_profile_read(new Phase7ProfilePolyA()), phase7_profile_read(new Phase7ProfilePolyB());",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(polymorphic.status.is_success(), "{:?}", polymorphic.status);
+        assert_eq!(polymorphic.output.as_bytes(), b"AB");
+        let counters = polymorphic.counters.expect("polymorphic counters");
+        let profile = property_fetch_profile(&counters, "value");
+        assert_eq!(profile.receiver_classes.len(), 2, "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"state\": \"polymorphic\""), "{json}");
+        assert!(json.contains("\"polymorphic_receiver\""), "{json}");
+
+        let megamorphic = execute_source_with_options(
+            "<?php class Phase7ProfileMegaA { public $value = 'A'; } class Phase7ProfileMegaB { public $value = 'B'; } class Phase7ProfileMegaC { public $value = 'C'; } class Phase7ProfileMegaD { public $value = 'D'; } class Phase7ProfileMegaE { public $value = 'E'; } function phase7_profile_mega_read($object) { return $object->value; } echo phase7_profile_mega_read(new Phase7ProfileMegaA()), phase7_profile_mega_read(new Phase7ProfileMegaB()), phase7_profile_mega_read(new Phase7ProfileMegaC()), phase7_profile_mega_read(new Phase7ProfileMegaD()), phase7_profile_mega_read(new Phase7ProfileMegaE());",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(megamorphic.status.is_success(), "{:?}", megamorphic.status);
+        assert_eq!(megamorphic.output.as_bytes(), b"ABCDE");
+        let counters = megamorphic.counters.expect("megamorphic counters");
+        let profile = property_fetch_profile(&counters, "value");
+        assert_eq!(profile.receiver_classes.len(), 5, "{profile:?}");
+        let json = counters.to_json();
+        assert!(json.contains("\"state\": \"megamorphic\""), "{json}");
+        assert!(json.contains("\"megamorphic_receiver\""), "{json}");
+    }
+
+    #[test]
     fn property_fetch_inline_cache_preserves_dynamic_property_fallback() {
         let source = "<?php class Phase7DynamicProperty {} $object = new Phase7DynamicProperty(); $object->value = 'd'; for ($i = 0; $i < 6; $i++) { echo $object->value; }";
         let on = execute_source_with_options(
@@ -21780,6 +24728,36 @@ mod tests {
         let counters = on.counters.expect("on counters");
         assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_profiles_dynamic_property_fallback() {
+        let result = execute_source_with_options(
+            "<?php class Phase7ProfileDynamicProperty {} $object = new Phase7ProfileDynamicProperty(); $object->value = 'd'; echo $object->value;",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"d");
+        let counters = result.counters.expect("counters");
+        let profile = property_fetch_profile(&counters, "value");
+        assert!(profile.dynamic_property_fallback, "{profile:?}");
+        assert!(
+            profile
+                .non_eligible_reasons
+                .contains("dynamic_property_fallback"),
+            "{profile:?}"
+        );
+        assert!(
+            profile
+                .non_eligible_reasons
+                .contains("missing_declared_property"),
+            "{profile:?}"
+        );
     }
 
     #[test]
@@ -21802,6 +24780,34 @@ mod tests {
     }
 
     #[test]
+    fn property_fetch_profiles_magic_get_reason() {
+        let result = execute_source_with_options(
+            "<?php class Phase7ProfileMagicProperty { public function __get($name) { return $name . '!'; } } $object = new Phase7ProfileMagicProperty(); echo $object->missing;",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"missing!");
+        let counters = result.counters.expect("counters");
+        let profile = property_fetch_profile(&counters, "missing");
+        assert!(profile.has_magic_get, "{profile:?}");
+        assert!(
+            profile.non_eligible_reasons.contains("magic_get_present"),
+            "{profile:?}"
+        );
+        assert!(
+            profile
+                .non_eligible_reasons
+                .contains("missing_declared_property"),
+            "{profile:?}"
+        );
+    }
+
+    #[test]
     fn property_fetch_inline_cache_preserves_property_hook_fallback() {
         let source = "<?php class Phase7HookProperty { public string $name { get { return 'hook'; } } } $object = new Phase7HookProperty(); for ($i = 0; $i < 4; $i++) { echo $object->name; }";
         let on = execute_source_with_options(
@@ -21818,6 +24824,31 @@ mod tests {
         let counters = on.counters.expect("on counters");
         assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_profiles_property_hook_reason() {
+        let result = execute_source_with_options(
+            "<?php class Phase7ProfileHookProperty { public string $name { get { return 'hook'; } } } $object = new Phase7ProfileHookProperty(); echo $object->name;",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"hook");
+        let counters = result.counters.expect("counters");
+        let profile = property_fetch_profile(&counters, "name");
+        assert!(profile.has_property_hook, "{profile:?}");
+        assert!(profile.saw_declared_visible_property, "{profile:?}");
+        assert!(
+            profile
+                .non_eligible_reasons
+                .contains("property_hook_present"),
+            "{profile:?}"
+        );
     }
 
     #[test]
@@ -21839,6 +24870,30 @@ mod tests {
         let counters = result.counters.expect("counters");
         assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_profiles_uninitialized_typed_property_reason() {
+        let result = execute_source_with_options(
+            "<?php class Phase7ProfileTypedProperty { public int $value; } $object = new Phase7ProfileTypedProperty(); echo $object->value;",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let counters = result.counters.expect("counters");
+        let profile = property_fetch_profile(&counters, "value");
+        assert!(profile.saw_uninitialized_typed_property, "{profile:?}");
+        assert!(
+            profile
+                .non_eligible_reasons
+                .contains("uninitialized_typed_property"),
+            "{profile:?}"
+        );
+        assert!(profile.saw_declared_visible_property, "{profile:?}");
     }
 
     #[test]

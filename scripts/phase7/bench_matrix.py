@@ -71,12 +71,49 @@ def parse_args() -> argparse.Namespace:
         help="Rust VM run flag to pass before the fixture and record in JSON.",
     )
     parser.add_argument(
+        "--jit",
+        choices=("off", "noop", "cranelift"),
+        default=None,
+        help="Rust VM JIT mode to pass through before the fixture.",
+    )
+    parser.add_argument(
+        "--jit-threshold",
+        type=positive_int,
+        default=None,
+        help="Rust VM JIT hot-call threshold to pass through before the fixture.",
+    )
+    parser.add_argument(
+        "--jit-dump-clif",
+        type=Path,
+        default=None,
+        help="Rust VM JIT CLIF dump path to pass through before the fixture.",
+    )
+    parser.add_argument(
+        "--jit-stats",
+        choices=("json",),
+        default=None,
+        help="Rust VM JIT stats format to pass through before the fixture.",
+    )
+    parser.add_argument(
         "--reference-flag",
         action="append",
         default=[],
         help="Reference PHP CLI flag to pass before the fixture.",
     )
     return parser.parse_args()
+
+
+def jit_run_flags(args: argparse.Namespace) -> tuple[str, ...]:
+    flags: list[str] = []
+    if args.jit is not None:
+        flags.append(f"--jit={args.jit}")
+    if args.jit_threshold is not None:
+        flags.append(f"--jit-threshold={args.jit_threshold}")
+    if args.jit_dump_clif is not None:
+        flags.append(f"--jit-dump-clif={args.jit_dump_clif}")
+    if args.jit_stats is not None:
+        flags.append(f"--jit-stats={args.jit_stats}")
+    return tuple(flags)
 
 
 def rel(path: Path) -> str:
@@ -337,6 +374,7 @@ def report_environment(args: argparse.Namespace, reference_skip: str | None) -> 
         "git_commit": git_commit(),
         "rust_target_triple": platform.machine() + "-" + platform.system().lower(),
         "opt_flags": args.opt_flag,
+        "jit_flags": list(jit_run_flags(args)),
         "feature_flags": {},
         "extra": extra,
     }
@@ -351,7 +389,8 @@ def main() -> int:
 
     fixtures = fixture_paths(args.fixtures_dir)
     reference_php, reference_skip = reference_php_path(args.reference_php)
-    engines = [Engine("rust-vm", args.engine, tuple(args.opt_flag))]
+    rust_vm_flags = tuple(args.opt_flag) + jit_run_flags(args)
+    engines = [Engine("rust-vm", args.engine, rust_vm_flags)]
     if reference_php is not None:
         engines.append(Engine("reference-php", reference_php, tuple(args.reference_flag)))
 

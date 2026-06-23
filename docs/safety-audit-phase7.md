@@ -120,9 +120,10 @@ Audit result:
   exposed as public malformed-input parsing APIs.
 
 No Phase 7 safety issue currently requires disabling bytecode cache,
-quickening, inline caches, tiering, or default-off JIT. Native machine-code JIT
-execution remains disabled until optional W^X/mprotect work supplies a separate
-safe executable-memory wrapper and audit.
+quickening, inline caches, tiering, or default-off JIT. Cranelift native
+execution is still Cargo-feature-gated and runtime default-off; its executable
+memory and ABI boundary is audited separately in
+`docs/safety-audit-cranelift-phase7.md`.
 
 ### Developer Commands
 
@@ -147,16 +148,29 @@ Manual unsafe scan used by the smoke:
 ```bash
 nix develop -c rg -n '\bunsafe\b' \
   crates/php_bytecode_cache \
-  crates/php_jit \
   crates/php_vm/src/inline_cache.rs \
   crates/php_vm/src/quickening.rs \
   crates/php_vm/src/tiering.rs
+
+nix develop -c rg -n '\bunsafe\b' crates/php_jit/src \
+  --glob '!lib.rs' \
+  --glob '!helpers.rs' \
+  --glob '!cranelift_lowering.rs'
 ```
+
+The excluded `php_jit` files contain the feature-gated Cranelift native-call
+boundary and must stay covered by `docs/safety-audit-cranelift-phase7.md`,
+`docs/adr/0785-cranelift-memory-safety.md`, and
+`just verify-phase7-cranelift`.
 
 ### Troubleshooting
 
-- New `unsafe`: document the boundary here, isolate it behind a small wrapper,
-  add negative tests, and keep feature-off/default-off behavior unchanged.
+- New default-surface `unsafe`: document the boundary here, isolate it behind a
+  small wrapper, add negative tests, and keep feature-off/default-off behavior
+  unchanged.
+- New Cranelift native-boundary `unsafe`: document it in
+  `docs/safety-audit-cranelift-phase7.md`, keep `jit-cranelift` default-off,
+  and validate it with `just verify-phase7-cranelift`.
 - Miri unavailable: the safety smoke skips cleanly when `cargo miri` is absent
   or unusable for the active toolchain. That skip is acceptable; do not hide
   normal Rust test failures behind it.
@@ -230,8 +244,9 @@ Coverage:
 ## Prompt 07.52: Cranelift IR Lowering Prototype
 
 `crates/php_jit/src/cranelift_lowering.rs` is compiled only when the
-`jit-cranelift` feature is enabled. It lowers a tiny integer-only subset into
-Cranelift IR text and verifies that IR with Cranelift's verifier.
+`jit-cranelift` feature is enabled. It began as a CLIF-only lowering prototype
+and now owns the constrained native-entry experiment audited in
+`docs/safety-audit-cranelift-phase7.md`.
 
 Safety constraints:
 

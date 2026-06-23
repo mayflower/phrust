@@ -10,9 +10,15 @@ default = []
 jit-cranelift = [
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
 ]
 
 [dependencies]
 cranelift-codegen = { version = "0.133.0", optional = true }
 cranelift-frontend = { version = "0.133.0", optional = true }
+cranelift-jit = { version = "0.133.0", optional = true }
+cranelift-module = { version = "0.133.0", optional = true }
+cranelift-native = { version = "0.133.0", optional = true }
 php_ir = { path = "../php_ir" }

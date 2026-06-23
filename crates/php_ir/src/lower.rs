@@ -2972,6 +2972,21 @@ impl LoweringContext<'_> {
         let kind = expression.kind().clone();
         match kind {
             HirExprKind::Literal { text } => {
+                if text.starts_with('$') {
+                    let local = builder.intern_local(function, local_name(&text));
+                    let dst = builder.alloc_register(function);
+                    let instruction = builder.emit(
+                        function,
+                        block,
+                        InstructionKind::LoadLocal { dst, local },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, block, instruction, expr, span);
+                    return Some(LoweredExpr {
+                        register: dst,
+                        block,
+                    });
+                }
                 if let Some(constant) = self.magic_constant(&text, site) {
                     return Some(self.emit_constant_to_register(builder, site, constant));
                 }

@@ -151,7 +151,7 @@ nix develop -c target/debug/php-vm run \
   tests/fixtures/phase7/jit/int-leaf-hot-loop.php
 nix develop -c target/debug/php-vm run \
   --jit=on \
-  --tiering-function-threshold=1 \
+  --jit-eager \
   --counters-json target/phase7/jit-counters.json \
   tests/fixtures/phase7/jit/int-leaf-hot-loop.php
 ```

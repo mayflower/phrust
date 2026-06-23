@@ -150,15 +150,47 @@ pub enum FunctionCallCacheTarget {
 pub enum MethodCallCacheTarget {
     CurrentUnit {
         receiver_class: String,
+        receiver_class_id: u32,
         declaring_class: String,
         function: FunctionId,
     },
     DynamicUnit {
         unit_index: usize,
         receiver_class: String,
+        receiver_class_id: u32,
         declaring_class: String,
         function: FunctionId,
     },
+}
+
+impl MethodCallCacheTarget {
+    #[must_use]
+    pub fn receiver_class(&self) -> &str {
+        match self {
+            Self::CurrentUnit { receiver_class, .. } | Self::DynamicUnit { receiver_class, .. } => {
+                receiver_class
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn receiver_class_id(&self) -> u32 {
+        match self {
+            Self::CurrentUnit {
+                receiver_class_id, ..
+            }
+            | Self::DynamicUnit {
+                receiver_class_id, ..
+            } => *receiver_class_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn function(&self) -> FunctionId {
+        match self {
+            Self::CurrentUnit { function, .. } | Self::DynamicUnit { function, .. } => *function,
+        }
+    }
 }
 
 /// Resolution target cached by a property-fetch IC slot.
@@ -1771,6 +1803,7 @@ mod tests {
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
                 receiver_class: "phase7method".to_owned(),
+                receiver_class_id: 7,
                 declaring_class: "Phase7Method".to_owned(),
                 function,
             },
@@ -1811,6 +1844,7 @@ mod tests {
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
                 receiver_class: "phase7methoda".to_owned(),
+                receiver_class_id: 7,
                 declaring_class: "Phase7MethodA".to_owned(),
                 function,
             },
@@ -1851,6 +1885,7 @@ mod tests {
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
                 receiver_class: "phase7method".to_owned(),
+                receiver_class_id: 7,
                 declaring_class: "Phase7Method".to_owned(),
                 function,
             },
@@ -1895,6 +1930,7 @@ mod tests {
                 InvalidationEpoch::new(4),
                 MethodCallCacheTarget::CurrentUnit {
                     receiver_class: receiver.to_owned(),
+                    receiver_class_id: function_id.raw(),
                     declaring_class: receiver.to_owned(),
                     function: function_id,
                 },
@@ -1947,6 +1983,7 @@ mod tests {
                 InvalidationEpoch::new(4),
                 MethodCallCacheTarget::CurrentUnit {
                     receiver_class: receiver.to_owned(),
+                    receiver_class_id: 7,
                     declaring_class: receiver.to_owned(),
                     function,
                 },

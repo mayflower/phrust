@@ -1,14 +1,15 @@
 # Phase 7 CI Policy
 
-Phase 7 CI uses the same Nix entrypoint as local development. The required
-workflow is `.github/workflows/phase7.yml` and the required command is:
+Phase 7 CI uses the same Nix entrypoints as local development. The required
+default workflow job is `.github/workflows/phase7.yml` and the required
+default command is:
 
 ```bash
 nix develop -c just verify-phase7
 ```
 
-`verify-phase7` is the source of truth for required Phase 7 correctness and
-smoke coverage. It runs workspace tests, regression fixtures, the full
+`verify-phase7` is the source of truth for required default Phase 7 correctness
+and smoke coverage. It runs workspace tests, regression fixtures, the full
 performance-flag A/B matrix, bytecode-cache roundtrip checks, optimizer
 differential checks, quickening smoke, inline-cache smoke, skip-safe Callgrind
 smoke, default-off JIT smoke, safety audit smoke, benchmark smoke, hot-path
@@ -24,6 +25,18 @@ nix develop -c just inline-cache-smoke
 nix develop -c just jit-smoke
 ```
 
+The Cranelift addendum is feature-gated and runs as a separate optional CI job:
+
+```bash
+nix develop -c just verify-phase7-cranelift
+```
+
+This job compiles with `--features jit-cranelift`, runs the Cranelift smoke,
+diff, bench-smoke, consolidated report, and guard-report gates, and uploads
+`target/phase7/cranelift/**/*.json`, `*.md`, and `*.txt` as diagnostic
+artifacts. The default `verify-phase7` job intentionally does not enable the
+Cranelift feature.
+
 The required workflow also runs:
 
 ```bash
@@ -35,6 +48,27 @@ benchmark-only crates, and feature-gated JIT dependencies must not become hard
 flake checks. Unsupported JIT/native-code configurations must fail closed,
 fallback, or skip with an explicit reason; they must not make pull-request CI
 architecture-specific.
+
+Cranelift platform support is probed by:
+
+```bash
+scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json
+```
+
+The JSON status is machine-readable:
+
+```json
+{
+  "schema_version": 1,
+  "status": "pass",
+  "reason": "host triple is supported for Phase 7 Cranelift smoke gates",
+  "host_triple": "x86_64-unknown-linux-gnu"
+}
+```
+
+Unsupported platforms write the same file with `"status": "skip"` and a stable
+`reason`; the public Cranelift just targets then exit successfully after the
+skip so optional feature coverage does not make unrelated CI hosts fail.
 
 Long benchmark jobs are not required for every pull request. The same workflow
 has an optional benchmark job that runs only on the weekly schedule or when a
@@ -48,6 +82,9 @@ nix develop -c just perf-report
 Benchmark output is uploaded as CI artifacts from `target/phase7` and
 `target/criterion`. These artifacts are diagnostic evidence for the CI host, not
 portable performance budgets.
+
+Host-specific Cranelift reports are also generated only under
+`target/phase7/cranelift/` and must not be committed.
 
 CI tests must not require secrets, network access from test code, a vendored
 `php-src`, or a prebuilt reference PHP binary. Reference-dependent checks keep

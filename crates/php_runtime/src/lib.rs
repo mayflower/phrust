@@ -17,6 +17,7 @@ pub mod gc;
 pub mod generator;
 pub mod globals;
 pub mod ini;
+pub mod jit_array;
 pub mod numeric_string;
 pub mod object;
 pub mod output;
@@ -56,6 +57,12 @@ pub use gc::{
 pub use generator::{GeneratorRef, GeneratorState};
 pub use globals::GlobalSymbolTable;
 pub use ini::{IniEntrySnapshot, IniRegistry};
+pub use jit_array::{
+    PHP_JIT_ARRAY_LAYOUT_VERSION, PHP_JIT_ARRAY_STATUS_BOUNDS_EXIT, PHP_JIT_ARRAY_STATUS_FALLBACK,
+    PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT, PHP_JIT_ARRAY_STATUS_OK, PhpJitArrayAbiError,
+    php_jit_array_fetch_int_slow, php_jit_array_is_packed_ints, php_jit_array_layout_guard,
+    php_jit_array_len,
+};
 pub use object::{
     AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
     ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,

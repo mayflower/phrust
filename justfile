@@ -57,6 +57,13 @@ help:
       '  just inline-cache-smoke  Run Phase 7 inline-cache smoke gate' \
       '  just polymorphic-inline-cache-smoke  Run Phase 7 polymorphic IC smoke gate' \
       '  just jit-smoke  Run Phase 7 default-off JIT smoke gate' \
+      '  just jit-cranelift-smoke  Run Phase 7 Cranelift feature-gating smoke gate' \
+      '  just jit-cranelift-diff  Run Phase 7 Cranelift off-vs-on differential gate' \
+      '  just jit-cranelift-bench-smoke  Run Phase 7 Cranelift int-arithmetic bench/report smoke' \
+      '  just jit-cranelift-report  Generate Phase 7 Cranelift big-win report' \
+      '  just cranelift-guard-report  Generate Phase 7 Cranelift side-exit/guard report' \
+      '  just verify-phase7-cranelift  Run Phase 7 Cranelift addendum verification' \
+      '  just dump-cranelift-clif  Write and verify the Phase 7 Cranelift CLIF smoke dump' \
       '  just phase7-safety-audit-smoke  Run optional Phase 7 safety audit smoke' \
       '  just perf-report  Generate Phase 7 performance report' \
       '  just bootstrap-ref  Clone/pin the PHP reference checkout' \
@@ -1187,11 +1194,65 @@ polymorphic-inline-cache-smoke:
 jit-smoke:
     scripts/phase7/jit_smoke.sh
 
+jit-cranelift-smoke:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    cargo check --workspace
+    @if cargo tree -p php_jit --no-default-features -e features | rg 'cranelift-' >/dev/null; then \
+        printf '%s\n' '[fail] default php_jit dependency tree unexpectedly includes Cranelift crates' >&2; \
+        cargo tree -p php_jit --no-default-features -e features >&2; \
+        exit 1; \
+    fi
+    cargo check --workspace --features jit-cranelift
+    cargo test -p php_jit --features jit-cranelift
+    cargo test -p php_vm --features jit-cranelift jit_
+    cargo test -p php_vm --features jit-cranelift cranelift_
+    cargo build -p php_vm_cli --bin php-vm --features jit-cranelift
+    @printf '%s\n' '[pass] Cranelift feature-gating smoke passed'
+
+jit-cranelift-diff:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    cargo build -p php_vm_cli --bin php-vm --features jit-cranelift
+    scripts/phase7/cranelift/jit_diff.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
+
+jit-cranelift-bench-smoke:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    @just jit-cranelift-diff
+    cargo build -p php_vm_cli --bin php-vm --features jit-cranelift
+    scripts/phase7/cranelift/jit_bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/phase7/cranelift/bench-smoke.json --smoke
+
+jit-cranelift-report:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    @just jit-cranelift-diff
+    cargo build -p php_vm_cli --bin php-vm --features jit-cranelift
+    scripts/phase7/cranelift/jit_bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/phase7/cranelift/big_wins_report.json
+
+cranelift-guard-report:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    @just jit-cranelift-report
+    scripts/phase7/cranelift/guard_failure_report.py --input target/phase7/cranelift/big_wins_report.json --out target/phase7/cranelift/guard-report.json --text-out target/phase7/cranelift/guard-report.txt
+
+verify-phase7-cranelift:
+    @set +e; scripts/phase7/cranelift/platform_check.py --out target/phase7/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
+    @just jit-cranelift-smoke
+    @just jit-cranelift-diff
+    @just jit-cranelift-bench-smoke
+    @just jit-cranelift-report
+    @just cranelift-guard-report
+    @printf '%s\n' '[pass] phase7 Cranelift addendum verification complete'
+
+dump-cranelift-clif:
+    cargo run -p php_vm_cli --bin php-vm --features jit-cranelift -- dump-cranelift-clif
+
 phase7-safety-audit-smoke:
-    @if rg -n '\bunsafe\b' crates/php_bytecode_cache crates/php_jit crates/php_vm/src/inline_cache.rs crates/php_vm/src/quickening.rs crates/php_vm/src/tiering.rs; then \
+    @if rg -n '\bunsafe\b' crates/php_bytecode_cache crates/php_vm/src/inline_cache.rs crates/php_vm/src/quickening.rs crates/php_vm/src/tiering.rs; then \
         printf '%s\n' '[fail] Phase 7 cache/JIT/adaptive surface contains Rust unsafe' >&2; \
         exit 1; \
     fi
+    @if rg -n '\bunsafe\b' crates/php_jit/src --glob '!lib.rs' --glob '!helpers.rs' --glob '!cranelift_lowering.rs'; then \
+        printf '%s\n' '[fail] Phase 7 default JIT surface contains unaudited Rust unsafe' >&2; \
+        exit 1; \
+    fi
+    @test -f docs/safety-audit-cranelift-phase7.md
     cargo test -p php_bytecode_cache corrupt
     cargo test -p php_vm_cli bytecode_cache
     @if ! command -v cargo-miri >/dev/null 2>&1 && ! cargo miri --version >/dev/null 2>&1; then \

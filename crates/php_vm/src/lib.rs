@@ -38,7 +38,7 @@ pub use quickening::{
 };
 pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 pub use todo_phase4::{Phase4VmTodo, vm_skeleton_status};
-pub use vm::{JitMode, Vm, VmOptions, VmResult};
+pub use vm::{JitBlacklistMode, JitMode, Vm, VmOptions, VmResult};
 
 #[cfg(test)]
 mod tests {

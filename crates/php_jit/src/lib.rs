@@ -1,30 +1,46 @@
-//! Default-off Phase 7 JIT API skeleton.
+//! Default-off Phase 7 JIT API.
 //!
-//! This crate intentionally does not allocate or execute native code. The
-//! `jit-cranelift` feature is a compile-time experiment flag only until later
-//! prompts add eligibility, ABI, and executable-memory safety gates.
+//! Default builds use the stub backend and never allocate executable memory.
+//! The `jit-cranelift` feature enables a constrained Phase 7 experiment with
+//! explicit native-execution opt-in, ABI hash checks, verifier-backed Cranelift
+//! lowering, and documented unsafe call boundaries.
 
 mod abi;
+mod backend;
 #[cfg(feature = "jit-cranelift")]
 mod cranelift_lowering;
 mod eligibility;
+mod helpers;
 
 pub use abi::{
-    JitAbiValue, JitBailout, JitBailoutKind, JitExceptionMarker, JitFrameHandle, JitFrameView,
-    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
-    JitRuntimeCalloutResult, JitVmContextHandle,
+    JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitAbiValue, JitBailout, JitBailoutKind,
+    JitCExit, JitCExitTag, JitCFrameView, JitCValue, JitCValueTag, JitExceptionMarker,
+    JitFrameHandle, JitFrameView, JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult,
+    JitRuntimeCallout, JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle, SideExitReason,
+};
+pub use backend::{
+    CurrentJitBackend, JitBackendApi, JitBackendCompileOutcome, JitBackendCompileRequest,
+    NoopJitBackend,
 };
 #[cfg(feature = "jit-cranelift")]
 pub use cranelift_lowering::{
-    CraneliftLoweringError, CraneliftLoweringResult, CraneliftLoweringStats,
-    CraneliftMachineCodeHandle, lower_function_to_cranelift,
+    CraneliftClifSmokeResult, CraneliftLoweringError, CraneliftLoweringResult,
+    CraneliftLoweringStats, CraneliftMachineCodeHandle, CraneliftNoExecBackend,
+    build_trivial_add_clif_smoke, lower_function_to_cranelift,
 };
 pub use eligibility::{
-    JitEligibility, JitEligibilityReason, JitEligibilityReport, JitEligibilityStats,
-    analyze_jit_eligibility, call_args_are_jit_primitive,
+    JitCandidateKind, JitEligibility, JitEligibilityReason, JitEligibilityReport,
+    JitEligibilityStats, analyze_jit_eligibility, call_args_are_jit_primitive,
+};
+pub use helpers::{
+    JIT_HELPER_REGISTRY_ABI_HASH, JIT_HELPER_STATUS_FALLBACK, JIT_HELPER_STATUS_OK,
+    JIT_HELPER_STATUS_OVERFLOW, JIT_HELPER_SYMBOLS, JitHelperArgKind, JitHelperId,
+    JitHelperReturnKind, JitHelperSymbol, helper_registry_is_stable,
+    helper_registry_layout_summary, lookup_helper_by_id, lookup_helper_by_name,
 };
 use php_ir::{FunctionId, IrUnit};
 use std::fmt;
+use std::mem;
 
 /// Stable backend selected for the current build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +90,23 @@ impl Default for JitOptions {
     }
 }
 
+/// Runtime-owned helper addresses the backend may call from generated code.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitRuntimeHelperAddresses {
+    /// ABI wrapper for `php_jit_array_len`.
+    pub packed_array_len: usize,
+    /// ABI wrapper for `php_jit_array_fetch_int_slow`.
+    pub packed_array_fetch_int_slow: usize,
+    /// ABI wrapper for guarded `strlen($value)`.
+    pub known_strlen: usize,
+    /// ABI wrapper for guarded `count($value)`.
+    pub known_count: usize,
+    /// ABI wrapper for guarded string/string concatenation.
+    pub string_concat: usize,
+    /// ABI wrapper for guarded monomorphic property loads.
+    pub property_load: usize,
+}
+
 /// Request to compile one future JIT region.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JitCompileRequest {
@@ -121,15 +154,684 @@ impl JitCompileRequest {
     }
 }
 
-/// Opaque handle for a future compiled function.
+/// Opaque handle for a compiled function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JitFunctionHandle {
-    /// Stable handle id. It is not an executable pointer.
+    /// Stable handle id.
     pub id: u64,
     /// Region that produced this handle.
     pub region_id: String,
     /// Backend that produced this handle.
     pub backend: JitBackend,
+    native_entry: Option<JitNativeEntry>,
+    specialization: JitNativeSpecialization,
+    code_bytes: u64,
+    helper_calls_per_invocation: u64,
+    fast_path_hits_per_invocation: u64,
+    property_load_metadata: Option<JitPropertyLoadMetadata>,
+}
+
+/// Compile-time metadata for a monomorphic property-load fast path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JitPropertyLoadMetadata {
+    /// Normalized receiver class name expected by the guard.
+    pub receiver_class: String,
+    /// Stable class table ID expected by the guard.
+    pub class_id: u32,
+    /// Declared property name without `$`.
+    pub property: String,
+    /// Runtime storage name used by the safe helper ABI.
+    pub storage_name: String,
+    /// Declared property slot/index in the class metadata.
+    pub property_slot_index: usize,
+    /// Lookup/layout epoch captured when the handle was compiled.
+    pub layout_version: u64,
+}
+
+/// Native specialization kind used by the VM to attribute guarded exits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JitNativeSpecialization {
+    /// Generic native entry without specialization-specific counters.
+    #[default]
+    Generic,
+    /// Packed-array foreach integer sum loop.
+    PackedForeachIntSum,
+    /// Guarded known `strlen($value)` call.
+    KnownCallStrlen,
+    /// Guarded known `count($value)` call.
+    KnownCallCount,
+    /// Guarded two-string concatenation.
+    StringConcat,
+    /// Guarded monomorphic property load.
+    PropertyLoad,
+}
+
+impl JitFunctionHandle {
+    /// Creates a non-executable handle for tests and future metadata-only paths.
+    #[must_use]
+    pub const fn metadata_only(id: u64, region_id: String, backend: JitBackend) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: None,
+            specialization: JitNativeSpecialization::Generic,
+            code_bytes: 0,
+            helper_calls_per_invocation: 0,
+            fast_path_hits_per_invocation: 0,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Creates a scalar integer native-entry handle.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) const fn i64_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        arity: u8,
+        code_bytes: u64,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::I64Return,
+            }),
+            specialization: JitNativeSpecialization::Generic,
+            code_bytes,
+            helper_calls_per_invocation: 0,
+            fast_path_hits_per_invocation: 0,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Creates a status/out-pointer integer native-entry handle.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) const fn i64_status_out_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        arity: u8,
+        code_bytes: u64,
+        helper_calls_per_invocation: u64,
+        fast_path_hits_per_invocation: u64,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::I64StatusOut,
+            }),
+            specialization: JitNativeSpecialization::Generic,
+            code_bytes,
+            helper_calls_per_invocation,
+            fast_path_hits_per_invocation,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Creates a status/out-pointer native entry for one opaque value and int index.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) const fn value_i64_status_out_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        code_bytes: u64,
+        helper_calls_per_invocation: u64,
+        fast_path_hits_per_invocation: u64,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity: 2,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::ValueI64StatusOut,
+            }),
+            specialization: JitNativeSpecialization::Generic,
+            code_bytes,
+            helper_calls_per_invocation,
+            fast_path_hits_per_invocation,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Creates a status/out-pointer native entry for one opaque value.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) const fn value_status_out_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        code_bytes: u64,
+        helper_calls_per_invocation: u64,
+        fast_path_hits_per_invocation: u64,
+        specialization: JitNativeSpecialization,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity: 1,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::ValueStatusOut,
+            }),
+            specialization,
+            code_bytes,
+            helper_calls_per_invocation,
+            fast_path_hits_per_invocation,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Creates a status/out-pointer native entry for one opaque value plus metadata.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) fn value_metadata_status_out_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        code_bytes: u64,
+        helper_calls_per_invocation: u64,
+        fast_path_hits_per_invocation: u64,
+        property_load_metadata: JitPropertyLoadMetadata,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity: 2,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::ValueMetadataStatusOut,
+            }),
+            specialization: JitNativeSpecialization::PropertyLoad,
+            code_bytes,
+            helper_calls_per_invocation,
+            fast_path_hits_per_invocation,
+            property_load_metadata: Some(property_load_metadata),
+        }
+    }
+
+    /// Creates a status/out-pointer native entry for two opaque values.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub(crate) const fn value_value_status_out_native(
+        id: u64,
+        region_id: String,
+        backend: JitBackend,
+        address: usize,
+        code_bytes: u64,
+        helper_calls_per_invocation: u64,
+        fast_path_hits_per_invocation: u64,
+        specialization: JitNativeSpecialization,
+    ) -> Self {
+        Self {
+            id,
+            region_id,
+            backend,
+            native_entry: Some(JitNativeEntry {
+                address,
+                arity: 2,
+                abi_hash: JIT_RUNTIME_ABI_HASH,
+                kind: JitNativeEntryKind::ValueValueStatusOut,
+            }),
+            specialization,
+            code_bytes,
+            helper_calls_per_invocation,
+            fast_path_hits_per_invocation,
+            property_load_metadata: None,
+        }
+    }
+
+    /// Returns specialization metadata for VM counter attribution.
+    #[must_use]
+    pub const fn specialization(&self) -> JitNativeSpecialization {
+        self.specialization
+    }
+
+    /// Returns native code bytes associated with the handle.
+    #[must_use]
+    pub const fn code_bytes(&self) -> u64 {
+        self.code_bytes
+    }
+
+    /// Returns statically known helper calls per successful native invocation.
+    #[must_use]
+    pub const fn helper_calls_per_invocation(&self) -> u64 {
+        self.helper_calls_per_invocation
+    }
+
+    /// Returns statically known inline fast-path hits per successful native invocation.
+    #[must_use]
+    pub const fn fast_path_hits_per_invocation(&self) -> u64 {
+        self.fast_path_hits_per_invocation
+    }
+
+    /// Returns monomorphic property-load metadata when this handle carries it.
+    #[must_use]
+    pub const fn property_load_metadata(&self) -> Option<&JitPropertyLoadMetadata> {
+        self.property_load_metadata.as_ref()
+    }
+
+    /// Returns true when this handle expects one opaque runtime value and one integer.
+    #[must_use]
+    pub const fn expects_value_i64(&self) -> bool {
+        matches!(
+            self.native_entry,
+            Some(JitNativeEntry {
+                kind: JitNativeEntryKind::ValueI64StatusOut,
+                ..
+            })
+        )
+    }
+
+    /// Returns true when this handle expects one opaque runtime value.
+    #[must_use]
+    pub const fn expects_value(&self) -> bool {
+        matches!(
+            self.native_entry,
+            Some(JitNativeEntry {
+                kind: JitNativeEntryKind::ValueStatusOut,
+                ..
+            })
+        )
+    }
+
+    /// Returns true when this handle expects two opaque runtime values.
+    #[must_use]
+    pub const fn expects_value_value(&self) -> bool {
+        matches!(
+            self.native_entry,
+            Some(JitNativeEntry {
+                kind: JitNativeEntryKind::ValueValueStatusOut,
+                ..
+            })
+        )
+    }
+
+    /// Returns true when this handle expects one value plus metadata.
+    #[must_use]
+    pub const fn expects_value_metadata(&self) -> bool {
+        matches!(
+            self.native_entry,
+            Some(JitNativeEntry {
+                kind: JitNativeEntryKind::ValueMetadataStatusOut,
+                ..
+            })
+        )
+    }
+
+    /// Invokes a compiled `i64` return function after checking the runtime ABI.
+    pub fn invoke_i64(&self, args: &[i64], runtime_abi_hash: u64) -> Result<i64, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        if args.len() != usize::from(entry.arity) {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: entry.arity,
+                actual: args.len() as u8,
+            });
+        }
+        entry.invoke_i64(args)
+    }
+
+    /// Invokes a native entry specialized for `Value` plus integer index.
+    pub fn invoke_value_i64(
+        &self,
+        value_ptr: usize,
+        index: i64,
+        runtime_abi_hash: u64,
+    ) -> Result<i64, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        entry.invoke_value_i64(value_ptr, index)
+    }
+
+    /// Invokes a native entry specialized for one `Value` argument.
+    pub fn invoke_value(
+        &self,
+        value_ptr: usize,
+        runtime_abi_hash: u64,
+    ) -> Result<i64, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        entry.invoke_value(value_ptr)
+    }
+
+    /// Invokes a native entry specialized for two `Value` arguments.
+    pub fn invoke_value_value(
+        &self,
+        lhs_ptr: usize,
+        rhs_ptr: usize,
+        runtime_abi_hash: u64,
+    ) -> Result<usize, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        entry.invoke_value_value(lhs_ptr, rhs_ptr)
+    }
+
+    /// Invokes a native entry specialized for one `Value` plus metadata.
+    pub fn invoke_value_metadata(
+        &self,
+        value_ptr: usize,
+        metadata_ptr: usize,
+        runtime_abi_hash: u64,
+    ) -> Result<usize, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        entry.invoke_value_metadata(value_ptr, metadata_ptr)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JitNativeEntry {
+    address: usize,
+    arity: u8,
+    abi_hash: u64,
+    kind: JitNativeEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+enum JitNativeEntryKind {
+    I64Return,
+    I64StatusOut,
+    ValueI64StatusOut,
+    ValueStatusOut,
+    ValueMetadataStatusOut,
+    ValueValueStatusOut,
+}
+
+impl JitNativeEntry {
+    fn invoke_i64(self, args: &[i64]) -> Result<i64, JitInvokeError> {
+        match self.kind {
+            JitNativeEntryKind::I64Return => self.invoke_i64_return(args),
+            JitNativeEntryKind::I64StatusOut => self.invoke_i64_status_out(args),
+            JitNativeEntryKind::ValueI64StatusOut
+            | JitNativeEntryKind::ValueStatusOut
+            | JitNativeEntryKind::ValueMetadataStatusOut
+            | JitNativeEntryKind::ValueValueStatusOut => Err(JitInvokeError::ArityMismatch {
+                expected: self.arity,
+                actual: args.len() as u8,
+            }),
+        }
+    }
+
+    fn invoke_i64_return(self, args: &[i64]) -> Result<i64, JitInvokeError> {
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(...i64) -> i64` signature. The public method checks
+        // ABI hash and exact arity before reaching this call.
+        let value = unsafe {
+            match args {
+                [] => {
+                    let function: extern "C" fn() -> i64 = mem::transmute(self.address);
+                    function()
+                }
+                [a] => {
+                    let function: extern "C" fn(i64) -> i64 = mem::transmute(self.address);
+                    function(*a)
+                }
+                [a, b] => {
+                    let function: extern "C" fn(i64, i64) -> i64 = mem::transmute(self.address);
+                    function(*a, *b)
+                }
+                [a, b, c] => {
+                    let function: extern "C" fn(i64, i64, i64) -> i64 =
+                        mem::transmute(self.address);
+                    function(*a, *b, *c)
+                }
+                [a, b, c, d] => {
+                    let function: extern "C" fn(i64, i64, i64, i64) -> i64 =
+                        mem::transmute(self.address);
+                    function(*a, *b, *c, *d)
+                }
+                _ => return Err(JitInvokeError::UnsupportedArity(args.len() as u8)),
+            }
+        };
+        Ok(value)
+    }
+
+    fn invoke_i64_status_out(self, args: &[i64]) -> Result<i64, JitInvokeError> {
+        let mut out = 0_i64;
+        let out_ptr = &mut out as *mut i64;
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(...i64, *mut i64) -> i32` signature. The public method
+        // checks ABI hash and exact arity before reaching this call.
+        let status = unsafe {
+            match args {
+                [] => {
+                    let function: extern "C" fn(*mut i64) -> i32 = mem::transmute(self.address);
+                    function(out_ptr)
+                }
+                [a] => {
+                    let function: extern "C" fn(i64, *mut i64) -> i32 =
+                        mem::transmute(self.address);
+                    function(*a, out_ptr)
+                }
+                [a, b] => {
+                    let function: extern "C" fn(i64, i64, *mut i64) -> i32 =
+                        mem::transmute(self.address);
+                    function(*a, *b, out_ptr)
+                }
+                [a, b, c] => {
+                    let function: extern "C" fn(i64, i64, i64, *mut i64) -> i32 =
+                        mem::transmute(self.address);
+                    function(*a, *b, *c, out_ptr)
+                }
+                [a, b, c, d] => {
+                    let function: extern "C" fn(i64, i64, i64, i64, *mut i64) -> i32 =
+                        mem::transmute(self.address);
+                    function(*a, *b, *c, *d, out_ptr)
+                }
+                _ => return Err(JitInvokeError::UnsupportedArity(args.len() as u8)),
+            }
+        };
+        if status == JIT_HELPER_STATUS_OK {
+            Ok(out)
+        } else {
+            Err(JitInvokeError::NativeStatus(status))
+        }
+    }
+
+    fn invoke_value_i64(self, value_ptr: usize, index: i64) -> Result<i64, JitInvokeError> {
+        if self.kind != JitNativeEntryKind::ValueI64StatusOut {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: self.arity,
+                actual: 2,
+            });
+        }
+        let mut out = 0_i64;
+        let out_ptr = &mut out as *mut i64;
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(usize, i64, *mut i64) -> i32` signature. The public
+        // method checks ABI hashes before reaching this call.
+        let status = unsafe {
+            let function: extern "C" fn(usize, i64, *mut i64) -> i32 = mem::transmute(self.address);
+            function(value_ptr, index, out_ptr)
+        };
+        if status == JIT_HELPER_STATUS_OK {
+            Ok(out)
+        } else {
+            Err(JitInvokeError::NativeStatus(status))
+        }
+    }
+
+    fn invoke_value(self, value_ptr: usize) -> Result<i64, JitInvokeError> {
+        if self.kind != JitNativeEntryKind::ValueStatusOut {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: self.arity,
+                actual: 1,
+            });
+        }
+        let mut out = 0_i64;
+        let out_ptr = &mut out as *mut i64;
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(usize, *mut i64) -> i32` signature. The public method
+        // checks ABI hashes before reaching this call.
+        let status = unsafe {
+            let function: extern "C" fn(usize, *mut i64) -> i32 = mem::transmute(self.address);
+            function(value_ptr, out_ptr)
+        };
+        if status == JIT_HELPER_STATUS_OK {
+            Ok(out)
+        } else {
+            Err(JitInvokeError::NativeStatus(status))
+        }
+    }
+
+    fn invoke_value_value(self, lhs_ptr: usize, rhs_ptr: usize) -> Result<usize, JitInvokeError> {
+        if self.kind != JitNativeEntryKind::ValueValueStatusOut {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: self.arity,
+                actual: 2,
+            });
+        }
+        let mut out = 0_usize;
+        let out_ptr = &mut out as *mut usize;
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(usize, usize, *mut usize) -> i32` signature. The public
+        // method checks ABI hashes before reaching this call.
+        let status = unsafe {
+            let function: extern "C" fn(usize, usize, *mut usize) -> i32 =
+                mem::transmute(self.address);
+            function(lhs_ptr, rhs_ptr, out_ptr)
+        };
+        if status == JIT_HELPER_STATUS_OK {
+            Ok(out)
+        } else {
+            Err(JitInvokeError::NativeStatus(status))
+        }
+    }
+
+    fn invoke_value_metadata(
+        self,
+        value_ptr: usize,
+        metadata_ptr: usize,
+    ) -> Result<usize, JitInvokeError> {
+        if self.kind != JitNativeEntryKind::ValueMetadataStatusOut {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: self.arity,
+                actual: 2,
+            });
+        }
+        let mut out = 0_usize;
+        let out_ptr = &mut out as *mut usize;
+        // SAFETY: Handles are created only after Cranelift defines the matching
+        // `extern "C" fn(usize, usize, *mut usize) -> i32` signature. The
+        // public method checks ABI hashes before reaching this call.
+        let status = unsafe {
+            let function: extern "C" fn(usize, usize, *mut usize) -> i32 =
+                mem::transmute(self.address);
+            function(value_ptr, metadata_ptr, out_ptr)
+        };
+        if status == JIT_HELPER_STATUS_OK {
+            Ok(out)
+        } else {
+            Err(JitInvokeError::NativeStatus(status))
+        }
+    }
+}
+
+/// Invocation failures reported before interpreter fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JitInvokeError {
+    /// Handle does not contain an executable entry.
+    MissingNativeEntry,
+    /// VM/runtime ABI hash does not match the compiled entry.
+    AbiHashMismatch { expected: u64, actual: u64 },
+    /// Call arguments do not match the compiled signature.
+    ArityMismatch { expected: u8, actual: u8 },
+    /// This prompt only exposes a tiny fixed-arity trampoline.
+    UnsupportedArity(u8),
+    /// Native code returned a non-zero helper status.
+    NativeStatus(i32),
+}
+
+impl JitInvokeError {
+    /// Native helper status when available.
+    #[must_use]
+    pub const fn native_status(&self) -> Option<i32> {
+        match self {
+            Self::NativeStatus(status) => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Returns structured side-exit metadata for failures that should resume
+    /// through the interpreter instead of trusting native output.
+    #[must_use]
+    pub const fn side_exit(&self) -> JitSideExit {
+        match self {
+            Self::MissingNativeEntry | Self::UnsupportedArity(_) => {
+                JitSideExit::new(SideExitReason::UnsupportedValue)
+            }
+            Self::AbiHashMismatch { .. } => JitSideExit::new(SideExitReason::AbiMismatch),
+            Self::ArityMismatch { .. } => JitSideExit::new(SideExitReason::TypeMismatch),
+            Self::NativeStatus(status) if *status == JIT_HELPER_STATUS_OVERFLOW => {
+                JitSideExit::new(SideExitReason::Overflow).with_status(*status)
+            }
+            Self::NativeStatus(status) => {
+                JitSideExit::new(SideExitReason::HelperStatus).with_status(*status)
+            }
+        }
+    }
 }
 
 /// Machine-readable compile status.
@@ -143,6 +845,8 @@ pub enum JitCompileStatus {
     NativeExecutionDisabled,
     /// Region was rejected before code generation.
     Rejected { reason: String },
+    /// Region compiled to native code.
+    Compiled,
 }
 
 impl JitCompileStatus {
@@ -154,6 +858,7 @@ impl JitCompileStatus {
             Self::BackendUnavailable => "backend_unavailable",
             Self::NativeExecutionDisabled => "native_execution_disabled",
             Self::Rejected { .. } => "rejected",
+            Self::Compiled => "compiled",
         }
     }
 }
@@ -201,10 +906,14 @@ pub struct JitStats {
     pub native_execution_disabled: u64,
     /// Regions rejected by the skeleton before code generation.
     pub rejected: u64,
-    /// Native compile successes. Always zero in Prompt 07.49.
+    /// Native compile successes. Zero until native compile prompts enable it.
     pub native_compiles: u64,
-    /// Executable memory allocations. Always zero in Prompt 07.49.
+    /// Executable memory allocations. Zero until native compile prompts enable it.
     pub executable_memory_allocations: u64,
+    /// Native code bytes emitted by successful compiles.
+    pub native_code_bytes: u64,
+    /// Cumulative native compile latency in nanoseconds.
+    pub native_compile_time_nanos: u64,
     /// Eligibility analyses observed.
     pub eligibility_analyses: u64,
     /// Functions accepted by the conservative eligibility analysis.
@@ -277,43 +986,133 @@ impl JitEngine {
         report
     }
 
-    /// Attempts to compile a region.
-    ///
-    /// Prompt 07.49 never emits native code. The method only records why the
-    /// request is skipped or rejected.
+    /// Attempts to compile a region with the build-selected backend.
     pub fn compile(&mut self, request: JitCompileRequest) -> Result<JitCompileResult, JitError> {
+        let mut backend = CurrentJitBackend::new(self.backend);
+        self.compile_with_backend(request, &mut backend)
+    }
+
+    /// Attempts to compile one IR function with the build-selected backend.
+    pub fn compile_function(
+        &mut self,
+        unit: &IrUnit,
+        function: FunctionId,
+        request: JitCompileRequest,
+    ) -> Result<JitCompileResult, JitError> {
+        let mut backend = CurrentJitBackend::new(self.backend);
+        self.compile_function_with_backend(unit, function, request, &mut backend)
+    }
+
+    /// Attempts to compile one IR function with runtime helper addresses.
+    pub fn compile_function_with_runtime_helpers(
+        &mut self,
+        unit: &IrUnit,
+        function: FunctionId,
+        request: JitCompileRequest,
+        runtime_helpers: JitRuntimeHelperAddresses,
+    ) -> Result<JitCompileResult, JitError> {
+        let mut backend = CurrentJitBackend::new(self.backend);
+        self.compile_inner(
+            request,
+            Some(unit),
+            Some(function),
+            runtime_helpers,
+            &mut backend,
+        )
+    }
+
+    /// Attempts to compile a region through a backend-neutral implementation.
+    ///
+    /// This is the API boundary the VM can exercise without taking a concrete
+    /// dependency on Cranelift internals.
+    pub fn compile_with_backend<B: JitBackendApi>(
+        &mut self,
+        request: JitCompileRequest,
+        backend: &mut B,
+    ) -> Result<JitCompileResult, JitError> {
+        self.compile_inner(
+            request,
+            None,
+            None,
+            JitRuntimeHelperAddresses::default(),
+            backend,
+        )
+    }
+
+    /// Attempts to compile one IR function through a backend-neutral implementation.
+    pub fn compile_function_with_backend<B: JitBackendApi>(
+        &mut self,
+        unit: &IrUnit,
+        function: FunctionId,
+        request: JitCompileRequest,
+        backend: &mut B,
+    ) -> Result<JitCompileResult, JitError> {
+        self.compile_inner(
+            request,
+            Some(unit),
+            Some(function),
+            JitRuntimeHelperAddresses::default(),
+            backend,
+        )
+    }
+
+    fn compile_inner<B: JitBackendApi>(
+        &mut self,
+        request: JitCompileRequest,
+        unit: Option<&IrUnit>,
+        function: Option<FunctionId>,
+        runtime_helpers: JitRuntimeHelperAddresses,
+        backend: &mut B,
+    ) -> Result<JitCompileResult, JitError> {
         if request.region_id.is_empty() {
             return Err(JitError::EmptyRegionId);
         }
 
         self.stats.compile_requests += 1;
-        let status = if !self.options.enabled {
+        let (status, handle, diagnostics) = if !self.options.enabled {
             self.stats.disabled_requests += 1;
-            JitCompileStatus::Disabled
-        } else if self.backend == JitBackend::Stub {
-            self.stats.backend_unavailable += 1;
-            JitCompileStatus::BackendUnavailable
-        } else if !self.options.allow_native_execution {
-            self.stats.native_execution_disabled += 1;
-            JitCompileStatus::NativeExecutionDisabled
+            (
+                JitCompileStatus::Disabled,
+                None,
+                vec![format!(
+                    "jit region `{}` skipped with status `disabled`",
+                    request.region_id
+                )],
+            )
         } else {
-            self.stats.rejected += 1;
-            JitCompileStatus::Rejected {
-                reason: "jit code generation is not implemented in prompt 07.49".to_owned(),
+            let backend_request = JitBackendCompileRequest {
+                compile: &request,
+                unit,
+                function,
+                allow_native_execution: self.options.allow_native_execution,
+                runtime_helpers,
+            };
+            let outcome = backend.compile_region(&backend_request);
+            self.record_compile_status(&outcome.status);
+            self.stats.native_code_bytes += outcome.code_bytes;
+            self.stats.native_compile_time_nanos += outcome.compile_time_nanos;
+            if outcome.handle.is_some() {
+                self.stats.executable_memory_allocations += 1;
             }
+            (outcome.status, outcome.handle, outcome.diagnostics)
         };
 
-        let diagnostics = vec![format!(
-            "jit region `{}` skipped with status `{}`",
-            request.region_id,
-            status.as_str()
-        )];
         Ok(JitCompileResult {
             status,
-            handle: None,
+            handle,
             diagnostics,
             stats: self.stats.clone(),
         })
+    }
+
+    fn record_compile_status(&mut self, status: &JitCompileStatus) {
+        match status {
+            JitCompileStatus::Disabled => self.stats.disabled_requests += 1,
+            JitCompileStatus::BackendUnavailable => self.stats.backend_unavailable += 1,
+            JitCompileStatus::NativeExecutionDisabled => self.stats.native_execution_disabled += 1,
+            JitCompileStatus::Rejected { .. } => self.stats.rejected += 1,
+            JitCompileStatus::Compiled => self.stats.native_compiles += 1,
+        }
     }
 }
 
@@ -333,7 +1132,7 @@ mod tests {
     };
     use php_ir::{
         BinaryOp, BlockId, FunctionFlags, FunctionId, InstrId, InstructionKind, IrBuilder,
-        IrConstant, IrSpan, LocalId, Operand, RegId, UnitId,
+        IrConstant, IrReturnType, IrSpan, LocalId, Operand, RegId, UnitId,
     };
 
     #[test]
@@ -406,6 +1205,10 @@ mod tests {
         let report = analyze_jit_eligibility(&unit, function);
 
         assert_eq!(report.eligibility, JitEligibility::Eligible);
+        assert_eq!(
+            report.candidate_kind,
+            Some(super::JitCandidateKind::IntLeafCandidate)
+        );
         assert!(report.reasons.is_empty());
         assert_eq!(report.stats.blocks_analyzed, 1);
         assert_eq!(report.stats.instructions_analyzed, 3);
@@ -426,6 +1229,22 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_marks_typed_int_leaf_candidate_and_serializes_json() {
+        let (unit, function) = typed_int_leaf_fixture();
+        let report = analyze_jit_eligibility(&unit, function);
+
+        assert_eq!(report.eligibility, JitEligibility::Eligible);
+        assert_eq!(
+            report.candidate_kind,
+            Some(super::JitCandidateKind::IntLeafCandidate)
+        );
+        let json = report.to_json();
+        assert!(json.contains("\"status\":\"eligible\""));
+        assert!(json.contains("\"candidate_kind\":\"IntLeafCandidate\""));
+        assert!(json.contains("\"function_name\":\"typed_int_leaf\""));
+    }
+
+    #[test]
     fn eligibility_rejects_calls_arrays_and_nonprimitive_constants() {
         let (unit, function) = rejected_dynamic_fixture();
         let report = analyze_jit_eligibility(&unit, function);
@@ -436,6 +1255,20 @@ mod tests {
         assert!(codes.contains(&"JIT_ELIGIBILITY_REJECT_ARRAY_OPCODE"));
         assert!(codes.contains(&"JIT_ELIGIBILITY_REJECT_NON_PRIMITIVE_CONSTANT"));
         assert!(report.debug_output().contains("status=rejected"));
+    }
+
+    #[test]
+    fn eligibility_rejects_untyped_parameters_without_profile() {
+        let (unit, function) = untyped_param_fixture();
+        let report = analyze_jit_eligibility(&unit, function);
+
+        assert_eq!(report.eligibility.as_str(), "rejected");
+        assert!(report.candidate_kind.is_none());
+        assert_eq!(
+            report.reasons[0].code,
+            "JIT_ELIGIBILITY_REJECT_UNTYPED_PARAM"
+        );
+        assert!(report.to_json().contains("no stable int profile"));
     }
 
     #[test]
@@ -540,6 +1373,102 @@ mod tests {
             span,
         );
         builder.terminate_return(function, block, Some(Operand::Register(r2)), span);
+        (builder.finish(), function)
+    }
+
+    fn typed_int_leaf_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file =
+            builder.add_file("tests/fixtures/phase7/cranelift/eligibility/eligible-int-leaf.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function = builder.start_function("typed_int_leaf", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        let local_a = builder.intern_local(function, "a");
+        let local_b = builder.intern_local(function, "b");
+        builder.push_param(
+            function,
+            php_ir::IrParam {
+                name: "a".to_owned(),
+                local: local_a,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        builder.push_param(
+            function,
+            php_ir::IrParam {
+                name: "b".to_owned(),
+                local: local_b,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        let r0 = builder.alloc_register(function);
+        let r1 = builder.alloc_register(function);
+        let r2 = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal {
+                dst: r0,
+                local: local_a,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal {
+                dst: r1,
+                local: local_b,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Binary {
+                dst: r2,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(r0),
+                rhs: Operand::Register(r1),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(r2)), span);
+        (builder.finish(), function)
+    }
+
+    fn untyped_param_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder
+            .add_file("tests/fixtures/phase7/cranelift/eligibility/rejected-untyped-param.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function =
+            builder.start_function("rejected_untyped_param", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        let local = builder.intern_local(function, "value");
+        builder.push_required_param(function, "value", local);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        let r0 = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal { dst: r0, local },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(r0)), span);
         (builder.finish(), function)
     }
 

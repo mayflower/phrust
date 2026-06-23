@@ -19,7 +19,7 @@ on:
 
 jobs:
   verify:
-    name: Phase 7 verify
+    name: Phase 7 verify default
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -44,6 +44,30 @@ jobs:
             target/phase7/**/*.json
             target/phase7/**/*.md
             target/phase7/**/*.txt
+
+  cranelift:
+    name: Phase 7 Cranelift optional
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Verify optional Cranelift addendum
+        run: nix develop -c just verify-phase7-cranelift
+
+      - name: Upload Phase 7 Cranelift reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase7-cranelift-reports
+          if-no-files-found: ignore
+          path: |
+            target/phase7/cranelift/**/*.json
+            target/phase7/cranelift/**/*.md
+            target/phase7/cranelift/**/*.txt
 
   benchmarks:
     name: Optional Phase 7 benchmarks

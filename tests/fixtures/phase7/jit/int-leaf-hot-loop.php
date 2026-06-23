@@ -1,5 +1,5 @@
 <?php
-function phase7_jit_add($a, $b) {
+function phase7_jit_add(int $a, int $b): int {
     return $a + $b;
 }
 

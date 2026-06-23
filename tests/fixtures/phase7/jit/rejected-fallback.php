@@ -1,5 +1,5 @@
 <?php
-function phase7_jit_reject($value) {
+function phase7_jit_reject($value): int {
     return strlen($value);
 }
 
