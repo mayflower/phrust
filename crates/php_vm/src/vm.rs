@@ -4,11 +4,25 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::compiled_unit::CompiledUnit;
+use crate::counters::VmCounters;
 use crate::frame::{CallStack, Frame};
-use crate::include::IncludeLoader;
+use crate::include::{IncludeLoader, include_path_file_fingerprint};
+use crate::inline_cache::{
+    AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
+    AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
+    ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallCacheTarget,
+    IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind, InlineCacheMode,
+    InlineCacheObservation, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
+    PropertyFetchCacheTarget,
+};
+use crate::literal_pool::LiteralPool;
+use crate::quickening::{
+    QuickeningMode, QuickeningObservation, QuickeningSpecialization, QuickeningTable,
+};
+use crate::tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 use php_ir::constants::IrConstant;
 use php_ir::function::{IrFunction, IrParam, IrReturnType};
-use php_ir::ids::{BlockId, ConstId, FunctionId, LocalId};
+use php_ir::ids::{BlockId, ConstId, FunctionId, InstrId, LocalId};
 use php_ir::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, Instruction,
     InstructionKind, IrCallArg, TerminatorKind, UnaryOp,
@@ -16,9 +30,10 @@ use php_ir::instruction::{
 use php_ir::module::IrUnit;
 use php_ir::operand::Operand;
 use php_ir::verify::verify_unit;
+use php_runtime::IniRegistry;
 use php_runtime::{
     ArrayKey, AttributeEntry as RuntimeAttributeEntry, AutoloadRegistry, BuiltinContext,
-    BuiltinRegistry, CallableValue, ClassConstantEntry as RuntimeClassConstantEntry,
+    BuiltinEntry, BuiltinRegistry, CallableValue, ClassConstantEntry as RuntimeClassConstantEntry,
     ClassConstantFlags as RuntimeClassConstantFlags, ClassEntry as RuntimeClassEntry,
     ClassEnumBackingType as RuntimeClassEnumBackingType,
     ClassEnumCaseEntry as RuntimeClassEnumCaseEntry, ClassFlags as RuntimeClassFlags,
@@ -27,20 +42,41 @@ use php_runtime::{
     ClassPropertyFlags as RuntimeClassPropertyFlags,
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ExecutionStatus,
     FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
-    OutputBuffer, PhpArray, PhpString, ReferenceCell, RuntimeContext, RuntimeDiagnostic,
-    RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Value, compare,
-    division_by_zero_mvp, equal, identical, runtime_type_name, to_bool, to_float, to_int,
+    OutputBuffer, PhpArray, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
+    RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Value,
+    compare, division_by_zero_mvp, equal, identical, runtime_type_name, to_bool, to_float, to_int,
     to_number, to_string, undefined_function, undefined_variable_warning, unsupported_feature,
     value_matches_runtime_type, value_type_name,
 };
 #[cfg(test)]
 use php_runtime::{GcEntityId, GcEntityKind};
-use php_runtime::{GcRoot, GcRootKind, GcSnapshot, scan_roots};
+use php_runtime::{GcRoot, GcRootKind, GcSnapshot, ResourceTable, scan_roots};
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 const MAX_EVAL_DEPTH: usize = 16;
+#[cfg(feature = "jit-cranelift")]
+const JIT_WARMUP_THRESHOLD: u64 = 1;
+
+fn output_preallocation_hint(unit: &IrUnit) -> usize {
+    unit.functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            InstructionKind::Echo {
+                src: Operand::Constant(id),
+            } => unit.constants.get(id.index()),
+            _ => None,
+        })
+        .filter_map(|constant| match constant {
+            IrConstant::String(value) => Some(value.len()),
+            _ => None,
+        })
+        .sum()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ForeachIterator {
@@ -174,6 +210,20 @@ pub struct VmOptions {
     pub trace: bool,
     /// Capture deterministic runtime object, reference, COW, and suspension events.
     pub trace_runtime: bool,
+    /// Collect Phase 7 VM/runtime counters in the execution result.
+    pub collect_counters: bool,
+    /// Maintain request-local quickening metadata without changing semantics.
+    pub quickening: QuickeningMode,
+    /// Allocate request-local inline-cache slots without changing semantics.
+    pub inline_caches: InlineCacheMode,
+    /// Enable the experimental Phase 7 JIT tier for eligible hot leaf functions.
+    pub jit: JitMode,
+    /// Request-local adaptive tiering policy and stats configuration.
+    pub tiering: TieringOptions,
+    /// Use conservative fast paths for simple runtime type checks.
+    pub typecheck_fast_paths: bool,
+    /// Cache request-local internal builtin dispatch metadata.
+    pub internal_function_dispatch_cache: bool,
 }
 
 impl Default for VmOptions {
@@ -185,7 +235,160 @@ impl Default for VmOptions {
             runtime_context: RuntimeContext::default(),
             trace: false,
             trace_runtime: false,
+            collect_counters: false,
+            quickening: QuickeningMode::Off,
+            inline_caches: InlineCacheMode::Off,
+            jit: JitMode::Off,
+            tiering: TieringOptions::default(),
+            typecheck_fast_paths: true,
+            internal_function_dispatch_cache: true,
         }
+    }
+}
+
+/// Experimental Phase 7 JIT switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JitMode {
+    /// Keep all execution on the interpreter.
+    #[default]
+    Off,
+    /// Allow feature-gated hot leaf functions to use the JIT tier.
+    On,
+}
+
+impl JitMode {
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct JitFunctionKey {
+    unit: u64,
+    function: FunctionId,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct JitFunctionState {
+    calls: u64,
+    compiled: bool,
+    disabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct JitRuntimeState {
+    functions: HashMap<JitFunctionKey, JitFunctionState>,
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn jit_leaf_call_shape_is_supported(
+    function: &IrFunction,
+    call_shape_supported: bool,
+    args: &[PreparedArg],
+) -> bool {
+    call_shape_supported
+        && !function.flags.is_top_level
+        && !function.flags.is_closure
+        && !function.flags.is_method
+        && !function.flags.is_generator
+        && !function.returns_by_ref
+        && function.return_type.is_none()
+        && function.captures.is_empty()
+        && function.params.iter().all(|param| {
+            !param.by_ref && !param.variadic && param.default.is_none() && param.type_.is_none()
+        })
+        && args.iter().all(|arg| arg.reference.is_none())
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn execute_jit_int_leaf(
+    unit: &IrUnit,
+    function: &IrFunction,
+    args: &[PreparedArg],
+) -> Result<Value, ()> {
+    if function.blocks.len() != 1 || function.params.len() != args.len() {
+        return Err(());
+    }
+    let mut locals = vec![None; function.local_count as usize];
+    let mut registers = vec![None; function.register_count as usize];
+    for (param, arg) in function.params.iter().zip(args) {
+        locals[param.local.index()] = Some(value_as_jit_int(&arg.value)?);
+    }
+
+    let block = &function.blocks[0];
+    for instruction in &block.instructions {
+        match &instruction.kind {
+            InstructionKind::Nop => {}
+            InstructionKind::LoadConst { dst, constant } => {
+                registers[dst.index()] = Some(constant_as_jit_int(unit, *constant)?);
+            }
+            InstructionKind::Move { dst, src } => {
+                registers[dst.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
+            }
+            InstructionKind::LoadLocal { dst, local } => {
+                registers[dst.index()] =
+                    Some(locals.get(local.index()).copied().flatten().ok_or(())?);
+            }
+            InstructionKind::StoreLocal { local, src } => {
+                locals[local.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
+            }
+            InstructionKind::Binary { dst, op, lhs, rhs } => {
+                let lhs = operand_as_jit_int(unit, &registers, &locals, lhs)?;
+                let rhs = operand_as_jit_int(unit, &registers, &locals, rhs)?;
+                let value = match op {
+                    BinaryOp::Add => lhs.checked_add(rhs).ok_or(())?,
+                    BinaryOp::Sub => lhs.checked_sub(rhs).ok_or(())?,
+                    BinaryOp::Mul => lhs.checked_mul(rhs).ok_or(())?,
+                    _ => return Err(()),
+                };
+                registers[dst.index()] = Some(value);
+            }
+            _ => return Err(()),
+        }
+    }
+
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(value),
+                by_ref_local: None,
+            } => Ok(Value::Int(operand_as_jit_int(
+                unit, &registers, &locals, value,
+            )?)),
+            _ => Err(()),
+        },
+        None => Err(()),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn operand_as_jit_int(
+    unit: &IrUnit,
+    registers: &[Option<i64>],
+    locals: &[Option<i64>],
+    operand: &Operand,
+) -> Result<i64, ()> {
+    match operand {
+        Operand::Register(register) => registers.get(register.index()).copied().flatten().ok_or(()),
+        Operand::Local(local) => locals.get(local.index()).copied().flatten().ok_or(()),
+        Operand::Constant(constant) => constant_as_jit_int(unit, *constant),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn constant_as_jit_int(unit: &IrUnit, constant: ConstId) -> Result<i64, ()> {
+    match unit.constants.get(constant.index()) {
+        Some(IrConstant::Int(value)) => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn value_as_jit_int(value: &Value) -> Result<i64, ()> {
+    match value {
+        Value::Int(value) => Ok(*value),
+        _ => Err(()),
     }
 }
 
@@ -205,6 +408,10 @@ pub struct VmResult {
     return_ref: Option<ReferenceCell>,
     /// Deterministic trace events captured when `VmOptions::trace` is enabled.
     pub trace: Vec<String>,
+    /// Optional Phase 7 VM/runtime counters.
+    pub counters: Option<VmCounters>,
+    /// Optional Phase 7 tiering stats.
+    pub tiering_stats: Option<TieringStats>,
 }
 
 /// VM control-flow signal, kept separate from runtime diagnostics.
@@ -220,7 +427,55 @@ pub enum VmControlFlow {
     Continue,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum PropertyFetchCacheRead {
+    Value(Value),
+    Fallback,
+}
+
+enum ClassStaticCacheRead {
+    Value(Value),
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternalFunctionDispatchCacheOutcome {
+    Hit,
+    Miss,
+    Uncached,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InternalFunctionDispatchCache {
+    entries: HashMap<String, BuiltinEntry>,
+}
+
+impl InternalFunctionDispatchCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn lookup(
+        &mut self,
+        name: &str,
+    ) -> (Option<BuiltinEntry>, InternalFunctionDispatchCacheOutcome) {
+        if !internal_function_dispatch_cacheable(name) {
+            return (
+                BuiltinRegistry::new().get(name),
+                InternalFunctionDispatchCacheOutcome::Uncached,
+            );
+        }
+        if let Some(entry) = self.entries.get(name).copied() {
+            return (Some(entry), InternalFunctionDispatchCacheOutcome::Hit);
+        }
+        let entry = BuiltinRegistry::new().get(name);
+        if let Some(entry) = entry {
+            self.entries.insert(name.to_owned(), entry);
+        }
+        (entry, InternalFunctionDispatchCacheOutcome::Miss)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ExecutionState {
     globals: GlobalSymbolTable,
     included_once: Vec<PathBuf>,
@@ -236,9 +491,72 @@ struct ExecutionState {
     yield_from_delegations: HashMap<YieldFromKey, YieldFromDelegation>,
     eval_depth: usize,
     eval_counter: usize,
+    function_table_epoch: u64,
+    autoload_stack_epoch: u64,
+    class_table_epoch: u64,
+    include_config_epoch: u64,
     autoload_registry: AutoloadRegistry,
     autoload_stack: Vec<String>,
-    dynamic_classes: Vec<php_ir::module::ClassEntry>,
+    dynamic_units: Vec<CompiledUnit>,
+    dynamic_functions: Vec<DynamicFunctionEntry>,
+    dynamic_classes: Vec<DynamicClassEntry>,
+    ini: IniRegistry,
+    env: Vec<(String, String)>,
+    resources: ResourceTable,
+    error_handlers: Vec<ErrorHandlerEntry>,
+    exception_handlers: Vec<CallableValue>,
+}
+
+impl ExecutionState {
+    fn lookup_epoch(&self) -> InvalidationEpoch {
+        InvalidationEpoch::new(self.function_table_epoch)
+    }
+
+    fn bump_lookup_epoch(&mut self) {
+        self.function_table_epoch = self.function_table_epoch.saturating_add(1);
+    }
+
+    fn autoload_class_lookup_epochs(&self) -> AutoloadClassLookupEpochs {
+        AutoloadClassLookupEpochs {
+            autoload_stack_epoch: self.autoload_stack_epoch,
+            class_table_epoch: self.class_table_epoch,
+            include_config_epoch: self.include_config_epoch,
+        }
+    }
+
+    fn bump_autoload_stack_epoch(&mut self) {
+        self.autoload_stack_epoch = self.autoload_stack_epoch.saturating_add(1);
+        self.bump_lookup_epoch();
+    }
+
+    fn bump_class_table_epoch(&mut self) {
+        self.class_table_epoch = self.class_table_epoch.saturating_add(1);
+        self.bump_lookup_epoch();
+    }
+
+    fn bump_include_config_epoch(&mut self) {
+        self.include_config_epoch = self.include_config_epoch.saturating_add(1);
+        self.bump_lookup_epoch();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DynamicFunctionEntry {
+    name: String,
+    unit_index: usize,
+    function: FunctionId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DynamicClassEntry {
+    class: php_ir::module::ClassEntry,
+    unit_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ErrorHandlerEntry {
+    callback: CallableValue,
+    levels: i64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -469,6 +787,11 @@ struct CallArgument {
     by_ref_local: Option<LocalId>,
 }
 
+enum ArrayCallbackError {
+    Runtime(Box<VmResult>),
+    Message(String),
+}
+
 impl CallArgument {
     fn positional(value: Value) -> Self {
         Self {
@@ -480,7 +803,7 @@ impl CallArgument {
 }
 
 impl VmResult {
-    fn success(output: OutputBuffer, return_value: Option<Value>) -> Self {
+    pub(crate) fn success(output: OutputBuffer, return_value: Option<Value>) -> Self {
         Self {
             status: ExecutionStatus::success(),
             output,
@@ -490,10 +813,12 @@ impl VmResult {
             fiber_suspension: None,
             return_ref: None,
             trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
         }
     }
 
-    fn success_with_diagnostics(
+    pub(crate) fn success_with_diagnostics(
         output: OutputBuffer,
         return_value: Option<Value>,
         diagnostics: Vec<RuntimeDiagnostic>,
@@ -507,10 +832,12 @@ impl VmResult {
             fiber_suspension: None,
             return_ref: None,
             trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
         }
     }
 
-    fn runtime_error_with_diagnostic(
+    pub(crate) fn runtime_error_with_diagnostic(
         output: OutputBuffer,
         message: impl Into<String>,
         diagnostic: RuntimeDiagnostic,
@@ -524,6 +851,8 @@ impl VmResult {
             fiber_suspension: None,
             return_ref: None,
             trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
         }
     }
 
@@ -537,6 +866,8 @@ impl VmResult {
             fiber_suspension: None,
             return_ref: None,
             trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
         }
     }
 }
@@ -546,6 +877,13 @@ impl VmResult {
 pub struct Vm {
     options: VmOptions,
     trace: RefCell<Vec<String>>,
+    counters: RefCell<Option<VmCounters>>,
+    literal_pool: RefCell<LiteralPool>,
+    quickening: RefCell<QuickeningTable>,
+    inline_caches: RefCell<InlineCacheTable>,
+    jit: RefCell<JitRuntimeState>,
+    tiering: RefCell<TieringState>,
+    internal_function_dispatch_cache: RefCell<InternalFunctionDispatchCache>,
 }
 
 impl Vm {
@@ -558,9 +896,17 @@ impl Vm {
     /// Creates a VM with explicit options.
     #[must_use]
     pub fn with_options(options: VmOptions) -> Self {
+        let tiering = TieringState::new(options.tiering.clone());
         Self {
             options,
             trace: RefCell::new(Vec::new()),
+            counters: RefCell::new(None),
+            literal_pool: RefCell::new(LiteralPool::default()),
+            quickening: RefCell::new(QuickeningTable::default()),
+            inline_caches: RefCell::new(InlineCacheTable::default()),
+            jit: RefCell::new(JitRuntimeState::default()),
+            tiering: RefCell::new(tiering),
+            internal_function_dispatch_cache: RefCell::new(InternalFunctionDispatchCache::default()),
         }
     }
 
@@ -568,8 +914,18 @@ impl Vm {
     #[must_use]
     pub fn execute(&self, unit: impl Into<CompiledUnit>) -> VmResult {
         let unit = unit.into();
-        let mut output = OutputBuffer::new();
+        let mut output = OutputBuffer::with_capacity(output_preallocation_hint(unit.unit()));
         self.trace.borrow_mut().clear();
+        *self.literal_pool.borrow_mut() = LiteralPool::default();
+        *self.quickening.borrow_mut() = QuickeningTable::default();
+        *self.inline_caches.borrow_mut() = InlineCacheTable::default();
+        *self.jit.borrow_mut() = JitRuntimeState::default();
+        *self.tiering.borrow_mut() = TieringState::new(self.options.tiering.clone());
+        self.internal_function_dispatch_cache.borrow_mut().clear();
+        *self.counters.borrow_mut() = self.options.collect_counters.then(VmCounters::default);
+        if self.options.collect_counters {
+            php_runtime::numeric_string::reset_cache_and_stats();
+        }
 
         if self.options.verify_ir
             && let Err(errors) = verify_unit(unit.unit())
@@ -587,9 +943,14 @@ impl Vm {
         if let Err(message) = validate_class_table(&unit) {
             return VmResult::compile_error(output, message);
         }
+        self.warm_literal_pool(unit.unit());
 
         let mut stack = CallStack::new();
-        let mut state = ExecutionState::default();
+        let mut state = ExecutionState {
+            ini: self.options.runtime_context.ini_registry(),
+            env: self.options.runtime_context.env.clone(),
+            ..ExecutionState::default()
+        };
         seed_runtime_globals(&mut state.globals, &self.options.runtime_context);
         let mut result = self.execute_function(
             &unit,
@@ -613,10 +974,913 @@ impl Vm {
         if self.options.trace_runtime {
             self.record_gc_root_trace_event(&stack, &state);
         }
+        output.flush_all_buffers();
+        let output_len = output.len();
+        let output_stats = output.stats();
+        result.output = output.clone();
         if self.options.trace || self.options.trace_runtime {
             result.trace = self.trace.borrow().clone();
         }
+        if self.options.collect_counters {
+            let stats = php_runtime::numeric_string::take_cache_stats();
+            if let Some(counters) = self.counters.borrow_mut().as_mut() {
+                counters.record_numeric_string_cache_stats(stats);
+                counters.record_output_stats(output_len, output_stats);
+            }
+            result.counters = self.counters.borrow().clone();
+        }
+        if self.options.tiering.collect_stats {
+            result.tiering_stats = Some(self.tiering.borrow().stats());
+        }
         result
+    }
+
+    fn record_counter_instruction(&self, kind: &InstructionKind) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_instruction(kind);
+        }
+    }
+
+    fn record_counter_autoload(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_autoload();
+        }
+    }
+
+    fn record_counter_frame_activation(&self, reused: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_frame_activation(reused);
+        }
+    }
+
+    fn record_counter_literal_intern(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_literal_intern(hit);
+        }
+    }
+
+    fn record_counter_quickening(&self, observation: QuickeningObservation) {
+        self.tiering.borrow_mut().record_quickening(observation);
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_quickening(observation);
+        }
+    }
+
+    fn record_counter_inline_cache(&self, observation: InlineCacheObservation) {
+        self.tiering.borrow_mut().record_inline_cache(observation);
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_inline_cache(observation);
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_compile_attempt(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_compile_attempt();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_compiled(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_compiled();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_executed(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_executed();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_jit_bailout(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_bailout();
+        }
+    }
+
+    fn record_inline_cache_event(&self, observation: InlineCacheObservation) {
+        self.record_counter_inline_cache(observation);
+    }
+
+    fn observe_inline_cache(
+        &self,
+        unit_key: u64,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        kind: &InstructionKind,
+    ) {
+        if !self.options.tiering.enabled || !self.options.inline_caches.enabled() {
+            return;
+        }
+        let Some(cache_kind) = crate::inline_cache::inline_cache_kind_for_instruction(kind) else {
+            return;
+        };
+        let observation = self.inline_caches.borrow_mut().observe_slot(
+            unit_key,
+            function_id,
+            block_id,
+            instruction_id,
+            cache_kind,
+        );
+        self.record_counter_inline_cache(observation);
+    }
+
+    fn lookup_function_call_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lowered_name: &str,
+        epoch: InvalidationEpoch,
+    ) -> Option<FunctionCallCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self.inline_caches.borrow_mut().lookup_function_call(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            lowered_name,
+            epoch,
+        );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn install_function_call_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lowered_name: &str,
+        epoch: InvalidationEpoch,
+        target: FunctionCallCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches.borrow_mut().install_function_call(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            lowered_name,
+            epoch,
+            target,
+        );
+    }
+
+    fn lookup_method_call_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lowered_method: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> Option<MethodCallCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self.inline_caches.borrow_mut().lookup_method_call(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            lowered_method,
+            receiver_class,
+            scope,
+            epoch,
+        );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn install_method_call_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lowered_method: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+        target: MethodCallCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches.borrow_mut().install_method_call(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            lowered_method,
+            receiver_class,
+            scope,
+            epoch,
+            target,
+        );
+    }
+
+    fn lookup_property_fetch_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> Option<PropertyFetchCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self.inline_caches.borrow_mut().lookup_property_fetch(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            scope,
+            epoch,
+        );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn install_property_fetch_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+        target: PropertyFetchCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches.borrow_mut().install_property_fetch(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            scope,
+            epoch,
+            target,
+        );
+    }
+
+    fn lookup_class_constant_static_property_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        kind: ClassConstantStaticPropertyCacheKind,
+        resolved_class: &str,
+        member: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> Option<ClassConstantStaticPropertyCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self
+            .inline_caches
+            .borrow_mut()
+            .lookup_class_constant_static_property(
+                compiled_unit_cache_key(compiled),
+                function_id,
+                block_id,
+                instruction_id,
+                kind,
+                resolved_class,
+                member,
+                scope,
+                epoch,
+            );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn install_class_constant_static_property_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        kind: ClassConstantStaticPropertyCacheKind,
+        resolved_class: &str,
+        member: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+        target: ClassConstantStaticPropertyCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches
+            .borrow_mut()
+            .install_class_constant_static_property(
+                compiled_unit_cache_key(compiled),
+                function_id,
+                block_id,
+                instruction_id,
+                kind,
+                resolved_class,
+                member,
+                scope,
+                epoch,
+                target,
+            );
+    }
+
+    fn observe_quickening(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+    ) {
+        if !self.options.tiering.enabled || !self.options.quickening.enabled() {
+            return;
+        }
+        let observation =
+            self.quickening
+                .borrow_mut()
+                .observe(function_id, block_id, instruction_id);
+        self.record_counter_quickening(observation);
+    }
+
+    fn record_quickening_guard(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        hit: bool,
+    ) {
+        if !self.options.tiering.enabled || !self.options.quickening.enabled() {
+            return;
+        }
+        let observation = self.quickening.borrow_mut().record_specialized_guard(
+            function_id,
+            block_id,
+            instruction_id,
+            hit,
+        );
+        self.record_counter_quickening(observation);
+    }
+
+    fn record_counter_string_concat_fast_path(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_string_concat_fast_path(hit);
+        }
+    }
+
+    fn record_quickened_concat_guard(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        hit: bool,
+    ) {
+        self.record_quickening_guard(function_id, block_id, instruction_id, hit);
+        self.record_counter_string_concat_fast_path(hit);
+    }
+
+    fn record_counter_packed_dim_fast_path(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_packed_dim_fast_path(hit);
+        }
+    }
+
+    fn record_counter_array_packed_append_fast_path_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_packed_append_fast_path_hit();
+        }
+    }
+
+    fn record_counter_array_packed_read_fast_path_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_packed_read_fast_path_hit();
+        }
+    }
+
+    fn record_counter_array_sequential_foreach_fast_path_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_sequential_foreach_fast_path_hit();
+        }
+    }
+
+    fn record_counter_array_count_fast_path_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_count_fast_path_hit();
+        }
+    }
+
+    fn record_counter_array_packed_to_mixed_transition(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_packed_to_mixed_transition();
+        }
+    }
+
+    fn record_array_count_fast_path_if_applicable(&self, name: &str, values: &[Value]) {
+        if name != "count" {
+            return;
+        }
+        let Some(first) = values.first() else {
+            return;
+        };
+        let recursive_mode = values
+            .get(1)
+            .is_some_and(|value| matches!(effective_value(value), Value::Int(1)));
+        if recursive_mode {
+            return;
+        }
+        if matches!(effective_value(first), Value::Array(_)) {
+            self.record_counter_array_count_fast_path_hit();
+        }
+    }
+
+    fn record_counter_internal_function_dispatch(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_internal_function_dispatch();
+        }
+    }
+
+    fn record_counter_internal_function_dispatch_cache(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_internal_function_dispatch_cache(hit);
+        }
+    }
+
+    fn record_counter_internal_count_array_direct_fast_path_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_internal_count_array_direct_fast_path_hit();
+        }
+    }
+
+    fn lookup_internal_function_dispatch(&self, name: &str) -> Option<BuiltinEntry> {
+        if !self.options.internal_function_dispatch_cache {
+            return BuiltinRegistry::new().get(name);
+        }
+        let (entry, outcome) = self
+            .internal_function_dispatch_cache
+            .borrow_mut()
+            .lookup(name);
+        match outcome {
+            InternalFunctionDispatchCacheOutcome::Hit => {
+                self.record_counter_internal_function_dispatch_cache(true);
+            }
+            InternalFunctionDispatchCacheOutcome::Miss => {
+                self.record_counter_internal_function_dispatch_cache(false);
+            }
+            InternalFunctionDispatchCacheOutcome::Uncached => {}
+        }
+        entry
+    }
+
+    fn execute_internal_registry_builtin(
+        &self,
+        name: &str,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> VmResult {
+        self.record_counter_internal_function_dispatch();
+        let Some(entry) = self.lookup_internal_function_dispatch(name) else {
+            return unknown_builtin_result(name, output);
+        };
+        if let Some(result) = self.try_execute_direct_count_array(name, &values, output) {
+            return result;
+        }
+        self.record_array_count_fast_path_if_applicable(name, &values);
+        execute_builtin_entry(
+            entry,
+            values,
+            output,
+            &self.options.runtime_context,
+            state,
+            builtin_source_span(compiled),
+        )
+    }
+
+    fn try_execute_direct_count_array(
+        &self,
+        name: &str,
+        values: &[Value],
+        output: &OutputBuffer,
+    ) -> Option<VmResult> {
+        if name != "count" || values.len() != 1 {
+            return None;
+        }
+        let Value::Array(array) = effective_value(&values[0]) else {
+            return None;
+        };
+        self.record_counter_array_count_fast_path_hit();
+        self.record_counter_internal_count_array_direct_fast_path_hit();
+        Some(VmResult::success(
+            output.clone(),
+            Some(Value::Int(array.len() as i64)),
+        ))
+    }
+
+    fn record_counter_local_slot_fast_path(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_local_slot_fast_path(hit);
+        }
+    }
+
+    fn typecheck_fast_path_context(&self) -> TypecheckFastPathContext<'_> {
+        TypecheckFastPathContext {
+            enabled: self.options.typecheck_fast_paths,
+            counters: self.options.collect_counters.then_some(&self.counters),
+        }
+    }
+
+    fn record_quickened_packed_dim_guard(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        hit: bool,
+    ) {
+        self.record_quickening_guard(function_id, block_id, instruction_id, hit);
+        self.record_counter_packed_dim_fast_path(hit);
+    }
+
+    fn try_quickened_add_int_int(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Option<Value> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+
+        let specialization = {
+            self.quickening
+                .borrow()
+                .specialization(function_id, block_id, instruction_id)
+        };
+
+        match specialization {
+            Some(QuickeningSpecialization::AddIntInt) => match (lhs, rhs) {
+                (Value::Int(lhs), Value::Int(rhs)) => {
+                    if let Some(sum) = lhs.checked_add(*rhs) {
+                        self.record_quickening_guard(function_id, block_id, instruction_id, true);
+                        Some(Value::Int(sum))
+                    } else {
+                        self.record_quickening_guard(function_id, block_id, instruction_id, false);
+                        None
+                    }
+                }
+                _ => {
+                    self.record_quickening_guard(function_id, block_id, instruction_id, false);
+                    None
+                }
+            },
+            None => {
+                if matches!(lhs, Value::Int(_)) && matches!(rhs, Value::Int(_)) {
+                    let observation = self.quickening.borrow_mut().observe_add_int_int_candidate(
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(QuickeningSpecialization::ConcatStringString) => None,
+            Some(QuickeningSpecialization::PackedArrayIntKey) => None,
+        }
+    }
+
+    fn try_quickened_concat_string_string(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Option<Value> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+
+        let specialization = {
+            self.quickening
+                .borrow()
+                .specialization(function_id, block_id, instruction_id)
+        };
+
+        match specialization {
+            Some(QuickeningSpecialization::ConcatStringString) => match (lhs, rhs) {
+                (Value::String(lhs), Value::String(rhs)) => {
+                    let Some(capacity) = lhs.len().checked_add(rhs.len()) else {
+                        self.record_quickened_concat_guard(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            false,
+                        );
+                        return None;
+                    };
+                    let mut bytes = Vec::with_capacity(capacity);
+                    bytes.extend_from_slice(lhs.as_bytes());
+                    bytes.extend_from_slice(rhs.as_bytes());
+                    self.record_quickened_concat_guard(function_id, block_id, instruction_id, true);
+                    Some(Value::String(PhpString::from_bytes(bytes)))
+                }
+                _ => {
+                    self.record_quickened_concat_guard(
+                        function_id,
+                        block_id,
+                        instruction_id,
+                        false,
+                    );
+                    None
+                }
+            },
+            None => {
+                if matches!(lhs, Value::String(_)) && matches!(rhs, Value::String(_)) {
+                    let observation = self
+                        .quickening
+                        .borrow_mut()
+                        .observe_concat_string_string_candidate(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                        );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(
+                QuickeningSpecialization::AddIntInt | QuickeningSpecialization::PackedArrayIntKey,
+            ) => None,
+        }
+    }
+
+    fn try_quickened_packed_array_int_key(
+        &self,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        array: &Value,
+        key: &Value,
+    ) -> Option<Value> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+
+        let specialization = {
+            self.quickening
+                .borrow()
+                .specialization(function_id, block_id, instruction_id)
+        };
+
+        match specialization {
+            Some(QuickeningSpecialization::PackedArrayIntKey) => match (array, key) {
+                (Value::Array(array), Value::Int(index)) if *index >= 0 => {
+                    if let Some(value) = array.packed_element_fast(*index as usize) {
+                        self.record_quickened_packed_dim_guard(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            true,
+                        );
+                        self.record_counter_array_packed_read_fast_path_hit();
+                        Some(effective_value(value))
+                    } else {
+                        self.record_quickened_packed_dim_guard(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            false,
+                        );
+                        None
+                    }
+                }
+                _ => {
+                    self.record_quickened_packed_dim_guard(
+                        function_id,
+                        block_id,
+                        instruction_id,
+                        false,
+                    );
+                    None
+                }
+            },
+            None => {
+                if let (Value::Array(array), Value::Int(index)) = (array, key)
+                    && *index >= 0
+                    && array.packed_element_fast(*index as usize).is_some()
+                {
+                    let observation = self
+                        .quickening
+                        .borrow_mut()
+                        .observe_packed_array_int_key_candidate(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                        );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(
+                QuickeningSpecialization::AddIntInt | QuickeningSpecialization::ConcatStringString,
+            ) => None,
+        }
+    }
+
+    fn intern_bytes(&self, bytes: &[u8]) -> PhpString {
+        let interned = self.literal_pool.borrow_mut().intern_bytes(bytes);
+        let hit = interned.hit;
+        let value = interned.value;
+        self.record_counter_literal_intern(hit);
+        value
+    }
+
+    fn intern_str(&self, value: &str) -> PhpString {
+        self.intern_bytes(value.as_bytes())
+    }
+
+    fn warm_literal_pool(&self, unit: &IrUnit) {
+        for constant in &unit.constants {
+            if let IrConstant::String(value) = constant {
+                self.intern_str(value);
+            }
+        }
+        for function in &unit.functions {
+            self.intern_str(&function.name);
+            for local in &function.locals {
+                self.intern_str(local);
+            }
+            for param in &function.params {
+                self.intern_str(&param.name);
+            }
+            for capture in &function.captures {
+                self.intern_str(&capture.name);
+            }
+        }
+        for entry in &unit.function_table {
+            self.intern_str(&entry.name);
+        }
+        for entry in &unit.constant_table {
+            self.intern_str(&entry.name);
+        }
+        for class in &unit.classes {
+            self.intern_str(&class.name);
+            self.intern_str(&class.display_name);
+            if let Some(parent) = &class.parent {
+                self.intern_str(parent);
+            }
+            for interface in &class.interfaces {
+                self.intern_str(interface);
+            }
+            for method in &class.methods {
+                self.intern_str(&method.name);
+                self.intern_str(&method.origin_class);
+                for attribute in &method.attributes {
+                    self.intern_attribute(attribute);
+                }
+            }
+            for property in &class.properties {
+                self.intern_str(&property.name);
+                for attribute in &property.attributes {
+                    self.intern_attribute(attribute);
+                }
+            }
+            for constant in &class.constants {
+                self.intern_str(&constant.name);
+                for attribute in &constant.attributes {
+                    self.intern_attribute(attribute);
+                }
+            }
+            for case in &class.enum_cases {
+                self.intern_str(&case.name);
+                for attribute in &case.attributes {
+                    self.intern_attribute(attribute);
+                }
+            }
+            for attribute in &class.attributes {
+                self.intern_attribute(attribute);
+            }
+        }
+    }
+
+    fn intern_attribute(&self, attribute: &php_ir::module::AttributeEntry) {
+        self.intern_str(&attribute.name);
+        if let Some(name) = &attribute.resolved_name {
+            self.intern_str(name);
+        }
+        if let Some(name) = &attribute.fallback_name {
+            self.intern_str(name);
+        }
+    }
+
+    fn constant_value(&self, unit: &IrUnit, constant: ConstId) -> Result<Value, String> {
+        let Some(value) = unit.constants.get(constant.index()) else {
+            return Err(format!("invalid constant const:{}", constant.raw()));
+        };
+        Ok(self.inline_constant_value(value))
+    }
+
+    fn inline_constant_value(&self, constant: &IrConstant) -> Value {
+        match constant {
+            IrConstant::Null => Value::Null,
+            IrConstant::Bool(value) => Value::Bool(*value),
+            IrConstant::Int(value) => Value::Int(*value),
+            IrConstant::Float(value) => Value::float(*value),
+            IrConstant::String(value) => Value::String(self.intern_str(value)),
+        }
     }
 
     fn record_trace_event(
@@ -683,6 +1947,85 @@ impl Vm {
         ));
     }
 
+    #[cfg(not(feature = "jit-cranelift"))]
+    fn try_execute_jit_leaf(
+        &self,
+        _compiled: &CompiledUnit,
+        _function_id: FunctionId,
+        _function: &IrFunction,
+        _tier: ExecutionTier,
+        _call_shape_supported: bool,
+        _args: &[PreparedArg],
+    ) -> Option<Value> {
+        None
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    fn try_execute_jit_leaf(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        function: &IrFunction,
+        tier: ExecutionTier,
+        call_shape_supported: bool,
+        args: &[PreparedArg],
+    ) -> Option<Value> {
+        if tier != ExecutionTier::Jit
+            || !self.options.tiering.enabled
+            || !self.options.jit.enabled()
+            || !jit_leaf_call_shape_is_supported(function, call_shape_supported, args)
+        {
+            return None;
+        }
+
+        let key = JitFunctionKey {
+            unit: compiled_unit_cache_key(compiled),
+            function: function_id,
+        };
+        let should_compile = {
+            let mut jit = self.jit.borrow_mut();
+            let entry = jit.functions.entry(key).or_default();
+            if entry.disabled {
+                return None;
+            }
+            entry.calls = entry.calls.saturating_add(1);
+            if entry.calls < JIT_WARMUP_THRESHOLD {
+                return None;
+            }
+            !entry.compiled
+        };
+
+        if should_compile {
+            self.record_counter_jit_compile_attempt();
+            match php_jit::lower_function_to_cranelift(compiled.unit(), function_id) {
+                Ok(_) => {
+                    if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
+                        entry.compiled = true;
+                    }
+                    self.record_counter_jit_compiled();
+                }
+                Err(_) => {
+                    if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
+                        entry.disabled = true;
+                    }
+                    self.record_counter_jit_bailout();
+                    return None;
+                }
+            }
+        }
+
+        match execute_jit_int_leaf(compiled.unit(), function, args) {
+            Ok(value) => {
+                self.record_counter_jit_executed();
+                Some(value)
+            }
+            Err(()) => {
+                self.record_counter_jit_bailout();
+                None
+            }
+        }
+    }
+
     fn execute_function(
         &self,
         compiled: &CompiledUnit,
@@ -696,6 +2039,11 @@ impl Vm {
         let Some(function) = unit.functions.get(function_id.index()) else {
             return self.runtime_error(output, compiled, stack, "called function is missing");
         };
+        let function_tier = self.tiering.borrow_mut().record_function_entry(
+            function_id,
+            self.options.quickening,
+            self.options.jit,
+        );
         let mut diagnostics = Vec::new();
         let mut block_id;
         let mut start_instruction_index = 0usize;
@@ -739,7 +2087,8 @@ impl Vm {
                         start_instruction_index = 0;
                     } else {
                         stack.pop();
-                        return uncaught_exception(output, compiled, stack, value);
+                        return self
+                            .handle_uncaught_exception(compiled, output, stack, state, value);
                     }
                 }
             }
@@ -777,11 +2126,20 @@ impl Vm {
                         start_instruction_index = 0;
                     } else {
                         stack.pop();
-                        return uncaught_exception(output, compiled, stack, value);
+                        return self
+                            .handle_uncaught_exception(compiled, output, stack, state, value);
                     }
                 }
             }
         } else {
+            let jit_call_shape_supported = call.captures.is_empty()
+                && call.this_value.is_none()
+                && call.scope_class.is_none()
+                && call.called_class.is_none()
+                && call.declaring_class.is_none()
+                && call.shared_top_level_locals.is_none()
+                && call.running_generator.is_none()
+                && call.running_fiber.is_none();
             let args = match prepare_arguments(function, call.args, stack) {
                 Ok(args) => args,
                 Err(message) => {
@@ -814,24 +2172,37 @@ impl Vm {
                     ))),
                 );
             }
-            stack.push(Frame::new_with_class_context(
+            if let Some(value) = self.try_execute_jit_leaf(
+                compiled,
+                function_id,
+                function,
+                function_tier,
+                jit_call_shape_supported,
+                &args,
+            ) {
+                return VmResult::success(output.clone(), Some(value));
+            }
+            let reused_frame = stack.push_reusable_frame(
                 function_id,
                 function.register_count,
                 function.local_count,
                 call.scope_class.take(),
                 call.called_class.take(),
                 call.declaring_class.take(),
-            ));
+            );
+            self.record_counter_frame_activation(reused_frame);
+            stack.current_mut().expect("frame was pushed").arguments =
+                args.iter().map(|arg| arg.value.clone()).collect();
             if let Err(message) = initialize_captures(function, call.captures, stack) {
                 let result = self.runtime_error(output, compiled, stack, message);
-                stack.pop();
+                stack.pop_recycle();
                 return result;
             }
             if let Some(this_value) = call.this_value
                 && let Err(message) = initialize_this(function, this_value, stack)
             {
                 let result = self.runtime_error(output, compiled, stack, message);
-                stack.pop();
+                stack.pop_recycle();
                 return result;
             }
             if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
@@ -847,9 +2218,10 @@ impl Vm {
                     param,
                     &mut arg.value,
                     arg.reference.is_some(),
+                    self.typecheck_fast_path_context(),
                 ) {
                     let result = self.runtime_error(output, compiled, stack, message);
-                    stack.pop();
+                    stack.pop_recycle();
                     return result;
                 }
                 let locals = &mut stack.current_mut().expect("frame was pushed").locals;
@@ -863,7 +2235,7 @@ impl Vm {
                 };
                 if let Err(message) = result {
                     let result = self.runtime_error(output, compiled, stack, message);
-                    stack.pop();
+                    stack.pop_recycle();
                     return result;
                 }
             }
@@ -906,10 +2278,19 @@ impl Vm {
                         output.len(),
                     );
                 }
+                self.record_counter_instruction(&instruction.kind);
+                self.observe_quickening(function_id, block_id, instruction.id);
+                self.observe_inline_cache(
+                    compiled_unit_cache_key(compiled),
+                    function_id,
+                    block_id,
+                    instruction.id,
+                    &instruction.kind,
+                );
                 match &instruction.kind {
                     InstructionKind::Nop => {}
                     InstructionKind::LoadConst { dst, constant } => {
-                        let value = match constant_value(unit, *constant) {
+                        let value = match self.constant_value(unit, *constant) {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -926,11 +2307,11 @@ impl Vm {
                     }
                     InstructionKind::FetchConst { dst, name } => {
                         let value = if let Some(constant) = compiled.lookup_constant(name) {
-                            inline_constant_value(constant)
+                            self.inline_constant_value(constant)
                         } else if name == "PHP_VERSION" {
-                            Value::String(PhpString::from_test_str(
-                                php_source::reference_php_version(),
-                            ))
+                            Value::String(self.intern_str(php_source::reference_php_version()))
+                        } else if let Some(value) = predefined_constant_value(name) {
+                            value
                         } else {
                             return self.runtime_error(
                                 output,
@@ -979,13 +2360,33 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = match self
-                            .execute_binary(compiled, *op, &lhs, &rhs, output, stack, state)
-                        {
-                            Ok(value) => value,
-                            Err(result) => {
-                                return result;
-                            }
+                        let value = match *op {
+                            BinaryOp::Add => self.try_quickened_add_int_int(
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                &lhs,
+                                &rhs,
+                            ),
+                            BinaryOp::Concat => self.try_quickened_concat_string_string(
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                &lhs,
+                                &rhs,
+                            ),
+                            _ => None,
+                        };
+                        let value = match value {
+                            Some(value) => value,
+                            None => match self
+                                .execute_binary(compiled, *op, &lhs, &rhs, output, stack, state)
+                            {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    return result;
+                                }
+                            },
                         };
                         if let Err(message) = stack
                             .current_mut()
@@ -1102,8 +2503,12 @@ impl Vm {
                     }
                     InstructionKind::LoadLocal { dst, local } => {
                         let value = if is_globals_local(function, *local) {
+                            self.record_counter_local_slot_fast_path(false);
                             Value::Array(state.globals.globals_array())
                         } else {
+                            self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                                stack, *local,
+                            ));
                             match stack
                                 .current()
                                 .expect("frame was pushed")
@@ -1148,8 +2553,12 @@ impl Vm {
                     }
                     InstructionKind::LoadLocalQuiet { dst, local } => {
                         let value = if is_globals_local(function, *local) {
+                            self.record_counter_local_slot_fast_path(false);
                             Value::Array(state.globals.globals_array())
                         } else {
+                            self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                                stack, *local,
+                            ));
                             match stack
                                 .current()
                                 .expect("frame was pushed")
@@ -1184,6 +2593,9 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -1194,6 +2606,10 @@ impl Vm {
                         }
                     }
                     InstructionKind::BindReference { target, source } => {
+                        self.record_counter_local_slot_fast_path(
+                            local_slot_is_in_bounds(stack, *target)
+                                && local_slot_is_in_bounds(stack, *source),
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -1205,6 +2621,7 @@ impl Vm {
                     }
                     InstructionKind::BindGlobal { local, name } => {
                         let cell = state.globals.ensure_slot(name.clone(), Value::Null);
+                        self.record_counter_local_slot_fast_path(false);
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -1226,6 +2643,10 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_counter_local_slot_fast_path(
+                            local_slot_is_in_bounds(stack, *local)
+                                && local_slot_is_in_bounds(stack, *source),
+                        );
                         let cell = match stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -1375,15 +2796,18 @@ impl Vm {
                     }
                     InstructionKind::EndFinally { after } => match pending_control.take() {
                         Some(PendingControl::Return(value)) => {
-                            if let Err(message) =
-                                check_return_type(compiled, function, value.as_ref())
-                            {
+                            if let Err(message) = check_return_type(
+                                compiled,
+                                function,
+                                value.as_ref(),
+                                self.typecheck_fast_path_context(),
+                            ) {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                             if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
                                 export_shared_locals(function, stack, shared);
                             }
-                            stack.pop();
+                            stack.pop_recycle();
                             return VmResult::success_with_diagnostics(
                                 output.clone(),
                                 value,
@@ -1401,7 +2825,8 @@ impl Vm {
                                 block_id = target;
                                 continue 'dispatch;
                             }
-                            return uncaught_exception(output, compiled, stack, value);
+                            return self
+                                .handle_uncaught_exception(compiled, output, stack, state, value);
                         }
                         None => {
                             block_id = *after;
@@ -1425,7 +2850,8 @@ impl Vm {
                             block_id = target;
                             continue 'dispatch;
                         }
-                        return uncaught_exception(output, compiled, stack, value);
+                        return self
+                            .handle_uncaught_exception(compiled, output, stack, state, value);
                     }
                     InstructionKind::MakeException {
                         dst,
@@ -1516,9 +2942,165 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_spl_iterator_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_spl_iterator_object(class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_container_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_spl_container_object(class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_file_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_spl_file_object(
+                                class_name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let class = match lookup_class_in_state(compiled, state, class_name) {
                             Some(class) => class,
                             None => {
+                                if is_spl_iterator_runtime_class(class_name) {
+                                    let values = match read_call_args(unit, stack, args) {
+                                        Ok(values) => values,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    let object = match new_spl_iterator_object(class_name, values) {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, Value::Object(object))
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                if is_spl_container_runtime_class(class_name) {
+                                    let values = match read_call_args(unit, stack, args) {
+                                        Ok(values) => values,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    let object = match new_spl_container_object(class_name, values)
+                                    {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, Value::Object(object))
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                if is_spl_file_runtime_class(class_name) {
+                                    let values = match read_call_args(unit, stack, args) {
+                                        Ok(values) => values,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    let object = match new_spl_file_object(
+                                        class_name,
+                                        values,
+                                        &self.options.runtime_context,
+                                    ) {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, Value::Object(object))
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
                                 if class_name
                                     .trim_start_matches('\\')
                                     .to_ascii_lowercase()
@@ -1554,10 +3136,22 @@ impl Vm {
                                     }
                                     continue;
                                 }
-                                match self
-                                    .autoload_class(compiled, class_name, output, stack, state)
-                                {
-                                    Ok(()) => {}
+                                match self.class_like_exists_with_autoload_cache(
+                                    compiled,
+                                    class_name,
+                                    AutoloadClassLookupKind::Class,
+                                    true,
+                                    Some((
+                                        compiled_unit_cache_key(compiled),
+                                        function_id,
+                                        block_id,
+                                        instruction.id,
+                                    )),
+                                    output,
+                                    stack,
+                                    state,
+                                ) {
+                                    Ok(_) => {}
                                     Err(result) => return result,
                                 }
                                 if let Some(class) =
@@ -1576,7 +3170,9 @@ impl Vm {
                                 }
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class) {
+                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
+                            self.constant_value(compiled.unit(), value)
+                        }) {
                             Ok(class) => class,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -1593,8 +3189,10 @@ impl Vm {
                         };
                         let object = ObjectRef::new(&runtime_class);
                         if let Some(constructor) = class.constructor {
+                            let class_owner = dynamic_class_owner_in_state(state, &class.name)
+                                .unwrap_or_else(|| compiled.clone());
                             let result = self.execute_function(
-                                compiled,
+                                &class_owner,
                                 constructor,
                                 FunctionCall::new(values, Vec::new())
                                     .with_this(object.clone())
@@ -1678,7 +3276,9 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class) {
+                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
+                            self.constant_value(compiled.unit(), value)
+                        }) {
                             Ok(class) => class,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -1756,7 +3356,9 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class) {
+                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
+                            self.constant_value(compiled.unit(), value)
+                        }) {
                             Ok(class) => class,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -1836,6 +3438,7 @@ impl Vm {
                                 &property,
                                 &entry.type_,
                                 value,
+                                self.typecheck_fast_path_context(),
                             ) {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
@@ -1916,24 +3519,71 @@ impl Vm {
                             }
                             continue;
                         }
-                        let class = match compiled.lookup_class(&object.class_name()) {
-                            Some(class) => class,
-                            None => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                                        object.class_name()
-                                    ),
-                                );
+                        if is_php_token_runtime_class(&object.class_name()) {
+                            let value = object.get_property(property).unwrap_or(Value::Null);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
                             }
-                        };
+                            continue;
+                        }
+                        let class =
+                            match lookup_class_in_state(compiled, state, &object.class_name()) {
+                                Some(class) => class,
+                                None => {
+                                    return self.runtime_error(
+                                        output,
+                                        compiled,
+                                        stack,
+                                        format!(
+                                            "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                                            object.class_name()
+                                        ),
+                                    );
+                                }
+                            };
                         let scope = current_scope_class(compiled, stack);
+                        let normalized_scope = scope.as_deref().map(normalize_class_name);
+                        let receiver_class = normalize_class_name(&object.class_name());
+                        let lookup_epoch = state.lookup_epoch();
+                        if let Some(target) = self.lookup_property_fetch_inline_cache(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            property,
+                            &receiver_class,
+                            normalized_scope.as_deref(),
+                            lookup_epoch,
+                        ) {
+                            match self
+                                .read_property_fetch_target(compiled, target, &object, stack, state)
+                            {
+                                Ok(PropertyFetchCacheRead::Value(value)) => {
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                Ok(PropertyFetchCacheRead::Fallback) => {}
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        }
                         let resolved = match lookup_property_in_hierarchy(
                             compiled,
-                            class,
+                            &class,
                             property,
                             scope.as_deref(),
                         ) {
@@ -2098,6 +3748,56 @@ impl Vm {
                                 ),
                             );
                         }
+                        if !resolved.property.flags.is_static
+                            && !resolved.property.flags.is_protected
+                            && resolved.property.hooks.get.is_none()
+                            && resolved.property.hooks.set.is_none()
+                            && !property_hook_is_active(
+                                state,
+                                &object,
+                                resolved.class,
+                                resolved.property,
+                            )
+                        {
+                            let cache_scope = resolved
+                                .property
+                                .flags
+                                .is_private
+                                .then(|| normalize_class_name(&resolved.class.name));
+                            if !resolved.property.flags.is_private
+                                || cache_scope.as_deref() == normalized_scope.as_deref()
+                            {
+                                let target = match dynamic_class_owner_index_in_state(
+                                    state,
+                                    &resolved.class.name,
+                                ) {
+                                    Some(unit_index) => PropertyFetchCacheTarget::DynamicUnit {
+                                        unit_index,
+                                        receiver_class: receiver_class.clone(),
+                                        declaring_class: resolved.class.name.clone(),
+                                        property: resolved.property.name.clone(),
+                                        storage_name: storage_name.clone(),
+                                    },
+                                    None => PropertyFetchCacheTarget::CurrentUnit {
+                                        receiver_class: receiver_class.clone(),
+                                        declaring_class: resolved.class.name.clone(),
+                                        property: resolved.property.name.clone(),
+                                        storage_name: storage_name.clone(),
+                                    },
+                                };
+                                self.install_property_fetch_inline_cache(
+                                    compiled,
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                    property,
+                                    &receiver_class,
+                                    cache_scope.as_deref(),
+                                    lookup_epoch,
+                                    target,
+                                );
+                            }
+                        }
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -2119,6 +3819,43 @@ impl Vm {
                             }
                         };
                         let scope = current_scope_class(compiled, stack);
+                        let normalized_scope = scope.as_deref().map(normalize_class_name);
+                        let resolved_class = normalize_class_name(&class.name);
+                        let lookup_epoch = state.lookup_epoch();
+                        if let Some(target) = self
+                            .lookup_class_constant_static_property_inline_cache(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                ClassConstantStaticPropertyCacheKind::StaticProperty,
+                                &resolved_class,
+                                property,
+                                normalized_scope.as_deref(),
+                                lookup_epoch,
+                            )
+                        {
+                            match self.read_class_constant_static_property_target(
+                                compiled, target, stack, state,
+                            ) {
+                                Ok(ClassStaticCacheRead::Value(value)) => {
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                Ok(ClassStaticCacheRead::Fallback) => {}
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        }
                         let resolved = match lookup_property_in_hierarchy(
                             compiled,
                             class,
@@ -2190,6 +3927,43 @@ impl Vm {
                                 ),
                             );
                         }
+                        let cache_scope = if resolved.property.flags.is_private
+                            || resolved.property.flags.is_protected
+                        {
+                            normalized_scope.clone()
+                        } else {
+                            None
+                        };
+                        let target =
+                            match dynamic_class_owner_index_in_state(state, &resolved.class.name) {
+                                Some(unit_index) => {
+                                    ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                                        unit_index,
+                                        kind: ClassConstantStaticPropertyCacheKind::StaticProperty,
+                                        resolved_class: resolved_class.clone(),
+                                        declaring_class: resolved.class.name.clone(),
+                                        member: resolved.property.name.clone(),
+                                    }
+                                }
+                                None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                                    kind: ClassConstantStaticPropertyCacheKind::StaticProperty,
+                                    resolved_class: resolved_class.clone(),
+                                    declaring_class: resolved.class.name.clone(),
+                                    member: resolved.property.name.clone(),
+                                },
+                            };
+                        self.install_class_constant_static_property_inline_cache(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            ClassConstantStaticPropertyCacheKind::StaticProperty,
+                            &resolved_class,
+                            property,
+                            cache_scope.as_deref(),
+                            lookup_epoch,
+                            target,
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -2213,19 +3987,105 @@ impl Vm {
                         let value = if constant.eq_ignore_ascii_case("class") {
                             Value::String(PhpString::from_test_str(&class.display_name))
                         } else {
+                            let scope = current_scope_class(compiled, stack);
+                            let normalized_scope = scope.as_deref().map(normalize_class_name);
+                            let resolved_class = normalize_class_name(&class.name);
+                            let lookup_epoch = state.lookup_epoch();
+                            let cache_kind = if class.flags.is_enum
+                                && class
+                                    .enum_cases
+                                    .iter()
+                                    .any(|case| case.name.eq_ignore_ascii_case(constant))
+                            {
+                                ClassConstantStaticPropertyCacheKind::EnumCase
+                            } else {
+                                ClassConstantStaticPropertyCacheKind::ClassConstant
+                            };
+                            if let Some(target) = self
+                                .lookup_class_constant_static_property_inline_cache(
+                                    compiled,
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                    cache_kind,
+                                    &resolved_class,
+                                    constant,
+                                    normalized_scope.as_deref(),
+                                    lookup_epoch,
+                                )
+                            {
+                                match self.read_class_constant_static_property_target(
+                                    compiled, target, stack, state,
+                                ) {
+                                    Ok(ClassStaticCacheRead::Value(value)) => {
+                                        if let Err(message) = stack
+                                            .current_mut()
+                                            .expect("frame was pushed")
+                                            .registers
+                                            .set(*dst, value)
+                                        {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                        continue;
+                                    }
+                                    Ok(ClassStaticCacheRead::Fallback) => {}
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                }
+                            }
                             if class.flags.is_enum
                                 && let Some(case) = class
                                     .enum_cases
                                     .iter()
                                     .find(|case| case.name.eq_ignore_ascii_case(constant))
                             {
-                                let object = match enum_case_object(compiled, state, class, case) {
-                                    Ok(object) => object,
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                };
+                                let object =
+                                    match enum_case_object(compiled, state, class, case, &|value| {
+                                        self.constant_value(compiled.unit(), value)
+                                    }) {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                let target =
+                                    match dynamic_class_owner_index_in_state(state, &class.name) {
+                                        Some(unit_index) => {
+                                            ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                                                unit_index,
+                                                kind:
+                                                    ClassConstantStaticPropertyCacheKind::EnumCase,
+                                                resolved_class: resolved_class.clone(),
+                                                declaring_class: class.name.clone(),
+                                                member: case.name.clone(),
+                                            }
+                                        }
+                                        None => {
+                                            ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                                                kind:
+                                                    ClassConstantStaticPropertyCacheKind::EnumCase,
+                                                resolved_class: resolved_class.clone(),
+                                                declaring_class: class.name.clone(),
+                                                member: case.name.clone(),
+                                            }
+                                        }
+                                    };
+                                self.install_class_constant_static_property_inline_cache(
+                                    compiled,
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                    ClassConstantStaticPropertyCacheKind::EnumCase,
+                                    &resolved_class,
+                                    constant,
+                                    None,
+                                    lookup_epoch,
+                                    target,
+                                );
                                 if let Err(message) = stack
                                     .current_mut()
                                     .expect("frame was pushed")
@@ -2236,7 +4096,6 @@ impl Vm {
                                 }
                                 continue;
                             }
-                            let scope = current_scope_class(compiled, stack);
                             let resolved = match lookup_constant_in_hierarchy(
                                 compiled,
                                 class,
@@ -2267,7 +4126,34 @@ impl Vm {
                             ) {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
-                            match resolved.constant.value {
+                            let cache_scope = if resolved.constant.flags.is_private
+                                || resolved.constant.flags.is_protected
+                            {
+                                normalized_scope.clone()
+                            } else {
+                                None
+                            };
+                            let target = match dynamic_class_owner_index_in_state(
+                                state,
+                                &resolved.class.name,
+                            ) {
+                                Some(unit_index) => {
+                                    ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                                        unit_index,
+                                        kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
+                                        resolved_class: resolved_class.clone(),
+                                        declaring_class: resolved.class.name.clone(),
+                                        member: resolved.constant.name.clone(),
+                                    }
+                                }
+                                None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                                    kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
+                                    resolved_class: resolved_class.clone(),
+                                    declaring_class: resolved.class.name.clone(),
+                                    member: resolved.constant.name.clone(),
+                                },
+                            };
+                            let value = match resolved.constant.value {
                                 Some(value) => match constant_value(unit, value) {
                                     Ok(value) => value,
                                     Err(message) => {
@@ -2276,7 +4162,20 @@ impl Vm {
                                     }
                                 },
                                 None => Value::Null,
-                            }
+                            };
+                            self.install_class_constant_static_property_inline_cache(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                ClassConstantStaticPropertyCacheKind::ClassConstant,
+                                &resolved_class,
+                                constant,
+                                cache_scope.as_deref(),
+                                lookup_epoch,
+                                target,
+                            );
+                            value
                         };
                         if let Err(message) = stack
                             .current_mut()
@@ -2542,24 +4441,25 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let class = match compiled.lookup_class(&object.class_name()) {
-                            Some(class) => class,
-                            None => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                                        object.class_name()
-                                    ),
-                                );
-                            }
-                        };
+                        let class =
+                            match lookup_class_in_state(compiled, state, &object.class_name()) {
+                                Some(class) => class,
+                                None => {
+                                    return self.runtime_error(
+                                        output,
+                                        compiled,
+                                        stack,
+                                        format!(
+                                            "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                                            object.class_name()
+                                        ),
+                                    );
+                                }
+                            };
                         let scope = current_scope_class(compiled, stack);
                         let resolved = match lookup_property_in_hierarchy(
                             compiled,
-                            class,
+                            &class,
                             property,
                             scope.as_deref(),
                         ) {
@@ -2692,6 +4592,7 @@ impl Vm {
                             property,
                             &property_type,
                             &value,
+                            self.typecheck_fast_path_context(),
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -2820,6 +4721,7 @@ impl Vm {
                             resolved.property.name.as_str(),
                             &property_type,
                             &value,
+                            self.typecheck_fast_path_context(),
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -2884,10 +4786,17 @@ impl Vm {
                                 "E_PHP_VM_ARRAY_INSERT_TARGET: target is not an array register",
                             );
                         };
+                        let was_packed = array_value.is_packed_fast();
                         if let Some(key) = key {
                             array_value.insert(key, value);
                         } else {
                             array_value.append(value);
+                            if was_packed && array_value.is_packed_fast() {
+                                self.record_counter_array_packed_append_fast_path_hit();
+                            }
+                        }
+                        if was_packed && !array_value.is_packed_fast() {
+                            self.record_counter_array_packed_to_mixed_transition();
                         }
                     }
                     InstructionKind::FetchDim {
@@ -2902,26 +4811,44 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let key = match read_operand(unit, stack, *key)
-                            .and_then(|value| array_key_from_value(&value))
-                        {
-                            Ok(key) => key,
+                        let key_value = match read_operand(unit, stack, *key) {
+                            Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = match fetch_dim_value(&array, &key) {
-                            Ok(Some(value)) => value,
-                            Ok(None) if *quiet => Value::Null,
-                            Ok(None) => {
-                                diagnostics.push(undefined_array_key_warning(
-                                    &key,
-                                    stack_trace(compiled, stack),
-                                ));
-                                Value::Null
-                            }
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
+                        let value = self.try_quickened_packed_array_int_key(
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            &array,
+                            &key_value,
+                        );
+                        let value = match value {
+                            Some(value) => value,
+                            None => {
+                                let key = match array_key_from_value(&key_value) {
+                                    Ok(key) => key,
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
+                                match fetch_dim_value(&array, &key) {
+                                    Ok(Some(value)) => value,
+                                    Ok(None) if *quiet => Value::Null,
+                                    Ok(None) => {
+                                        diagnostics.push(undefined_array_key_warning(
+                                            &key,
+                                            stack_trace(compiled, stack),
+                                        ));
+                                        Value::Null
+                                    }
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                }
                             }
                         };
                         if let Err(message) = stack
@@ -2954,7 +4881,16 @@ impl Vm {
                         let result = if is_globals_local(function, *local) {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), false)
                         } else {
-                            assign_dim_local(stack, *local, &dims, value.clone(), false)
+                            let was_packed = local_array_is_packed_fast(stack, *local);
+                            let result =
+                                assign_dim_local(stack, *local, &dims, value.clone(), false);
+                            if result.is_ok()
+                                && was_packed
+                                && !local_array_is_packed_fast(stack, *local)
+                            {
+                                self.record_counter_array_packed_to_mixed_transition();
+                            }
+                            result
                         };
                         if let Err(message) = result {
                             return self.runtime_error(output, compiled, stack, message);
@@ -2990,7 +4926,23 @@ impl Vm {
                         let result = if is_globals_local(function, *local) {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), true)
                         } else {
-                            assign_dim_local(stack, *local, &dims, value.clone(), true)
+                            let was_packed = local_array_is_packed_fast(stack, *local);
+                            let result =
+                                assign_dim_local(stack, *local, &dims, value.clone(), true);
+                            if result.is_ok()
+                                && dims.is_empty()
+                                && was_packed
+                                && local_array_is_packed_fast(stack, *local)
+                            {
+                                self.record_counter_array_packed_append_fast_path_hit();
+                            }
+                            if result.is_ok()
+                                && was_packed
+                                && !local_array_is_packed_fast(stack, *local)
+                            {
+                                self.record_counter_array_packed_to_mixed_transition();
+                            }
+                            result
                         };
                         if let Err(message) = result {
                             return self.runtime_error(output, compiled, stack, message);
@@ -3006,6 +4958,9 @@ impl Vm {
                         }
                     }
                     InstructionKind::IssetLocal { dst, local } => {
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         let value = read_local_value(stack, *local).unwrap_or(Value::Uninitialized);
                         let result = !matches!(value, Value::Uninitialized | Value::Null);
                         if let Err(message) = stack
@@ -3018,6 +4973,9 @@ impl Vm {
                         }
                     }
                     InstructionKind::EmptyLocal { dst, local } => {
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         let value = read_local_value(stack, *local).unwrap_or(Value::Uninitialized);
                         let result = match php_empty(&value) {
                             Ok(value) => value,
@@ -3035,6 +4993,9 @@ impl Vm {
                         }
                     }
                     InstructionKind::UnsetLocal { local } => {
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -3051,6 +5012,9 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         let value = read_local_value(stack, *local)
                             .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten());
                         if let Err(message) = stack
@@ -3072,6 +5036,9 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         let value = read_local_value(stack, *local)
                             .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
                             .unwrap_or(Value::Uninitialized);
@@ -3097,8 +5064,15 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
+                        let was_packed = local_array_is_packed_fast(stack, *local);
                         if let Err(message) = unset_dim_local(stack, *local, &dims) {
                             return self.runtime_error(output, compiled, stack, message);
+                        }
+                        if was_packed && !local_array_is_packed_fast(stack, *local) {
+                            self.record_counter_array_packed_to_mixed_transition();
                         }
                         self.record_lvalue_trace_event("array-unset-dim", *local, &dims);
                     }
@@ -3318,6 +5292,9 @@ impl Vm {
                         }
                     }
                     InstructionKind::ForeachInitRef { iterator, local } => {
+                        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
+                            stack, *local,
+                        ));
                         let source = read_local_value(stack, *local).unwrap_or(Value::Null);
                         let Value::Array(_) = effective_value(&source) else {
                             let diagnostic = unsupported_feature(
@@ -3340,6 +5317,8 @@ impl Vm {
                                 fiber_suspension: None,
                                 return_ref: None,
                                 trace: Vec::new(),
+                                counters: None,
+                                tiering_stats: None,
                             };
                         };
                         foreach_iterators.insert(
@@ -3581,34 +5560,35 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result = if is_autoload_builtin_name(name)
-                            || is_class_probe_builtin_name(name)
-                        {
-                            self.call_autoload_builtin(compiled, name, values, output, stack, state)
-                        } else if let Some(callee) = compiled.lookup_function(name) {
-                            self.execute_function(
+                        let lowered_name = normalize_function_name(name);
+                        let epoch = state.lookup_epoch();
+                        let target = self
+                            .lookup_function_call_inline_cache(
                                 compiled,
-                                callee,
-                                FunctionCall::new(values, Vec::new())
-                                    .inherit_fiber_context(&running_fiber),
-                                output,
-                                stack,
-                                state,
+                                function_id,
+                                block_id,
+                                instruction.id,
+                                &lowered_name,
+                                epoch,
                             )
-                        } else if BuiltinRegistry::new().contains(name) {
-                            let values = match call_args_to_positional(name, values) {
-                                Ok(values) => values,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                            };
-                            if name == "var_dump"
-                                && let Some(message) = debug_info_gap_message(compiled, &values)
-                            {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                            execute_builtin(name, values, output)
-                        } else {
+                            .or_else(|| {
+                                let resolved = self.resolve_function_call_target(
+                                    compiled,
+                                    state,
+                                    &lowered_name,
+                                )?;
+                                self.install_function_call_inline_cache(
+                                    compiled,
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                    &lowered_name,
+                                    epoch,
+                                    resolved.clone(),
+                                );
+                                Some(resolved)
+                            });
+                        let Some(target) = target else {
                             let diagnostic = undefined_function(
                                 name,
                                 RuntimeSourceSpan::default(),
@@ -3620,6 +5600,38 @@ impl Vm {
                                 diagnostic,
                             );
                         };
+                        let result = self.execute_function_call_target(
+                            compiled,
+                            target,
+                            values,
+                            Some((
+                                compiled_unit_cache_key(compiled),
+                                function_id,
+                                block_id,
+                                instruction.id,
+                            )),
+                            output,
+                            stack,
+                            state,
+                            &running_fiber,
+                        );
+                        if !result.status.is_success()
+                            && let Some(throwable) = builtin_error_throwable(&result)
+                        {
+                            if let Some(target) = handle_throw(
+                                compiled,
+                                throwable.clone(),
+                                &mut exception_handlers,
+                                stack,
+                                &mut pending_control,
+                            ) {
+                                block_id = target;
+                                continue 'dispatch;
+                            }
+                            return self.handle_uncaught_exception(
+                                compiled, output, stack, state, throwable,
+                            );
+                        }
                         if !result.status.is_success() {
                             return result;
                         }
@@ -3758,24 +5770,157 @@ impl Vm {
                             }
                             continue;
                         }
-                        let class = match compiled.lookup_class(&object.class_name()) {
-                            Some(class) => class,
-                            None => {
-                                return self.runtime_error(
-                                    output,
+                        if is_php_token_runtime_class(&object.class_name()) {
+                            let values =
+                                values.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+                            let value = match php_token_method_value(&object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_iterator_runtime_class(&object.class_name()) {
+                            let value = match call_spl_iterator_method(object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_container_runtime_class(&object.class_name()) {
+                            let value = match call_spl_container_method(object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_file_runtime_class(&object.class_name()) {
+                            let value = match call_spl_file_method(
+                                &object,
+                                method,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        let dynamic_owner_index =
+                            dynamic_class_owner_index_in_state(state, &object.class_name());
+                        let receiver_class = normalize_class_name(&object.class_name());
+                        let lowered_method = normalize_method_name(method);
+                        let scope = current_scope_class(compiled, stack);
+                        let epoch = state.lookup_epoch();
+                        if let Some(target) = self.lookup_method_call_inline_cache(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            &lowered_method,
+                            &receiver_class,
+                            scope.as_deref(),
+                            epoch,
+                        ) {
+                            let result = self.execute_method_call_target(
+                                compiled,
+                                target,
+                                object.clone(),
+                                values,
+                                output,
+                                stack,
+                                state,
+                                &running_fiber,
+                            );
+                            if !result.status.is_success() {
+                                return result;
+                            }
+                            if result.fiber_suspension.is_some() {
+                                return self.propagate_fiber_suspension(
+                                    result,
                                     compiled,
+                                    *dst,
+                                    block_id,
+                                    instruction_index + 1,
+                                    &foreach_iterators,
+                                    &exception_handlers,
+                                    &pending_control,
+                                    output,
                                     stack,
-                                    format!(
-                                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                                        object.class_name()
-                                    ),
                                 );
                             }
-                        };
-                        let scope = current_scope_class(compiled, stack);
+                            diagnostics.extend(result.diagnostics);
+                            let return_value = result.return_value.unwrap_or(Value::Null);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, return_value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        let dynamic_owner = dynamic_owner_index
+                            .and_then(|unit_index| state.dynamic_units.get(unit_index).cloned());
+                        let class =
+                            match lookup_class_in_state(compiled, state, &object.class_name()) {
+                                Some(class) => class,
+                                None => {
+                                    return self.runtime_error(
+                                        output,
+                                        compiled,
+                                        stack,
+                                        format!(
+                                            "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                                            object.class_name()
+                                        ),
+                                    );
+                                }
+                            };
+                        let class_owner = dynamic_owner.unwrap_or_else(|| compiled.clone());
                         let resolved = match lookup_method_in_hierarchy(
-                            compiled,
-                            class,
+                            &class_owner,
+                            &class,
                             method,
                             scope.as_deref(),
                         ) {
@@ -3838,9 +5983,12 @@ impl Vm {
                                 ),
                             );
                         }
-                        if let Err(message) =
-                            validate_method_callable(compiled, stack, declaring_class, method_entry)
-                        {
+                        if let Err(message) = validate_method_callable(
+                            &class_owner,
+                            stack,
+                            declaring_class,
+                            method_entry,
+                        ) {
                             if method_entry.flags.is_private || method_entry.flags.is_protected {
                                 let result = match self.call_magic_instance_method(
                                     compiled,
@@ -3876,8 +6024,32 @@ impl Vm {
                             }
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        let result = self.execute_function(
+                        let target = dynamic_owner_index.map_or_else(
+                            || MethodCallCacheTarget::CurrentUnit {
+                                receiver_class: receiver_class.clone(),
+                                declaring_class: declaring_class.name.clone(),
+                                function: method_entry.function,
+                            },
+                            |unit_index| MethodCallCacheTarget::DynamicUnit {
+                                unit_index,
+                                receiver_class: receiver_class.clone(),
+                                declaring_class: declaring_class.name.clone(),
+                                function: method_entry.function,
+                            },
+                        );
+                        self.install_method_call_inline_cache(
                             compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            &lowered_method,
+                            &receiver_class,
+                            scope.as_deref(),
+                            epoch,
+                            target,
+                        );
+                        let result = self.execute_function(
+                            &class_owner,
                             method_entry.function,
                             FunctionCall::new(values, Vec::new())
                                 .with_this(object.clone())
@@ -3951,6 +6123,31 @@ impl Vm {
                                 Err(result) => result,
                             };
                         }
+                        if is_php_token_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let value =
+                                match php_token_static_method_value(class_name, method, values) {
+                                    Ok(value) => value,
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let class = match resolve_static_class_name(compiled, stack, class_name) {
                             Ok(class) => class,
                             Err(message) => {
@@ -3971,14 +6168,19 @@ impl Vm {
                                 "cases" | "from" | "tryfrom"
                             )
                         {
-                            let value =
-                                match enum_static_method(compiled, state, class, method, values) {
-                                    Ok(value) => value,
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                };
+                            let value = match enum_static_method(
+                                compiled,
+                                state,
+                                class,
+                                method,
+                                values,
+                                &|value| self.constant_value(compiled.unit(), value),
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                             if let Err(message) = stack
                                 .current_mut()
                                 .expect("caller frame is active")
@@ -4315,8 +6517,18 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result =
-                            self.execute_include(compiled, *kind, &path, output, stack, state);
+                        let result = self.execute_include(
+                            compiled,
+                            compiled_unit_cache_key(compiled),
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            *kind,
+                            &path,
+                            output,
+                            stack,
+                            state,
+                        );
                         if !result.status.is_success() {
                             if matches!(kind, IncludeKind::Include | IncludeKind::IncludeOnce) {
                                 diagnostics.extend(result.diagnostics);
@@ -4409,6 +6621,8 @@ impl Vm {
                             fiber_suspension: None,
                             return_ref: None,
                             trace: Vec::new(),
+                            counters: None,
+                            tiering_stats: None,
                         };
                     }
                     InstructionKind::RuntimeError {
@@ -4449,7 +6663,12 @@ impl Vm {
                         block_id = finally;
                         continue 'dispatch;
                     }
-                    if let Err(message) = check_return_type(compiled, function, value.as_ref()) {
+                    if let Err(message) = check_return_type(
+                        compiled,
+                        function,
+                        value.as_ref(),
+                        self.typecheck_fast_path_context(),
+                    ) {
                         return self.runtime_error(output, compiled, stack, message);
                     }
                     let return_ref = if function.returns_by_ref {
@@ -4477,13 +6696,14 @@ impl Vm {
                     if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
                         export_shared_locals(function, stack, shared);
                     }
-                    stack.pop();
+                    stack.pop_recycle();
                     let mut result =
                         VmResult::success_with_diagnostics(output.clone(), value, diagnostics);
                     result.return_ref = return_ref;
                     return result;
                 }
                 TerminatorKind::Jump { target } => {
+                    self.record_tiering_backedge(function_id, block_id, *target);
                     block_id = *target;
                 }
                 TerminatorKind::JumpIfFalse { condition, target } => {
@@ -4500,13 +6720,16 @@ impl Vm {
                         }
                     };
                     if truthy {
-                        block_id = match next_block_id(function, block_id) {
+                        let next = match next_block_id(function, block_id) {
                             Ok(block_id) => block_id,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_tiering_backedge(function_id, block_id, next);
+                        block_id = next;
                     } else {
+                        self.record_tiering_backedge(function_id, block_id, *target);
                         block_id = *target;
                     }
                 }
@@ -4524,14 +6747,17 @@ impl Vm {
                         }
                     };
                     if truthy {
+                        self.record_tiering_backedge(function_id, block_id, *target);
                         block_id = *target;
                     } else {
-                        block_id = match next_block_id(function, block_id) {
+                        let next = match next_block_id(function, block_id) {
                             Ok(block_id) => block_id,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        self.record_tiering_backedge(function_id, block_id, next);
+                        block_id = next;
                     }
                 }
                 TerminatorKind::JumpIf {
@@ -4551,10 +6777,187 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     };
-                    block_id = if truthy { *if_true } else { *if_false };
+                    let next = if truthy { *if_true } else { *if_false };
+                    self.record_tiering_backedge(function_id, block_id, next);
+                    block_id = next;
                 }
             }
         }
+    }
+
+    fn record_tiering_backedge(&self, function_id: FunctionId, current: BlockId, target: BlockId) {
+        self.tiering
+            .borrow_mut()
+            .record_loop_backedge(function_id, current, target);
+    }
+
+    fn lookup_include_path_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        request: &IncludePathCacheKey,
+        epoch: InvalidationEpoch,
+    ) -> Option<IncludePathCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self.inline_caches.borrow_mut().lookup_include_path(
+            unit_key,
+            function,
+            block,
+            instruction,
+            request,
+            epoch,
+        );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn record_include_path_inline_cache_hit(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self.inline_caches.borrow_mut().record_include_path_hit(
+            unit_key,
+            function,
+            block,
+            instruction,
+        );
+        self.record_inline_cache_event(observation);
+    }
+
+    fn record_include_path_inline_cache_invalidation(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self.inline_caches.borrow_mut().invalidate_include_path(
+            unit_key,
+            function,
+            block,
+            instruction,
+        );
+        self.record_inline_cache_event(observation);
+    }
+
+    fn install_include_path_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        request: IncludePathCacheKey,
+        epoch: InvalidationEpoch,
+        target: IncludePathCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches.borrow_mut().install_include_path(
+            unit_key,
+            function,
+            block,
+            instruction,
+            request,
+            epoch,
+            target,
+        );
+    }
+
+    fn lookup_autoload_class_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        request: &AutoloadClassLookupCacheKey,
+        epochs: AutoloadClassLookupEpochs,
+    ) -> Option<AutoloadClassLookupCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self
+            .inline_caches
+            .borrow_mut()
+            .lookup_autoload_class_lookup(unit_key, function, block, instruction, request, epochs);
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn observe_autoload_class_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self.inline_caches.borrow_mut().observe_slot(
+            unit_key,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::AutoloadClassLookup,
+        );
+        self.record_inline_cache_event(observation);
+    }
+
+    fn invalidate_autoload_class_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self
+            .inline_caches
+            .borrow_mut()
+            .invalidate_autoload_class_lookup(unit_key, function, block, instruction);
+        self.record_inline_cache_event(observation);
+    }
+
+    fn install_autoload_class_inline_cache(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        request: AutoloadClassLookupCacheKey,
+        epochs: AutoloadClassLookupEpochs,
+        target: AutoloadClassLookupCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches
+            .borrow_mut()
+            .install_autoload_class_lookup(
+                unit_key,
+                function,
+                block,
+                instruction,
+                request,
+                epochs,
+                target,
+            );
     }
 
     fn call_callable(
@@ -4568,22 +6971,32 @@ impl Vm {
     ) -> VmResult {
         match callee {
             Value::Callable(CallableValue::UserFunction { name }) => {
-                let Some(function) = compiled.lookup_function(&name) else {
-                    return self.runtime_error(
+                if let Some(function) = compiled.lookup_function(&name) {
+                    self.execute_function(
+                        compiled,
+                        function,
+                        FunctionCall::new(args, Vec::new()),
+                        output,
+                        stack,
+                        state,
+                    )
+                } else if let Some((owner, function)) = dynamic_function_in_state(state, &name) {
+                    self.execute_function(
+                        &owner,
+                        function,
+                        FunctionCall::new(args, Vec::new()),
+                        output,
+                        stack,
+                        state,
+                    )
+                } else {
+                    self.runtime_error(
                         output,
                         compiled,
                         stack,
                         format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
-                    );
-                };
-                self.execute_function(
-                    compiled,
-                    function,
-                    FunctionCall::new(args, Vec::new()),
-                    output,
-                    stack,
-                    state,
-                )
+                    )
+                }
             }
             Value::Callable(CallableValue::Closure { function, captures }) => {
                 self.execute_function(
@@ -4596,7 +7009,41 @@ impl Vm {
                 )
             }
             Value::Callable(CallableValue::InternalBuiltin { name }) => {
-                let values = match call_args_to_positional(&name, args) {
+                if is_array_callback_builtin_name(&name) {
+                    return self.call_array_callback_builtin(
+                        compiled, &name, args, output, stack, state,
+                    );
+                }
+                if is_array_sort_builtin_name(&name) {
+                    return self.call_array_sort_builtin(compiled, &name, args, output, stack, state);
+                }
+                if is_autoload_builtin_name(&name) || is_symbol_introspection_builtin_name(&name) {
+                    return self.call_autoload_builtin(
+                        compiled, &name, args, None, output, stack, state,
+                    );
+                }
+                if is_config_builtin_name(&name) {
+                    return self.call_config_builtin(compiled, &name, args, output, stack, state);
+                }
+                if is_error_handling_builtin_name(&name) {
+                    return self.call_error_handling_builtin(
+                        compiled, &name, args, output, stack, state,
+                    );
+                }
+                if is_output_buffering_builtin_name(&name) {
+                    return self.call_output_buffering_builtin(
+                        compiled, &name, args, output, stack,
+                    );
+                }
+                if is_environment_builtin_name(&name) {
+                    return self.call_environment_builtin(
+                        compiled, &name, args, output, stack, state,
+                    );
+                }
+                if is_process_builtin_name(&name) {
+                    return self.call_process_builtin(compiled, &name, args, output, stack);
+                }
+                let values = match call_builtin_args_to_positional(&name, args, stack) {
                     Ok(values) => values,
                     Err(message) => {
                         return self.runtime_error(output, compiled, stack, message);
@@ -4607,7 +7054,13 @@ impl Vm {
                 {
                     return self.runtime_error(output, compiled, stack, message);
                 }
-                execute_builtin(&name, values, output)
+                self.execute_internal_registry_builtin(
+                    &name,
+                    values,
+                    output,
+                    state,
+                    compiled,
+                )
             }
             Value::Callable(CallableValue::MethodPlaceholder { target }) => self.runtime_error(
                 output,
@@ -4649,6 +7102,1122 @@ impl Vm {
         }
     }
 
+    fn call_config_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let values = match call_args_to_positional(name, args) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        match name {
+            "ini_get" => {
+                if values.len() != 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CONFIG_ARITY: ini_get expects one argument",
+                    );
+                }
+                let option = match ini_option_name(&values[0]) {
+                    Ok(option) => option,
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let value = state
+                    .ini
+                    .get(&option)
+                    .map(Value::string)
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            "ini_set" => {
+                if values.len() != 2 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CONFIG_ARITY: ini_set expects two arguments",
+                    );
+                }
+                let option = match ini_option_name(&values[0]) {
+                    Ok(option) => option,
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let value = match to_string(&values[1]) {
+                    Ok(value) => value.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let previous = state
+                    .ini
+                    .set(&option, value)
+                    .map(Value::string)
+                    .unwrap_or(Value::Bool(false));
+                if option.eq_ignore_ascii_case("include_path") {
+                    state.bump_include_config_epoch();
+                }
+                VmResult::success(output.clone(), Some(previous))
+            }
+            "ini_get_all" => {
+                if values.len() > 2 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CONFIG_ARITY: ini_get_all expects zero to two arguments",
+                    );
+                }
+                if let Some(extension) = values.first()
+                    && !matches!(extension, Value::Null)
+                {
+                    let extension = match ini_option_name(extension) {
+                        Ok(extension) => extension,
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    };
+                    if !extension.eq_ignore_ascii_case("standard")
+                        && !extension.eq_ignore_ascii_case("core")
+                    {
+                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                    }
+                }
+                let details = values
+                    .get(1)
+                    .is_none_or(|value| to_bool(value).unwrap_or(true));
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Array(ini_get_all_array(&state.ini, details))),
+                )
+            }
+            "get_cfg_var" => {
+                if values.len() != 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CONFIG_ARITY: get_cfg_var expects one argument",
+                    );
+                }
+                let option = match ini_option_name(&values[0]) {
+                    Ok(option) => option,
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let value = state
+                    .ini
+                    .cfg_var(&option)
+                    .map(Value::string)
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_CONFIG_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_error_handling_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let values = match call_args_to_positional(name, args) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        match name {
+            "error_reporting" => {
+                if values.len() > 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ERROR_ARITY: error_reporting expects zero or one argument",
+                    );
+                }
+                let previous = current_error_reporting(state);
+                if let Some(value) = values.first() {
+                    let next = match to_int(value) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    };
+                    let _ = state.ini.set("error_reporting", next.to_string());
+                }
+                VmResult::success(output.clone(), Some(Value::Int(previous)))
+            }
+            "set_error_handler" => {
+                if !(1..=2).contains(&values.len()) {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ERROR_ARITY: set_error_handler expects one or two arguments",
+                    );
+                }
+                let callback = match error_handler_callback_from_value(compiled, values[0].clone())
+                {
+                    Ok(callback) => callback,
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let levels = match values.get(1) {
+                    Some(value) => match to_int(value) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    },
+                    None => php_std::constants::E_ALL,
+                };
+                let previous = state
+                    .error_handlers
+                    .last()
+                    .map(|entry| Value::Callable(entry.callback.clone()))
+                    .unwrap_or(Value::Null);
+                state
+                    .error_handlers
+                    .push(ErrorHandlerEntry { callback, levels });
+                VmResult::success(output.clone(), Some(previous))
+            }
+            "restore_error_handler" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ERROR_ARITY: restore_error_handler expects no arguments",
+                    );
+                }
+                let _ = state.error_handlers.pop();
+                VmResult::success(output.clone(), Some(Value::Bool(true)))
+            }
+            "set_exception_handler" => {
+                if values.len() != 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ERROR_ARITY: set_exception_handler expects one argument",
+                    );
+                }
+                let callback = match error_handler_callback_from_value(compiled, values[0].clone())
+                {
+                    Ok(callback) => callback,
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let previous = state
+                    .exception_handlers
+                    .last()
+                    .map(|callback| Value::Callable(callback.clone()))
+                    .unwrap_or(Value::Null);
+                state.exception_handlers.push(callback);
+                VmResult::success(output.clone(), Some(previous))
+            }
+            "restore_exception_handler" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ERROR_ARITY: restore_exception_handler expects no arguments",
+                    );
+                }
+                let _ = state.exception_handlers.pop();
+                VmResult::success(output.clone(), Some(Value::Bool(true)))
+            }
+            "trigger_error" | "user_error" => {
+                self.call_trigger_error_builtin(compiled, name, values, output, stack, state)
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_ERROR_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_trigger_error_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if !(1..=2).contains(&values.len()) {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_ERROR_ARITY: {name} expects one or two arguments"),
+            );
+        }
+        let message = match to_string(&values[0]) {
+            Ok(message) => message.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let level = match values.get(1) {
+            Some(value) => match to_int(value) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+            None => php_std::constants::E_USER_NOTICE,
+        };
+        if level == php_std::constants::E_USER_ERROR {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_USER_ERROR: {message}"),
+            );
+        }
+        if !is_supported_user_error_level(level) {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_VALUE_ERROR: {name}(): invalid error level {level}"),
+            );
+        }
+
+        let reported = error_reporting_allows(state, level);
+        let handler = state
+            .error_handlers
+            .last()
+            .cloned()
+            .filter(|entry| reported && (entry.levels == -1 || (entry.levels & level) != 0));
+        if let Some(handler) = handler {
+            let result = self.call_callable(
+                compiled,
+                Value::Callable(handler.callback),
+                vec![
+                    CallArgument::positional(Value::Int(level)),
+                    CallArgument::positional(Value::string(message.clone())),
+                    CallArgument::positional(Value::string("")),
+                    CallArgument::positional(Value::Int(0)),
+                ],
+                output,
+                stack,
+                state,
+            );
+            if !result.status.is_success() {
+                return result;
+            }
+            let handled = result
+                .return_value
+                .as_ref()
+                .is_some_and(|value| to_bool(value).unwrap_or(false));
+            if handled {
+                return VmResult::success(output.clone(), Some(Value::Bool(true)));
+            }
+        }
+
+        if reported && display_errors_enabled(state) {
+            output.write_php_string(&PhpString::from(
+                format!("{}: {}\n", error_level_display_name(level), message).into_bytes(),
+            ));
+        }
+
+        let diagnostics = if reported {
+            vec![RuntimeDiagnostic::new(
+                error_level_diagnostic_id(level),
+                error_level_severity(level),
+                message,
+                RuntimeSourceSpan::default(),
+                stack_trace(compiled, stack),
+                Some(php_runtime::PhpReferenceClassification::Warning),
+            )]
+        } else {
+            Vec::new()
+        };
+        VmResult::success_with_diagnostics(output.clone(), Some(Value::Bool(true)), diagnostics)
+    }
+
+    fn call_output_buffering_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        let values = match call_args_to_positional(name, args) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        match name {
+            "ob_start" => {
+                if values.len() > 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_start expects zero or one argument in Phase 6",
+                    );
+                }
+                if let Some(callback) = values.first()
+                    && !matches!(callback, Value::Null)
+                {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_CALLBACK_UNSUPPORTED: ob_start callbacks are not implemented in Phase 6",
+                    );
+                }
+                output.start_buffer();
+                VmResult::success(output.clone(), Some(Value::Bool(true)))
+            }
+            "ob_get_contents" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_contents expects no arguments",
+                    );
+                }
+                let value = output
+                    .current_buffer_bytes()
+                    .map(|bytes| Value::string(bytes.to_vec()))
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            "ob_get_length" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_length expects no arguments",
+                    );
+                }
+                let value = output
+                    .current_buffer_len()
+                    .map(|length| Value::Int(length as i64))
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            "ob_get_level" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_level expects no arguments",
+                    );
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Int(output.buffer_level() as i64)),
+                )
+            }
+            "ob_get_clean" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_clean expects no arguments",
+                    );
+                }
+                let value = output
+                    .pop_buffer_clean()
+                    .map(Value::string)
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            "ob_end_clean" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_end_clean expects no arguments",
+                    );
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Bool(output.pop_buffer_clean().is_some())),
+                )
+            }
+            "ob_end_flush" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_end_flush expects no arguments",
+                    );
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Bool(output.pop_buffer_flush().is_some())),
+                )
+            }
+            "flush" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: flush expects no arguments",
+                    );
+                }
+                VmResult::success(output.clone(), Some(Value::Null))
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_OUTPUT_BUFFER_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_environment_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let values = match call_args_to_positional(name, args) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        match name {
+            "getenv" => {
+                if values.len() > 2 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ENV_ARITY: getenv expects zero to two arguments",
+                    );
+                }
+                if values
+                    .first()
+                    .is_none_or(|value| matches!(value, Value::Null))
+                {
+                    return VmResult::success(
+                        output.clone(),
+                        Some(Value::Array(env_entries_array(&state.env))),
+                    );
+                }
+                let key = match to_string(&values[0]) {
+                    Ok(value) => value.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let value = state
+                    .env
+                    .iter()
+                    .find(|(entry_key, _)| entry_key == &key)
+                    .map(|(_, value)| Value::string(value.clone()))
+                    .unwrap_or(Value::Bool(false));
+                VmResult::success(output.clone(), Some(value))
+            }
+            "putenv" => {
+                if values.len() != 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ENV_ARITY: putenv expects one argument",
+                    );
+                }
+                let assignment = match to_string(&values[0]) {
+                    Ok(value) => value.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                if let Some((key, value)) = assignment.split_once('=') {
+                    if key.is_empty() {
+                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                    }
+                    set_env_entry(&mut state.env, key.to_string(), Some(value.to_string()));
+                } else {
+                    if assignment.is_empty() {
+                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                    }
+                    set_env_entry(&mut state.env, assignment, None);
+                }
+                VmResult::success(output.clone(), Some(Value::Bool(true)))
+            }
+            "php_sapi_name" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ENV_ARITY: php_sapi_name expects no arguments",
+                    );
+                }
+                VmResult::success(output.clone(), Some(Value::string("cli")))
+            }
+            "php_uname" => {
+                if values.len() > 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ENV_ARITY: php_uname expects zero or one argument",
+                    );
+                }
+                let mode = match values.first() {
+                    Some(value) => match to_string(value) {
+                        Ok(value) => value.to_string_lossy(),
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    },
+                    None => "a".to_string(),
+                };
+                VmResult::success(output.clone(), Some(Value::string(php_uname_value(&mode))))
+            }
+            "get_current_user" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_ENV_ARITY: get_current_user expects no arguments",
+                    );
+                }
+                VmResult::success(output.clone(), Some(Value::string("phrust")))
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_ENV_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_process_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        if let Some(message) = validate_process_arity(name, args.len()) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        if let Some(arg) = args.iter().find(|arg| arg.name.is_some()) {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_UNKNOWN_NAMED_ARG: function {name} has no builtin parameter ${}",
+                    arg.name.as_deref().unwrap_or_default()
+                ),
+            );
+        }
+
+        match &self.options.runtime_context.process {
+            ProcessCapability::Disabled => {
+                process_disabled_result(output, name, stack_trace(compiled, stack))
+            }
+            ProcessCapability::Mock {
+                output: mock_output,
+                exit_status,
+            } => self.call_mocked_process_builtin(
+                compiled,
+                name,
+                args,
+                mock_output,
+                *exit_status,
+                output,
+                stack,
+            ),
+        }
+    }
+
+    fn call_mocked_process_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        mock_output: &str,
+        exit_status: i64,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        match name {
+            "shell_exec" => VmResult::success(output.clone(), Some(Value::string(mock_output))),
+            "exec" => {
+                if let Some(arg) = args.get(1)
+                    && let Err(message) =
+                        assign_process_ref_arg(stack, arg, process_output_lines_array(mock_output))
+                {
+                    return self.runtime_error(output, compiled, stack, message);
+                }
+                if let Some(arg) = args.get(2)
+                    && let Err(message) =
+                        assign_process_ref_arg(stack, arg, Value::Int(exit_status))
+                {
+                    return self.runtime_error(output, compiled, stack, message);
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::string(process_last_output_line(mock_output))),
+                )
+            }
+            "system" => {
+                output.write_bytes(mock_output.as_bytes());
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::string(process_last_output_line(mock_output))),
+                )
+            }
+            "passthru" => {
+                output.write_bytes(mock_output.as_bytes());
+                if let Some(arg) = args.get(1)
+                    && let Err(message) =
+                        assign_process_ref_arg(stack, arg, Value::Int(exit_status))
+                {
+                    return self.runtime_error(output, compiled, stack, message);
+                }
+                VmResult::success(output.clone(), Some(Value::Null))
+            }
+            "proc_open" | "proc_close" | "proc_get_status" | "popen" | "pclose" => {
+                process_unsupported_mock_result(output, name, stack_trace(compiled, stack))
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_PROCESS_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_array_callback_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let args = match call_args_to_positional(name, args) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let result = match name {
+            "array_map" => self.call_array_map_builtin(compiled, args, output, stack, state),
+            "array_filter" => self.call_array_filter_builtin(compiled, args, output, stack, state),
+            "array_reduce" => self.call_array_reduce_builtin(compiled, args, output, stack, state),
+            "array_walk" => self.call_array_walk_builtin(compiled, args, output, stack, state),
+            "array_any" | "array_all" | "array_find" | "array_find_key" => {
+                self.call_array_predicate_builtin(compiled, name, args, output, stack, state)
+            }
+            _ => Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_UNKNOWN_ARRAY_CALLBACK_BUILTIN: {name}"
+            ))),
+        };
+        match result {
+            Ok(value) => VmResult::success(output.clone(), Some(value)),
+            Err(ArrayCallbackError::Runtime(result)) => *result,
+            Err(ArrayCallbackError::Message(message)) => {
+                self.runtime_error(output, compiled, stack, message)
+            }
+        }
+    }
+
+    fn call_array_map_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if args.len() < 2 {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_BUILTIN_ARITY: array_map expects at least two argument(s)".to_owned(),
+            ));
+        }
+        let callback = args[0].clone();
+        let arrays = args[1..]
+            .iter()
+            .map(|arg| array_callback_entries("array_map", arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let max_len = arrays.iter().map(Vec::len).max().unwrap_or(0);
+        let preserve_single_keys = arrays.len() == 1;
+        let mut result = PhpArray::new();
+        for index in 0..max_len {
+            let callback_args = arrays
+                .iter()
+                .map(|array| {
+                    array
+                        .get(index)
+                        .map_or(Value::Null, |(_, value)| value.clone())
+                })
+                .collect::<Vec<_>>();
+            let mapped = if matches!(callback, Value::Null) {
+                if callback_args.len() == 1 {
+                    callback_args[0].clone()
+                } else {
+                    Value::packed_array(callback_args)
+                }
+            } else {
+                self.invoke_array_callback(
+                    compiled,
+                    callback.clone(),
+                    callback_args,
+                    output,
+                    stack,
+                    state,
+                )?
+            };
+            if preserve_single_keys {
+                if let Some((key, _)) = arrays[0].get(index) {
+                    result.insert(key.clone(), mapped);
+                }
+            } else {
+                result.append(mapped);
+            }
+        }
+        Ok(Value::Array(result))
+    }
+
+    fn call_array_filter_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if !(1..=3).contains(&args.len()) {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_BUILTIN_ARITY: array_filter expects one to three argument(s)".to_owned(),
+            ));
+        }
+        let entries = array_callback_entries("array_filter", &args[0])?;
+        let callback = args.get(1).cloned().unwrap_or(Value::Null);
+        let mode = args
+            .get(2)
+            .map(to_int)
+            .transpose()
+            .map_err(|message| ArrayCallbackError::Message(format!("array_filter: {message}")))?
+            .unwrap_or(0);
+        let mut result = PhpArray::new();
+        for (key, value) in entries {
+            let keep = if matches!(callback, Value::Null) {
+                to_bool(&value).map_err(|message| {
+                    ArrayCallbackError::Message(format!("array_filter: {message}"))
+                })?
+            } else {
+                let callback_args = match mode {
+                    1 => vec![value.clone(), array_callback_key_value(&key)],
+                    2 => vec![array_callback_key_value(&key)],
+                    _ => vec![value.clone()],
+                };
+                let predicate = self.invoke_array_callback(
+                    compiled,
+                    callback.clone(),
+                    callback_args,
+                    output,
+                    stack,
+                    state,
+                )?;
+                to_bool(&predicate).map_err(|message| {
+                    ArrayCallbackError::Message(format!("array_filter: {message}"))
+                })?
+            };
+            if keep {
+                result.insert(key, value);
+            }
+        }
+        Ok(Value::Array(result))
+    }
+
+    fn call_array_reduce_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if !(2..=3).contains(&args.len()) {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_BUILTIN_ARITY: array_reduce expects two or three argument(s)".to_owned(),
+            ));
+        }
+        let entries = array_callback_entries("array_reduce", &args[0])?;
+        let callback = args[1].clone();
+        let mut carry = args.get(2).cloned().unwrap_or(Value::Null);
+        for (_, value) in entries {
+            carry = self.invoke_array_callback(
+                compiled,
+                callback.clone(),
+                vec![carry, value],
+                output,
+                stack,
+                state,
+            )?;
+        }
+        Ok(carry)
+    }
+
+    fn call_array_walk_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if !(2..=3).contains(&args.len()) {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_BUILTIN_ARITY: array_walk expects two or three argument(s)".to_owned(),
+            ));
+        }
+        let entries = array_callback_entries("array_walk", &args[0])?;
+        let callback = args[1].clone();
+        let userdata = args.get(2).cloned();
+        for (key, value) in entries {
+            let mut callback_args = vec![value, array_callback_key_value(&key)];
+            if let Some(userdata) = &userdata {
+                callback_args.push(userdata.clone());
+            }
+            self.invoke_array_callback(
+                compiled,
+                callback.clone(),
+                callback_args,
+                output,
+                stack,
+                state,
+            )?;
+        }
+        Ok(Value::Bool(true))
+    }
+
+    fn call_array_predicate_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if args.len() != 2 {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_BUILTIN_ARITY: {name} expects two argument(s)"
+            )));
+        }
+        let entries = array_callback_entries(name, &args[0])?;
+        let callback = args[1].clone();
+        if name == "array_all" && entries.is_empty() {
+            return Ok(Value::Bool(true));
+        }
+        for (key, value) in entries {
+            let predicate = self.invoke_array_callback(
+                compiled,
+                callback.clone(),
+                vec![value.clone(), array_callback_key_value(&key)],
+                output,
+                stack,
+                state,
+            )?;
+            let truthy = to_bool(&predicate)
+                .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))?;
+            match name {
+                "array_any" if truthy => return Ok(Value::Bool(true)),
+                "array_all" if !truthy => return Ok(Value::Bool(false)),
+                "array_find" if truthy => return Ok(value),
+                "array_find_key" if truthy => return Ok(array_callback_key_value(&key)),
+                _ => {}
+            }
+        }
+        Ok(match name {
+            "array_all" => Value::Bool(true),
+            "array_any" => Value::Bool(false),
+            "array_find" | "array_find_key" => Value::Null,
+            _ => Value::Null,
+        })
+    }
+
+    fn invoke_array_callback(
+        &self,
+        compiled: &CompiledUnit,
+        callback: Value,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        let call_args = args.into_iter().map(CallArgument::positional).collect();
+        let result = self.call_callable(compiled, callback, call_args, output, stack, state);
+        if !result.status.is_success() {
+            return Err(ArrayCallbackError::Runtime(Box::new(result)));
+        }
+        if result.fiber_suspension.is_some() {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_ARRAY_CALLBACK_FIBER_GAP: suspending inside array callbacks is not implemented"
+                    .to_owned(),
+            ));
+        }
+        Ok(result.return_value.unwrap_or(Value::Null))
+    }
+
+    fn call_array_sort_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let result = self.call_array_sort_builtin_inner(compiled, name, args, output, stack, state);
+        match result {
+            Ok(value) => VmResult::success(output.clone(), Some(value)),
+            Err(ArrayCallbackError::Runtime(result)) => *result,
+            Err(ArrayCallbackError::Message(message)) => {
+                self.runtime_error(output, compiled, stack, message)
+            }
+        }
+    }
+
+    fn call_array_sort_builtin_inner(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        let expects_callback = matches!(name, "usort" | "uasort" | "uksort");
+        let max_arity = 2;
+        if args.is_empty() || args.len() > max_arity || (expects_callback && args.len() != 2) {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_BUILTIN_ARITY: {name} expects {}",
+                if expects_callback {
+                    "two argument(s)"
+                } else {
+                    "one or two argument(s)"
+                }
+            )));
+        }
+        if args.iter().any(|arg| arg.name.is_some()) {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {name} has no builtin parameter"
+            )));
+        }
+
+        let mut args = args.into_iter();
+        let first = args.next().expect("checked non-empty");
+        let cell = sort_reference_cell(name, first, stack)?;
+        let Value::Array(array) = cell.get() else {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_BUILTIN_TYPE: {name} expects array"
+            )));
+        };
+        let mut entries = array
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let callback = args.next().map(|arg| arg.value);
+        sort_entries_stable(&mut entries, |left, right| {
+            self.compare_sort_entries(
+                compiled,
+                name,
+                callback.clone(),
+                left,
+                right,
+                output,
+                stack,
+                state,
+            )
+        })?;
+        if matches!(name, "rsort" | "arsort" | "krsort") {
+            entries.reverse();
+        }
+
+        let mut sorted = PhpArray::new();
+        let reindex = matches!(name, "sort" | "rsort" | "usort");
+        for (key, value) in entries {
+            if reindex {
+                sorted.append(value);
+            } else {
+                sorted.insert(key, value);
+            }
+        }
+        cell.set(Value::Array(sorted));
+        Ok(Value::Bool(true))
+    }
+
+    fn compare_sort_entries(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        callback: Option<Value>,
+        left: &(ArrayKey, Value),
+        right: &(ArrayKey, Value),
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        if let Some(callback) = callback {
+            let args = if name == "uksort" {
+                vec![
+                    array_callback_key_value(&left.0),
+                    array_callback_key_value(&right.0),
+                ]
+            } else {
+                vec![left.1.clone(), right.1.clone()]
+            };
+            let result =
+                self.invoke_array_callback(compiled, callback, args, output, stack, state)?;
+            let int = to_int(&result)
+                .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))?;
+            return Ok(int.cmp(&0));
+        }
+        if matches!(name, "ksort" | "krsort") {
+            return compare(
+                &array_callback_key_value(&left.0),
+                &array_callback_key_value(&right.0),
+            )
+            .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")));
+        }
+        if matches!(name, "natsort" | "natcasesort") {
+            return Ok(natural_compare_values(
+                &left.1,
+                &right.1,
+                name == "natcasesort",
+            ));
+        }
+        compare(&left.1, &right.1)
+            .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))
+    }
+
     fn call_fiber_callable(
         &self,
         compiled: &CompiledUnit,
@@ -4661,22 +8230,32 @@ impl Vm {
     ) -> VmResult {
         match callee {
             Value::Callable(CallableValue::UserFunction { name }) => {
-                let Some(function) = compiled.lookup_function(&name) else {
-                    return self.runtime_error(
+                if let Some(function) = compiled.lookup_function(&name) {
+                    self.execute_function(
+                        compiled,
+                        function,
+                        FunctionCall::new(args, Vec::new()).running_fiber(fiber),
+                        output,
+                        stack,
+                        state,
+                    )
+                } else if let Some((owner, function)) = dynamic_function_in_state(state, &name) {
+                    self.execute_function(
+                        &owner,
+                        function,
+                        FunctionCall::new(args, Vec::new()).running_fiber(fiber),
+                        output,
+                        stack,
+                        state,
+                    )
+                } else {
+                    self.runtime_error(
                         output,
                         compiled,
                         stack,
                         format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
-                    );
-                };
-                self.execute_function(
-                    compiled,
-                    function,
-                    FunctionCall::new(args, Vec::new()).running_fiber(fiber),
-                    output,
-                    stack,
-                    state,
-                )
+                    )
+                }
             }
             Value::Callable(CallableValue::Closure { function, captures }) => self
                 .execute_function(
@@ -4716,8 +8295,60 @@ impl Vm {
                 state,
             );
         }
+        if let Some((owner, function)) = dynamic_function_in_state(state, &normalized) {
+            return self.execute_function(
+                &owner,
+                function,
+                FunctionCall::new(args, Vec::new()),
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_autoload_builtin_name(&normalized)
+            || is_symbol_introspection_builtin_name(&normalized)
+        {
+            return self.call_autoload_builtin(
+                compiled,
+                &normalized,
+                args,
+                None,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_config_builtin_name(&normalized) {
+            return self.call_config_builtin(compiled, &normalized, args, output, stack, state);
+        }
+        if is_error_handling_builtin_name(&normalized) {
+            return self.call_error_handling_builtin(
+                compiled,
+                &normalized,
+                args,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_output_buffering_builtin_name(&normalized) {
+            return self.call_output_buffering_builtin(compiled, &normalized, args, output, stack);
+        }
+        if is_environment_builtin_name(&normalized) {
+            return self.call_environment_builtin(
+                compiled,
+                &normalized,
+                args,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_process_builtin_name(&normalized) {
+            return self.call_process_builtin(compiled, &normalized, args, output, stack);
+        }
         if BuiltinRegistry::new().contains(&normalized) {
-            let values = match call_args_to_positional(&normalized, args) {
+            let values = match call_builtin_args_to_positional(&normalized, args, stack) {
                 Ok(values) => values,
                 Err(message) => {
                     return self.runtime_error(output, compiled, stack, message);
@@ -4728,13 +8359,418 @@ impl Vm {
             {
                 return self.runtime_error(output, compiled, stack, message);
             }
-            return execute_builtin(&normalized, values, output);
+            return self.execute_internal_registry_builtin(
+                &normalized,
+                values,
+                output,
+                state,
+                compiled,
+            );
         }
         self.runtime_error(
             output,
             compiled,
             stack,
             format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
+        )
+    }
+
+    fn resolve_function_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        name: &str,
+    ) -> Option<FunctionCallCacheTarget> {
+        if is_autoload_builtin_name(name) || is_symbol_introspection_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection,
+                name: name.to_owned(),
+            });
+        }
+        if is_config_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::Config,
+                name: name.to_owned(),
+            });
+        }
+        if is_error_handling_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::ErrorHandling,
+                name: name.to_owned(),
+            });
+        }
+        if is_output_buffering_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::OutputBuffering,
+                name: name.to_owned(),
+            });
+        }
+        if is_environment_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::Environment,
+                name: name.to_owned(),
+            });
+        }
+        if is_process_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::Process,
+                name: name.to_owned(),
+            });
+        }
+        if let Some(function) = compiled.lookup_function(name) {
+            return Some(FunctionCallCacheTarget::CurrentUnit { function });
+        }
+        if let Some((unit_index, function)) = dynamic_function_target_in_state(state, name) {
+            return Some(FunctionCallCacheTarget::DynamicUnit {
+                unit_index,
+                function,
+            });
+        }
+        if is_array_callback_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::ArrayCallback,
+                name: name.to_owned(),
+            });
+        }
+        if is_array_sort_builtin_name(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::ArraySort,
+                name: name.to_owned(),
+            });
+        }
+        if BuiltinRegistry::new().contains(name) {
+            return Some(FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::InternalRegistry,
+                name: name.to_owned(),
+            });
+        }
+        None
+    }
+
+    fn execute_function_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: FunctionCallCacheTarget,
+        args: Vec<CallArgument>,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        running_fiber: &Option<FiberRef>,
+    ) -> VmResult {
+        match target {
+            FunctionCallCacheTarget::CurrentUnit { function } => self.execute_function(
+                compiled,
+                function,
+                FunctionCall::new(args, Vec::new()).inherit_fiber_context(running_fiber),
+                output,
+                stack,
+                state,
+            ),
+            FunctionCallCacheTarget::DynamicUnit {
+                unit_index,
+                function,
+            } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_INLINE_CACHE_STALE_DYNAMIC_UNIT: dynamic unit {unit_index} is unavailable"
+                        ),
+                    );
+                };
+                self.execute_function(
+                    &owner,
+                    function,
+                    FunctionCall::new(args, Vec::new()).inherit_fiber_context(running_fiber),
+                    output,
+                    stack,
+                    state,
+                )
+            }
+            FunctionCallCacheTarget::Builtin { kind, name } => match kind {
+                FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection => self
+                    .call_autoload_builtin(compiled, &name, args, call_site, output, stack, state),
+                FunctionCallBuiltinKind::Config => {
+                    self.call_config_builtin(compiled, &name, args, output, stack, state)
+                }
+                FunctionCallBuiltinKind::ErrorHandling => {
+                    self.call_error_handling_builtin(compiled, &name, args, output, stack, state)
+                }
+                FunctionCallBuiltinKind::OutputBuffering => {
+                    self.call_output_buffering_builtin(compiled, &name, args, output, stack)
+                }
+                FunctionCallBuiltinKind::Environment => {
+                    self.call_environment_builtin(compiled, &name, args, output, stack, state)
+                }
+                FunctionCallBuiltinKind::Process => {
+                    self.call_process_builtin(compiled, &name, args, output, stack)
+                }
+                FunctionCallBuiltinKind::ArrayCallback => {
+                    self.call_array_callback_builtin(compiled, &name, args, output, stack, state)
+                }
+                FunctionCallBuiltinKind::ArraySort => {
+                    self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
+                }
+                FunctionCallBuiltinKind::InternalRegistry => {
+                    let values = match call_builtin_args_to_positional(&name, args, stack) {
+                        Ok(values) => values,
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    };
+                    if name == "var_dump"
+                        && let Some(message) = debug_info_gap_message(compiled, &values)
+                    {
+                        return self.runtime_error(output, compiled, stack, message);
+                    }
+                    self.execute_internal_registry_builtin(&name, values, output, state, compiled)
+                }
+            },
+        }
+    }
+
+    fn read_property_fetch_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: PropertyFetchCacheTarget,
+        object: &ObjectRef,
+        stack: &CallStack,
+        state: &ExecutionState,
+    ) -> Result<PropertyFetchCacheRead, String> {
+        let (owner, declaring_class_name, property_name, storage_name) = match target {
+            PropertyFetchCacheTarget::CurrentUnit {
+                receiver_class: _,
+                declaring_class,
+                property,
+                storage_name,
+            } => (compiled.clone(), declaring_class, property, storage_name),
+            PropertyFetchCacheTarget::DynamicUnit {
+                unit_index,
+                receiver_class: _,
+                declaring_class,
+                property,
+                storage_name,
+            } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    return Ok(PropertyFetchCacheRead::Fallback);
+                };
+                (owner, declaring_class, property, storage_name)
+            }
+        };
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name) else {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        };
+        let Some(property) = declaring_class
+            .properties
+            .iter()
+            .find(|entry| entry.name == property_name)
+        else {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        };
+        if property.flags.is_static || property.flags.is_protected {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if property.hooks.get.is_some() || property.hooks.set.is_some() {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if property_hook_is_active(state, object, declaring_class, property) {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if validate_property_access(&owner, stack, declaring_class, property).is_err() {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        let Some(value) = object.get_property(&storage_name) else {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        };
+        if matches!(value, Value::Uninitialized) {
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        Ok(PropertyFetchCacheRead::Value(value))
+    }
+
+    fn read_class_constant_static_property_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: ClassConstantStaticPropertyCacheTarget,
+        stack: &CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<ClassStaticCacheRead, String> {
+        let (owner, kind, declaring_class_name, member) = match target {
+            ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                kind,
+                resolved_class: _,
+                declaring_class,
+                member,
+            } => (compiled.clone(), kind, declaring_class, member),
+            ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                unit_index,
+                kind,
+                resolved_class: _,
+                declaring_class,
+                member,
+            } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                };
+                (owner, kind, declaring_class, member)
+            }
+        };
+        let Some(class) = owner.lookup_class(&declaring_class_name) else {
+            return Ok(ClassStaticCacheRead::Fallback);
+        };
+        match kind {
+            ClassConstantStaticPropertyCacheKind::ClassConstant => {
+                let Some(constant) = class.constants.iter().find(|entry| entry.name == member)
+                else {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                };
+                if validate_constant_access(&owner, stack, class, constant).is_err() {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                }
+                let value = match constant.value {
+                    Some(value) => constant_value(owner.unit(), value)?,
+                    None => Value::Null,
+                };
+                Ok(ClassStaticCacheRead::Value(value))
+            }
+            ClassConstantStaticPropertyCacheKind::EnumCase => {
+                let Some(case) = class
+                    .enum_cases
+                    .iter()
+                    .find(|case| case.name.eq_ignore_ascii_case(&member))
+                else {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                };
+                let object = enum_case_object(&owner, state, class, case, &|value| {
+                    constant_value(owner.unit(), value)
+                })?;
+                Ok(ClassStaticCacheRead::Value(Value::Object(object)))
+            }
+            ClassConstantStaticPropertyCacheKind::StaticProperty => {
+                let Some(property) = class.properties.iter().find(|entry| entry.name == member)
+                else {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                };
+                if !property.flags.is_static {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                }
+                if validate_property_access(&owner, stack, class, property).is_err() {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                }
+                let key = static_property_key(class, property);
+                if !state.static_properties.contains_key(&key) {
+                    let default = static_property_default(owner.unit(), class, property)?;
+                    state.static_properties.insert(key.clone(), default);
+                }
+                let value = state
+                    .static_properties
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(Value::Uninitialized);
+                if matches!(value, Value::Uninitialized) {
+                    return Ok(ClassStaticCacheRead::Fallback);
+                }
+                Ok(ClassStaticCacheRead::Value(value))
+            }
+        }
+    }
+
+    fn execute_method_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: MethodCallCacheTarget,
+        object: ObjectRef,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        running_fiber: &Option<FiberRef>,
+    ) -> VmResult {
+        let (owner, declaring_class_name, function) = match target {
+            MethodCallCacheTarget::CurrentUnit {
+                receiver_class: _,
+                declaring_class,
+                function,
+            } => (compiled.clone(), declaring_class, function),
+            MethodCallCacheTarget::DynamicUnit {
+                unit_index,
+                receiver_class: _,
+                declaring_class,
+                function,
+            } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_INLINE_CACHE_STALE_DYNAMIC_UNIT: dynamic unit {unit_index} is unavailable"
+                        ),
+                    );
+                };
+                (owner, declaring_class, function)
+            }
+        };
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name).cloned() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_INLINE_CACHE_STALE_METHOD_CLASS: class {declaring_class_name} is unavailable"
+                ),
+            );
+        };
+        let Some(method_entry) = declaring_class
+            .methods
+            .iter()
+            .find(|method| method.function == function)
+            .cloned()
+        else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_INLINE_CACHE_STALE_METHOD: method target {}#{} is unavailable",
+                    declaring_class.name,
+                    function.index()
+                ),
+            );
+        };
+        if method_entry.flags.is_static {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_STATIC_METHOD_AS_INSTANCE: method {}::{} is static",
+                    declaring_class.name, method_entry.name
+                ),
+            );
+        }
+        if let Err(message) =
+            validate_method_callable(&owner, stack, &declaring_class, &method_entry)
+        {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        self.execute_function(
+            &owner,
+            method_entry.function,
+            FunctionCall::new(args, Vec::new())
+                .with_this(object.clone())
+                .with_class_context(
+                    declaring_class.name.clone(),
+                    object.class_name(),
+                    declaring_class.name,
+                )
+                .inherit_fiber_context(running_fiber),
+            output,
+            stack,
+            state,
         )
     }
 
@@ -4817,6 +8853,25 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        if is_spl_iterator_runtime_class(&object.class_name()) {
+            return match call_spl_iterator_method(object, method, args) {
+                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Err(message) => self.runtime_error(output, compiled, stack, message),
+            };
+        }
+        if is_spl_container_runtime_class(&object.class_name()) {
+            return match call_spl_container_method(object, method, args) {
+                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Err(message) => self.runtime_error(output, compiled, stack, message),
+            };
+        }
+        if is_spl_file_runtime_class(&object.class_name()) {
+            return match call_spl_file_method(&object, method, args, &self.options.runtime_context)
+            {
+                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Err(message) => self.runtime_error(output, compiled, stack, message),
+            };
+        }
         let Some(class) = compiled.lookup_class(&object.class_name()) else {
             return self.runtime_error(
                 output,
@@ -4963,13 +9018,18 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> Result<ForeachIterator, VmResult> {
         match source {
-            Value::Array(array) => Ok(ForeachIterator::Snapshot {
-                entries: array
-                    .iter()
-                    .map(|(key, value)| (key.clone(), effective_value(value)))
-                    .collect(),
-                position: 0,
-            }),
+            Value::Array(array) => {
+                if array.is_packed_fast() {
+                    self.record_counter_array_sequential_foreach_fast_path_hit();
+                }
+                Ok(ForeachIterator::Snapshot {
+                    entries: array
+                        .iter()
+                        .map(|(key, value)| (key.clone(), effective_value(value)))
+                        .collect(),
+                    position: 0,
+                })
+            }
             Value::Generator(generator) => Ok(ForeachIterator::Generator {
                 generator,
                 consumed: false,
@@ -4996,6 +9056,8 @@ impl Vm {
                     fiber_suspension: None,
                     return_ref: None,
                     trace: Vec::new(),
+                    counters: None,
+                    tiering_stats: None,
                 })
             }
         }
@@ -5010,6 +9072,30 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> Result<ForeachIterator, VmResult> {
         let class_name = object.class_name();
+        if is_spl_iterator_runtime_class(&class_name) {
+            call_spl_iterator_method(object.clone(), "rewind", Vec::new())
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+            return Ok(ForeachIterator::IteratorObject {
+                object,
+                needs_next: false,
+            });
+        }
+        if is_spl_container_runtime_class(&class_name) {
+            call_spl_container_method(object.clone(), "rewind", Vec::new())
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+            return Ok(ForeachIterator::IteratorObject {
+                object,
+                needs_next: false,
+            });
+        }
+        if is_spl_file_runtime_class(&class_name) {
+            call_spl_file_method(&object, "rewind", Vec::new(), &self.options.runtime_context)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+            return Ok(ForeachIterator::IteratorObject {
+                object,
+                needs_next: false,
+            });
+        }
         match class_implements_interface(compiled, &class_name, "Iterator", &mut Vec::new()) {
             Ok(true) => {
                 self.call_object_method_value(
@@ -5813,7 +9899,9 @@ impl Vm {
                     ));
                 }
                 if !matches!(generator.state(), GeneratorState::Suspended) {
-                    return Err(uncaught_exception(output, compiled, stack, throwable));
+                    return Err(self.handle_uncaught_exception(
+                        compiled, output, stack, state, throwable,
+                    ));
                 }
                 let next = self.resume_generator_to_next_yield(
                     compiled,
@@ -6322,9 +10410,23 @@ impl Vm {
         state: &mut ExecutionState,
         value: &Value,
     ) -> Result<(), VmResult> {
-        let string = self.value_to_string(compiled, value, output, stack, state)?;
-        output.write_php_string(&string);
-        Ok(())
+        match value {
+            Value::String(value) => {
+                output.write_php_string(value);
+                Ok(())
+            }
+            Value::Null | Value::Bool(false) => Ok(()),
+            Value::Bool(true) => {
+                output.write_bytes(b"1");
+                Ok(())
+            }
+            Value::Reference(cell) => self.write_echo(compiled, output, stack, state, &cell.get()),
+            _ => {
+                let string = self.value_to_string(compiled, value, output, stack, state)?;
+                output.write_php_string(&string);
+                Ok(())
+            }
+        }
     }
 
     fn execute_binary(
@@ -6527,6 +10629,13 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        if is_php_token_runtime_class(class_name) {
+            let value = match php_token_static_method_value(class_name, method, args) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            };
+            return VmResult::success(output.clone(), Some(value));
+        }
         let class = match resolve_static_class_name(compiled, stack, class_name) {
             Ok(class) => class,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -6629,6 +10738,10 @@ impl Vm {
     fn execute_include(
         &self,
         compiled: &CompiledUnit,
+        unit_key: u64,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
         kind: IncludeKind,
         path: &Value,
         output: &mut OutputBuffer,
@@ -6648,10 +10761,132 @@ impl Vm {
             );
         };
         let including_file = current_source_path(compiled, stack);
-        let loaded = match loader.load(including_file.as_deref(), &path) {
-            Ok(loaded) => loaded,
-            Err(message) => {
-                return include_failure(output, kind, message, stack_trace(compiled, stack));
+        let include_path = state_include_path(state);
+        let cwd = self.options.runtime_context.cwd.clone();
+        let request = IncludePathCacheKey {
+            path: path.clone(),
+            include_path: include_path.clone(),
+            cwd: cwd.clone(),
+            calling_file_directory: including_file
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        let cached = self.lookup_include_path_inline_cache(
+            unit_key,
+            function_id,
+            block_id,
+            instruction_id,
+            &request,
+            InvalidationEpoch::default(),
+        );
+        let loaded = if let Some(target) = cached {
+            match include_path_file_fingerprint(&target.canonical_path) {
+                Ok(current) if current == target.fingerprint => {
+                    self.record_include_path_inline_cache_hit(
+                        unit_key,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    );
+                    match loader.load_resolved(target.canonical_path) {
+                        Ok(loaded) => loaded,
+                        Err(message) => {
+                            return include_failure(
+                                output,
+                                kind,
+                                message,
+                                stack_trace(compiled, stack),
+                            );
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    self.record_include_path_inline_cache_invalidation(
+                        unit_key,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    );
+                    match loader.resolve_with_include_path(
+                        including_file.as_deref(),
+                        &path,
+                        &include_path,
+                        Some(&cwd),
+                    ) {
+                        Ok(resolved) => {
+                            let target = IncludePathCacheTarget {
+                                canonical_path: resolved.canonical_path.clone(),
+                                fingerprint: resolved.fingerprint.clone(),
+                            };
+                            self.install_include_path_inline_cache(
+                                unit_key,
+                                function_id,
+                                block_id,
+                                instruction_id,
+                                request.clone(),
+                                InvalidationEpoch::default(),
+                                target,
+                            );
+                            match loader.load_resolved(resolved.canonical_path) {
+                                Ok(loaded) => loaded,
+                                Err(message) => {
+                                    return include_failure(
+                                        output,
+                                        kind,
+                                        message,
+                                        stack_trace(compiled, stack),
+                                    );
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            return include_failure(
+                                output,
+                                kind,
+                                message,
+                                stack_trace(compiled, stack),
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            match loader.resolve_with_include_path(
+                including_file.as_deref(),
+                &path,
+                &include_path,
+                Some(&cwd),
+            ) {
+                Ok(resolved) => {
+                    let target = IncludePathCacheTarget {
+                        canonical_path: resolved.canonical_path.clone(),
+                        fingerprint: resolved.fingerprint.clone(),
+                    };
+                    self.install_include_path_inline_cache(
+                        unit_key,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                        request,
+                        InvalidationEpoch::default(),
+                        target,
+                    );
+                    match loader.load_resolved(resolved.canonical_path) {
+                        Ok(loaded) => loaded,
+                        Err(message) => {
+                            return include_failure(
+                                output,
+                                kind,
+                                message,
+                                stack_trace(compiled, stack),
+                            );
+                        }
+                    }
+                }
+                Err(message) => {
+                    return include_failure(output, kind, message, stack_trace(compiled, stack));
+                }
             }
         };
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
@@ -6693,7 +10928,7 @@ impl Vm {
             );
         }
         let included = CompiledUnit::new(lowering.unit);
-        register_dynamic_classes(state, included.unit());
+        register_dynamic_unit(state, included.clone());
         let mut shared = shared_locals_from_current_frame(compiled, stack);
         let call = FunctionCall {
             args: Vec::new(),
@@ -6723,6 +10958,7 @@ impl Vm {
         compiled: &CompiledUnit,
         name: &str,
         args: Vec<CallArgument>,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -6741,11 +10977,13 @@ impl Vm {
                         "E_PHP_VM_AUTOLOAD_ARITY: spl_autoload_register expects at least 1 argument",
                     );
                 };
-                let callback = match autoload_callback_from_value(compiled, callback.clone()) {
+                let callback = match autoload_callback_from_value(compiled, state, callback.clone())
+                {
                     Ok(callback) => callback,
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 state.autoload_registry.register(callback);
+                state.bump_autoload_stack_epoch();
                 VmResult::success(output.clone(), Some(Value::Bool(true)))
             }
             "spl_autoload_unregister" => {
@@ -6757,11 +10995,15 @@ impl Vm {
                         "E_PHP_VM_AUTOLOAD_ARITY: spl_autoload_unregister expects at least 1 argument",
                     );
                 };
-                let callback = match autoload_callback_from_value(compiled, callback.clone()) {
+                let callback = match autoload_callback_from_value(compiled, state, callback.clone())
+                {
                     Ok(callback) => callback,
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 let removed = state.autoload_registry.unregister(&callback);
+                if removed {
+                    state.bump_autoload_stack_epoch();
+                }
                 VmResult::success(output.clone(), Some(Value::Bool(removed)))
             }
             "spl_autoload_functions" => {
@@ -6789,7 +11031,101 @@ impl Vm {
                     Err(result) => result,
                 }
             }
-            "class_exists" | "interface_exists" => {
+            "defined" => {
+                let Some(constant_name) = values.first() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: defined expects constant name",
+                    );
+                };
+                let constant_name = match to_string(constant_name) {
+                    Ok(name) => name.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Bool(
+                        compiled.lookup_constant(&constant_name).is_some()
+                            || predefined_constant_value(&constant_name).is_some(),
+                    )),
+                )
+            }
+            "constant" => {
+                let Some(constant_name) = values.first() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: constant expects constant name",
+                    );
+                };
+                let constant_name = match to_string(constant_name) {
+                    Ok(name) => name.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let value = if let Some(constant) = compiled.lookup_constant(&constant_name) {
+                    inline_constant_value(constant)
+                } else if let Some(value) = predefined_constant_value(&constant_name) {
+                    value
+                } else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_RUNTIME_UNDEFINED_CONSTANT: undefined constant {constant_name}"
+                        ),
+                    );
+                };
+                VmResult::success(output.clone(), Some(value))
+            }
+            "extension_loaded" => {
+                let Some(extension_name) = values.first() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: extension_loaded expects extension name",
+                    );
+                };
+                let extension_name = match to_string(extension_name) {
+                    Ok(name) => name.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Bool(php_std::introspection::extension_loaded(
+                        &registry,
+                        &extension_name,
+                    ))),
+                )
+            }
+            "function_exists" => {
+                let Some(function_name) = values.first() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: function_exists expects function name",
+                    );
+                };
+                let function_name = match to_string(function_name) {
+                    Ok(name) => normalize_function_name(&name.to_string_lossy()),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Bool(
+                        compiled.lookup_function(&function_name).is_some()
+                            || dynamic_function_in_state(state, &function_name).is_some()
+                            || BuiltinRegistry::new().contains(&function_name),
+                    )),
+                )
+            }
+            "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
                 let Some(class_name) = values.first() else {
                     return self.runtime_error(
                         output,
@@ -6805,22 +11141,71 @@ impl Vm {
                 let autoload = values
                     .get(1)
                     .is_none_or(|value| to_bool(value).unwrap_or(true));
-                if autoload
-                    && lookup_class_in_state(compiled, state, &class_name).is_none()
-                    && let Err(result) =
-                        self.autoload_class(compiled, &class_name, output, stack, state)
-                {
-                    return result;
-                }
-                let exists =
-                    lookup_class_in_state(compiled, state, &class_name).is_some_and(|class| {
-                        if name == "interface_exists" {
-                            class.flags.is_interface
-                        } else {
-                            !class.flags.is_interface
-                        }
-                    });
+                let lookup_kind = match name {
+                    "interface_exists" => AutoloadClassLookupKind::Interface,
+                    "enum_exists" => AutoloadClassLookupKind::Enum,
+                    "trait_exists" => AutoloadClassLookupKind::Trait,
+                    _ => AutoloadClassLookupKind::Class,
+                };
+                let exists = match self.class_like_exists_with_autoload_cache(
+                    compiled,
+                    &class_name,
+                    lookup_kind,
+                    autoload,
+                    call_site,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(exists) => exists,
+                    Err(result) => return result,
+                };
                 VmResult::success(output.clone(), Some(Value::Bool(exists)))
+            }
+            "method_exists" => {
+                self.call_method_exists_builtin(compiled, values, output, stack, state)
+            }
+            "property_exists" => {
+                self.call_property_exists_builtin(compiled, values, output, stack, state)
+            }
+            "get_object_vars" => self.call_get_object_vars_builtin(compiled, values, output, stack),
+            "get_mangled_object_vars" => {
+                self.call_get_mangled_object_vars_builtin(compiled, values, output, stack)
+            }
+            "get_class_methods" => {
+                self.call_get_class_methods_builtin(compiled, values, output, stack, state)
+            }
+            "get_class_vars" => {
+                self.call_get_class_vars_builtin(compiled, values, output, stack, state)
+            }
+            "call_user_func" => self.call_user_func_builtin(compiled, values, output, stack, state),
+            "call_user_func_array" => {
+                self.call_user_func_array_builtin(compiled, values, output, stack, state)
+            }
+            "forward_static_call" => {
+                self.call_forward_static_call_builtin(compiled, values, output, stack, state)
+            }
+            "func_get_args" | "func_num_args" | "func_get_arg" => {
+                self.call_function_context_builtin(compiled, name, values, output, stack)
+            }
+            "is_subclass_of" => {
+                self.call_is_subclass_of_builtin(compiled, values, output, stack, state)
+            }
+            "get_class" => self.call_get_class_builtin(compiled, values, output, stack, state),
+            "get_parent_class" => {
+                self.call_get_parent_class_builtin(compiled, values, output, stack, state)
+            }
+            "get_declared_classes" | "get_declared_interfaces" | "get_declared_traits" => {
+                self.call_get_declared_builtin(compiled, name, output, state)
+            }
+            "get_loaded_extensions" => {
+                let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+                VmResult::success(
+                    output.clone(),
+                    Some(php_std::introspection::get_loaded_extensions_value(
+                        &registry,
+                    )),
+                )
             }
             _ => self.runtime_error(
                 output,
@@ -6829,6 +11214,641 @@ impl Vm {
                 format!("E_PHP_VM_UNKNOWN_AUTOLOAD_BUILTIN: {name}"),
             ),
         }
+    }
+
+    fn call_method_exists_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: method_exists expects two arguments",
+            );
+        }
+        let class_name = match class_name_from_object_or_string(&values[0]) {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let method = match to_string(&values[1]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if lookup_class_in_state(compiled, state, &class_name).is_none()
+            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+        {
+            return result;
+        }
+        let exists = lookup_method_in_state(compiled, state, &class_name, &method)
+            .map(|value| value.is_some())
+            .unwrap_or(false);
+        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+    }
+
+    fn call_property_exists_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: property_exists expects two arguments",
+            );
+        }
+        let object = object_from_value(&values[0]);
+        let class_name = match object.as_ref() {
+            Some(object) => object.class_name(),
+            None => match to_string(&values[0]) {
+                Ok(name) => name.to_string_lossy(),
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+        };
+        let property = match to_string(&values[1]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if let Some(object) = object
+            && object
+                .properties_snapshot()
+                .into_iter()
+                .any(|(name, _)| name == property)
+        {
+            return VmResult::success(output.clone(), Some(Value::Bool(true)));
+        }
+        if lookup_class_in_state(compiled, state, &class_name).is_none()
+            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+        {
+            return result;
+        }
+        let exists = lookup_property_in_state(compiled, state, &class_name, &property)
+            .map(|value| value.is_some())
+            .unwrap_or(false);
+        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+    }
+
+    fn call_get_object_vars_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_object_vars expects one object argument",
+            );
+        }
+        let Some(object) = object_from_value(&values[0]) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_TYPE: get_object_vars expects object",
+            );
+        };
+        VmResult::success(
+            output.clone(),
+            Some(Value::Array(object_vars_array(
+                compiled, stack, &object, false,
+            ))),
+        )
+    }
+
+    fn call_get_mangled_object_vars_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_mangled_object_vars expects one object argument",
+            );
+        }
+        let Some(object) = object_from_value(&values[0]) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_TYPE: get_mangled_object_vars expects object",
+            );
+        };
+        VmResult::success(
+            output.clone(),
+            Some(Value::Array(object_vars_array(
+                compiled, stack, &object, true,
+            ))),
+        )
+    }
+
+    fn call_get_class_methods_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_class_methods expects one argument",
+            );
+        }
+        let class_name = match class_name_from_object_or_string(&values[0]) {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if lookup_class_in_state(compiled, state, &class_name).is_none()
+            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+        {
+            return result;
+        }
+        let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        };
+        let mut array = PhpArray::new();
+        for name in visible_class_methods(compiled, stack, state, &class) {
+            array.append(Value::string(name));
+        }
+        VmResult::success(output.clone(), Some(Value::Array(array)))
+    }
+
+    fn call_get_class_vars_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_class_vars expects one class argument",
+            );
+        }
+        let class_name = match to_string(&values[0]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if lookup_class_in_state(compiled, state, &class_name).is_none()
+            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+        {
+            return result;
+        }
+        let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        };
+        VmResult::success(
+            output.clone(),
+            Some(Value::Array(visible_class_vars(
+                compiled, stack, state, &class,
+            ))),
+        )
+    }
+
+    fn call_user_func_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let Some(callback) = values.first().cloned() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CALLABLE_ARITY: call_user_func expects at least one argument",
+            );
+        };
+        let args = values
+            .into_iter()
+            .skip(1)
+            .map(CallArgument::positional)
+            .collect();
+        self.call_callable(compiled, callback, args, output, stack, state)
+    }
+
+    fn call_user_func_array_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CALLABLE_ARITY: call_user_func_array expects two arguments",
+            );
+        }
+        let callback = values[0].clone();
+        let Value::Array(array) = callable_resolve_reference(values[1].clone()) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CALLABLE_TYPE: call_user_func_array expects array arguments",
+            );
+        };
+        let args = call_args_from_php_array(array);
+        self.call_callable(compiled, callback, args, output, stack, state)
+    }
+
+    fn call_forward_static_call_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let Some(callback) = values.first().cloned() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CALLABLE_ARITY: forward_static_call expects at least one argument",
+            );
+        };
+        if current_scope_class(compiled, stack).is_none() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_STATIC_SCOPE: forward_static_call is not available outside class scope",
+            );
+        }
+        let args = values
+            .into_iter()
+            .skip(1)
+            .map(CallArgument::positional)
+            .collect();
+        self.call_callable(compiled, callback, args, output, stack, state)
+    }
+
+    fn call_function_context_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        let Some(frame) = stack.current() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_CALL_CONTEXT: {name} is not available outside function scope"),
+            );
+        };
+        let Some(function) = compiled.unit().functions.get(frame.function.index()) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CALL_CONTEXT: missing frame function",
+            );
+        };
+        if function.flags.is_top_level {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_CALL_CONTEXT: {name} is not available in top-level scope"),
+            );
+        }
+        match name {
+            "func_get_args" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CALL_CONTEXT_ARITY: func_get_args expects no arguments",
+                    );
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Array(PhpArray::from_packed(frame.arguments.clone()))),
+                )
+            }
+            "func_num_args" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CALL_CONTEXT_ARITY: func_num_args expects no arguments",
+                    );
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::Int(frame.arguments.len() as i64)),
+                )
+            }
+            "func_get_arg" => {
+                if values.len() != 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_CALL_CONTEXT_ARITY: func_get_arg expects one argument",
+                    );
+                }
+                let index = match to_int(&values[0]) {
+                    Ok(index) if index >= 0 => index as usize,
+                    Ok(_) => {
+                        return self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_VM_CALL_CONTEXT_INDEX: func_get_arg index must be non-negative",
+                        );
+                    }
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                let Some(value) = frame.arguments.get(index).cloned() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!("E_PHP_VM_CALL_CONTEXT_INDEX: func_get_arg index {index} is out of range"),
+                    );
+                };
+                VmResult::success(output.clone(), Some(value))
+            }
+            _ => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_CALL_CONTEXT_BUILTIN: {name}"),
+            ),
+        }
+    }
+
+    fn call_is_subclass_of_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if !(2..=3).contains(&values.len()) {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: is_subclass_of expects two or three arguments",
+            );
+        }
+        let allow_string = values
+            .get(2)
+            .is_none_or(|value| to_bool(value).unwrap_or(true));
+        let class_name = match object_from_value(&values[0]) {
+            Some(object) => object.class_name(),
+            None if allow_string => match to_string(&values[0]) {
+                Ok(name) => name.to_string_lossy(),
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+            None => return VmResult::success(output.clone(), Some(Value::Bool(false))),
+        };
+        let target_name = match to_string(&values[1]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        for candidate in [&class_name, &target_name] {
+            if lookup_class_in_state(compiled, state, candidate).is_none()
+                && let Err(result) = self.autoload_class(compiled, candidate, output, stack, state)
+            {
+                return result;
+            }
+        }
+        let exists = class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
+            .unwrap_or(false);
+        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+    }
+
+    fn call_get_class_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &ExecutionState,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_class expects one object argument",
+            );
+        }
+        let Some(object) = object_from_value(&values[0]) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_TYPE: get_class expects object",
+            );
+        };
+        let class_name = object.class_name();
+        let display_name = lookup_class_in_state(compiled, state, &class_name)
+            .map(|class| class.display_name)
+            .unwrap_or(class_name);
+        VmResult::success(output.clone(), Some(Value::string(display_name)))
+    }
+
+    fn call_get_parent_class_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: get_parent_class expects one argument",
+            );
+        }
+        let class_name = match class_name_from_object_or_string(&values[0]) {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if lookup_class_in_state(compiled, state, &class_name).is_none()
+            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+        {
+            return result;
+        }
+        let parent = lookup_class_in_state(compiled, state, &class_name)
+            .and_then(|class| class.parent)
+            .and_then(|parent| {
+                lookup_class_in_state(compiled, state, &parent)
+                    .map(|class| class.display_name)
+                    .or(Some(parent))
+            })
+            .map(Value::string)
+            .unwrap_or(Value::Bool(false));
+        VmResult::success(output.clone(), Some(parent))
+    }
+
+    fn call_get_declared_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        output: &mut OutputBuffer,
+        state: &ExecutionState,
+    ) -> VmResult {
+        let classes = declared_classes_in_state(compiled, state);
+        let values = classes
+            .into_iter()
+            .filter(|class| match name {
+                "get_declared_interfaces" => class.flags.is_interface,
+                "get_declared_traits" => false,
+                _ => !class.flags.is_interface,
+            })
+            .map(|class| Value::string(class.display_name))
+            .collect();
+        VmResult::success(
+            output.clone(),
+            Some(Value::Array(PhpArray::from_packed(values))),
+        )
+    }
+
+    fn class_like_exists_with_autoload_cache(
+        &self,
+        compiled: &CompiledUnit,
+        class_name: &str,
+        kind: AutoloadClassLookupKind,
+        autoload: bool,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<bool, VmResult> {
+        let request = AutoloadClassLookupCacheKey {
+            kind,
+            normalized_name: normalize_class_name(class_name),
+            autoload_enabled: autoload,
+            autoload_stack_depth: state.autoload_stack.len(),
+            include_path_config: state.ini.get("include_path").unwrap_or(".").to_owned(),
+            composer_map_fingerprint: None,
+        };
+        let epochs = state.autoload_class_lookup_epochs();
+        if let Some((unit_key, function, block, instruction)) = call_site {
+            self.observe_autoload_class_inline_cache(unit_key, function, block, instruction);
+            if let Some(target) = self.lookup_autoload_class_inline_cache(
+                unit_key,
+                function,
+                block,
+                instruction,
+                &request,
+                epochs,
+            ) {
+                match target {
+                    AutoloadClassLookupCacheTarget::Positive { .. } => {
+                        if class_like_exists_direct(compiled, state, class_name, kind) {
+                            return Ok(true);
+                        }
+                        self.invalidate_autoload_class_inline_cache(
+                            unit_key,
+                            function,
+                            block,
+                            instruction,
+                        );
+                    }
+                    AutoloadClassLookupCacheTarget::Negative => return Ok(false),
+                }
+            }
+        }
+
+        if class_like_exists_direct(compiled, state, class_name, kind) {
+            if let Some((unit_key, function, block, instruction)) = call_site {
+                self.install_autoload_class_inline_cache(
+                    unit_key,
+                    function,
+                    block,
+                    instruction,
+                    request,
+                    epochs,
+                    AutoloadClassLookupCacheTarget::Positive {
+                        display_name: class_name.to_owned(),
+                    },
+                );
+            }
+            return Ok(true);
+        }
+
+        let may_autoload_with_side_effects =
+            autoload && !state.autoload_registry.callbacks().is_empty();
+        if autoload {
+            self.autoload_class(compiled, class_name, output, stack, state)?;
+        }
+
+        let exists = class_like_exists_direct(compiled, state, class_name, kind);
+        if let Some((unit_key, function, block, instruction)) = call_site {
+            let post_epochs = state.autoload_class_lookup_epochs();
+            if exists {
+                self.install_autoload_class_inline_cache(
+                    unit_key,
+                    function,
+                    block,
+                    instruction,
+                    request,
+                    post_epochs,
+                    AutoloadClassLookupCacheTarget::Positive {
+                        display_name: class_name.to_owned(),
+                    },
+                );
+            } else if !may_autoload_with_side_effects {
+                self.install_autoload_class_inline_cache(
+                    unit_key,
+                    function,
+                    block,
+                    instruction,
+                    request,
+                    post_epochs,
+                    AutoloadClassLookupCacheTarget::Negative,
+                );
+            }
+        }
+        Ok(exists)
     }
 
     fn autoload_class(
@@ -6846,6 +11866,9 @@ impl Vm {
             return Ok(());
         }
         let callbacks = state.autoload_registry.callbacks().to_vec();
+        if !callbacks.is_empty() {
+            self.record_counter_autoload();
+        }
         state.autoload_stack.push(normalized.clone());
         for callback in callbacks {
             let result = self.call_callable(
@@ -6891,6 +11914,7 @@ impl Vm {
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         state.eval_counter += 1;
+        state.bump_lookup_epoch();
         let source_path = format!("eval://{}", state.eval_counter);
         let source = format!("<?php {code}");
         let frontend = php_semantics::analyze_source(&source);
@@ -6992,6 +12016,32 @@ impl Vm {
         let diagnostic = runtime_diagnostic_for_message(&diagnostic_message, compiled, stack);
         VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic)
     }
+
+    fn handle_uncaught_exception(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        value: Value,
+    ) -> VmResult {
+        let Some(callback) = state.exception_handlers.last().cloned() else {
+            return uncaught_exception(output, compiled, stack, value);
+        };
+        let result = self.call_callable(
+            compiled,
+            Value::Callable(callback),
+            vec![CallArgument::positional(value)],
+            output,
+            stack,
+            state,
+        );
+        if result.status.is_success() {
+            VmResult::success(output.clone(), None)
+        } else {
+            result
+        }
+    }
 }
 
 fn format_instruction_kind(kind: &InstructionKind) -> String {
@@ -7052,6 +12102,11 @@ fn trace_value(value: &Value) -> String {
         Value::Uninitialized => "Uninitialized".to_owned(),
         Value::Array(array) => format!("Array(len={}, shared={})", array.len(), array.is_shared()),
         Value::Object(object) => format!("Object(class={})", object.class_name()),
+        Value::Resource(resource) => format!(
+            "Resource(id={}, type={})",
+            resource.id().get(),
+            resource.resource_type()
+        ),
         Value::Fiber(fiber) => format!("Fiber(state={:?})", fiber.state()),
         Value::Generator(generator) => format!("Generator(state={:?})", generator.state()),
         Value::Callable(CallableValue::UserFunction { name }) => {
@@ -7121,6 +12176,19 @@ fn internal_throwable_display_name(class_name: &str) -> String {
         "valueerror" => "ValueError".to_owned(),
         "argumentcounterror" => "ArgumentCountError".to_owned(),
         "fibererror" => "FiberError".to_owned(),
+        "logicexception" => "LogicException".to_owned(),
+        "badfunctioncallexception" => "BadFunctionCallException".to_owned(),
+        "badmethodcallexception" => "BadMethodCallException".to_owned(),
+        "domainexception" => "DomainException".to_owned(),
+        "invalidargumentexception" => "InvalidArgumentException".to_owned(),
+        "lengthexception" => "LengthException".to_owned(),
+        "outofrangeexception" => "OutOfRangeException".to_owned(),
+        "runtimeexception" => "RuntimeException".to_owned(),
+        "outofboundsexception" => "OutOfBoundsException".to_owned(),
+        "overflowexception" => "OverflowException".to_owned(),
+        "rangeexception" => "RangeException".to_owned(),
+        "underflowexception" => "UnderflowException".to_owned(),
+        "unexpectedvalueexception" => "UnexpectedValueException".to_owned(),
         _ => class_name.to_owned(),
     }
 }
@@ -7128,24 +12196,61 @@ fn internal_throwable_display_name(class_name: &str) -> String {
 fn internal_throwable_parent(class_name: &str) -> Option<&'static str> {
     match normalize_class_name(class_name).as_str() {
         "typeerror" | "valueerror" | "argumentcounterror" | "fibererror" => Some("Error"),
+        "logicexception" | "runtimeexception" => Some("Exception"),
+        "badfunctioncallexception"
+        | "domainexception"
+        | "invalidargumentexception"
+        | "lengthexception"
+        | "outofrangeexception" => Some("LogicException"),
+        "badmethodcallexception" => Some("BadFunctionCallException"),
+        "outofboundsexception"
+        | "overflowexception"
+        | "rangeexception"
+        | "underflowexception"
+        | "unexpectedvalueexception" => Some("RuntimeException"),
         _ => None,
     }
 }
 
 fn internal_throwable_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
-    let object_class = normalize_class_name(object_class);
+    let mut object_class = normalize_class_name(object_class);
     let target_class = normalize_class_name(target_class);
     if !matches!(
         object_class.as_str(),
-        "exception" | "error" | "typeerror" | "valueerror" | "argumentcounterror" | "fibererror"
+        "exception"
+            | "error"
+            | "typeerror"
+            | "valueerror"
+            | "argumentcounterror"
+            | "fibererror"
+            | "logicexception"
+            | "badfunctioncallexception"
+            | "badmethodcallexception"
+            | "domainexception"
+            | "invalidargumentexception"
+            | "lengthexception"
+            | "outofrangeexception"
+            | "runtimeexception"
+            | "outofboundsexception"
+            | "overflowexception"
+            | "rangeexception"
+            | "underflowexception"
+            | "unexpectedvalueexception"
     ) {
         return None;
     }
-    if target_class == "throwable" || object_class == target_class {
+    if target_class == "throwable" {
         return Some(true);
     }
-    let parent = internal_throwable_parent(&object_class)?;
-    Some(normalize_class_name(parent) == target_class)
+    loop {
+        if object_class == target_class {
+            return Some(true);
+        }
+        let Some(parent) = internal_throwable_parent(&object_class) else {
+            return Some(false);
+        };
+        object_class = normalize_class_name(parent);
+    }
 }
 
 fn throwable_class_name(value: &Value) -> String {
@@ -7287,14 +12392,15 @@ fn uncaught_exception(
 fn runtime_class_entry(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<RuntimeClassEntry, String> {
     let mut lineage = Vec::new();
     collect_class_lineage(compiled, class, &mut lineage)?;
     let mut properties = Vec::new();
     let mut constants = Vec::new();
     for class in lineage {
-        push_runtime_properties(compiled.unit(), class, &mut properties)?;
-        push_runtime_constants(compiled.unit(), class, &mut constants)?;
+        push_runtime_properties(class, &mut properties, constant_value)?;
+        push_runtime_constants(class, &mut constants, constant_value)?;
     }
     Ok(RuntimeClassEntry {
         name: class.name.clone(),
@@ -7315,14 +12421,14 @@ fn runtime_class_entry(
                         is_abstract: method.flags.is_abstract,
                         is_final: method.flags.is_final,
                     },
-                    attributes: runtime_attributes(compiled.unit(), &method.attributes)?,
+                    attributes: runtime_attributes(&method.attributes, constant_value)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
         properties,
         constants,
-        enum_cases: push_runtime_enum_cases(compiled.unit(), class)?,
-        attributes: runtime_attributes(compiled.unit(), &class.attributes)?,
+        enum_cases: push_runtime_enum_cases(class, constant_value)?,
+        attributes: runtime_attributes(&class.attributes, constant_value)?,
         enum_backing_type: class.enum_backing_type.map(|backing| match backing {
             php_ir::module::ClassEnumBackingType::Int => RuntimeClassEnumBackingType::Int,
             php_ir::module::ClassEnumBackingType::String => RuntimeClassEnumBackingType::String,
@@ -7375,9 +12481,9 @@ fn collect_class_lineage_inner<'a>(
 }
 
 fn push_runtime_properties(
-    unit: &IrUnit,
     class: &php_ir::module::ClassEntry,
     properties: &mut Vec<RuntimeClassPropertyEntry>,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<(), String> {
     for property in &class.properties {
         if (property.hooks.get.is_some() || property.hooks.set.is_some())
@@ -7402,12 +12508,12 @@ fn push_runtime_properties(
                     set_function_id: property.hooks.set.map(|id| id.index() as u32),
                     backed: false,
                 },
-                attributes: runtime_attributes(unit, &property.attributes)?,
+                attributes: runtime_attributes(&property.attributes, constant_value)?,
             });
             continue;
         }
         let default = if let Some(default) = property.default {
-            constant_value(unit, default)?
+            constant_value(default)?
         } else if property.flags.is_typed {
             Value::Uninitialized
         } else {
@@ -7431,20 +12537,20 @@ fn push_runtime_properties(
                 set_function_id: property.hooks.set.map(|id| id.index() as u32),
                 backed: property.hooks.backed,
             },
-            attributes: runtime_attributes(unit, &property.attributes)?,
+            attributes: runtime_attributes(&property.attributes, constant_value)?,
         });
     }
     Ok(())
 }
 
 fn push_runtime_constants(
-    unit: &IrUnit,
     class: &php_ir::module::ClassEntry,
     constants: &mut Vec<RuntimeClassConstantEntry>,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<(), String> {
     for constant in &class.constants {
         let value = if let Some(value) = constant.value {
-            constant_value(unit, value)?
+            constant_value(value)?
         } else {
             Value::Null
         };
@@ -7455,15 +12561,15 @@ fn push_runtime_constants(
                 is_private: constant.flags.is_private,
                 is_protected: constant.flags.is_protected,
             },
-            attributes: runtime_attributes(unit, &constant.attributes)?,
+            attributes: runtime_attributes(&constant.attributes, constant_value)?,
         });
     }
     Ok(())
 }
 
 fn push_runtime_enum_cases(
-    unit: &IrUnit,
     class: &php_ir::module::ClassEntry,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<Vec<RuntimeClassEnumCaseEntry>, String> {
     class
         .enum_cases
@@ -7471,19 +12577,16 @@ fn push_runtime_enum_cases(
         .map(|case| {
             Ok(RuntimeClassEnumCaseEntry {
                 name: case.name.clone(),
-                value: case
-                    .value
-                    .map(|value| constant_value(unit, value))
-                    .transpose()?,
-                attributes: runtime_attributes(unit, &case.attributes)?,
+                value: case.value.map(constant_value).transpose()?,
+                attributes: runtime_attributes(&case.attributes, constant_value)?,
             })
         })
         .collect()
 }
 
 fn runtime_attributes(
-    unit: &IrUnit,
     attributes: &[php_ir::module::AttributeEntry],
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<Vec<RuntimeAttributeEntry>, String> {
     attributes
         .iter()
@@ -7491,7 +12594,7 @@ fn runtime_attributes(
             let arguments = attribute
                 .arguments
                 .iter()
-                .map(|argument| constant_value(unit, *argument))
+                .map(|argument| constant_value(*argument))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(RuntimeAttributeEntry {
                 name: attribute.name.clone(),
@@ -7519,15 +12622,21 @@ fn is_reflection_runtime_class(name: &str) -> bool {
         "reflectionclassconstant",
         "reflectionenum",
         "reflectionenumunitcase",
+        "reflectionenumbackedcase",
         "reflectionparameter",
         "reflectionattribute",
         "reflectionnamedtype",
+        "reflectionextension",
     ]
     .contains(&name.as_str())
 }
 
 fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+fn compiled_unit_cache_key(compiled: &CompiledUnit) -> u64 {
+    std::ptr::from_ref(compiled.unit()) as usize as u64
 }
 
 fn reflection_runtime_class(name: &str) -> RuntimeClassEntry {
@@ -7598,6 +12707,17 @@ fn reflection_type_value(type_: Option<&IrReturnType>) -> Value {
             ("name", reflection_string(ir_type_name(type_))),
             ("allows_null", Value::Bool(ir_type_allows_null(type_))),
             ("builtin", Value::Bool(ir_type_is_builtin(type_))),
+        ],
+    ))
+}
+
+fn reflection_named_type_value(name: &str, allows_null: bool, builtin: bool) -> Value {
+    Value::Object(reflection_object(
+        "ReflectionNamedType",
+        vec![
+            ("name", reflection_string(name)),
+            ("allows_null", Value::Bool(allows_null)),
+            ("builtin", Value::Bool(builtin)),
         ],
     ))
 }
@@ -7688,9 +12808,9 @@ fn reflection_bool_property(object: &ObjectRef, property: &str) -> Value {
 }
 
 fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<ObjectRef, String> {
-    let target = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(target) = compiled.lookup_class(class_name) else {
+        return reflection_internal_class_object(class_name);
+    };
     Ok(reflection_object(
         "ReflectionClass",
         vec![
@@ -7729,6 +12849,8 @@ fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<
                 "end_line",
                 reflection_span_line(compiled, target.span, true),
             ),
+            ("is_internal", Value::Bool(false)),
+            ("extension", Value::Bool(false)),
         ],
     ))
 }
@@ -7752,16 +12874,13 @@ fn reflection_new_object(
             };
             match target {
                 Value::Callable(CallableValue::UserFunction { name }) => {
-                    let function_id =
-                        compiled
-                            .lookup_function(&normalize_function_name(name))
-                            .ok_or_else(|| {
-                                format!(
-                                    "E_PHP_VM_REFLECTION_UNKNOWN_FUNCTION: function {name} is not defined"
-                                )
-                            })?;
-                    let function_entry = &compiled.unit().functions[function_id.index()];
-                    Ok(reflection_function_object(compiled, function_entry)?)
+                    if let Some(function_id) = compiled.lookup_function(&normalize_function_name(name))
+                    {
+                        let function_entry = &compiled.unit().functions[function_id.index()];
+                        Ok(reflection_function_object(compiled, function_entry)?)
+                    } else {
+                        reflection_internal_function_object(name)
+                    }
                 }
                 Value::Callable(CallableValue::Closure { function, captures }) => {
                     let function = FunctionId::new(*function);
@@ -7779,15 +12898,14 @@ fn reflection_new_object(
                 ),
                 _ => {
                     let function = reflection_string_arg(&args, 0, "ReflectionFunction::__construct")?;
-                    let function_id = compiled
-                        .lookup_function(&normalize_function_name(&function))
-                        .ok_or_else(|| {
-                            format!(
-                                "E_PHP_VM_REFLECTION_UNKNOWN_FUNCTION: function {function} is not defined"
-                            )
-                        })?;
-                    let function_entry = &compiled.unit().functions[function_id.index()];
-                    Ok(reflection_function_object(compiled, function_entry)?)
+                    if let Some(function_id) =
+                        compiled.lookup_function(&normalize_function_name(&function))
+                    {
+                        let function_entry = &compiled.unit().functions[function_id.index()];
+                        Ok(reflection_function_object(compiled, function_entry)?)
+                    } else {
+                        reflection_internal_function_object(&function)
+                    }
                 }
             }
         }
@@ -7814,6 +12932,21 @@ fn reflection_new_object(
             let class = reflection_string_arg(&args, 0, "ReflectionEnumUnitCase::__construct")?;
             let case = reflection_string_arg(&args, 1, "ReflectionEnumUnitCase::__construct")?;
             reflection_enum_case_object(compiled, &class, &case)
+        }
+        "reflectionenumbackedcase" => {
+            let class = reflection_string_arg(&args, 0, "ReflectionEnumBackedCase::__construct")?;
+            let case = reflection_string_arg(&args, 1, "ReflectionEnumBackedCase::__construct")?;
+            let object = reflection_enum_case_object(compiled, &class, &case)?;
+            if !matches!(object.class_name().as_str(), "ReflectionEnumBackedCase") {
+                return Err(format!(
+                    "E_PHP_VM_REFLECTION_NOT_BACKED_ENUM_CASE: case {class}::{case} is not backed"
+                ));
+            }
+            Ok(object)
+        }
+        "reflectionextension" => {
+            let extension = reflection_string_arg(&args, 0, "ReflectionExtension::__construct")?;
+            reflection_extension_object(&extension)
         }
         "reflectionattribute" => Err(
             "E_PHP_VM_REFLECTION_ATTRIBUTE_CONSTRUCTION: ReflectionAttribute is created by getAttributes"
@@ -7846,6 +12979,7 @@ fn reflection_method_value(
             "getarguments" => Ok(object
                 .get_property("arguments")
                 .unwrap_or_else(empty_array_value)),
+            "isrepeated" => Ok(reflection_bool_property(object, "repeated")),
             "newinstance" => Err(
                 "E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE: attribute instantiation needs class constructor semantics"
                     .to_owned(),
@@ -7887,6 +13021,12 @@ fn reflection_method_value(
             "getstartline" => Ok(object.get_property("start_line").unwrap_or(Value::Bool(false))),
             "getendline" => Ok(object.get_property("end_line").unwrap_or(Value::Bool(false))),
             "getdoccomment" => Ok(Value::Bool(false)),
+            "isinternal" => Ok(reflection_bool_property(object, "is_internal")),
+            "isuserdefined" => Ok(Value::Bool(!matches!(
+                object.get_property("is_internal"),
+                Some(Value::Bool(true))
+            ))),
+            "getextensionname" => Ok(object.get_property("extension").unwrap_or(Value::Bool(false))),
             "getmethods" => {
                 let class = reflection_object_string_property(object, "class")?;
                 Ok(reflection_class_methods_value(compiled, &class)?)
@@ -7960,6 +13100,12 @@ fn reflection_method_value(
             "getstartline" => Ok(object.get_property("start_line").unwrap_or(Value::Bool(false))),
             "getendline" => Ok(object.get_property("end_line").unwrap_or(Value::Bool(false))),
             "getdoccomment" => Ok(Value::Bool(false)),
+            "isinternal" => Ok(reflection_bool_property(object, "is_internal")),
+            "isuserdefined" => Ok(Value::Bool(!matches!(
+                object.get_property("is_internal"),
+                Some(Value::Bool(true))
+            ))),
+            "getextensionname" => Ok(object.get_property("extension").unwrap_or(Value::Bool(false))),
             "ispublic" => Ok(object.get_property("is_public").unwrap_or(Value::Bool(true))),
             "isprivate" => Ok(reflection_bool_property(object, "is_private")),
             "isprotected" => Ok(reflection_bool_property(object, "is_protected")),
@@ -7983,7 +13129,8 @@ fn reflection_method_value(
                 method
             )),
         },
-        "reflectionproperty" | "reflectionclassconstant" | "reflectionenumunitcase" => {
+        "reflectionproperty" | "reflectionclassconstant" | "reflectionenumunitcase"
+        | "reflectionenumbackedcase" => {
             match method.as_str() {
                 "getname" => Ok(object.get_property("name").unwrap_or(Value::Null)),
                 "getattributes" => Ok(object
@@ -7994,6 +13141,10 @@ fn reflection_method_value(
                     Ok(Value::Object(reflection_class_object(compiled, &class)?))
                 }
                 "gettype" => Ok(object.get_property("type").unwrap_or(Value::Null)),
+                "hastype" => Ok(Value::Bool(!matches!(
+                    object.get_property("type"),
+                    Some(Value::Null) | None
+                ))),
                 "hasdefaultvalue" => Ok(reflection_bool_property(object, "has_default")),
                 "getdefaultvalue" | "getvalue" => {
                     Ok(object.get_property("default").unwrap_or(Value::Null))
@@ -8001,11 +13152,16 @@ fn reflection_method_value(
                 "getbackingvalue" => Ok(object
                     .get_property("backing_value")
                     .unwrap_or(Value::Bool(false))),
+                "isenumcase" => Ok(reflection_bool_property(object, "is_enum_case")),
                 "ispublic" => Ok(object.get_property("is_public").unwrap_or(Value::Bool(true))),
                 "isprivate" => Ok(reflection_bool_property(object, "is_private")),
                 "isprotected" => Ok(reflection_bool_property(object, "is_protected")),
                 "isstatic" => Ok(reflection_bool_property(object, "is_static")),
                 "isreadonly" => Ok(reflection_bool_property(object, "is_readonly")),
+                "getmodifiers" => Ok(object.get_property("modifiers").unwrap_or(Value::Int(0))),
+                "hashooks" => Ok(reflection_bool_property(object, "has_hooks")),
+                "gethooks" => Ok(object.get_property("hooks").unwrap_or_else(empty_array_value)),
+                "isvirtual" => Ok(reflection_bool_property(object, "is_virtual")),
                 _ => Err(format!(
                     "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
                     object.class_name(),
@@ -8024,6 +13180,16 @@ fn reflection_method_value(
                 let class = reflection_object_string_property(object, "class")?;
                 Ok(reflection_enum_cases_value(compiled, &class)?)
             }
+            "getcase" => {
+                let class = reflection_object_string_property(object, "class")?;
+                let case = reflection_string_arg(&args, 0, "ReflectionEnum::getCase")?;
+                Ok(Value::Object(reflection_enum_case_object(compiled, &class, &case)?))
+            }
+            "hascase" => {
+                let class = reflection_object_string_property(object, "class")?;
+                let case = reflection_string_arg(&args, 0, "ReflectionEnum::hasCase")?;
+                Ok(Value::Bool(reflection_enum_has_case(compiled, &class, &case)))
+            }
             "getfilename" => Ok(object.get_property("file").unwrap_or(Value::Bool(false))),
             "getstartline" => Ok(object.get_property("start_line").unwrap_or(Value::Bool(false))),
             "getendline" => Ok(object.get_property("end_line").unwrap_or(Value::Bool(false))),
@@ -8040,12 +13206,37 @@ fn reflection_method_value(
                 .get_property("attributes")
                 .unwrap_or_else(empty_array_value)),
             "gettype" => Ok(object.get_property("type").unwrap_or(Value::Null)),
+            "hastype" => Ok(Value::Bool(!matches!(
+                object.get_property("type"),
+                Some(Value::Null) | None
+            ))),
             "hasdefaultvalue" | "isdefaultvalueavailable" => {
                 Ok(reflection_bool_property(object, "has_default"))
             }
             "getdefaultvalue" => Ok(object.get_property("default").unwrap_or(Value::Null)),
             "isoptional" => Ok(reflection_bool_property(object, "optional")),
             "allowsnull" => Ok(reflection_bool_property(object, "allows_null")),
+            _ => Err(format!(
+                "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                object.class_name(),
+                method
+            )),
+        },
+        "reflectionextension" => match method.as_str() {
+            "getname" => Ok(object.get_property("name").unwrap_or(Value::Null)),
+            "getversion" => Ok(Value::Bool(false)),
+            "getfunctions" => {
+                let extension = reflection_object_string_property(object, "name")?;
+                reflection_extension_functions_value(&extension)
+            }
+            "getclasses" => {
+                let extension = reflection_object_string_property(object, "name")?;
+                reflection_extension_classes_value(&extension)
+            }
+            "getclassnames" => {
+                let extension = reflection_object_string_property(object, "name")?;
+                reflection_extension_class_names_value(&extension)
+            }
             _ => Err(format!(
                 "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
                 object.class_name(),
@@ -8060,13 +13251,471 @@ fn reflection_method_value(
     }
 }
 
+#[derive(Clone)]
+struct InternalReflectionParam {
+    name: &'static str,
+    type_name: Option<&'static str>,
+    optional: bool,
+    default: Value,
+}
+
+#[derive(Clone, Copy)]
+struct InternalReflectionSignature {
+    return_type: Option<&'static str>,
+    params: &'static [InternalReflectionParam],
+}
+
+const INTERNAL_PARAM_VALUE: InternalReflectionParam = InternalReflectionParam {
+    name: "value",
+    type_name: Some("mixed"),
+    optional: false,
+    default: Value::Null,
+};
+
+const INTERNAL_PARAM_STRING: InternalReflectionParam = InternalReflectionParam {
+    name: "string",
+    type_name: Some("string"),
+    optional: false,
+    default: Value::Null,
+};
+
+const INTERNAL_PARAM_MODE: InternalReflectionParam = InternalReflectionParam {
+    name: "mode",
+    type_name: Some("int"),
+    optional: true,
+    default: Value::Int(0),
+};
+
+const INTERNAL_PARAM_FLAGS: InternalReflectionParam = InternalReflectionParam {
+    name: "flags",
+    type_name: Some("int"),
+    optional: true,
+    default: Value::Int(0),
+};
+
+const INTERNAL_PARAM_DEPTH: InternalReflectionParam = InternalReflectionParam {
+    name: "depth",
+    type_name: Some("int"),
+    optional: true,
+    default: Value::Int(512),
+};
+
+const INTERNAL_PARAM_OBJECT: InternalReflectionParam = InternalReflectionParam {
+    name: "object",
+    type_name: Some("object"),
+    optional: false,
+    default: Value::Null,
+};
+
+const INTERNAL_PARAM_FORMAT: InternalReflectionParam = InternalReflectionParam {
+    name: "format",
+    type_name: Some("string"),
+    optional: false,
+    default: Value::Null,
+};
+
+const COUNT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_VALUE, INTERNAL_PARAM_MODE];
+const STRLEN_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_STRING];
+const JSON_ENCODE_PARAMS: &[InternalReflectionParam] = &[
+    INTERNAL_PARAM_VALUE,
+    INTERNAL_PARAM_FLAGS,
+    INTERNAL_PARAM_DEPTH,
+];
+const SPL_OBJECT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_OBJECT];
+const FORMAT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_FORMAT];
+
+fn internal_function_signature(name: &str) -> InternalReflectionSignature {
+    match normalize_function_name(name).as_str() {
+        "count" | "sizeof" => InternalReflectionSignature {
+            return_type: Some("int"),
+            params: COUNT_PARAMS,
+        },
+        "strlen" => InternalReflectionSignature {
+            return_type: Some("int"),
+            params: STRLEN_PARAMS,
+        },
+        "json_encode" => InternalReflectionSignature {
+            return_type: Some("string|false"),
+            params: JSON_ENCODE_PARAMS,
+        },
+        "spl_object_id" => InternalReflectionSignature {
+            return_type: Some("int"),
+            params: SPL_OBJECT_PARAMS,
+        },
+        "spl_object_hash" => InternalReflectionSignature {
+            return_type: Some("string"),
+            params: SPL_OBJECT_PARAMS,
+        },
+        _ => InternalReflectionSignature {
+            return_type: Some("mixed"),
+            params: &[],
+        },
+    }
+}
+
+fn internal_method_signature(class_name: &str, method_name: &str) -> InternalReflectionSignature {
+    match (
+        normalize_class_name(class_name).as_str(),
+        normalize_method_name(method_name).as_str(),
+    ) {
+        ("arrayobject", "count") | ("arrayiterator", "count") | ("splfixedarray", "count") => {
+            InternalReflectionSignature {
+                return_type: Some("int"),
+                params: &[],
+            }
+        }
+        ("arrayobject", "getarraycopy") | ("arrayiterator", "getarraycopy") => {
+            InternalReflectionSignature {
+                return_type: Some("array"),
+                params: &[],
+            }
+        }
+        ("splfileinfo", "getfilename")
+        | ("splfileinfo", "getpathname")
+        | ("splfileobject", "fgets")
+        | ("splfileobject", "current")
+        | ("spltempfileobject", "fgets")
+        | ("spltempfileobject", "current") => InternalReflectionSignature {
+            return_type: Some("string"),
+            params: &[],
+        },
+        ("datetime", "format") => InternalReflectionSignature {
+            return_type: Some("string"),
+            params: FORMAT_PARAMS,
+        },
+        _ => InternalReflectionSignature {
+            return_type: Some("mixed"),
+            params: &[],
+        },
+    }
+}
+
+fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> Value {
+    let mut array = PhpArray::new();
+    for param in params {
+        let has_default = param.optional;
+        array.append(Value::Object(reflection_object(
+            "ReflectionParameter",
+            vec![
+                ("name", reflection_string(param.name)),
+                ("attributes", empty_array_value()),
+                (
+                    "type",
+                    param.type_name.map_or(Value::Null, |type_name| {
+                        reflection_named_type_value(type_name, type_name == "mixed", true)
+                    }),
+                ),
+                ("has_default", Value::Bool(has_default)),
+                (
+                    "default",
+                    if has_default {
+                        param.default.clone()
+                    } else {
+                        Value::Null
+                    },
+                ),
+                ("optional", Value::Bool(param.optional)),
+                (
+                    "allows_null",
+                    Value::Bool(param.type_name.is_none_or(|type_name| type_name == "mixed")),
+                ),
+            ],
+        )));
+    }
+    Value::Array(array)
+}
+
+fn reflection_internal_function_object(function: &str) -> Result<ObjectRef, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry.enabled_php_function(function).ok_or_else(|| {
+        format!("E_PHP_VM_REFLECTION_UNKNOWN_FUNCTION: function {function} is not defined")
+    })?;
+    let signature = internal_function_signature(descriptor.name());
+    Ok(reflection_object(
+        "ReflectionFunction",
+        vec![
+            ("name", reflection_string(descriptor.name())),
+            ("attributes", empty_array_value()),
+            (
+                "parameters",
+                reflection_internal_parameters_value(signature.params),
+            ),
+            ("parameter_count", Value::Int(signature.params.len() as i64)),
+            (
+                "required_parameter_count",
+                Value::Int(
+                    signature
+                        .params
+                        .iter()
+                        .filter(|param| !param.optional)
+                        .count() as i64,
+                ),
+            ),
+            (
+                "return_type",
+                signature.return_type.map_or(Value::Null, |name| {
+                    reflection_named_type_value(name, name == "mixed", true)
+                }),
+            ),
+            ("file", Value::Bool(false)),
+            ("start_line", Value::Bool(false)),
+            ("end_line", Value::Bool(false)),
+            ("is_closure", Value::Bool(false)),
+            ("static_variables", empty_array_value()),
+            ("closure_scope_class", Value::Null),
+            ("is_internal", Value::Bool(true)),
+            ("extension", reflection_string(descriptor.extension())),
+        ],
+    ))
+}
+
+fn reflection_internal_class_object(class_name: &str) -> Result<ObjectRef, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry.enabled_class(class_name).ok_or_else(|| {
+        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
+    })?;
+    let is_interface = descriptor.kind() == php_std::ClassKind::Interface;
+    let is_trait = descriptor.kind() == php_std::ClassKind::Trait;
+    let is_enum = descriptor.kind() == php_std::ClassKind::Enum;
+    Ok(reflection_object(
+        "ReflectionClass",
+        vec![
+            ("name", reflection_string(descriptor.name())),
+            ("class", reflection_string(descriptor.name())),
+            ("attributes", empty_array_value()),
+            ("is_interface", Value::Bool(is_interface)),
+            ("is_trait", Value::Bool(is_trait)),
+            ("is_enum", Value::Bool(is_enum)),
+            ("is_abstract", Value::Bool(is_interface || is_trait)),
+            ("is_final", Value::Bool(false)),
+            (
+                "interfaces",
+                reflection_string_array(internal_class_interfaces(descriptor.name())),
+            ),
+            ("file", Value::Bool(false)),
+            ("start_line", Value::Bool(false)),
+            ("end_line", Value::Bool(false)),
+            ("is_internal", Value::Bool(true)),
+            ("extension", reflection_string(descriptor.extension())),
+        ],
+    ))
+}
+
+fn internal_class_interfaces(class_name: &str) -> Vec<String> {
+    match normalize_class_name(class_name).as_str() {
+        "arrayobject" => [
+            "IteratorAggregate",
+            "ArrayAccess",
+            "Serializable",
+            "Countable",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "arrayiterator" | "recursivearrayiterator" => [
+            "SeekableIterator",
+            "ArrayAccess",
+            "Serializable",
+            "Countable",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "splfileobject" | "spltempfileobject" => ["RecursiveIterator", "SeekableIterator"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn internal_class_methods(class_name: &str) -> Vec<InternalClassMethod> {
+    match normalize_class_name(class_name).as_str() {
+        "arrayobject" => vec![
+            InternalClassMethod { name: "count" },
+            InternalClassMethod {
+                name: "getArrayCopy",
+            },
+        ],
+        "arrayiterator" => vec![
+            InternalClassMethod { name: "count" },
+            InternalClassMethod {
+                name: "getArrayCopy",
+            },
+        ],
+        "splfixedarray" => vec![InternalClassMethod { name: "count" }],
+        "splfileinfo" => vec![
+            InternalClassMethod {
+                name: "getFilename",
+            },
+            InternalClassMethod {
+                name: "getPathname",
+            },
+        ],
+        "splfileobject" | "spltempfileobject" => vec![
+            InternalClassMethod {
+                name: "getFilename",
+            },
+            InternalClassMethod {
+                name: "getPathname",
+            },
+            InternalClassMethod { name: "fgets" },
+            InternalClassMethod { name: "current" },
+        ],
+        "datetime" => vec![InternalClassMethod { name: "format" }],
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InternalClassMethod {
+    name: &'static str,
+}
+
+fn reflection_internal_method_object(
+    class_name: &str,
+    method_name: &str,
+) -> Result<ObjectRef, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry.enabled_class(class_name).ok_or_else(|| {
+        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
+    })?;
+    let method = internal_class_methods(descriptor.name())
+        .into_iter()
+        .find(|method| normalize_method_name(method.name) == normalize_method_name(method_name))
+        .ok_or_else(|| {
+            format!(
+                "E_PHP_VM_REFLECTION_UNKNOWN_METHOD: method {}::{} is not defined",
+                descriptor.name(),
+                method_name
+            )
+        })?;
+    let signature = internal_method_signature(descriptor.name(), method.name);
+    Ok(reflection_object(
+        "ReflectionMethod",
+        vec![
+            ("class", reflection_string(descriptor.name())),
+            ("name", reflection_string(method.name)),
+            ("attributes", empty_array_value()),
+            (
+                "parameters",
+                reflection_internal_parameters_value(signature.params),
+            ),
+            ("parameter_count", Value::Int(signature.params.len() as i64)),
+            (
+                "required_parameter_count",
+                Value::Int(
+                    signature
+                        .params
+                        .iter()
+                        .filter(|param| !param.optional)
+                        .count() as i64,
+                ),
+            ),
+            (
+                "return_type",
+                signature.return_type.map_or(Value::Null, |name| {
+                    reflection_named_type_value(name, name == "mixed", true)
+                }),
+            ),
+            ("file", Value::Bool(false)),
+            ("start_line", Value::Bool(false)),
+            ("end_line", Value::Bool(false)),
+            ("is_public", Value::Bool(true)),
+            ("is_private", Value::Bool(false)),
+            ("is_protected", Value::Bool(false)),
+            ("is_static", Value::Bool(false)),
+            ("is_abstract", Value::Bool(false)),
+            ("is_final", Value::Bool(false)),
+            ("is_internal", Value::Bool(true)),
+            ("extension", reflection_string(descriptor.extension())),
+        ],
+    ))
+}
+
+fn reflection_extension_object(extension: &str) -> Result<ObjectRef, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry
+        .extension_case_insensitive(extension)
+        .ok_or_else(|| {
+            format!("E_PHP_VM_REFLECTION_UNKNOWN_EXTENSION: extension {extension} is not defined")
+        })?;
+    if !registry.is_extension_enabled(descriptor.name()) {
+        return Err(format!(
+            "E_PHP_VM_REFLECTION_UNKNOWN_EXTENSION: extension {extension} is not loaded"
+        ));
+    }
+    Ok(reflection_object(
+        "ReflectionExtension",
+        vec![("name", reflection_string(descriptor.name()))],
+    ))
+}
+
+fn reflection_extension_functions_value(extension: &str) -> Result<Value, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry
+        .extension_case_insensitive(extension)
+        .ok_or_else(|| {
+            format!("E_PHP_VM_REFLECTION_UNKNOWN_EXTENSION: extension {extension} is not defined")
+        })?;
+    let mut array = PhpArray::new();
+    for function in descriptor.functions() {
+        if function.visibility() != php_std::SymbolVisibility::PhpVisible {
+            continue;
+        }
+        reflection_assoc_insert(
+            &mut array,
+            function.name(),
+            Value::Object(reflection_internal_function_object(function.name())?),
+        );
+    }
+    Ok(Value::Array(array))
+}
+
+fn reflection_extension_classes_value(extension: &str) -> Result<Value, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry
+        .extension_case_insensitive(extension)
+        .ok_or_else(|| {
+            format!("E_PHP_VM_REFLECTION_UNKNOWN_EXTENSION: extension {extension} is not defined")
+        })?;
+    let mut array = PhpArray::new();
+    for class in descriptor.classes() {
+        reflection_assoc_insert(
+            &mut array,
+            class.name(),
+            Value::Object(reflection_internal_class_object(class.name())?),
+        );
+    }
+    Ok(Value::Array(array))
+}
+
+fn reflection_extension_class_names_value(extension: &str) -> Result<Value, String> {
+    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let descriptor = registry
+        .extension_case_insensitive(extension)
+        .ok_or_else(|| {
+            format!("E_PHP_VM_REFLECTION_UNKNOWN_EXTENSION: extension {extension} is not defined")
+        })?;
+    Ok(reflection_string_array(
+        descriptor
+            .classes()
+            .iter()
+            .map(|class| class.name().to_owned()),
+    ))
+}
+
 fn reflection_class_methods_value(
     compiled: &CompiledUnit,
     class_name: &str,
 ) -> Result<Value, String> {
-    let class = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(class) = compiled.lookup_class(class_name) else {
+        let methods = internal_class_methods(class_name)
+            .into_iter()
+            .map(|method| reflection_internal_method_object(class_name, method.name))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(reflection_objects_array(methods));
+    };
     let methods = class
         .methods
         .iter()
@@ -8079,9 +13728,14 @@ fn reflection_class_properties_value(
     compiled: &CompiledUnit,
     class_name: &str,
 ) -> Result<Value, String> {
-    let class = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(class) = compiled.lookup_class(class_name) else {
+        php_std::ExtensionRegistry::phase6_infrastructure()
+            .enabled_class(class_name)
+            .ok_or_else(|| {
+                format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
+            })?;
+        return Ok(empty_array_value());
+    };
     let properties = class
         .properties
         .iter()
@@ -8094,9 +13748,14 @@ fn reflection_class_constants_value(
     compiled: &CompiledUnit,
     class_name: &str,
 ) -> Result<Value, String> {
-    let class = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(class) = compiled.lookup_class(class_name) else {
+        php_std::ExtensionRegistry::phase6_infrastructure()
+            .enabled_class(class_name)
+            .ok_or_else(|| {
+                format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
+            })?;
+        return Ok(empty_array_value());
+    };
     let mut array = PhpArray::new();
     for constant in &class.constants {
         let value = constant
@@ -8113,9 +13772,14 @@ fn reflection_class_reflection_constants_value(
     compiled: &CompiledUnit,
     class_name: &str,
 ) -> Result<Value, String> {
-    let class = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(class) = compiled.lookup_class(class_name) else {
+        php_std::ExtensionRegistry::phase6_infrastructure()
+            .enabled_class(class_name)
+            .ok_or_else(|| {
+                format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
+            })?;
+        return Ok(empty_array_value());
+    };
     let constants = class
         .constants
         .iter()
@@ -8134,6 +13798,49 @@ fn reflection_enum_cases_value(compiled: &CompiledUnit, class_name: &str) -> Res
         .map(|case| reflection_enum_case_object(compiled, &class.name, &case.name))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(reflection_objects_array(cases))
+}
+
+fn reflection_enum_has_case(compiled: &CompiledUnit, class_name: &str, case_name: &str) -> bool {
+    compiled.lookup_class(class_name).is_some_and(|class| {
+        class
+            .enum_cases
+            .iter()
+            .any(|case| case.name.eq_ignore_ascii_case(case_name))
+    })
+}
+
+fn reflection_visibility_modifiers(
+    is_private: bool,
+    is_protected: bool,
+    is_static: bool,
+    is_readonly: bool,
+) -> Value {
+    let mut modifiers = 0;
+    if is_private {
+        modifiers |= 4;
+    } else if is_protected {
+        modifiers |= 2;
+    } else {
+        modifiers |= 1;
+    }
+    if is_static {
+        modifiers |= 16;
+    }
+    if is_readonly {
+        modifiers |= 128;
+    }
+    Value::Int(modifiers)
+}
+
+fn reflection_property_hooks_value(hooks: &php_ir::module::ClassPropertyHooks) -> Value {
+    let mut array = PhpArray::new();
+    if hooks.get.is_some() {
+        reflection_assoc_insert(&mut array, "get", reflection_string("get"));
+    }
+    if hooks.set.is_some() {
+        reflection_assoc_insert(&mut array, "set", reflection_string("set"));
+    }
+    Value::Array(array)
 }
 
 fn reflection_enum_backing_type_value(
@@ -8213,6 +13920,8 @@ fn reflection_function_object(
             ("is_closure", Value::Bool(function.flags.is_closure)),
             ("static_variables", empty_array_value()),
             ("closure_scope_class", Value::Null),
+            ("is_internal", Value::Bool(false)),
+            ("extension", Value::Bool(false)),
         ],
     ))
 }
@@ -8238,9 +13947,9 @@ fn reflection_method_object(
     class_name: &str,
     method_name: &str,
 ) -> Result<ObjectRef, String> {
-    let class = compiled.lookup_class(class_name).ok_or_else(|| {
-        format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
-    })?;
+    let Some(class) = compiled.lookup_class(class_name) else {
+        return reflection_internal_method_object(class_name, method_name);
+    };
     let method = class
         .methods
         .iter()
@@ -8299,6 +14008,8 @@ fn reflection_method_object(
             ("is_static", Value::Bool(method.flags.is_static)),
             ("is_abstract", Value::Bool(method.flags.is_abstract)),
             ("is_final", Value::Bool(method.flags.is_final)),
+            ("is_internal", Value::Bool(false)),
+            ("extension", Value::Bool(false)),
         ],
     ))
 }
@@ -8341,6 +14052,7 @@ fn reflection_property_object(
                 reflection_attributes_value(compiled, &property.attributes)?,
             ),
             ("type", reflection_type_value(property.type_.as_ref())),
+            ("has_type", Value::Bool(property.type_.is_some())),
             ("has_default", Value::Bool(default.is_some())),
             ("default", default.unwrap_or(Value::Null)),
             (
@@ -8351,6 +14063,21 @@ fn reflection_property_object(
             ("is_protected", Value::Bool(property.flags.is_protected)),
             ("is_static", Value::Bool(property.flags.is_static)),
             ("is_readonly", Value::Bool(property.flags.is_readonly)),
+            (
+                "modifiers",
+                reflection_visibility_modifiers(
+                    property.flags.is_private,
+                    property.flags.is_protected,
+                    property.flags.is_static,
+                    property.flags.is_readonly,
+                ),
+            ),
+            (
+                "has_hooks",
+                Value::Bool(property.hooks.get.is_some() || property.hooks.set.is_some()),
+            ),
+            ("hooks", reflection_property_hooks_value(&property.hooks)),
+            ("is_virtual", Value::Bool(!property.hooks.backed)),
         ],
     ))
 }
@@ -8363,16 +14090,23 @@ fn reflection_class_constant_object(
     let class = compiled.lookup_class(class_name).ok_or_else(|| {
         format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
     })?;
-    let constant = class
+    let Some(constant) = class
         .constants
         .iter()
         .find(|constant| constant.name == constant_name)
-        .ok_or_else(|| {
-            format!(
-                "E_PHP_VM_REFLECTION_UNKNOWN_CONSTANT: constant {}::{} is not defined",
-                class.name, constant_name
-            )
-        })?;
+    else {
+        if class
+            .enum_cases
+            .iter()
+            .any(|case| case.name.eq_ignore_ascii_case(constant_name))
+        {
+            return reflection_enum_case_object(compiled, &class.name, constant_name);
+        }
+        return Err(format!(
+            "E_PHP_VM_REFLECTION_UNKNOWN_CONSTANT: constant {}::{} is not defined",
+            class.name, constant_name
+        ));
+    };
     let value = constant
         .value
         .map(|constant| constant_value(compiled.unit(), constant))
@@ -8401,6 +14135,16 @@ fn reflection_class_constant_object(
             ("is_private", Value::Bool(constant.flags.is_private)),
             ("is_protected", Value::Bool(constant.flags.is_protected)),
             ("is_static", Value::Bool(true)),
+            ("is_enum_case", Value::Bool(false)),
+            (
+                "modifiers",
+                reflection_visibility_modifiers(
+                    constant.flags.is_private,
+                    constant.flags.is_protected,
+                    false,
+                    false,
+                ),
+            ),
         ],
     ))
 }
@@ -8469,8 +14213,13 @@ fn reflection_enum_case_object(
         .value
         .map(|constant| constant_value(compiled.unit(), constant))
         .transpose()?;
+    let reflection_class = if backing_value.is_some() {
+        "ReflectionEnumBackedCase"
+    } else {
+        "ReflectionEnumUnitCase"
+    };
     Ok(reflection_object(
-        "ReflectionEnumUnitCase",
+        reflection_class,
         vec![
             (
                 "class",
@@ -8482,6 +14231,18 @@ fn reflection_enum_case_object(
                 reflection_attributes_value(compiled, &case.attributes)?,
             ),
             ("backing_value", backing_value.unwrap_or(Value::Bool(false))),
+            ("has_default", Value::Bool(false)),
+            ("default", Value::Null),
+            ("is_enum_case", Value::Bool(true)),
+            ("is_public", Value::Bool(true)),
+            ("is_private", Value::Bool(false)),
+            ("is_protected", Value::Bool(false)),
+            ("is_static", Value::Bool(true)),
+            ("is_readonly", Value::Bool(true)),
+            (
+                "modifiers",
+                reflection_visibility_modifiers(false, false, true, true),
+            ),
         ],
     ))
 }
@@ -8520,7 +14281,9 @@ fn reflection_attributes_value(
     attributes: &[php_ir::module::AttributeEntry],
 ) -> Result<Value, String> {
     let mut array = PhpArray::new();
-    for attribute in runtime_attributes(compiled.unit(), attributes)? {
+    for attribute in
+        runtime_attributes(attributes, &|value| constant_value(compiled.unit(), value))?
+    {
         array.append(Value::Object(reflection_attribute_object(attribute)));
     }
     Ok(Value::Array(array))
@@ -8537,6 +14300,7 @@ fn reflection_attribute_object(attribute: RuntimeAttributeEntry) -> ObjectRef {
         vec![
             ("name", Value::String(PhpString::from_test_str(&name))),
             ("arguments", Value::Array(arguments)),
+            ("repeated", Value::Bool(attribute.repeated_on_target)),
         ],
     )
 }
@@ -8560,6 +14324,7 @@ fn enum_case_object(
     state: &mut ExecutionState,
     class: &php_ir::module::ClassEntry,
     case: &php_ir::module::ClassEnumCaseEntry,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<ObjectRef, String> {
     let key = (
         normalize_class_name(&class.name),
@@ -8568,20 +14333,16 @@ fn enum_case_object(
     if let Some(object) = state.enum_cases.get(&key) {
         return Ok(object.clone());
     }
-    let runtime_class = runtime_class_entry(compiled, class)?;
+    let runtime_class = runtime_class_entry(compiled, class, constant_value)?;
     let object = ObjectRef::new(&runtime_class);
     object.set_property("name", Value::String(PhpString::from_test_str(&case.name)));
     if runtime_class.enum_backing_type.is_some() {
-        let value = case
-            .value
-            .map(|value| constant_value(compiled.unit(), value))
-            .transpose()?
-            .ok_or_else(|| {
-                format!(
-                    "E_PHP_VM_ENUM_CASE_MISSING_VALUE: backed enum case {}::{} has no value",
-                    class.name, case.name
-                )
-            })?;
+        let value = case.value.map(constant_value).transpose()?.ok_or_else(|| {
+            format!(
+                "E_PHP_VM_ENUM_CASE_MISSING_VALUE: backed enum case {}::{} has no value",
+                class.name, case.name
+            )
+        })?;
         object.set_property("value", value);
     }
     state.enum_cases.insert(key, object.clone());
@@ -8594,6 +14355,7 @@ fn enum_static_method(
     class: &php_ir::module::ClassEntry,
     method: &str,
     args: Vec<CallArgument>,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<Value, String> {
     match normalize_method_name(method).as_str() {
         "cases" => {
@@ -8606,12 +14368,18 @@ fn enum_static_method(
             let mut array = PhpArray::new();
             for case in &class.enum_cases {
                 array.append(Value::Object(enum_case_object(
-                    compiled, state, class, case,
+                    compiled,
+                    state,
+                    class,
+                    case,
+                    constant_value,
                 )?));
             }
             Ok(Value::Array(array))
         }
-        "from" | "tryfrom" => enum_backed_lookup(compiled, state, class, method, args),
+        "from" | "tryfrom" => {
+            enum_backed_lookup(compiled, state, class, method, args, constant_value)
+        }
         _ => unreachable!("enum_static_method called for non-enum method"),
     }
 }
@@ -8622,6 +14390,7 @@ fn enum_backed_lookup(
     class: &php_ir::module::ClassEntry,
     method: &str,
     args: Vec<CallArgument>,
+    constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<Value, String> {
     let normalized_method = normalize_method_name(method);
     if args.len() != 1 {
@@ -8641,10 +14410,14 @@ fn enum_backed_lookup(
         let Some(value_id) = case.value else {
             continue;
         };
-        let value = constant_value(compiled.unit(), value_id)?;
+        let value = constant_value(value_id)?;
         if identical(&value, needle) {
             return Ok(Value::Object(enum_case_object(
-                compiled, state, class, case,
+                compiled,
+                state,
+                class,
+                case,
+                constant_value,
             )?));
         }
     }
@@ -9600,6 +15373,18 @@ fn object_instanceof(
             if let Some(result) = internal_throwable_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if let Some(result) = internal_spl_iterator_instanceof(&object.class_name(), class_name)
+            {
+                return Ok(result);
+            }
+            if let Some(result) =
+                internal_spl_container_instanceof(&object.class_name(), class_name)
+            {
+                return Ok(result);
+            }
+            if let Some(result) = internal_spl_file_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
             class_is_or_implements(compiled, &object.class_name(), class_name)
         }
         _ => Ok(false),
@@ -9645,6 +15430,1357 @@ fn normalize_method_name(method: &str) -> String {
 
 fn is_fiber_runtime_class(class_name: &str) -> bool {
     normalize_class_name(class_name) == "fiber"
+}
+
+fn is_php_token_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "phptoken"
+}
+
+fn php_token_static_method_value(
+    class_name: &str,
+    method: &str,
+    args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    match normalize_method_name(method).as_str() {
+        "tokenize" => {
+            let values = call_args_to_positional("PhpToken::tokenize", args)?;
+            if values.is_empty() || values.len() > 2 {
+                return Err(format!(
+                    "E_PHP_VM_TOKENIZER_ARITY: {class_name}::tokenize expects 1 or 2 argument(s), {} given",
+                    values.len()
+                ));
+            }
+            let source = to_string(&values[0])?.to_string_lossy();
+            let flags = values.get(1).map(to_int).transpose()?.unwrap_or(0);
+            let tokens = php_runtime::tokenizer::tokenize(&source, flags)
+                .map_err(|error| error.display_message())?;
+            Ok(Value::packed_array(
+                tokens
+                    .into_iter()
+                    .map(|token| Value::Object(php_token_object(token)))
+                    .collect(),
+            ))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn php_token_method_value(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    match normalize_method_name(method).as_str() {
+        "gettokenname" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "E_PHP_VM_TOKENIZER_ARITY: PhpToken::getTokenName expects 0 argument(s), {} given",
+                    args.len()
+                ));
+            }
+            Ok(object.get_property("name").unwrap_or(Value::Bool(false)))
+        }
+        "isignorable" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "E_PHP_VM_TOKENIZER_ARITY: PhpToken::isIgnorable expects 0 argument(s), {} given",
+                    args.len()
+                ));
+            }
+            Ok(object
+                .get_property("__ignorable")
+                .unwrap_or(Value::Bool(false)))
+        }
+        "is" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "E_PHP_VM_TOKENIZER_ARITY: PhpToken::is expects 1 argument(s), {} given",
+                    args.len()
+                ));
+            }
+            Ok(Value::Bool(php_token_matches_kind(object, &args[0])?))
+        }
+        "__tostring" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "E_PHP_VM_TOKENIZER_ARITY: PhpToken::__toString expects 0 argument(s), {} given",
+                    args.len()
+                ));
+            }
+            Ok(object
+                .get_property("text")
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+            object.class_name(),
+            method
+        )),
+    }
+}
+
+fn php_token_matches_kind(object: &ObjectRef, kind: &Value) -> Result<bool, String> {
+    match kind {
+        Value::Reference(cell) => php_token_matches_kind(object, &cell.get()),
+        Value::Int(value) => Ok(object.get_property("id") == Some(Value::Int(*value))),
+        Value::String(value) => {
+            let candidate = value.to_string_lossy();
+            let text = object
+                .get_property("text")
+                .and_then(|value| match value {
+                    Value::String(text) => Some(text.to_string_lossy()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let name = object
+                .get_property("name")
+                .and_then(|value| match value {
+                    Value::String(name) => Some(name.to_string_lossy()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(candidate == text || candidate.eq_ignore_ascii_case(&name))
+        }
+        Value::Array(array) => {
+            for (_, value) in array.iter() {
+                if php_token_matches_kind(object, value)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        other => Err(format!(
+            "E_PHP_VM_TOKENIZER_KIND_TYPE: PhpToken::is expects int|string|array, {} given",
+            value_type_name(other)
+        )),
+    }
+}
+
+fn php_token_object(token: php_runtime::tokenizer::TokenizerToken) -> ObjectRef {
+    let object = ObjectRef::new(&php_token_class());
+    object.set_property("id", Value::Int(token.id));
+    object.set_property("text", Value::string(token.text.into_bytes()));
+    object.set_property("line", Value::Int(i64::from(token.line)));
+    object.set_property("pos", Value::Int(i64::from(token.pos)));
+    object.set_property("name", Value::String(PhpString::from_test_str(&token.name)));
+    object.set_property(
+        "__ignorable",
+        Value::Bool(php_runtime::tokenizer::is_ignorable_name(token.token_name)),
+    );
+    object
+}
+
+fn php_token_class() -> RuntimeClassEntry {
+    RuntimeClassEntry {
+        name: "PhpToken".to_owned(),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn is_spl_iterator_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "arrayiterator"
+            | "recursivearrayiterator"
+            | "iteratoriterator"
+            | "limititerator"
+            | "emptyiterator"
+            | "appenditerator"
+    )
+}
+
+fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_spl_iterator_runtime_class(object_class) {
+        return None;
+    }
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match target_class.as_str() {
+        "traversable" | "iterator" => true,
+        "countable" => matches!(
+            object_class.as_str(),
+            "arrayiterator" | "recursivearrayiterator" | "appenditerator"
+        ),
+        "arrayaccess" => matches!(
+            object_class.as_str(),
+            "arrayiterator" | "recursivearrayiterator"
+        ),
+        "appenditerator" => object_class == "appenditerator",
+        "arrayiterator" => {
+            object_class == "arrayiterator" || object_class == "recursivearrayiterator"
+        }
+        "recursivearrayiterator" => object_class == "recursivearrayiterator",
+        "iteratoriterator" => object_class == "iteratoriterator",
+        "limititerator" => object_class == "limititerator",
+        "emptyiterator" => object_class == "emptyiterator",
+        _ => false,
+    })
+}
+
+fn new_spl_iterator_object(class_name: &str, args: Vec<CallArgument>) -> Result<ObjectRef, String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: {class_name}::__construct has no builtin parameter ${name}"
+        ));
+    }
+    let normalized = normalize_class_name(class_name);
+    let entries = match normalized.as_str() {
+        "emptyiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            Vec::new()
+        }
+        "arrayiterator" | "recursivearrayiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            args.first()
+                .map(|arg| spl_entries_from_value(&arg.value))
+                .transpose()?
+                .unwrap_or_default()
+        }
+        "iteratoriterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 1)?;
+            spl_entries_from_value(&args[0].value)?
+        }
+        "limititerator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 3)?;
+            let entries = spl_entries_from_value(&args[0].value)?;
+            let offset = args
+                .get(1)
+                .map(|arg| to_int(&arg.value))
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as usize;
+            let count = args.get(2).map(|arg| to_int(&arg.value)).transpose()?;
+            let iter = entries.into_iter().skip(offset);
+            match count {
+                Some(count) if count >= 0 => iter.take(count as usize).collect(),
+                _ => iter.collect(),
+            }
+        }
+        "appenditerator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            Vec::new()
+        }
+        _ => unreachable!("is_spl_iterator_runtime_class validates class names"),
+    };
+    let object = ObjectRef::new(&spl_iterator_class(class_name));
+    spl_set_entries(&object, entries);
+    spl_set_position(&object, 0);
+    Ok(object)
+}
+
+fn call_spl_iterator_method(
+    object: ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "rewind" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(&object, 0);
+            Ok(Value::Null)
+        }
+        "valid" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(&object) < spl_entries(&object).len(),
+            ))
+        }
+        "current" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_current_entry(&object)
+                .map(|(_, value)| value)
+                .unwrap_or(Value::Null))
+        }
+        "key" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_current_entry(&object)
+                .map(|(key, _)| array_key_to_value(key))
+                .unwrap_or(Value::Null))
+        }
+        "next" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(&object, spl_position(&object).saturating_add(1));
+            Ok(Value::Null)
+        }
+        "count" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_entries(&object).len() as i64))
+        }
+        "getarraycopy" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
+        }
+        "append" | "additerator" => {
+            if normalize_class_name(&class_name) != "appenditerator" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let mut entries = spl_entries(&object);
+            entries.extend(spl_entries_from_value(&args[0].value)?);
+            spl_set_entries(&object, entries);
+            Ok(Value::Null)
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn validate_spl_iterator_arg_count(
+    name: &str,
+    args: &[CallArgument],
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if args.len() < min {
+        return Err(format!(
+            "E_PHP_VM_TOO_FEW_ARGS: {name} expects at least {min} argument(s), {} given",
+            args.len()
+        ));
+    }
+    if args.len() > max {
+        return Err(format!(
+            "E_PHP_VM_TOO_MANY_ARGS: {name} expects at most {max} argument(s), {} given",
+            args.len()
+        ));
+    }
+    Ok(())
+}
+
+fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
+    let normalized = normalize_class_name(class_name);
+    let mut interfaces = vec!["Iterator".to_owned(), "Traversable".to_owned()];
+    if matches!(
+        normalized.as_str(),
+        "arrayiterator" | "recursivearrayiterator" | "appenditerator"
+    ) {
+        interfaces.push("Countable".to_owned());
+    }
+    if matches!(
+        normalized.as_str(),
+        "arrayiterator" | "recursivearrayiterator"
+    ) {
+        interfaces.push("ArrayAccess".to_owned());
+    }
+    RuntimeClassEntry {
+        name: spl_iterator_display_name(class_name).to_owned(),
+        parent: None,
+        interfaces,
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn spl_iterator_display_name(class_name: &str) -> &'static str {
+    match normalize_class_name(class_name).as_str() {
+        "arrayiterator" => "ArrayIterator",
+        "recursivearrayiterator" => "RecursiveArrayIterator",
+        "iteratoriterator" => "IteratorIterator",
+        "limititerator" => "LimitIterator",
+        "emptyiterator" => "EmptyIterator",
+        "appenditerator" => "AppendIterator",
+        _ => "ArrayIterator",
+    }
+}
+
+fn spl_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, String> {
+    match effective_value(value) {
+        Value::Array(array) => Ok(array
+            .iter()
+            .map(|(key, value)| (key.clone(), effective_value(value)))
+            .collect()),
+        Value::Object(object) if is_spl_iterator_runtime_class(&object.class_name()) => {
+            Ok(spl_entries(&object))
+        }
+        Value::Object(object) if is_spl_container_runtime_class(&object.class_name()) => {
+            Ok(spl_container_entries(&object))
+        }
+        Value::Object(object) => Ok(object
+            .properties_snapshot()
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("__"))
+            .map(|(name, value)| (ArrayKey::String(PhpString::from_test_str(&name)), value))
+            .collect()),
+        other => Err(format!(
+            "E_PHP_VM_SPL_ITERATOR_SOURCE: {} is not iterable for SPL iterator MVP",
+            value_type_name(&other)
+        )),
+    }
+}
+
+fn spl_entries_to_php_array(entries: Vec<(ArrayKey, Value)>) -> PhpArray {
+    let mut array = PhpArray::new();
+    for (key, value) in entries {
+        array.insert(key, value);
+    }
+    array
+}
+
+fn spl_entries(object: &ObjectRef) -> Vec<(ArrayKey, Value)> {
+    let Some(Value::Array(entries)) = object.get_property("__entries") else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(_, entry)| {
+            let Value::Array(pair) = effective_value(entry) else {
+                return None;
+            };
+            let key = pair
+                .get(&ArrayKey::Int(0))
+                .and_then(ArrayKey::from_value_mvp)?;
+            let value = pair.get(&ArrayKey::Int(1)).map(effective_value)?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn spl_set_entries(object: &ObjectRef, entries: Vec<(ArrayKey, Value)>) {
+    let packed = entries
+        .into_iter()
+        .map(|(key, value)| Value::packed_array(vec![array_key_to_value(key), value]))
+        .collect();
+    object.set_property("__entries", Value::packed_array(packed));
+}
+
+fn spl_position(object: &ObjectRef) -> usize {
+    object
+        .get_property("__position")
+        .and_then(|value| match effective_value(&value) {
+            Value::Int(value) if value > 0 => Some(value as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn spl_set_position(object: &ObjectRef, position: usize) {
+    object.set_property("__position", Value::Int(position as i64));
+}
+
+fn spl_current_entry(object: &ObjectRef) -> Option<(ArrayKey, Value)> {
+    spl_entries(object).into_iter().nth(spl_position(object))
+}
+
+fn is_spl_container_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "arrayobject"
+            | "splfixedarray"
+            | "splobjectstorage"
+            | "spldoublylinkedlist"
+            | "splstack"
+            | "splqueue"
+    )
+}
+
+fn internal_spl_container_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_spl_container_runtime_class(object_class) {
+        return None;
+    }
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match target_class.as_str() {
+        "traversable" | "iterator" | "countable" => true,
+        "arrayaccess" => matches!(
+            object_class.as_str(),
+            "arrayobject" | "splfixedarray" | "splobjectstorage"
+        ),
+        "arrayobject" => object_class == "arrayobject",
+        "splfixedarray" => object_class == "splfixedarray",
+        "splobjectstorage" => object_class == "splobjectstorage",
+        "spldoublylinkedlist" => matches!(
+            object_class.as_str(),
+            "spldoublylinkedlist" | "splstack" | "splqueue"
+        ),
+        "splstack" => object_class == "splstack",
+        "splqueue" => object_class == "splqueue",
+        _ => false,
+    })
+}
+
+fn new_spl_container_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+) -> Result<ObjectRef, String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: {class_name}::__construct has no builtin parameter ${name}"
+        ));
+    }
+    let normalized = normalize_class_name(class_name);
+    let object = ObjectRef::new(&spl_container_class(class_name));
+    match normalized.as_str() {
+        "arrayobject" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            let entries = args
+                .first()
+                .map(|arg| spl_entries_from_value(&arg.value))
+                .transpose()?
+                .unwrap_or_default();
+            spl_set_entries(&object, entries);
+        }
+        "splfixedarray" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            let size = args
+                .first()
+                .map(|arg| to_int(&arg.value))
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as usize;
+            spl_fixed_array_resize(&object, size);
+        }
+        "splobjectstorage" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            spl_set_storage_entries(&object, Vec::new());
+        }
+        "spldoublylinkedlist" | "splstack" | "splqueue" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            spl_set_entries(&object, Vec::new());
+        }
+        _ => unreachable!("is_spl_container_runtime_class validates class names"),
+    }
+    spl_set_position(&object, 0);
+    Ok(object)
+}
+
+fn call_spl_container_method(
+    object: ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let normalized_class = normalize_class_name(&class_name);
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "rewind" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(&object, 0);
+            Ok(Value::Null)
+        }
+        "valid" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(&object) < spl_container_entries(&object).len(),
+            ))
+        }
+        "current" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_container_current_entry(&object)
+                .map(|(_, value)| value)
+                .unwrap_or(Value::Null))
+        }
+        "key" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_container_current_entry(&object)
+                .map(|(key, _)| array_key_to_value(key))
+                .unwrap_or(Value::Null))
+        }
+        "next" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(&object, spl_position(&object).saturating_add(1));
+            Ok(Value::Null)
+        }
+        "count" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_container_entries(&object).len() as i64))
+        }
+        "getarraycopy" | "toarray" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Array(spl_entries_to_php_array(
+                spl_container_entries(&object),
+            )))
+        }
+        "append" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            match normalized_class.as_str() {
+                "arrayobject" | "spldoublylinkedlist" | "splstack" | "splqueue" => {
+                    let mut entries = spl_entries(&object);
+                    let next = entries
+                        .iter()
+                        .filter_map(|(key, _)| match key {
+                            ArrayKey::Int(value) => Some(*value),
+                            ArrayKey::String(_) => None,
+                        })
+                        .max()
+                        .map_or(0, |value| value.saturating_add(1));
+                    entries.push((ArrayKey::Int(next), args[0].value.clone()));
+                    spl_set_entries(&object, entries);
+                    Ok(Value::Null)
+                }
+                _ => Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                )),
+            }
+        }
+        "push" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_push(&object, args[0].value.clone());
+            Ok(Value::Null)
+        }
+        "pop" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_container_pop(&object).unwrap_or(Value::Null))
+        }
+        "shift" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_container_shift(&object).unwrap_or(Value::Null))
+        }
+        "unshift" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let mut entries = spl_entries(&object);
+            entries.insert(0, (ArrayKey::Int(0), args[0].value.clone()));
+            spl_reindex_and_set_entries(&object, entries);
+            Ok(Value::Null)
+        }
+        "top" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_entries(&object)
+                .last()
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Null))
+        }
+        "bottom" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_entries(&object)
+                .first()
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Null))
+        }
+        "getsize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_entries(&object).len() as i64))
+        }
+        "setsize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class != "splfixedarray" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let size = to_int(&args[0].value)?.max(0) as usize;
+            spl_fixed_array_resize(&object, size);
+            Ok(Value::Null)
+        }
+        "exchangearray" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class != "arrayobject" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let old = Value::Array(spl_entries_to_php_array(spl_entries(&object)));
+            spl_set_entries(&object, spl_entries_from_value(&args[0].value)?);
+            Ok(old)
+        }
+        "offsetget" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_get(&object, &args[0].value)
+        }
+        "offsetexists" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_exists(&object, &args[0].value)
+        }
+        "offsetset" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            spl_container_offset_set(&object, args[0].value.clone(), args[1].value.clone())?;
+            Ok(Value::Null)
+        }
+        "offsetunset" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_unset(&object, &args[0].value)?;
+            Ok(Value::Null)
+        }
+        "attach" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 2)?;
+            let info = args
+                .get(1)
+                .map(|arg| arg.value.clone())
+                .unwrap_or(Value::Null);
+            spl_object_storage_attach(&object, &args[0].value, info)?;
+            Ok(Value::Null)
+        }
+        "detach" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_object_storage_detach(&object, &args[0].value)?;
+            Ok(Value::Null)
+        }
+        "contains" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            Ok(Value::Bool(
+                spl_object_storage_find(&object, &args[0].value).is_some(),
+            ))
+        }
+        "getinfo" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let pos = spl_position(&object);
+            Ok(spl_storage_entries(&object)
+                .get(pos)
+                .map(|(_, _, info)| effective_value(info))
+                .unwrap_or(Value::Null))
+        }
+        "setinfo" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let mut entries = spl_storage_entries(&object);
+            let pos = spl_position(&object);
+            if let Some((_, _, info)) = entries.get_mut(pos) {
+                *info = args[0].value.clone();
+            }
+            spl_set_storage_entries(&object, entries);
+            Ok(Value::Null)
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn spl_container_class(class_name: &str) -> RuntimeClassEntry {
+    let normalized = normalize_class_name(class_name);
+    let mut interfaces = vec![
+        "Iterator".to_owned(),
+        "Traversable".to_owned(),
+        "Countable".to_owned(),
+    ];
+    if matches!(
+        normalized.as_str(),
+        "arrayobject" | "splfixedarray" | "splobjectstorage"
+    ) {
+        interfaces.push("ArrayAccess".to_owned());
+    }
+    RuntimeClassEntry {
+        name: spl_container_display_name(class_name).to_owned(),
+        parent: match normalized.as_str() {
+            "splstack" | "splqueue" => Some("SplDoublyLinkedList".to_owned()),
+            _ => None,
+        },
+        interfaces,
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn spl_container_display_name(class_name: &str) -> &'static str {
+    match normalize_class_name(class_name).as_str() {
+        "arrayobject" => "ArrayObject",
+        "splfixedarray" => "SplFixedArray",
+        "splobjectstorage" => "SplObjectStorage",
+        "spldoublylinkedlist" => "SplDoublyLinkedList",
+        "splstack" => "SplStack",
+        "splqueue" => "SplQueue",
+        _ => "ArrayObject",
+    }
+}
+
+fn spl_container_entries(object: &ObjectRef) -> Vec<(ArrayKey, Value)> {
+    if normalize_class_name(&object.class_name()) == "splobjectstorage" {
+        return spl_storage_entries(object)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, object, _))| (ArrayKey::Int(index as i64), Value::Object(object)))
+            .collect();
+    }
+    spl_entries(object)
+}
+
+fn spl_container_current_entry(object: &ObjectRef) -> Option<(ArrayKey, Value)> {
+    spl_container_entries(object)
+        .into_iter()
+        .nth(spl_position(object))
+}
+
+fn spl_fixed_array_resize(object: &ObjectRef, size: usize) {
+    let mut entries = spl_entries(object);
+    entries.resize_with(size, || (ArrayKey::Int(0), Value::Null));
+    let entries = entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, value))| (ArrayKey::Int(index as i64), value))
+        .collect();
+    spl_set_entries(object, entries);
+}
+
+fn spl_container_push(object: &ObjectRef, value: Value) {
+    let mut entries = spl_entries(object);
+    entries.push((ArrayKey::Int(entries.len() as i64), value));
+    spl_set_entries(object, entries);
+}
+
+fn spl_container_pop(object: &ObjectRef) -> Option<Value> {
+    let mut entries = spl_entries(object);
+    let value = entries.pop().map(|(_, value)| value);
+    spl_reindex_and_set_entries(object, entries);
+    value
+}
+
+fn spl_container_shift(object: &ObjectRef) -> Option<Value> {
+    let mut entries = spl_entries(object);
+    if entries.is_empty() {
+        return None;
+    }
+    let value = entries.remove(0).1;
+    spl_reindex_and_set_entries(object, entries);
+    Some(value)
+}
+
+fn spl_reindex_and_set_entries(object: &ObjectRef, entries: Vec<(ArrayKey, Value)>) {
+    spl_set_entries(
+        object,
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, value))| (ArrayKey::Int(index as i64), value))
+            .collect(),
+    );
+}
+
+fn spl_container_offset_get(object: &ObjectRef, key: &Value) -> Result<Value, String> {
+    match normalize_class_name(&object.class_name()).as_str() {
+        "splobjectstorage" => Ok(spl_object_storage_find(object, key)
+            .map(|(_, _, info)| effective_value(&info))
+            .unwrap_or(Value::Null)),
+        _ => {
+            let key = array_key_from_value(key)?;
+            Ok(spl_entries(object)
+                .into_iter()
+                .find_map(|(entry_key, value)| (entry_key == key).then_some(value))
+                .unwrap_or(Value::Null))
+        }
+    }
+}
+
+fn spl_container_offset_exists(object: &ObjectRef, key: &Value) -> Result<Value, String> {
+    let exists = match normalize_class_name(&object.class_name()).as_str() {
+        "splobjectstorage" => spl_object_storage_find(object, key).is_some(),
+        _ => {
+            let key = array_key_from_value(key)?;
+            spl_entries(object)
+                .into_iter()
+                .any(|(entry_key, value)| entry_key == key && !matches!(value, Value::Null))
+        }
+    };
+    Ok(Value::Bool(exists))
+}
+
+fn spl_container_offset_set(object: &ObjectRef, key: Value, value: Value) -> Result<(), String> {
+    match normalize_class_name(&object.class_name()).as_str() {
+        "splobjectstorage" => spl_object_storage_attach(object, &key, value),
+        "splfixedarray" => {
+            let key = array_key_from_value(&key)?;
+            let ArrayKey::Int(index) = key else {
+                return Err(
+                    "E_PHP_VM_SPL_FIXED_ARRAY_KEY: SplFixedArray keys must be integers".to_owned(),
+                );
+            };
+            let mut entries = spl_entries(object);
+            if index < 0 || index as usize >= entries.len() {
+                return Err(
+                    "E_PHP_VM_SPL_FIXED_ARRAY_BOUNDS: SplFixedArray index out of range".to_owned(),
+                );
+            }
+            entries[index as usize] = (ArrayKey::Int(index), value);
+            spl_set_entries(object, entries);
+            Ok(())
+        }
+        _ => {
+            let mut entries = spl_entries(object);
+            if matches!(key, Value::Null) {
+                let next = entries
+                    .iter()
+                    .filter_map(|(key, _)| match key {
+                        ArrayKey::Int(value) => Some(*value),
+                        ArrayKey::String(_) => None,
+                    })
+                    .max()
+                    .map_or(0, |value| value.saturating_add(1));
+                entries.push((ArrayKey::Int(next), value));
+                spl_set_entries(object, entries);
+                return Ok(());
+            }
+            let key = array_key_from_value(&key)?;
+            if let Some((_, entry_value)) =
+                entries.iter_mut().find(|(entry_key, _)| entry_key == &key)
+            {
+                *entry_value = value;
+            } else {
+                entries.push((key, value));
+            }
+            spl_set_entries(object, entries);
+            Ok(())
+        }
+    }
+}
+
+fn spl_container_offset_unset(object: &ObjectRef, key: &Value) -> Result<(), String> {
+    match normalize_class_name(&object.class_name()).as_str() {
+        "splobjectstorage" => spl_object_storage_detach(object, key),
+        _ => {
+            let key = array_key_from_value(key)?;
+            let entries = spl_entries(object)
+                .into_iter()
+                .filter(|(entry_key, _)| entry_key != &key)
+                .collect();
+            spl_set_entries(object, entries);
+            Ok(())
+        }
+    }
+}
+
+fn spl_storage_entries(object: &ObjectRef) -> Vec<(u64, ObjectRef, Value)> {
+    let Some(Value::Array(entries)) = object.get_property("__storage") else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(_, entry)| {
+            let Value::Array(pair) = effective_value(entry) else {
+                return None;
+            };
+            let id = match pair.get(&ArrayKey::Int(0)).map(effective_value)? {
+                Value::Int(value) if value >= 0 => value as u64,
+                _ => return None,
+            };
+            let object = match pair.get(&ArrayKey::Int(1)).map(effective_value)? {
+                Value::Object(object) => object,
+                _ => return None,
+            };
+            let info = pair.get(&ArrayKey::Int(2)).map(effective_value)?;
+            Some((id, object, info))
+        })
+        .collect()
+}
+
+fn spl_set_storage_entries(object: &ObjectRef, entries: Vec<(u64, ObjectRef, Value)>) {
+    let packed = entries
+        .into_iter()
+        .map(|(id, object, info)| {
+            Value::packed_array(vec![Value::Int(id as i64), Value::Object(object), info])
+        })
+        .collect();
+    object.set_property("__storage", Value::packed_array(packed));
+}
+
+fn spl_object_storage_find(object: &ObjectRef, key: &Value) -> Option<(u64, ObjectRef, Value)> {
+    let Value::Object(needle) = effective_value(key) else {
+        return None;
+    };
+    let id = needle.id();
+    spl_storage_entries(object)
+        .into_iter()
+        .find(|(entry_id, _, _)| *entry_id == id)
+}
+
+fn spl_object_storage_attach(object: &ObjectRef, key: &Value, info: Value) -> Result<(), String> {
+    let Value::Object(attached) = effective_value(key) else {
+        return Err(
+            "E_PHP_VM_SPL_OBJECT_STORAGE_KEY: SplObjectStorage keys must be objects".to_owned(),
+        );
+    };
+    let id = attached.id();
+    let mut entries = spl_storage_entries(object);
+    if let Some((_, _, entry_info)) = entries.iter_mut().find(|(entry_id, _, _)| *entry_id == id) {
+        *entry_info = info;
+    } else {
+        entries.push((id, attached, info));
+    }
+    spl_set_storage_entries(object, entries);
+    Ok(())
+}
+
+fn spl_object_storage_detach(object: &ObjectRef, key: &Value) -> Result<(), String> {
+    let Value::Object(needle) = effective_value(key) else {
+        return Err(
+            "E_PHP_VM_SPL_OBJECT_STORAGE_KEY: SplObjectStorage keys must be objects".to_owned(),
+        );
+    };
+    let id = needle.id();
+    let entries = spl_storage_entries(object)
+        .into_iter()
+        .filter(|(entry_id, _, _)| *entry_id != id)
+        .collect();
+    spl_set_storage_entries(object, entries);
+    Ok(())
+}
+
+fn is_spl_file_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "splfileinfo" | "splfileobject" | "spltempfileobject"
+    )
+}
+
+fn internal_spl_file_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_spl_file_runtime_class(object_class) {
+        return None;
+    }
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match target_class.as_str() {
+        "splfileinfo" => matches!(
+            object_class.as_str(),
+            "splfileinfo" | "splfileobject" | "spltempfileobject"
+        ),
+        "splfileobject" => matches!(object_class.as_str(), "splfileobject" | "spltempfileobject"),
+        "spltempfileobject" => object_class == "spltempfileobject",
+        "traversable" | "iterator" => {
+            matches!(object_class.as_str(), "splfileobject" | "spltempfileobject")
+        }
+        _ => false,
+    })
+}
+
+fn new_spl_file_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: {class_name}::__construct has no builtin parameter ${name}"
+        ));
+    }
+    let normalized = normalize_class_name(class_name);
+    let object = ObjectRef::new(&spl_file_class(class_name));
+    match normalized.as_str() {
+        "splfileinfo" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 1)?;
+            let path = to_string(&args[0].value)?.to_string_lossy();
+            spl_file_set_path(&object, &path);
+        }
+        "splfileobject" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 2)?;
+            let path = to_string(&args[0].value)?.to_string_lossy();
+            let mode = args
+                .get(1)
+                .map(|arg| to_string(&arg.value).map(|value| value.to_string_lossy()))
+                .transpose()?
+                .unwrap_or_else(|| "r".to_owned());
+            let content = spl_file_read_to_string(&path, runtime_context)?;
+            spl_file_set_path(&object, &path);
+            object.set_property("__mode", Value::string(mode.into_bytes()));
+            spl_file_set_content(&object, content);
+        }
+        "spltempfileobject" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            spl_file_set_path(&object, "php://temp");
+            object.set_property("__mode", Value::string(b"w+".to_vec()));
+            object.set_property("__temp", Value::Bool(true));
+            spl_file_set_content(&object, String::new());
+        }
+        _ => unreachable!("is_spl_file_runtime_class validates class names"),
+    }
+    spl_set_position(&object, 0);
+    Ok(object)
+}
+
+fn call_spl_file_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let normalized_class = normalize_class_name(&class_name);
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "__tostring" | "getpathname" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::string(spl_file_path(object).into_bytes()))
+        }
+        "getfilename" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::string(
+                spl_file_basename(&spl_file_path(object)).into_bytes(),
+            ))
+        }
+        "getbasename" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 1)?;
+            let mut base = spl_file_basename(&spl_file_path(object));
+            if let Some(suffix) = args.first() {
+                let suffix = to_string(&suffix.value)?.to_string_lossy();
+                if !suffix.is_empty() && base.ends_with(&suffix) {
+                    base.truncate(base.len() - suffix.len());
+                }
+            }
+            Ok(Value::string(base.into_bytes()))
+        }
+        "getpath" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let path = spl_file_path(object);
+            let parent = Path::new(&path)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(Value::string(parent.into_bytes()))
+        }
+        "getrealpath" | "realpath" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
+            if !runtime_context.filesystem.allows_path(&path) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(fs::canonicalize(&path)
+                .ok()
+                .map(|path| Value::string(path.to_string_lossy().into_owned().into_bytes()))
+                .unwrap_or(Value::Bool(false)))
+        }
+        "getsize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if matches!(normalized_class.as_str(), "spltempfileobject") {
+                return Ok(Value::Int(spl_file_content(object).len() as i64));
+            }
+            Ok(Value::Int(
+                spl_file_metadata(object, runtime_context)?.len() as i64,
+            ))
+        }
+        "getmtime" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let modified = spl_file_metadata(object, runtime_context)?
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            Ok(Value::Int(modified))
+        }
+        "isfile" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_file_metadata(object, runtime_context)
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false),
+            ))
+        }
+        "isreadable" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
+            Ok(Value::Bool(
+                runtime_context.filesystem.allows_path(&path) && fs::File::open(path).is_ok(),
+            ))
+        }
+        "rewind" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(object, 0);
+            Ok(Value::Null)
+        }
+        "eof" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(object) >= spl_file_lines(object).len(),
+            ))
+        }
+        "valid" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(object) < spl_file_lines(object).len(),
+            ))
+        }
+        "key" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_position(object) as i64))
+        }
+        "current" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_file_lines(object)
+                .get(spl_position(object))
+                .map(|line| Value::string(line.as_bytes().to_vec()))
+                .unwrap_or(Value::Null))
+        }
+        "next" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(object, spl_position(object).saturating_add(1));
+            Ok(Value::Null)
+        }
+        "fgets" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let lines = spl_file_lines(object);
+            let pos = spl_position(object);
+            if let Some(line) = lines.get(pos) {
+                spl_set_position(object, pos.saturating_add(1));
+                Ok(Value::string(line.as_bytes().to_vec()))
+            } else {
+                Ok(Value::Bool(false))
+            }
+        }
+        "fgetcsv" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 1)?;
+            let delimiter = args
+                .first()
+                .map(|arg| to_string(&arg.value).map(|value| value.to_string_lossy()))
+                .transpose()?
+                .and_then(|value| value.bytes().next())
+                .unwrap_or(b',');
+            let line = match call_spl_file_method(object, "fgets", Vec::new(), runtime_context)? {
+                Value::String(line) => line.to_string_lossy(),
+                _ => return Ok(Value::Bool(false)),
+            };
+            let fields = line
+                .trim_end_matches(['\r', '\n'])
+                .split(delimiter as char)
+                .map(|field| Value::string(field.as_bytes().to_vec()))
+                .collect();
+            Ok(Value::packed_array(fields))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn spl_file_class(class_name: &str) -> RuntimeClassEntry {
+    let normalized = normalize_class_name(class_name);
+    RuntimeClassEntry {
+        name: spl_file_display_name(class_name).to_owned(),
+        parent: match normalized.as_str() {
+            "splfileobject" | "spltempfileobject" => Some("SplFileInfo".to_owned()),
+            _ => None,
+        },
+        interfaces: if matches!(normalized.as_str(), "splfileobject" | "spltempfileobject") {
+            vec!["Iterator".to_owned(), "Traversable".to_owned()]
+        } else {
+            Vec::new()
+        },
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn spl_file_display_name(class_name: &str) -> &'static str {
+    match normalize_class_name(class_name).as_str() {
+        "splfileinfo" => "SplFileInfo",
+        "splfileobject" => "SplFileObject",
+        "spltempfileobject" => "SplTempFileObject",
+        _ => "SplFileInfo",
+    }
+}
+
+fn spl_file_set_path(object: &ObjectRef, path: &str) {
+    object.set_property("__path", Value::string(path.as_bytes().to_vec()));
+}
+
+fn spl_file_path(object: &ObjectRef) -> String {
+    match object
+        .get_property("__path")
+        .map(|value| effective_value(&value))
+    {
+        Some(Value::String(path)) => path.to_string_lossy(),
+        _ => String::new(),
+    }
+}
+
+fn spl_file_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn spl_file_resolve_path(path: &str, runtime_context: &RuntimeContext) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        runtime_context.cwd.join(path)
+    }
+}
+
+fn spl_file_metadata(
+    object: &ObjectRef,
+    runtime_context: &RuntimeContext,
+) -> Result<fs::Metadata, String> {
+    let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
+    if !runtime_context.filesystem.allows_path(&path) {
+        return Err(format!(
+            "E_PHP_VM_SPL_FILE_DENIED: local file access denied for `{}`",
+            path.to_string_lossy()
+        ));
+    }
+    fs::metadata(&path).map_err(|error| {
+        format!(
+            "E_PHP_VM_SPL_FILE_STAT: failed to stat `{}`: {error}",
+            path.to_string_lossy()
+        )
+    })
+}
+
+fn spl_file_read_to_string(path: &str, runtime_context: &RuntimeContext) -> Result<String, String> {
+    let path = spl_file_resolve_path(path, runtime_context);
+    if !runtime_context.filesystem.allows_path(&path) {
+        return Err(format!(
+            "E_PHP_VM_SPL_FILE_DENIED: local file access denied for `{}`",
+            path.to_string_lossy()
+        ));
+    }
+    fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "E_PHP_VM_SPL_FILE_READ: failed to read `{}`: {error}",
+            path.to_string_lossy()
+        )
+    })
+}
+
+fn spl_file_set_content(object: &ObjectRef, content: String) {
+    let lines = content
+        .split_inclusive('\n')
+        .map(|line| Value::string(line.as_bytes().to_vec()))
+        .collect();
+    object.set_property("__content", Value::string(content.into_bytes()));
+    object.set_property("__lines", Value::packed_array(lines));
+}
+
+fn spl_file_content(object: &ObjectRef) -> String {
+    match object
+        .get_property("__content")
+        .map(|value| effective_value(&value))
+    {
+        Some(Value::String(content)) => content.to_string_lossy(),
+        _ => String::new(),
+    }
+}
+
+fn spl_file_lines(object: &ObjectRef) -> Vec<String> {
+    let Some(Value::Array(lines)) = object.get_property("__lines") else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .filter_map(|(_, value)| match effective_value(value) {
+            Value::String(line) => Some(line.to_string_lossy()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn new_fiber_object(args: Vec<CallArgument>) -> Result<FiberRef, String> {
@@ -9776,18 +16912,150 @@ fn is_autoload_builtin_name(name: &str) -> bool {
     )
 }
 
-fn is_class_probe_builtin_name(name: &str) -> bool {
-    matches!(name, "class_exists" | "interface_exists")
+fn is_symbol_introspection_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "defined"
+            | "constant"
+            | "extension_loaded"
+            | "function_exists"
+            | "class_exists"
+            | "call_user_func"
+            | "call_user_func_array"
+            | "forward_static_call"
+            | "func_get_arg"
+            | "func_get_args"
+            | "func_num_args"
+            | "interface_exists"
+            | "trait_exists"
+            | "enum_exists"
+            | "method_exists"
+            | "property_exists"
+            | "is_subclass_of"
+            | "get_class"
+            | "get_class_methods"
+            | "get_class_vars"
+            | "get_parent_class"
+            | "get_declared_classes"
+            | "get_declared_interfaces"
+            | "get_declared_traits"
+            | "get_loaded_extensions"
+            | "get_mangled_object_vars"
+            | "get_object_vars"
+    )
 }
 
-fn autoload_callback_from_value(
+fn is_config_builtin_name(name: &str) -> bool {
+    matches!(name, "ini_get" | "ini_set" | "ini_get_all" | "get_cfg_var")
+}
+
+fn is_error_handling_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "error_reporting"
+            | "set_error_handler"
+            | "restore_error_handler"
+            | "trigger_error"
+            | "user_error"
+            | "set_exception_handler"
+            | "restore_exception_handler"
+    )
+}
+
+fn is_output_buffering_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "ob_start"
+            | "ob_get_contents"
+            | "ob_get_clean"
+            | "ob_get_length"
+            | "ob_get_level"
+            | "ob_end_clean"
+            | "ob_end_flush"
+            | "flush"
+    )
+}
+
+fn is_environment_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "getenv" | "putenv" | "php_sapi_name" | "php_uname" | "get_current_user"
+    )
+}
+
+fn is_process_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "proc_open"
+            | "proc_close"
+            | "proc_get_status"
+            | "popen"
+            | "pclose"
+            | "shell_exec"
+            | "exec"
+            | "passthru"
+            | "system"
+    )
+}
+
+fn error_handler_callback_from_value(
     compiled: &CompiledUnit,
     value: Value,
 ) -> Result<CallableValue, String> {
     match value {
         Value::Callable(CallableValue::UserFunction { name }) => {
             let normalized = normalize_function_name(&name);
+            if compiled.lookup_function(&normalized).is_some() {
+                Ok(CallableValue::UserFunction { name: normalized })
+            } else if BuiltinRegistry::new().contains(&normalized) {
+                Ok(CallableValue::InternalBuiltin { name: normalized })
+            } else {
+                Err(format!(
+                    "E_PHP_VM_ERROR_INVALID_CALLBACK: function {name} is not callable"
+                ))
+            }
+        }
+        Value::Callable(CallableValue::Closure { function, captures }) => {
+            Ok(CallableValue::Closure { function, captures })
+        }
+        Value::Callable(CallableValue::InternalBuiltin { name }) => {
+            if BuiltinRegistry::new().contains(&name) {
+                Ok(CallableValue::InternalBuiltin { name })
+            } else {
+                Err(format!(
+                    "E_PHP_VM_ERROR_INVALID_CALLBACK: builtin {name} is not callable"
+                ))
+            }
+        }
+        Value::String(name) => {
+            let name = normalize_function_name(&name.to_string_lossy());
+            if compiled.lookup_function(&name).is_some() {
+                Ok(CallableValue::UserFunction { name })
+            } else if BuiltinRegistry::new().contains(&name) {
+                Ok(CallableValue::InternalBuiltin { name })
+            } else {
+                Err(format!(
+                    "E_PHP_VM_ERROR_INVALID_CALLBACK: function {name} is not callable"
+                ))
+            }
+        }
+        other => Err(format!(
+            "E_PHP_VM_ERROR_INVALID_CALLBACK: value of type {} is not callable",
+            value_type_name(&other)
+        )),
+    }
+}
+
+fn autoload_callback_from_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: Value,
+) -> Result<CallableValue, String> {
+    match value {
+        Value::Callable(CallableValue::UserFunction { name }) => {
+            let normalized = normalize_function_name(&name);
             if compiled.lookup_function(&normalized).is_some()
+                || dynamic_function_in_state(state, &normalized).is_some()
                 || BuiltinRegistry::new().contains(&normalized)
             {
                 Ok(CallableValue::UserFunction { name: normalized })
@@ -9828,7 +17096,28 @@ fn autoload_callback_from_value(
     }
 }
 
-fn register_dynamic_classes(state: &mut ExecutionState, unit: &IrUnit) {
+fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) {
+    let unit_index = state.dynamic_units.len();
+    for entry in unit.function_table() {
+        if state
+            .dynamic_functions
+            .iter()
+            .any(|existing| existing.name == entry.name)
+        {
+            continue;
+        }
+        state.dynamic_functions.push(DynamicFunctionEntry {
+            name: entry.name.clone(),
+            unit_index,
+            function: entry.function,
+        });
+    }
+    register_dynamic_classes(state, unit_index, unit.unit());
+    state.dynamic_units.push(unit);
+    state.bump_class_table_epoch();
+}
+
+fn register_dynamic_classes(state: &mut ExecutionState, unit_index: usize, unit: &IrUnit) {
     for class in unit
         .classes
         .iter()
@@ -9838,12 +17127,36 @@ fn register_dynamic_classes(state: &mut ExecutionState, unit: &IrUnit) {
         if state
             .dynamic_classes
             .iter()
-            .any(|existing| normalize_class_name(&existing.name) == normalized)
+            .any(|existing| normalize_class_name(&existing.class.name) == normalized)
         {
             continue;
         }
-        state.dynamic_classes.push(class.clone());
+        state.dynamic_classes.push(DynamicClassEntry {
+            class: class.clone(),
+            unit_index,
+        });
     }
+}
+
+fn dynamic_function_in_state(
+    state: &ExecutionState,
+    function_name: &str,
+) -> Option<(CompiledUnit, FunctionId)> {
+    let (unit_index, function) = dynamic_function_target_in_state(state, function_name)?;
+    let owner = state.dynamic_units.get(unit_index)?.clone();
+    Some((owner, function))
+}
+
+fn dynamic_function_target_in_state(
+    state: &ExecutionState,
+    function_name: &str,
+) -> Option<(usize, FunctionId)> {
+    let normalized = normalize_function_name(function_name);
+    let entry = state
+        .dynamic_functions
+        .iter()
+        .find(|entry| entry.name == normalized)?;
+    Some((entry.unit_index, entry.function))
 }
 
 fn lookup_class_in_state(
@@ -9856,9 +17169,625 @@ fn lookup_class_in_state(
         state
             .dynamic_classes
             .iter()
-            .find(|class| normalize_class_name(&class.name) == normalized)
-            .cloned()
+            .find(|entry| normalize_class_name(&entry.class.name) == normalized)
+            .map(|entry| entry.class.clone())
     })
+}
+
+fn class_like_exists_direct(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    kind: AutoloadClassLookupKind,
+) -> bool {
+    lookup_class_in_state(compiled, state, class_name).is_some_and(|class| match kind {
+        AutoloadClassLookupKind::Interface => class.flags.is_interface,
+        AutoloadClassLookupKind::Enum => class.flags.is_enum,
+        AutoloadClassLookupKind::Trait => false,
+        AutoloadClassLookupKind::Class => !class.flags.is_interface,
+    }) || php_std::ExtensionRegistry::phase6_infrastructure()
+        .enabled_class(class_name)
+        .is_some_and(|class| match kind {
+            AutoloadClassLookupKind::Interface => {
+                matches!(class.kind(), php_std::ClassKind::Interface)
+            }
+            AutoloadClassLookupKind::Enum => matches!(class.kind(), php_std::ClassKind::Enum),
+            AutoloadClassLookupKind::Trait => matches!(class.kind(), php_std::ClassKind::Trait),
+            AutoloadClassLookupKind::Class => matches!(class.kind(), php_std::ClassKind::Class),
+        })
+}
+
+fn dynamic_class_owner_in_state(state: &ExecutionState, class_name: &str) -> Option<CompiledUnit> {
+    let unit_index = dynamic_class_owner_index_in_state(state, class_name)?;
+    state.dynamic_units.get(unit_index).cloned()
+}
+
+fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) -> Option<usize> {
+    let normalized = normalize_class_name(class_name);
+    let entry = state
+        .dynamic_classes
+        .iter()
+        .find(|entry| normalize_class_name(&entry.class.name) == normalized)?;
+    Some(entry.unit_index)
+}
+
+fn predefined_constant_value(name: &str) -> Option<Value> {
+    php_std::ExtensionRegistry::phase6_infrastructure()
+        .enabled_constant(name)
+        .and_then(|constant| constant.value())
+        .map(php_std::constants::constant_to_value)
+}
+
+fn ini_option_name(value: &Value) -> Result<String, String> {
+    to_string(value).map(|name| name.to_string_lossy())
+}
+
+fn ini_get_all_array(registry: &IniRegistry, details: bool) -> PhpArray {
+    let mut output = PhpArray::new();
+    for entry in registry.entries() {
+        let value = if details {
+            let mut detail = PhpArray::new();
+            detail.insert(
+                php_string_key("global_value"),
+                Value::string(entry.global_value),
+            );
+            detail.insert(
+                php_string_key("local_value"),
+                Value::string(entry.local_value),
+            );
+            detail.insert(php_string_key("access"), Value::Int(entry.access));
+            Value::Array(detail)
+        } else {
+            Value::string(entry.local_value)
+        };
+        output.insert(php_string_key(entry.name), value);
+    }
+    output
+}
+
+fn current_error_reporting(state: &ExecutionState) -> i64 {
+    state
+        .ini
+        .get("error_reporting")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(-1)
+}
+
+fn error_reporting_allows(state: &ExecutionState, level: i64) -> bool {
+    let mask = current_error_reporting(state);
+    mask == -1 || (mask & level) != 0
+}
+
+fn display_errors_enabled(state: &ExecutionState) -> bool {
+    !matches!(
+        state.ini.get("display_errors"),
+        Some("") | Some("0") | Some("Off") | Some("off")
+    )
+}
+
+fn is_supported_user_error_level(level: i64) -> bool {
+    matches!(
+        level,
+        php_std::constants::E_USER_WARNING
+            | php_std::constants::E_USER_NOTICE
+            | php_std::constants::E_USER_DEPRECATED
+            | php_std::constants::E_USER_ERROR
+    )
+}
+
+fn error_level_display_name(level: i64) -> &'static str {
+    match level {
+        php_std::constants::E_USER_NOTICE => "Notice",
+        php_std::constants::E_USER_DEPRECATED => "Deprecated",
+        php_std::constants::E_USER_ERROR => "Fatal error",
+        _ => "Warning",
+    }
+}
+
+fn error_level_diagnostic_id(level: i64) -> &'static str {
+    match level {
+        php_std::constants::E_USER_NOTICE => "E_PHP_VM_USER_NOTICE",
+        php_std::constants::E_USER_DEPRECATED => "E_PHP_VM_USER_DEPRECATED",
+        php_std::constants::E_USER_ERROR => "E_PHP_VM_USER_ERROR",
+        _ => "E_PHP_VM_USER_WARNING",
+    }
+}
+
+fn error_level_severity(level: i64) -> RuntimeSeverity {
+    match level {
+        php_std::constants::E_USER_NOTICE => RuntimeSeverity::Notice,
+        php_std::constants::E_USER_DEPRECATED => RuntimeSeverity::Deprecation,
+        php_std::constants::E_USER_ERROR => RuntimeSeverity::FatalError,
+        _ => RuntimeSeverity::Warning,
+    }
+}
+
+fn state_include_path(state: &ExecutionState) -> Vec<PathBuf> {
+    state
+        .ini
+        .get("include_path")
+        .unwrap_or(".")
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn php_string_key(value: &str) -> ArrayKey {
+    ArrayKey::String(PhpString::from_test_str(value))
+}
+
+fn object_from_value(value: &Value) -> Option<ObjectRef> {
+    match value {
+        Value::Object(object) => Some(object.clone()),
+        Value::Reference(cell) => object_from_value(&cell.get()),
+        _ => None,
+    }
+}
+
+fn object_vars_array(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    object: &ObjectRef,
+    mangled: bool,
+) -> PhpArray {
+    let mut array = PhpArray::new();
+    let class = compiled.lookup_class(&object.class_name());
+    let scope = current_scope_class(compiled, stack);
+
+    for (storage_name, value) in object.properties_snapshot() {
+        if let Some((declaring_class, property)) = private_storage_parts(&storage_name) {
+            if mangled {
+                let display_class =
+                    class_display_name(compiled, &declaring_class).unwrap_or(declaring_class);
+                array.insert(
+                    ArrayKey::String(PhpString::from_test_str(&format!(
+                        "\0{display_class}\0{property}"
+                    ))),
+                    value,
+                );
+            } else if scope
+                .as_deref()
+                .is_some_and(|scope| normalize_class_name(scope) == declaring_class)
+            {
+                array.insert(php_string_key(&property), value);
+            }
+            continue;
+        }
+
+        let property = class.and_then(|class| {
+            lookup_property_in_hierarchy(compiled, class, &storage_name, None)
+                .ok()
+                .flatten()
+        });
+        if mangled {
+            let key = property
+                .as_ref()
+                .and_then(|resolved| {
+                    if resolved.property.flags.is_protected {
+                        Some(ArrayKey::String(PhpString::from_test_str(&format!(
+                            "\0*\0{}",
+                            resolved.property.name
+                        ))))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| php_string_key(&storage_name));
+            array.insert(key, value);
+            continue;
+        }
+
+        let visible = property.as_ref().is_none_or(|resolved| {
+            class_member_visible(
+                compiled,
+                scope.as_deref(),
+                resolved.class,
+                resolved.property.flags.is_private,
+                resolved.property.flags.is_protected,
+            )
+        });
+        if visible {
+            let name = property
+                .as_ref()
+                .map(|resolved| resolved.property.name.as_str())
+                .unwrap_or(storage_name.as_str());
+            array.insert(php_string_key(name), value);
+        }
+    }
+
+    array
+}
+
+fn private_storage_parts(storage_name: &str) -> Option<(String, String)> {
+    storage_name
+        .strip_prefix("private:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(class, property)| (class.to_owned(), property.to_owned()))
+}
+
+fn class_display_name(compiled: &CompiledUnit, normalized_class: &str) -> Option<String> {
+    compiled
+        .unit()
+        .classes
+        .iter()
+        .find(|class| normalize_class_name(&class.name) == normalized_class)
+        .map(|class| class.display_name.clone())
+}
+
+fn method_display_name(
+    compiled: &CompiledUnit,
+    method: &php_ir::module::ClassMethodEntry,
+) -> String {
+    compiled
+        .unit()
+        .functions
+        .get(method.function.index())
+        .and_then(|function| {
+            function
+                .name
+                .split_once("::")
+                .map(|(_, name)| name.to_owned())
+        })
+        .unwrap_or_else(|| method.name.clone())
+}
+
+fn visible_class_methods(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+) -> Vec<String> {
+    let scope = current_scope_class(compiled, stack);
+    let mut methods = Vec::new();
+    let mut seen = BTreeSet::new();
+    for class in class_hierarchy(compiled, state, class) {
+        for method in &class.methods {
+            let normalized = normalize_method_name(&method.name);
+            if seen.contains(&normalized) {
+                continue;
+            }
+            seen.insert(normalized);
+            if class_member_visible(
+                compiled,
+                scope.as_deref(),
+                &class,
+                method.flags.is_private,
+                method.flags.is_protected,
+            ) {
+                methods.push(method_display_name(compiled, method));
+            }
+        }
+    }
+    methods
+}
+
+fn visible_class_vars(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+) -> PhpArray {
+    let scope = current_scope_class(compiled, stack);
+    let mut array = PhpArray::new();
+    let mut classes = class_hierarchy(compiled, state, class);
+    classes.reverse();
+    for class in classes {
+        for property in &class.properties {
+            if class_member_visible(
+                compiled,
+                scope.as_deref(),
+                &class,
+                property.flags.is_private,
+                property.flags.is_protected,
+            ) {
+                let value = static_property_default(compiled.unit(), &class, property)
+                    .unwrap_or(Value::Uninitialized);
+                array.insert(php_string_key(&property.name), value);
+            }
+        }
+    }
+    array
+}
+
+fn class_hierarchy(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+) -> Vec<php_ir::module::ClassEntry> {
+    let mut classes = Vec::new();
+    let mut current = Some(class.clone());
+    let mut seen = BTreeSet::new();
+    while let Some(class) = current {
+        let normalized = normalize_class_name(&class.name);
+        if !seen.insert(normalized) {
+            break;
+        }
+        current = class
+            .parent
+            .as_deref()
+            .and_then(|parent| lookup_class_in_state(compiled, state, parent));
+        classes.push(class);
+    }
+    classes
+}
+
+fn class_member_visible(
+    compiled: &CompiledUnit,
+    scope: Option<&str>,
+    declaring_class: &php_ir::module::ClassEntry,
+    is_private: bool,
+    is_protected: bool,
+) -> bool {
+    if is_private {
+        return scope.is_some_and(|scope| {
+            normalize_class_name(scope) == normalize_class_name(&declaring_class.name)
+        });
+    }
+    if is_protected {
+        return scope.is_some_and(|scope| {
+            class_is_or_extends(compiled, scope, &declaring_class.name).unwrap_or(false)
+        });
+    }
+    true
+}
+
+fn call_args_from_php_array(array: PhpArray) -> Vec<CallArgument> {
+    array
+        .iter()
+        .map(|(key, value)| {
+            let mut arg = CallArgument::positional(value.clone());
+            if let ArrayKey::String(name) = key {
+                arg.name = Some(name.to_string_lossy());
+            }
+            arg
+        })
+        .collect()
+}
+
+fn class_name_from_object_or_string(value: &Value) -> Result<String, String> {
+    if let Some(object) = object_from_value(value) {
+        return Ok(object.class_name());
+    }
+    to_string(value).map(|name| name.to_string_lossy())
+}
+
+fn lookup_method_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    method: &str,
+) -> Result<Option<php_ir::module::ClassMethodEntry>, String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Ok(None);
+    };
+    lookup_method_in_state_inner(compiled, state, &class, method, &mut Vec::new())
+}
+
+fn lookup_method_in_state_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    method: &str,
+    seen: &mut Vec<String>,
+) -> Result<Option<php_ir::module::ClassMethodEntry>, String> {
+    let class_name = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &class_name) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(class_name);
+    let normalized = normalize_method_name(method);
+    if let Some(method) = class
+        .methods
+        .iter()
+        .find(|entry| normalize_method_name(&entry.name) == normalized)
+    {
+        seen.pop();
+        return Ok(Some(method.clone()));
+    }
+    if let Some(parent) = class
+        .parent
+        .as_deref()
+        .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+    {
+        let resolved = lookup_method_in_state_inner(compiled, state, &parent, method, seen)?;
+        seen.pop();
+        return Ok(resolved);
+    }
+    seen.pop();
+    Ok(None)
+}
+
+fn lookup_property_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    property: &str,
+) -> Result<Option<php_ir::module::ClassPropertyEntry>, String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Ok(None);
+    };
+    lookup_property_in_state_inner(compiled, state, &class, property, &mut Vec::new())
+}
+
+fn lookup_property_in_state_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    property: &str,
+    seen: &mut Vec<String>,
+) -> Result<Option<php_ir::module::ClassPropertyEntry>, String> {
+    let class_name = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &class_name) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(class_name);
+    if let Some(property) = class.properties.iter().find(|entry| entry.name == property) {
+        seen.pop();
+        return Ok(Some(property.clone()));
+    }
+    if let Some(parent) = class
+        .parent
+        .as_deref()
+        .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+    {
+        let resolved = lookup_property_in_state_inner(compiled, state, &parent, property, seen)?;
+        seen.pop();
+        return Ok(resolved);
+    }
+    seen.pop();
+    Ok(None)
+}
+
+fn class_is_subclass_of_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    target_name: &str,
+) -> Result<bool, String> {
+    let class_name = normalize_class_name(class_name);
+    let target_name = normalize_class_name(target_name);
+    if class_name == target_name {
+        return Ok(false);
+    }
+    class_extends_in_state(compiled, state, &class_name, &target_name, &mut Vec::new())?
+        .then_some(true)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            class_implements_in_state(compiled, state, &class_name, &target_name, &mut Vec::new())
+        })
+}
+
+fn class_extends_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    target_name: &str,
+    seen: &mut Vec<String>,
+) -> Result<bool, String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Ok(false);
+    };
+    let current = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &current) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(current);
+    let Some(parent) = class.parent.as_deref() else {
+        seen.pop();
+        return Ok(false);
+    };
+    let parent = normalize_class_name(parent);
+    if parent == target_name {
+        seen.pop();
+        return Ok(true);
+    }
+    let result = class_extends_in_state(compiled, state, &parent, target_name, seen)?;
+    seen.pop();
+    Ok(result)
+}
+
+fn class_implements_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    target_name: &str,
+    seen: &mut Vec<String>,
+) -> Result<bool, String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Ok(false);
+    };
+    let current = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &current) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(current);
+    for interface in &class.interfaces {
+        let interface = normalize_class_name(interface);
+        if interface == target_name
+            || interface_extends_in_state(
+                compiled,
+                state,
+                &interface,
+                target_name,
+                &mut Vec::new(),
+            )?
+        {
+            seen.pop();
+            return Ok(true);
+        }
+    }
+    if let Some(parent) = class.parent.as_deref()
+        && class_implements_in_state(compiled, state, parent, target_name, seen)?
+    {
+        seen.pop();
+        return Ok(true);
+    }
+    seen.pop();
+    Ok(false)
+}
+
+fn interface_extends_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    interface_name: &str,
+    target_name: &str,
+    seen: &mut Vec<String>,
+) -> Result<bool, String> {
+    let interface_name = normalize_class_name(interface_name);
+    if interface_name == target_name {
+        return Ok(true);
+    }
+    let Some(interface) = lookup_class_in_state(compiled, state, &interface_name) else {
+        return Ok(false);
+    };
+    if seen.iter().any(|name| name == &interface_name) {
+        return Err(format!(
+            "E_PHP_VM_INTERFACE_INHERITANCE_CYCLE: interface {} participates in an inheritance cycle",
+            interface.name
+        ));
+    }
+    seen.push(interface_name);
+    for parent in &interface.interfaces {
+        if interface_extends_in_state(compiled, state, parent, target_name, seen)? {
+            seen.pop();
+            return Ok(true);
+        }
+    }
+    seen.pop();
+    Ok(false)
+}
+
+fn declared_classes_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+) -> Vec<php_ir::module::ClassEntry> {
+    let mut seen = BTreeSet::new();
+    let mut classes = Vec::new();
+    for class in compiled
+        .unit()
+        .classes
+        .iter()
+        .chain(state.dynamic_classes.iter().map(|entry| &entry.class))
+    {
+        let normalized = normalize_class_name(&class.name);
+        if seen.insert(normalized) {
+            classes.push(class.clone());
+        }
+    }
+    classes
 }
 
 fn eval_failure(
@@ -9941,6 +17870,145 @@ fn seed_runtime_globals(globals: &mut GlobalSymbolTable, context: &RuntimeContex
             globals.set(name, value);
         }
     }
+}
+
+fn env_entries_array(entries: &[(String, String)]) -> PhpArray {
+    let mut array = PhpArray::new();
+    for (key, value) in entries {
+        array.insert(
+            ArrayKey::String(PhpString::from_test_str(key)),
+            Value::string(value.clone()),
+        );
+    }
+    array
+}
+
+fn set_env_entry(entries: &mut Vec<(String, String)>, key: String, value: Option<String>) {
+    entries.retain(|(entry_key, _)| entry_key != &key);
+    if let Some(value) = value {
+        entries.push((key, value));
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    }
+}
+
+fn php_uname_value(mode: &str) -> String {
+    match mode.chars().next().unwrap_or('a').to_ascii_lowercase() {
+        's' => "Phrust".to_string(),
+        'n' => "localhost".to_string(),
+        'r' => php_source::reference_php_version().to_string(),
+        'v' => "Phase6".to_string(),
+        'm' => "generic".to_string(),
+        _ => format!(
+            "Phrust localhost {} Phase6 generic",
+            php_source::reference_php_version()
+        ),
+    }
+}
+
+fn validate_process_arity(name: &str, argc: usize) -> Option<String> {
+    let valid = match name {
+        "proc_open" => (3..=6).contains(&argc),
+        "proc_close" | "proc_get_status" | "pclose" => argc == 1,
+        "popen" => argc == 2,
+        "shell_exec" | "system" => argc == 1,
+        "exec" => (1..=3).contains(&argc),
+        "passthru" => (1..=2).contains(&argc),
+        _ => false,
+    };
+    if valid {
+        None
+    } else {
+        Some(format!(
+            "E_PHP_VM_PROCESS_ARITY: {name} received {argc} argument(s)"
+        ))
+    }
+}
+
+fn process_disabled_result(
+    output: &OutputBuffer,
+    name: &str,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> VmResult {
+    process_warning_result(
+        output,
+        name,
+        "E_PHP_VM_PROCESS_CAPABILITY_DISABLED",
+        format!("{name}(): process execution is disabled by runtime capabilities"),
+        process_failure_value(name),
+        stack_trace,
+    )
+}
+
+fn process_unsupported_mock_result(
+    output: &OutputBuffer,
+    name: &str,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> VmResult {
+    process_warning_result(
+        output,
+        name,
+        "E_PHP_VM_PROCESS_RESOURCE_MOCK_UNSUPPORTED",
+        format!("{name}(): process resource APIs are not implemented by the Phase 6 mock"),
+        process_failure_value(name),
+        stack_trace,
+    )
+}
+
+fn process_warning_result(
+    output: &OutputBuffer,
+    _name: &str,
+    id: &'static str,
+    message: String,
+    return_value: Value,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> VmResult {
+    VmResult::success_with_diagnostics(
+        output.clone(),
+        Some(return_value),
+        vec![RuntimeDiagnostic::new(
+            id,
+            RuntimeSeverity::Warning,
+            message,
+            RuntimeSourceSpan::default(),
+            stack_trace,
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        )],
+    )
+}
+
+fn process_failure_value(name: &str) -> Value {
+    match name {
+        "shell_exec" | "passthru" => Value::Bool(false),
+        _ => Value::Bool(false),
+    }
+}
+
+fn process_output_lines_array(output: &str) -> Value {
+    Value::packed_array(
+        output
+            .lines()
+            .map(|line| Value::string(line.to_owned()))
+            .collect(),
+    )
+}
+
+fn process_last_output_line(output: &str) -> String {
+    output.lines().last().unwrap_or_default().to_owned()
+}
+
+fn assign_process_ref_arg(
+    stack: &mut CallStack,
+    arg: &CallArgument,
+    value: Value,
+) -> Result<(), String> {
+    let Some(local) = arg.by_ref_local else {
+        return Ok(());
+    };
+    let frame = stack.current_mut().ok_or_else(|| {
+        "E_PHP_VM_NO_ACTIVE_FRAME: cannot bind process reference argument".to_owned()
+    })?;
+    frame.locals.ensure_reference_cell(local)?.set(value);
+    Ok(())
 }
 
 fn bind_top_level_global_locals(
@@ -10036,24 +18104,67 @@ fn is_supported_builtin(name: &str) -> bool {
     BuiltinRegistry::new().contains(name)
 }
 
-fn execute_builtin(name: &str, args: Vec<Value>, output: &mut OutputBuffer) -> VmResult {
-    let Some(entry) = BuiltinRegistry::new().get(name) else {
-        let message = format!("E_PHP_VM_UNKNOWN_BUILTIN: builtin {name} is not implemented");
-        return VmResult::runtime_error_with_diagnostic(
-            output.clone(),
-            message.clone(),
-            RuntimeDiagnostic::new(
-                "E_PHP_VM_UNKNOWN_BUILTIN",
-                RuntimeSeverity::FatalError,
-                message,
-                RuntimeSourceSpan::default(),
-                Vec::new(),
-                None,
-            ),
-        );
-    };
-    let mut context = BuiltinContext::new(output);
-    match (entry.function())(&mut context, args, RuntimeSourceSpan::default()) {
+fn internal_function_dispatch_cacheable(name: &str) -> bool {
+    name == "count"
+        || name == "strlen"
+        || name.starts_with("is_")
+        || matches!(
+            name,
+            "array_chunk"
+                | "array_column"
+                | "array_combine"
+                | "array_count_values"
+                | "array_fill"
+                | "array_flip"
+                | "array_is_list"
+                | "array_key_exists"
+                | "array_keys"
+                | "array_merge"
+                | "array_pad"
+                | "array_pop"
+                | "array_push"
+                | "array_reverse"
+                | "array_search"
+                | "array_shift"
+                | "array_slice"
+                | "array_splice"
+                | "array_sum"
+                | "array_unshift"
+                | "array_values"
+                | "implode"
+                | "join"
+                | "lcfirst"
+                | "ltrim"
+                | "rtrim"
+                | "str_contains"
+                | "str_ends_with"
+                | "str_repeat"
+                | "str_replace"
+                | "str_starts_with"
+                | "strtolower"
+                | "strtoupper"
+                | "substr"
+                | "trim"
+        )
+}
+
+fn execute_builtin_entry(
+    entry: BuiltinEntry,
+    args: Vec<Value>,
+    output: &mut OutputBuffer,
+    runtime_context: &RuntimeContext,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
+) -> VmResult {
+    let include_path = state_include_path(state);
+    let mut context = BuiltinContext::with_runtime(
+        output,
+        runtime_context.cwd.clone(),
+        runtime_context.filesystem.clone(),
+        Some(&mut state.resources),
+    );
+    context.set_include_path(include_path);
+    match (entry.function())(&mut context, args, source_span) {
         Ok(value) => VmResult::success(context.output().clone(), Some(value)),
         Err(error) => VmResult::runtime_error_with_diagnostic(
             context.output().clone(),
@@ -10068,6 +18179,45 @@ fn execute_builtin(name: &str, args: Vec<Value>, output: &mut OutputBuffer) -> V
             ),
         ),
     }
+}
+
+fn unknown_builtin_result(name: &str, output: &OutputBuffer) -> VmResult {
+    let message = format!("E_PHP_VM_UNKNOWN_BUILTIN: builtin {name} is not implemented");
+    VmResult::runtime_error_with_diagnostic(
+        output.clone(),
+        message.clone(),
+        RuntimeDiagnostic::new(
+            "E_PHP_VM_UNKNOWN_BUILTIN",
+            RuntimeSeverity::FatalError,
+            message,
+            RuntimeSourceSpan::default(),
+            Vec::new(),
+            None,
+        ),
+    )
+}
+
+fn builtin_source_span(compiled: &CompiledUnit) -> RuntimeSourceSpan {
+    RuntimeSourceSpan {
+        file: compiled.unit().files.first().map(|file| file.path.clone()),
+        start: 0,
+        end: 0,
+    }
+}
+
+fn builtin_error_throwable(result: &VmResult) -> Option<Value> {
+    let diagnostic = result.diagnostics.first()?;
+    let class_name = match diagnostic.id() {
+        "E_PHP_RUNTIME_BUILTIN_TYPE" => "TypeError",
+        "E_PHP_RUNTIME_BUILTIN_VALUE" => "ValueError",
+        _ => return None,
+    };
+    make_exception_object(
+        class_name,
+        &Value::string(diagnostic.message().as_bytes().to_vec()),
+    )
+    .ok()
+    .map(Value::Object)
 }
 
 impl Default for Vm {
@@ -10259,6 +18409,21 @@ struct VariadicTailArg {
     value: Value,
 }
 
+#[derive(Clone, Copy)]
+struct TypecheckFastPathContext<'a> {
+    enabled: bool,
+    counters: Option<&'a RefCell<Option<VmCounters>>>,
+}
+
+impl TypecheckFastPathContext<'_> {
+    fn disabled(self) -> Self {
+        Self {
+            enabled: false,
+            counters: self.counters,
+        }
+    }
+}
+
 fn variadic_array(args: Vec<VariadicTailArg>) -> Value {
     let mut array = PhpArray::new();
     for arg in args {
@@ -10278,13 +18443,22 @@ fn coerce_or_check_param_type(
     param: &IrParam,
     value: &mut Value,
     by_ref_arg: bool,
+    typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<(), String> {
-    if param.variadic {
-        return Ok(());
-    }
     let Some(runtime_type) = ir_runtime_type(param.type_.as_ref()) else {
         return Ok(());
     };
+    if param.variadic {
+        return coerce_or_check_variadic_param_type(
+            compiled,
+            unit,
+            function,
+            param,
+            value,
+            &runtime_type,
+            typecheck,
+        );
+    }
     if !unit.strict_types
         && !by_ref_arg
         && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type)
@@ -10292,7 +18466,7 @@ fn coerce_or_check_param_type(
         *value = coerced;
         return Ok(());
     }
-    if vm_value_matches_runtime_type(compiled, value, &runtime_type)? {
+    if vm_value_matches_runtime_type(compiled, value, &runtime_type, typecheck)? {
         Ok(())
     } else {
         Err(format!(
@@ -10303,6 +18477,43 @@ fn coerce_or_check_param_type(
             runtime_type_name(&runtime_type)
         ))
     }
+}
+
+fn coerce_or_check_variadic_param_type(
+    compiled: &CompiledUnit,
+    unit: &IrUnit,
+    function: &IrFunction,
+    param: &IrParam,
+    value: &mut Value,
+    runtime_type: &RuntimeType,
+    typecheck: TypecheckFastPathContext<'_>,
+) -> Result<(), String> {
+    let Value::Array(array) = value else {
+        return Ok(());
+    };
+    let entries = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    for (key, mut element) in entries {
+        if !unit.strict_types
+            && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
+        {
+            element = coerced;
+        } else if !vm_value_matches_runtime_type(compiled, &element, runtime_type, typecheck)? {
+            return Err(format!(
+                "E_PHP_VM_PARAM_TYPE_MISMATCH: function {} argument ${} got {}, expected {}",
+                function.name,
+                param.name,
+                value_type_name(&element),
+                runtime_type_name(runtime_type)
+            ));
+        }
+        if let Some(slot) = array.get_mut(&key) {
+            *slot = element;
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_closure_captures(
@@ -10392,6 +18603,7 @@ fn check_return_type(
     compiled: &CompiledUnit,
     function: &IrFunction,
     value: Option<&Value>,
+    typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<(), String> {
     let Some(return_type) = ir_runtime_type(function.return_type.as_ref()) else {
         return Ok(());
@@ -10407,7 +18619,7 @@ fn check_return_type(
         };
     };
     let value = value.unwrap_or(&Value::Null);
-    if vm_value_matches_runtime_type(compiled, value, &return_type)? {
+    if vm_value_matches_runtime_type(compiled, value, &return_type, typecheck)? {
         Ok(())
     } else {
         Err(format!(
@@ -10425,11 +18637,12 @@ fn check_property_type(
     property: &str,
     runtime_type: &Option<RuntimeType>,
     value: &Value,
+    typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<(), String> {
     let Some(runtime_type) = runtime_type else {
         return Ok(());
     };
-    if vm_value_matches_runtime_type(compiled, value, runtime_type)? {
+    if vm_value_matches_runtime_type(compiled, value, runtime_type, typecheck)? {
         Ok(())
     } else {
         Err(format!(
@@ -10444,18 +18657,28 @@ fn vm_value_matches_runtime_type(
     compiled: &CompiledUnit,
     value: &Value,
     runtime_type: &RuntimeType,
+    typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<bool, String> {
     if let Value::Reference(cell) = value {
-        return vm_value_matches_runtime_type(compiled, &cell.get(), runtime_type);
+        return vm_value_matches_runtime_type(compiled, &cell.get(), runtime_type, typecheck);
     }
+    if typecheck.enabled {
+        if typecheck_fast_path_match(value, runtime_type) {
+            record_typecheck_fast_path(typecheck, true);
+            return Ok(true);
+        }
+        record_typecheck_fast_path(typecheck, false);
+    }
+    let fallback_typecheck = typecheck.disabled();
     Ok(match runtime_type {
         RuntimeType::Class { name } => object_instanceof(compiled, value, name)?,
         RuntimeType::Nullable { inner } => {
-            matches!(value, Value::Null) || vm_value_matches_runtime_type(compiled, value, inner)?
+            matches!(value, Value::Null)
+                || vm_value_matches_runtime_type(compiled, value, inner, fallback_typecheck)?
         }
         RuntimeType::Union { members } => {
             for member in members {
-                if vm_value_matches_runtime_type(compiled, value, member)? {
+                if vm_value_matches_runtime_type(compiled, value, member, fallback_typecheck)? {
                     return Ok(true);
                 }
             }
@@ -10463,7 +18686,7 @@ fn vm_value_matches_runtime_type(
         }
         RuntimeType::Intersection { members } => {
             for member in members {
-                if !vm_value_matches_runtime_type(compiled, value, member)? {
+                if !vm_value_matches_runtime_type(compiled, value, member, fallback_typecheck)? {
                     return Ok(false);
                 }
             }
@@ -10471,7 +18694,7 @@ fn vm_value_matches_runtime_type(
         }
         RuntimeType::Dnf { clauses } => {
             for clause in clauses {
-                if vm_value_matches_runtime_type(compiled, value, clause)? {
+                if vm_value_matches_runtime_type(compiled, value, clause, fallback_typecheck)? {
                     return Ok(true);
                 }
             }
@@ -10479,6 +18702,47 @@ fn vm_value_matches_runtime_type(
         }
         _ => value_matches_runtime_type(value, runtime_type),
     })
+}
+
+fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool {
+    match runtime_type {
+        RuntimeType::Bool => matches!(value, Value::Bool(_)),
+        RuntimeType::Int => matches!(value, Value::Int(_)),
+        RuntimeType::Float => matches!(value, Value::Float(_) | Value::Int(_)),
+        RuntimeType::String => matches!(value, Value::String(_)),
+        RuntimeType::Array => matches!(value, Value::Array(_)),
+        RuntimeType::Callable => matches!(value, Value::Callable(_)),
+        RuntimeType::Object => {
+            matches!(
+                value,
+                Value::Object(_) | Value::Fiber(_) | Value::Generator(_)
+            )
+        }
+        RuntimeType::Class { name } => {
+            matches!(
+                value,
+                Value::Object(object) if object.class_name().eq_ignore_ascii_case(name)
+            ) || matches!(
+                value,
+                Value::Fiber(_) if name.eq_ignore_ascii_case("Fiber")
+            ) || matches!(
+                value,
+                Value::Generator(_) if name.eq_ignore_ascii_case("Generator")
+            )
+        }
+        RuntimeType::Nullable { inner } => {
+            matches!(value, Value::Null) || typecheck_fast_path_match(value, inner)
+        }
+        _ => false,
+    }
+}
+
+fn record_typecheck_fast_path(typecheck: TypecheckFastPathContext<'_>, hit: bool) {
+    if let Some(counters) = typecheck.counters
+        && let Some(counters) = counters.borrow_mut().as_mut()
+    {
+        counters.record_typecheck_fast_path(hit);
+    }
 }
 
 fn ir_runtime_type(return_type: Option<&IrReturnType>) -> Option<RuntimeType> {
@@ -10587,6 +18851,11 @@ fn fetch_dim_value(array: &Value, key: &ArrayKey) -> Result<Option<Value>, Strin
     if let Value::Reference(cell) = array {
         return fetch_dim_value(&cell.get(), key);
     }
+    if let Value::Object(object) = array
+        && is_spl_container_runtime_class(&object.class_name())
+    {
+        return spl_container_offset_get(object, &array_key_to_value(key.clone())).map(Some);
+    }
     let Value::Array(array) = array else {
         return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
     };
@@ -10628,6 +18897,19 @@ fn read_dim_operands(
 
 fn read_local_value(stack: &CallStack, local: LocalId) -> Option<Value> {
     stack.current()?.locals.get(local)
+}
+
+fn local_slot_is_in_bounds(stack: &CallStack, local: LocalId) -> bool {
+    stack
+        .current()
+        .is_some_and(|frame| frame.locals.contains(local))
+}
+
+fn local_array_is_packed_fast(stack: &CallStack, local: LocalId) -> bool {
+    let Some(value) = read_local_value(stack, local) else {
+        return false;
+    };
+    matches!(effective_value(&value), Value::Array(array) if array.is_packed_fast())
 }
 
 fn foreach_array_keys_from_local(
@@ -10750,6 +19032,202 @@ fn call_args_to_positional(function: &str, args: Vec<CallArgument>) -> Result<Ve
     Ok(values)
 }
 
+fn is_array_callback_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "array_map"
+            | "array_filter"
+            | "array_reduce"
+            | "array_walk"
+            | "array_any"
+            | "array_all"
+            | "array_find"
+            | "array_find_key"
+    )
+}
+
+fn is_array_sort_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "sort"
+            | "rsort"
+            | "asort"
+            | "arsort"
+            | "ksort"
+            | "krsort"
+            | "usort"
+            | "uasort"
+            | "uksort"
+            | "natsort"
+            | "natcasesort"
+    )
+}
+
+fn array_callback_entries(
+    function: &str,
+    value: &Value,
+) -> Result<Vec<(ArrayKey, Value)>, ArrayCallbackError> {
+    match callable_resolve_reference(value.clone()) {
+        Value::Array(array) => Ok(array
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()),
+        other => Err(ArrayCallbackError::Message(format!(
+            "E_PHP_VM_BUILTIN_TYPE: {function} expects array, {} given",
+            value_type_name(&other)
+        ))),
+    }
+}
+
+fn array_callback_key_value(key: &ArrayKey) -> Value {
+    match key {
+        ArrayKey::Int(index) => Value::Int(*index),
+        ArrayKey::String(value) => Value::String(value.clone()),
+    }
+}
+
+fn sort_reference_cell(
+    function: &str,
+    arg: CallArgument,
+    stack: &mut CallStack,
+) -> Result<ReferenceCell, ArrayCallbackError> {
+    if let Some(local) = arg.by_ref_local {
+        let frame = stack.current_mut().ok_or_else(|| {
+            ArrayCallbackError::Message(
+                "E_PHP_VM_NO_ACTIVE_FRAME: cannot bind sort reference argument".to_owned(),
+            )
+        })?;
+        return frame
+            .locals
+            .ensure_reference_cell(local)
+            .map_err(ArrayCallbackError::Message);
+    }
+    match arg.value {
+        Value::Reference(cell) => Ok(cell),
+        other => Err(ArrayCallbackError::Message(format!(
+            "E_PHP_VM_SORT_BY_REF_ARG: {function} argument #1 must be a mutable array variable, {} given",
+            value_type_name(&other)
+        ))),
+    }
+}
+
+fn sort_entries_stable<F>(
+    entries: &mut [(ArrayKey, Value)],
+    mut compare_entries: F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    for index in 1..entries.len() {
+        let mut current = index;
+        while current > 0 && compare_entries(&entries[current - 1], &entries[current])?.is_gt() {
+            entries.swap(current - 1, current);
+            current -= 1;
+        }
+    }
+    Ok(())
+}
+
+fn natural_compare_values(
+    left: &Value,
+    right: &Value,
+    case_insensitive: bool,
+) -> std::cmp::Ordering {
+    let left = sort_string_value(left, case_insensitive);
+    let right = sort_string_value(right, case_insensitive);
+    natural_compare_bytes(left.as_bytes(), right.as_bytes())
+}
+
+fn sort_string_value(value: &Value, case_insensitive: bool) -> String {
+    let text = match to_string(value) {
+        Ok(value) => value.to_string_lossy(),
+        Err(_) => format!("{value:?}"),
+    };
+    if case_insensitive {
+        text.to_ascii_lowercase()
+    } else {
+        text
+    }
+}
+
+fn natural_compare_bytes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() && right_index < right.len() {
+        let left_byte = left[left_index];
+        let right_byte = right[right_index];
+        if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+            let left_start = left_index;
+            let right_start = right_index;
+            while left_index < left.len() && left[left_index].is_ascii_digit() {
+                left_index += 1;
+            }
+            while right_index < right.len() && right[right_index].is_ascii_digit() {
+                right_index += 1;
+            }
+            let left_digits = trim_leading_ascii_zeroes(&left[left_start..left_index]);
+            let right_digits = trim_leading_ascii_zeroes(&right[right_start..right_index]);
+            let len_order = left_digits.len().cmp(&right_digits.len());
+            if !len_order.is_eq() {
+                return len_order;
+            }
+            let digit_order = left_digits.cmp(right_digits);
+            if !digit_order.is_eq() {
+                return digit_order;
+            }
+            continue;
+        }
+        let order = left_byte.cmp(&right_byte);
+        if !order.is_eq() {
+            return order;
+        }
+        left_index += 1;
+        right_index += 1;
+    }
+    left.len().cmp(&right.len())
+}
+
+fn trim_leading_ascii_zeroes(bytes: &[u8]) -> &[u8] {
+    let trimmed = bytes
+        .iter()
+        .position(|byte| *byte != b'0')
+        .unwrap_or(bytes.len());
+    &bytes[trimmed..]
+}
+
+fn call_builtin_args_to_positional(
+    function: &str,
+    args: Vec<CallArgument>,
+    stack: &mut CallStack,
+) -> Result<Vec<Value>, String> {
+    let mut values = Vec::with_capacity(args.len());
+    for (index, arg) in args.into_iter().enumerate() {
+        if let Some(name) = arg.name {
+            return Err(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${name}"
+            ));
+        }
+        let bind_by_ref = (function == "str_replace" && index == 3)
+            || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
+            || (matches!(
+                function,
+                "array_pop" | "array_push" | "array_shift" | "array_splice" | "array_unshift"
+            ) && index == 0);
+        if bind_by_ref && let Some(local) = arg.by_ref_local {
+            let frame = stack.current_mut().ok_or_else(|| {
+                "E_PHP_VM_NO_ACTIVE_FRAME: cannot bind builtin reference argument".to_owned()
+            })?;
+            values.push(Value::Reference(frame.locals.ensure_reference_cell(local)?));
+            continue;
+        }
+        values.push(arg.value);
+    }
+    Ok(values)
+}
+
 fn assign_dim_local(
     stack: &mut CallStack,
     local: LocalId,
@@ -10815,6 +19293,26 @@ fn assign_dim_value(
         let mut current = cell.get();
         assign_dim_value(&mut current, dims, value, append)?;
         cell.set(current);
+        return Ok(());
+    }
+    if let Value::Object(object) = container
+        && is_spl_container_runtime_class(&object.class_name())
+    {
+        if dims.len() > 1 {
+            return Err(
+                "E_PHP_VM_SPL_CONTAINER_NESTED_DIM: nested ArrayAccess writes are not implemented"
+                    .to_owned(),
+            );
+        }
+        let key = if append {
+            Value::Null
+        } else {
+            let Some(key) = dims.first() else {
+                return Err("E_PHP_VM_ARRAY_ASSIGN_DIM: missing array dimension".to_owned());
+            };
+            array_key_to_value(key.clone())
+        };
+        spl_container_offset_set(object, key, value)?;
         return Ok(());
     }
     let Value::Array(array) = container else {
@@ -11002,6 +19500,13 @@ fn unset_dim_value(container: &mut Value, dims: &[ArrayKey]) {
     let Some((first, rest)) = dims.split_first() else {
         return;
     };
+    if let Value::Object(object) = container
+        && is_spl_container_runtime_class(&object.class_name())
+        && rest.is_empty()
+    {
+        let _ = spl_container_offset_unset(object, &array_key_to_value(first.clone()));
+        return;
+    }
     let Value::Array(array) = container else {
         return;
     };
@@ -11026,7 +19531,11 @@ fn php_empty(value: &Value) -> Result<bool, String> {
         }
         Value::String(value) => Ok(value.is_empty() || value.as_bytes() == b"0"),
         Value::Array(array) => Ok(array.is_empty()),
-        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_) => Ok(false),
+        Value::Object(_)
+        | Value::Resource(_)
+        | Value::Fiber(_)
+        | Value::Generator(_)
+        | Value::Callable(_) => Ok(false),
     }
 }
 
@@ -11318,6 +19827,520 @@ mod tests {
     }
 
     #[test]
+    fn symbol_introspection_core_functions_use_runtime_symbols() {
+        let result = execute_source(
+            "<?php
+            const LOCAL_CONST = 41;
+            function local_fn() {}
+            interface I {}
+            class A { public $x; public function m() {} }
+            class B extends A implements I {}
+            enum E { case One; }
+            $b = new B();
+            $b->dyn = 1;
+            echo defined('LOCAL_CONST') ? 'D' : 'd';
+            echo '|', constant('LOCAL_CONST');
+            echo '|', function_exists('LOCAL_FN') ? 'F' : 'f';
+            echo '|', class_exists('b', false) ? 'C' : 'c';
+            echo '|', interface_exists('i', false) ? 'I' : 'i';
+            echo '|', enum_exists('e', false) ? 'E' : 'e';
+            echo '|', method_exists('B', 'M') ? 'M' : 'm';
+            echo '|', property_exists('B', 'x') ? 'P' : 'p';
+            echo '|', property_exists($b, 'dyn') ? 'Y' : 'y';
+            echo '|', is_subclass_of('B', 'A') ? 'S' : 's';
+            echo '|', is_subclass_of('B', 'A', false) ? 'bad' : 'N';
+            echo '|', get_class($b);
+            echo '|', get_parent_class('B');
+            echo '|', in_array('B', get_declared_classes(), true) ? 'DC' : 'dc';
+            echo '|', in_array('I', get_declared_interfaces(), true) ? 'DI' : 'di';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "D|41|F|C|I|E|M|P|Y|S|N|B|A|DC|DI"
+        );
+    }
+
+    #[test]
+    fn object_and_class_handling_functions_respect_visibility() {
+        let result = execute_source(
+            "<?php
+            class Box {
+                public $pub = 'P';
+                protected $prot = 'R';
+                private $priv = 'V';
+                public function objectVars() {
+                    $vars = get_object_vars($this);
+                    return $vars['pub'] . $vars['prot'] . $vars['priv'];
+                }
+                public function mangledVars() {
+                    $vars = get_mangled_object_vars($this);
+                    return $vars[\"\0*\0prot\"] . $vars[\"\0Box\0priv\"];
+                }
+                public static function classVars() {
+                    $vars = get_class_vars('Box');
+                    return $vars['pub'] . $vars['prot'] . $vars['priv'];
+                }
+                public function hidden() { return 'hidden'; }
+                protected function protMethod() {}
+                private function privMethod() {}
+            }
+            $box = new Box();
+            $outside = get_object_vars($box);
+            $methods = get_class_methods('Box');
+            $classVars = get_class_vars('Box');
+            echo $outside['pub'];
+            echo '|', array_key_exists('prot', $outside) ? 'bad' : 'no-prot';
+            echo '|', $box->objectVars();
+            echo '|', $box->mangledVars();
+            echo '|', Box::classVars();
+            echo '|', in_array('hidden', $methods, true) ? 'method' : 'missing';
+            echo '|', in_array('protMethod', $methods, true) ? 'bad' : 'no-prot-method';
+            echo '|', array_key_exists('priv', $classVars) ? 'bad' : 'no-priv-var';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "P|no-prot|PRV|RV|PRV|method|no-prot-method|no-priv-var"
+        );
+    }
+
+    #[test]
+    fn callable_and_function_context_builtins_use_vm_call_path() {
+        let result = execute_source(
+            "<?php
+            function join_args($a, $b = 'D') {
+                return $a . $b . ':' . func_num_args() . ':' . func_get_arg(0) . ':' . count(func_get_args());
+            }
+            function named_args($a, $b) { return $a . $b; }
+            class CallTarget {
+                public static function target($value) { return 'S' . $value; }
+                public static function forward($value) {
+                    return forward_static_call(['CallTarget', 'target'], $value);
+                }
+            }
+            echo call_user_func('join_args', 'A', 'B');
+            echo '|', call_user_func_array('named_args', ['b' => 'B', 'a' => 'A']);
+            echo '|', call_user_func(['CallTarget', 'target'], 'X');
+            echo '|', CallTarget::forward('Y');
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "AB:2:A:2|AB|SX|SY");
+    }
+
+    #[test]
+    fn symbol_introspection_respects_autoload_flag() {
+        let result = execute_source(
+            "<?php
+            function mark_symbol($name) { echo 'autoload:', $name, '|'; }
+            spl_autoload_register('mark_symbol');
+            echo class_exists('MissingSymbol', false) ? 'T' : 'F';
+            echo '|';
+            echo class_exists('MissingSymbol', true) ? 'T' : 'F';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "F|autoload:MissingSymbol|F"
+        );
+    }
+
+    #[test]
+    fn spl_autoload_stack_preserves_order_lists_and_unregisters_callbacks() {
+        let result = execute_source(
+            "<?php
+            function first_loader($name) { echo 'first:', $name, '|'; }
+            function second_loader($name) { echo 'second:', $name, '|'; }
+            spl_autoload_register('first_loader');
+            spl_autoload_register('second_loader');
+            echo count(spl_autoload_functions()), '|';
+            spl_autoload_call('MissingClass');
+            echo '|';
+            echo spl_autoload_unregister('first_loader') ? 'removed' : 'missing';
+            echo '|', count(spl_autoload_functions()), '|';
+            spl_autoload_call('OtherClass');
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "2|first:MissingClass|second:MissingClass||removed|1|second:OtherClass|"
+        );
+    }
+
+    #[test]
+    fn ini_config_builtins_use_request_local_registry() {
+        let result = execute_source(
+            "<?php
+            echo ini_get('default_charset'), \"\\n\";
+            echo ini_get('missing.option') === false ? \"missing\\n\" : \"bad\\n\";
+            echo ini_set('memory_limit', '64M'), \"\\n\";
+            echo ini_get('memory_limit'), \"\\n\";
+            echo get_cfg_var('memory_limit'), \"\\n\";
+            $flat = ini_get_all(null, false);
+            echo $flat['memory_limit'], \"\\n\";
+            $details = ini_get_all();
+            echo $details['memory_limit']['global_value'], '|',
+                 $details['memory_limit']['local_value'], '|',
+                 $details['memory_limit']['access'], \"\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "UTF-8\nmissing\n128M\n64M\n128M\n64M\n128M|64M|7\n"
+        );
+    }
+
+    #[test]
+    fn error_handling_builtins_use_request_local_handler_stack() {
+        let result = execute_source(
+            "<?php
+            function first($errno, $errstr, $errfile, $errline) { echo 'first:', $errno, ':', $errstr, \"\\n\"; return true; }
+            function second($errno, $errstr, $errfile, $errline) { echo 'second:', $errno, ':', $errstr, \"\\n\"; return true; }
+            echo set_error_handler('first') === null ? \"first-null\\n\" : \"bad\\n\";
+            set_error_handler('second');
+            echo \"second-set\\n\";
+            trigger_error('top', E_USER_WARNING);
+            restore_error_handler();
+            user_error('restored', E_USER_WARNING);
+            restore_error_handler();
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "first-null\nsecond-set\nsecond:512:top\nfirst:512:restored\n"
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn trigger_error_respects_handler_return_reporting_and_display() {
+        let result = execute_source(
+            "<?php
+            function unhandled($errno, $errstr, $errfile, $errline) { echo 'handler:', $errstr, \"\\n\"; return false; }
+            set_error_handler('unhandled', E_USER_WARNING);
+            ini_set('display_errors', '0');
+            trigger_error('hidden', E_USER_WARNING);
+            error_reporting(0);
+            trigger_error('masked', E_USER_WARNING);
+            echo 'done', \"\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "handler:hidden\ndone\n");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_USER_WARNING");
+    }
+
+    #[test]
+    fn exception_handler_stack_tracks_previous_handlers() {
+        let result = execute_source(
+            "<?php
+            function ex1($e) {}
+            function ex2($e) {}
+            echo set_exception_handler('ex1') === null ? \"first\\n\" : \"bad\\n\";
+            set_exception_handler('ex2');
+            echo \"second\\n\";
+            echo restore_exception_handler() ? \"restore1\\n\" : \"bad\\n\";
+            echo restore_exception_handler() ? \"restore2\\n\" : \"bad\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "first\nsecond\nrestore1\nrestore2\n"
+        );
+    }
+
+    #[test]
+    fn uncaught_exceptions_call_registered_exception_handler() {
+        let result = execute_source(
+            "<?php
+            function on_exception($e) { echo 'handled:', $e->getMessage(); }
+            set_exception_handler('on_exception');
+            throw new Exception('boom');
+            echo 'after';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "handled:boom");
+    }
+
+    #[test]
+    fn fatal_user_errors_are_not_recovered_by_error_handler() {
+        let result = execute_source(
+            "<?php
+            function swallow($errno, $errstr, $errfile, $errline) { echo 'handler'; return true; }
+            set_error_handler('swallow');
+            trigger_error('fatal', E_USER_ERROR);
+            echo 'after';
+            ",
+        );
+
+        assert!(!result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "");
+        assert!(
+            result
+                .status
+                .message()
+                .is_some_and(|message| message.contains("E_PHP_VM_USER_ERROR"))
+        );
+    }
+
+    #[test]
+    fn direct_builtin_type_and_value_errors_are_catchable_throwables() {
+        let result = execute_source(
+            "<?php
+            try { strlen([]); } catch (TypeError $e) { echo 'type'; }
+            echo '|';
+            try { explode('', 'abc'); } catch (ValueError $e) { echo 'value'; }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "type|value");
+    }
+
+    #[test]
+    fn output_buffering_builtins_support_nested_clean_and_flush() {
+        let result = execute_source(
+            "<?php
+            echo 'root|';
+            ob_start();
+            echo 'a';
+            ob_start();
+            echo 'b';
+            $level = ob_get_level();
+            $inner_length = ob_get_length();
+            $contents = ob_get_contents();
+            $inner = ob_get_clean();
+            echo 'c';
+            $outer_length = ob_get_length();
+            ob_end_flush();
+            echo '|', $level, ':', $inner_length, ':', $contents, ':', $inner, ':', $outer_length;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "root|ac|2:1:b:b:2");
+    }
+
+    #[test]
+    fn output_buffers_survive_caught_exceptions() {
+        let result = execute_source(
+            "<?php
+            ob_start();
+            try {
+                echo 'before|';
+                throw new Exception('boom');
+            } catch (Exception $e) {
+                echo 'catch|';
+            }
+            echo ob_get_clean();
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "before|catch|");
+    }
+
+    #[test]
+    fn output_fast_paths_preserve_echo_print_buffering_and_report_counters() {
+        let result = execute_source_with_options(
+            "<?php
+            echo 'a', 'b', true, false, null, 7, \"\\n\";
+            echo print 'p';
+            echo \"\\n\";
+            ob_start();
+            echo 'x', 'y';
+            ob_end_flush();
+            echo \"\\n\";
+            ",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let expected = "ab17\np1\nxy\n";
+        assert_eq!(result.output.to_string_lossy(), expected);
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.output_bytes, expected.len() as u64);
+        assert!(counters.output_buffer_appends > 0, "{counters:?}");
+        assert_eq!(counters.output_buffer_flushes, 1);
+    }
+
+    #[test]
+    fn output_fast_paths_preserve_to_string_fallback_and_conversion_errors() {
+        let object = execute_source(
+            "<?php
+            class S {
+                public function __toString(): string {
+                    echo 'side|';
+                    return 'object';
+                }
+            }
+            echo new S(), '|done';
+            ",
+        );
+
+        assert!(object.status.is_success(), "{:?}", object.status);
+        assert_eq!(object.output.to_string_lossy(), "side|object|done");
+
+        let throwing = execute_source(
+            "<?php
+            class Bad {
+                public function __toString(): string {
+                    throw new Exception('boom');
+                }
+            }
+            echo 'before|';
+            echo new Bad();
+            echo 'after';
+            ",
+        );
+
+        assert!(!throwing.status.is_success(), "{:?}", throwing.status);
+        assert_eq!(throwing.output.to_string_lossy(), "before|");
+    }
+
+    #[test]
+    fn output_buffer_callback_gap_is_preserved_by_fast_paths() {
+        let result = execute_source("<?php ob_start('strtolower'); echo 'unreachable';");
+
+        assert!(!result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "");
+        assert!(
+            result.status.message().is_some_and(
+                |message| message.contains("E_PHP_VM_OUTPUT_BUFFER_CALLBACK_UNSUPPORTED")
+            ),
+            "{:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn environment_builtins_use_controlled_request_context() {
+        let result = execute_source_with_options(
+            "<?php
+            echo getenv('COMPOSER_HOME'), \"\\n\";
+            echo $_ENV['COMPOSER_CACHE_DIR'], \"\\n\";
+            echo isset($_SERVER['argv']) ? 'argv' : 'missing', \"\\n\";
+            echo $_SERVER['SCRIPT_NAME'], \"\\n\";
+            echo php_sapi_name(), \"\\n\";
+            echo php_uname('s'), '|', php_uname('n'), '|', php_uname('r'), \"\\n\";
+            echo php_uname(), \"\\n\";
+            echo get_current_user(), \"\\n\";
+            putenv('COMPOSER_HOME=/changed');
+            echo getenv('COMPOSER_HOME'), \"\\n\";
+            putenv('COMPOSER_HOME');
+            echo getenv('COMPOSER_HOME') === false ? 'unset' : 'bad', \"\\n\";
+            ",
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli(
+                    "/tmp/controlled.php",
+                    vec!["arg".to_string()],
+                )
+                .with_env(vec![
+                    ("COMPOSER_HOME".to_string(), "/tmp/composer".to_string()),
+                    (
+                        "COMPOSER_CACHE_DIR".to_string(),
+                        "/tmp/composer-cache".to_string(),
+                    ),
+                ]),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            format!(
+                "/tmp/composer\n/tmp/composer-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Phase6 generic\nphrust\n/changed\nunset\n",
+                php_source::reference_php_version(),
+                php_source::reference_php_version()
+            )
+        );
+    }
+
+    #[test]
+    fn process_surface_is_disabled_by_default_without_crashing() {
+        let result = execute_source(
+            "<?php
+            echo function_exists('shell_exec') ? 'has-shell|' : 'missing|';
+            echo shell_exec('echo no') === false ? 'shell-disabled|' : 'bad|';
+            echo exec('echo no') === false ? 'exec-disabled|' : 'bad|';
+            echo system('echo no') === false ? 'system-disabled|' : 'bad|';
+            echo passthru('echo no') === false ? 'passthru-disabled|' : 'bad|';
+            $pipes = [];
+            echo proc_open('echo no', [], $pipes) === false ? 'proc-disabled|' : 'bad|';
+            echo popen('echo no', 'r') === false ? 'popen-disabled' : 'bad';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "has-shell|shell-disabled|exec-disabled|system-disabled|passthru-disabled|proc-disabled|popen-disabled"
+        );
+        assert_eq!(result.diagnostics.len(), 6);
+        assert!(result.diagnostics.iter().all(|diagnostic| {
+            diagnostic.id() == "E_PHP_VM_PROCESS_CAPABILITY_DISABLED"
+                && diagnostic.severity() == RuntimeSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn process_surface_can_use_isolated_mock_outputs() {
+        let result = execute_source_with_options(
+            "<?php
+            echo shell_exec('echo mock');
+            echo '|';
+            $lines = [];
+            $code = -1;
+            echo exec('echo mock', $lines, $code), '|', $lines[0], ':', $lines[1], ':', $code, '|';
+            echo system('echo mock'), '|';
+            $passthruCode = -1;
+            $pass = passthru('echo mock', $passthruCode);
+            echo '|', $pass === null ? 'pass-null' : 'bad', ':', $passthruCode, '|';
+            echo proc_get_status(false) === false ? 'proc-stub' : 'bad';
+            ",
+            VmOptions {
+                runtime_context: RuntimeContext::default().with_process_mock("alpha\nbeta\n", 7),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "alpha\nbeta\n|beta|alpha:beta:7|alpha\nbeta\nbeta|alpha\nbeta\n|pass-null:7|proc-stub"
+        );
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].id(),
+            "E_PHP_VM_PROCESS_RESOURCE_MOCK_UNSUPPORTED"
+        );
+    }
+
+    #[test]
     fn constants_execute_magic_constants_top_level_and_function() {
         let source = "<?php\nfunction f() {\n echo __FUNCTION__, \"|\", __LINE__, \"|\", __CLASS__, \"|\", __METHOD__, \"|\", __NAMESPACE__;\n}\necho __FILE__, \"|\", __DIR__, \"|\", __CLASS__, \"|\", __METHOD__, \"|\", __NAMESPACE__, \"\\n\";\nf();";
         let result = execute_source(source);
@@ -11369,6 +20392,430 @@ mod tests {
             require.diagnostics[0].severity(),
             RuntimeSeverity::FatalError
         );
+    }
+
+    #[test]
+    fn autoload_lookup_cache_preserves_composer_psr4_classmap_and_files() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate should live under workspace/crates/php_vm")
+            .canonicalize()
+            .expect("canonical workspace");
+        let vendor = workspace.join("tests/fixtures/phase6/composer/basic_project/vendor");
+        let autoload = vendor.join("autoload.php");
+        let source = format!(
+            "<?php
+            ini_set('include_path', '{}');
+            require '{}';
+            echo function_exists('phase6_basic_file_helper') ? \"files-loaded\\n\" : \"files-missing\\n\";
+            $psr = new Phase6\\Basic\\PsrGreeter();
+            echo $psr->message(), \"\\n\";
+            $mapped = new Phase6\\BasicClassmap\\MappedThing();
+            echo $mapped->label(), \"\\n\";
+            echo class_exists('Phase6\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
+            ",
+            vendor.display(),
+            autoload.display()
+        );
+        let off = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(off.output, on.output);
+        assert_eq!(
+            on.output.as_bytes(),
+            b"files-loaded\nfile-psr4\nfile-classmap\nsafe-missing\n"
+        );
+    }
+
+    #[test]
+    fn autoload_lookup_cache_keeps_files_autoload_side_effects_visible() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate should live under workspace/crates/php_vm")
+            .canonicalize()
+            .expect("canonical workspace");
+        let vendor = workspace.join("tests/fixtures/phase6/composer/basic_project/vendor");
+        let autoload = vendor.join("autoload.php");
+        let source = format!(
+            "<?php
+            ini_set('include_path', '{}');
+            include_once '{}';
+            include_once '{}';
+            echo function_exists('phase6_basic_file_helper') ? \"files-first\\n\" : \"files-missing\\n\";
+            echo phase6_basic_file_helper('order'), \"\\n\";
+            $psr = new Phase6\\Basic\\PsrGreeter();
+            echo $psr->message(), \"\\n\";
+            $mapped = new Phase6\\BasicClassmap\\MappedThing();
+            echo $mapped->label(), \"\\n\";
+            echo count(spl_autoload_functions()), \"\\n\";
+            echo class_exists('Phase6\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
+            ",
+            vendor.display(),
+            autoload.display(),
+            autoload.display()
+        );
+        let off = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(off.output, on.output);
+        assert_eq!(
+            on.output.as_bytes(),
+            b"files-first\nfile-order\nfile-psr4\nfile-classmap\n1\nsafe-missing\n"
+        );
+    }
+
+    #[test]
+    fn autoload_lookup_cache_records_hits_and_keeps_missing_autoload_side_effects() {
+        let source = "<?php
+            $autoloadCount = 0;
+            function phase7_counting_loader($class) {
+                global $autoloadCount;
+                $autoloadCount = $autoloadCount + 1;
+            }
+            spl_autoload_register('phase7_counting_loader');
+            for ($i = 0; $i < 2; $i++) {
+                if (class_exists('Phase7MissingSideEffect', true)) {
+                    echo 'bad';
+                } else {
+                    echo 'miss';
+                }
+            }
+            echo ':', $autoloadCount, \"\\n\";
+            class Phase7PositiveCache {}
+            for ($i = 0; $i < 3; $i++) {
+                if (class_exists('Phase7PositiveCache', false)) {
+                    echo 'hit';
+                } else {
+                    echo 'bad';
+                }
+            }
+            ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "missmiss:2\nhithithit");
+        let counters = result.counters.expect("counters");
+        assert!(counters.autoload_class_lookup_ic_hits > 0, "{counters:?}");
+        assert!(counters.autoload_class_lookup_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn autoload_lookup_cache_invalidates_after_spl_autoload_register() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate should live under workspace/crates/php_vm")
+            .canonicalize()
+            .expect("canonical workspace");
+        let class_file =
+            workspace.join("tests/fixtures/phase7/inline_cache/Phase7RegisteredCache.php");
+        let source = "<?php
+            function phase7_registered_exists() {
+                return class_exists('Phase7RegisteredCache', true);
+            }
+            if (phase7_registered_exists()) {
+                echo 'bad';
+            } else {
+                echo 'miss';
+            }
+            spl_autoload_register(function ($class) {
+                if (strtolower($class) === 'phase7registeredcache') {
+                    include '__CLASS_FILE__';
+                }
+            });
+            if (phase7_registered_exists()) {
+                echo ':hit';
+            } else {
+                echo ':bad';
+            }
+            "
+        .replace("__CLASS_FILE__", &class_file.to_string_lossy());
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "miss:hit");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters.autoload_class_lookup_ic_invalidations > 0,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn autoload_lookup_cache_invalidates_negative_after_new_include() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate should live under workspace/crates/php_vm")
+            .canonicalize()
+            .expect("canonical workspace");
+        let class_file =
+            workspace.join("tests/fixtures/phase7/inline_cache/Phase7IncludedCache.php");
+        let source = "<?php
+            function phase7_included_exists() {
+                return class_exists('Phase7IncludedCache', false);
+            }
+            if (phase7_included_exists()) {
+                echo 'bad';
+            } else {
+                echo 'miss';
+            }
+            include '__CLASS_FILE__';
+            if (phase7_included_exists()) {
+                echo ':hit';
+            } else {
+                echo ':bad';
+            }
+            "
+        .replace("__CLASS_FILE__", &class_file.to_string_lossy());
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "miss:hit");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters.autoload_class_lookup_ic_invalidations > 0,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn include_path_inline_cache_records_hits_and_preserves_semantics() {
+        let off = execute_fixture_file_with_options(
+            "tests/fixtures/phase7/inline_cache/include-path-cache.php",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_fixture_file_with_options(
+            "tests/fixtures/phase7/inline_cache/include-path-cache.php",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(off.output, on.output);
+        assert_eq!(on.output.as_bytes(), b"VVVOnce\n");
+        assert_eq!(
+            off.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id())
+                .collect::<Vec<_>>(),
+            on.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.id())
+                .collect::<Vec<_>>()
+        );
+        let counters = on.counters.expect("counters");
+        assert!(counters.inline_cache_include_path_slots > 0, "{counters:?}");
+        assert!(counters.include_path_ic_hits > 0, "{counters:?}");
+        assert!(counters.include_path_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn include_path_inline_cache_preserves_include_path_order() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate should live under workspace/crates/php_vm");
+        let lib_root = workspace.join("tests/fixtures/phase7/inline_cache/include-path-cache-lib");
+        let first = lib_root.join("first");
+        let second = lib_root.join("second");
+        let source = "<?php include 'chosen.php';";
+        let first_result = execute_source_with_options(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(lib_root.clone()).expect("loader")),
+                runtime_context: RuntimeContext::default()
+                    .with_include_path(vec![first.clone(), second.clone()]),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+        let second_result = execute_source_with_options(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(lib_root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_include_path(vec![second, first]),
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(
+            first_result.status.is_success(),
+            "{:?}",
+            first_result.status
+        );
+        assert!(
+            second_result.status.is_success(),
+            "{:?}",
+            second_result.status
+        );
+        assert_eq!(first_result.output.as_bytes(), b"First");
+        assert_eq!(second_result.output.as_bytes(), b"Second");
+    }
+
+    #[test]
+    fn include_path_inline_cache_preserves_missing_file_warning() {
+        let off = execute_fixture_file_with_options(
+            "fixtures/runtime/valid/includes/include-missing.php",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_fixture_file_with_options(
+            "fixtures/runtime/valid/includes/include-missing.php",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(off.output, on.output);
+        assert_eq!(off.diagnostics.len(), 1);
+        assert_eq!(on.diagnostics.len(), 1);
+        assert_eq!(off.diagnostics[0].id(), on.diagnostics[0].id());
+        assert_eq!(off.diagnostics[0].severity(), on.diagnostics[0].severity());
+    }
+
+    #[test]
+    fn include_path_inline_cache_invalidates_changed_file_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-include-path-ic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        let include_path = root.join("mutable.php");
+        std::fs::write(&include_path, "<?php echo 'A';\n").expect("write include");
+        let loader = IncludeLoader::for_root(root.clone()).expect("loader");
+        let resolved = loader
+            .resolve_with_include_path(None, &include_path.to_string_lossy(), &[], None)
+            .expect("resolve include");
+        let request = IncludePathCacheKey {
+            path: include_path.to_string_lossy().into_owned(),
+            include_path: Vec::new(),
+            cwd: root.clone(),
+            calling_file_directory: None,
+        };
+        let mut table = InlineCacheTable::default();
+        let function = FunctionId::new(0);
+        let block = BlockId::new(0);
+        let instruction = InstrId::new(0);
+        table.observe_slot(
+            23,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::IncludePath,
+        );
+        table.install_include_path(
+            23,
+            function,
+            block,
+            instruction,
+            request.clone(),
+            InvalidationEpoch::new(1),
+            IncludePathCacheTarget {
+                canonical_path: resolved.canonical_path.clone(),
+                fingerprint: resolved.fingerprint.clone(),
+            },
+        );
+        std::fs::write(&include_path, "<?php echo 'changed';\n").expect("rewrite include");
+        let (target, probe) = table.lookup_include_path(
+            23,
+            function,
+            block,
+            instruction,
+            &request,
+            InvalidationEpoch::new(1),
+        );
+        let target = target.expect("cached target");
+        let current =
+            include_path_file_fingerprint(&target.canonical_path).expect("current fingerprint");
+        let event = if current == target.fingerprint {
+            table.record_include_path_hit(23, function, block, instruction)
+        } else {
+            table.invalidate_include_path(23, function, block, instruction)
+        };
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(probe.kind, Some(InlineCacheKind::IncludePath));
+        assert!(event.invalidation);
+        assert!(event.miss);
     }
 
     #[test]
@@ -11746,6 +21193,1594 @@ mod tests {
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"trace off");
         assert!(result.trace.is_empty());
+        assert_eq!(result.counters, None);
+    }
+
+    #[test]
+    fn counters_are_opt_in_and_cover_phase7_families() {
+        let result = execute_source_with_options(
+            "<?php function f($v) { return $v . 'x'; } class C { public $p = 0; } $a = [1]; $c = new C(); $ok = $c instanceof C; echo f($a[0]), $c->p;",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1x0");
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.instructions_executed > 0);
+        assert!(counters.function_calls >= 1);
+        assert!(counters.array_dim_fetches >= 1);
+        assert!(counters.property_fetches >= 1);
+        assert!(counters.type_checks >= 1);
+        assert!(counters.string_concats >= 1);
+        assert_eq!(counters.guard_failures, 0);
+        assert_eq!(counters.cache_hits, 0);
+        assert_eq!(counters.cache_misses, 0);
+        assert!(counters.literal_intern_hits > 0);
+        assert!(counters.literal_intern_misses > 0);
+    }
+
+    #[test]
+    fn literal_pool_counters_report_repeated_literal_hits() {
+        let result = execute_source_with_options(
+            "<?php $a = 'same'; $b = 'same'; echo $a, $b, 'same';",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"samesamesame");
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.literal_intern_misses >= 1, "{counters:?}");
+        assert!(counters.literal_intern_hits >= 2, "{counters:?}");
+    }
+
+    #[test]
+    fn quickening_is_default_off_and_on_is_output_identical() {
+        let source =
+            "<?php $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $i; } echo $sum, \"\\n\";";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let off_counters = off.counters.expect("off counters");
+        let on_counters = on.counters.expect("on counters");
+        assert_eq!(off_counters.quickening_attempts, 0);
+        assert!(on_counters.quickening_attempts > 0, "{on_counters:?}");
+        assert!(on_counters.quickening_specialized > 0, "{on_counters:?}");
+        assert!(on_counters.quickening_guard_hits > 0, "{on_counters:?}");
+        assert_eq!(on_counters.quickening_guard_misses, 0);
+        assert_eq!(on_counters.quickening_guard_failures, 0);
+        assert_eq!(on_counters.quickening_dequickens, 0);
+    }
+
+    #[test]
+    fn tiering_disabled_suppresses_quickening_observations() {
+        let source =
+            "<?php $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $i; } echo $sum, \"\\n\";";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                tiering: TieringOptions {
+                    enabled: false,
+                    collect_stats: true,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"66\n");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.quickening_attempts, 0, "{counters:?}");
+        let stats = result.tiering_stats.expect("tiering stats");
+        assert!(stats.tiering_disabled_entries > 0, "{stats:?}");
+        assert_eq!(stats.tier1_quickened_entries, 0, "{stats:?}");
+        assert_eq!(stats.tier2_jit_candidates, 0, "{stats:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn jit_int_leaf_hot_loop_executes_after_warmup() {
+        let source = "<?php function phase7_jit_add($a, $b) { return $a + $b; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + phase7_jit_add($i, 2); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"90");
+        let counters = result.counters.expect("counters");
+        assert!(counters.jit_compile_attempts > 0, "{counters:?}");
+        assert!(counters.jit_compiled > 0, "{counters:?}");
+        assert!(counters.jit_executed > 0, "{counters:?}");
+        assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn jit_rejected_leaf_falls_back_to_interpreter() {
+        let source = "<?php function phase7_jit_reject($value) { return strlen($value); } $sum = 0; for ($i = 0; $i < 8; $i++) { $sum = $sum + phase7_jit_reject('abcd'); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"32");
+        let counters = result.counters.expect("counters");
+        assert!(counters.jit_compile_attempts > 0, "{counters:?}");
+        assert_eq!(counters.jit_compiled, 0, "{counters:?}");
+        assert_eq!(counters.jit_executed, 0, "{counters:?}");
+        assert!(counters.jit_bailouts > 0, "{counters:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn jit_on_off_output_is_identical() {
+        let source = "<?php function phase7_jit_add($a, $b) { return $a + $b; } $sum = 0; for ($i = 0; $i < 10; $i++) { $sum = $sum + phase7_jit_add($i, 3); } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                jit: JitMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let off_counters = off.counters.expect("off counters");
+        let on_counters = on.counters.expect("on counters");
+        assert_eq!(off_counters.jit_compile_attempts, 0);
+        assert!(on_counters.jit_executed > 0, "{on_counters:?}");
+    }
+
+    #[test]
+    fn inline_cache_slots_are_counted_without_changing_output() {
+        let source = "<?php function ic_f() { return 1; } class ICSlotSmoke { public $x = 3; public function m() { return 2; } } $object = new ICSlotSmoke(); $items = [4,5]; for ($i = 0; $i < 3; $i++) { echo ic_f(), $object->m(), $object->x, $items[1]; }";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let off_counters = off.counters.expect("off counters");
+        let on_counters = on.counters.expect("on counters");
+        assert_eq!(off_counters.inline_cache_slots, 0);
+        assert_eq!(off_counters.inline_cache_observations, 0);
+        assert!(on_counters.inline_cache_slots >= 4, "{on_counters:?}");
+        assert!(
+            on_counters.inline_cache_observations >= on_counters.inline_cache_slots,
+            "{on_counters:?}"
+        );
+        assert!(
+            on_counters.inline_cache_function_slots > 0,
+            "{on_counters:?}"
+        );
+        assert!(on_counters.inline_cache_method_slots > 0, "{on_counters:?}");
+        assert!(
+            on_counters.inline_cache_property_slots > 0,
+            "{on_counters:?}"
+        );
+        assert!(on_counters.inline_cache_dim_slots > 0, "{on_counters:?}");
+        assert!(on_counters.inline_cache_hits > 0, "{on_counters:?}");
+        assert!(on_counters.inline_cache_misses > 0, "{on_counters:?}");
+        assert_eq!(on_counters.inline_cache_invalidations, 0);
+        assert_eq!(on_counters.inline_cache_guard_failures, 0);
+        assert_eq!(on_counters.inline_cache_megamorphic, 0);
+    }
+
+    #[test]
+    fn function_call_inline_cache_records_user_function_hits() {
+        let source = "<?php function phase7_ic_user($value) { return $value + 1; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = phase7_ic_user($sum); } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        let counters = on.counters.expect("on counters");
+        assert!(counters.inline_cache_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_misses > 0, "{counters:?}");
+        assert_eq!(counters.inline_cache_invalidations, 0);
+        assert_eq!(counters.inline_cache_megamorphic, 0);
+    }
+
+    #[test]
+    fn function_call_inline_cache_records_internal_function_hits() {
+        let source = "<?php $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + strlen('abcd'); } echo $sum;";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"48");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.inline_cache_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn function_call_inline_cache_handles_namespaced_functions() {
+        let source = "<?php namespace PhaseSevenIC; function hot() { return 2; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + hot(); } echo $sum;";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"24");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.inline_cache_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn function_call_inline_cache_invalidates_after_include_defined_function() {
+        let result = execute_fixture_file_with_options(
+            "tests/fixtures/phase7/inline_cache/include-invalidation.php",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"111111111111:yes\n");
+        let counters = result.counters.expect("counters");
+        assert!(counters.inline_cache_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_misses > 0, "{counters:?}");
+        assert!(counters.inline_cache_invalidations > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn function_call_inline_cache_preserves_function_exists_introspection() {
+        let source = "<?php function phase7_ic_exists() { return 1; } for ($i = 0; $i < 12; $i++) { echo function_exists('strlen') ? 'b' : 'm'; echo function_exists('phase7_ic_exists') ? 'u' : 'm'; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"bubububububububububububu");
+        let counters = on.counters.expect("counters");
+        assert!(counters.inline_cache_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn method_call_inline_cache_records_hot_loop_hits() {
+        let source = "<?php class Phase7MethodHot { public function value() { return 2; } } $object = new Phase7MethodHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value(); } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"24");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+        assert!(counters.method_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.method_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn method_call_inline_cache_handles_inherited_methods() {
+        let source = "<?php class Phase7MethodBase { public function value() { return 'B'; } } class Phase7MethodChild extends Phase7MethodBase {} $object = new Phase7MethodChild(); for ($i = 0; $i < 8; $i++) { echo $object->value(); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"BBBBBBBB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+        assert!(counters.method_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.method_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn method_call_inline_cache_guard_fails_for_overridden_receivers() {
+        let source = "<?php class Phase7MethodA { public function value() { return 'A'; } } class Phase7MethodB extends Phase7MethodA { public function value() { return 'B'; } } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new Phase7MethodB(); $flip = false; } else { $object = new Phase7MethodA(); $flip = true; } echo $object->value(); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"ABABABAB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_misses > 0, "{counters:?}");
+        assert!(counters.method_ic_guard_failures > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn method_call_inline_cache_preserves_magic_call_fallback() {
+        let source = "<?php class Phase7MagicMethod { public function __call($name, $args) { return $name . count($args); } } $object = new Phase7MagicMethod(); for ($i = 0; $i < 4; $i++) { echo $object->missing(1, 2); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"missing2missing2missing2missing2");
+        let counters = on.counters.expect("on counters");
+        assert_eq!(counters.method_ic_hits, 0, "{counters:?}");
+        assert!(counters.method_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn method_call_inline_cache_keeps_private_and_protected_visibility() {
+        let source = "<?php class Phase7MethodScopeBase { private function secret() { return 's'; } protected function inherited() { return 'p'; } public function callSecret() { return $this->secret(); } } class Phase7MethodScopeChild extends Phase7MethodScopeBase { public function callProtected() { return $this->inherited(); } } $object = new Phase7MethodScopeChild(); for ($i = 0; $i < 6; $i++) { echo $object->callSecret(), $object->callProtected(); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"spspspspspsp");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+        assert_eq!(counters.method_ic_guard_failures, 0, "{counters:?}");
+
+        let private = execute_source_with_options(
+            "<?php class Phase7MethodPrivate { private function secret() { return 1; } } (new Phase7MethodPrivate())->secret();",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert_eq!(private.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            private.diagnostics[0].id(),
+            "E_PHP_VM_PRIVATE_METHOD_ACCESS"
+        );
+    }
+
+    #[test]
+    fn method_call_inline_cache_handles_trait_method_alias() {
+        let source = "<?php trait Phase7MethodTrait { public function base() { return 't'; } } class Phase7MethodTraitUser { use Phase7MethodTrait { base as alias; } } $object = new Phase7MethodTraitUser(); for ($i = 0; $i < 8; $i++) { echo $object->alias(); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"tttttttt");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+        assert!(counters.method_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_records_public_hot_loop_hits() {
+        let source = "<?php class Phase7PropertyHot { public $value = 3; } $object = new Phase7PropertyHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"36");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_ic_hits > 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.property_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_handles_private_property_within_class() {
+        let source = "<?php class Phase7PropertyPrivate { private $value = 4; public function read() { return $this->value; } } $object = new Phase7PropertyPrivate(); for ($i = 0; $i < 8; $i++) { echo $object->read(); }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"44444444");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_ic_hits > 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.property_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_handles_inherited_property() {
+        let source = "<?php class Phase7PropertyBase { public $value = 'B'; } class Phase7PropertyChild extends Phase7PropertyBase {} $object = new Phase7PropertyChild(); for ($i = 0; $i < 8; $i++) { echo $object->value; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"BBBBBBBB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_ic_hits > 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.property_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_guard_fails_for_alternating_receivers() {
+        let source = "<?php class Phase7PropertyA { public $value = 'A'; } class Phase7PropertyB { public $value = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new Phase7PropertyB(); $flip = false; } else { $object = new Phase7PropertyA(); $flip = true; } echo $object->value; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"ABABABAB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+        assert!(counters.property_ic_guard_failures > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_preserves_dynamic_property_fallback() {
+        let source = "<?php class Phase7DynamicProperty {} $object = new Phase7DynamicProperty(); $object->value = 'd'; for ($i = 0; $i < 6; $i++) { echo $object->value; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"dddddd");
+        let counters = on.counters.expect("on counters");
+        assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_preserves_magic_get_fallback() {
+        let source = "<?php class Phase7MagicProperty { public function __get($name) { return $name . '!'; } } $object = new Phase7MagicProperty(); for ($i = 0; $i < 4; $i++) { echo $object->missing; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"missing!missing!missing!missing!");
+        let counters = on.counters.expect("on counters");
+        assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_preserves_property_hook_fallback() {
+        let source = "<?php class Phase7HookProperty { public string $name { get { return 'hook'; } } } $object = new Phase7HookProperty(); for ($i = 0; $i < 4; $i++) { echo $object->name; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"hookhookhookhook");
+        let counters = on.counters.expect("on counters");
+        assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn property_fetch_inline_cache_preserves_uninitialized_typed_property_error() {
+        let result = execute_source_with_options(
+            "<?php class Phase7TypedProperty { public int $value; } $object = new Phase7TypedProperty(); echo $object->value;",
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            result.diagnostics[0].id(),
+            "E_PHP_VM_UNINITIALIZED_PROPERTY"
+        );
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.property_ic_hits, 0, "{counters:?}");
+        assert!(counters.property_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn class_static_inline_cache_records_repeated_class_constant_hits() {
+        let source = "<?php class Phase7ConstHot { public const VALUE = 5; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + Phase7ConstHot::VALUE; } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"60");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_static_ic_hits > 0, "{counters:?}");
+        assert!(counters.class_static_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.class_static_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn class_static_inline_cache_handles_inherited_constant() {
+        let source = "<?php class Phase7ConstBase { public const VALUE = 'B'; } class Phase7ConstChild extends Phase7ConstBase {} for ($i = 0; $i < 8; $i++) { echo Phase7ConstChild::VALUE; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"BBBBBBBB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_static_ic_hits > 0, "{counters:?}");
+        assert!(counters.class_static_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn class_static_inline_cache_handles_enum_case_access() {
+        let source = "<?php enum Phase7CacheStatus: string { case Ready = 'ready'; } for ($i = 0; $i < 6; $i++) { echo Phase7CacheStatus::Ready->value; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"readyreadyreadyreadyreadyready");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_static_ic_hits > 0, "{counters:?}");
+        assert!(counters.class_static_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn class_static_inline_cache_reads_static_property_metadata_without_stale_value() {
+        let source = "<?php class Phase7StaticCache { public static $value = 1; } echo Phase7StaticCache::$value; Phase7StaticCache::$value = 7; for ($i = 0; $i < 6; $i++) { echo Phase7StaticCache::$value; }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"1777777");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_static_ic_hits > 0, "{counters:?}");
+        assert!(counters.class_static_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.class_static_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn class_static_inline_cache_guards_late_static_binding() {
+        let source = "<?php class Phase7LsbBase { public const VALUE = 'A'; public static function read() { return static::VALUE; } } class Phase7LsbChild extends Phase7LsbBase { public const VALUE = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { echo Phase7LsbChild::read(); $flip = false; } else { echo Phase7LsbBase::read(); $flip = true; } }";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"ABABABAB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_static_ic_misses > 0, "{counters:?}");
+        assert!(counters.class_static_ic_guard_failures > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn inline_cache_type_changes_reach_polymorphic_and_megamorphic_without_output_changes() {
+        let source = "<?php class Phase7ProtoA { public $prop = 'A'; public function value() { return 'A'; } } class Phase7ProtoB { public $prop = 'B'; public function value() { return 'B'; } } class Phase7ProtoC { public $prop = 'C'; public function value() { return 'C'; } } class Phase7ProtoD { public $prop = 'D'; public function value() { return 'D'; } } class Phase7ProtoE { public $prop = 'E'; public function value() { return 'E'; } } function phase7_emit_proto($object) { echo $object->value(), $object->prop; } $a = new Phase7ProtoA(); $b = new Phase7ProtoB(); $c = new Phase7ProtoC(); $d = new Phase7ProtoD(); $e = new Phase7ProtoE(); phase7_emit_proto($a); phase7_emit_proto($b); phase7_emit_proto($a); phase7_emit_proto($b); phase7_emit_proto($c); phase7_emit_proto($d); phase7_emit_proto($e); phase7_emit_proto($a);";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("on counters");
+        assert!(counters.method_ic_hits > 0, "{counters:?}");
+        assert!(counters.property_ic_hits > 0, "{counters:?}");
+        assert!(counters.inline_cache_polymorphic > 0, "{counters:?}");
+        assert!(counters.inline_cache_megamorphic >= 2, "{counters:?}");
+        assert_eq!(counters.inline_cache_disabled, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn quickening_type_changes_dequicken_to_megamorphic_without_output_changes() {
+        let source = "<?php $a = 1; $b = 1; $last = 0; for ($i = 0; $i < 16; $i++) { if ($i < 10) { $b = 1; } else if ($b === 1) { $b = '2'; } else { $b = 1.5; } $last = $a + $b; } echo $last;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("on counters");
+        assert!(counters.quickening_guard_misses >= 2, "{counters:?}");
+        assert!(counters.quickening_guard_failures >= 2, "{counters:?}");
+        assert!(counters.quickening_fallback_calls >= 2, "{counters:?}");
+        assert!(counters.quickening_dequickens > 0, "{counters:?}");
+        assert!(counters.quickening_megamorphic > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn add_int_int_quickening_records_guard_hits_for_hot_loop() {
+        let source =
+            "<?php $sum = 0; for ($i = 0; $i < 20; $i++) { $sum = $sum + $i; } echo $sum, \"\\n\";";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        let on_counters = on.counters.expect("on counters");
+        assert!(on_counters.quickening_guard_hits > 0, "{on_counters:?}");
+        assert_eq!(on_counters.quickening_guard_misses, 0);
+    }
+
+    #[test]
+    fn add_int_int_quickening_falls_back_on_overflow() {
+        let source = "<?php $a = 1; $b = 1; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $a = 9223372036854775807; } $sum = $a + $b; } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status, off.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        assert!(!on.status.is_success(), "overflow should use generic error");
+        let on_counters = on.counters.expect("on counters");
+        assert!(on_counters.quickening_guard_misses > 0, "{on_counters:?}");
+    }
+
+    #[test]
+    fn add_int_int_quickening_falls_back_on_float_and_numeric_string() {
+        let cases = [
+            (
+                "float",
+                "<?php $a = 1; $b = 1; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $b = 1.5; } $sum = $a + $b; } echo $sum;",
+            ),
+            (
+                "numeric string",
+                "<?php $a = 1; $b = 1; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $b = \"2\"; } $sum = $a + $b; } echo $sum;",
+            ),
+        ];
+
+        for (name, source) in cases {
+            let off = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    quickening: QuickeningMode::Off,
+                    ..VmOptions::default()
+                },
+            );
+            let on = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    quickening: QuickeningMode::On,
+                    ..VmOptions::default()
+                },
+            );
+
+            assert!(off.status.is_success(), "{name}: {:?}", off.status);
+            assert!(on.status.is_success(), "{name}: {:?}", on.status);
+            assert_eq!(on.output, off.output, "{name}");
+            assert_eq!(on.diagnostics, off.diagnostics, "{name}");
+            let on_counters = on.counters.expect("on counters");
+            assert!(
+                on_counters.quickening_guard_misses > 0,
+                "{name}: {on_counters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_int_int_quickening_preserves_reference_cow_behavior() {
+        let source = "<?php $a = 1; $b = 1; $r =& $b; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $r = 4; } $sum = $a + $b; } echo $sum, ':', $r;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let on_counters = on.counters.expect("on counters");
+        assert!(on_counters.quickening_guard_hits > 0, "{on_counters:?}");
+    }
+
+    #[test]
+    fn concat_string_string_quickening_records_hits_for_hot_append_loop() {
+        let source = "<?php $s = ''; for ($i = 0; $i < 20; $i++) { $s .= 'x'; } echo $s;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters.string_concat_fast_path_hits > 0,
+            "{on_counters:?}"
+        );
+        assert_eq!(on_counters.string_concat_fast_path_misses, 0);
+    }
+
+    #[test]
+    fn concat_string_string_quickening_records_hits_for_binary_concat() {
+        let source = "<?php $a = 'left'; $b = 'right'; for ($i = 0; $i < 16; $i++) { $s = $a . $b; } echo $s;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters.string_concat_fast_path_hits > 0,
+            "{on_counters:?}"
+        );
+    }
+
+    #[test]
+    fn concat_string_string_quickening_falls_back_for_object_and_int_conversion() {
+        let cases = [
+            (
+                "object",
+                "<?php class QS { public function __toString(): string { return 'object'; } } $a = 'a'; $b = 'b'; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $a = new QS(); } $s = $a . $b; } echo $s;",
+            ),
+            (
+                "int",
+                "<?php $a = 'a'; $b = 'b'; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $a = 7; } $s = $a . $b; } echo $s;",
+            ),
+        ];
+
+        for (name, source) in cases {
+            let off = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    quickening: QuickeningMode::Off,
+                    ..VmOptions::default()
+                },
+            );
+            let on = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    quickening: QuickeningMode::On,
+                    ..VmOptions::default()
+                },
+            );
+
+            assert!(off.status.is_success(), "{name}: {:?}", off.status);
+            assert!(on.status.is_success(), "{name}: {:?}", on.status);
+            assert_eq!(on.output, off.output, "{name}");
+            assert_eq!(on.diagnostics, off.diagnostics, "{name}");
+            let on_counters = on.counters.expect("on counters");
+            assert!(
+                on_counters.string_concat_fast_path_misses > 0,
+                "{name}: {on_counters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_string_string_quickening_preserves_string_cow_and_references() {
+        let source = "<?php $a = 'a'; $alias =& $a; $copy = $a; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $alias = 'z'; } $s = $a . 'x'; } echo $s, '|', $copy, '|', $alias;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters.string_concat_fast_path_hits > 0,
+            "{on_counters:?}"
+        );
+    }
+
+    #[test]
+    fn packed_dim_quickening_records_hits_for_hot_list_fetch_loop() {
+        let source = "<?php $items = [1,2,3]; $sum = 0; for ($i = 0; $i < 12; $i++) { $sum += $items[1]; } echo $sum;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let on_counters = on.counters.expect("on counters");
+        assert!(on_counters.packed_dim_fast_path_hits > 0, "{on_counters:?}");
+        assert_eq!(on_counters.packed_dim_fast_path_misses, 0);
+    }
+
+    #[test]
+    fn packed_dim_quickening_falls_back_for_oob_with_warning_and_null() {
+        let source = "<?php $items = [10,20,30]; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $items = []; } $value = $items[1]; } echo $value;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        assert!(
+            on.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_RUNTIME_UNDEFINED_ARRAY_KEY_WARNING")
+        );
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters.packed_dim_fast_path_misses > 0,
+            "{on_counters:?}"
+        );
+    }
+
+    #[test]
+    fn packed_dim_quickening_falls_back_for_mixed_array_and_numeric_string_key() {
+        let mixed_source = "<?php $items = [10,20,30]; for ($i = 0; $i < 12; $i++) { if ($i === 10) { $items[5] = 99; } $value = $items[1]; } echo $value;";
+        let off = execute_source_with_options(
+            mixed_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            mixed_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters.packed_dim_fast_path_misses > 0,
+            "{on_counters:?}"
+        );
+
+        let numeric_string_source = "<?php $items = [10,20,30]; echo $items[1], '|', $items['1'];";
+        let off = execute_source_with_options(
+            numeric_string_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            numeric_string_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.diagnostics, off.diagnostics);
+        assert_eq!(on.output.as_bytes(), b"20|20");
+    }
+
+    #[test]
+    fn packed_dim_quickening_does_not_specialize_by_ref_element_access() {
+        let source = "<?php $items = [1,2,3]; for ($i = 0; $i < 12; $i++) { $r =& $items[1]; $r = $r + 1; } echo $items[1];";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"14");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.packed_dim_fast_path_hits, 0, "{counters:?}");
+        assert_eq!(counters.packed_dim_fast_path_misses, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn array_fast_paths_record_packed_append_read_foreach_and_count_hits() {
+        let source = "<?php
+            $items = [];
+            for ($i = 0; $i < 8; $i++) {
+                $items[] = $i;
+            }
+            $sum = 0;
+            foreach ($items as $value) {
+                $sum += $value;
+            }
+            $read = 0;
+            for ($j = 0; $j < 12; $j++) {
+                $read += $items[3];
+            }
+            echo $sum, '|', count($items), '|', $read;
+        ";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"28|8|36");
+        assert_eq!(on.diagnostics, off.diagnostics);
+        let counters = on.counters.expect("counters");
+        assert!(
+            counters.array_packed_append_fast_path_hits >= 8,
+            "{counters:?}"
+        );
+        assert!(
+            counters.array_packed_read_fast_path_hits > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters.array_sequential_foreach_fast_path_hits > 0,
+            "{counters:?}"
+        );
+        assert!(counters.array_count_fast_path_hits > 0, "{counters:?}");
+        assert_eq!(counters.array_packed_to_mixed_transitions, 0);
+    }
+
+    #[test]
+    fn array_fast_paths_record_packed_to_mixed_transitions() {
+        let source = "<?php
+            $nonseq = [1, 2];
+            $nonseq[5] = 5;
+            echo $nonseq[1], '|';
+
+            $stringKey = [1, 2];
+            $stringKey['x'] = 3;
+            echo count($stringKey), '|';
+
+            $hole = [1, 2, 3];
+            unset($hole[1]);
+            $hole[] = 4;
+            foreach ($hole as $key => $value) {
+                echo $key, ':', $value, ',';
+            }
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "2|3|0:1,2:3,3:4,");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters.array_packed_to_mixed_transitions >= 3,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn array_fast_paths_preserve_references_and_foreach_mutation_order() {
+        let source = "<?php
+            $items = [1];
+            $ref =& $items[0];
+            $items[] = 2;
+            $ref = 9;
+            foreach ($items as $key => $value) {
+                echo $key, ':', $value, ',';
+                if ($key === 0) {
+                    $items[] = 3;
+                }
+            }
+            echo '|', $items[0], '|', $items[2], '|', count($items);
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "0:9,1:2,|9|3|3");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters.array_packed_append_fast_path_hits > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters.array_sequential_foreach_fast_path_hits > 0,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_string_cache_records_hits_for_hot_arithmetic_comparison_and_casts() {
+        let source = "<?php
+            $s = \" 42\\t\";
+            $sum = 0;
+            for ($i = 0; $i < 12; $i++) {
+                $sum += $s;
+                if ($s == 42) {
+                    $sum += 1;
+                }
+                $last = (int) $s;
+            }
+            $big = \"9223372036854775808\";
+            $large = 0;
+            for ($j = 0; $j < 4; $j++) {
+                if ($big > 1) {
+                    $large++;
+                }
+            }
+            echo $sum, '|', $last, '|', $large;
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"516|42|4");
+        let counters = result.counters.expect("counters");
+        assert!(counters.numeric_string_cache_hits > 0, "{counters:?}");
+        assert!(counters.numeric_string_cache_misses > 0, "{counters:?}");
+        assert!(
+            counters.numeric_string_cache_hits > counters.numeric_string_cache_misses,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_string_cache_does_not_cache_or_delay_non_numeric_diagnostics() {
+        let result = execute_source_with_options(
+            "<?php $s = 'abc'; echo $s + 1;",
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            result.status.message(),
+            Some("E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number")
+        );
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.numeric_string_cache_misses, 1, "{counters:?}");
+        assert_eq!(counters.numeric_string_cache_hits, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn local_slot_fast_path_records_hits_for_simple_hot_loop() {
+        let source = "<?php $sum = 0; for ($i = 0; $i < 20; $i++) { $sum = $sum + $i; } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"190");
+        let counters = result.counters.expect("counters");
+        assert!(counters.local_slot_fast_path_hits > 0, "{counters:?}");
+        assert_eq!(counters.local_slot_fast_path_misses, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn local_slot_fast_path_counts_global_symbol_table_fallback() {
+        let source = "<?php $g = 7; function bump_global() { global $g; $g = $g + 1; } bump_global(); echo $g;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"8");
+        let counters = result.counters.expect("counters");
+        assert!(counters.local_slot_fast_path_hits > 0, "{counters:?}");
+        assert!(counters.local_slot_fast_path_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn local_slot_fast_path_preserves_by_ref_params() {
+        let source = "<?php function bump_ref(&$x) { $x = $x + 1; } $value = 1; bump_ref($value); echo $value;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2");
+        let counters = result.counters.expect("counters");
+        assert!(counters.local_slot_fast_path_hits > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn local_slot_fast_path_preserves_closure_use_slots() {
+        let source =
+            "<?php $base = 3; $f = function ($x) use ($base) { return $x + $base; }; echo $f(4);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"7");
+        let counters = result.counters.expect("counters");
+        assert!(counters.local_slot_fast_path_hits > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn local_slot_fast_path_preserves_global_and_superglobal_fallbacks() {
+        let source = "<?php $value = 5; echo $GLOBALS['value'], '|', isset($_SERVER['argv']);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"5|1");
+        let counters = result.counters.expect("counters");
+        assert!(counters.local_slot_fast_path_hits > 0, "{counters:?}");
+        assert!(counters.local_slot_fast_path_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn frame_reuse_records_reuse_for_call_heavy_loop() {
+        let source = "<?php function inc_frame_reuse($x) { return $x + 1; } $sum = 0; for ($i = 0; $i < 20; $i++) { $sum = inc_frame_reuse($sum); } echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"20");
+        let counters = result.counters.expect("counters");
+        assert!(counters.frame_allocations > 0, "{counters:?}");
+        assert!(counters.frame_reuses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn frame_reuse_preserves_recursive_calls() {
+        let source = "<?php function fact_frame_reuse($n) { if ($n < 2) { return 1; } return $n * fact_frame_reuse($n - 1); } echo fact_frame_reuse(5);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"120");
+        let counters = result.counters.expect("counters");
+        assert!(counters.frame_allocations >= 5, "{counters:?}");
+    }
+
+    #[test]
+    fn frame_reuse_preserves_exceptions_through_calls() {
+        let source = "<?php function frame_reuse_finally($v) { try { return $v; } finally { echo 'finally|'; } } echo frame_reuse_finally('ok');";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"finally|ok");
+    }
+
+    #[test]
+    fn frame_reuse_preserves_destructors_during_unwind() {
+        let source = "<?php class FrameReuseDestruct { public function __destruct() { echo 'd'; } } function frame_reuse_make() { $x = new FrameReuseDestruct(); echo 'm|'; } frame_reuse_make(); echo 'after|';";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"m|after|d");
+    }
+
+    #[test]
+    fn frame_reuse_preserves_generator_and_fiber_suspension() {
+        let generator = execute_source_with_options(
+            "<?php function frame_reuse_gen() { yield 'k' => 'v'; } $g = frame_reuse_gen(); echo $g->current();",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        assert!(generator.status.is_success(), "{:?}", generator.status);
+        assert_eq!(generator.output.as_bytes(), b"v");
+
+        let fiber = execute_source_with_options(
+            "<?php $fiber = new Fiber(function() { echo 'a'; Fiber::suspend('s'); echo 'b'; }); echo $fiber->start(); echo '|'; $fiber->resume('r');",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        assert!(fiber.status.is_success(), "{:?}", fiber.status);
+        assert_eq!(fiber.output.as_bytes(), b"as|b");
     }
 
     #[test]
@@ -12305,6 +23340,352 @@ mod tests {
     }
 
     #[test]
+    fn typecheck_fast_paths_match_slow_path_for_common_prologues() {
+        let source = "<?php declare(strict_types=1);
+            class Base {}
+            class Child extends Base {}
+            function scalars(int $i, string $s, bool $b, float $f, array $a, object $o, callable $cb): string {
+                if (!$b) { return 'bad'; }
+                return $s . $i . ':' . $f . ':' . $a[0] . ':' . $cb();
+            }
+            function mutate(int &$n, ?string $label = null, bool $flag = true): int {
+                if ($label !== null || !$flag) { return 0; }
+                $n = $n + 1;
+                return $n;
+            }
+            function collect(string $first = 'x', string ...$rest): string {
+                return $first . $rest[0] . $rest['tail'];
+            }
+            function exact(Base $b): string { return 'base'; }
+            $n = 1;
+            echo scalars(7, 's', true, 1.5, [9], new Base(), fn() => 'call');
+            echo '|', mutate(n: $n), ':', $n;
+            echo '|', collect('A', ...['B'], tail: 'C');
+            echo '|', exact(new Base()), ':', exact(new Child());";
+
+        let fast = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: true,
+                ..VmOptions::default()
+            },
+        );
+        let slow = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: false,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(fast.status.is_success(), "{:?}", fast.status);
+        assert_eq!(fast.output.as_bytes(), slow.output.as_bytes());
+        assert_eq!(fast.output.as_bytes(), b"s7:1.5:9:call|2:2|ABC|base:base");
+        let fast_counters = fast.counters.expect("fast counters");
+        let slow_counters = slow.counters.expect("slow counters");
+        assert!(
+            fast_counters.typecheck_fast_path_hits > 0,
+            "{fast_counters:?}"
+        );
+        assert!(
+            fast_counters.typecheck_fast_path_misses > 0,
+            "{fast_counters:?}"
+        );
+        assert_eq!(slow_counters.typecheck_fast_path_hits, 0);
+        assert_eq!(slow_counters.typecheck_fast_path_misses, 0);
+    }
+
+    #[test]
+    fn typecheck_fast_paths_preserve_coercion_by_ref_and_return_errors() {
+        let weak =
+            "<?php function takes_int(int $value): int { return $value; } echo takes_int('42');";
+        let weak_fast = execute_source_with_options(
+            weak,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: true,
+                ..VmOptions::default()
+            },
+        );
+        let weak_slow = execute_source_with_options(
+            weak,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: false,
+                ..VmOptions::default()
+            },
+        );
+        assert!(weak_fast.status.is_success(), "{:?}", weak_fast.status);
+        assert_eq!(weak_fast.output.as_bytes(), weak_slow.output.as_bytes());
+        assert_eq!(weak_fast.output.as_bytes(), b"42");
+        assert!(
+            weak_fast
+                .counters
+                .expect("weak counters")
+                .typecheck_fast_path_hits
+                > 0
+        );
+
+        let strict = "<?php declare(strict_types=1); function takes_int(int $value): int { return $value; } takes_int('42');";
+        assert_typecheck_fast_path_error_matches_slow_path(strict, "E_PHP_VM_PARAM_TYPE_MISMATCH");
+
+        let by_ref =
+            "<?php function takes_ref(int &$value): void {} $value = '42'; takes_ref($value);";
+        assert_typecheck_fast_path_error_matches_slow_path(by_ref, "E_PHP_VM_PARAM_TYPE_MISMATCH");
+
+        let variadic = "<?php function ints(int ...$xs): int { return $xs[0] + $xs[1]; } echo ints('40', 2), '|'; ints('bad');";
+        let variadic_result = execute_source_with_options(
+            variadic,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: true,
+                ..VmOptions::default()
+            },
+        );
+        assert_eq!(
+            variadic_result.status.exit_status(),
+            ExitStatus::RuntimeError
+        );
+        assert_eq!(
+            variadic_result.diagnostics[0].id(),
+            "E_PHP_VM_PARAM_TYPE_MISMATCH"
+        );
+        assert_eq!(variadic_result.output.as_bytes(), b"42|");
+
+        let return_error = "<?php function bad(): int { return 'x'; } bad();";
+        assert_typecheck_fast_path_error_matches_slow_path(
+            return_error,
+            "E_PHP_VM_RETURN_TYPE_MISMATCH",
+        );
+    }
+
+    fn assert_typecheck_fast_path_error_matches_slow_path(source: &str, expected_id: &str) {
+        let fast = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: true,
+                ..VmOptions::default()
+            },
+        );
+        let slow = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: false,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(fast.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(slow.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(fast.status.message(), slow.status.message());
+        assert_eq!(fast.diagnostics[0].id(), expected_id);
+        assert_eq!(slow.diagnostics[0].id(), expected_id);
+        let counters = fast.counters.expect("fast counters");
+        assert!(counters.typecheck_fast_path_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn internal_function_dispatch_cache_preserves_normal_output_and_records_hits() {
+        let source = "<?php
+            $items = [1, 2, 3];
+            echo count($items), ':', strlen('abcd'), ':', (is_int(7) ? 'i' : 'n'), ':', implode(',', array_values(['a' => 1, 'b' => 2])), \"\\n\";
+            echo count($items), ':', strlen('ef'), ':', (is_string('x') ? 's' : 'n'), ':', implode(',', array_values(['c' => 3, 'd' => 4])), \"\\n\";
+            echo count($items), ':', strlen('ghij'), ':', (is_array($items) ? 'a' : 'n'), ':', strtolower('ABC'), \"\\n\";
+            echo function_exists('strlen') ? 'exists|' : 'missing|';
+            $rf = new ReflectionFunction('strlen');
+            echo $rf->getName(), ':', ($rf->isInternal() ? 'internal' : 'user');
+        ";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                internal_function_dispatch_cache: false,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                internal_function_dispatch_cache: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(
+            on.output.as_bytes(),
+            b"3:4:i:1,2\n3:2:s:3,4\n3:4:a:abc\nexists|strlen:internal"
+        );
+        let off_counters = off.counters.expect("off counters");
+        let on_counters = on.counters.expect("on counters");
+        assert_eq!(off_counters.internal_function_dispatch_cache_hits, 0);
+        assert_eq!(off_counters.internal_function_dispatch_cache_misses, 0);
+        assert!(
+            on_counters.internal_function_dispatches >= 12,
+            "{on_counters:?}"
+        );
+        assert!(
+            on_counters.internal_function_dispatch_cache_hits >= 4,
+            "{on_counters:?}"
+        );
+        assert!(
+            on_counters.internal_function_dispatch_cache_misses >= 6,
+            "{on_counters:?}"
+        );
+        assert!(
+            on_counters.internal_count_array_direct_fast_path_hits >= 3,
+            "{on_counters:?}"
+        );
+    }
+
+    #[test]
+    fn internal_function_dispatch_cache_preserves_error_paths() {
+        let cases = [
+            (
+                "<?php strlen(string: 'abc');",
+                ExitStatus::RuntimeError,
+                b"".as_slice(),
+            ),
+            ("<?php strlen();", ExitStatus::RuntimeError, b"".as_slice()),
+            (
+                "<?php try { strlen([]); } catch (TypeError $e) { echo 'type'; }",
+                ExitStatus::Success,
+                b"type".as_slice(),
+            ),
+            (
+                "<?php try { str_repeat('x', -1); } catch (ValueError $e) { echo 'value'; }",
+                ExitStatus::Success,
+                b"value".as_slice(),
+            ),
+            (
+                "<?php phase7_741_missing_internal();",
+                ExitStatus::RuntimeError,
+                b"".as_slice(),
+            ),
+        ];
+
+        for (source, expected_status, expected_output) in cases {
+            let off = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    internal_function_dispatch_cache: false,
+                    ..VmOptions::default()
+                },
+            );
+            let on = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    internal_function_dispatch_cache: true,
+                    ..VmOptions::default()
+                },
+            );
+
+            assert_eq!(off.status.exit_status(), expected_status, "{source}");
+            assert_eq!(on.status.exit_status(), expected_status, "{source}");
+            assert_eq!(on.status.message(), off.status.message(), "{source}");
+            assert_eq!(on.output, off.output, "{source}");
+            assert_eq!(on.output.as_bytes(), expected_output, "{source}");
+        }
+    }
+
+    #[test]
+    fn reflection_internal_functions_expose_phase6_metadata() {
+        let result = execute_source(
+            "<?php $fn = new ReflectionFunction('count'); echo $fn->getName(), '|'; echo $fn->isInternal() ? 'internal|' : 'user|'; echo $fn->getFileName() === false ? 'nofile|' : 'file|'; echo $fn->getNumberOfParameters(), ':', $fn->getNumberOfRequiredParameters(), '|'; $params = $fn->getParameters(); echo $params[0]->getName(), ':', ($params[0]->hasType() ? $params[0]->getType()->getName() : 'none'), '|'; echo $fn->getReturnType()->getName(), '|', $fn->getExtensionName();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"count|internal|nofile|2:1|value:mixed|int|standard"
+        );
+    }
+
+    #[test]
+    fn reflection_internal_classes_and_methods_expose_extension_and_locations() {
+        let result = execute_source(
+            "<?php $class = new ReflectionClass('ArrayObject'); echo $class->getName(), '|', $class->getExtensionName(), '|'; echo $class->isInternal() ? 'internal|' : 'user|'; echo $class->getFileName() === false ? 'nofile|' : 'file|'; $method = $class->getMethod('count'); echo $method->getName(), '|', $method->getDeclaringClass()->getName(), '|'; echo $method->isInternal() ? 'internal|' : 'user|'; echo $method->getNumberOfParameters(), '|', $method->getExtensionName();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"ArrayObject|spl|internal|nofile|count|ArrayObject|internal|0|spl"
+        );
+    }
+
+    #[test]
+    fn reflection_extension_lists_enabled_symbols() {
+        let result = execute_source(
+            "<?php $spl = new ReflectionExtension('spl'); echo $spl->getName(), '|'; $found = 'missing'; foreach ($spl->getClassNames() as $name) { if ($name === 'ArrayObject') { $found = 'arrayobject'; } } echo $found, '|'; $standard = new ReflectionExtension('standard'); $functions = $standard->getFunctions(); echo $functions['count']->getName(), '|', $functions['count']->getExtensionName();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"spl|arrayobject|count|standard");
+    }
+
+    #[test]
+    fn reflection_members_expose_property_constant_and_attribute_metadata() {
+        let result = execute_source(
+            "<?php #[RepeatMe('a'), RepeatMe('b')] class ReflectionPhase641 { protected const CODE = 42; public readonly string $name; } $class = new ReflectionClass(ReflectionPhase641::class); $property = $class->getProperty('name'); $constant = $class->getReflectionConstant('CODE'); $attributes = $class->getAttributes(); echo $property->getName(), '|', ($property->hasType() ? $property->getType()->getName() : 'none'), '|', ($property->isReadOnly() ? 'readonly' : 'mutable'), '|', $property->getModifiers(), '|'; echo $constant->getName(), '|', ($constant->isProtected() ? 'protected' : 'not-protected'), '|', $constant->getValue(), '|', ($constant->isEnumCase() ? 'enum' : 'constant'), '|'; echo $attributes[0]->getName(), ':', ($attributes[0]->isRepeated() ? 'repeated' : 'single'), '|', $attributes[1]->getName(), ':', ($attributes[1]->isRepeated() ? 'repeated' : 'single');",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"name|string|readonly|129|CODE|protected|42|constant|RepeatMe:single|RepeatMe:repeated"
+        );
+    }
+
+    #[test]
+    fn reflection_enum_backed_cases_are_distinct_and_queryable() {
+        let result = execute_source(
+            "<?php enum ReflectionPhase641Status: string { #[CaseMark('ready')] case Ready = 'ready'; case Done = 'done'; } $enum = new ReflectionEnum(ReflectionPhase641Status::class); echo $enum->hasCase('Ready') ? 'has|' : 'missing|'; $case = $enum->getCase('Ready'); echo get_class($case), '|', $case->getName(), '|', $case->getBackingValue(), '|'; $direct = new ReflectionEnumBackedCase(ReflectionPhase641Status::class, 'Done'); echo get_class($direct), '|', $direct->getBackingValue(), '|'; $constant = (new ReflectionClass(ReflectionPhase641Status::class))->getReflectionConstant('Ready'); echo $constant->isEnumCase() ? 'enumcase' : 'constant';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"has|ReflectionEnumBackedCase|Ready|ready|ReflectionEnumBackedCase|done|enumcase"
+        );
+    }
+
+    #[test]
+    fn tokenizer_token_get_all_exposes_phase1_tokens() {
+        let result = execute_source(
+            "<?php $tokens = token_get_all('<?php echo $name + 1;'); echo token_name($tokens[0][0]), '|', $tokens[0][1], '|', $tokens[0][2], '|'; foreach ($tokens as $token) { if (is_array($token) && token_name($token[0]) === 'T_VARIABLE') { echo token_name($token[0]), ':', $token[1], '|'; } if ($token === '+') { echo 'symbol:+|'; } } echo token_name(-1);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"T_OPEN_TAG|<?php |1|T_VARIABLE:$name|symbol:+|UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn tokenizer_php_token_objects_support_is_and_ignorable() {
+        let result = execute_source(
+            "<?php $tokens = PhpToken::tokenize(\"<?php // hi\\n echo 1;\"); echo get_class($tokens[0]), '|', $tokens[0]->getTokenName(), '|', $tokens[0]->line, ':', $tokens[0]->pos, '|'; foreach ($tokens as $token) { if ($token->isIgnorable()) { echo 'I:', $token->getTokenName(), '|'; } if ($token->is(T_ECHO)) { echo 'echo|'; } if ($token->is([';', T_LNUMBER])) { echo 'match:', $token->text, '|'; } }",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"PhpToken|T_OPEN_TAG|1:0|I:T_COMMENT|I:T_WHITESPACE|echo|I:T_WHITESPACE|match:1|match:;|"
+        );
+    }
+
+    #[test]
     fn closures_execute_simple_calls_captures_arrows_and_returns() {
         let simple = execute_source("<?php $f = function($x) { return $x + 1; }; echo $f(2);");
         assert!(simple.status.is_success(), "{:?}", simple.status);
@@ -12538,6 +23919,29 @@ mod tests {
     }
 
     #[test]
+    fn exceptions_support_spl_logic_and_runtime_hierarchy() {
+        let result = execute_source(
+            "<?php
+            try {
+                throw new InvalidArgumentException('bad');
+            } catch (LogicException $e) {
+                echo 'logic:', $e->getMessage(), '|';
+            }
+            $runtime = new UnexpectedValueException('runtime');
+            echo ($runtime instanceof RuntimeException) ? 'runtime|' : 'no|';
+            echo ($runtime instanceof Exception) ? 'exception|' : 'no|';
+            echo ($runtime instanceof LogicException) ? 'logic' : 'not-logic';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"logic:bad|runtime|exception|not-logic"
+        );
+    }
+
+    #[test]
     fn exceptions_skip_nonmatching_catch_and_run_finally() {
         let result = execute_source(
             "<?php try { try { throw new TypeError(\"bad\"); } catch (Exception $e) { echo \"wrong\"; } finally { echo \"finally|\"; } } catch (Throwable $e) { echo \"outer:\", $e->getMessage(); }",
@@ -12573,6 +23977,229 @@ mod tests {
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"a:1;4:2;b:3;");
+    }
+
+    #[test]
+    fn spl_array_iterator_methods_and_foreach_preserve_keys_values() {
+        let result = execute_source(
+            r#"<?php
+            $it = new ArrayIterator(["a" => 10, "b" => 20]);
+            echo $it->key(), "=", $it->current(), "|";
+            $it->next();
+            echo $it->key(), "=", $it->current(), "|";
+            echo $it->valid() ? "valid|" : "invalid|";
+            $it->rewind();
+            foreach ($it as $key => $value) {
+                echo "f:", $key, "=", $value, "|";
+            }
+            echo $it->count(), "|", count($it);
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"a=10|b=20|valid|f:a=10|f:b=20|2|2"
+        );
+    }
+
+    #[test]
+    fn spl_iterator_wrappers_limit_empty_and_append_iterate() {
+        let result = execute_source(
+            r#"<?php
+            $base = new ArrayIterator(["a" => 1, "b" => 2, "c" => 3]);
+            foreach (new IteratorIterator($base) as $key => $value) {
+                echo "i:", $key, "=", $value, "|";
+            }
+            foreach (new LimitIterator(new ArrayIterator([10, 20, 30]), 1, 1) as $key => $value) {
+                echo "l:", $key, "=", $value, "|";
+            }
+            foreach (new EmptyIterator() as $value) {
+                echo "bad";
+            }
+            $append = new AppendIterator();
+            $append->append(new ArrayIterator(["x" => 7]));
+            $append->append(new ArrayIterator(["y" => 8]));
+            foreach ($append as $key => $value) {
+                echo "a:", $key, "=", $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"i:a=1|i:b=2|i:c=3|l:1=20|a:x=7|a:y=8|"
+        );
+    }
+
+    #[test]
+    fn spl_recursive_array_iterator_and_type_checks_use_internal_metadata() {
+        let result = execute_source(
+            r#"<?php
+            $it = new RecursiveArrayIterator(["k" => "v"]);
+            echo ($it instanceof RecursiveArrayIterator) ? "recursive|" : "no|";
+            echo ($it instanceof ArrayIterator) ? "array|" : "no|";
+            echo ($it instanceof Iterator) ? "iterator|" : "no|";
+            echo ($it instanceof Traversable) ? "traversable|" : "no|";
+            echo ($it instanceof Countable) ? "countable|" : "no|";
+            foreach ($it as $key => $value) {
+                echo $key, "=", $value;
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"recursive|array|iterator|traversable|countable|k=v"
+        );
+    }
+
+    #[test]
+    fn spl_array_object_supports_array_access_iteration_and_exchange() {
+        let result = execute_source(
+            r#"<?php
+            $object = new ArrayObject(["a" => 1]);
+            $object["b"] = 2;
+            $object->append(3);
+            echo $object["a"], "|", $object->offsetExists("b") ? "yes|" : "no|";
+            foreach ($object as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            $old = $object->exchangeArray(["z" => 9]);
+            echo count($object), "|", $old["a"], "|", $object["z"];
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|yes|a=1|b=2|0=3|1|1|9");
+    }
+
+    #[test]
+    fn spl_fixed_array_supports_bounds_checked_array_access() {
+        let result = execute_source(
+            r#"<?php
+            $fixed = new SplFixedArray(3);
+            $fixed[1] = "middle";
+            echo $fixed->getSize(), "|", count($fixed), "|", $fixed[1], "|";
+            foreach ($fixed as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            $fixed->setSize(2);
+            echo $fixed->getSize();
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"3|3|middle|0=|1=middle|2=|2");
+    }
+
+    #[test]
+    fn spl_object_storage_uses_runtime_object_identity() {
+        let result = execute_source(
+            r#"<?php
+            class Phase6Box {}
+            $a = new Phase6Box();
+            $b = new Phase6Box();
+            $storage = new SplObjectStorage();
+            $storage->attach($a, "alpha");
+            $storage->attach($b, "beta");
+            echo $storage->contains($a) ? "has-a|" : "missing|";
+            echo $storage->offsetGet($b), "|", count($storage), "|";
+            foreach ($storage as $index => $object) {
+                echo $index, ":", ($object instanceof Phase6Box) ? "box|" : "no|";
+            }
+            $storage->detach($a);
+            echo count($storage);
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"has-a|beta|2|0:box|1:box|1");
+    }
+
+    #[test]
+    fn spl_stack_queue_and_doubly_linked_list_mvp_use_simple_storage() {
+        let result = execute_source(
+            r#"<?php
+            $stack = new SplStack();
+            $stack->push("a");
+            $stack->push("b");
+            echo $stack->top(), "|", $stack->pop(), "|", $stack->count(), "|";
+            $queue = new SplQueue();
+            $queue->push("x");
+            $queue->push("y");
+            echo $queue->shift(), "|", $queue->bottom(), "|";
+            $list = new SplDoublyLinkedList();
+            $list->push(4);
+            $list->unshift(3);
+            foreach ($list as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            echo ($stack instanceof SplDoublyLinkedList) ? "list" : "no";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"b|b|1|x|y|0=3|1=4|list");
+    }
+
+    #[test]
+    fn spl_file_info_and_file_object_use_allowed_local_files() {
+        let root = std::env::temp_dir().join(format!("phrust-spl-file-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let file = root.join("items.csv");
+        std::fs::write(&file, "name,qty\napple,2\n").expect("fixture should be written");
+        let path = file.to_string_lossy().replace('\\', "\\\\");
+        let source = format!(
+            r#"<?php
+            $info = new SplFileInfo("{path}");
+            echo $info->getFilename(), "|", $info->getBasename(".csv"), "|";
+            echo ($info->getSize() > 0) ? "size|" : "empty|";
+            echo ($info->getRealPath() !== false) ? "real|" : "missing|";
+            $file = new SplFileObject("{path}");
+            echo $file->fgets();
+            $file->rewind();
+            foreach ($file as $line => $text) {{
+                echo $line, ":", $text;
+            }}
+            $file->rewind();
+            $row = $file->fgetcsv();
+            echo "|", $row[0], ":", $row[1], "|";
+            echo ($file instanceof SplFileInfo) ? "info" : "no";
+            "#
+        );
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli(
+                    file.to_string_lossy().into_owned(),
+                    Vec::new(),
+                )
+                .with_filesystem_capabilities(
+                    php_runtime::FilesystemCapabilities::none()
+                        .with_allowed_roots(vec![root.clone()]),
+                ),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "items.csv|items|size|real|name,qty\n0:name,qty\n1:apple,2\n|name:qty|info"
+        );
+    }
+
+    #[test]
+    fn spl_temp_file_object_reports_empty_temp_stream_mvp() {
+        let result = execute_source(
+            "<?php $file = new SplTempFileObject(); echo $file->getPathname(), '|', $file->getSize(), '|', $file->eof() ? 'eof' : 'data';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"php://temp|0|eof");
     }
 
     #[test]
@@ -12841,12 +24468,21 @@ mod tests {
 
     #[test]
     fn eval_recursion_limit_is_runtime_diagnostic() {
-        let mut code = "echo \"done\";".to_owned();
-        for _ in 0..=MAX_EVAL_DEPTH {
-            code = format!("eval({code:?});");
-        }
-        let source = format!("<?php {code}");
-        let result = execute_source(&source);
+        let vm = Vm::new();
+        let compiled = CompiledUnit::new(manual_return_unit(IrConstant::Null));
+        let mut output = OutputBuffer::new();
+        let mut stack = CallStack::new();
+        let mut state = ExecutionState {
+            eval_depth: MAX_EVAL_DEPTH,
+            ..ExecutionState::default()
+        };
+        let result = vm.execute_eval(
+            &compiled,
+            &Value::string("echo \"done\";"),
+            &mut output,
+            &mut stack,
+            &mut state,
+        );
 
         assert!(!result.status.is_success());
         assert!(
@@ -12915,6 +24551,59 @@ mod tests {
             execute_source("<?php echo \"abc\" |> gettype(...), \"|\", \"abc\" |> strlen(...);");
         assert!(callable.status.is_success(), "{:?}", callable.status);
         assert_eq!(callable.output.as_bytes(), b"string|3");
+    }
+
+    #[test]
+    fn array_callback_builtins_execute_php_callables() {
+        let result = execute_source(
+            "<?php
+            function plus_one($v) { return $v + 1; }
+            class Scale { static function double($v) { return $v * 2; } }
+            $input = ['a' => 1, 'b' => 2, 'c' => 3];
+            echo var_export(array_map('plus_one', $input), true), \"\\n\";
+            echo var_export(array_map(['Scale', 'double'], [1, 2]), true), \"\\n\";
+            echo var_export(array_filter($input, fn($v, $k) => $v > 1 && $k !== 'c', 1), true), \"\\n\";
+            echo array_reduce([1, 2, 3], fn($carry, $v) => $carry + $v, 0), \"\\n\";
+            array_walk(['x' => 1, 'y' => 2], function($v, $k) { echo $k, ':', $v, ';'; });
+            echo \"\\n\";
+            echo array_any($input, fn($v, $k) => $k === 'b') ? 'T' : 'F';
+            echo array_all($input, fn($v, $k) => $v > 0) ? 'T' : 'F';
+            echo '|', array_find($input, fn($v, $k) => $v === 2);
+            echo '|', array_find_key($input, fn($v, $k) => $v === 3);
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "array (\n  'a' => 2,\n  'b' => 3,\n  'c' => 4,\n)\narray (\n  0 => 2,\n  1 => 4,\n)\narray (\n  'b' => 2,\n)\n6\nx:1;y:2;\nTT|2|c"
+        );
+    }
+
+    #[test]
+    fn array_sort_builtins_mutate_arrays_and_call_comparators() {
+        let result = execute_source(
+            "<?php
+            $a = [2 => 'b', 0 => 'a', 1 => 'c'];
+            sort($a);
+            echo var_export($a, true), \"\\n\";
+            $b = ['z' => 2, 'a' => 1, 'm' => 3];
+            asort($b);
+            echo var_export($b, true), \"\\n\";
+            krsort($b);
+            echo var_export($b, true), \"\\n\";
+            $c = [3, 1, 2];
+            usort($c, fn($left, $right) => $right <=> $left);
+            echo var_export($c, true), \"\\n\";
+            $d = ['img10', 'img2', 'img1'];
+            natsort($d);
+            echo var_export($d, true), \"\\n\";
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "array (\n  0 => 'a',\n  1 => 'b',\n  2 => 'c',\n)\narray (\n  'a' => 1,\n  'z' => 2,\n  'm' => 3,\n)\narray (\n  'z' => 2,\n  'm' => 3,\n  'a' => 1,\n)\narray (\n  0 => 3,\n  1 => 2,\n  2 => 1,\n)\narray (\n  2 => 'img1',\n  1 => 'img2',\n  0 => 'img10',\n)\n"
+        );
     }
 
     #[test]
@@ -13061,6 +24750,10 @@ mod tests {
     }
 
     fn execute_fixture_file(path: &str) -> VmResult {
+        execute_fixture_file_with_options(path, VmOptions::default())
+    }
+
+    fn execute_fixture_file_with_options(path: &str, options: VmOptions) -> VmResult {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -13101,7 +24794,7 @@ mod tests {
         .expect("include loader should initialize");
         Vm::with_options(VmOptions {
             include_loader: Some(loader),
-            ..VmOptions::default()
+            ..options
         })
         .execute(lowering.unit)
     }

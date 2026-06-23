@@ -1,0 +1,623 @@
+//! Arginfo, parameter validation, and builtin coercion support.
+
+use php_runtime::{
+    PhpString, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, Value, to_bool, to_float,
+    to_int, to_string,
+};
+
+/// PHP builtin coercion mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoercionMode {
+    /// Accept only exact runtime types.
+    Strict,
+    /// Apply PHP-style weak scalar coercions for internal functions.
+    Weak,
+}
+
+/// Supported arginfo type atom.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArgType {
+    /// `mixed`.
+    Mixed,
+    /// `null`.
+    Null,
+    /// `bool`.
+    Bool,
+    /// `int`.
+    Int,
+    /// `float`.
+    Float,
+    /// `string`.
+    String,
+    /// `array`.
+    Array,
+    /// `object`.
+    Object,
+    /// `callable`.
+    Callable,
+}
+
+impl ArgType {
+    /// Stable PHP spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Null => "null",
+            Self::Bool => "bool",
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+            Self::Callable => "callable",
+        }
+    }
+}
+
+/// Union-like parameter or return type descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeSpec {
+    atoms: Vec<ArgType>,
+    nullable: bool,
+}
+
+impl TypeSpec {
+    /// Creates a non-nullable single type.
+    #[must_use]
+    pub fn one(atom: ArgType) -> Self {
+        Self {
+            atoms: vec![atom],
+            nullable: atom == ArgType::Mixed || atom == ArgType::Null,
+        }
+    }
+
+    /// Creates a union-like type.
+    #[must_use]
+    pub fn union(atoms: impl IntoIterator<Item = ArgType>) -> Self {
+        let atoms: Vec<_> = atoms.into_iter().collect();
+        let nullable = atoms
+            .iter()
+            .any(|atom| matches!(atom, ArgType::Mixed | ArgType::Null));
+        Self { atoms, nullable }
+    }
+
+    /// Marks this type nullable.
+    #[must_use]
+    pub fn nullable(mut self) -> Self {
+        self.nullable = true;
+        self
+    }
+
+    /// Returns true when null is accepted.
+    #[must_use]
+    pub const fn is_nullable(&self) -> bool {
+        self.nullable
+    }
+
+    /// Type atoms.
+    #[must_use]
+    pub fn atoms(&self) -> &[ArgType] {
+        &self.atoms
+    }
+
+    /// Stable PHP spelling.
+    #[must_use]
+    pub fn display(&self) -> String {
+        if self.atoms.contains(&ArgType::Mixed) {
+            return "mixed".to_owned();
+        }
+        let mut names: Vec<_> = self.atoms.iter().map(|atom| atom.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let joined = names.join("|");
+        if self.nullable && !names.contains(&"null") {
+            format!("?{joined}")
+        } else {
+            joined
+        }
+    }
+}
+
+/// Default parameter value metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DefaultValue {
+    /// No default value.
+    None,
+    /// Default `null`.
+    Null,
+    /// Default bool.
+    Bool(bool),
+    /// Default int.
+    Int(i64),
+    /// Default string bytes.
+    String(PhpString),
+}
+
+/// One parameter descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterInfo {
+    name: &'static str,
+    type_spec: TypeSpec,
+    required: bool,
+    variadic: bool,
+    by_ref: bool,
+    default: DefaultValue,
+}
+
+impl ParameterInfo {
+    /// Creates a required by-value parameter.
+    #[must_use]
+    pub fn required(name: &'static str, type_spec: TypeSpec) -> Self {
+        Self {
+            name,
+            type_spec,
+            required: true,
+            variadic: false,
+            by_ref: false,
+            default: DefaultValue::None,
+        }
+    }
+
+    /// Creates an optional by-value parameter.
+    #[must_use]
+    pub fn optional(name: &'static str, type_spec: TypeSpec, default: DefaultValue) -> Self {
+        Self {
+            name,
+            type_spec,
+            required: false,
+            variadic: false,
+            by_ref: false,
+            default,
+        }
+    }
+
+    /// Marks this parameter variadic.
+    #[must_use]
+    pub fn variadic(mut self) -> Self {
+        self.variadic = true;
+        self
+    }
+
+    /// Marks this parameter by-reference.
+    #[must_use]
+    pub fn by_ref(mut self) -> Self {
+        self.by_ref = true;
+        self
+    }
+
+    /// Parameter name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Parameter type.
+    #[must_use]
+    pub const fn type_spec(&self) -> &TypeSpec {
+        &self.type_spec
+    }
+
+    /// Whether the parameter is required.
+    #[must_use]
+    pub const fn is_required(&self) -> bool {
+        self.required
+    }
+
+    /// Whether the parameter is variadic.
+    #[must_use]
+    pub const fn is_variadic(&self) -> bool {
+        self.variadic
+    }
+
+    /// Whether the parameter requires by-reference passing.
+    #[must_use]
+    pub const fn is_by_ref(&self) -> bool {
+        self.by_ref
+    }
+
+    /// Default value metadata.
+    #[must_use]
+    pub const fn default(&self) -> &DefaultValue {
+        &self.default
+    }
+}
+
+/// Function signature metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionArgInfo {
+    name: &'static str,
+    params: Vec<ParameterInfo>,
+    return_type: TypeSpec,
+}
+
+impl FunctionArgInfo {
+    /// Creates function arginfo.
+    #[must_use]
+    pub fn new(name: &'static str, params: Vec<ParameterInfo>, return_type: TypeSpec) -> Self {
+        Self {
+            name,
+            params,
+            return_type,
+        }
+    }
+
+    /// Function name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Parameter metadata.
+    #[must_use]
+    pub fn params(&self) -> &[ParameterInfo] {
+        &self.params
+    }
+
+    /// Return type metadata.
+    #[must_use]
+    pub const fn return_type(&self) -> &TypeSpec {
+        &self.return_type
+    }
+}
+
+/// Successful validation output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedArguments {
+    values: Vec<Value>,
+}
+
+impl ValidatedArguments {
+    /// Coerced values in parameter order.
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+}
+
+/// Central argument validator for PHP standard-library builtins.
+#[derive(Clone, Debug)]
+pub struct ArgumentValidator {
+    mode: CoercionMode,
+}
+
+impl ArgumentValidator {
+    /// Creates a validator.
+    #[must_use]
+    pub const fn new(mode: CoercionMode) -> Self {
+        Self { mode }
+    }
+
+    /// Validates and coerces positional arguments.
+    pub fn validate(
+        &self,
+        info: &FunctionArgInfo,
+        args: &[Value],
+        span: RuntimeSourceSpan,
+    ) -> Result<ValidatedArguments, ArginfoError> {
+        let required = info
+            .params()
+            .iter()
+            .filter(|param| param.is_required())
+            .count();
+        let variadic = info.params().last().is_some_and(ParameterInfo::is_variadic);
+        if args.len() < required {
+            return Err(ArginfoError::type_error(
+                "E_PHP_STD_MISSING_ARGUMENT",
+                format!(
+                    "{}() expects at least {} argument{}, {} given",
+                    info.name(),
+                    required,
+                    plural(required),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        if !variadic && args.len() > info.params().len() {
+            return Err(ArginfoError::type_error(
+                "E_PHP_STD_TOO_MANY_ARGUMENTS",
+                format!(
+                    "{}() expects at most {} argument{}, {} given",
+                    info.name(),
+                    info.params().len(),
+                    plural(info.params().len()),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+
+        let mut values = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            let param = if let Some(param) = info.params().get(index) {
+                param
+            } else {
+                info.params().last().expect("variadic param exists")
+            };
+            values.push(self.coerce(info.name(), param, arg, span.clone())?);
+        }
+
+        for param in info.params().iter().skip(args.len()) {
+            match param.default() {
+                DefaultValue::None => {}
+                DefaultValue::Null => values.push(Value::Null),
+                DefaultValue::Bool(value) => values.push(Value::Bool(*value)),
+                DefaultValue::Int(value) => values.push(Value::Int(*value)),
+                DefaultValue::String(value) => values.push(Value::String(value.clone())),
+            }
+        }
+
+        Ok(ValidatedArguments { values })
+    }
+
+    fn coerce(
+        &self,
+        function: &str,
+        param: &ParameterInfo,
+        value: &Value,
+        span: RuntimeSourceSpan,
+    ) -> Result<Value, ArginfoError> {
+        if matches!(value, Value::Null) && param.type_spec().is_nullable() {
+            return Ok(Value::Null);
+        }
+        for atom in param.type_spec().atoms() {
+            if let Some(value) = match_exact(*atom, value) {
+                return Ok(value);
+            }
+        }
+        if self.mode == CoercionMode::Weak {
+            for atom in param.type_spec().atoms() {
+                if let Some(value) = weak_coerce(*atom, value) {
+                    return Ok(value);
+                }
+            }
+        }
+        Err(ArginfoError::type_error(
+            "E_PHP_STD_TYPE_ERROR",
+            format!(
+                "{}(): Argument ${} must be of type {}, {} given",
+                function,
+                param.name(),
+                param.type_spec().display(),
+                value_type(value)
+            ),
+            span,
+        ))
+    }
+}
+
+/// Arginfo validation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArginfoError {
+    diagnostic: RuntimeDiagnostic,
+    class: ArginfoErrorClass,
+}
+
+impl ArginfoError {
+    /// Creates a TypeError-like validation error.
+    #[must_use]
+    pub fn type_error(
+        id: &'static str,
+        message: impl Into<String>,
+        span: RuntimeSourceSpan,
+    ) -> Self {
+        Self {
+            diagnostic: RuntimeDiagnostic::new(
+                id,
+                RuntimeSeverity::FatalError,
+                message,
+                span,
+                Vec::new(),
+                None,
+            ),
+            class: ArginfoErrorClass::TypeError,
+        }
+    }
+
+    /// Creates a ValueError-like validation error.
+    #[must_use]
+    pub fn value_error(
+        id: &'static str,
+        message: impl Into<String>,
+        span: RuntimeSourceSpan,
+    ) -> Self {
+        Self {
+            diagnostic: RuntimeDiagnostic::new(
+                id,
+                RuntimeSeverity::FatalError,
+                message,
+                span,
+                Vec::new(),
+                None,
+            ),
+            class: ArginfoErrorClass::ValueError,
+        }
+    }
+
+    /// Error class.
+    #[must_use]
+    pub const fn class(&self) -> ArginfoErrorClass {
+        self.class
+    }
+
+    /// Diagnostic.
+    #[must_use]
+    pub const fn diagnostic(&self) -> &RuntimeDiagnostic {
+        &self.diagnostic
+    }
+}
+
+/// PHP error class modeled by arginfo.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArginfoErrorClass {
+    /// PHP `TypeError`.
+    TypeError,
+    /// PHP `ValueError`.
+    ValueError,
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn match_exact(atom: ArgType, value: &Value) -> Option<Value> {
+    match (atom, value) {
+        (ArgType::Mixed, value) => Some(value.clone()),
+        (ArgType::Null, Value::Null) => Some(Value::Null),
+        (ArgType::Bool, Value::Bool(_)) => Some(value.clone()),
+        (ArgType::Int, Value::Int(_)) => Some(value.clone()),
+        (ArgType::Float, Value::Float(_)) => Some(value.clone()),
+        (ArgType::String, Value::String(_)) => Some(value.clone()),
+        (ArgType::Array, Value::Array(_)) => Some(value.clone()),
+        (ArgType::Object, Value::Object(_)) => Some(value.clone()),
+        (ArgType::Callable, Value::Callable(_)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn weak_coerce(atom: ArgType, value: &Value) -> Option<Value> {
+    match atom {
+        ArgType::Bool => to_bool(value).ok().map(Value::Bool),
+        ArgType::Int => to_int(value).ok().map(Value::Int),
+        ArgType::Float => to_float(value).ok().map(Value::float),
+        ArgType::String => to_string(value).ok().map(Value::String),
+        _ => None,
+    }
+}
+
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::String(_) => "string",
+        Value::Uninitialized => "uninitialized",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Resource(_) => "resource",
+        Value::Fiber(_) => "Fiber",
+        Value::Generator(_) => "Generator",
+        Value::Callable(_) => "callable",
+        Value::Reference(_) => "reference",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span() -> RuntimeSourceSpan {
+        RuntimeSourceSpan {
+            file: Some("arginfo-fixture.php".to_owned()),
+            start: 3,
+            end: 9,
+        }
+    }
+
+    fn sample_info() -> FunctionArgInfo {
+        FunctionArgInfo::new(
+            "phase6_sample",
+            vec![
+                ParameterInfo::required("value", TypeSpec::one(ArgType::String)),
+                ParameterInfo::optional("limit", TypeSpec::one(ArgType::Int), DefaultValue::Int(3)),
+            ],
+            TypeSpec::one(ArgType::Bool),
+        )
+    }
+
+    #[test]
+    fn validates_missing_args_with_snapshot_message() {
+        let error = ArgumentValidator::new(CoercionMode::Weak)
+            .validate(&sample_info(), &[], span())
+            .expect_err("missing arg");
+
+        assert_eq!(error.class(), ArginfoErrorClass::TypeError);
+        assert_eq!(error.diagnostic().id(), "E_PHP_STD_MISSING_ARGUMENT");
+        assert_eq!(
+            error.diagnostic().message(),
+            "phase6_sample() expects at least 1 argument, 0 given"
+        );
+        assert_eq!(error.diagnostic().source_span().start, 3);
+    }
+
+    #[test]
+    fn validates_too_many_args_with_snapshot_message() {
+        let error = ArgumentValidator::new(CoercionMode::Weak)
+            .validate(
+                &sample_info(),
+                &[
+                    Value::String(PhpString::from("x")),
+                    Value::Int(1),
+                    Value::Int(2),
+                ],
+                span(),
+            )
+            .expect_err("too many args");
+
+        assert_eq!(error.diagnostic().id(), "E_PHP_STD_TOO_MANY_ARGUMENTS");
+        assert_eq!(
+            error.diagnostic().message(),
+            "phase6_sample() expects at most 2 arguments, 3 given"
+        );
+    }
+
+    #[test]
+    fn validates_wrong_type_with_snapshot_message() {
+        let error = ArgumentValidator::new(CoercionMode::Strict)
+            .validate(&sample_info(), &[Value::Array(Default::default())], span())
+            .expect_err("wrong type");
+
+        assert_eq!(error.diagnostic().id(), "E_PHP_STD_TYPE_ERROR");
+        assert_eq!(
+            error.diagnostic().message(),
+            "phase6_sample(): Argument $value must be of type string, array given"
+        );
+    }
+
+    #[test]
+    fn weak_coercion_and_defaults_are_applied_centrally() {
+        let validated = ArgumentValidator::new(CoercionMode::Weak)
+            .validate(&sample_info(), &[Value::Int(42)], span())
+            .expect("validated");
+
+        assert_eq!(
+            validated.values(),
+            &[Value::String(PhpString::from("42")), Value::Int(3),]
+        );
+    }
+
+    #[test]
+    fn union_nullable_variadic_and_by_ref_metadata_are_modelable() {
+        let info = FunctionArgInfo::new(
+            "phase6_meta",
+            vec![
+                ParameterInfo::required(
+                    "value",
+                    TypeSpec::union([ArgType::String, ArgType::Int]).nullable(),
+                )
+                .by_ref(),
+                ParameterInfo::required("rest", TypeSpec::one(ArgType::Mixed)).variadic(),
+            ],
+            TypeSpec::one(ArgType::Null),
+        );
+
+        assert!(info.params()[0].is_by_ref());
+        assert!(info.params()[0].type_spec().is_nullable());
+        assert!(info.params()[1].is_variadic());
+        assert_eq!(info.return_type().display(), "null");
+    }
+
+    #[test]
+    fn value_error_class_is_available_for_builtin_range_checks() {
+        let error = ArginfoError::value_error(
+            "E_PHP_STD_VALUE_ERROR",
+            "phase6_sample(): Argument $limit must be greater than 0",
+            span(),
+        );
+
+        assert_eq!(error.class(), ArginfoErrorClass::ValueError);
+        assert_eq!(error.diagnostic().id(), "E_PHP_STD_VALUE_ERROR");
+    }
+}

@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+jit-cranelift = ["dep:php_jit", "php_jit/jit-cranelift"]
+
 [dependencies]
 php_ir = { path = "../php_ir" }
+php_jit = { path = "../php_jit", optional = true }
 php_runtime = { path = "../php_runtime" }
 php_semantics = { path = "../php_semantics" }
 php_source = { path = "../php_source" }
+php_std = { path = "../php_std" }
 
 [dev-dependencies]
 php_testkit = { path = "../php_testkit" }

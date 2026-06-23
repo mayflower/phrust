@@ -2,7 +2,7 @@
 
 use crate::{
     PhpString, Value,
-    numeric_string::{NumericStringKind, NumericStringValue, classify as classify_numeric_string},
+    numeric_string::{NumericStringKind, NumericStringValue, classify_php_string},
 };
 use std::cmp::Ordering;
 
@@ -45,7 +45,7 @@ pub fn to_bool(value: &Value) -> Result<bool, String> {
         Value::String(value) => Ok(!value.is_empty() && value.as_bytes() != b"0"),
         Value::Uninitialized => Err("cannot convert uninitialized value to bool".to_owned()),
         Value::Array(array) => Ok(!array.is_empty()),
-        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => Ok(true),
+        Value::Object(_) | Value::Resource(_) | Value::Fiber(_) | Value::Generator(_) => Ok(true),
         Value::Callable(_) => Err("callable truthiness is not implemented".to_owned()),
         Value::Reference(cell) => to_bool(&cell.get()),
     }
@@ -68,6 +68,10 @@ pub fn to_string(value: &Value) -> Result<PhpString, String> {
             "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP: object __toString conversion is not implemented"
                 .to_owned(),
         ),
+        Value::Resource(resource) => Ok(PhpString::from_test_str(&format!(
+            "Resource id #{}",
+            resource.id().get()
+        ))),
         Value::Callable(_) => Err("callable to string conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_string(&cell.get()),
     }
@@ -80,7 +84,7 @@ pub fn to_int(value: &Value) -> Result<i64, String> {
         Value::Bool(true) => Ok(1),
         Value::Int(value) => Ok(*value),
         Value::Float(value) => Ok(value.to_f64() as i64),
-        Value::String(value) => Ok(classify_numeric_string(value.as_bytes())
+        Value::String(value) => Ok(classify_php_string(value)
             .value
             .map_or(0, NumericStringValue::to_i64)),
         Value::Uninitialized => Err("cannot convert uninitialized value to int".to_owned()),
@@ -88,6 +92,7 @@ pub fn to_int(value: &Value) -> Result<i64, String> {
         Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => {
             Err("E_PHP_RUNTIME_OBJECT_NUMERIC_CONVERSION_GAP: object to int conversion is not implemented".to_owned())
         }
+        Value::Resource(resource) => Ok(resource.id().get() as i64),
         Value::Callable(_) => Err("callable to int conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_int(&cell.get()),
     }
@@ -100,7 +105,7 @@ pub fn to_float(value: &Value) -> Result<f64, String> {
         Value::Bool(true) => Ok(1.0),
         Value::Int(value) => Ok(*value as f64),
         Value::Float(value) => Ok(value.to_f64()),
-        Value::String(value) => Ok(classify_numeric_string(value.as_bytes())
+        Value::String(value) => Ok(classify_php_string(value)
             .value
             .map_or(0.0, NumericStringValue::as_f64)),
         Value::Uninitialized => Err("cannot convert uninitialized value to float".to_owned()),
@@ -108,6 +113,7 @@ pub fn to_float(value: &Value) -> Result<f64, String> {
         Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => {
             Err("E_PHP_RUNTIME_OBJECT_NUMERIC_CONVERSION_GAP: object to float conversion is not implemented".to_owned())
         }
+        Value::Resource(resource) => Ok(resource.id().get() as f64),
         Value::Callable(_) => Err("callable to float conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_float(&cell.get()),
     }
@@ -126,6 +132,7 @@ pub fn to_number(value: &Value) -> Result<NumericValue, String> {
         Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => {
             Err("E_PHP_RUNTIME_OBJECT_NUMERIC_CONVERSION_GAP: object to number conversion is not implemented".to_owned())
         }
+        Value::Resource(resource) => Ok(NumericValue::Int(resource.id().get() as i64)),
         Value::Callable(_) => Err("callable to number conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_number(&cell.get()),
     }
@@ -141,6 +148,7 @@ pub fn identical(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Array(left), Value::Array(right)) => arrays_identical(left, right),
         (Value::Object(left), Value::Object(right)) => left.id() == right.id(),
+        (Value::Resource(left), Value::Resource(right)) => left.id() == right.id(),
         (Value::Reference(left), Value::Reference(right)) if left.ptr_eq(right) => true,
         (Value::Reference(left), right) => identical(&left.get(), right),
         (left, Value::Reference(right)) => identical(left, &right.get()),
@@ -155,6 +163,8 @@ pub fn equal(left: &Value, right: &Value) -> Result<bool, String> {
         (Value::Array(_), _) | (_, Value::Array(_)) => Ok(false),
         (Value::Object(left), Value::Object(right)) => objects_equal(left, right),
         (Value::Object(_), _) | (_, Value::Object(_)) => Ok(false),
+        (Value::Resource(left), Value::Resource(right)) => Ok(left.id() == right.id()),
+        (Value::Resource(_), _) | (_, Value::Resource(_)) => Ok(false),
         (Value::Reference(left), Value::Reference(right)) if left.ptr_eq(right) => Ok(true),
         (Value::Reference(left), right) => equal(&left.get(), right),
         (left, Value::Reference(right)) => equal(left, &right.get()),
@@ -200,6 +210,9 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ordering, String> {
         (Value::Object(left), Value::Object(right)) => objects_compare(left, right),
         (Value::Object(_), _) => Ok(Ordering::Greater),
         (_, Value::Object(_)) => Ok(Ordering::Less),
+        (Value::Resource(left), Value::Resource(right)) => Ok(left.id().cmp(&right.id())),
+        (Value::Resource(_), _) => Ok(Ordering::Greater),
+        (_, Value::Resource(_)) => Ok(Ordering::Less),
         _ => Err(format!(
             "loose comparison is not implemented for {} and {}",
             type_name(left),
@@ -234,7 +247,7 @@ fn compare_number_and_string(left: &Value, right: &Value) -> Result<Ordering, St
 }
 
 fn comparison_numeric_string(value: &PhpString) -> Option<NumericValue> {
-    let classified = classify_numeric_string(value.as_bytes());
+    let classified = classify_php_string(value);
     match (classified.kind, classified.value) {
         (
             NumericStringKind::IntString | NumericStringKind::FloatString,
@@ -249,7 +262,7 @@ fn comparison_numeric_string(value: &PhpString) -> Option<NumericValue> {
 }
 
 fn arithmetic_numeric_string(value: &PhpString) -> Result<NumericValue, String> {
-    let classified = classify_numeric_string(value.as_bytes());
+    let classified = classify_php_string(value);
     match (classified.kind, classified.value) {
         (
             NumericStringKind::IntString
@@ -354,6 +367,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Uninitialized => "uninitialized",
         Value::Array(_) => "array",
         Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => "object",
+        Value::Resource(_) => "resource",
         Value::Callable(_) => "callable",
         Value::Reference(_) => "reference",
     }

@@ -408,4 +408,12 @@ without parsing the text snapshot format.
 - valid locals and constants;
 - valid closure target function IDs and capture operands;
 - valid jump targets;
+- valid exception/finally edge targets;
+- valid call argument operands and by-reference metadata;
+- register operands defined on every reachable incoming control-flow path before
+  use;
 - every block has a terminator.
+
+Phase 7 extends the same verifier for optimizer/cache/JIT preparation. See
+`docs/phase7-ir-verifier.md` for the Phase 7 pre/post optimizer boundary,
+optimizer-sensitive instruction families, and stable verifier diagnostic IDs.

@@ -98,3 +98,9 @@ instead of interpreted.
 The `EXPECTF` subset is deliberately small and tested in `php_testkit::phpt`:
 `%%`, `%s`, `%S`, `%d`, `%i`, and `%w`. Generated PHP files and the aggregate
 `phpt-smoke-report.json` are written under `target/phase4/phpt-smoke`.
+
+Phase 6 adds `just phase6-phpt-smoke` for selected upstream extension PHPTs.
+That gate reads `fixtures/phase6/phpt_extension_manifest.toml`, references
+`third_party/php-src` paths without vendoring the PHPT suite, reports missing
+upstream files as explicit skips, and writes a path-normalized report under
+`target/phase6/phpt-extension-smoke`.

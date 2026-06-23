@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "run_id": "phase7-compare-fixture-baseline",
+  "environment": {
+    "engine_version": "fixture",
+    "rust_target_triple": "fixture",
+    "opt_flags": [],
+    "feature_flags": {}
+  },
+  "measurements": [
+    {
+      "scenario": {
+        "id": "phase7.perf_smoke.rust-vm.same",
+        "name": "same",
+        "group": "perf_smoke.rust-vm",
+        "fixture": "same.php"
+      },
+      "iterations": 1,
+      "metrics": [
+        {
+          "name": "wall_time_median",
+          "unit": "ms",
+          "value": 10.0,
+          "lower_is_better": true
+        },
+        {
+          "name": "stdout_bytes",
+          "unit": "bytes",
+          "value": 4.0,
+          "lower_is_better": false
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "id": "phase7.perf_smoke.rust-vm.missing",
+        "name": "missing",
+        "group": "perf_smoke.rust-vm",
+        "fixture": "missing.php"
+      },
+      "iterations": 1,
+      "metrics": [
+        {
+          "name": "wall_time_median",
+          "unit": "ms",
+          "value": 5.0,
+          "lower_is_better": true
+        }
+      ]
+    }
+  ]
+}

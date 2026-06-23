@@ -35,6 +35,7 @@ impl ArrayKey {
             Value::Uninitialized => Some(Self::String(PhpString::from_bytes(Vec::new()))),
             Value::Array(_)
             | Value::Object(_)
+            | Value::Resource(_)
             | Value::Fiber(_)
             | Value::Generator(_)
             | Value::Callable(_)
@@ -93,10 +94,21 @@ impl ArrayEntry {
 /// The storage is intentionally opaque. Today it is a simple insertion-ordered
 /// vector, but callers interact through key/value APIs that can later route to
 /// packed or mixed representations without changing the VM boundary.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ArrayStorage {
     entries: Vec<ArrayEntry>,
     next_append_key: Option<i64>,
+    packed_len: Option<usize>,
+}
+
+impl Default for ArrayStorage {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_append_key: None,
+            packed_len: Some(0),
+        }
+    }
 }
 
 /// Copy-on-write ordered PHP array facade.
@@ -105,9 +117,15 @@ struct ArrayStorage {
 /// `separate_for_write` through `storage_mut`, so by-value assignment shares
 /// until the first write while true PHP references still write through their
 /// owning slot/reference cell.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhpArray {
     storage: Rc<ArrayStorage>,
+}
+
+impl Default for PhpArray {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Weak debug handle to array storage for GC tests.
@@ -139,6 +157,7 @@ impl PhpArray {
             storage: Rc::new(ArrayStorage {
                 entries: Vec::new(),
                 next_append_key: None,
+                packed_len: Some(0),
             }),
         }
     }
@@ -169,6 +188,19 @@ impl PhpArray {
     #[must_use]
     pub fn is_shared(&self) -> bool {
         Rc::strong_count(&self.storage) > 1
+    }
+
+    /// Returns true when tracked metadata proves the array is exactly
+    /// `0..len` in insertion order.
+    #[must_use]
+    pub fn is_packed_fast(&self) -> bool {
+        self.storage.packed_len == Some(self.storage.entries.len())
+    }
+
+    /// Returns the packed length when tracked metadata proves packed storage.
+    #[must_use]
+    pub fn packed_len_fast(&self) -> Option<usize> {
+        self.is_packed_fast().then_some(self.storage.entries.len())
     }
 
     /// Returns a process-local storage identity for GC debug snapshots.
@@ -208,7 +240,11 @@ impl PhpArray {
         if let Some(entry) = storage.entries.iter_mut().find(|entry| entry.key == key) {
             return Some(std::mem::replace(&mut entry.value, value));
         }
+        let old_len = storage.entries.len();
+        let remains_packed = storage.packed_len == Some(old_len)
+            && matches!(key, ArrayKey::Int(value) if value == old_len as i64);
         storage.entries.push(ArrayEntry { key, value });
+        storage.packed_len = remains_packed.then_some(old_len + 1);
         None
     }
 
@@ -216,11 +252,15 @@ impl PhpArray {
     pub fn append(&mut self, value: Value) -> ArrayKey {
         let storage = self.storage_mut();
         let key = ArrayKey::Int(storage.next_append_key.unwrap_or(0));
+        let old_len = storage.entries.len();
+        let remains_packed = storage.packed_len == Some(old_len)
+            && matches!(key, ArrayKey::Int(value) if value == old_len as i64);
         bump_append_key(storage, &key);
         storage.entries.push(ArrayEntry {
             key: key.clone(),
             value,
         });
+        storage.packed_len = remains_packed.then_some(old_len + 1);
         key
     }
 
@@ -250,7 +290,19 @@ impl PhpArray {
             .entries
             .iter()
             .position(|entry| &entry.key == key)
-            .map(|index| storage.entries.remove(index).value)
+            .map(|index| {
+                let was_packed_len = storage.packed_len;
+                let value = storage.entries.remove(index).value;
+                if let Some(packed_len) = was_packed_len {
+                    storage.packed_len =
+                        if index + 1 == packed_len && index == storage.entries.len() {
+                            Some(storage.entries.len())
+                        } else {
+                            None
+                        };
+                }
+                value
+            })
     }
 
     /// Iterates in insertion order.
@@ -264,6 +316,9 @@ impl PhpArray {
     /// Returns packed elements only when the keys are exactly `0..len`.
     #[must_use]
     pub fn packed_elements(&self) -> Option<Vec<&Value>> {
+        if self.is_packed_fast() {
+            return Some(self.storage.entries.iter().map(ArrayEntry::value).collect());
+        }
         let mut elements = Vec::with_capacity(self.storage.entries.len());
         for (index, entry) in self.storage.entries.iter().enumerate() {
             if entry.key != ArrayKey::Int(index as i64) {
@@ -272,6 +327,25 @@ impl PhpArray {
             elements.push(&entry.value);
         }
         Some(elements)
+    }
+
+    /// Returns one packed element only when the keys are exactly `0..len`.
+    #[must_use]
+    pub fn packed_element(&self, index: usize) -> Option<&Value> {
+        for (entry_index, entry) in self.storage.entries.iter().enumerate() {
+            if entry.key != ArrayKey::Int(entry_index as i64) {
+                return None;
+            }
+        }
+        self.storage.entries.get(index).map(ArrayEntry::value)
+    }
+
+    /// Returns one packed element using only tracked metadata.
+    #[must_use]
+    pub fn packed_element_fast(&self, index: usize) -> Option<&Value> {
+        self.is_packed_fast()
+            .then(|| self.storage.entries.get(index).map(ArrayEntry::value))
+            .flatten()
     }
 
     fn storage_mut(&mut self) -> &mut ArrayStorage {
@@ -463,11 +537,23 @@ mod tests {
             ArrayKey::from_value_mvp(&Value::String(PhpString::from("9223372036854775808"))),
             Some(ArrayKey::String(PhpString::from("9223372036854775808")))
         );
+        assert_eq!(
+            ArrayKey::from_php_string(PhpString::from(" 42")),
+            ArrayKey::String(PhpString::from(" 42"))
+        );
+        assert_eq!(
+            ArrayKey::from_php_string(PhpString::from("1.0")),
+            ArrayKey::String(PhpString::from("1.0"))
+        );
     }
 
     #[test]
     fn array_packed_facade_detects_contiguous_integer_keys() {
         let packed = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        assert!(packed.is_packed_fast());
+        assert_eq!(packed.packed_len_fast(), Some(2));
+        assert_eq!(packed.packed_element_fast(1), Some(&Value::Int(2)));
+        assert_eq!(packed.packed_element_fast(2), None);
         assert_eq!(
             packed
                 .packed_elements()
@@ -477,9 +563,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Value::Int(1), Value::Int(2)]
         );
+        assert_eq!(packed.packed_element(1), Some(&Value::Int(2)));
+        assert_eq!(packed.packed_element(2), None);
 
         let mut mixed = packed;
         mixed.remove(&ArrayKey::Int(0));
+        assert!(!mixed.is_packed_fast());
         assert!(mixed.packed_elements().is_none());
+        assert_eq!(mixed.packed_element(0), None);
+        assert_eq!(mixed.packed_element_fast(0), None);
+    }
+
+    #[test]
+    fn packed_metadata_stays_fast_for_sequential_append_and_overwrite() {
+        let mut array = PhpArray::new();
+        array.append(Value::Int(1));
+        array.append(Value::Int(2));
+        array.insert(ArrayKey::Int(1), Value::Int(5));
+
+        assert!(array.is_packed_fast());
+        assert_eq!(array.packed_len_fast(), Some(2));
+        assert_eq!(array.packed_element_fast(1), Some(&Value::Int(5)));
+    }
+
+    #[test]
+    fn packed_metadata_transitions_for_non_sequential_int_key() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        array.insert(ArrayKey::Int(4), Value::Int(5));
+
+        assert!(!array.is_packed_fast());
+        assert!(array.packed_elements().is_none());
+        assert_eq!(array.packed_element_fast(1), None);
+    }
+
+    #[test]
+    fn packed_metadata_transitions_for_string_key() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        array.insert(ArrayKey::String(PhpString::from("x")), Value::Int(5));
+
+        assert!(!array.is_packed_fast());
+        assert!(array.packed_elements().is_none());
+    }
+
+    #[test]
+    fn packed_metadata_tracks_unset_holes_and_append_after_last_unset() {
+        let mut hole = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        hole.remove(&ArrayKey::Int(1));
+        assert!(!hole.is_packed_fast());
+        assert!(hole.packed_elements().is_none());
+
+        let mut tail = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        tail.remove(&ArrayKey::Int(2));
+        assert!(tail.is_packed_fast());
+        assert_eq!(tail.packed_len_fast(), Some(2));
+        assert_eq!(tail.append(Value::Int(4)), ArrayKey::Int(3));
+        assert!(!tail.is_packed_fast());
+        assert!(tail.packed_elements().is_none());
+    }
+
+    #[test]
+    fn packed_metadata_allows_reference_elements_without_cow_shortcuts() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1)]);
+        let cell = crate::ReferenceCell::new(Value::Int(2));
+        array.append(Value::Reference(cell.clone()));
+
+        assert!(array.is_packed_fast());
+        assert_eq!(array.packed_len_fast(), Some(2));
+        cell.set(Value::Int(7));
+        assert_eq!(array.packed_element_fast(1), Some(&Value::Reference(cell)));
     }
 }

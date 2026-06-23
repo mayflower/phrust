@@ -1,14 +1,20 @@
 //! Phase 4 VM CLI.
 
+use php_bytecode_cache::{
+    CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
+};
 use php_ir::{LoweringOptions, lower_frontend_result, verify_unit};
-use php_runtime::{ExitStatus, RuntimeContext};
+use php_optimizer::{OptimizationLevel, OptimizationReport, PassContext, PassPipeline};
+use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source};
 use php_source::TextRange;
-use php_vm::{IncludeLoader, Vm, VmOptions};
+use php_vm::{
+    IncludeLoader, InlineCacheMode, JitMode, QuickeningMode, TieringOptions, Vm, VmOptions,
+};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod todo_phase4;
 
@@ -146,25 +152,57 @@ where
 {
     let run_options = parse_run_args(args)?;
     let path = run_options.path;
-    let pipeline = match compile_pipeline(path) {
-        Ok(pipeline) => pipeline,
-        Err(error) => {
-            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+    let mut cache_stats = BytecodeCacheStats::new(run_options.bytecode_cache.mode);
+    let cache_context = prepare_bytecode_cache(path, &run_options, &mut cache_stats)?;
+    let cached = try_load_bytecode_cache(&run_options, cache_context.as_ref(), &mut cache_stats);
+    let (unit, compiled_pipeline) = if let Some(CachedIrArtifact { unit, .. }) = cached {
+        (unit, None)
+    } else {
+        let pipeline = match compile_pipeline_with_optimization(path, run_options.opt_level) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                if run_options.bytecode_cache.stats {
+                    write_cache_stats_json(stderr, &cache_stats)?;
+                }
+                writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+                return Ok(EXIT_COMPILE_ERROR);
+            }
+        };
+        if !pipeline.ok() {
+            if run_options.bytecode_cache.stats {
+                write_cache_stats_json(stderr, &cache_stats)?;
+            }
+            write_frontend_diagnostics(stderr, &pipeline)?;
             return Ok(EXIT_COMPILE_ERROR);
         }
+        if let Some(context) = cache_context.as_ref()
+            && run_options.bytecode_cache.mode.can_write()
+        {
+            store_bytecode_cache(context, &pipeline, &mut cache_stats);
+        }
+        let _optimizer_pass_count = pipeline.optimizer_pass_count();
+        (pipeline.lowering.unit.clone(), Some(pipeline))
     };
-    if !pipeline.ok() {
-        write_frontend_diagnostics(stderr, &pipeline)?;
-        return Ok(EXIT_COMPILE_ERROR);
-    }
+    let include_loader = include_loader_for(path).ok();
+    let runtime_context = runtime_context_for(
+        path,
+        run_options.script_args,
+        run_options.env,
+        include_loader.as_ref(),
+    );
     let vm = Vm::with_options(VmOptions {
-        include_loader: include_loader_for(path).ok(),
-        runtime_context: RuntimeContext::controlled_cli(path, run_options.script_args),
+        include_loader,
+        runtime_context,
         trace: run_options.trace,
         trace_runtime: run_options.trace_runtime,
+        collect_counters: run_options.counters_json.is_some(),
+        quickening: run_options.quickening,
+        inline_caches: run_options.inline_caches,
+        jit: run_options.jit,
+        tiering: run_options.tiering.clone(),
         ..VmOptions::default()
     });
-    let result = vm.execute(pipeline.lowering.unit.clone());
+    let result = vm.execute(unit);
     stdout
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
@@ -172,6 +210,22 @@ where
     if run_options.trace || run_options.trace_runtime {
         write_trace(stderr, &result.trace)?;
     }
+    if let Some(path) = run_options.counters_json {
+        let Some(counters) = &result.counters else {
+            return Err("counters were requested but not collected".to_string());
+        };
+        write_counters_json(path, counters)?;
+    }
+    if let Some(path) = run_options.tiering_stats_json {
+        let Some(stats) = &result.tiering_stats else {
+            return Err("tiering stats were requested but not collected".to_string());
+        };
+        write_tiering_stats_json(path, stats)?;
+    }
+    if run_options.bytecode_cache.stats {
+        write_cache_stats_json(stderr, &cache_stats)?;
+    }
+    drop(compiled_pipeline);
     match result.status.exit_status() {
         ExitStatus::Success => Ok(EXIT_SUCCESS),
         ExitStatus::CompileError => {
@@ -205,9 +259,12 @@ where
     };
 
     let vm_result = if pipeline.ok() {
+        let include_loader = include_loader_for(path).ok();
+        let runtime_context =
+            runtime_context_for(path, Vec::new(), Vec::new(), include_loader.as_ref());
         let vm = Vm::with_options(VmOptions {
-            include_loader: include_loader_for(path).ok(),
-            runtime_context: RuntimeContext::controlled_cli(path, Vec::new()),
+            include_loader,
+            runtime_context,
             ..VmOptions::default()
         });
         Some(vm.execute(pipeline.lowering.unit.clone()))
@@ -242,6 +299,7 @@ struct Pipeline {
     source: String,
     frontend: FrontendResult,
     lowering: php_ir::LoweringResult,
+    optimizer: Option<OptimizationReport>,
 }
 
 impl Pipeline {
@@ -281,15 +339,28 @@ impl Pipeline {
         out.push_str("}}");
         out
     }
+
+    fn optimizer_pass_count(&self) -> usize {
+        self.optimizer
+            .as_ref()
+            .map_or(0, OptimizationReport::enabled_pass_count)
+    }
 }
 
 fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
+    compile_pipeline_with_optimization(path, OptimizationLevel::O0)
+}
+
+fn compile_pipeline_with_optimization(
+    path: &str,
+    opt_level: OptimizationLevel,
+) -> Result<Pipeline, String> {
     let source = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
     let frontend = analyze_source(&source);
     let source_path = fs::canonicalize(path)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    let lowering = lower_frontend_result(
+    let mut lowering = lower_frontend_result(
         &frontend,
         LoweringOptions {
             source_path,
@@ -297,6 +368,19 @@ fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
             ..LoweringOptions::default()
         },
     );
+    let optimizer = if opt_level.runs_pipeline()
+        && !frontend.has_errors()
+        && lowering.diagnostics.is_empty()
+        && lowering.verification.is_ok()
+    {
+        let report = PassPipeline::phase7()
+            .run(&mut lowering.unit, &PassContext::new(opt_level))
+            .map_err(|error| format!("{path}: optimizer failed: {error}"))?;
+        lowering.verification = verify_unit(&lowering.unit);
+        Some(report)
+    } else {
+        None
+    };
     if !frontend.has_errors() && lowering.verification.is_ok() {
         verify_unit(&lowering.unit).map_err(|errors| {
             format!("{path}: IR verification failed: {} error(s)", errors.len())
@@ -307,6 +391,7 @@ fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
         source,
         frontend,
         lowering,
+        optimizer,
     })
 }
 
@@ -315,7 +400,23 @@ fn include_loader_for(path: &str) -> Result<IncludeLoader, String> {
     let root = path
         .parent()
         .ok_or_else(|| format!("{}: missing parent directory", path.display()))?;
-    IncludeLoader::for_root(root.to_path_buf())
+    let cwd = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+    IncludeLoader::new([root.to_path_buf(), cwd])
+}
+
+fn runtime_context_for(
+    path: &str,
+    script_args: Vec<String>,
+    env: Vec<(String, String)>,
+    include_loader: Option<&IncludeLoader>,
+) -> RuntimeContext {
+    let context = RuntimeContext::controlled_cli(path, script_args).with_env(env);
+    let Some(loader) = include_loader else {
+        return context;
+    };
+    context.with_filesystem_capabilities(
+        FilesystemCapabilities::none().with_allowed_roots(loader.allowed_roots().to_vec()),
+    )
 }
 
 fn write_frontend_diagnostics<W: Write>(stderr: &mut W, pipeline: &Pipeline) -> Result<(), String> {
@@ -451,8 +552,96 @@ struct DumpIrOptions<'a> {
 struct RunOptions<'a> {
     path: &'a str,
     script_args: Vec<String>,
+    env: Vec<(String, String)>,
     trace: bool,
     trace_runtime: bool,
+    counters_json: Option<String>,
+    bytecode_cache: BytecodeCacheOptions,
+    opt_level: OptimizationLevel,
+    quickening: QuickeningMode,
+    inline_caches: InlineCacheMode,
+    jit: JitMode,
+    tiering: TieringOptions,
+    tiering_stats_json: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BytecodeCacheMode {
+    Off,
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl BytecodeCacheMode {
+    fn can_read(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    fn can_write(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "read-write",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BytecodeCacheOptions {
+    mode: BytecodeCacheMode,
+    dir: Option<PathBuf>,
+    stats: bool,
+    clear: bool,
+}
+
+impl Default for BytecodeCacheOptions {
+    fn default() -> Self {
+        Self {
+            mode: BytecodeCacheMode::Off,
+            dir: None,
+            stats: false,
+            clear: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BytecodeCacheContext {
+    fingerprint: CacheFingerprint,
+    cache_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct BytecodeCacheStats {
+    mode: BytecodeCacheMode,
+    cache_file: Option<PathBuf>,
+    hit: bool,
+    miss: bool,
+    wrote: bool,
+    cleared: bool,
+    load_error: Option<String>,
+    store_error: Option<String>,
+}
+
+impl BytecodeCacheStats {
+    fn new(mode: BytecodeCacheMode) -> Self {
+        Self {
+            mode,
+            cache_file: None,
+            hit: false,
+            miss: false,
+            wrote: false,
+            cleared: false,
+            load_error: None,
+            store_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,13 +679,178 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     };
 
     let mut path = None;
+    let mut env = Vec::new();
     let mut trace = false;
     let mut trace_runtime = false;
+    let mut counters_json = None;
+    let mut bytecode_cache = BytecodeCacheOptions::default();
+    let mut opt_level = OptimizationLevel::O0;
+    let mut quickening = QuickeningMode::Off;
+    let mut inline_caches = InlineCacheMode::Off;
+    let mut jit = JitMode::Off;
+    let mut tiering = TieringOptions::default();
+    let mut tiering_stats_json = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--trace" => trace = true,
             "--trace-runtime" => trace_runtime = true,
+            "--bytecode-cache" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(
+                        "run --bytecode-cache requires off, read, write, or read-write".to_string(),
+                    );
+                };
+                bytecode_cache.mode = parse_bytecode_cache_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--bytecode-cache=") => {
+                bytecode_cache.mode = parse_bytecode_cache_mode(value)?;
+            }
+            "--bytecode-cache-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --bytecode-cache-dir requires <path>".to_string());
+                };
+                bytecode_cache.dir = Some(PathBuf::from(value));
+            }
+            arg if let Some(value) = arg.strip_prefix("--bytecode-cache-dir=") => {
+                bytecode_cache.dir = Some(PathBuf::from(value));
+            }
+            "--bytecode-cache-stats" => bytecode_cache.stats = true,
+            "--clear-bytecode-cache" => bytecode_cache.clear = true,
+            "--opt-level" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --opt-level requires <level>".to_string());
+                };
+                opt_level = parse_optimization_level(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--opt-level=") => {
+                opt_level = parse_optimization_level(value)?;
+            }
+            "--quickening" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --quickening requires off or on".to_string());
+                };
+                quickening = parse_quickening_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--quickening=") => {
+                quickening = parse_quickening_mode(value)?;
+            }
+            "--inline-caches" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --inline-caches requires off or on".to_string());
+                };
+                inline_caches = parse_inline_cache_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--inline-caches=") => {
+                inline_caches = parse_inline_cache_mode(value)?;
+            }
+            "--jit" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --jit requires off or on".to_string());
+                };
+                jit = parse_jit_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--jit=") => {
+                jit = parse_jit_mode(value)?;
+            }
+            "--tiering" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --tiering requires off or on".to_string());
+                };
+                tiering.enabled = parse_on_off(value, "tiering")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering=") => {
+                tiering.enabled = parse_on_off(value, "tiering")?;
+            }
+            "--tiering-function-threshold" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --tiering-function-threshold requires <count>".to_string());
+                };
+                tiering.function_entry_threshold =
+                    parse_u64_option(value, "tiering-function-threshold")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering-function-threshold=") => {
+                tiering.function_entry_threshold =
+                    parse_u64_option(value, "tiering-function-threshold")?;
+            }
+            "--tiering-loop-threshold" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --tiering-loop-threshold requires <count>".to_string());
+                };
+                tiering.loop_backedge_threshold =
+                    parse_u64_option(value, "tiering-loop-threshold")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering-loop-threshold=") => {
+                tiering.loop_backedge_threshold =
+                    parse_u64_option(value, "tiering-loop-threshold")?;
+            }
+            "--tiering-ic-stability-threshold" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --tiering-ic-stability-threshold requires <score>".to_string());
+                };
+                tiering.ic_stability_threshold =
+                    parse_i64_option(value, "tiering-ic-stability-threshold")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering-ic-stability-threshold=") => {
+                tiering.ic_stability_threshold =
+                    parse_i64_option(value, "tiering-ic-stability-threshold")?;
+            }
+            "--tiering-guard-failure-threshold" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(
+                        "run --tiering-guard-failure-threshold requires <count>".to_string()
+                    );
+                };
+                tiering.guard_failure_threshold =
+                    parse_u64_option(value, "tiering-guard-failure-threshold")?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering-guard-failure-threshold=") => {
+                tiering.guard_failure_threshold =
+                    parse_u64_option(value, "tiering-guard-failure-threshold")?;
+            }
+            "--tiering-stats-json" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --tiering-stats-json requires <path>".to_string());
+                };
+                tiering_stats_json = Some(value.clone());
+                tiering.collect_stats = true;
+            }
+            arg if let Some(value) = arg.strip_prefix("--tiering-stats-json=") => {
+                tiering_stats_json = Some(value.to_owned());
+                tiering.collect_stats = true;
+            }
+            "--counters-json" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --counters-json requires <path>".to_string());
+                };
+                counters_json = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--counters-json=") => {
+                counters_json = Some(value.to_owned());
+            }
+            "--env" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --env requires KEY=VALUE".to_string());
+                };
+                env.push(parse_env_assignment(value)?);
+            }
+            arg if let Some(value) = arg.strip_prefix("--env=") => {
+                env.push(parse_env_assignment(value)?);
+            }
             "--" => {
                 let Some(path) = path else {
                     return Err("run requires <path.php> before `--`".to_string());
@@ -504,8 +858,17 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 return Ok(RunOptions {
                     path,
                     script_args: args[index + 1..].to_vec(),
+                    env,
                     trace,
                     trace_runtime,
+                    counters_json,
+                    bytecode_cache,
+                    opt_level,
+                    quickening,
+                    inline_caches,
+                    jit,
+                    tiering,
+                    tiering_stats_json,
                 });
             }
             arg if path.is_none() => path = Some(arg),
@@ -523,9 +886,317 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     Ok(RunOptions {
         path,
         script_args: Vec::new(),
+        env,
         trace,
         trace_runtime,
+        counters_json,
+        bytecode_cache,
+        opt_level,
+        quickening,
+        inline_caches,
+        jit,
+        tiering,
+        tiering_stats_json,
     })
+}
+
+fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {
+    match value {
+        "off" => Ok(false),
+        "on" => Ok(true),
+        _ => Err(format!(
+            "unsupported {flag} mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_u64_option(value: &str, flag: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("run --{flag} requires a non-negative integer"))
+}
+
+fn parse_i64_option(value: &str, flag: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("run --{flag} requires an integer"))
+}
+
+fn parse_quickening_mode(value: &str) -> Result<QuickeningMode, String> {
+    match value {
+        "off" => Ok(QuickeningMode::Off),
+        "on" => Ok(QuickeningMode::On),
+        _ => Err(format!(
+            "unsupported quickening mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_inline_cache_mode(value: &str) -> Result<InlineCacheMode, String> {
+    match value {
+        "off" => Ok(InlineCacheMode::Off),
+        "on" => Ok(InlineCacheMode::On),
+        _ => Err(format!(
+            "unsupported inline-cache mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_jit_mode(value: &str) -> Result<JitMode, String> {
+    match value {
+        "off" => Ok(JitMode::Off),
+        "on" => Ok(JitMode::On),
+        _ => Err(format!(
+            "unsupported jit mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_bytecode_cache_mode(value: &str) -> Result<BytecodeCacheMode, String> {
+    match value {
+        "off" => Ok(BytecodeCacheMode::Off),
+        "read" => Ok(BytecodeCacheMode::Read),
+        "write" => Ok(BytecodeCacheMode::Write),
+        "read-write" => Ok(BytecodeCacheMode::ReadWrite),
+        _ => Err(format!(
+            "unsupported bytecode cache mode `{value}`; expected off, read, write, or read-write"
+        )),
+    }
+}
+
+fn parse_optimization_level(value: &str) -> Result<OptimizationLevel, String> {
+    value
+        .parse()
+        .map_err(|error: php_optimizer::ParseOptimizationLevelError| error.to_string())
+}
+
+fn prepare_bytecode_cache(
+    path: &str,
+    run_options: &RunOptions<'_>,
+    stats: &mut BytecodeCacheStats,
+) -> Result<Option<BytecodeCacheContext>, String> {
+    if run_options.bytecode_cache.mode == BytecodeCacheMode::Off
+        && !run_options.bytecode_cache.clear
+    {
+        return Ok(None);
+    }
+
+    let cache_dir = run_options
+        .bytecode_cache
+        .dir
+        .clone()
+        .unwrap_or_else(default_bytecode_cache_dir);
+    if run_options.bytecode_cache.clear {
+        clear_bytecode_cache_dir(&cache_dir)?;
+        stats.cleared = true;
+    }
+    if run_options.bytecode_cache.mode == BytecodeCacheMode::Off {
+        return Ok(None);
+    }
+
+    let source = match fs::read(path) {
+        Ok(source) => source,
+        Err(_) => {
+            stats.miss = true;
+            return Ok(None);
+        }
+    };
+    let source_path = fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let fingerprint = CacheFingerprint::from_inputs(
+        CacheFingerprintInput::new(source, env!("CARGO_PKG_VERSION"), rust_target_label())
+            .with_source_path(source_path)
+            .with_opt_level(run_options.opt_level.as_str())
+            .with_feature_flag("bytecode_cache", true)
+            .with_runtime_config("script_env_count", run_options.env.len().to_string()),
+    )
+    .map_err(|error| format!("bytecode cache fingerprint: {error}"))?;
+    let cache_file = cache_file_for(&cache_dir, &fingerprint)?;
+    stats.cache_file = Some(cache_file.clone());
+
+    Ok(Some(BytecodeCacheContext {
+        fingerprint,
+        cache_file,
+    }))
+}
+
+fn try_load_bytecode_cache(
+    run_options: &RunOptions<'_>,
+    context: Option<&BytecodeCacheContext>,
+    stats: &mut BytecodeCacheStats,
+) -> Option<CachedIrArtifact> {
+    if !run_options.bytecode_cache.mode.can_read() {
+        return None;
+    }
+    let Some(context) = context else {
+        stats.miss = true;
+        return None;
+    };
+    let bytes = match fs::read(&context.cache_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            stats.miss = true;
+            return None;
+        }
+        Err(error) => {
+            stats.miss = true;
+            stats.load_error = Some(error.to_string());
+            return None;
+        }
+    };
+    match CacheArtifact::load_ir_unit(&bytes, &rust_target_label(), &context.fingerprint) {
+        Ok(cached) => {
+            stats.hit = true;
+            Some(cached)
+        }
+        Err(error) => {
+            stats.miss = true;
+            stats.load_error = Some(error.to_string());
+            None
+        }
+    }
+}
+
+fn store_bytecode_cache(
+    context: &BytecodeCacheContext,
+    pipeline: &Pipeline,
+    stats: &mut BytecodeCacheStats,
+) {
+    let Some(parent) = context.cache_file.parent() else {
+        stats.store_error = Some("cache file has no parent directory".to_string());
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        stats.store_error = Some(format!("{}: {error}", parent.display()));
+        return;
+    }
+    let header = CacheHeader::new(
+        env!("CARGO_PKG_VERSION"),
+        "phase7-ir-cache-abi-1",
+        rust_target_label(),
+        context.fingerprint.clone(),
+    );
+    let artifact = match CacheArtifact::from_ir_unit(header, &pipeline.lowering.unit) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            stats.store_error = Some(error.to_string());
+            return;
+        }
+    };
+    let bytes = match artifact.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            stats.store_error = Some(error.to_string());
+            return;
+        }
+    };
+    match fs::write(&context.cache_file, bytes) {
+        Ok(()) => stats.wrote = true,
+        Err(error) => {
+            stats.store_error = Some(format!("{}: {error}", context.cache_file.display()))
+        }
+    }
+}
+
+fn default_bytecode_cache_dir() -> PathBuf {
+    PathBuf::from("target/phase7/bytecode-cache")
+}
+
+fn cache_file_for(cache_dir: &Path, fingerprint: &CacheFingerprint) -> Result<PathBuf, String> {
+    if !fingerprint.digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("bytecode cache fingerprint digest is not hex".to_string());
+    }
+    Ok(cache_dir.join(format!("{}.phbc", fingerprint.digest)))
+}
+
+fn clear_bytecode_cache_dir(cache_dir: &Path) -> Result<(), String> {
+    match fs::read_dir(cache_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("{}: {error}", cache_dir.display()))?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("phbc") {
+                    fs::remove_file(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{}: {error}", cache_dir.display())),
+    }
+}
+
+fn rust_target_label() -> String {
+    format!("{}-{}", env::consts::ARCH, env::consts::OS)
+}
+
+fn write_cache_stats_json<W: Write>(
+    stderr: &mut W,
+    stats: &BytecodeCacheStats,
+) -> Result<(), String> {
+    let mut json = String::new();
+    json.push_str("{\"bytecode_cache\":{");
+    json.push_str("\"mode\":\"");
+    json.push_str(stats.mode.as_str());
+    json.push_str("\",\"hit\":");
+    json.push_str(if stats.hit { "true" } else { "false" });
+    json.push_str(",\"miss\":");
+    json.push_str(if stats.miss { "true" } else { "false" });
+    json.push_str(",\"wrote\":");
+    json.push_str(if stats.wrote { "true" } else { "false" });
+    json.push_str(",\"cleared\":");
+    json.push_str(if stats.cleared { "true" } else { "false" });
+    if let Some(path) = &stats.cache_file {
+        json.push_str(",\"file\":\"");
+        json.push_str(&escape_json(&path.to_string_lossy()));
+        json.push('"');
+    }
+    if let Some(error) = &stats.load_error {
+        json.push_str(",\"load_error\":\"");
+        json.push_str(&escape_json(error));
+        json.push('"');
+    }
+    if let Some(error) = &stats.store_error {
+        json.push_str(",\"store_error\":\"");
+        json.push_str(&escape_json(error));
+        json.push('"');
+    }
+    json.push_str("}}\n");
+    stderr
+        .write_all(json.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn write_counters_json(path: String, counters: &php_vm::VmCounters) -> Result<(), String> {
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    fs::write(path, counters.to_json()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn write_tiering_stats_json(path: String, stats: &php_vm::TieringStats) -> Result<(), String> {
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    fs::write(path, stats.to_json()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn parse_env_assignment(value: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err("run --env requires KEY=VALUE".to_string());
+    };
+    if key.is_empty() {
+        return Err("run --env requires a non-empty key".to_string());
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 fn parse_report_args(args: &[String]) -> Result<ReportOptions<'_>, String> {
@@ -568,7 +1239,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm run [--trace] [--trace-runtime] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--quickening off|on] [--inline-caches off|on] [--jit off|on] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -927,7 +1598,13 @@ fn path_exists(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, run};
+    use super::{
+        BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, OptimizationLevel,
+        QuickeningMode, cache_file_for, compile_pipeline_with_optimization, parse_run_args, run,
+    };
+    use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
+    use php_vm::{InlineCacheMode, JitMode};
+    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -979,6 +1656,189 @@ mod tests {
     }
 
     #[test]
+    fn opt_level_one_reports_phase7_optimizer_passes() {
+        let pipeline = compile_pipeline_with_optimization(
+            &fixture("tests/fixtures/phase7/perf_smoke/arithmetic.php"),
+            OptimizationLevel::O1,
+        )
+        .expect("fixture should compile");
+
+        assert!(pipeline.ok());
+        let report = pipeline.optimizer.expect("level 1 should run optimizer");
+        assert_eq!(report.level, OptimizationLevel::O1);
+        assert_eq!(report.enabled_pass_count(), 5);
+        assert_eq!(report.passes[0].name, "phase7_pre_verify_noop");
+        assert_eq!(report.passes[1].name, "constant_folding_safe_subset");
+        assert_eq!(report.passes[2].name, "peephole_simplify");
+        assert_eq!(report.passes[3].name, "branch_simplify");
+        assert_eq!(report.passes[4].name, "phase7_post_verify_noop");
+        assert!(report.passes.iter().all(|pass| pass.source_spans_preserved));
+    }
+
+    #[test]
+    fn opt_level_zero_has_no_optimizer_report() {
+        let pipeline = compile_pipeline_with_optimization(
+            &fixture("tests/fixtures/phase7/perf_smoke/arithmetic.php"),
+            OptimizationLevel::O0,
+        )
+        .expect("fixture should compile");
+
+        assert!(pipeline.ok());
+        assert!(pipeline.optimizer.is_none());
+    }
+
+    #[test]
+    fn run_opt_level_zero_and_one_are_identical_for_phase7_fixtures() {
+        for fixture in optimizer_fixture_paths() {
+            let mut stdout_zero = Vec::new();
+            let mut stderr_zero = Vec::new();
+            let code_zero = run(
+                [
+                    "run".to_string(),
+                    "--opt-level=0".to_string(),
+                    fixture.clone(),
+                ],
+                &mut stdout_zero,
+                &mut stderr_zero,
+            );
+
+            let mut stdout_one = Vec::new();
+            let mut stderr_one = Vec::new();
+            let code_one = run(
+                [
+                    "run".to_string(),
+                    "--opt-level=1".to_string(),
+                    fixture.clone(),
+                ],
+                &mut stdout_one,
+                &mut stderr_one,
+            );
+
+            assert_eq!(code_one, code_zero, "{fixture}");
+            assert_eq!(stdout_one, stdout_zero, "{fixture}");
+            assert_eq!(stderr_one, stderr_zero, "{fixture}");
+        }
+    }
+
+    #[test]
+    fn invalid_opt_level_is_rejected() {
+        let args = vec![
+            "--opt-level=3".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("level 3 should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected 0, 1, or 2"));
+    }
+
+    #[test]
+    fn invalid_quickening_mode_is_rejected() {
+        let args = vec![
+            "--quickening=maybe".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid quickening mode should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected off or on"));
+    }
+
+    #[test]
+    fn invalid_inline_cache_mode_is_rejected() {
+        let args = vec![
+            "--inline-caches=maybe".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid inline-cache mode should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected off or on"));
+    }
+
+    #[test]
+    fn invalid_jit_mode_is_rejected() {
+        let args = vec![
+            "--jit=maybe".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid jit mode should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected off or on"));
+    }
+
+    #[test]
+    fn invalid_tiering_mode_is_rejected() {
+        let args = vec![
+            "--tiering=maybe".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid tiering mode should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected off or on"));
+    }
+
+    #[test]
+    fn invalid_tiering_threshold_is_rejected() {
+        let args = vec![
+            "--tiering-function-threshold=soon".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid tiering threshold should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn run_counters_json_writes_file_without_stdout_leak() {
+        let path =
+            std::env::temp_dir().join(format!("phrust-vm-counters-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--counters-json".to_string(),
+                path.display().to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello phase4\n");
+        assert!(stderr.is_empty());
+        let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
+        let _ = std::fs::remove_file(&path);
+        assert!(json.contains("\"instructions_executed\""));
+        assert!(json.contains("\"echo\": 1"));
+        assert!(json.contains("\"guard_failures\": 0"));
+    }
+
+    #[test]
     fn args_after_separator_initialize_argc_and_argv() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1019,6 +1879,205 @@ mod tests {
                 .unwrap()
                 .contains("pass script arguments after `--`")
         );
+    }
+
+    #[test]
+    fn run_args_accept_controlled_environment_entries() {
+        let args = vec![
+            "--env".to_string(),
+            "COMPOSER_HOME=/tmp/composer".to_string(),
+            "--env=COMPOSER_CACHE_DIR=/tmp/cache".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+            "--".to_string(),
+            "script-arg".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.path, "fixtures/runtime/valid/hello.php");
+        assert_eq!(options.script_args, vec!["script-arg"]);
+        assert_eq!(options.counters_json, None);
+        assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
+        assert_eq!(options.opt_level, OptimizationLevel::O0);
+        assert_eq!(options.quickening, QuickeningMode::Off);
+        assert_eq!(options.inline_caches, InlineCacheMode::Off);
+        assert_eq!(options.jit, JitMode::Off);
+        assert!(options.tiering.enabled);
+        assert!(!options.tiering.collect_stats);
+        assert_eq!(options.tiering_stats_json, None);
+        assert_eq!(
+            options.env,
+            vec![
+                ("COMPOSER_HOME".to_string(), "/tmp/composer".to_string()),
+                ("COMPOSER_CACHE_DIR".to_string(), "/tmp/cache".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_accept_bytecode_cache_options() {
+        let args = vec![
+            "--bytecode-cache=read-write".to_string(),
+            "--bytecode-cache-dir".to_string(),
+            "target/phase7/cli-cache".to_string(),
+            "--bytecode-cache-stats".to_string(),
+            "--clear-bytecode-cache".to_string(),
+            "--opt-level=1".to_string(),
+            "--quickening=on".to_string(),
+            "--inline-caches=on".to_string(),
+            "--jit=on".to_string(),
+            "--tiering=off".to_string(),
+            "--tiering-function-threshold=3".to_string(),
+            "--tiering-loop-threshold".to_string(),
+            "4".to_string(),
+            "--tiering-ic-stability-threshold=5".to_string(),
+            "--tiering-guard-failure-threshold".to_string(),
+            "6".to_string(),
+            "--tiering-stats-json=target/phase7/tiering.json".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::ReadWrite);
+        assert_eq!(
+            options.bytecode_cache.dir,
+            Some(PathBuf::from("target/phase7/cli-cache"))
+        );
+        assert!(options.bytecode_cache.stats);
+        assert!(options.bytecode_cache.clear);
+        assert_eq!(options.opt_level, OptimizationLevel::O1);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::On);
+        assert!(!options.tiering.enabled);
+        assert!(options.tiering.collect_stats);
+        assert_eq!(options.tiering.function_entry_threshold, 3);
+        assert_eq!(options.tiering.loop_backedge_threshold, 4);
+        assert_eq!(options.tiering.ic_stability_threshold, 5);
+        assert_eq!(options.tiering.guard_failure_threshold, 6);
+        assert_eq!(
+            options.tiering_stats_json,
+            Some("target/phase7/tiering.json".to_string())
+        );
+    }
+
+    #[test]
+    fn run_tiering_stats_json_writes_file_without_stdout_leak() {
+        let path =
+            std::env::temp_dir().join(format!("phrust-vm-tiering-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--tiering-stats-json".to_string(),
+                path.display().to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello phase4\n");
+        assert!(stderr.is_empty());
+        let json = std::fs::read_to_string(&path).expect("tiering JSON should be written");
+        let _ = std::fs::remove_file(&path);
+        assert!(json.contains("\"function_entry_count\""));
+        assert!(json.contains("\"tier0_interpreter_entries\""));
+        assert!(json.contains("\"tiering_disabled_entries\""));
+    }
+
+    #[test]
+    fn run_bytecode_cache_first_write_then_second_read_hits() {
+        let cache_dir = cache_test_dir("write-read");
+        reset_dir(&cache_dir);
+        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+
+        let first = run_cache_fixture_with_mode(&fixture, &cache_dir, "0", "write");
+        assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
+        assert_eq!(first.1, b"cache:5\n");
+        assert!(first.2.contains("\"wrote\":true"), "{}", first.2);
+        assert!(!cache_files(&cache_dir).is_empty());
+
+        let second = run_cache_fixture_with_mode(&fixture, &cache_dir, "0", "read");
+        assert_eq!(second.0, EXIT_SUCCESS, "{}", second.2);
+        assert_eq!(second.1, b"cache:5\n");
+        assert!(second.2.contains("\"hit\":true"), "{}", second.2);
+        assert!(!second.2.contains("load_error"), "{}", second.2);
+    }
+
+    #[test]
+    fn run_bytecode_cache_source_change_misses() {
+        let cache_dir = cache_test_dir("source-change");
+        reset_dir(&cache_dir);
+        let source = cache_dir.join("source-change.php");
+        fs::write(&source, "<?php echo \"one\\n\";").expect("write source");
+
+        let first = run_cache_fixture(&source.display().to_string(), &cache_dir, "0");
+        assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
+        assert_eq!(first.1, b"one\n");
+        assert!(first.2.contains("\"wrote\":true"), "{}", first.2);
+
+        fs::write(&source, "<?php echo \"two\\n\";").expect("rewrite source");
+        let second = run_cache_fixture(&source.display().to_string(), &cache_dir, "0");
+        assert_eq!(second.0, EXIT_SUCCESS, "{}", second.2);
+        assert_eq!(second.1, b"two\n");
+        assert!(second.2.contains("\"miss\":true"), "{}", second.2);
+        assert!(!second.2.contains("\"hit\":true"), "{}", second.2);
+    }
+
+    #[test]
+    fn run_bytecode_cache_opt_level_change_misses() {
+        let cache_dir = cache_test_dir("opt-level-change");
+        reset_dir(&cache_dir);
+        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+
+        let first = run_cache_fixture(&fixture, &cache_dir, "0");
+        assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
+        assert!(first.2.contains("\"wrote\":true"), "{}", first.2);
+
+        let second = run_cache_fixture(&fixture, &cache_dir, "1");
+        assert_eq!(second.0, EXIT_SUCCESS, "{}", second.2);
+        assert_eq!(second.1, b"cache:5\n");
+        assert!(second.2.contains("\"miss\":true"), "{}", second.2);
+        assert!(!second.2.contains("\"hit\":true"), "{}", second.2);
+    }
+
+    #[test]
+    fn run_bytecode_cache_corrupt_cache_does_not_block_execution() {
+        let cache_dir = cache_test_dir("corrupt");
+        reset_dir(&cache_dir);
+        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+
+        let first = run_cache_fixture(&fixture, &cache_dir, "0");
+        assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
+        for file in cache_files(&cache_dir) {
+            fs::write(file, b"not a bytecode cache").expect("corrupt cache file");
+        }
+
+        let second = run_cache_fixture(&fixture, &cache_dir, "0");
+        assert_eq!(second.0, EXIT_SUCCESS, "{}", second.2);
+        assert_eq!(second.1, b"cache:5\n");
+        assert!(second.2.contains("\"miss\":true"), "{}", second.2);
+        assert!(second.2.contains("load_error"), "{}", second.2);
+    }
+
+    #[test]
+    fn run_bytecode_cache_rejects_non_hex_digest_path_component() {
+        let cache_dir = PathBuf::from("target/phase7/cli-cache");
+        let mut fingerprint = CacheFingerprint::from_inputs(
+            CacheFingerprintInput::new(b"<?php echo 1;\n", env!("CARGO_PKG_VERSION"), "test")
+                .with_feature_flag("bytecode_cache", true),
+        )
+        .expect("fingerprint");
+        fingerprint.digest = "../outside".to_string();
+
+        let error = cache_file_for(&cache_dir, &fingerprint).expect_err("digest must be rejected");
+
+        assert_eq!(error, "bytecode cache fingerprint digest is not hex");
     }
 
     #[test]
@@ -1221,6 +2280,80 @@ mod tests {
             stderr.contains("\"stack\":[{\"function\":\"main\"}]"),
             "{stderr}"
         );
+    }
+
+    fn run_cache_fixture(
+        path: &str,
+        cache_dir: &std::path::Path,
+        opt_level: &str,
+    ) -> (i32, Vec<u8>, String) {
+        run_cache_fixture_with_mode(path, cache_dir, opt_level, "read-write")
+    }
+
+    fn run_cache_fixture_with_mode(
+        path: &str,
+        cache_dir: &std::path::Path,
+        opt_level: &str,
+        mode: &str,
+    ) -> (i32, Vec<u8>, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                format!("--bytecode-cache={mode}"),
+                "--bytecode-cache-dir".to_string(),
+                cache_dir.display().to_string(),
+                "--bytecode-cache-stats".to_string(),
+                "--opt-level".to_string(),
+                opt_level.to_string(),
+                path.to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        (code, stdout, String::from_utf8(stderr).unwrap())
+    }
+
+    fn cache_test_dir(name: &str) -> PathBuf {
+        workspace_root().join(format!(
+            "target/phase7/cli-cache-tests/{}-{}",
+            name,
+            std::process::id()
+        ))
+    }
+
+    fn reset_dir(path: &std::path::Path) {
+        let _ = fs::remove_dir_all(path);
+        fs::create_dir_all(path).expect("create cache test dir");
+    }
+
+    fn cache_files(path: &std::path::Path) -> Vec<PathBuf> {
+        fs::read_dir(path)
+            .expect("read cache dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("phbc"))
+            .collect()
+    }
+
+    fn optimizer_fixture_paths() -> Vec<String> {
+        let mut fixtures = Vec::new();
+        for dir in [
+            workspace_root().join("tests/fixtures/phase7/perf_smoke"),
+            workspace_root().join("tests/fixtures/phase7/bytecode_cache"),
+        ] {
+            for entry in fs::read_dir(&dir).expect("read optimizer fixture dir") {
+                let path = entry.expect("read optimizer fixture entry").path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("php")
+                    && path.with_extension("php.out").is_file()
+                {
+                    fixtures.push(path.display().to_string());
+                }
+            }
+        }
+        fixtures.sort();
+        fixtures
     }
 
     fn fixture(path: &str) -> String {

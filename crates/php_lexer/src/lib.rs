@@ -20,4 +20,6 @@ pub use diagnostics::{LexDiagnostic, LexDiagnosticKind};
 pub use lexer::{LexResult, Lexer, LexerConfig, lex_all};
 pub use modes::LexerMode;
 pub use php_source::{BytePos, LineCol, LineIndex, SourceText, TextRange};
-pub use token::{SymbolKind, Token, TokenKind, TokenName};
+pub use token::{
+    SymbolKind, TOKENIZER_TOKEN_ID_BASE, TOKENIZER_TOKEN_NAMES, Token, TokenKind, TokenName,
+};

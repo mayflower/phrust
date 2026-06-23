@@ -114,6 +114,7 @@ pub fn value_type_name(value: &Value) -> &'static str {
         Value::Uninitialized => "uninitialized",
         Value::Array(_) => "array",
         Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => "object",
+        Value::Resource(_) => "resource",
         Value::Callable(_) => "callable",
         Value::Reference(_) => unreachable!("references are handled before matching"),
     }

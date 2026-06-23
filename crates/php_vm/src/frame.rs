@@ -30,9 +30,27 @@ impl LocalFile {
         self.locals.get(id.index()).map(Slot::read)
     }
 
+    /// Returns true when the compiled local slot exists.
+    #[must_use]
+    pub fn contains(&self, id: LocalId) -> bool {
+        id.index() < self.locals.len()
+    }
+
     /// Iterates over local slots in stable slot order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (usize, &Slot)> {
         self.locals.iter().enumerate()
+    }
+
+    /// Clears all local values while keeping allocation capacity for reuse.
+    pub fn clear_for_reuse(&mut self) {
+        self.locals.clear();
+    }
+
+    /// Resizes local storage to the compiled slot count using existing capacity
+    /// whenever possible.
+    pub fn reset_for_function(&mut self, count: u32) {
+        self.locals.clear();
+        self.locals.resize(count as usize, Slot::uninitialized());
     }
 
     /// Reads a local slot mutably without panicking.
@@ -114,6 +132,19 @@ impl RegisterFile {
         self.registers.is_empty()
     }
 
+    /// Clears all register values while keeping allocation capacity for reuse.
+    pub fn clear_for_reuse(&mut self) {
+        self.registers.clear();
+    }
+
+    /// Resizes register storage to the compiled register count using existing
+    /// capacity whenever possible.
+    pub fn reset_for_function(&mut self, count: u32) {
+        self.registers.clear();
+        self.registers
+            .resize(count as usize, TempValue::uninitialized());
+    }
+
     /// Reads a register without panicking.
     #[must_use]
     pub fn get(&self, id: RegId) -> Option<&Value> {
@@ -154,6 +185,9 @@ pub struct Frame {
     pub called_class: Option<String>,
     /// Class that declares the selected method body.
     pub declaring_class: Option<String>,
+    /// PHP-visible arguments supplied to this call after default/variadic
+    /// normalization.
+    pub arguments: Vec<Value>,
     /// Registers for the function.
     pub registers: RegisterFile,
     /// PHP local variable slots for the function.
@@ -169,6 +203,7 @@ impl Frame {
             scope_class: None,
             called_class: None,
             declaring_class: None,
+            arguments: Vec::new(),
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
         }
@@ -189,9 +224,40 @@ impl Frame {
             scope_class,
             called_class,
             declaring_class,
+            arguments: Vec::new(),
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
         }
+    }
+
+    /// Clears PHP-visible values before moving a frame into the request-local
+    /// reuse pool. Capacities are retained but roots are dropped.
+    pub fn clear_for_reuse(&mut self) {
+        self.scope_class = None;
+        self.called_class = None;
+        self.declaring_class = None;
+        self.arguments.clear();
+        self.registers.clear_for_reuse();
+        self.locals.clear_for_reuse();
+    }
+
+    /// Reinitializes a pooled frame for a new function activation.
+    pub fn reset_with_class_context(
+        &mut self,
+        function: FunctionId,
+        register_count: u32,
+        local_count: u32,
+        scope_class: Option<String>,
+        called_class: Option<String>,
+        declaring_class: Option<String>,
+    ) {
+        self.function = function;
+        self.scope_class = scope_class;
+        self.called_class = called_class;
+        self.declaring_class = declaring_class;
+        self.arguments.clear();
+        self.registers.reset_for_function(register_count);
+        self.locals.reset_for_function(local_count);
     }
 }
 
@@ -199,13 +265,17 @@ impl Frame {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CallStack {
     frames: Vec<Frame>,
+    frame_pool: Vec<Frame>,
 }
 
 impl CallStack {
     /// Creates an empty call stack.
     #[must_use]
     pub const fn new() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            frame_pool: Vec::new(),
+        }
     }
 
     /// Pushes a frame.
@@ -213,9 +283,54 @@ impl CallStack {
         self.frames.push(frame);
     }
 
+    /// Pushes a compiled function frame, reusing request-local storage when a
+    /// completed frame is available. Returns true when reuse happened.
+    pub fn push_reusable_frame(
+        &mut self,
+        function: FunctionId,
+        register_count: u32,
+        local_count: u32,
+        scope_class: Option<String>,
+        called_class: Option<String>,
+        declaring_class: Option<String>,
+    ) -> bool {
+        if let Some(mut frame) = self.frame_pool.pop() {
+            frame.reset_with_class_context(
+                function,
+                register_count,
+                local_count,
+                scope_class,
+                called_class,
+                declaring_class,
+            );
+            self.frames.push(frame);
+            return true;
+        }
+
+        self.frames.push(Frame::new_with_class_context(
+            function,
+            register_count,
+            local_count,
+            scope_class,
+            called_class,
+            declaring_class,
+        ));
+        false
+    }
+
     /// Pops a frame.
     pub fn pop(&mut self) -> Option<Frame> {
         self.frames.pop()
+    }
+
+    /// Pops a completed frame into the request-local reuse pool.
+    pub fn pop_recycle(&mut self) -> bool {
+        let Some(mut frame) = self.frames.pop() else {
+            return false;
+        };
+        frame.clear_for_reuse();
+        self.frame_pool.push(frame);
+        true
     }
 
     /// Returns the top frame.

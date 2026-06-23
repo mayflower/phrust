@@ -5,16 +5,40 @@
 //! it as a compile-tested skeleton only.
 
 pub mod compiled_unit;
+pub mod counters;
+pub mod fallback;
 pub mod frame;
 pub mod include;
+pub mod inline_cache;
+pub mod literal_pool;
+pub mod quickening;
+pub mod std_builtins;
+pub mod tiering;
 pub mod todo_phase4;
 pub mod vm;
 
 pub use compiled_unit::CompiledUnit;
+pub use counters::VmCounters;
+pub use fallback::{
+    DEQUICKEN_AFTER_GUARD_MISSES, DISABLE_AFTER_GUARD_MISSES, FallbackProtocolEvent,
+    FallbackProtocolStats,
+};
 pub use frame::{CallStack, Frame, RegisterFile};
-pub use include::{IncludeLoader, LoadedInclude};
+pub use include::{IncludeLoader, IncludePathFileFingerprint, LoadedInclude, ResolvedIncludePath};
+pub use inline_cache::{
+    ClassConstantStaticPropertyCacheKind, ClassConstantStaticPropertyCacheTarget, InlineCacheId,
+    InlineCacheKind, InlineCacheMode, InlineCacheObservation, InlineCacheSlot, InlineCacheState,
+    InlineCacheStats, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
+    PropertyFetchCacheTarget,
+};
+pub use literal_pool::{InternedLiteral, LiteralPool};
+pub use quickening::{
+    QuickeningMode, QuickeningObservation, QuickeningSpecialization, QuickeningState,
+    QuickeningTable,
+};
+pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 pub use todo_phase4::{Phase4VmTodo, vm_skeleton_status};
-pub use vm::{Vm, VmOptions, VmResult};
+pub use vm::{JitMode, Vm, VmOptions, VmResult};
 
 #[cfg(test)]
 mod tests {

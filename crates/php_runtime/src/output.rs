@@ -3,21 +3,116 @@
 use crate::string::PhpString;
 
 /// Runtime output buffer.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OutputStats {
+    /// Final/root-visible bytes are computed by the VM from `OutputBuffer::len`.
+    pub appends: u64,
+    /// Writes that appended more than one slice after one reserve.
+    pub batch_writes: u64,
+    /// Active output-buffer flushes into a parent or root buffer.
+    pub flushes: u64,
+}
+
+/// Runtime output buffer.
+#[derive(Clone, Debug, Default)]
 pub struct OutputBuffer {
     bytes: Vec<u8>,
+    stack: Vec<Vec<u8>>,
+    stats: OutputStats,
 }
+
+impl PartialEq for OutputBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.stack == other.stack
+    }
+}
+
+impl Eq for OutputBuffer {}
 
 impl OutputBuffer {
     /// Creates an empty output buffer.
     #[must_use]
     pub const fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            stack: Vec::new(),
+            stats: OutputStats {
+                appends: 0,
+                batch_writes: 0,
+                flushes: 0,
+            },
+        }
+    }
+
+    /// Creates an empty output buffer with root buffer capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            stack: Vec::new(),
+            stats: OutputStats::default(),
+        }
+    }
+
+    /// Returns request-local output write statistics.
+    #[must_use]
+    pub const fn stats(&self) -> OutputStats {
+        self.stats
+    }
+
+    /// Reserves capacity in the active buffer.
+    pub fn reserve(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        if let Some(buffer) = self.stack.last_mut() {
+            buffer.reserve(additional);
+        } else {
+            self.bytes.reserve(additional);
+        }
     }
 
     /// Appends exact bytes.
     pub fn write_bytes(&mut self, bytes: impl AsRef<[u8]>) {
-        self.bytes.extend_from_slice(bytes.as_ref());
+        let bytes = bytes.as_ref();
+        if bytes.is_empty() {
+            return;
+        }
+        self.stats.appends += 1;
+        if let Some(buffer) = self.stack.last_mut() {
+            buffer.extend_from_slice(bytes);
+        } else {
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    /// Appends several byte slices with one active-buffer reservation.
+    pub fn write_slices(&mut self, slices: &[&[u8]]) {
+        let total = slices.iter().map(|bytes| bytes.len()).sum::<usize>();
+        if total == 0 {
+            return;
+        }
+        self.stats.appends += 1;
+        if slices
+            .iter()
+            .filter(|bytes| !bytes.is_empty())
+            .take(2)
+            .count()
+            > 1
+        {
+            self.stats.batch_writes += 1;
+        }
+        if let Some(buffer) = self.stack.last_mut() {
+            buffer.reserve(total);
+            for bytes in slices.iter().copied().filter(|bytes| !bytes.is_empty()) {
+                buffer.extend_from_slice(bytes);
+            }
+        } else {
+            self.bytes.reserve(total);
+            for bytes in slices.iter().copied().filter(|bytes| !bytes.is_empty()) {
+                self.bytes.extend_from_slice(bytes);
+            }
+        }
     }
 
     /// Appends a PHP string's exact bytes.
@@ -63,5 +158,85 @@ impl OutputBuffer {
     /// Clears buffered output.
     pub fn clear(&mut self) {
         self.bytes.clear();
+        self.stack.clear();
+    }
+
+    /// Starts a nested PHP output buffer.
+    pub fn start_buffer(&mut self) {
+        self.stack.push(Vec::new());
+    }
+
+    /// Returns the current output buffering level.
+    #[must_use]
+    pub fn buffer_level(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Returns the active buffer contents, if output buffering is active.
+    #[must_use]
+    pub fn current_buffer_bytes(&self) -> Option<&[u8]> {
+        self.stack.last().map(Vec::as_slice)
+    }
+
+    /// Returns the active buffer length, if output buffering is active.
+    #[must_use]
+    pub fn current_buffer_len(&self) -> Option<usize> {
+        self.stack.last().map(Vec::len)
+    }
+
+    /// Discards and returns the active buffer.
+    pub fn pop_buffer_clean(&mut self) -> Option<Vec<u8>> {
+        self.stack.pop()
+    }
+
+    /// Flushes the active buffer into its parent buffer or root output.
+    pub fn pop_buffer_flush(&mut self) -> Option<()> {
+        let bytes = self.stack.pop()?;
+        self.stats.flushes += 1;
+        self.write_bytes(bytes);
+        Some(())
+    }
+
+    /// Flushes all open buffers to root output in shutdown order.
+    pub fn flush_all_buffers(&mut self) {
+        while self.pop_buffer_flush().is_some() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputBuffer;
+
+    #[test]
+    fn nested_buffers_capture_clean_and_flush() {
+        let mut output = OutputBuffer::new();
+        output.write_test_str("root");
+        output.start_buffer();
+        output.write_test_str("a");
+        output.start_buffer();
+        output.write_test_str("b");
+
+        assert_eq!(output.as_bytes(), b"root");
+        assert_eq!(output.buffer_level(), 2);
+        assert_eq!(output.current_buffer_bytes(), Some(&b"b"[..]));
+        assert_eq!(output.pop_buffer_clean(), Some(b"b".to_vec()));
+        assert_eq!(output.current_buffer_bytes(), Some(&b"a"[..]));
+        assert_eq!(output.pop_buffer_flush(), Some(()));
+        assert_eq!(output.as_bytes(), b"roota");
+        assert_eq!(output.stats().appends, 4);
+        assert_eq!(output.stats().batch_writes, 0);
+        assert_eq!(output.stats().flushes, 1);
+    }
+
+    #[test]
+    fn batch_write_reserves_and_counts_one_append() {
+        let mut output = OutputBuffer::new();
+
+        output.write_slices(&[b"a", b"", b"bc"]);
+
+        assert_eq!(output.as_bytes(), b"abc");
+        assert_eq!(output.stats().appends, 1);
+        assert_eq!(output.stats().batch_writes, 1);
+        assert_eq!(output.stats().flushes, 0);
     }
 }

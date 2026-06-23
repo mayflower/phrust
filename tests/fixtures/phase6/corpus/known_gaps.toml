@@ -1,0 +1,2 @@
+[known_gaps]
+PHASE6-GAP-CORPUS-REFLECTION-ATTRIBUTES = "Reflection attribute corpus coverage depends on Phase 6 reflected attribute metadata and remains explicit until constructor/target parity is complete."

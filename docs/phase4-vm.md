@@ -106,7 +106,7 @@ Fixture proof: `fixtures/runtime/valid/exceptions/catch-exception.php`,
 `fixtures/runtime/valid/exceptions/catch-finally.php`,
 `fixtures/runtime/valid/exceptions/finally-return.php`,
 `fixtures/runtime/invalid/exceptions/throw-uncaught.php`, and
-`fixtures/runtime/known_gaps/exceptions/catch-type.php`.
+`fixtures/runtime/invalid/exceptions/nonmatching-catch-type.php`.
 
 ## Include Execution
 

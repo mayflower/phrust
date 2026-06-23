@@ -65,8 +65,9 @@ fi
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p php_frontend_cli -- --help >/dev/null
-cargo run -p php_frontend_cli -- analyze fixtures/semantic/valid/hello.php --format json >/dev/null
+cargo build -p php_frontend_cli
+"${CARGO_TARGET_DIR:-target}"/debug/php-frontend --help >/dev/null
+"${CARGO_TARGET_DIR:-target}"/debug/php-frontend analyze fixtures/semantic/valid/hello.php --format json >/dev/null
 just semantic-reference-smoke
 just semantic-fixtures
 just semantic-diff

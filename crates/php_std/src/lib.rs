@@ -1,0 +1,1896 @@
+//! Phase 6 standard-library registry infrastructure.
+//!
+//! This crate owns metadata for PHP 8.5.7 internal extensions, functions,
+//! constants, and classes. Prompt 06.03 intentionally keeps it infrastructure
+//! only: no PHP-visible function implementation is exposed from here yet.
+
+pub mod abi;
+pub mod arginfo;
+pub mod constants;
+pub mod introspection;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Descriptor for one PHP extension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionDescriptor {
+    name: &'static str,
+    enabled_by_default: bool,
+    functions: Vec<FunctionDescriptor>,
+    constants: Vec<ConstantDescriptor>,
+    classes: Vec<ClassDescriptor>,
+}
+
+impl ExtensionDescriptor {
+    /// Creates an extension descriptor.
+    #[must_use]
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            enabled_by_default: true,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            classes: Vec::new(),
+        }
+    }
+
+    /// Marks whether this extension is enabled in the default registry.
+    #[must_use]
+    pub fn enabled_by_default(mut self, enabled: bool) -> Self {
+        self.enabled_by_default = enabled;
+        self
+    }
+
+    /// Adds a function descriptor.
+    #[must_use]
+    pub fn with_function(mut self, function: FunctionDescriptor) -> Self {
+        self.functions.push(function);
+        self
+    }
+
+    /// Adds a constant descriptor.
+    #[must_use]
+    pub fn with_constant(mut self, constant: ConstantDescriptor) -> Self {
+        self.constants.push(constant);
+        self
+    }
+
+    /// Adds a class descriptor.
+    #[must_use]
+    pub fn with_class(mut self, class: ClassDescriptor) -> Self {
+        self.classes.push(class);
+        self
+    }
+
+    /// Stable extension name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Whether the extension is enabled by default.
+    #[must_use]
+    pub const fn is_enabled_by_default(&self) -> bool {
+        self.enabled_by_default
+    }
+
+    /// Function descriptors in stable name order.
+    #[must_use]
+    pub fn functions(&self) -> &[FunctionDescriptor] {
+        &self.functions
+    }
+
+    /// Constant descriptors in stable name order.
+    #[must_use]
+    pub fn constants(&self) -> &[ConstantDescriptor] {
+        &self.constants
+    }
+
+    /// Class descriptors in stable name order.
+    #[must_use]
+    pub fn classes(&self) -> &[ClassDescriptor] {
+        &self.classes
+    }
+
+    fn sort_symbols(&mut self) {
+        self.functions.sort_by_key(FunctionDescriptor::name);
+        self.constants.sort_by_key(ConstantDescriptor::name);
+        self.classes.sort_by_key(ClassDescriptor::name);
+    }
+}
+
+/// Descriptor for an internal function symbol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionDescriptor {
+    name: &'static str,
+    extension: &'static str,
+    visibility: SymbolVisibility,
+}
+
+impl FunctionDescriptor {
+    /// Creates a PHP-visible function descriptor.
+    #[must_use]
+    pub const fn php(name: &'static str, extension: &'static str) -> Self {
+        Self {
+            name,
+            extension,
+            visibility: SymbolVisibility::PhpVisible,
+        }
+    }
+
+    /// Creates an internal test-only function descriptor.
+    #[must_use]
+    pub const fn internal_test(name: &'static str, extension: &'static str) -> Self {
+        Self {
+            name,
+            extension,
+            visibility: SymbolVisibility::InternalTestFixture,
+        }
+    }
+
+    /// Stable function name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Owning extension name.
+    #[must_use]
+    pub const fn extension(&self) -> &'static str {
+        self.extension
+    }
+
+    /// Symbol visibility classification.
+    #[must_use]
+    pub const fn visibility(&self) -> SymbolVisibility {
+        self.visibility
+    }
+}
+
+/// Descriptor for an internal constant symbol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstantDescriptor {
+    name: &'static str,
+    extension: &'static str,
+    value: Option<ConstantValue>,
+}
+
+impl ConstantDescriptor {
+    /// Creates a constant descriptor.
+    #[must_use]
+    pub const fn new(name: &'static str, extension: &'static str) -> Self {
+        Self {
+            name,
+            extension,
+            value: None,
+        }
+    }
+
+    /// Creates a constant descriptor with a value.
+    #[must_use]
+    pub const fn with_value(
+        name: &'static str,
+        extension: &'static str,
+        value: ConstantValue,
+    ) -> Self {
+        Self {
+            name,
+            extension,
+            value: Some(value),
+        }
+    }
+
+    /// Stable constant name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Owning extension name.
+    #[must_use]
+    pub const fn extension(&self) -> &'static str {
+        self.extension
+    }
+
+    /// Constant value metadata, when available.
+    #[must_use]
+    pub const fn value(&self) -> Option<ConstantValue> {
+        self.value
+    }
+}
+
+/// Registry-safe constant value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstantValue {
+    /// PHP bool constant.
+    Bool(bool),
+    /// PHP int constant.
+    Int(i64),
+    /// PHP string constant.
+    String(&'static str),
+}
+
+/// Descriptor for an internal class, interface, trait, or enum symbol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassDescriptor {
+    name: &'static str,
+    extension: &'static str,
+    kind: ClassKind,
+}
+
+impl ClassDescriptor {
+    /// Creates a class descriptor.
+    #[must_use]
+    pub const fn new(name: &'static str, extension: &'static str, kind: ClassKind) -> Self {
+        Self {
+            name,
+            extension,
+            kind,
+        }
+    }
+
+    /// Stable class name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Owning extension name.
+    #[must_use]
+    pub const fn extension(&self) -> &'static str {
+        self.extension
+    }
+
+    /// Class-like kind.
+    #[must_use]
+    pub const fn kind(&self) -> ClassKind {
+        self.kind
+    }
+}
+
+/// PHP class-like kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClassKind {
+    /// PHP class.
+    Class,
+    /// PHP interface.
+    Interface,
+    /// PHP trait.
+    Trait,
+    /// PHP enum.
+    Enum,
+}
+
+/// Whether a symbol is PHP-visible or only present for tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolVisibility {
+    /// Visible to PHP code once the owning extension is enabled.
+    PhpVisible,
+    /// Internal test-only descriptor; never listed as a public PHP function.
+    InternalTestFixture,
+}
+
+/// Deterministic extension registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionRegistry {
+    extensions: BTreeMap<&'static str, ExtensionDescriptor>,
+    enabled: BTreeSet<&'static str>,
+}
+
+impl ExtensionRegistry {
+    /// Creates a registry from descriptors.
+    ///
+    /// Names are stored in sorted maps, and every descriptor's local symbol
+    /// lists are sorted, so iteration order is stable across platforms.
+    #[must_use]
+    pub fn from_extensions(extensions: impl IntoIterator<Item = ExtensionDescriptor>) -> Self {
+        let mut map = BTreeMap::new();
+        let mut enabled = BTreeSet::new();
+        for mut extension in extensions {
+            extension.sort_symbols();
+            if extension.is_enabled_by_default() {
+                enabled.insert(extension.name());
+            }
+            map.insert(extension.name(), extension);
+        }
+        Self {
+            extensions: map,
+            enabled,
+        }
+    }
+
+    /// Returns the default Phase 6 infrastructure registry.
+    #[must_use]
+    pub fn phase6_infrastructure() -> Self {
+        Self::from_extensions([
+            ExtensionDescriptor::new("core")
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_VERSION",
+                    "core",
+                    ConstantValue::String(constants::PHP_VERSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_VERSION_ID",
+                    "core",
+                    ConstantValue::Int(constants::PHP_VERSION_ID),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_MAJOR_VERSION",
+                    "core",
+                    ConstantValue::Int(constants::PHP_MAJOR_VERSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_MINOR_VERSION",
+                    "core",
+                    ConstantValue::Int(constants::PHP_MINOR_VERSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_RELEASE_VERSION",
+                    "core",
+                    ConstantValue::Int(constants::PHP_RELEASE_VERSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "DIRECTORY_SEPARATOR",
+                    "core",
+                    ConstantValue::String(constants::DIRECTORY_SEPARATOR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PATH_SEPARATOR",
+                    "core",
+                    ConstantValue::String(constants::PATH_SEPARATOR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_OS",
+                    "core",
+                    ConstantValue::String(constants::PHP_OS),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_OS_FAMILY",
+                    "core",
+                    ConstantValue::String(constants::PHP_OS_FAMILY),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_EOL",
+                    "core",
+                    ConstantValue::String(constants::PHP_EOL),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_ERROR",
+                    "core",
+                    ConstantValue::Int(constants::E_ERROR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_WARNING",
+                    "core",
+                    ConstantValue::Int(constants::E_WARNING),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_PARSE",
+                    "core",
+                    ConstantValue::Int(constants::E_PARSE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_NOTICE",
+                    "core",
+                    ConstantValue::Int(constants::E_NOTICE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_CORE_ERROR",
+                    "core",
+                    ConstantValue::Int(constants::E_CORE_ERROR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_CORE_WARNING",
+                    "core",
+                    ConstantValue::Int(constants::E_CORE_WARNING),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_COMPILE_ERROR",
+                    "core",
+                    ConstantValue::Int(constants::E_COMPILE_ERROR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_COMPILE_WARNING",
+                    "core",
+                    ConstantValue::Int(constants::E_COMPILE_WARNING),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_USER_ERROR",
+                    "core",
+                    ConstantValue::Int(constants::E_USER_ERROR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_USER_WARNING",
+                    "core",
+                    ConstantValue::Int(constants::E_USER_WARNING),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_USER_NOTICE",
+                    "core",
+                    ConstantValue::Int(constants::E_USER_NOTICE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_STRICT",
+                    "core",
+                    ConstantValue::Int(constants::E_STRICT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_RECOVERABLE_ERROR",
+                    "core",
+                    ConstantValue::Int(constants::E_RECOVERABLE_ERROR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_DEPRECATED",
+                    "core",
+                    ConstantValue::Int(constants::E_DEPRECATED),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_USER_DEPRECATED",
+                    "core",
+                    ConstantValue::Int(constants::E_USER_DEPRECATED),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "E_ALL",
+                    "core",
+                    ConstantValue::Int(constants::E_ALL),
+                )),
+            ExtensionDescriptor::new("standard")
+                .with_function(FunctionDescriptor::php("abs", "standard"))
+                .with_function(FunctionDescriptor::php("array_all", "standard"))
+                .with_function(FunctionDescriptor::php("array_any", "standard"))
+                .with_function(FunctionDescriptor::php("array_chunk", "standard"))
+                .with_function(FunctionDescriptor::php("array_column", "standard"))
+                .with_function(FunctionDescriptor::php("array_filter", "standard"))
+                .with_function(FunctionDescriptor::php("array_find", "standard"))
+                .with_function(FunctionDescriptor::php("array_find_key", "standard"))
+                .with_function(FunctionDescriptor::php("array_flip", "standard"))
+                .with_function(FunctionDescriptor::php("array_is_list", "standard"))
+                .with_function(FunctionDescriptor::php("array_key_exists", "standard"))
+                .with_function(FunctionDescriptor::php("array_key_first", "standard"))
+                .with_function(FunctionDescriptor::php("array_key_last", "standard"))
+                .with_function(FunctionDescriptor::php("array_keys", "standard"))
+                .with_function(FunctionDescriptor::php("array_map", "standard"))
+                .with_function(FunctionDescriptor::php("array_merge", "standard"))
+                .with_function(FunctionDescriptor::php("array_merge_recursive", "standard"))
+                .with_function(FunctionDescriptor::php("array_pad", "standard"))
+                .with_function(FunctionDescriptor::php("array_pop", "standard"))
+                .with_function(FunctionDescriptor::php("array_push", "standard"))
+                .with_function(FunctionDescriptor::php("array_reduce", "standard"))
+                .with_function(FunctionDescriptor::php("array_replace", "standard"))
+                .with_function(FunctionDescriptor::php("array_reverse", "standard"))
+                .with_function(FunctionDescriptor::php("array_search", "standard"))
+                .with_function(FunctionDescriptor::php("array_shift", "standard"))
+                .with_function(FunctionDescriptor::php("array_slice", "standard"))
+                .with_function(FunctionDescriptor::php("array_splice", "standard"))
+                .with_function(FunctionDescriptor::php("array_unshift", "standard"))
+                .with_function(FunctionDescriptor::php("array_values", "standard"))
+                .with_function(FunctionDescriptor::php("array_walk", "standard"))
+                .with_function(FunctionDescriptor::php("arsort", "standard"))
+                .with_function(FunctionDescriptor::php("asort", "standard"))
+                .with_function(FunctionDescriptor::php("base64_decode", "standard"))
+                .with_function(FunctionDescriptor::php("base64_encode", "standard"))
+                .with_function(FunctionDescriptor::php("basename", "standard"))
+                .with_function(FunctionDescriptor::php("bin2hex", "standard"))
+                .with_function(FunctionDescriptor::php("boolval", "standard"))
+                .with_function(FunctionDescriptor::php("ceil", "standard"))
+                .with_function(FunctionDescriptor::php("chdir", "standard"))
+                .with_function(FunctionDescriptor::php("chr", "standard"))
+                .with_function(FunctionDescriptor::php("class_exists", "standard"))
+                .with_function(FunctionDescriptor::php("call_user_func", "standard"))
+                .with_function(FunctionDescriptor::php("call_user_func_array", "standard"))
+                .with_function(FunctionDescriptor::php("clearstatcache", "standard"))
+                .with_function(FunctionDescriptor::php("closedir", "standard"))
+                .with_function(FunctionDescriptor::php("constant", "standard"))
+                .with_function(FunctionDescriptor::php("copy", "standard"))
+                .with_function(FunctionDescriptor::php("count", "standard"))
+                .with_function(FunctionDescriptor::php("crc32", "standard"))
+                .with_function(FunctionDescriptor::php("defined", "standard"))
+                .with_function(FunctionDescriptor::php("dirname", "standard"))
+                .with_function(FunctionDescriptor::php("enum_exists", "standard"))
+                .with_function(FunctionDescriptor::php("error_reporting", "standard"))
+                .with_function(FunctionDescriptor::php("exec", "standard"))
+                .with_function(FunctionDescriptor::php("explode", "standard"))
+                .with_function(FunctionDescriptor::php("extension_loaded", "standard"))
+                .with_function(FunctionDescriptor::php("fclose", "standard"))
+                .with_function(FunctionDescriptor::php("feof", "standard"))
+                .with_function(FunctionDescriptor::php("fflush", "standard"))
+                .with_function(FunctionDescriptor::php("fgetc", "standard"))
+                .with_function(FunctionDescriptor::php("fgets", "standard"))
+                .with_function(FunctionDescriptor::php("file_exists", "standard"))
+                .with_function(FunctionDescriptor::php("file_get_contents", "standard"))
+                .with_function(FunctionDescriptor::php("file_put_contents", "standard"))
+                .with_function(FunctionDescriptor::php("filemtime", "standard"))
+                .with_function(FunctionDescriptor::php("filesize", "standard"))
+                .with_function(FunctionDescriptor::php("filetype", "standard"))
+                .with_function(FunctionDescriptor::php("floor", "standard"))
+                .with_function(FunctionDescriptor::php("floatval", "standard"))
+                .with_function(FunctionDescriptor::php("flush", "standard"))
+                .with_function(FunctionDescriptor::php("fmod", "standard"))
+                .with_function(FunctionDescriptor::php("fopen", "standard"))
+                .with_function(FunctionDescriptor::php("fprintf", "standard"))
+                .with_function(FunctionDescriptor::php("fread", "standard"))
+                .with_function(FunctionDescriptor::php("fseek", "standard"))
+                .with_function(FunctionDescriptor::php("ftell", "standard"))
+                .with_function(FunctionDescriptor::php("function_exists", "standard"))
+                .with_function(FunctionDescriptor::php("forward_static_call", "standard"))
+                .with_function(FunctionDescriptor::php("func_get_arg", "standard"))
+                .with_function(FunctionDescriptor::php("func_get_args", "standard"))
+                .with_function(FunctionDescriptor::php("func_num_args", "standard"))
+                .with_function(FunctionDescriptor::php("fwrite", "standard"))
+                .with_function(FunctionDescriptor::php("get_current_user", "standard"))
+                .with_function(FunctionDescriptor::php("get_cfg_var", "standard"))
+                .with_function(FunctionDescriptor::php("get_class", "standard"))
+                .with_function(FunctionDescriptor::php("get_class_methods", "standard"))
+                .with_function(FunctionDescriptor::php("get_class_vars", "standard"))
+                .with_function(FunctionDescriptor::php("get_debug_type", "standard"))
+                .with_function(FunctionDescriptor::php("get_declared_classes", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "get_declared_interfaces",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("get_declared_traits", "standard"))
+                .with_function(FunctionDescriptor::php("get_loaded_extensions", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "get_mangled_object_vars",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("get_object_vars", "standard"))
+                .with_function(FunctionDescriptor::php("get_parent_class", "standard"))
+                .with_function(FunctionDescriptor::php("get_resource_id", "standard"))
+                .with_function(FunctionDescriptor::php("get_resource_type", "standard"))
+                .with_function(FunctionDescriptor::php("getcwd", "standard"))
+                .with_function(FunctionDescriptor::php("getenv", "standard"))
+                .with_function(FunctionDescriptor::php("gettype", "standard"))
+                .with_function(FunctionDescriptor::php("glob", "standard"))
+                .with_function(FunctionDescriptor::php("hex2bin", "standard"))
+                .with_function(FunctionDescriptor::php("htmlentities", "standard"))
+                .with_function(FunctionDescriptor::php("htmlspecialchars", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "htmlspecialchars_decode",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("http_build_query", "standard"))
+                .with_function(FunctionDescriptor::php("implode", "standard"))
+                .with_function(FunctionDescriptor::php("in_array", "standard"))
+                .with_function(FunctionDescriptor::php("ini_get", "standard"))
+                .with_function(FunctionDescriptor::php("ini_get_all", "standard"))
+                .with_function(FunctionDescriptor::php("ini_set", "standard"))
+                .with_function(FunctionDescriptor::php("intdiv", "standard"))
+                .with_function(FunctionDescriptor::php("interface_exists", "standard"))
+                .with_function(FunctionDescriptor::php("intval", "standard"))
+                .with_function(FunctionDescriptor::php("is_array", "standard"))
+                .with_function(FunctionDescriptor::php("is_bool", "standard"))
+                .with_function(FunctionDescriptor::php("is_countable", "standard"))
+                .with_function(FunctionDescriptor::php("is_dir", "standard"))
+                .with_function(FunctionDescriptor::php("is_file", "standard"))
+                .with_function(FunctionDescriptor::php("is_finite", "standard"))
+                .with_function(FunctionDescriptor::php("is_float", "standard"))
+                .with_function(FunctionDescriptor::php("is_infinite", "standard"))
+                .with_function(FunctionDescriptor::php("is_int", "standard"))
+                .with_function(FunctionDescriptor::php("is_iterable", "standard"))
+                .with_function(FunctionDescriptor::php("is_link", "standard"))
+                .with_function(FunctionDescriptor::php("is_nan", "standard"))
+                .with_function(FunctionDescriptor::php("is_null", "standard"))
+                .with_function(FunctionDescriptor::php("is_object", "standard"))
+                .with_function(FunctionDescriptor::php("is_readable", "standard"))
+                .with_function(FunctionDescriptor::php("is_resource", "standard"))
+                .with_function(FunctionDescriptor::php("is_scalar", "standard"))
+                .with_function(FunctionDescriptor::php("is_string", "standard"))
+                .with_function(FunctionDescriptor::php("is_subclass_of", "standard"))
+                .with_function(FunctionDescriptor::php("is_writable", "standard"))
+                .with_function(FunctionDescriptor::php("krsort", "standard"))
+                .with_function(FunctionDescriptor::php("ksort", "standard"))
+                .with_function(FunctionDescriptor::php("lcfirst", "standard"))
+                .with_function(FunctionDescriptor::php("lstat", "standard"))
+                .with_function(FunctionDescriptor::php("ltrim", "standard"))
+                .with_function(FunctionDescriptor::php("max", "standard"))
+                .with_function(FunctionDescriptor::php("md5", "standard"))
+                .with_function(FunctionDescriptor::php("method_exists", "standard"))
+                .with_function(FunctionDescriptor::php("min", "standard"))
+                .with_function(FunctionDescriptor::php("mkdir", "standard"))
+                .with_function(FunctionDescriptor::php("natcasesort", "standard"))
+                .with_function(FunctionDescriptor::php("natsort", "standard"))
+                .with_function(FunctionDescriptor::php("number_format", "standard"))
+                .with_function(FunctionDescriptor::php("ob_end_clean", "standard"))
+                .with_function(FunctionDescriptor::php("ob_end_flush", "standard"))
+                .with_function(FunctionDescriptor::php("ob_get_clean", "standard"))
+                .with_function(FunctionDescriptor::php("ob_get_contents", "standard"))
+                .with_function(FunctionDescriptor::php("ob_get_length", "standard"))
+                .with_function(FunctionDescriptor::php("ob_get_level", "standard"))
+                .with_function(FunctionDescriptor::php("ob_start", "standard"))
+                .with_function(FunctionDescriptor::php("opendir", "standard"))
+                .with_function(FunctionDescriptor::php("ord", "standard"))
+                .with_function(FunctionDescriptor::php("pathinfo", "standard"))
+                .with_function(FunctionDescriptor::php("passthru", "standard"))
+                .with_function(FunctionDescriptor::php("pclose", "standard"))
+                .with_function(FunctionDescriptor::php("php_sapi_name", "standard"))
+                .with_function(FunctionDescriptor::php("php_uname", "standard"))
+                .with_function(FunctionDescriptor::php("popen", "standard"))
+                .with_function(FunctionDescriptor::php("print", "standard"))
+                .with_function(FunctionDescriptor::php("print_r", "standard"))
+                .with_function(FunctionDescriptor::php("printf", "standard"))
+                .with_function(FunctionDescriptor::php("pow", "standard"))
+                .with_function(FunctionDescriptor::php("property_exists", "standard"))
+                .with_function(FunctionDescriptor::php("proc_close", "standard"))
+                .with_function(FunctionDescriptor::php("proc_get_status", "standard"))
+                .with_function(FunctionDescriptor::php("proc_open", "standard"))
+                .with_function(FunctionDescriptor::php("putenv", "standard"))
+                .with_function(FunctionDescriptor::php("rawurldecode", "standard"))
+                .with_function(FunctionDescriptor::php("rawurlencode", "standard"))
+                .with_function(FunctionDescriptor::php("readdir", "standard"))
+                .with_function(FunctionDescriptor::php("readfile", "standard"))
+                .with_function(FunctionDescriptor::php("realpath", "standard"))
+                .with_function(FunctionDescriptor::php("rename", "standard"))
+                .with_function(FunctionDescriptor::php("restore_error_handler", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "restore_exception_handler",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("rewind", "standard"))
+                .with_function(FunctionDescriptor::php("rewinddir", "standard"))
+                .with_function(FunctionDescriptor::php("rmdir", "standard"))
+                .with_function(FunctionDescriptor::php("round", "standard"))
+                .with_function(FunctionDescriptor::php("rsort", "standard"))
+                .with_function(FunctionDescriptor::php("rtrim", "standard"))
+                .with_function(FunctionDescriptor::php("scandir", "standard"))
+                .with_function(FunctionDescriptor::php("serialize", "standard"))
+                .with_function(FunctionDescriptor::php("set_error_handler", "standard"))
+                .with_function(FunctionDescriptor::php("set_exception_handler", "standard"))
+                .with_function(FunctionDescriptor::php("sha1", "standard"))
+                .with_function(FunctionDescriptor::php("shell_exec", "standard"))
+                .with_function(FunctionDescriptor::php("sizeof", "standard"))
+                .with_function(FunctionDescriptor::php("sort", "standard"))
+                .with_function(FunctionDescriptor::php("sprintf", "standard"))
+                .with_function(FunctionDescriptor::php("sqrt", "standard"))
+                .with_function(FunctionDescriptor::php("stat", "standard"))
+                .with_function(FunctionDescriptor::php("stream_context_create", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "stream_context_get_options",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php(
+                    "stream_context_set_option",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("stream_copy_to_stream", "standard"))
+                .with_function(FunctionDescriptor::php("stream_get_contents", "standard"))
+                .with_function(FunctionDescriptor::php("stream_get_meta_data", "standard"))
+                .with_function(FunctionDescriptor::php("stream_get_wrappers", "standard"))
+                .with_function(FunctionDescriptor::php("stream_is_local", "standard"))
+                .with_function(FunctionDescriptor::php("stream_isatty", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "stream_resolve_include_path",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php("str_contains", "standard"))
+                .with_function(FunctionDescriptor::php("str_ends_with", "standard"))
+                .with_function(FunctionDescriptor::php("str_pad", "standard"))
+                .with_function(FunctionDescriptor::php("str_repeat", "standard"))
+                .with_function(FunctionDescriptor::php("str_replace", "standard"))
+                .with_function(FunctionDescriptor::php("str_starts_with", "standard"))
+                .with_function(FunctionDescriptor::php("strcasecmp", "standard"))
+                .with_function(FunctionDescriptor::php("strcmp", "standard"))
+                .with_function(FunctionDescriptor::php("stripos", "standard"))
+                .with_function(FunctionDescriptor::php("strlen", "standard"))
+                .with_function(FunctionDescriptor::php("strncasecmp", "standard"))
+                .with_function(FunctionDescriptor::php("strncmp", "standard"))
+                .with_function(FunctionDescriptor::php("strpos", "standard"))
+                .with_function(FunctionDescriptor::php("strrev", "standard"))
+                .with_function(FunctionDescriptor::php("strrpos", "standard"))
+                .with_function(FunctionDescriptor::php("strtolower", "standard"))
+                .with_function(FunctionDescriptor::php("strval", "standard"))
+                .with_function(FunctionDescriptor::php("strtoupper", "standard"))
+                .with_function(FunctionDescriptor::php("strtr", "standard"))
+                .with_function(FunctionDescriptor::php("substr", "standard"))
+                .with_function(FunctionDescriptor::php("system", "standard"))
+                .with_function(FunctionDescriptor::php("tempnam", "standard"))
+                .with_function(FunctionDescriptor::php("tmpfile", "standard"))
+                .with_function(FunctionDescriptor::php("touch", "standard"))
+                .with_function(FunctionDescriptor::php("trim", "standard"))
+                .with_function(FunctionDescriptor::php("trigger_error", "standard"))
+                .with_function(FunctionDescriptor::php("trait_exists", "standard"))
+                .with_function(FunctionDescriptor::php("uasort", "standard"))
+                .with_function(FunctionDescriptor::php("uksort", "standard"))
+                .with_function(FunctionDescriptor::php("unlink", "standard"))
+                .with_function(FunctionDescriptor::php("unserialize", "standard"))
+                .with_function(FunctionDescriptor::php("urldecode", "standard"))
+                .with_function(FunctionDescriptor::php("urlencode", "standard"))
+                .with_function(FunctionDescriptor::php("usort", "standard"))
+                .with_function(FunctionDescriptor::php("ucfirst", "standard"))
+                .with_function(FunctionDescriptor::php("ucwords", "standard"))
+                .with_function(FunctionDescriptor::php("user_error", "standard"))
+                .with_function(FunctionDescriptor::php("var_dump", "standard"))
+                .with_function(FunctionDescriptor::php("var_export", "standard"))
+                .with_function(FunctionDescriptor::php("version_compare", "standard"))
+                .with_function(FunctionDescriptor::php("vprintf", "standard"))
+                .with_function(FunctionDescriptor::php("vsprintf", "standard")),
+            ExtensionDescriptor::new("json")
+                .with_function(FunctionDescriptor::php("json_decode", "json"))
+                .with_function(FunctionDescriptor::php("json_encode", "json"))
+                .with_function(FunctionDescriptor::php("json_last_error", "json"))
+                .with_function(FunctionDescriptor::php("json_last_error_msg", "json"))
+                .with_function(FunctionDescriptor::php("json_validate", "json"))
+                .with_class(ClassDescriptor::new(
+                    "JsonException",
+                    "json",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "JsonSerializable",
+                    "json",
+                    ClassKind::Interface,
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_BIGINT_AS_STRING",
+                    "json",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_DEPTH",
+                    "json",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_NONE",
+                    "json",
+                    ConstantValue::Int(0),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_SYNTAX",
+                    "json",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_UTF8",
+                    "json",
+                    ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_OBJECT_AS_ARRAY",
+                    "json",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_PRETTY_PRINT",
+                    "json",
+                    ConstantValue::Int(128),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_PRESERVE_ZERO_FRACTION",
+                    "json",
+                    ConstantValue::Int(1024),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_THROW_ON_ERROR",
+                    "json",
+                    ConstantValue::Int(4_194_304),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_UNESCAPED_SLASHES",
+                    "json",
+                    ConstantValue::Int(64),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_UNESCAPED_UNICODE",
+                    "json",
+                    ConstantValue::Int(256),
+                )),
+            ExtensionDescriptor::new("pcre")
+                .with_function(FunctionDescriptor::php("preg_grep", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_last_error", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_last_error_msg", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_match", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_match_all", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_quote", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_replace", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_replace_callback", "pcre"))
+                .with_function(FunctionDescriptor::php("preg_split", "pcre"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_BAD_UTF8_ERROR",
+                    "pcre",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_BAD_UTF8_OFFSET_ERROR",
+                    "pcre",
+                    ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_BACKTRACK_LIMIT_ERROR",
+                    "pcre",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_GREP_INVERT",
+                    "pcre",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_INTERNAL_ERROR",
+                    "pcre",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_JIT_STACKLIMIT_ERROR",
+                    "pcre",
+                    ConstantValue::Int(6),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_NO_ERROR",
+                    "pcre",
+                    ConstantValue::Int(0),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_OFFSET_CAPTURE",
+                    "pcre",
+                    ConstantValue::Int(256),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_PATTERN_ORDER",
+                    "pcre",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_RECURSION_LIMIT_ERROR",
+                    "pcre",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_SET_ORDER",
+                    "pcre",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_SPLIT_DELIM_CAPTURE",
+                    "pcre",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_SPLIT_NO_EMPTY",
+                    "pcre",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_SPLIT_OFFSET_CAPTURE",
+                    "pcre",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PREG_UNMATCHED_AS_NULL",
+                    "pcre",
+                    ConstantValue::Int(512),
+                )),
+            ExtensionDescriptor::new("hash")
+                .with_function(FunctionDescriptor::php("hash", "hash"))
+                .with_function(FunctionDescriptor::php("hash_hmac", "hash")),
+            ExtensionDescriptor::new("random")
+                .with_function(FunctionDescriptor::php("random_bytes", "random"))
+                .with_function(FunctionDescriptor::php("random_int", "random")),
+            ExtensionDescriptor::new("date")
+                .with_function(FunctionDescriptor::php("date", "date"))
+                .with_function(FunctionDescriptor::php("date_default_timezone_get", "date"))
+                .with_function(FunctionDescriptor::php("date_default_timezone_set", "date"))
+                .with_function(FunctionDescriptor::php("strtotime", "date"))
+                .with_function(FunctionDescriptor::php("time", "date"))
+                .with_function(FunctionDescriptor::php("timezone_identifiers_list", "date"))
+                .with_class(ClassDescriptor::new(
+                    "DateInterval",
+                    "date",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new("DateTime", "date", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "DateTimeImmutable",
+                    "date",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "DateTimeInterface",
+                    "date",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "DateTimeZone",
+                    "date",
+                    ClassKind::Class,
+                )),
+            ExtensionDescriptor::new("spl")
+                .with_function(FunctionDescriptor::php("spl_autoload_call", "spl"))
+                .with_function(FunctionDescriptor::php("spl_autoload_functions", "spl"))
+                .with_function(FunctionDescriptor::php("spl_autoload_register", "spl"))
+                .with_function(FunctionDescriptor::php("spl_autoload_unregister", "spl"))
+                .with_function(FunctionDescriptor::php("spl_object_hash", "spl"))
+                .with_function(FunctionDescriptor::php("spl_object_id", "spl"))
+                .with_class(ClassDescriptor::new(
+                    "ArrayAccess",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "AppendIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "ArrayIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new("ArrayObject", "spl", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "BadFunctionCallException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "BadMethodCallException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "Countable",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "DomainException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "EmptyIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "InvalidArgumentException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "Iterator",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "IteratorAggregate",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "IteratorIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "LengthException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "LimitIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "LogicException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "OutOfBoundsException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "OutOfRangeException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "OverflowException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "RangeException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "RecursiveArrayIterator",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "RuntimeException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "Serializable",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "SplDoublyLinkedList",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new("SplFileInfo", "spl", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "SplFileObject",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "SplFixedArray",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "SplObjectStorage",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new("SplQueue", "spl", ClassKind::Class))
+                .with_class(ClassDescriptor::new("SplStack", "spl", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "SplTempFileObject",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "Traversable",
+                    "spl",
+                    ClassKind::Interface,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "UnderflowException",
+                    "spl",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "UnexpectedValueException",
+                    "spl",
+                    ClassKind::Class,
+                )),
+            ExtensionDescriptor::new("reflection").enabled_by_default(false),
+            tokenizer_extension(),
+            ExtensionDescriptor::new("test")
+                .enabled_by_default(false)
+                .with_function(FunctionDescriptor::internal_test(
+                    "__php_std_test_probe",
+                    "test",
+                )),
+        ])
+    }
+
+    /// Returns extension descriptors in stable name order.
+    pub fn extensions(&self) -> impl Iterator<Item = &ExtensionDescriptor> {
+        self.extensions.values()
+    }
+
+    /// Looks up an extension descriptor.
+    #[must_use]
+    pub fn extension(&self, name: &str) -> Option<&ExtensionDescriptor> {
+        self.extensions.get(name)
+    }
+
+    /// Looks up an extension case-insensitively.
+    #[must_use]
+    pub fn extension_case_insensitive(&self, name: &str) -> Option<&ExtensionDescriptor> {
+        self.extensions
+            .iter()
+            .find(|(extension_name, _)| extension_name.eq_ignore_ascii_case(name))
+            .map(|(_, extension)| extension)
+    }
+
+    /// Returns true when an extension exists and is enabled.
+    #[must_use]
+    pub fn is_extension_enabled(&self, name: &str) -> bool {
+        self.enabled
+            .iter()
+            .any(|extension_name| extension_name.eq_ignore_ascii_case(name))
+    }
+
+    /// Enables an existing extension.
+    pub fn enable_extension(&mut self, name: &'static str) -> Result<(), RegistryError> {
+        if !self.extensions.contains_key(name) {
+            return Err(RegistryError::UnknownExtension(name));
+        }
+        self.enabled.insert(name);
+        Ok(())
+    }
+
+    /// Disables an existing extension.
+    pub fn disable_extension(&mut self, name: &'static str) -> Result<(), RegistryError> {
+        if !self.extensions.contains_key(name) {
+            return Err(RegistryError::UnknownExtension(name));
+        }
+        self.enabled.remove(name);
+        Ok(())
+    }
+
+    /// Returns PHP-visible enabled function descriptors in stable order.
+    #[must_use]
+    pub fn enabled_php_functions(&self) -> Vec<&FunctionDescriptor> {
+        let mut functions = Vec::new();
+        for extension_name in &self.enabled {
+            let Some(extension) = self.extensions.get(extension_name) else {
+                continue;
+            };
+            for function in extension.functions() {
+                if function.visibility() == SymbolVisibility::PhpVisible {
+                    functions.push(function);
+                }
+            }
+        }
+        functions.sort_by_key(|function| function.name());
+        functions
+    }
+
+    /// Returns enabled extension names in stable order.
+    #[must_use]
+    pub fn enabled_extension_names(&self) -> Vec<&'static str> {
+        self.enabled.iter().copied().collect()
+    }
+
+    /// Finds a PHP-visible function case-insensitively among enabled extensions.
+    #[must_use]
+    pub fn enabled_php_function(&self, name: &str) -> Option<&FunctionDescriptor> {
+        self.enabled_php_functions()
+            .into_iter()
+            .find(|function| function.name().eq_ignore_ascii_case(name))
+    }
+
+    /// Finds an enabled class/interface/trait/enum case-insensitively.
+    #[must_use]
+    pub fn enabled_class(&self, name: &str) -> Option<&ClassDescriptor> {
+        for extension_name in &self.enabled {
+            let Some(extension) = self.extensions.get(extension_name) else {
+                continue;
+            };
+            if let Some(class) = extension
+                .classes()
+                .iter()
+                .find(|class| class.name().eq_ignore_ascii_case(name))
+            {
+                return Some(class);
+            }
+        }
+        None
+    }
+
+    /// Finds an enabled constant by exact name.
+    #[must_use]
+    pub fn enabled_constant(&self, name: &str) -> Option<&ConstantDescriptor> {
+        for extension_name in &self.enabled {
+            let Some(extension) = self.extensions.get(extension_name) else {
+                continue;
+            };
+            if let Some(constant) = extension
+                .constants()
+                .iter()
+                .find(|item| item.name() == name)
+            {
+                return Some(constant);
+            }
+        }
+        None
+    }
+}
+
+fn tokenizer_extension() -> ExtensionDescriptor {
+    let mut extension = ExtensionDescriptor::new("tokenizer")
+        .with_function(FunctionDescriptor::php("token_get_all", "tokenizer"))
+        .with_function(FunctionDescriptor::php("token_name", "tokenizer"))
+        .with_class(ClassDescriptor::new(
+            "PhpToken",
+            "tokenizer",
+            ClassKind::Class,
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "TOKEN_PARSE",
+            "tokenizer",
+            ConstantValue::Int(php_runtime::tokenizer::TOKEN_PARSE),
+        ));
+    for (index, token_name) in php_lexer::TOKENIZER_TOKEN_NAMES.iter().enumerate() {
+        extension = extension.with_constant(ConstantDescriptor::with_value(
+            token_name.as_php_name(),
+            "tokenizer",
+            ConstantValue::Int(php_lexer::TOKENIZER_TOKEN_ID_BASE + index as i64),
+        ));
+    }
+    extension
+}
+
+/// Registry construction or mutation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryError {
+    /// The requested extension name is not registered.
+    UnknownExtension(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_iteration_is_deterministic() {
+        let registry = ExtensionRegistry::from_extensions([
+            ExtensionDescriptor::new("zeta")
+                .with_function(FunctionDescriptor::php("z_func", "zeta"))
+                .with_function(FunctionDescriptor::php("a_func", "zeta")),
+            ExtensionDescriptor::new("core")
+                .with_constant(ConstantDescriptor::new("PHP_VERSION", "core"))
+                .with_class(ClassDescriptor::new("Exception", "core", ClassKind::Class)),
+        ]);
+
+        let names: Vec<_> = registry
+            .extensions()
+            .map(ExtensionDescriptor::name)
+            .collect();
+        assert_eq!(names, ["core", "zeta"]);
+
+        let zeta = registry.extension("zeta").expect("zeta extension");
+        let function_names: Vec<_> = zeta
+            .functions()
+            .iter()
+            .map(FunctionDescriptor::name)
+            .collect();
+        assert_eq!(function_names, ["a_func", "z_func"]);
+    }
+
+    #[test]
+    fn extensions_can_be_enabled_and_disabled() {
+        let mut registry = ExtensionRegistry::from_extensions([
+            ExtensionDescriptor::new("core"),
+            ExtensionDescriptor::new("json"),
+        ]);
+
+        assert!(registry.is_extension_enabled("core"));
+        assert!(registry.is_extension_enabled("json"));
+        registry.disable_extension("json").expect("disable json");
+        assert!(!registry.is_extension_enabled("json"));
+        registry.enable_extension("json").expect("enable json");
+        assert!(registry.is_extension_enabled("json"));
+
+        registry.disable_extension("core").expect("disable core");
+        assert!(!registry.is_extension_enabled("core"));
+    }
+
+    #[test]
+    fn infrastructure_registry_exposes_no_php_visible_functions() {
+        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        registry.enable_extension("test").expect("enable test");
+
+        assert!(
+            registry
+                .enabled_php_function("__php_std_test_probe")
+                .is_none()
+        );
+        let test = registry.extension("test").expect("test extension");
+        assert_eq!(
+            test.functions()[0].visibility(),
+            SymbolVisibility::InternalTestFixture
+        );
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_encoding_hash_url_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "base64_decode",
+            "base64_encode",
+            "bin2hex",
+            "chr",
+            "crc32",
+            "hex2bin",
+            "htmlspecialchars",
+            "htmlspecialchars_decode",
+            "htmlentities",
+            "http_build_query",
+            "md5",
+            "ord",
+            "rawurldecode",
+            "rawurlencode",
+            "sha1",
+            "urldecode",
+            "urlencode",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_hash_and_random_extensions_track_phase6_symbols() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in ["hash", "hash_hmac"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a hash function"
+            );
+        }
+        for name in ["random_bytes", "random_int"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a random function"
+            );
+        }
+        assert!(registry.is_extension_enabled("hash"));
+        assert!(registry.is_extension_enabled("random"));
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_formatting_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in ["fprintf", "printf", "sprintf", "vprintf", "vsprintf"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_array_basic_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "array_all",
+            "array_any",
+            "array_chunk",
+            "array_column",
+            "array_filter",
+            "array_find",
+            "array_find_key",
+            "array_flip",
+            "array_is_list",
+            "array_key_exists",
+            "array_key_first",
+            "array_key_last",
+            "array_keys",
+            "array_map",
+            "array_merge",
+            "array_merge_recursive",
+            "array_pad",
+            "array_pop",
+            "array_push",
+            "array_reduce",
+            "array_replace",
+            "array_reverse",
+            "array_search",
+            "array_shift",
+            "array_slice",
+            "array_splice",
+            "array_unshift",
+            "array_values",
+            "array_walk",
+            "arsort",
+            "asort",
+            "count",
+            "in_array",
+            "krsort",
+            "ksort",
+            "natcasesort",
+            "natsort",
+            "rsort",
+            "sizeof",
+            "sort",
+            "uasort",
+            "uksort",
+            "usort",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_math_numeric_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "abs",
+            "ceil",
+            "floor",
+            "fmod",
+            "intdiv",
+            "is_finite",
+            "is_infinite",
+            "is_nan",
+            "max",
+            "min",
+            "number_format",
+            "pow",
+            "round",
+            "sqrt",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_symbol_introspection_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "defined",
+            "constant",
+            "function_exists",
+            "class_exists",
+            "call_user_func",
+            "call_user_func_array",
+            "forward_static_call",
+            "func_get_arg",
+            "func_get_args",
+            "func_num_args",
+            "interface_exists",
+            "trait_exists",
+            "enum_exists",
+            "method_exists",
+            "property_exists",
+            "is_subclass_of",
+            "get_class",
+            "get_class_methods",
+            "get_class_vars",
+            "get_parent_class",
+            "get_declared_classes",
+            "get_declared_interfaces",
+            "get_declared_traits",
+            "get_mangled_object_vars",
+            "get_object_vars",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_ini_config_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in ["ini_get", "ini_set", "ini_get_all", "get_cfg_var"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_platform_check_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "extension_loaded",
+            "get_loaded_extensions",
+            "ini_get",
+            "defined",
+            "constant",
+            "class_exists",
+            "function_exists",
+            "version_compare",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a platform-check function"
+            );
+        }
+
+        assert!(
+            registry.enabled_constant("PHP_VERSION_ID").is_some(),
+            "PHP_VERSION_ID should be registered as a platform-check constant"
+        );
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_process_surface_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "proc_open",
+            "proc_close",
+            "proc_get_status",
+            "popen",
+            "pclose",
+            "shell_exec",
+            "exec",
+            "passthru",
+            "system",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a process-surface function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_error_handling_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "error_reporting",
+            "set_error_handler",
+            "restore_error_handler",
+            "trigger_error",
+            "user_error",
+            "set_exception_handler",
+            "restore_exception_handler",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+
+        assert_eq!(
+            registry
+                .enabled_constant("E_USER_WARNING")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(constants::E_USER_WARNING))
+        );
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_output_buffering_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "ob_start",
+            "ob_get_contents",
+            "ob_get_clean",
+            "ob_get_length",
+            "ob_get_level",
+            "ob_end_clean",
+            "ob_end_flush",
+            "flush",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_environment_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "getenv",
+            "putenv",
+            "php_sapi_name",
+            "php_uname",
+            "get_current_user",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_stream_resource_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in ["get_resource_id", "get_resource_type", "is_resource"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_path_and_stat_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "basename",
+            "dirname",
+            "pathinfo",
+            "realpath",
+            "file_exists",
+            "is_file",
+            "is_dir",
+            "is_link",
+            "is_readable",
+            "is_writable",
+            "filesize",
+            "filemtime",
+            "filetype",
+            "stat",
+            "lstat",
+            "clearstatcache",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_file_io_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "fopen",
+            "fclose",
+            "fread",
+            "fwrite",
+            "fgets",
+            "fgetc",
+            "feof",
+            "fflush",
+            "fseek",
+            "ftell",
+            "rewind",
+            "file_get_contents",
+            "file_put_contents",
+            "readfile",
+            "copy",
+            "rename",
+            "unlink",
+            "mkdir",
+            "rmdir",
+            "touch",
+            "tempnam",
+            "tmpfile",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_directory_glob_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "opendir",
+            "readdir",
+            "rewinddir",
+            "closedir",
+            "scandir",
+            "glob",
+            "getcwd",
+            "chdir",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_phase6_stream_context_functions() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "stream_get_wrappers",
+            "stream_get_meta_data",
+            "stream_get_contents",
+            "stream_copy_to_stream",
+            "stream_context_create",
+            "stream_context_get_options",
+            "stream_context_set_option",
+            "stream_resolve_include_path",
+            "stream_is_local",
+            "stream_isatty",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn json_extension_tracks_phase6_symbols() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "json_decode",
+            "json_encode",
+            "json_last_error",
+            "json_last_error_msg",
+            "json_validate",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a json function"
+            );
+        }
+        for name in [
+            "JSON_ERROR_NONE",
+            "JSON_THROW_ON_ERROR",
+            "JSON_OBJECT_AS_ARRAY",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a json constant"
+            );
+        }
+        assert!(matches!(
+            registry
+                .enabled_class("JsonException")
+                .map(ClassDescriptor::kind),
+            Some(ClassKind::Class)
+        ));
+        assert!(matches!(
+            registry
+                .enabled_class("JsonSerializable")
+                .map(ClassDescriptor::kind),
+            Some(ClassKind::Interface)
+        ));
+    }
+
+    #[test]
+    fn pcre_extension_tracks_phase6_symbols() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "preg_grep",
+            "preg_last_error",
+            "preg_last_error_msg",
+            "preg_match",
+            "preg_match_all",
+            "preg_quote",
+            "preg_replace",
+            "preg_replace_callback",
+            "preg_split",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a pcre function"
+            );
+        }
+        for name in [
+            "PREG_NO_ERROR",
+            "PREG_OFFSET_CAPTURE",
+            "PREG_PATTERN_ORDER",
+            "PREG_SET_ORDER",
+            "PREG_SPLIT_NO_EMPTY",
+            "PREG_GREP_INVERT",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a pcre constant"
+            );
+        }
+    }
+
+    #[test]
+    fn date_extension_tracks_phase6_timezone_symbols() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        for name in [
+            "date",
+            "date_default_timezone_get",
+            "date_default_timezone_set",
+            "strtotime",
+            "time",
+            "timezone_identifiers_list",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a date function"
+            );
+        }
+        for name in [
+            "DateInterval",
+            "DateTime",
+            "DateTimeImmutable",
+            "DateTimeZone",
+        ] {
+            assert!(matches!(
+                registry.enabled_class(name).map(ClassDescriptor::kind),
+                Some(ClassKind::Class)
+            ));
+        }
+        assert!(matches!(
+            registry
+                .enabled_class("DateTimeInterface")
+                .map(ClassDescriptor::kind),
+            Some(ClassKind::Interface)
+        ));
+    }
+
+    #[test]
+    fn spl_extension_tracks_phase6_basis_symbols() {
+        let registry = ExtensionRegistry::phase6_infrastructure();
+
+        assert!(registry.is_extension_enabled("spl"));
+        for name in [
+            "spl_autoload_call",
+            "spl_autoload_functions",
+            "spl_autoload_register",
+            "spl_autoload_unregister",
+            "spl_object_hash",
+            "spl_object_id",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as an spl function"
+            );
+        }
+        for name in [
+            "ArrayAccess",
+            "Countable",
+            "Iterator",
+            "IteratorAggregate",
+            "Serializable",
+            "Traversable",
+        ] {
+            assert!(matches!(
+                registry.enabled_class(name).map(ClassDescriptor::kind),
+                Some(ClassKind::Interface)
+            ));
+        }
+        for name in [
+            "AppendIterator",
+            "ArrayIterator",
+            "ArrayObject",
+            "BadFunctionCallException",
+            "BadMethodCallException",
+            "DomainException",
+            "EmptyIterator",
+            "InvalidArgumentException",
+            "IteratorIterator",
+            "LengthException",
+            "LimitIterator",
+            "LogicException",
+            "OutOfBoundsException",
+            "OutOfRangeException",
+            "OverflowException",
+            "RangeException",
+            "RecursiveArrayIterator",
+            "RuntimeException",
+            "SplDoublyLinkedList",
+            "SplFileInfo",
+            "SplFileObject",
+            "SplFixedArray",
+            "SplObjectStorage",
+            "SplQueue",
+            "SplStack",
+            "SplTempFileObject",
+            "UnderflowException",
+            "UnexpectedValueException",
+        ] {
+            assert!(matches!(
+                registry.enabled_class(name).map(ClassDescriptor::kind),
+                Some(ClassKind::Class)
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_extension_mutation_is_rejected() {
+        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        assert_eq!(
+            registry.enable_extension("missing"),
+            Err(RegistryError::UnknownExtension("missing"))
+        );
+    }
+}

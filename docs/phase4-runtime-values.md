@@ -101,7 +101,7 @@ Fixture proof: `fixtures/runtime/valid/objects/instantiate.php`,
 `fixtures/runtime/valid/objects/constructor-property.php`,
 `fixtures/runtime/valid/objects/property-read-write.php`,
 `fixtures/runtime/valid/objects/clone-with.php`,
-`fixtures/runtime/invalid/objects/private-property.php`, and
+`fixtures/runtime/valid/objects/private-property.php`, and
 `fixtures/runtime/known_gaps/property_hooks/get-hook.php`.
 
 ## References

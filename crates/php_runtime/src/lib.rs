@@ -10,18 +10,24 @@ pub mod autoload;
 pub mod builtins;
 pub mod context;
 pub mod convert;
+pub mod datetime;
 pub mod diagnostic;
 pub mod fiber;
 pub mod gc;
 pub mod generator;
 pub mod globals;
+pub mod ini;
 pub mod numeric_string;
 pub mod object;
 pub mod output;
+pub mod pcre;
 pub mod reference;
+pub mod resource;
+pub mod serialization;
 pub mod status;
 pub mod string;
 pub mod todo_phase4;
+pub mod tokenizer;
 pub mod types;
 pub mod value;
 
@@ -31,7 +37,9 @@ pub use builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinRegistry,
     BuiltinResult, InternalFunction, RuntimeSourceSpan,
 };
-pub use context::{ErrorReporting, RuntimeContext, RuntimeIniOptions, StrictTypesInfo};
+pub use context::{
+    ErrorReporting, ProcessCapability, RuntimeContext, RuntimeIniOptions, StrictTypesInfo,
+};
 pub use convert::{
     NumericValue, compare, equal, identical, to_bool, to_float, to_int, to_number, to_string,
 };
@@ -47,15 +55,27 @@ pub use gc::{
 };
 pub use generator::{GeneratorRef, GeneratorState};
 pub use globals::GlobalSymbolTable;
+pub use ini::{IniEntrySnapshot, IniRegistry};
 pub use object::{
     AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
     ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
     ClassPropertyFlags, ClassPropertyHooks, ObjectRef, RuntimeType, WeakObjectHandle,
 };
-pub use output::OutputBuffer;
+pub use output::{OutputBuffer, OutputStats};
+pub use pcre::{
+    PREG_BACKTRACK_LIMIT_ERROR, PREG_BAD_UTF8_ERROR, PREG_BAD_UTF8_OFFSET_ERROR, PREG_GREP_INVERT,
+    PREG_INTERNAL_ERROR, PREG_JIT_STACKLIMIT_ERROR, PREG_NO_ERROR, PREG_OFFSET_CAPTURE,
+    PREG_PATTERN_ORDER, PREG_RECURSION_LIMIT_ERROR, PREG_SET_ORDER, PREG_SPLIT_DELIM_CAPTURE,
+    PREG_SPLIT_NO_EMPTY, PREG_SPLIT_OFFSET_CAPTURE, PREG_UNMATCHED_AS_NULL, PcreCache,
+};
 pub use reference::{
     ReferenceCell, ReferencePlaceholder, Slot, TempValue, ValueSlot, WeakReferenceHandle,
 };
+pub use resource::{
+    FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
+    StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamWrapperRegistry,
+};
+pub use serialization::{SerializationError, UnserializeOptions, serialize, unserialize};
 pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
 pub use todo_phase4::{Phase4RuntimeTodo, runtime_skeleton_status};

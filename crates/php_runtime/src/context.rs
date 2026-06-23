@@ -1,6 +1,6 @@
 //! Deterministic runtime configuration for CLI fixture execution.
 
-use crate::{ArrayKey, PhpArray, PhpString, Value};
+use crate::{ArrayKey, FilesystemCapabilities, IniRegistry, PhpArray, PhpString, Value};
 use std::path::PathBuf;
 
 /// Minimal ini-like runtime options carried by the VM.
@@ -43,6 +43,22 @@ pub struct StrictTypesInfo {
     pub enabled: bool,
 }
 
+/// Default-off process execution policy carried by deterministic VM contexts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProcessCapability {
+    /// Process and shell APIs return PHP-visible failure values and warnings.
+    #[default]
+    Disabled,
+    /// Test-only mock result for shell-like process APIs. No host process is
+    /// launched; callers receive this deterministic output and status.
+    Mock {
+        /// Bytes exposed as process output.
+        output: String,
+        /// Exit status exposed through by-reference result-code arguments.
+        exit_status: i64,
+    },
+}
+
 /// Owned deterministic runtime context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeContext {
@@ -58,6 +74,10 @@ pub struct RuntimeContext {
     pub ini: RuntimeIniOptions,
     /// Strict-types metadata collected by future frontend integration.
     pub strict_types: Vec<StrictTypesInfo>,
+    /// Host filesystem capability policy for stream and filesystem builtins.
+    pub filesystem: FilesystemCapabilities,
+    /// Host process/shell execution policy.
+    pub process: ProcessCapability,
 }
 
 impl Default for RuntimeContext {
@@ -69,6 +89,8 @@ impl Default for RuntimeContext {
             include_path: vec![PathBuf::from(".")],
             ini: RuntimeIniOptions::default(),
             strict_types: Vec::new(),
+            filesystem: FilesystemCapabilities::none(),
+            process: ProcessCapability::Disabled,
         }
     }
 }
@@ -99,11 +121,47 @@ impl RuntimeContext {
         self
     }
 
+    /// Builds the per-request INI registry from deterministic context fields.
+    #[must_use]
+    pub fn ini_registry(&self) -> IniRegistry {
+        let mut registry = IniRegistry::default();
+        let include_path = self
+            .include_path
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(":");
+        let _ = registry.set("include_path", include_path);
+        let _ = registry.set("error_reporting", self.ini.error_reporting.mask.to_string());
+        let _ = registry.set(
+            "display_errors",
+            if self.ini.display_errors { "1" } else { "0" },
+        );
+        registry
+    }
+
     /// Sets controlled environment entries in stable key order.
     #[must_use]
     pub fn with_env(mut self, mut env: Vec<(String, String)>) -> Self {
         env.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         self.env = env;
+        self
+    }
+
+    /// Sets host filesystem capabilities for streams and filesystem builtins.
+    #[must_use]
+    pub fn with_filesystem_capabilities(mut self, filesystem: FilesystemCapabilities) -> Self {
+        self.filesystem = filesystem;
+        self
+    }
+
+    /// Enables a deterministic process mock for isolated tests.
+    #[must_use]
+    pub fn with_process_mock(mut self, output: impl Into<String>, exit_status: i64) -> Self {
+        self.process = ProcessCapability::Mock {
+            output: output.into(),
+            exit_status,
+        };
         self
     }
 
@@ -141,6 +199,12 @@ impl RuntimeContext {
         let mut array = PhpArray::new();
         array.insert(string_key("argc"), Value::Int(self.argc()));
         array.insert(string_key("argv"), self.argv_array());
+        let script = self.argv.first().cloned().unwrap_or_default();
+        array.insert(string_key("PHP_SELF"), Value::string(script.clone()));
+        array.insert(string_key("SCRIPT_FILENAME"), Value::string(script.clone()));
+        array.insert(string_key("SCRIPT_NAME"), Value::string(script));
+        array.insert(string_key("DOCUMENT_ROOT"), Value::string(""));
+        array.insert(string_key("REQUEST_TIME"), Value::Int(0));
         array
     }
 
@@ -172,6 +236,8 @@ mod tests {
         assert_eq!(context.include_path.len(), 1);
         assert_eq!(context.ini.error_reporting.mask, -1);
         assert!(context.ini.display_errors);
+        assert_eq!(context.ini_registry().get("include_path"), Some("."));
+        assert_eq!(context.process, super::ProcessCapability::Disabled);
         assert!(context.strict_types.is_empty());
     }
 
@@ -195,6 +261,16 @@ mod tests {
             server.get(&ArrayKey::String(PhpString::from_test_str("argv"))),
             Some(Value::Array(_))
         ));
+        assert_eq!(
+            server.get(&ArrayKey::String(PhpString::from_test_str("SCRIPT_NAME"))),
+            Some(&Value::string(
+                "fixtures/runtime/valid/superglobals/argv.php"
+            ))
+        );
+        assert_eq!(
+            server.get(&ArrayKey::String(PhpString::from_test_str("REQUEST_TIME"))),
+            Some(&Value::Int(0))
+        );
     }
 
     #[test]

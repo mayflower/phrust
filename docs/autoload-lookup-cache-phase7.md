@@ -1,0 +1,53 @@
+# Phase 7 Autoload Lookup Cache
+
+Prompt 07.35 adds a request-local inline cache for conservative class-like
+autoload lookups. The cache covers class, interface, trait, and enum lookup
+metadata and is disabled when inline caches are off.
+
+## Guard Model
+
+The cache key records:
+
+- normalized class-like name
+- lookup kind: class, interface, trait, or enum
+- whether autoload is enabled for the lookup
+- current autoload recursion depth
+- include_path configuration string
+- Composer map fingerprint when a future runtime exposes one
+
+The cache entry is separately guarded by explicit epochs:
+
+- autoload stack epoch
+- class table epoch
+- include_path/config epoch
+
+Phase 6 Composer smoke fixtures register PHP callbacks and load Composer-style
+maps as ordinary PHP arrays, so the VM does not yet receive a stable Composer
+map object to fingerprint. In that case the fingerprint guard is `None`, while
+autoload registration, class table changes, and include_path changes still
+invalidate cached lookups.
+
+## Cached Results
+
+Positive results may be reused only while all guards and epochs match. The VM
+rechecks the direct class table or internal extension registry before accepting
+a positive hit.
+
+Negative results are installed only when reusing them cannot suppress visible
+autoload side effects: lookups with autoload disabled, or lookups with no
+registered autoload callbacks. When autoload callbacks are present and autoload
+is enabled, misses are not negatively cached.
+
+The cache never stores included file contents, autoload callback execution, or
+Composer files autoload side effects.
+
+## Counters
+
+The Phase 7 counter JSON includes:
+
+- `autoload_class_lookup_ic_hits`
+- `autoload_class_lookup_ic_misses`
+- `autoload_class_lookup_ic_invalidations`
+- `autoload_class_lookup_ic_guard_failures`
+
+The `inline-cache-smoke` gate requires visible autoload lookup hits and misses.

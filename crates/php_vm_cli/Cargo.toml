@@ -5,12 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+jit-cranelift = ["php_vm/jit-cranelift"]
+
 [[bin]]
 name = "php-vm"
 path = "src/main.rs"
 
 [dependencies]
+php_bytecode_cache = { path = "../php_bytecode_cache" }
 php_ir = { path = "../php_ir" }
+php_optimizer = { path = "../php_optimizer" }
 php_runtime = { path = "../php_runtime" }
 php_semantics = { path = "../php_semantics" }
 php_source = { path = "../php_source" }

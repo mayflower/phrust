@@ -2,8 +2,8 @@
 
 use crate::block::BasicBlock;
 use crate::function::IrFunction;
-use crate::ids::{BlockId, ConstId, LocalId, RegId};
-use crate::instruction::{Instruction, InstructionKind, Terminator, TerminatorKind};
+use crate::ids::{BlockId, ConstId, InstrId, LocalId, RegId};
+use crate::instruction::{Instruction, InstructionKind, IrCallArg, Terminator, TerminatorKind};
 use crate::module::{IR_VERSION, IrUnit};
 use crate::operand::Operand;
 use crate::source_map::IrSpan;
@@ -43,6 +43,36 @@ pub enum VerificationErrorCode {
     InvalidBlockTarget,
     /// Basic block is missing a terminator.
     MissingTerminator,
+    /// Register operand can be read before every incoming path defines it.
+    UndefinedRegisterUse,
+    /// Call or return by-reference metadata is internally inconsistent.
+    InvalidCallArgMetadata,
+}
+
+impl VerificationErrorCode {
+    /// Stable machine-readable diagnostic ID for verifier consumers.
+    #[must_use]
+    pub const fn diagnostic_id(self) -> &'static str {
+        match self {
+            Self::InvalidVersion => "E_PHP_IR_VERIFY_INVALID_VERSION",
+            Self::InvalidEntryFunction => "E_PHP_IR_VERIFY_INVALID_ENTRY_FUNCTION",
+            Self::InvalidFileId => "E_PHP_IR_VERIFY_INVALID_FILE_ID",
+            Self::InvalidClassId => "E_PHP_IR_VERIFY_INVALID_CLASS_ID",
+            Self::InvalidSpan => "E_PHP_IR_VERIFY_INVALID_SPAN",
+            Self::InvalidBlockId => "E_PHP_IR_VERIFY_INVALID_BLOCK_ID",
+            Self::InvalidInstrId => "E_PHP_IR_VERIFY_INVALID_INSTR_ID",
+            Self::InvalidRegId => "E_PHP_IR_VERIFY_INVALID_REG_ID",
+            Self::InvalidLocalId => "E_PHP_IR_VERIFY_INVALID_LOCAL_ID",
+            Self::InvalidConstId => "E_PHP_IR_VERIFY_INVALID_CONST_ID",
+            Self::InvalidFunctionId => "E_PHP_IR_VERIFY_INVALID_FUNCTION_ID",
+            Self::DuplicateFunctionName => "E_PHP_IR_VERIFY_DUPLICATE_FUNCTION_NAME",
+            Self::DuplicateConstantName => "E_PHP_IR_VERIFY_DUPLICATE_CONSTANT_NAME",
+            Self::InvalidBlockTarget => "E_PHP_IR_VERIFY_INVALID_BLOCK_TARGET",
+            Self::MissingTerminator => "E_PHP_IR_VERIFY_MISSING_TERMINATOR",
+            Self::UndefinedRegisterUse => "E_PHP_IR_VERIFY_UNDEFINED_REGISTER_USE",
+            Self::InvalidCallArgMetadata => "E_PHP_IR_VERIFY_INVALID_CALL_ARG_METADATA",
+        }
+    }
 }
 
 /// One IR verifier error.
@@ -52,6 +82,14 @@ pub struct VerificationError {
     pub code: VerificationErrorCode,
     /// Human-readable context.
     pub message: String,
+}
+
+impl VerificationError {
+    /// Stable machine-readable diagnostic ID for this verifier error.
+    #[must_use]
+    pub const fn diagnostic_id(&self) -> &'static str {
+        self.code.diagnostic_id()
+    }
 }
 
 /// Verifies basic IR invariants.
@@ -171,6 +209,7 @@ fn verify_function(unit: &IrUnit, function: &IrFunction, errors: &mut Vec<Verifi
         verify_block_id(block.id, index, errors);
         verify_block(unit, function, block, errors);
     }
+    verify_register_definitions(function, errors);
 }
 
 fn verify_block(
@@ -301,42 +340,22 @@ fn verify_instruction(
         }
         InstructionKind::BindReferenceFromCall { target, args, .. } => {
             verify_local(*target, function.local_count, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::CallFunction { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::CallMethod {
             dst, object, args, ..
         } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(object, function, unit, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::CallStaticMethod { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::CloneObject { dst, object } => {
             verify_register(*dst, function.register_count, errors);
@@ -402,12 +421,7 @@ fn verify_instruction(
         InstructionKind::CallClosure { dst, callee, args } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(callee, function, unit, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::ResolveCallable { dst, .. } => {
             verify_register(*dst, function.register_count, errors);
@@ -415,12 +429,7 @@ fn verify_instruction(
         InstructionKind::CallCallable { dst, callee, args } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(callee, function, unit, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::Pipe {
             dst,
@@ -441,12 +450,7 @@ fn verify_instruction(
         }
         InstructionKind::NewObject { dst, args, .. } => {
             verify_register(*dst, function.register_count, errors);
-            for arg in args {
-                verify_operand(&arg.value, function, unit, errors);
-                if let Some(local) = arg.by_ref_local {
-                    verify_local(local, function.local_count, errors);
-                }
-            }
+            verify_call_args(args, function, unit, errors);
         }
         InstructionKind::FetchProperty { dst, object, .. } => {
             verify_register(*dst, function.register_count, errors);
@@ -606,7 +610,250 @@ fn verify_terminator(
             }
             if let Some(local) = by_ref_local {
                 verify_local(*local, function.local_count, errors);
+                if value != &Some(Operand::Local(*local)) {
+                    errors.push(error(
+                        VerificationErrorCode::InvalidCallArgMetadata,
+                        format!(
+                            "by-reference return local {} does not match return value",
+                            local.raw()
+                        ),
+                    ));
+                }
             }
+        }
+    }
+}
+
+fn verify_call_args(
+    args: &[IrCallArg],
+    function: &IrFunction,
+    unit: &IrUnit,
+    errors: &mut Vec<VerificationError>,
+) {
+    for arg in args {
+        verify_operand(&arg.value, function, unit, errors);
+        if let Some(local) = arg.by_ref_local {
+            verify_local(local, function.local_count, errors);
+            if arg.unpack {
+                errors.push(error(
+                    VerificationErrorCode::InvalidCallArgMetadata,
+                    format!(
+                        "unpacked call argument cannot carry by-reference local {}",
+                        local.raw()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn verify_register_definitions(function: &IrFunction, errors: &mut Vec<VerificationError>) {
+    let block_count = function.blocks.len();
+    let register_count = function.register_count as usize;
+    if block_count == 0 || register_count == 0 {
+        return;
+    }
+
+    let predecessors = block_predecessors(function);
+    let reachable = reachable_blocks(function);
+    let mut in_defs = vec![vec![true; register_count]; block_count];
+    let mut out_defs = vec![vec![true; register_count]; block_count];
+    in_defs[0] = vec![false; register_count];
+    out_defs[0] = apply_register_defs(&function.blocks[0], in_defs[0].clone());
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block_index in 0..block_count {
+            if !reachable[block_index] {
+                continue;
+            }
+            let next_in = if block_index == 0 || predecessors[block_index].is_empty() {
+                vec![false; register_count]
+            } else {
+                intersect_predecessor_defs(
+                    function,
+                    block_index,
+                    &predecessors[block_index],
+                    &reachable,
+                    &out_defs,
+                    register_count,
+                )
+            };
+            let next_out = apply_register_defs(&function.blocks[block_index], next_in.clone());
+            if next_in != in_defs[block_index] || next_out != out_defs[block_index] {
+                in_defs[block_index] = next_in;
+                out_defs[block_index] = next_out;
+                changed = true;
+            }
+        }
+    }
+
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        if !reachable[block_index] {
+            continue;
+        }
+        let mut defined = in_defs[block_index].clone();
+        for instruction in &block.instructions {
+            let mut uses = Vec::new();
+            instruction_register_uses(&instruction.kind, &mut uses);
+            report_undefined_registers(block.id, instruction.id, &uses, &defined, errors);
+            mark_instruction_defs(&instruction.kind, &mut defined);
+        }
+        if let Some(terminator) = &block.terminator {
+            let mut uses = Vec::new();
+            terminator_register_uses(&terminator.kind, &mut uses);
+            report_undefined_registers(block.id, InstrId::new(u32::MAX), &uses, &defined, errors);
+        }
+    }
+}
+
+fn block_predecessors(function: &IrFunction) -> Vec<Vec<usize>> {
+    let mut predecessors = vec![Vec::new(); function.blocks.len()];
+    for (source_index, block) in function.blocks.iter().enumerate() {
+        let Some(terminator) = &block.terminator else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        terminator_targets(&terminator.kind, &mut targets);
+        for target in targets {
+            if target.index() < predecessors.len() {
+                predecessors[target.index()].push(source_index);
+            }
+        }
+    }
+    predecessors
+}
+
+fn intersect_predecessor_defs(
+    function: &IrFunction,
+    target_index: usize,
+    predecessors: &[usize],
+    reachable: &[bool],
+    out_defs: &[Vec<bool>],
+    register_count: usize,
+) -> Vec<bool> {
+    let mut result = vec![true; register_count];
+    let mut saw_reachable_predecessor = false;
+    for predecessor in predecessors {
+        if !reachable[*predecessor] {
+            continue;
+        }
+        saw_reachable_predecessor = true;
+        let edge_defs = edge_register_defs(
+            &function.blocks[*predecessor],
+            BlockId::new(target_index as u32),
+            &out_defs[*predecessor],
+        );
+        for (index, defined) in edge_defs.iter().enumerate() {
+            result[index] &= *defined;
+        }
+    }
+    if !saw_reachable_predecessor {
+        return vec![false; register_count];
+    }
+    result
+}
+
+fn reachable_blocks(function: &IrFunction) -> Vec<bool> {
+    let mut reachable = vec![false; function.blocks.len()];
+    if function.blocks.is_empty() {
+        return reachable;
+    }
+    let mut stack = vec![0usize];
+    while let Some(index) = stack.pop() {
+        if index >= function.blocks.len() || reachable[index] {
+            continue;
+        }
+        reachable[index] = true;
+        let Some(terminator) = &function.blocks[index].terminator else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        terminator_targets(&terminator.kind, &mut targets);
+        for target in targets {
+            if target.index() < function.blocks.len() {
+                stack.push(target.index());
+            }
+        }
+    }
+    reachable
+}
+
+fn edge_register_defs(block: &BasicBlock, target: BlockId, out_defs: &[bool]) -> Vec<bool> {
+    let mut defs = out_defs.to_vec();
+    let Some(terminator) = &block.terminator else {
+        return defs;
+    };
+    if !is_false_successor(&terminator.kind, target) {
+        return defs;
+    }
+    let Some(last) = block.instructions.last() else {
+        return defs;
+    };
+    match &last.kind {
+        InstructionKind::ForeachNext { key, value, .. } => {
+            if let Some(key) = key
+                && let Some(slot) = defs.get_mut(key.index())
+            {
+                *slot = false;
+            }
+            if let Some(slot) = defs.get_mut(value.index()) {
+                *slot = false;
+            }
+        }
+        InstructionKind::ForeachNextRef { key, .. } => {
+            if let Some(key) = key
+                && let Some(slot) = defs.get_mut(key.index())
+            {
+                *slot = false;
+            }
+        }
+        _ => {}
+    }
+    defs
+}
+
+fn is_false_successor(kind: &TerminatorKind, target: BlockId) -> bool {
+    match kind {
+        TerminatorKind::JumpIfFalse {
+            condition: _,
+            target: false_target,
+        } => *false_target == target,
+        TerminatorKind::JumpIfTrue { .. } => false,
+        TerminatorKind::JumpIf { if_false, .. } => *if_false == target,
+        TerminatorKind::Jump { .. } | TerminatorKind::Return { .. } => false,
+    }
+}
+
+fn apply_register_defs(block: &BasicBlock, mut defined: Vec<bool>) -> Vec<bool> {
+    for instruction in &block.instructions {
+        mark_instruction_defs(&instruction.kind, &mut defined);
+    }
+    defined
+}
+
+fn report_undefined_registers(
+    block: BlockId,
+    instruction: InstrId,
+    uses: &[RegId],
+    defined: &[bool],
+    errors: &mut Vec<VerificationError>,
+) {
+    for register in uses {
+        if register.index() < defined.len() && !defined[register.index()] {
+            let where_ = if instruction.raw() == u32::MAX {
+                format!("block {} terminator", block.raw())
+            } else {
+                format!("block {} instruction {}", block.raw(), instruction.raw())
+            };
+            errors.push(error(
+                VerificationErrorCode::UndefinedRegisterUse,
+                format!(
+                    "{where_} reads register {} before definition",
+                    register.raw()
+                ),
+            ));
         }
     }
 }
@@ -635,6 +882,271 @@ fn verify_operand(
         Operand::Register(id) => verify_register(*id, function.register_count, errors),
         Operand::Local(id) => verify_local(*id, function.local_count, errors),
         Operand::Constant(id) => verify_constant(*id, unit.constants.len(), errors),
+    }
+}
+
+fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
+    match kind {
+        InstructionKind::Nop
+        | InstructionKind::LoadConst { .. }
+        | InstructionKind::FetchConst { .. }
+        | InstructionKind::LoadLocal { .. }
+        | InstructionKind::LoadLocalQuiet { .. }
+        | InstructionKind::BindReference { .. }
+        | InstructionKind::BindGlobal { .. }
+        | InstructionKind::LeaveTry
+        | InstructionKind::FetchStaticProperty { .. }
+        | InstructionKind::FetchClassConstant { .. }
+        | InstructionKind::NewArray { .. }
+        | InstructionKind::IssetLocal { .. }
+        | InstructionKind::EmptyLocal { .. }
+        | InstructionKind::UnsetLocal { .. }
+        | InstructionKind::ForeachInitRef { .. }
+        | InstructionKind::Unsupported { .. }
+        | InstructionKind::RuntimeError { .. } => {}
+        InstructionKind::Move { src, .. }
+        | InstructionKind::StoreLocal { src, .. }
+        | InstructionKind::InitStaticLocal { default: src, .. }
+        | InstructionKind::InstanceOf { object: src, .. }
+        | InstructionKind::Unary { src, .. }
+        | InstructionKind::Cast { src, .. }
+        | InstructionKind::Discard { src }
+        | InstructionKind::Echo { src }
+        | InstructionKind::YieldFrom { source: src, .. }
+        | InstructionKind::Throw { value: src }
+        | InstructionKind::CloneObject { object: src, .. }
+        | InstructionKind::Include { path: src, .. }
+        | InstructionKind::Eval { code: src, .. }
+        | InstructionKind::FetchProperty { object: src, .. }
+        | InstructionKind::IssetProperty { object: src, .. }
+        | InstructionKind::EmptyProperty { object: src, .. }
+        | InstructionKind::UnsetProperty { object: src, .. }
+        | InstructionKind::ForeachInit { source: src, .. } => operand_register_uses(src, uses),
+        InstructionKind::BindReferenceDim { dims, .. }
+        | InstructionKind::BindReferenceFromDim { dims, .. }
+        | InstructionKind::IssetDim { dims, .. }
+        | InstructionKind::EmptyDim { dims, .. }
+        | InstructionKind::UnsetDim { dims, .. } => {
+            for dim in dims {
+                operand_register_uses(dim, uses);
+            }
+        }
+        InstructionKind::Binary { lhs, rhs, .. }
+        | InstructionKind::Compare { lhs, rhs, .. }
+        | InstructionKind::ArrayGet {
+            array: lhs,
+            index: rhs,
+            ..
+        } => {
+            operand_register_uses(lhs, uses);
+            operand_register_uses(rhs, uses);
+        }
+        InstructionKind::Yield { key, value, .. } => {
+            if let Some(key) = key {
+                operand_register_uses(key, uses);
+            }
+            if let Some(value) = value {
+                operand_register_uses(value, uses);
+            }
+        }
+        InstructionKind::BindReferenceFromCall { args, .. }
+        | InstructionKind::CallFunction { args, .. }
+        | InstructionKind::CallStaticMethod { args, .. }
+        | InstructionKind::NewObject { args, .. } => call_args_register_uses(args, uses),
+        InstructionKind::CallMethod { object, args, .. } => {
+            operand_register_uses(object, uses);
+            call_args_register_uses(args, uses);
+        }
+        InstructionKind::CloneWith {
+            object,
+            replacements,
+            ..
+        } => {
+            operand_register_uses(object, uses);
+            operand_register_uses(replacements, uses);
+        }
+        InstructionKind::EnterTry { .. } | InstructionKind::EndFinally { .. } => {}
+        InstructionKind::MakeException { message, .. } => operand_register_uses(message, uses),
+        InstructionKind::MakeClosure { captures, .. } => {
+            for capture in captures {
+                operand_register_uses(&capture.src, uses);
+            }
+        }
+        InstructionKind::CallClosure { callee, args, .. }
+        | InstructionKind::CallCallable { callee, args, .. } => {
+            operand_register_uses(callee, uses);
+            call_args_register_uses(args, uses);
+        }
+        InstructionKind::ResolveCallable { .. } => {}
+        InstructionKind::Pipe {
+            input, callable, ..
+        } => {
+            operand_register_uses(input, uses);
+            operand_register_uses(callable, uses);
+        }
+        InstructionKind::AssignProperty { object, value, .. } => {
+            operand_register_uses(object, uses);
+            operand_register_uses(value, uses);
+        }
+        InstructionKind::AssignStaticProperty { value, .. } => operand_register_uses(value, uses),
+        InstructionKind::ArrayInsert { array, key, value } => {
+            uses.push(*array);
+            if let Some(key) = key {
+                operand_register_uses(key, uses);
+            }
+            operand_register_uses(value, uses);
+        }
+        InstructionKind::FetchDim { array, key, .. } => {
+            operand_register_uses(array, uses);
+            operand_register_uses(key, uses);
+        }
+        InstructionKind::AssignDim { dims, value, .. }
+        | InstructionKind::AppendDim { dims, value, .. } => {
+            for dim in dims {
+                operand_register_uses(dim, uses);
+            }
+            operand_register_uses(value, uses);
+        }
+        InstructionKind::ForeachNext { iterator, .. }
+        | InstructionKind::ForeachNextRef { iterator, .. } => uses.push(*iterator),
+    }
+}
+
+fn mark_instruction_defs(kind: &InstructionKind, defined: &mut [bool]) {
+    let mut defs = Vec::new();
+    instruction_register_defs(kind, &mut defs);
+    for register in defs {
+        if let Some(slot) = defined.get_mut(register.index()) {
+            *slot = true;
+        }
+    }
+}
+
+fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
+    match kind {
+        InstructionKind::LoadConst { dst, .. }
+        | InstructionKind::FetchConst { dst, .. }
+        | InstructionKind::Move { dst, .. }
+        | InstructionKind::LoadLocal { dst, .. }
+        | InstructionKind::LoadLocalQuiet { dst, .. }
+        | InstructionKind::Binary { dst, .. }
+        | InstructionKind::Compare { dst, .. }
+        | InstructionKind::InstanceOf { dst, .. }
+        | InstructionKind::Unary { dst, .. }
+        | InstructionKind::Cast { dst, .. }
+        | InstructionKind::Yield { dst, .. }
+        | InstructionKind::YieldFrom { dst, .. }
+        | InstructionKind::CallFunction { dst, .. }
+        | InstructionKind::CallMethod { dst, .. }
+        | InstructionKind::CallStaticMethod { dst, .. }
+        | InstructionKind::CloneObject { dst, .. }
+        | InstructionKind::CloneWith { dst, .. }
+        | InstructionKind::MakeException { dst, .. }
+        | InstructionKind::MakeClosure { dst, .. }
+        | InstructionKind::CallClosure { dst, .. }
+        | InstructionKind::ResolveCallable { dst, .. }
+        | InstructionKind::CallCallable { dst, .. }
+        | InstructionKind::Pipe { dst, .. }
+        | InstructionKind::Include { dst, .. }
+        | InstructionKind::Eval { dst, .. }
+        | InstructionKind::NewObject { dst, .. }
+        | InstructionKind::FetchProperty { dst, .. }
+        | InstructionKind::IssetProperty { dst, .. }
+        | InstructionKind::EmptyProperty { dst, .. }
+        | InstructionKind::FetchStaticProperty { dst, .. }
+        | InstructionKind::FetchClassConstant { dst, .. }
+        | InstructionKind::AssignProperty { dst, .. }
+        | InstructionKind::AssignStaticProperty { dst, .. }
+        | InstructionKind::NewArray { dst }
+        | InstructionKind::FetchDim { dst, .. }
+        | InstructionKind::AssignDim { dst, .. }
+        | InstructionKind::AppendDim { dst, .. }
+        | InstructionKind::IssetLocal { dst, .. }
+        | InstructionKind::EmptyLocal { dst, .. }
+        | InstructionKind::IssetDim { dst, .. }
+        | InstructionKind::EmptyDim { dst, .. }
+        | InstructionKind::ForeachInit { iterator: dst, .. }
+        | InstructionKind::ForeachInitRef { iterator: dst, .. }
+        | InstructionKind::ArrayGet { dst, .. } => defs.push(*dst),
+        InstructionKind::ForeachNext {
+            has_value,
+            key,
+            value,
+            ..
+        } => {
+            defs.push(*has_value);
+            if let Some(key) = key {
+                defs.push(*key);
+            }
+            defs.push(*value);
+        }
+        InstructionKind::ForeachNextRef { has_value, key, .. } => {
+            defs.push(*has_value);
+            if let Some(key) = key {
+                defs.push(*key);
+            }
+        }
+        InstructionKind::Nop
+        | InstructionKind::StoreLocal { .. }
+        | InstructionKind::BindReference { .. }
+        | InstructionKind::BindGlobal { .. }
+        | InstructionKind::BindReferenceDim { .. }
+        | InstructionKind::BindReferenceFromDim { .. }
+        | InstructionKind::BindReferenceFromCall { .. }
+        | InstructionKind::InitStaticLocal { .. }
+        | InstructionKind::Discard { .. }
+        | InstructionKind::Echo { .. }
+        | InstructionKind::EnterTry { .. }
+        | InstructionKind::LeaveTry
+        | InstructionKind::EndFinally { .. }
+        | InstructionKind::Throw { .. }
+        | InstructionKind::UnsetProperty { .. }
+        | InstructionKind::ArrayInsert { .. }
+        | InstructionKind::UnsetLocal { .. }
+        | InstructionKind::UnsetDim { .. }
+        | InstructionKind::Unsupported { .. }
+        | InstructionKind::RuntimeError { .. } => {}
+    }
+}
+
+fn terminator_register_uses(kind: &TerminatorKind, uses: &mut Vec<RegId>) {
+    match kind {
+        TerminatorKind::Jump { .. } => {}
+        TerminatorKind::JumpIfFalse { condition, .. }
+        | TerminatorKind::JumpIfTrue { condition, .. }
+        | TerminatorKind::JumpIf { condition, .. } => operand_register_uses(condition, uses),
+        TerminatorKind::Return { value, .. } => {
+            if let Some(value) = value {
+                operand_register_uses(value, uses);
+            }
+        }
+    }
+}
+
+fn terminator_targets(kind: &TerminatorKind, targets: &mut Vec<BlockId>) {
+    match kind {
+        TerminatorKind::Jump { target }
+        | TerminatorKind::JumpIfFalse { target, .. }
+        | TerminatorKind::JumpIfTrue { target, .. } => targets.push(*target),
+        TerminatorKind::JumpIf {
+            if_true, if_false, ..
+        } => {
+            targets.push(*if_true);
+            targets.push(*if_false);
+        }
+        TerminatorKind::Return { .. } => {}
+    }
+}
+
+fn call_args_register_uses(args: &[IrCallArg], uses: &mut Vec<RegId>) {
+    for arg in args {
+        operand_register_uses(&arg.value, uses);
+    }
+}
+
+fn operand_register_uses(operand: &Operand, uses: &mut Vec<RegId>) {
+    if let Operand::Register(register) = operand {
+        uses.push(*register);
     }
 }
 
@@ -703,16 +1215,25 @@ fn error(code: VerificationErrorCode, message: String) -> VerificationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BasicBlock;
     use crate::builder::IrBuilder;
     use crate::constants::IrConstant;
     use crate::function::FunctionFlags;
     use crate::ids::{FileId, FunctionId, InstrId, UnitId};
-    use crate::instruction::InstructionKind;
+    use crate::instruction::{BinaryOp, InstructionKind, IrCallArg};
 
     #[test]
     fn verifier_accepts_basic_unit() {
         let unit = valid_unit();
         verify_unit(&unit).expect("valid unit should verify");
+    }
+
+    #[test]
+    fn verifier_accepts_identity_optimizer_boundary() {
+        let unit = valid_unit();
+        verify_unit(&unit).expect("pre-optimizer unit should verify");
+        let optimized = unit.clone();
+        verify_unit(&optimized).expect("post-optimizer unit should verify");
     }
 
     #[test]
@@ -782,6 +1303,119 @@ mod tests {
                 .iter()
                 .any(|error| error.code == VerificationErrorCode::InvalidLocalId)
         );
+    }
+
+    #[test]
+    fn verifier_rejects_register_use_before_definition() {
+        let mut unit = valid_unit();
+        unit.functions[0].blocks[0].instructions[0].kind = InstructionKind::Binary {
+            dst: RegId::new(0),
+            op: BinaryOp::Add,
+            lhs: Operand::Register(RegId::new(0)),
+            rhs: Operand::Constant(ConstId::new(0)),
+        };
+        unit.functions[0].blocks[0].terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 6, 7),
+            kind: TerminatorKind::Return {
+                value: None,
+                by_ref_local: None,
+            },
+        });
+        let errors = verify_unit(&unit).expect_err("unit should fail verification");
+        let undefined = errors
+            .iter()
+            .find(|error| error.code == VerificationErrorCode::UndefinedRegisterUse)
+            .expect("undefined register use should be reported");
+        assert_eq!(
+            undefined.diagnostic_id(),
+            "E_PHP_IR_VERIFY_UNDEFINED_REGISTER_USE"
+        );
+    }
+
+    #[test]
+    fn verifier_accepts_register_defined_on_all_predecessors() {
+        let mut unit = valid_unit();
+        unit.functions[0].blocks[0].terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 6, 7),
+            kind: TerminatorKind::Jump {
+                target: BlockId::new(1),
+            },
+        });
+        let mut block = BasicBlock::new(BlockId::new(1));
+        block.terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 6, 7),
+            kind: TerminatorKind::Return {
+                value: Some(Operand::Register(RegId::new(0))),
+                by_ref_local: None,
+            },
+        });
+        unit.functions[0].blocks.push(block);
+        verify_unit(&unit).expect("register should be defined on the only incoming edge");
+    }
+
+    #[test]
+    fn verifier_rejects_foreach_value_use_on_false_edge() {
+        let mut unit = valid_unit();
+        unit.functions[0].register_count = 4;
+        unit.functions[0].blocks[0].instructions.push(Instruction {
+            id: InstrId::new(1),
+            span: IrSpan::new(FileId::new(0), 7, 8),
+            kind: InstructionKind::ForeachNext {
+                has_value: RegId::new(1),
+                iterator: RegId::new(0),
+                key: None,
+                value: RegId::new(2),
+            },
+        });
+        unit.functions[0].blocks[0].terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 8, 9),
+            kind: TerminatorKind::JumpIf {
+                condition: Operand::Register(RegId::new(1)),
+                if_true: BlockId::new(1),
+                if_false: BlockId::new(2),
+            },
+        });
+        let mut true_block = BasicBlock::new(BlockId::new(1));
+        true_block.terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 8, 9),
+            kind: TerminatorKind::Return {
+                value: Some(Operand::Register(RegId::new(2))),
+                by_ref_local: None,
+            },
+        });
+        let mut false_block = BasicBlock::new(BlockId::new(2));
+        false_block.terminator = Some(Terminator {
+            span: IrSpan::new(FileId::new(0), 8, 9),
+            kind: TerminatorKind::Return {
+                value: Some(Operand::Register(RegId::new(2))),
+                by_ref_local: None,
+            },
+        });
+        unit.functions[0].blocks.push(true_block);
+        unit.functions[0].blocks.push(false_block);
+        assert_has_error(&unit, VerificationErrorCode::UndefinedRegisterUse);
+    }
+
+    #[test]
+    fn verifier_rejects_inconsistent_call_argument_metadata() {
+        let mut unit = valid_unit();
+        unit.functions[0].locals.push("x".to_string());
+        unit.functions[0].local_count = 1;
+        unit.functions[0].blocks[0].instructions.push(Instruction {
+            id: InstrId::new(1),
+            span: IrSpan::new(FileId::new(0), 7, 8),
+            kind: InstructionKind::CallFunction {
+                dst: RegId::new(0),
+                name: "f".to_string(),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Register(RegId::new(0)),
+                    unpack: true,
+                    by_ref_local: Some(LocalId::new(0)),
+                }],
+            },
+        });
+        assert_has_error(&unit, VerificationErrorCode::InvalidCallArgMetadata);
     }
 
     fn assert_has_error(unit: &IrUnit, code: VerificationErrorCode) {

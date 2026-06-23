@@ -1,15 +1,21 @@
 [workspace]
 resolver = "3"
+exclude = ["crates/php_bench"]
 members = [
     "crates/php_ast",
+    "crates/php_bytecode_cache",
     "crates/php_frontend_cli",
     "crates/php_ir",
+    "crates/php_jit",
     "crates/php_lexer",
     "crates/php_lexer_cli",
+    "crates/php_optimizer",
     "crates/php_parser_cli",
+    "crates/php_perf",
     "crates/php_runtime",
     "crates/php_semantics",
     "crates/php_source",
+    "crates/php_std",
     "crates/php_syntax",
     "crates/php_testkit",
     "crates/php_vm",

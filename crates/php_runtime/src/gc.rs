@@ -338,6 +338,7 @@ impl GcTrackedHeap {
             | Value::Int(_)
             | Value::Float(_)
             | Value::String(_)
+            | Value::Resource(_)
             | Value::Uninitialized
             | Value::Callable(
                 CallableValue::UserFunction { .. }
@@ -446,6 +447,7 @@ impl GcScanner {
             | Value::Int(_)
             | Value::Float(_)
             | Value::String(_)
+            | Value::Resource(_)
             | Value::Uninitialized
             | Value::Callable(
                 CallableValue::UserFunction { .. }

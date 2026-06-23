@@ -174,6 +174,8 @@ require_file fixtures/runtime/valid/objects/instantiate.php
 require_file fixtures/runtime/valid/objects/constructor-property.php
 require_file fixtures/runtime/valid/objects/property-read-write.php
 require_file fixtures/runtime/valid/objects/two-objects.php
+require_file fixtures/runtime/valid/objects/private-property.php
+require_file fixtures/runtime/valid/objects/private-method.php
 require_file fixtures/runtime/valid/errors/warning-continuation.php
 require_file fixtures/runtime/invalid/division-by-zero.php
 require_file fixtures/runtime/invalid/type-error.php
@@ -186,7 +188,6 @@ require_file fixtures/runtime/invalid/functions/extra-arg.php
 require_file fixtures/runtime/invalid/functions/return-type-error.php
 require_file fixtures/runtime/valid/functions/by-ref-capture.php
 require_file fixtures/runtime/invalid/objects/unknown-class.php
-require_file fixtures/runtime/invalid/objects/private-property.php
 require_file fixtures/runtime/invalid/php85/pipe-not-callable.php
 require_file fixtures/runtime/valid/generators/yield.php
 require_file fixtures/runtime/valid/generators/yield-from.php

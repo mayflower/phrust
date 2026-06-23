@@ -5,8 +5,10 @@ engine.
 
 The repository currently contains the foundation tooling, byte-oriented lexer,
 lossless parser/CST layer, typed AST views, Phase 3 semantic frontend crates,
-Phase 4 IR/runtime/VM crates, fixture harnesses, and PHP reference comparison
-scripts. It does not implement JIT, extensions, or Zend ABI emulation.
+Phase 4 IR/runtime/VM crates, Phase 6 standard-library/runtime surface, Phase 7
+performance infrastructure, fixture harnesses, and PHP reference comparison
+scripts. It does not implement production native JIT, extensions, or Zend ABI
+emulation.
 
 ## Reference Target
 
@@ -154,6 +156,35 @@ nix develop -c just phase5-composer-smoke
 `phase5-composer-smoke` skips unless `PHPRUST_COMPOSER_FIXTURE_DIR` points at
 an existing local fixture project.
 
+## Phase 7 Performance Scope
+
+Phase 7 adds the first performance layer: benchmark infrastructure, counters,
+bytecode cache, optimizer passes, quickening, inline caches, runtime fast paths,
+an experimental default-off JIT path, safety audit coverage, and CI policy. The
+final audit is tracked in [the Phase 7 final audit](docs/phase7-final-audit.md)
+and [known-gap catalog](docs/known-gaps-phase7.md).
+
+Phase 7 keeps the same pipeline and must preserve PHP-visible behavior:
+
+```text
+php_lexer -> php_syntax -> php_ast -> php_semantics/HIR -> php_ir -> php_runtime -> php_vm -> php_vm_cli
+```
+
+Phase 7 commands:
+
+```bash
+nix develop -c just verify-phase7
+nix develop -c just perf-report
+nix develop -c just regression-phase7
+nix develop -c just perf-flag-matrix
+```
+
+Long benchmarks are local, manual, or scheduled evidence only:
+
+```bash
+nix develop -c just bench-phase7
+```
+
 ## CI
 
 CI uses Nix. The parser and semantic frontend workflows run the same commands
@@ -183,6 +214,25 @@ nix develop -c just semantic-corpus-smoke
 nix develop -c just fuzz-frontend-smoke
 nix develop -c just bench-frontend
 ```
+
+Phase 7 adds a required performance-layer smoke workflow that keeps
+`verify-phase7` as the source of truth:
+
+```bash
+nix flake check
+nix develop -c just verify-phase7
+```
+
+It includes cache, optimizer, quickening, inline-cache, default-off JIT, safety,
+regression, benchmark-smoke, and report-generation gates. Long Phase 7
+benchmarks are manual or scheduled only:
+
+```bash
+nix develop -c just bench-phase7
+nix develop -c just perf-report
+```
+
+See `docs/phase7-ci-policy.md` for the exact CI split and skip policy.
 
 ## Foundation Scope
 

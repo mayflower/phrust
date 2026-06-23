@@ -36,6 +36,12 @@ impl PhpString {
         Rc::strong_count(&self.bytes) > 1
     }
 
+    /// Returns true when two PHP strings share the same byte storage.
+    #[must_use]
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.bytes, &other.bytes)
+    }
+
     /// Ensures this string has unique storage before byte mutation.
     ///
     /// Normal PHP assignment clones the `PhpString` handle and shares the
@@ -66,6 +72,15 @@ impl PhpString {
     #[must_use]
     pub fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Returns a process-local identity for the shared byte storage.
+    ///
+    /// This is only suitable for request-local caches that also validate the
+    /// current bytes. It is not a PHP-visible identity.
+    #[must_use]
+    pub(crate) fn storage_id(&self) -> usize {
+        Rc::as_ptr(&self.bytes).cast::<()>() as usize
     }
 
     /// Test/debug convenience for non-runtime display.

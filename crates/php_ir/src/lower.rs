@@ -891,7 +891,7 @@ impl LoweringContext<'_> {
     ) -> FunctionId {
         let span = span_from_range(self.file, signature.span());
         let function = builder.start_function(
-            format!("{class_name}::{method_name}"),
+            format!("{display_class_name}::{display_method_name}"),
             FunctionFlags {
                 is_method: true,
                 ..FunctionFlags::default()
@@ -1366,6 +1366,7 @@ impl LoweringContext<'_> {
             let Some(name) = signature.name() else {
                 continue;
             };
+            let registered_name = qualified_function_name(module, &signature, name);
             let span = span_from_range(self.file, signature.span());
             let function = builder.start_function(
                 name,
@@ -1382,7 +1383,7 @@ impl LoweringContext<'_> {
             );
             builder.set_function_attributes(function, attributes);
             self.function_names.insert(function, name.to_string());
-            builder.register_function_name(normalize_function_name(name), function);
+            builder.register_function_name(normalize_function_name(&registered_name), function);
             builder.set_return_type(function, self.lower_return_type(signature.return_type()));
             builder.set_returns_by_ref(function, signature.by_ref_return());
             builder.add_source_map(
@@ -6756,6 +6757,26 @@ fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
 
+fn qualified_function_name(
+    module: &HirModule,
+    signature: &FunctionSignature,
+    short_name: &str,
+) -> String {
+    for namespace in module.namespaces().values() {
+        let owns_signature = namespace.items().iter().any(|item| {
+            item.kind() == TopLevelItemKind::Function && item.span() == signature.span()
+        });
+        if !owns_signature {
+            continue;
+        }
+        return namespace.name().map_or_else(
+            || short_name.to_owned(),
+            |name| format!("{}\\{short_name}", name.text()),
+        );
+    }
+    short_name.to_owned()
+}
+
 fn normalize_class_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
@@ -6778,6 +6799,19 @@ fn is_internal_throwable_class(normalized: &str) -> bool {
             | "valueerror"
             | "argumentcounterror"
             | "fibererror"
+            | "logicexception"
+            | "badfunctioncallexception"
+            | "badmethodcallexception"
+            | "domainexception"
+            | "invalidargumentexception"
+            | "lengthexception"
+            | "outofrangeexception"
+            | "runtimeexception"
+            | "outofboundsexception"
+            | "overflowexception"
+            | "rangeexception"
+            | "underflowexception"
+            | "unexpectedvalueexception"
     )
 }
 
@@ -7100,6 +7134,22 @@ mod tests {
         assert!(snapshot.contains("function_name \"add\" => function:1"));
         assert!(snapshot.contains("call_function r"));
         assert!(snapshot.contains("\"add\""));
+    }
+
+    #[test]
+    fn functions_lower_namespaced_declaration_table_and_call() {
+        let frontend = analyze_source(
+            "<?php namespace PhaseSevenIC; function hot() { return 2; } echo hot();",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert_eq!(result.unit.function_table.len(), 1);
+        assert_eq!(result.unit.function_table[0].name, "phasesevenic\\hot");
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("function_name \"phasesevenic\\\\hot\" => function:1"));
+        assert!(snapshot.contains("\"phasesevenic\\\\hot\""));
     }
 
     #[test]

@@ -1,0 +1,20 @@
+[package]
+name = "php_bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+publish = false
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+php_ir = { path = "../php_ir" }
+php_lexer = { path = "../php_lexer" }
+php_runtime = { path = "../php_runtime" }
+php_semantics = { path = "../php_semantics" }
+php_syntax = { path = "../php_syntax" }
+php_vm = { path = "../php_vm" }
+
+[[bench]]
+name = "phase7_hotpaths"
+harness = false

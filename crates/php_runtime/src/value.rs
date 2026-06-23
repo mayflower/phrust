@@ -1,6 +1,8 @@
 //! Minimal runtime value model for early VM execution.
 
-use crate::{FiberRef, GeneratorRef, ObjectRef, PhpArray, ReferenceCell, string::PhpString};
+use crate::{
+    FiberRef, GeneratorRef, ObjectRef, PhpArray, ReferenceCell, ResourceRef, string::PhpString,
+};
 use std::fmt;
 
 /// Runtime callable values.
@@ -101,6 +103,8 @@ pub enum Value {
     Array(PhpArray),
     /// Runtime object reference.
     Object(ObjectRef),
+    /// PHP resource handle.
+    Resource(ResourceRef),
     /// Internal fiber object.
     Fiber(FiberRef),
     /// Internal generator object.
@@ -252,6 +256,12 @@ impl fmt::Debug for Value {
                 .field("id", &object.id())
                 .field("class_name", &object.class_name())
                 .finish(),
+            Self::Resource(resource) => f
+                .debug_struct("Resource")
+                .field("id", &resource.id().get())
+                .field("type", &resource.resource_type())
+                .field("open", &resource.is_open())
+                .finish(),
             Self::Fiber(fiber) => f
                 .debug_struct("Fiber")
                 .field("id", &fiber.id())
@@ -310,6 +320,11 @@ impl fmt::Display for Value {
             Self::Uninitialized => f.write_str("<uninitialized>"),
             Self::Array(_) => f.write_str("<array>"),
             Self::Object(object) => f.write_str(&format!("object({})", object.class_name())),
+            Self::Resource(resource) => f.write_str(&format!(
+                "resource({}) of type ({})",
+                resource.id().get(),
+                resource.resource_type()
+            )),
             Self::Fiber(_) => f.write_str("object(Fiber)"),
             Self::Generator(_) => f.write_str("object(Generator)"),
             Self::Callable(_) => f.write_str("<callable>"),

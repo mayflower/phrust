@@ -1,5 +1,18 @@
 //! PHP numeric-string classification for runtime conversion.
 
+use crate::PhpString;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+const CACHE_LIMIT: usize = 4096;
+
+thread_local! {
+    static CLASSIFICATION_CACHE: RefCell<HashMap<NumericStringCacheKey, NumericString>> =
+        RefCell::new(HashMap::new());
+    static CLASSIFICATION_STATS: RefCell<NumericStringCacheStats> =
+        RefCell::new(NumericStringCacheStats::default());
+}
+
 /// Numeric value parsed from a PHP string.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericStringValue {
@@ -57,12 +70,79 @@ pub struct NumericString {
     pub value: Option<NumericStringValue>,
 }
 
+/// Numeric-string cache stats collected by the VM when counters are enabled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NumericStringCacheStats {
+    /// Cache hits.
+    pub hits: u64,
+    /// Cache misses.
+    pub misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NumericStringCacheKey {
+    storage_id: usize,
+    len: usize,
+    fingerprint: u64,
+}
+
 impl NumericString {
     /// Returns true when the string has a PHP numeric prefix.
     #[must_use]
     pub const fn has_numeric_value(self) -> bool {
         self.value.is_some()
     }
+}
+
+/// Classifies a PHP string through a conservative request-local cache.
+///
+/// The key includes storage identity, byte length, and a stable byte
+/// fingerprint. That keeps COW and in-place test mutations safe: changed bytes
+/// cannot reuse an old classification even when the backing allocation is the
+/// same.
+#[must_use]
+pub fn classify_php_string(value: &PhpString) -> NumericString {
+    let key = NumericStringCacheKey {
+        storage_id: value.storage_id(),
+        len: value.len(),
+        fingerprint: fingerprint(value.as_bytes()),
+    };
+    if let Some(classified) = CLASSIFICATION_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().hits += 1);
+        return classified;
+    }
+    let classified = classify(value.as_bytes());
+    CLASSIFICATION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, classified);
+    });
+    CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().misses += 1);
+    classified
+}
+
+/// Clears cache contents and hit/miss stats for deterministic VM executions.
+pub fn reset_cache_and_stats() {
+    CLASSIFICATION_CACHE.with(|cache| cache.borrow_mut().clear());
+    reset_cache_stats();
+}
+
+/// Clears only numeric-string cache hit/miss stats.
+pub fn reset_cache_stats() {
+    CLASSIFICATION_STATS.with(|stats| *stats.borrow_mut() = NumericStringCacheStats::default());
+}
+
+/// Returns and clears numeric-string cache hit/miss stats.
+#[must_use]
+pub fn take_cache_stats() -> NumericStringCacheStats {
+    CLASSIFICATION_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        let current = *stats;
+        *stats = NumericStringCacheStats::default();
+        current
+    })
 }
 
 /// Classifies a byte string using the Phase 5 PHP numeric-string subset.
@@ -99,6 +179,15 @@ pub fn classify(bytes: &[u8]) -> NumericString {
         kind: NumericStringKind::LeadingNumeric,
         value: Some(value),
     }
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn non_numeric() -> NumericString {
@@ -161,7 +250,11 @@ fn parse_numeric_prefix(bytes: &[u8]) -> Option<NumericStringValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NumericStringKind, NumericStringValue, classify};
+    use super::{
+        NumericStringKind, NumericStringValue, classify, classify_php_string,
+        reset_cache_and_stats, take_cache_stats,
+    };
+    use crate::PhpString;
 
     #[test]
     fn numeric_string_classifies_full_int_float_and_whitespace() {
@@ -179,5 +272,81 @@ mod tests {
         assert_eq!(classify(b"42abc").value, Some(NumericStringValue::Int(42)));
         assert_eq!(classify(b"").kind, NumericStringKind::NonNumeric);
         assert_eq!(classify(b"abc").kind, NumericStringKind::NonNumeric);
+    }
+
+    #[test]
+    fn numeric_string_cache_records_hits_misses_and_overflow() {
+        reset_cache_and_stats();
+        let value = PhpString::from("9223372036854775808");
+
+        let first = classify_php_string(&value);
+        let second = classify_php_string(&value);
+
+        assert_eq!(first, second);
+        assert_eq!(first.kind, NumericStringKind::FloatString);
+        assert!(matches!(first.value, Some(NumericStringValue::Float(_))));
+        let stats = take_cache_stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[test]
+    fn numeric_string_cache_separates_whitespace_and_non_numeric_cases() {
+        reset_cache_and_stats();
+        let int_with_space = PhpString::from(" 42\t");
+        let leading = PhpString::from("42abc");
+        let non_numeric = PhpString::from("abc");
+
+        assert_eq!(
+            classify_php_string(&int_with_space).kind,
+            NumericStringKind::IntString
+        );
+        assert_eq!(
+            classify_php_string(&leading).kind,
+            NumericStringKind::LeadingNumeric
+        );
+        assert_eq!(
+            classify_php_string(&non_numeric).kind,
+            NumericStringKind::NonNumeric
+        );
+        assert_eq!(
+            classify_php_string(&non_numeric).kind,
+            NumericStringKind::NonNumeric
+        );
+        let stats = take_cache_stats();
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[test]
+    fn numeric_string_cache_does_not_reuse_after_cow_or_in_place_mutation() {
+        reset_cache_and_stats();
+        let original = PhpString::from("12");
+        let mut shared = original.clone();
+
+        assert_eq!(
+            classify_php_string(&original).kind,
+            NumericStringKind::IntString
+        );
+        shared.bytes_mut()[0] = b'x';
+        assert_eq!(
+            classify_php_string(&shared).kind,
+            NumericStringKind::NonNumeric
+        );
+
+        let mut unique = PhpString::from("34");
+        assert_eq!(
+            classify_php_string(&unique).kind,
+            NumericStringKind::IntString
+        );
+        unique.bytes_mut()[0] = b'y';
+        assert_eq!(
+            classify_php_string(&unique).kind,
+            NumericStringKind::NonNumeric
+        );
+
+        let stats = take_cache_stats();
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.hits, 0);
     }
 }

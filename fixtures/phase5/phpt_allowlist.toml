@@ -22,8 +22,7 @@ reason = "Uses current(), which is outside the Phase 5 stdlib subset; keeps fore
 [[test]]
 path = "../../third_party/php-src/Zend/tests/traits/language001.phpt"
 category = "traits"
-disposition = "expected_fail"
-reason = "The upstream test calls error_reporting(E_ALL); E_ALL is not modeled in the Phase 5 runtime constants subset."
+disposition = "run"
 
 [[test]]
 path = "../../third_party/php-src/Zend/tests/enum/magic-constants.phpt"

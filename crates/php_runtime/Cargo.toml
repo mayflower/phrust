@@ -6,7 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+crc32fast = "1.4"
+getrandom = "0.2"
+md-5 = "0.10"
+pcre2 = "0.2"
+php_lexer = { path = "../php_lexer" }
 php_source = { path = "../php_source" }
+serde_json = "1"
+sha1 = "0.10"
 
 [dev-dependencies]
 php_testkit = { path = "../php_testkit" }
