@@ -1,6 +1,6 @@
 //! PHP 8.5.7 core and platform constants for Phase 6.
 
-use php_runtime::{PhpString, Value};
+use php_runtime::{FloatValue, PhpString, Value};
 
 use crate::ConstantValue;
 
@@ -14,6 +14,16 @@ pub const PHP_MAJOR_VERSION: i64 = 8;
 pub const PHP_MINOR_VERSION: i64 = 5;
 /// Target PHP release version.
 pub const PHP_RELEASE_VERSION: i64 = 7;
+/// PHP integer size in bytes for the current build target.
+pub const PHP_INT_SIZE: i64 = std::mem::size_of::<isize>() as i64;
+/// PHP maximum integer for the current build target.
+pub const PHP_INT_MAX: i64 = isize::MAX as i64;
+/// PHP minimum integer for the current build target.
+pub const PHP_INT_MIN: i64 = isize::MIN as i64;
+/// PHP positive infinity constant.
+pub const INF: FloatValue = FloatValue::from_f64(f64::INFINITY);
+/// PHP quiet NaN constant.
+pub const NAN: FloatValue = FloatValue::from_f64(f64::NAN);
 
 /// Directory separator for the current build target.
 #[cfg(windows)]
@@ -97,6 +107,7 @@ pub fn constant_to_value(value: ConstantValue) -> Value {
     match value {
         ConstantValue::Bool(value) => Value::Bool(value),
         ConstantValue::Int(value) => Value::Int(value),
+        ConstantValue::Float(value) => Value::Float(value),
         ConstantValue::String(value) => Value::String(PhpString::from(value)),
     }
 }
@@ -113,6 +124,11 @@ mod tests {
         assert_eq!(PHP_MAJOR_VERSION, 8);
         assert_eq!(PHP_MINOR_VERSION, 5);
         assert_eq!(PHP_RELEASE_VERSION, 7);
+        assert_eq!(PHP_INT_SIZE, std::mem::size_of::<isize>() as i64);
+        assert_eq!(PHP_INT_MAX, isize::MAX as i64);
+        assert_eq!(PHP_INT_MIN, isize::MIN as i64);
+        assert!(INF.to_f64().is_infinite());
+        assert!(NAN.to_f64().is_nan());
     }
 
     #[test]
@@ -130,6 +146,31 @@ mod tests {
             constant_to_value(separator.value().expect("separator value")),
             Value::String(PhpString::from(DIRECTORY_SEPARATOR))
         );
+
+        assert_eq!(
+            registry
+                .enabled_constant("PHP_INT_MAX")
+                .and_then(crate::ConstantDescriptor::value),
+            Some(ConstantValue::Int(PHP_INT_MAX))
+        );
+        assert_eq!(
+            registry
+                .enabled_constant("PHP_INT_SIZE")
+                .and_then(crate::ConstantDescriptor::value),
+            Some(ConstantValue::Int(PHP_INT_SIZE))
+        );
+        assert!(matches!(
+            registry
+                .enabled_constant("INF")
+                .and_then(crate::ConstantDescriptor::value),
+            Some(ConstantValue::Float(value)) if value.to_f64().is_infinite()
+        ));
+        assert!(matches!(
+            registry
+                .enabled_constant("NAN")
+                .and_then(crate::ConstantDescriptor::value),
+            Some(ConstantValue::Float(value)) if value.to_f64().is_nan()
+        ));
     }
 
     #[test]

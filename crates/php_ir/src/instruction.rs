@@ -37,6 +37,16 @@ pub enum BinaryOp {
     Concat,
     /// Exponentiation.
     Pow,
+    /// Bitwise and.
+    BitAnd,
+    /// Bitwise or.
+    BitOr,
+    /// Bitwise xor.
+    BitXor,
+    /// Shift left.
+    ShiftLeft,
+    /// Shift right.
+    ShiftRight,
 }
 
 /// Comparison operator family.

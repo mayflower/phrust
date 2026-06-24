@@ -1,0 +1,37 @@
+{
+  "module": "zend.basic",
+  "prompt": "09.11",
+  "description": "Zend basic execution, output, scalar literals, var_dump, statement sequencing, and top-level return/exit basics.",
+  "scope": [
+    "Zend/tests/*",
+    "basic language tests tagged as literals/output",
+    "echo/print",
+    "scalar null/bool/int/float/string literals",
+    "basic var_dump, var_export, and print_r output where already supported",
+    "statement sequencing",
+    "top-level return/exit basics"
+  ],
+  "selected_manifest": "tests/phpt/manifests/modules/zend.basic.selected.jsonl",
+  "generated_manifest": "tests/phpt/manifests/zend.basic-generated.jsonl",
+  "selected_originals": [
+    {
+      "path": "Zend/tests/numeric_literal_separator/numeric_literal_separator_001.phpt",
+      "source_hash": "e7854d36777eda6250e02933451e2ae35ebfbd4814267ddd833a843663eda9e1",
+      "reason": "Scalar int/float literal separators across decimal, exponent, hex, binary, and legacy octal forms with var_dump output."
+    }
+  ],
+  "selected_generated": [
+    {
+      "path": "tests/phpt/generated/zend.basic/regression-numeric_literal_separator_001-e7854d367777.phpt",
+      "original_path": "Zend/tests/numeric_literal_separator/numeric_literal_separator_001.phpt",
+      "original_source_hash": "e7854d36777eda6250e02933451e2ae35ebfbd4814267ddd833a843663eda9e1",
+      "reason": "Reduced scalar-literal regression generated from reference output."
+    }
+  ],
+  "closure_gate": [
+    "nix develop -c just phpt-module-phase9 MODULE=zend.basic",
+    "nix develop -c just phpt-full-regression-phase9",
+    "nix develop -c just phpt-verify-source-integrity-phase9",
+    "nix develop -c just verify-phase9"
+  ]
+}

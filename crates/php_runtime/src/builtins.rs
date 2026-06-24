@@ -5194,7 +5194,7 @@ fn builtin_json_encode(
         .map(|value| int_arg("json_encode", value))
         .transpose()?
         .unwrap_or(0);
-    match php_value_to_json(&args[0]) {
+    match php_value_to_json(&args[0], flags) {
         Ok(json) => {
             let encoded = if flags & JSON_PRETTY_PRINT != 0 {
                 serde_json::to_string_pretty(&json)
@@ -5885,14 +5885,26 @@ fn is_remote_stream_uri(uri: &str) -> bool {
     )
 }
 
-fn php_value_to_json(value: &Value) -> Result<JsonValue, i64> {
+fn php_value_to_json(value: &Value, flags: i64) -> Result<JsonValue, i64> {
     match deref_value(value) {
         Value::Null | Value::Uninitialized => Ok(JsonValue::Null),
         Value::Bool(value) => Ok(JsonValue::Bool(value)),
         Value::Int(value) => Ok(JsonValue::Number(JsonNumber::from(value))),
-        Value::Float(value) => JsonNumber::from_f64(value.to_f64())
-            .map(JsonValue::Number)
-            .ok_or(JSON_ERROR_SYNTAX),
+        Value::Float(value) => {
+            let value = value.to_f64();
+            if value.is_finite()
+                && value.fract() == 0.0
+                && flags & JSON_PRESERVE_ZERO_FRACTION == 0
+                && value >= i64::MIN as f64
+                && value <= i64::MAX as f64
+            {
+                Ok(JsonValue::Number(JsonNumber::from(value as i64)))
+            } else {
+                JsonNumber::from_f64(value)
+                    .map(JsonValue::Number)
+                    .ok_or(JSON_ERROR_SYNTAX)
+            }
+        }
         Value::String(value) => std::str::from_utf8(value.as_bytes())
             .map(|text| JsonValue::String(text.to_string()))
             .map_err(|_| JSON_ERROR_UTF8),
@@ -5900,7 +5912,7 @@ fn php_value_to_json(value: &Value) -> Result<JsonValue, i64> {
             if let Some(elements) = array.packed_elements() {
                 elements
                     .into_iter()
-                    .map(php_value_to_json)
+                    .map(|value| php_value_to_json(value, flags))
                     .collect::<Result<Vec<_>, _>>()
                     .map(JsonValue::Array)
             } else {
@@ -5910,7 +5922,7 @@ fn php_value_to_json(value: &Value) -> Result<JsonValue, i64> {
                         ArrayKey::Int(value) => value.to_string(),
                         ArrayKey::String(value) => value.to_string_lossy(),
                     };
-                    object.insert(key, php_value_to_json(value)?);
+                    object.insert(key, php_value_to_json(value, flags)?);
                 }
                 Ok(JsonValue::Object(object))
             }
@@ -5918,7 +5930,7 @@ fn php_value_to_json(value: &Value) -> Result<JsonValue, i64> {
         Value::Object(object) => {
             let mut json = JsonMap::new();
             for (name, value) in object.properties_snapshot() {
-                json.insert(name, php_value_to_json(&value)?);
+                json.insert(name, php_value_to_json(&value, flags)?);
             }
             Ok(JsonValue::Object(json))
         }
@@ -7307,7 +7319,9 @@ impl DebugFormatter {
             Value::Bool(true) => output.write_test_str("bool(true)\n"),
             Value::Bool(false) => output.write_test_str("bool(false)\n"),
             Value::Int(value) => output.write_test_str(&format!("int({value})\n")),
-            Value::Float(value) => output.write_test_str(&format!("float({value})\n")),
+            Value::Float(value) => {
+                output.write_test_str(&format!("float({})\n", php_float_debug_string(*value)));
+            }
             Value::String(value) => output.write_test_str(&format!(
                 "string({}) \"{}\"\n",
                 value.len(),
@@ -7420,7 +7434,7 @@ impl DebugFormatter {
             Value::Bool(true) => output.write_test_str("true"),
             Value::Bool(false) => output.write_test_str("false"),
             Value::Int(value) => output.write_test_str(&value.to_string()),
-            Value::Float(value) => output.write_test_str(&php_float_debug_string(*value)),
+            Value::Float(value) => output.write_test_str(&php_float_export_string(*value)),
             Value::String(value) => write_export_string(output, &value.to_string_lossy()),
             Value::Array(array) => {
                 output.write_test_str("array (\n");
@@ -7514,11 +7528,52 @@ fn write_export_string(output: &mut OutputBuffer, text: &str) {
 
 fn php_float_debug_string(value: FloatValue) -> String {
     let value = value.to_f64();
-    let text = value.to_string();
-    if value.is_finite() && value.fract() == 0.0 && !text.contains(['.', 'e', 'E']) {
-        format!("{text}.0")
+    if value.is_nan() {
+        return "NAN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-INF".to_owned()
+        } else {
+            "INF".to_owned()
+        };
+    }
+
+    let abs = value.abs();
+    if abs != 0.0 && !(1e-4..1e16).contains(&abs) {
+        return php_scientific_float_debug_string(value);
+    }
+
+    value.to_string()
+}
+
+fn php_float_export_string(value: FloatValue) -> String {
+    let value = value.to_f64();
+    if value.is_nan() {
+        return "NAN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-INF".to_owned()
+        } else {
+            "INF".to_owned()
+        };
+    }
+
+    let mut formatted = value.to_string();
+    if !formatted.contains(['.', 'E', 'e']) {
+        formatted.push_str(".0");
+    }
+    formatted
+}
+
+fn php_scientific_float_debug_string(value: f64) -> String {
+    let formatted = format!("{value:E}");
+    if let Some((mantissa, exponent)) = formatted.split_once('E') {
+        let sign = if exponent.starts_with('-') { "" } else { "+" };
+        format!("{mantissa}E{sign}{exponent}")
     } else {
-        text
+        formatted
     }
 }
 
@@ -9177,6 +9232,10 @@ mod tests {
             call_in_context(&mut context, "json_encode", vec![Value::Array(mixed)]),
             Value::string(r#"{"name":"pkg","versions":["1.0.0","1.1.0"]}"#)
         );
+        assert_eq!(
+            call_in_context(&mut context, "json_encode", vec![Value::float(42.0)]),
+            Value::string("42")
+        );
         let flags = JSON_PRETTY_PRINT
             | JSON_UNESCAPED_SLASHES
             | JSON_UNESCAPED_UNICODE
@@ -9326,6 +9385,10 @@ mod tests {
                 Value::Null,
                 Value::Bool(true),
                 Value::Int(7),
+                Value::float(1.0),
+                Value::float(f64::INFINITY),
+                Value::float(f64::NAN),
+                Value::float(9_223_372_036_854_776_000.0),
                 Value::string("hi"),
                 Value::packed_array(vec![Value::Int(1), Value::string("x")]),
             ],
@@ -9335,7 +9398,7 @@ mod tests {
         assert_eq!(result, Value::Null);
         assert_eq!(
             output.to_string_lossy(),
-            "NULL\nbool(true)\nint(7)\nstring(2) \"hi\"\narray(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) \"x\"\n}\n"
+            "NULL\nbool(true)\nint(7)\nfloat(1)\nfloat(INF)\nfloat(NAN)\nfloat(9.223372036854776E+18)\nstring(2) \"hi\"\narray(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) \"x\"\n}\n"
         );
     }
 
@@ -9372,6 +9435,30 @@ mod tests {
                 &mut output
             ),
             Value::string("array (\n  0 => \n  array (\n    0 => 1,\n  ),\n)")
+        );
+        assert_eq!(
+            call(
+                "var_export",
+                vec![Value::float(1.0), Value::Bool(true)],
+                &mut output
+            ),
+            Value::string("1.0")
+        );
+        assert_eq!(
+            call(
+                "var_export",
+                vec![Value::float(-0.0), Value::Bool(true)],
+                &mut output
+            ),
+            Value::string("-0.0")
+        );
+        assert_eq!(
+            call(
+                "var_export",
+                vec![Value::float(10_000_000_000_000_000.0), Value::Bool(true)],
+                &mut output
+            ),
+            Value::string("10000000000000000.0")
         );
 
         let cell = ReferenceCell::new(Value::Null);

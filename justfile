@@ -19,6 +19,18 @@ help:
       '  just verify-phase4  Run Phase 4 IR/VM/runtime verification' \
       '  just verify-phase5  Run Phase 5 runtime semantics verification' \
       '  just verify-phase6  Run Phase 6 standard-library verification' \
+      '  just verify-phase9  Run Phase 9 PHPT-driven runtime completion verification' \
+      '  just phpt-index-phase9  Index the Phase 9 PHPT corpus' \
+      '  just phpt-source-index-phase9  Index pinned php-src source and PHPT hashes' \
+      '  just phpt-runner-tests-phase9  Run Phase 9 PHPT runner tests' \
+      '  just phpt-reference-smoke-phase9  Run Phase 9 Reference PHP smoke' \
+      '  just phpt-target-smoke-phase9  Run Phase 9 Target PHP smoke' \
+      '  just phpt-generate-phase9 MODULE=<module>  Generate Phase 9 module tests' \
+      '  just phpt-module-phase9 MODULE=<module>  Run a Phase 9 module batch' \
+      '  just phpt-module-fixloop-phase9 MODULE=<module>  Run a Phase 9 module fix loop' \
+      '  just phpt-full-regression-phase9  Run the Phase 9 full PHPT no-regression gate' \
+      '  just phpt-full-strict-phase9  Run the final Phase 9 strict PHPT gate' \
+      '  just phpt-verify-source-integrity-phase9  Verify pinned php-src was not mutated' \
       '  just test-phase6  Run Phase 6 documentation and preflight tests' \
       '  just coverage-phase6  Run Phase 6 coverage document checks' \
       '  just phase6-generate-arginfo  Generate optional Phase 6 arginfo metadata from php-src stubs' \
@@ -279,6 +291,80 @@ verify-phase5:
 
 verify-phase6:
     scripts/verify-phase6.sh
+
+verify-phase9:
+    scripts/phase9/verify_foundation.sh
+    scripts/phase9/verify_source_integrity.sh
+
+phpt-index-phase9 *args:
+    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- phpt-index {{args}}
+
+phpt-source-index-phase9 *args:
+    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- source-index {{args}}
+    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- symbol-index {{args}}
+
+phpt-runner-tests-phase9 *args:
+    scripts/phase9/runner_smoke.sh
+
+phpt-reference-smoke-phase9 *args:
+    scripts/phase9/binary_smoke.sh reference
+
+phpt-target-smoke-phase9 *args:
+    scripts/phase9/binary_smoke.sh target
+
+phpt-generate-phase9 *args:
+    scripts/phase9/generate_module.sh {{args}}
+
+phpt-module-phase9 *args:
+    scripts/phase9/module_run.sh {{args}}
+
+phpt-module-fixloop-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-module-fixloop-phase9 {{args}}
+
+phpt-full-regression-phase9 *args:
+    scripts/phase9/full_regression.sh {{args}}
+
+phpt-full-strict-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-full-strict-phase9 {{args}}
+
+phpt-verify-source-integrity-phase9:
+    scripts/phase9/verify_source_integrity.sh
+
+phpt-source-lookup-phase9 *args:
+    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- lookup-symbol {{args}}
+
+phpt-official-smoke-phase9 *args:
+    scripts/phase9/official_smoke.sh {{args}}
+
+phpt-dashboard-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-dashboard-phase9 {{args}}
+
+phpt-plan-next-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-plan-next-phase9 {{args}}
+
+phpt-official-parity-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-official-parity-phase9 {{args}}
+
+phpt-behavior-notes-check-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-behavior-notes-check-phase9 {{args}}
+
+phpt-minimize-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-minimize-phase9 {{args}}
+
+phpt-generate-probes-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-generate-probes-phase9 {{args}}
+
+phpt-full-official-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-full-official-phase9 {{args}}
+
+phpt-coverage-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-coverage-phase9 {{args}}
+
+phpt-update-rehearsal-phase9 *args:
+    scripts/phase9/placeholder.sh phpt-update-rehearsal-phase9 {{args}}
+
+phpt-maintenance-check *args:
+    scripts/phase9/placeholder.sh phpt-maintenance-check {{args}}
 
 test-phase6:
     scripts/test-phase6.sh

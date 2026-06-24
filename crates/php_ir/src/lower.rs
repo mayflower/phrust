@@ -6666,6 +6666,11 @@ fn binary_op(operator: &str) -> Option<BinaryOp> {
         "%" => Some(BinaryOp::Mod),
         "**" => Some(BinaryOp::Pow),
         "." => Some(BinaryOp::Concat),
+        "&" => Some(BinaryOp::BitAnd),
+        "|" => Some(BinaryOp::BitOr),
+        "^" => Some(BinaryOp::BitXor),
+        "<<" => Some(BinaryOp::ShiftLeft),
+        ">>" => Some(BinaryOp::ShiftRight),
         _ => None,
     }
 }
@@ -6679,6 +6684,11 @@ fn assignment_binary_op(operator: &str) -> Option<BinaryOp> {
         "%=" => Some(BinaryOp::Mod),
         "**=" => Some(BinaryOp::Pow),
         ".=" => Some(BinaryOp::Concat),
+        "&=" => Some(BinaryOp::BitAnd),
+        "|=" => Some(BinaryOp::BitOr),
+        "^=" => Some(BinaryOp::BitXor),
+        "<<=" => Some(BinaryOp::ShiftLeft),
+        ">>=" => Some(BinaryOp::ShiftRight),
         _ => None,
     }
 }
@@ -6893,10 +6903,47 @@ fn literal_constant(text: &str) -> Option<IrConstant> {
     }
 
     let numeric = trimmed.replace('_', "");
-    if numeric.contains('.') || numeric.contains('e') || numeric.contains('E') {
+    if is_php_float_literal_candidate(&numeric) {
         return numeric.parse::<f64>().ok().map(IrConstant::Float);
     }
-    numeric.parse::<i64>().ok().map(IrConstant::Int)
+    parse_php_int_literal(&numeric).map(IrConstant::Int)
+}
+
+fn is_php_float_literal_candidate(text: &str) -> bool {
+    let body = text
+        .strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text);
+    let lower = body.to_ascii_lowercase();
+    if lower.starts_with("0x") || lower.starts_with("0b") {
+        return false;
+    }
+    body.contains('.') || body.contains('e') || body.contains('E')
+}
+
+fn parse_php_int_literal(text: &str) -> Option<i64> {
+    let (negative, body) = text
+        .strip_prefix('-')
+        .map(|body| (true, body))
+        .or_else(|| text.strip_prefix('+').map(|body| (false, body)))
+        .unwrap_or((false, text));
+    if body.is_empty() {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    let parsed = if let Some(digits) = lower.strip_prefix("0x") {
+        i64::from_str_radix(digits, 16).ok()?
+    } else if let Some(digits) = lower.strip_prefix("0b") {
+        i64::from_str_radix(digits, 2).ok()?
+    } else if body.len() > 1
+        && body.starts_with('0')
+        && body.chars().all(|ch| matches!(ch, '0'..='7'))
+    {
+        i64::from_str_radix(body, 8).ok()?
+    } else {
+        body.parse::<i64>().ok()?
+    };
+    Some(if negative { -parsed } else { parsed })
 }
 
 fn quoted_literal_body(text: &str) -> Option<String> {
@@ -7030,6 +7077,37 @@ mod tests {
                     crate::source_map::IrSourceMapTarget::Instruction { .. }
                 ) && entry.origin.starts_with("hir:expr:"))
         );
+    }
+
+    #[test]
+    fn numeric_literal_separators_and_prefixes_lower_to_constants() {
+        let frontend = analyze_source(
+            "<?php echo 299_792_458, '|', 0xCAFE_F00D, '|', 0b0101_1111, '|', 0137_041, '|', 0_124;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::Int(299_792_458))
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::Int(0xCAFE_F00D))
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::Int(0b0101_1111))
+        );
+        assert!(result.unit.constants.contains(&IrConstant::Int(0o137_041)));
+        assert!(result.unit.constants.contains(&IrConstant::Int(0o124)));
     }
 
     #[test]

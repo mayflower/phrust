@@ -24,6 +24,7 @@ result-*
 
 # Generated reports and extracted corpora
 /target/
+/target/phpt-work/
 /target/phase4/
 /target/runtime-fixtures/
 /target/runtime-known-gaps/

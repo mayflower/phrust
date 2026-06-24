@@ -206,6 +206,8 @@ pub enum ConstantValue {
     Bool(bool),
     /// PHP int constant.
     Int(i64),
+    /// PHP float constant.
+    Float(php_runtime::FloatValue),
     /// PHP string constant.
     String(&'static str),
 }
@@ -328,6 +330,31 @@ impl ExtensionRegistry {
                     "PHP_RELEASE_VERSION",
                     "core",
                     ConstantValue::Int(constants::PHP_RELEASE_VERSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_INT_MAX",
+                    "core",
+                    ConstantValue::Int(constants::PHP_INT_MAX),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_INT_MIN",
+                    "core",
+                    ConstantValue::Int(constants::PHP_INT_MIN),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_INT_SIZE",
+                    "core",
+                    ConstantValue::Int(constants::PHP_INT_SIZE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INF",
+                    "core",
+                    ConstantValue::Float(constants::INF),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "NAN",
+                    "core",
+                    ConstantValue::Float(constants::NAN),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "DIRECTORY_SEPARATOR",

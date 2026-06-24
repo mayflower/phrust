@@ -4,7 +4,14 @@ use crate::{
     PhpString, Value,
     numeric_string::{NumericStringKind, NumericStringValue, classify_php_string},
 };
+use std::cell::Cell;
 use std::cmp::Ordering;
+
+const DEFAULT_FLOAT_STRING_PRECISION: i32 = 14;
+
+thread_local! {
+    static FLOAT_STRING_PRECISION: Cell<i32> = const { Cell::new(DEFAULT_FLOAT_STRING_PRECISION) };
+}
 
 /// Numeric scalar produced by PHP-style scalar conversion.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -13,6 +20,16 @@ pub enum NumericValue {
     Int(i64),
     /// Floating-point value.
     Float(f64),
+}
+
+/// Resets request-local float-to-string precision to PHP's default.
+pub fn reset_float_string_precision() {
+    set_float_string_precision(DEFAULT_FLOAT_STRING_PRECISION);
+}
+
+/// Sets request-local float-to-string precision for INI-driven VM execution.
+pub fn set_float_string_precision(precision: i32) {
+    FLOAT_STRING_PRECISION.with(|cell| cell.set(precision.clamp(0, 17)));
 }
 
 impl NumericValue {
@@ -57,7 +74,9 @@ pub fn to_string(value: &Value) -> Result<PhpString, String> {
         Value::Null | Value::Bool(false) => Ok(PhpString::from_bytes(Vec::new())),
         Value::Bool(true) => Ok(PhpString::from_test_str("1")),
         Value::Int(value) => Ok(PhpString::from_test_str(&value.to_string())),
-        Value::Float(value) => Ok(PhpString::from_test_str(&value.to_string())),
+        Value::Float(value) => Ok(PhpString::from_test_str(&float_to_php_string(
+            value.to_f64(),
+        ))),
         Value::String(value) => Ok(value.clone()),
         Value::Uninitialized => Err("cannot convert uninitialized value to string".to_owned()),
         Value::Array(_) => Err(
@@ -74,6 +93,22 @@ pub fn to_string(value: &Value) -> Result<PhpString, String> {
         ))),
         Value::Callable(_) => Err("callable to string conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_string(&cell.get()),
+    }
+}
+
+fn float_to_php_string(value: f64) -> String {
+    if value.is_nan() {
+        "NAN".to_owned()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "-INF".to_owned()
+        } else {
+            "INF".to_owned()
+        }
+    } else if FLOAT_STRING_PRECISION.with(Cell::get) == 0 {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
     }
 }
 
@@ -234,16 +269,26 @@ fn compare_number_and_string(left: &Value, right: &Value) -> Result<Ordering, St
             if let Some(string) = comparison_numeric_string(string) {
                 return compare_numbers(string, to_number(number)?);
             }
+            if is_nan_number(number) {
+                return Ok(Ordering::Greater);
+            }
             Ok(string.as_bytes().cmp(to_string(number)?.as_bytes()))
         }
         (number, Value::String(string)) => {
             if let Some(string) = comparison_numeric_string(string) {
                 return compare_numbers(to_number(number)?, string);
             }
+            if is_nan_number(number) {
+                return Ok(Ordering::Less);
+            }
             Ok(to_string(number)?.as_bytes().cmp(string.as_bytes()))
         }
         _ => unreachable!("compare_number_and_string requires one string and one number"),
     }
+}
+
+fn is_nan_number(value: &Value) -> bool {
+    matches!(value, Value::Float(value) if value.to_f64().is_nan())
 }
 
 fn comparison_numeric_string(value: &PhpString) -> Option<NumericValue> {
@@ -429,6 +474,7 @@ mod tests {
 
     #[test]
     fn numeric_casts_handle_non_numeric_strings_and_arrays() {
+        reset_float_string_precision();
         assert_eq!(to_int(&Value::string(b"".to_vec())).unwrap(), 0);
         assert_eq!(to_int(&Value::string(b"42abc".to_vec())).unwrap(), 42);
         assert_eq!(to_int(&Value::string(b"abc".to_vec())).unwrap(), 0);
@@ -438,6 +484,24 @@ mod tests {
             to_int(&Value::packed_array(vec![Value::Int(1)])).unwrap(),
             1
         );
+        assert_eq!(
+            to_string(&Value::float(f64::INFINITY)).unwrap().as_bytes(),
+            b"INF"
+        );
+        assert_eq!(
+            to_string(&Value::float(f64::NEG_INFINITY))
+                .unwrap()
+                .as_bytes(),
+            b"-INF"
+        );
+        assert_eq!(
+            to_string(&Value::float(f64::NAN)).unwrap().as_bytes(),
+            b"NAN"
+        );
+        assert_eq!(to_string(&Value::float(1.75)).unwrap().as_bytes(), b"1.75");
+        set_float_string_precision(0);
+        assert_eq!(to_string(&Value::float(1.75)).unwrap().as_bytes(), b"2");
+        reset_float_string_precision();
     }
 
     #[test]
@@ -479,6 +543,21 @@ mod tests {
             .unwrap(),
             Ordering::Greater
         );
+        assert!(
+            equal(
+                &Value::float(f64::INFINITY),
+                &Value::string(b"INF".to_vec())
+            )
+            .unwrap()
+        );
+        assert!(
+            equal(
+                &Value::float(f64::NEG_INFINITY),
+                &Value::string(b"-INF".to_vec())
+            )
+            .unwrap()
+        );
+        assert!(!equal(&Value::float(f64::NAN), &Value::string(b"NAN".to_vec())).unwrap());
     }
 
     #[test]

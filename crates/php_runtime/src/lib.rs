@@ -42,7 +42,8 @@ pub use context::{
     ErrorReporting, ProcessCapability, RuntimeContext, RuntimeIniOptions, StrictTypesInfo,
 };
 pub use convert::{
-    NumericValue, compare, equal, identical, to_bool, to_float, to_int, to_number, to_string,
+    NumericValue, compare, equal, identical, reset_float_string_precision,
+    set_float_string_precision, to_bool, to_float, to_int, to_number, to_string,
 };
 pub use diagnostic::{
     PhpReferenceClassification, RuntimeDiagnostic, RuntimeError, RuntimeSeverity,
@@ -87,7 +88,7 @@ pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
 pub use todo_phase4::{Phase4RuntimeTodo, runtime_skeleton_status};
 pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
-pub use value::{CallableValue, ClosureCaptureValue, Value};
+pub use value::{CallableValue, ClosureCaptureValue, FloatValue, Value};
 
 #[cfg(test)]
 mod tests {

@@ -12,6 +12,7 @@ members = [
     "crates/php_optimizer",
     "crates/php_parser_cli",
     "crates/php_perf",
+    "crates/php_phpt_tools",
     "crates/php_runtime",
     "crates/php_semantics",
     "crates/php_source",

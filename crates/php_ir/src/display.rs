@@ -332,6 +332,11 @@ fn format_binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::Mod => "mod",
         BinaryOp::Concat => "concat",
         BinaryOp::Pow => "pow",
+        BinaryOp::BitAnd => "bit_and",
+        BinaryOp::BitOr => "bit_or",
+        BinaryOp::BitXor => "bit_xor",
+        BinaryOp::ShiftLeft => "shift_left",
+        BinaryOp::ShiftRight => "shift_right",
     }
 }
 

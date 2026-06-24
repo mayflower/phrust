@@ -46,8 +46,9 @@ use php_runtime::{
     FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
     OutputBuffer, PhpArray, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
     RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Value,
-    compare, division_by_zero_mvp, equal, identical, runtime_type_name, to_bool, to_float, to_int,
-    to_number, to_string, undefined_function, undefined_variable_warning, unsupported_feature,
+    compare, division_by_zero_mvp, equal, identical, reset_float_string_precision,
+    runtime_type_name, set_float_string_precision, to_bool, to_float, to_int, to_number, to_string,
+    undefined_function, undefined_variable_warning, unsupported_feature,
     value_matches_runtime_type, value_type_name,
 };
 #[cfg(test)]
@@ -1346,6 +1347,7 @@ impl Vm {
         if self.options.collect_counters {
             php_runtime::numeric_string::reset_cache_and_stats();
         }
+        reset_float_string_precision();
 
         if self.options.verify_ir
             && let Err(errors) = verify_unit(unit.unit())
@@ -1371,6 +1373,7 @@ impl Vm {
             env: self.options.runtime_context.env.clone(),
             ..ExecutionState::default()
         };
+        apply_float_string_precision(&state.ini);
         seed_runtime_globals(&mut state.globals, &self.options.runtime_context);
         let mut result = self.execute_function(
             &unit,
@@ -8698,6 +8701,9 @@ impl Vm {
                 if option.eq_ignore_ascii_case("include_path") {
                     state.bump_include_config_epoch();
                 }
+                if option.eq_ignore_ascii_case("precision") {
+                    apply_float_string_precision(&state.ini);
+                }
                 VmResult::success(output.clone(), Some(previous))
             }
             "ini_get_all" => {
@@ -11997,12 +12003,19 @@ impl Vm {
                 execute_arithmetic(op, lhs, rhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))
             }
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight => execute_bitwise(op, lhs, rhs)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
             BinaryOp::Pow => {
                 let lhs = to_number(lhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 let rhs = to_number(rhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
-                Ok(Value::float(lhs.as_f64().powf(rhs.as_f64())))
+                execute_power(lhs, rhs)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))
             }
         }
     }
@@ -12020,12 +12033,24 @@ impl Vm {
             CastKind::Bool => to_bool(src)
                 .map(Value::Bool)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message)),
-            CastKind::Int => to_int(src)
-                .map(Value::Int)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
-            CastKind::Float => to_float(src)
-                .map(Value::float)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+            CastKind::Int => match src {
+                Value::Object(object) => {
+                    write_object_numeric_cast_warning(output, object, "int");
+                    Ok(Value::Int(1))
+                }
+                _ => to_int(src)
+                    .map(Value::Int)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+            },
+            CastKind::Float => match src {
+                Value::Object(object) => {
+                    write_object_numeric_cast_warning(output, object, "float");
+                    Ok(Value::float(1.0))
+                }
+                _ => to_float(src)
+                    .map(Value::float)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+            },
             CastKind::String => self
                 .value_to_string(compiled, src, output, stack, state)
                 .map(Value::String),
@@ -19103,6 +19128,15 @@ fn ini_option_name(value: &Value) -> Result<String, String> {
     to_string(value).map(|name| name.to_string_lossy())
 }
 
+fn apply_float_string_precision(registry: &IniRegistry) {
+    if let Some(precision) = registry
+        .get("precision")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+    {
+        set_float_string_precision(precision);
+    }
+}
+
 fn ini_get_all_array(registry: &IniRegistry, details: bool) -> PhpArray {
     let mut output = PhpArray::new();
     for entry in registry.entries() {
@@ -21495,29 +21529,34 @@ fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, Str
 fn execute_arithmetic(op: BinaryOp, lhs: NumericValue, rhs: NumericValue) -> Result<Value, String> {
     match op {
         BinaryOp::Add if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => lhs
+            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
                 .checked_add(rhs)
                 .map(Value::Int)
-                .ok_or_else(|| "integer addition overflow".to_owned()),
+                .unwrap_or_else(|| Value::float(lhs as f64 + rhs as f64))),
             _ => unreachable!("guarded by integer check"),
         },
         BinaryOp::Sub if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => lhs
+            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
                 .checked_sub(rhs)
                 .map(Value::Int)
-                .ok_or_else(|| "integer subtraction overflow".to_owned()),
+                .unwrap_or_else(|| Value::float(lhs as f64 - rhs as f64))),
             _ => unreachable!("guarded by integer check"),
         },
         BinaryOp::Mul if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => lhs
+            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
                 .checked_mul(rhs)
                 .map(Value::Int)
-                .ok_or_else(|| "integer multiplication overflow".to_owned()),
+                .unwrap_or_else(|| Value::float(lhs as f64 * rhs as f64))),
             _ => unreachable!("guarded by integer check"),
         },
         BinaryOp::Div => {
             if rhs.as_f64() == 0.0 {
                 return Err("division by zero".to_owned());
+            }
+            if let (NumericValue::Int(lhs), NumericValue::Int(rhs)) = (lhs, rhs)
+                && lhs % rhs == 0
+            {
+                return Ok(Value::Int(lhs / rhs));
             }
             Ok(Value::float(lhs.as_f64() / rhs.as_f64()))
         }
@@ -21535,7 +21574,117 @@ fn execute_arithmetic(op: BinaryOp, lhs: NumericValue, rhs: NumericValue) -> Res
         BinaryOp::Add => Ok(Value::float(lhs.as_f64() + rhs.as_f64())),
         BinaryOp::Sub => Ok(Value::float(lhs.as_f64() - rhs.as_f64())),
         BinaryOp::Mul => Ok(Value::float(lhs.as_f64() * rhs.as_f64())),
-        BinaryOp::Concat | BinaryOp::Pow => unreachable!("handled outside arithmetic"),
+        BinaryOp::Concat
+        | BinaryOp::Pow
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => unreachable!("handled outside arithmetic"),
+    }
+}
+
+fn execute_power(lhs: NumericValue, rhs: NumericValue) -> Result<Value, String> {
+    if let (NumericValue::Int(lhs), NumericValue::Int(rhs)) = (lhs, rhs)
+        && rhs >= 0
+        && let Ok(exponent) = u32::try_from(rhs)
+        && let Some(value) = lhs.checked_pow(exponent)
+    {
+        return Ok(Value::Int(value));
+    }
+    Ok(Value::float(lhs.as_f64().powf(rhs.as_f64())))
+}
+
+fn execute_bitwise(op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
+    match op {
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+            if matches!((lhs, rhs), (Value::String(_), Value::String(_))) =>
+        {
+            let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs) else {
+                unreachable!("guarded by string match");
+            };
+            return Ok(Value::String(PhpString::from_bytes(bitwise_string_bytes(
+                op,
+                lhs.as_bytes(),
+                rhs.as_bytes(),
+            ))));
+        }
+        BinaryOp::BitAnd => Ok(Value::Int(to_int(lhs)? & to_int(rhs)?)),
+        BinaryOp::BitOr => Ok(Value::Int(to_int(lhs)? | to_int(rhs)?)),
+        BinaryOp::BitXor => Ok(Value::Int(to_int(lhs)? ^ to_int(rhs)?)),
+        BinaryOp::ShiftLeft => {
+            let shift = to_int(rhs)?;
+            if shift < 0 {
+                return Err("bit shift by negative number".to_owned());
+            }
+            Ok(Value::Int(to_int(lhs)?.wrapping_shl(shift as u32)))
+        }
+        BinaryOp::ShiftRight => {
+            let shift = to_int(rhs)?;
+            if shift < 0 {
+                return Err("bit shift by negative number".to_owned());
+            }
+            Ok(Value::Int(to_int(lhs)?.wrapping_shr(shift as u32)))
+        }
+        BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::Concat
+        | BinaryOp::Pow => unreachable!("handled outside bitwise"),
+    }
+}
+
+fn write_object_numeric_cast_warning(output: &mut OutputBuffer, object: &ObjectRef, target: &str) {
+    output.write_php_string(&PhpString::from(
+        format!(
+            "\nWarning: Object of class {} could not be converted to {target} in <unknown> on line 0\n",
+            object.class_name()
+        )
+        .into_bytes(),
+    ));
+}
+
+fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
+    match op {
+        BinaryOp::BitAnd => lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(left, right)| left & right)
+            .collect(),
+        BinaryOp::BitXor => lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(left, right)| left ^ right)
+            .collect(),
+        BinaryOp::BitOr => {
+            let (longer, shorter, lhs_is_longer) = if lhs.len() >= rhs.len() {
+                (lhs, rhs, true)
+            } else {
+                (rhs, lhs, false)
+            };
+            let mut bytes = Vec::with_capacity(longer.len());
+            for index in 0..longer.len() {
+                let byte = match (longer.get(index), shorter.get(index)) {
+                    (Some(long), Some(short)) if lhs_is_longer => long | short,
+                    (Some(long), Some(short)) => short | long,
+                    (Some(long), None) => *long,
+                    _ => unreachable!("bounded by longer length"),
+                };
+                bytes.push(byte);
+            }
+            bytes
+        }
+        BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::Concat
+        | BinaryOp::Pow
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => unreachable!("not a string bitwise op"),
     }
 }
 
@@ -21681,6 +21830,27 @@ mod tests {
     }
 
     #[test]
+    fn expressions_exact_division_and_integer_power_preserve_int_results() {
+        let result = execute_source("<?php var_dump(8 / 4, 7 / 4, 2 ** 3);");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "int(2)\nfloat(1.75)\nint(8)\n"
+        );
+    }
+
+    #[test]
+    fn expressions_execute_bitwise_and_assignment_operators() {
+        let result = execute_source(
+            "<?php $x = 6; $x &= 3; echo $x, '|', (6 | 3), '|', (6 ^ 3), '|', (8 << 1), '|', (8 >> 1), '|'; echo bin2hex('12' & '3'), '|', bin2hex('12' | '3'), '|', bin2hex('12' ^ '3');",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2|7|5|16|4|31|3332|02");
+    }
+
+    #[test]
     fn expressions_execute_casts_and_truthiness() {
         let result =
             execute_source("<?php echo (int) \"12\", \"|\", (string) true, \"|\", (bool) \"0\";");
@@ -21690,11 +21860,35 @@ mod tests {
     }
 
     #[test]
+    fn expressions_object_numeric_cast_warns_and_returns_one() {
+        let result = execute_source(
+            "<?php class Box {} $box = new Box; var_dump((int) $box, (float) $box);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("Warning: Object of class box could not be converted to int"));
+        assert!(output.contains("Warning: Object of class box could not be converted to float"));
+        assert!(output.contains("int(1)"));
+        assert!(output.contains("float(1)"));
+    }
+
+    #[test]
     fn expressions_division_by_zero_is_controlled_runtime_error() {
         let result = execute_source("<?php echo 1 / 0;");
 
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
         assert_eq!(result.status.message(), Some("division by zero"));
+    }
+
+    #[test]
+    fn expressions_integer_overflow_promotes_to_float() {
+        let result =
+            execute_source("<?php var_dump(PHP_INT_MAX + 1, PHP_INT_MIN - 1, PHP_INT_MAX * 2);");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = String::from_utf8(result.output.as_bytes().to_vec()).expect("utf8 output");
+        assert_eq!(output.matches("float(").count(), 3);
     }
 
     #[test]
@@ -21716,6 +21910,24 @@ mod tests {
             result.output.as_bytes(),
             php_source::reference_php_version().as_bytes()
         );
+    }
+
+    #[test]
+    fn constants_execute_operator_predefined_values() {
+        let result = execute_source(
+            "<?php echo PHP_INT_SIZE, '|', PHP_INT_MAX, '|', PHP_INT_MIN, '|'; var_dump(INF, NAN);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = String::from_utf8(result.output.as_bytes().to_vec()).expect("utf8 output");
+        assert!(output.starts_with(&format!(
+            "{}|{}|{}|",
+            std::mem::size_of::<isize>(),
+            isize::MAX,
+            isize::MIN
+        )));
+        assert!(output.contains("float(INF)"));
+        assert!(output.contains("float(NAN)"));
     }
 
     #[test]
@@ -21889,6 +22101,9 @@ mod tests {
             echo ini_set('memory_limit', '64M'), \"\\n\";
             echo ini_get('memory_limit'), \"\\n\";
             echo get_cfg_var('memory_limit'), \"\\n\";
+            echo (string) 1.75, \"\\n\";
+            echo ini_set('precision', '0'), \"\\n\";
+            echo (string) 1.75, \"\\n\";
             $flat = ini_get_all(null, false);
             echo $flat['memory_limit'], \"\\n\";
             $details = ini_get_all();
@@ -21901,7 +22116,7 @@ mod tests {
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "UTF-8\nmissing\n128M\n64M\n128M\n64M\n128M|64M|7\n"
+            "UTF-8\nmissing\n128M\n64M\n128M\n1.75\n14\n2\n64M\n128M|64M|7\n"
         );
     }
 
@@ -25163,7 +25378,10 @@ echo phase7_jit_unstable_types_debug(4), "\n";
         assert_eq!(on.status, off.status);
         assert_eq!(on.output, off.output);
         assert_eq!(on.diagnostics, off.diagnostics);
-        assert!(!on.status.is_success(), "overflow should use generic error");
+        assert!(
+            on.status.is_success(),
+            "overflow should use generic promoted result"
+        );
         let on_counters = on.counters.expect("on counters");
         assert!(on_counters.quickening_guard_misses > 0, "{on_counters:?}");
     }
