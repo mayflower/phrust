@@ -24,7 +24,7 @@ impl Default for RuntimeIniOptions {
 /// Minimal error_reporting placeholder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ErrorReporting {
-    /// Stored mask. The Phase 4 VM does not interpret it yet.
+    /// Stored mask. The runtime VM does not interpret it yet.
     pub mask: i64,
 }
 

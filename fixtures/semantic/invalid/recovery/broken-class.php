@@ -1,5 +1,5 @@
 <?php
-class Prompt33BrokenClass
+class RecoveryBrokenClass
 {
     public function broken(
 }

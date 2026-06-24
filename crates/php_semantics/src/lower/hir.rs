@@ -430,8 +430,8 @@ impl HirLowerer<'_> {
                 ));
                 self.report_deferred_effect(
                     node,
-                    "(void) cast discards its operand at runtime; Phase 3 records the cast without executing it",
-                    "runtime value-discard behavior belongs to Phase 4 execution semantics",
+                    "(void) cast discards its operand at runtime; Semantic frontend records the cast without executing it",
+                    "runtime value-discard behavior belongs to runtime execution semantics",
                 );
                 HirExprKind::Cast {
                     kind: "void".to_owned(),
@@ -560,7 +560,7 @@ impl HirLowerer<'_> {
             "include" | "include_once" | "require" | "require_once" => {
                 self.report_deferred_effect(
                     node,
-                    "include/require effects are deferred; Phase 3 does not load files or import symbols",
+                    "include/require effects are deferred; Semantic frontend does not load files or import symbols",
                     "include paths may be dynamic and runtime code executes in the current scope",
                 );
                 HirExprKind::Include {
@@ -572,7 +572,7 @@ impl HirLowerer<'_> {
             "eval" => {
                 self.report_deferred_effect(
                     node,
-                    "eval effects are deferred; Phase 3 does not parse or execute runtime code",
+                    "eval effects are deferred; Semantic frontend does not parse or execute runtime code",
                     "eval may define symbols and mutate the current runtime scope",
                 );
                 HirExprKind::Eval {

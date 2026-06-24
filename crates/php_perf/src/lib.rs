@@ -1,4 +1,4 @@
-//! Phase 7 performance measurement data model.
+//! performance performance measurement data model.
 //!
 //! This crate only defines stable report types. It does not run benchmarks,
 //! collect VM counters, or choose performance budgets.
@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Stable schema version for Phase 7 performance reports.
+/// Stable schema version for performance performance reports.
 pub const PERF_REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// Stable schema version for Cranelift big-win JIT reports.
@@ -35,7 +35,7 @@ impl PerfRunId {
 /// Benchmark scenario metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PerfScenario {
-    /// Stable scenario id, for example `phase7.perf_smoke.echo_loop`.
+    /// Stable scenario id, for example `performance.perf_smoke.echo_loop`.
     pub id: String,
     /// Human-readable name.
     pub name: String,
@@ -570,14 +570,14 @@ mod tests {
             .with_feature_flag("bytecode-cache", true)
             .with_extra("TZ", "UTC")
             .with_extra("LC_ALL", "C");
-        let scenario = PerfScenario::new("phase7.echo-loop", "Echo loop", "vm")
-            .with_fixture("tests/fixtures/phase7/perf_smoke/echo_loop.php");
+        let scenario = PerfScenario::new("performance.echo-loop", "Echo loop", "vm")
+            .with_fixture("tests/fixtures/performance/perf_smoke/echo_loop.php");
         let measurement = PerfMeasurement::new(scenario, 10)
             .with_wall_time_ms(12.5)
             .with_metric(PerfMetric::new("dispatches", "count", 42.0, true))
             .with_vm_counter("op_echo", 10)
             .with_vm_counter("op_load_const", 32);
-        let report = PerfReport::new(PerfRunId::new("phase7-test-run"), environment)
+        let report = PerfReport::new(PerfRunId::new("performance-test-run"), environment)
             .with_measurement(measurement);
 
         let json = report.to_stable_json().expect("serialize report");
@@ -586,7 +586,7 @@ mod tests {
             json,
             r#"{
   "schema_version": 1,
-  "run_id": "phase7-test-run",
+  "run_id": "performance-test-run",
   "environment": {
     "engine_version": "phrust-0.0.0",
     "git_commit": "abc1234",
@@ -607,10 +607,10 @@ mod tests {
   "measurements": [
     {
       "scenario": {
-        "id": "phase7.echo-loop",
+        "id": "performance.echo-loop",
         "name": "Echo loop",
         "group": "vm",
-        "fixture": "tests/fixtures/phase7/perf_smoke/echo_loop.php"
+        "fixture": "tests/fixtures/performance/perf_smoke/echo_loop.php"
       },
       "iterations": 10,
       "metrics": [
@@ -640,7 +640,7 @@ mod tests {
             PerfEnvironment::new("phrust-0.0.0", "unknown-target"),
         )
         .with_measurement(PerfMeasurement::new(
-            PerfScenario::new("phase7.minimal", "Minimal", "smoke"),
+            PerfScenario::new("performance.minimal", "Minimal", "smoke"),
             1,
         ));
 
@@ -656,7 +656,7 @@ mod tests {
     fn cranelift_jit_report_json_is_stable_and_sorted() {
         let environment = PerfEnvironment::new("phrust-0.0.0", "aarch64-apple-darwin")
             .with_git_commit("abc1234")
-            .with_opt_flags(["--jit=on", "--jit-backend=cranelift"])
+            .with_opt_flags(["--jit=cranelift", "--jit-backend=cranelift"])
             .with_feature_flag("jit-cranelift", true);
         let counters = JitCounterSnapshot {
             compile_attempts: 1,
@@ -701,7 +701,7 @@ mod tests {
         };
         let row = CraneliftJitReportRow::new(
             "integer_arithmetic_leaf",
-            "tests/fixtures/phase7/cranelift/int_leaf.php",
+            "tests/fixtures/performance/cranelift/int_leaf.php",
             JitCorrectnessStatus::Pass,
             JitExecutionStatus::Executed,
             1,
@@ -710,8 +710,9 @@ mod tests {
         .with_timings_seconds(0.00125, 0.00005, 0.00120)
         .with_vm_counter("jit_compile_attempts", 1)
         .with_vm_counter("jit_executed", 1);
-        let report = CraneliftJitReport::new(PerfRunId::new("phase7-cranelift-test"), environment)
-            .with_row(row);
+        let report =
+            CraneliftJitReport::new(PerfRunId::new("performance-cranelift-test"), environment)
+                .with_row(row);
 
         let json = report.to_stable_json().expect("serialize report");
 
@@ -719,13 +720,13 @@ mod tests {
             json,
             r#"{
   "schema_version": 1,
-  "run_id": "phase7-cranelift-test",
+  "run_id": "performance-cranelift-test",
   "environment": {
     "engine_version": "phrust-0.0.0",
     "git_commit": "abc1234",
     "rust_target_triple": "aarch64-apple-darwin",
     "opt_flags": [
-      "--jit=on",
+      "--jit=cranelift",
       "--jit-backend=cranelift"
     ],
     "feature_flags": {
@@ -735,7 +736,7 @@ mod tests {
   "rows": [
     {
       "target": "integer_arithmetic_leaf",
-      "fixture": "tests/fixtures/phase7/cranelift/int_leaf.php",
+      "fixture": "tests/fixtures/performance/cranelift/int_leaf.php",
       "correctness": "pass",
       "jit_status": "executed",
       "iterations": 1,

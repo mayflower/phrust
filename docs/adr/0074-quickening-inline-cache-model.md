@@ -6,8 +6,8 @@ Accepted.
 
 ## Context
 
-Phase 7 introduces performance infrastructure after the Phase 4 VM, Phase 5
-runtime model, Phase 6 standard-library surface, bytecode cache, and optimizer
+Performance introduces performance infrastructure after the Runtime VM, Runtime semantics
+runtime model, Standard library standard-library surface, bytecode cache, and optimizer
 framework. The next layer is adaptive execution: gather local runtime evidence,
 try a guarded specialized operation, and fall back to the existing interpreter
 operation whenever the evidence no longer applies.
@@ -32,7 +32,7 @@ generic interpreter instruction remains the semantic source of truth.
   quickening state. It observes operand shapes and dispatches either to the
   generic path or to a candidate specialized path.
 - Specialized opcode: a guarded fast handler for one stable shape, such as
-  int/int `ADD` or string/string `CONCAT`. Phase 7 may implement this as a VM
+  int/int `ADD` or string/string `CONCAT`. Performance may implement this as a VM
   side-table entry before adding new IR instruction variants.
 - Guard: a checked assumption that must hold before a specialized handler can
   run. Guards include value type, array layout, key kind, function identity,
@@ -56,7 +56,7 @@ execution, are controlled by opt levels, and must preserve verifier validity.
 Quickening observes runtime values during execution and must be discardable
 without changing the compiled unit.
 
-Quickening is not a bytecode cache. Quickening state is request-local in Phase 7
+Quickening is not a bytecode cache. Quickening state is request-local in Performance
 unless a later ADR defines a safe lifecycle for cross-request sharing. Cached
 IR/bytecode artifacts must not depend on warmed quickening state.
 
@@ -99,7 +99,7 @@ installed.
 
 ## Counter Thresholds
 
-Phase 7 starts with conservative thresholds:
+Performance starts with conservative thresholds:
 
 - Observation threshold: 8 executions of the same instruction before
   specialization is considered.
@@ -107,7 +107,7 @@ Phase 7 starts with conservative thresholds:
 - Guard-failure threshold: 2 failures after installation dequicken the entry.
 - Saturation: counters saturate rather than wrap.
 
-Prompts that implement quickening may tune these constants, but changes require
+Work items that implement quickening may tune these constants, but changes require
 tests that prove fallback behavior and counter determinism.
 
 ## Invalidation Events
@@ -127,7 +127,7 @@ assumption they rely on may be stale. Relevant events include:
   that were previously assumed monomorphic.
 - Any runtime feature that can alter reference/COW aliasing assumptions.
 
-Phase 7 state is request-local by default. No global persistent quickening
+Performance state is request-local by default. No global persistent quickening
 state is allowed without a lifecycle plan covering invalidation, request
 cleanup, worker recycling, and configuration reload.
 
@@ -174,5 +174,5 @@ for normal execution.
 
 Quickening can improve hot interpreter operations without requiring IR changes
 or native code. The cost is extra state, invalidation complexity, and more
-fallback tests. Phase 7 therefore starts with side-table state, strict guards,
+fallback tests. Performance therefore starts with side-table state, strict guards,
 small candidates, deterministic stats, and default-safe fallback behavior.

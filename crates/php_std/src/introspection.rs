@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn extension_loaded_is_case_insensitive_and_configurable() {
-        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        let mut registry = ExtensionRegistry::standard_library();
 
         assert!(extension_loaded(&registry, "CORE"));
         assert!(extension_loaded(&registry, "DATE"));
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn loaded_extensions_are_stable_and_array_convertible() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+        let registry = ExtensionRegistry::standard_library();
 
         assert_eq!(
             get_loaded_extensions(&registry),
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn function_names_are_case_insensitive_and_test_helpers_hidden() {
-        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        let mut registry = ExtensionRegistry::standard_library();
         registry.enable_extension("test").expect("enable test");
 
         assert!(function_exists(&registry, "STRLEN"));

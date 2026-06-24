@@ -1,5 +1,5 @@
 <?php
-// phase4-runtime: expect=pass args=alpha,beta
+// runtime-fixture: expect=pass args=alpha,beta
 echo $argc;
 echo "|";
 echo $argv[1];

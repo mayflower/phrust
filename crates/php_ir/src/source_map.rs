@@ -62,7 +62,7 @@ pub enum IrSourceMapTarget {
 pub struct IrSourceMapEntry {
     /// IR target.
     pub target: IrSourceMapTarget,
-    /// Stable Phase 3 origin label, such as `hir:expr:0`.
+    /// Stable Semantic frontend origin label, such as `hir:expr:0`.
     pub origin: String,
     /// Source span in the IR file table.
     pub span: IrSpan,

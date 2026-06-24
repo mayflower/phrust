@@ -1,6 +1,6 @@
 <?php
-// phase5: kind=pass id=property-hook-get
-class Phase4PropertyHookGap
+// runtime-fixture: kind=pass id=property-hook-get
+class RuntimePropertyHookGap
 {
     public string $name {
         get {
@@ -9,4 +9,4 @@ class Phase4PropertyHookGap
     }
 }
 
-echo (new Phase4PropertyHookGap())->name;
+echo (new RuntimePropertyHookGap())->name;

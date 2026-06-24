@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "run_id": "performance-compare-fixture-current",
+  "environment": {
+    "engine_version": "fixture",
+    "rust_target_triple": "fixture",
+    "opt_flags": [],
+    "feature_flags": {}
+  },
+  "measurements": [
+    {
+      "scenario": {
+        "id": "performance.perf_smoke.rust-vm.same",
+        "name": "same",
+        "group": "perf_smoke.rust-vm",
+        "fixture": "same.php"
+      },
+      "iterations": 1,
+      "metrics": [
+        {
+          "name": "wall_time_median",
+          "unit": "ms",
+          "value": 13.0,
+          "lower_is_better": true
+        },
+        {
+          "name": "stdout_bytes",
+          "unit": "bytes",
+          "value": 4.0,
+          "lower_is_better": false
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "id": "performance.perf_smoke.rust-vm.added",
+        "name": "added",
+        "group": "perf_smoke.rust-vm",
+        "fixture": "added.php"
+      },
+      "iterations": 1,
+      "metrics": [
+        {
+          "name": "wall_time_median",
+          "unit": "ms",
+          "value": 1.0,
+          "lower_is_better": true
+        }
+      ]
+    }
+  ]
+}

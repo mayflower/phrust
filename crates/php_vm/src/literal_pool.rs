@@ -1,4 +1,4 @@
-//! Request-local literal interning for Phase 7 VM execution.
+//! Request-local literal interning for performance VM execution.
 
 use std::collections::BTreeMap;
 

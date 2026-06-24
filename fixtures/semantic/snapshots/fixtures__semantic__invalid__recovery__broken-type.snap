@@ -4,7 +4,7 @@ semantic_ok: false
 diagnostics:
   []
 symbols:
-  - function prompt33_broken_type
+  - function recovery_broken_type
 hir_summary:
   statements: 2
   expressions: 1

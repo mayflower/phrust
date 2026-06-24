@@ -165,7 +165,7 @@ impl FunctionLikeFlags {
         self.has_return_type_never = has_return_type_never;
     }
 
-    /// Marks whether later phases must fill or validate deferred metadata.
+    /// Marks whether later layers must fill or validate deferred metadata.
     pub const fn set_tentative_or_deferred_info(&mut self, has_deferred_info: bool) {
         self.has_tentative_or_deferred_info = has_deferred_info;
     }
@@ -205,7 +205,7 @@ impl FunctionLikeFlags {
         self.has_return_type_never
     }
 
-    /// Returns true when a later phase owns a precise check.
+    /// Returns true when a later layer owns a precise check.
     #[must_use]
     pub const fn has_tentative_or_deferred_info(self) -> bool {
         self.has_tentative_or_deferred_info
@@ -382,7 +382,7 @@ impl ReturnType {
     }
 }
 
-/// Default value reference. The expression is not evaluated in Phase 3.
+/// Default value reference. The expression is not evaluated in Semantic frontend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DefaultValueRef {
     span: TextRange,

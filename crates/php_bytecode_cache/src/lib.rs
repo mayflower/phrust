@@ -1,4 +1,4 @@
-//! Phase 7 bytecode-cache metadata envelope.
+//! performance bytecode-cache metadata envelope.
 //!
 //! The cache format is documented in `docs/adr/0072-bytecode-cache-format.md`.
 //! This crate intentionally serializes only the untrusted header/metadata
@@ -15,17 +15,17 @@ use sha2::{Digest, Sha256};
 /// Current bytecode-cache format version supported by this reader/writer.
 pub const CURRENT_CACHE_FORMAT_VERSION: u16 = 1;
 
-/// PHP compatibility target for Phase 7 bytecode-cache artifacts.
+/// PHP compatibility target for performance bytecode-cache artifacts.
 pub const PHP_TARGET_VERSION: &str = "8.5.7";
 
-/// Phase 7 frontend fingerprint version marker.
-pub const FRONTEND_FORMAT_VERSION: &str = "phase7-frontend-1";
+/// performance frontend fingerprint version marker.
+pub const FRONTEND_FORMAT_VERSION: &str = "performance-frontend-1";
 
-/// Phase 7 cache metadata fingerprint version marker.
-pub const CACHE_FINGERPRINT_VERSION: &str = "phase7-cache-fingerprint-1";
+/// performance cache metadata fingerprint version marker.
+pub const CACHE_FINGERPRINT_VERSION: &str = "performance-cache-fingerprint-1";
 
-/// Phase 4 IR version currently consumed by the VM.
-pub const IR_FORMAT_VERSION: &str = "phase4-ir-1";
+/// runtime IR version currently consumed by the VM.
+pub const IR_FORMAT_VERSION: &str = "runtime-ir-1";
 
 /// Magic bytes for project-owned bytecode-cache artifacts.
 pub const CACHE_MAGIC: [u8; 8] = *b"PHRBC\0\0\x01";
@@ -103,7 +103,7 @@ pub struct CacheFingerprint {
     /// Sorted runtime configuration values that influence compile/runtime behavior.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtime_config: BTreeMap<String, String>,
-    /// Additional deterministic components reserved for later Phase 7 prompts.
+    /// Additional deterministic components reserved for later performance work.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, String>,
 }
@@ -267,7 +267,7 @@ pub struct CacheFingerprintInput {
 }
 
 impl CacheFingerprintInput {
-    /// Creates fingerprint input with Phase 7 defaults.
+    /// Creates fingerprint input with performance defaults.
     #[must_use]
     pub fn new(
         source_bytes: impl Into<Vec<u8>>,
@@ -381,7 +381,7 @@ pub struct CacheHeader {
     pub format_version: CacheFormatVersion,
     /// Engine crate or workspace version that wrote the artifact.
     pub engine_version: String,
-    /// PHP target version. Phase 7 accepts only `8.5.7`.
+    /// PHP target version. performance accepts only `8.5.7`.
     pub php_target_version: String,
     /// Engine ABI marker for runtime/IR compatibility.
     pub abi_version: String,
@@ -398,7 +398,7 @@ pub struct CacheHeader {
 }
 
 impl CacheHeader {
-    /// Creates a Phase 7 header for the current cache format.
+    /// Creates a performance header for the current cache format.
     #[must_use]
     pub fn new(
         engine_version: impl Into<String>,
@@ -467,7 +467,7 @@ impl CacheDependency {
 pub struct CacheArtifact {
     /// Validated cache metadata header.
     pub header: CacheHeader,
-    /// Opaque payload bytes. Phase 7 metadata tests keep this empty.
+    /// Opaque payload bytes. performance metadata tests keep this empty.
     pub payload: Vec<u8>,
 }
 
@@ -511,7 +511,7 @@ impl CacheArtifact {
         })
     }
 
-    /// Serializes an artifact into the Phase 7 cache envelope.
+    /// Serializes an artifact into the performance cache envelope.
     pub fn to_bytes(&self) -> Result<Vec<u8>, CacheStoreError> {
         if self.header.format_version.as_u16() != CURRENT_CACHE_FORMAT_VERSION {
             return Err(CacheStoreError::UnsupportedFormatVersion {
@@ -1140,16 +1140,16 @@ mod tests {
     fn fingerprint_includes_normalized_source_path_without_temp_dependency() {
         let fingerprint = CacheFingerprint::from_inputs(
             CacheFingerprintInput::new(b"<?php echo 1;\n", "engine-test", TARGET)
-                .with_source_path("fixtures/phase7/cache/fingerprint.php"),
+                .with_source_path("fixtures/performance/cache/fingerprint.php"),
         )
         .expect("fingerprint");
 
         let json = fingerprint.to_stable_json().expect("json");
-        assert!(json.contains("fixtures/phase7/cache/fingerprint.php"));
+        assert!(json.contains("fixtures/performance/cache/fingerprint.php"));
         assert!(!json.contains("/tmp/"));
         assert_eq!(
             fingerprint.source_path.as_deref(),
-            Some("fixtures/phase7/cache/fingerprint.php")
+            Some("fixtures/performance/cache/fingerprint.php")
         );
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
     fn bytecode_cache_roundtrip_executes_loaded_ir_with_identical_output() {
         for fixture in ["simple.php", "functions.php"] {
             let path = workspace_root()
-                .join("tests/fixtures/phase7/bytecode_cache")
+                .join("tests/fixtures/performance/bytecode_cache")
                 .join(fixture);
             let expected = fs::read_to_string(path.with_extension("php.out")).expect("expected");
             let source = fs::read_to_string(&path).expect("source");
@@ -1199,7 +1199,7 @@ mod tests {
 
     #[test]
     fn bytecode_cache_corrupt_payload_is_typed_error_and_compile_path_still_runs() {
-        let path = workspace_root().join("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let path = workspace_root().join("tests/fixtures/performance/bytecode_cache/simple.php");
         let source = fs::read_to_string(&path).expect("source");
         let source_path = normalized_fixture_path(&path);
         let unit = compile_fixture(&source, &source_path);
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn bytecode_cache_rejects_payload_that_fails_ir_verifier() {
-        let path = workspace_root().join("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let path = workspace_root().join("tests/fixtures/performance/bytecode_cache/simple.php");
         let source = fs::read_to_string(&path).expect("source");
         let source_path = normalized_fixture_path(&path);
         let mut unit = compile_fixture(&source, &source_path);
@@ -1267,7 +1267,7 @@ mod tests {
 
     #[test]
     fn bytecode_cache_rejects_fingerprint_mismatch_before_payload_decode() {
-        let path = workspace_root().join("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let path = workspace_root().join("tests/fixtures/performance/bytecode_cache/simple.php");
         let source = fs::read_to_string(&path).expect("source");
         let source_path = normalized_fixture_path(&path);
         let unit = compile_fixture(&source, &source_path);

@@ -1,7 +1,7 @@
 <?php
-class Prompt29CloneWithSubject
+class CloneWithSubjectFixture
 {
     public function __construct(public string $name = "old") {}
 }
 
-$copy = clone(new Prompt29CloneWithSubject(), ["name" => "new"]);
+$copy = clone(new CloneWithSubjectFixture(), ["name" => "new"]);

@@ -2,7 +2,7 @@
 
 Optional 07.CL.F adds offline Composer/framework-like Cranelift smokes without
 vendoring Composer packages or real frameworks. The smoke exists to answer which
-Phase 7 Big-Win paths fire in small application-shaped code, not to claim broad
+Performance Big-Win paths fire in small application-shaped code, not to claim broad
 framework performance.
 
 ## Command
@@ -12,9 +12,9 @@ nix develop -c just jit-cranelift-framework-smoke
 ```
 
 The target builds `php-vm` with `jit-cranelift`, generates local PHP fixtures
-under `target/phase7/cranelift/framework-smoke/fixtures/`, runs each fixture
+under `target/performance/cranelift/framework-smoke/fixtures/`, runs each fixture
 with JIT off and eager Cranelift, compares exit status/stdout/stderr, and writes
-`target/phase7/cranelift/framework-smoke.json`.
+`target/performance/cranelift/framework-smoke.json`.
 
 ## Fixture Families
 
@@ -34,7 +34,7 @@ fire for that fixture.
 
 `framework-smoke.json` contains:
 
-- `required_fixture_kinds`, proving the required prompt categories were
+- `required_fixture_kinds`, proving the required work item categories were
   generated;
 - `all_triggered_paths`, summarizing which Big-Win paths fired across the
   smoke;
@@ -43,5 +43,5 @@ fire for that fixture.
 
 The smoke is intentionally offline and local. Generated fixtures and reports
 remain under `target/` and must not be committed. Real Composer/framework
-benchmark suites remain out of Phase 7 scope until a later phase has broader
+benchmark suites remain out of Performance scope until a later layer has broader
 workload policy, dependency pinning, and benchmark methodology for them.

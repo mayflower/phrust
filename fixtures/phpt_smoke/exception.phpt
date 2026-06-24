@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT caught exception
+runtime PHPT caught exception
 --FILE--
 <?php
 try {

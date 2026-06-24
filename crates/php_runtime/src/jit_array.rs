@@ -1,13 +1,13 @@
 //! Read-only array helper surface for JIT fast paths.
 //!
 //! These helpers intentionally consume the public `PhpArray` facade instead of
-//! exposing the backing storage. They are the only Phase 7 packed-array ABI
+//! exposing the backing storage. They are the only performance packed-array ABI
 //! surface available to JIT code until a later safety audit allows anything
 //! lower level.
 
 use crate::{PhpArray, Value};
 
-/// Stable layout version for the Phase 7 read-only packed-array helper ABI.
+/// Stable layout version for the performance read-only packed-array helper ABI.
 pub const PHP_JIT_ARRAY_LAYOUT_VERSION: u64 = 0x0007_0014_0000_0001;
 
 /// Helper status for a successful packed-array ABI operation.
@@ -68,7 +68,7 @@ pub fn php_jit_array_is_packed_ints(value: &Value) -> i32 {
     }
 }
 
-/// Returns the packed array length after the Phase 7 layout and alias guards.
+/// Returns the packed array length after the performance layout and alias guards.
 pub fn php_jit_array_len(value: &Value, out: &mut usize) -> i32 {
     match php_jit_array_len_result(value) {
         Ok(length) => {

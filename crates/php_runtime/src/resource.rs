@@ -1,4 +1,4 @@
-//! Resource handles and stream metadata for Phase 6.
+//! Resource handles and stream metadata for standard-library.
 
 use crate::{ArrayKey, PhpArray, PhpString, Value};
 use std::cell::RefCell;
@@ -179,7 +179,7 @@ impl fmt::Display for StreamOpenError {
 
 impl std::error::Error for StreamOpenError {}
 
-/// Stream open mode after Phase 6 MVP parsing.
+/// Stream open mode after standard-library MVP parsing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamOpenMode {
     readable: bool,
@@ -261,7 +261,7 @@ impl StreamOpenMode {
     }
 }
 
-/// Deterministic Phase 6 wrapper registry.
+/// Deterministic standard-library wrapper registry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StreamWrapperRegistry;
 
@@ -272,7 +272,7 @@ impl StreamWrapperRegistry {
         Self
     }
 
-    /// Opens a URI through the Phase 6 wrapper MVP.
+    /// Opens a URI through the standard-library wrapper MVP.
     pub fn open(
         &self,
         table: &mut ResourceTable,
@@ -1077,16 +1077,16 @@ mod tests {
                 .expect("php memory/temp opens");
             assert_eq!(resource.metadata().wrapper_type, "PHP");
             assert_eq!(resource.flags(), StreamFlags::new(true, true, true));
-            assert_eq!(resource.write_bytes(b"phase6").expect("write"), 6);
+            assert_eq!(resource.write_bytes(b"stdlib").expect("write"), 6);
             resource.rewind().expect("rewind");
-            assert_eq!(resource.read_to_end().expect("read"), b"phase6");
+            assert_eq!(resource.read_to_end().expect("read"), b"stdlib");
         }
     }
 
     #[test]
     fn local_file_wrapper_is_constrained_to_allowed_roots() {
         let root =
-            std::env::temp_dir().join(format!("phrust-phase6-streams-{}", std::process::id()));
+            std::env::temp_dir().join(format!("phrust-stdlib-streams-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let file = root.join("fixture.txt");
         std::fs::write(&file, b"fixture").expect("write fixture");
@@ -1115,7 +1115,7 @@ mod tests {
         let outside = root
             .parent()
             .expect("temp root has parent")
-            .join("phrust-phase6-outside.txt");
+            .join("phrust-stdlib-outside.txt");
         std::fs::write(&outside, b"outside").expect("write outside fixture");
         let error = registry
             .open(

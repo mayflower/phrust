@@ -1,7 +1,7 @@
 <?php
-class Prompt28ReadonlyCloneWith {
+class ReadonlyCloneWithFixture {
     public readonly $value;
 }
 
-$original = new Prompt28ReadonlyCloneWith();
+$original = new ReadonlyCloneWithFixture();
 $copy = clone($original, ["value" => 1]);

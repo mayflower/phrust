@@ -1,6 +1,6 @@
 //! Semantic validation pass module boundary.
 //!
-//! Prompt 01 creates this namespace so later Phase 3 checks can be added
+//! Semantic checks live here as the frontend grows beyond structural lowering.
 //! without putting validation logic in the parser or AST view layers.
 
 pub mod class_context;

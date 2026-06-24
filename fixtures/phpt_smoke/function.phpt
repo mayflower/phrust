@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT function with EXPECTF
+runtime PHPT function with EXPECTF
 --FILE--
 <?php
 function add($a, $b)

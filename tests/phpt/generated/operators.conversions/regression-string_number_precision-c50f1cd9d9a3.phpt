@@ -1,10 +1,10 @@
 --TEST--
-Phase 9 generated regression: numeric-string comparison precision
+Generated regression: numeric-string comparison precision
 --DESCRIPTION--
 original php-src path: Zend/tests/string_to_number_comparison.phpt
 original source hash: c50f1cd9d9a36635662220516c3734e73e2d9957e7c4587a4cf60686b455a60b
 generated timestamp: 20260624T000000Z
-generator version: phase9-operators-conversions-v1
+generator version: phpt-operators-conversions-v1
 reason: reduced precision-sensitive numeric-string comparison regression generated from reference output
 --FILE--
 <?php

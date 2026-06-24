@@ -12,7 +12,7 @@ acceptance harder to compare with the PHP lint oracle.
 
 ## Decision
 
-Phase 3 introduces a separate semantic diagnostic type with stable diagnostic
+Semantic frontend introduces a separate semantic diagnostic type with stable diagnostic
 IDs, severity, phase, byte spans, labels, and related information. Parser
 diagnostics are included in frontend results but are not reclassified as
 semantic diagnostics.

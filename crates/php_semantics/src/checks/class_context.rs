@@ -131,7 +131,7 @@ impl ClassContextChecker {
 
     fn check_this_token(&mut self, _node: &SyntaxNode, _token: &SyntaxToken) {
         // PHP 8.5 lint accepts `$this` inside static methods and static
-        // closures; the runtime may still fail. Prompt 26 keeps this as a
+        // closures; the runtime may still fail. object-runtime keeps this as a
         // documented deferred runtime check rather than emitting diagnostics.
     }
 

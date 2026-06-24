@@ -109,7 +109,7 @@ impl DeclareValue {
     }
 }
 
-/// File-level directive summary for downstream phases.
+/// File-level directive summary for downstream layers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileDirectives {
     strict_types: Option<DeclareDirective>,

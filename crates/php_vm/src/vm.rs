@@ -405,13 +405,13 @@ pub struct VmOptions {
     pub trace: bool,
     /// Capture deterministic runtime object, reference, COW, and suspension events.
     pub trace_runtime: bool,
-    /// Collect Phase 7 VM/runtime counters in the execution result.
+    /// Collect performance VM/runtime counters in the execution result.
     pub collect_counters: bool,
     /// Maintain request-local quickening metadata without changing semantics.
     pub quickening: QuickeningMode,
     /// Allocate request-local inline-cache slots without changing semantics.
     pub inline_caches: InlineCacheMode,
-    /// Enable the experimental Phase 7 JIT tier for eligible hot leaf functions.
+    /// Enable the experimental performance JIT tier for eligible hot leaf functions.
     pub jit: JitMode,
     /// Hot-call threshold requested by the CLI for JIT compilation.
     pub jit_threshold: u64,
@@ -450,7 +450,7 @@ impl Default for VmOptions {
     }
 }
 
-/// Experimental Phase 7 JIT switch.
+/// Experimental JIT switch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum JitMode {
     /// Keep all execution on the interpreter.
@@ -460,30 +460,23 @@ pub enum JitMode {
     Noop,
     /// Select the Cranelift backend for reports without enabling PHP-code JIT execution yet.
     Cranelift,
-    /// Compatibility mode for the pre-addendum `--jit=on` smoke path.
-    #[doc(hidden)]
-    LegacyOn,
 }
 
 impl JitMode {
-    /// Compatibility alias for pre-addendum Phase 7 scripts and tests.
-    #[allow(non_upper_case_globals)]
-    pub const On: Self = Self::LegacyOn;
-
     /// Stable report spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Noop => "noop",
-            Self::Cranelift | Self::LegacyOn => "cranelift",
+            Self::Cranelift => "cranelift",
         }
     }
 
     /// Returns true when this mode needs the Cranelift feature to have effect.
     #[must_use]
     pub const fn requires_cranelift(self) -> bool {
-        matches!(self, Self::Cranelift | Self::LegacyOn)
+        matches!(self, Self::Cranelift)
     }
 }
 
@@ -825,9 +818,9 @@ pub struct VmResult {
     return_ref: Option<ReferenceCell>,
     /// Deterministic trace events captured when `VmOptions::trace` is enabled.
     pub trace: Vec<String>,
-    /// Optional Phase 7 VM/runtime counters.
+    /// Optional performance VM/runtime counters.
     pub counters: Option<VmCounters>,
-    /// Optional Phase 7 tiering stats.
+    /// Optional performance tiering stats.
     pub tiering_stats: Option<TieringStats>,
 }
 
@@ -2839,12 +2832,8 @@ impl Vm {
         {
             return None;
         }
-        match self.options.jit {
-            JitMode::LegacyOn => {
-                return self.try_execute_legacy_jit_leaf(compiled, function_id, function, args);
-            }
-            JitMode::Cranelift => {}
-            JitMode::Off | JitMode::Noop => return None,
+        if self.options.jit != JitMode::Cranelift {
+            return None;
         }
 
         let key = JitFunctionKey {
@@ -3285,65 +3274,6 @@ impl Vm {
         }
     }
 
-    #[cfg(feature = "jit-cranelift")]
-    fn try_execute_legacy_jit_leaf(
-        &self,
-        compiled: &CompiledUnit,
-        function_id: FunctionId,
-        function: &IrFunction,
-        args: &[PreparedArg],
-    ) -> Option<Value> {
-        let key = JitFunctionKey {
-            unit: compiled_unit_cache_key(compiled),
-            function: function_id,
-        };
-        let should_compile = {
-            let mut jit = self.jit.borrow_mut();
-            let entry = jit.functions.entry(key).or_default();
-            if entry.disabled {
-                self.record_counter_jit_tiering_blacklist_rejection();
-                return None;
-            }
-            entry.calls = entry.calls.saturating_add(1);
-            !entry.compiled
-        };
-
-        if should_compile {
-            if !self.jit_compile_budget_allows_attempt() {
-                self.record_counter_jit_tiering_budget_rejection();
-                return None;
-            }
-            self.record_counter_jit_compile_attempt();
-            match php_jit::lower_function_to_cranelift(compiled.unit(), function_id) {
-                Ok(_) => {
-                    if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
-                        entry.compiled = true;
-                    }
-                    self.record_counter_jit_compiled();
-                    self.record_jit_compile_budget_spent(0);
-                }
-                Err(_) => {
-                    if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
-                        entry.disabled = true;
-                    }
-                    self.record_counter_jit_bailout();
-                    return None;
-                }
-            }
-        }
-
-        match execute_jit_int_leaf(compiled.unit(), function, args) {
-            Ok(value) => {
-                self.record_counter_jit_executed();
-                Some(value)
-            }
-            Err(()) => {
-                self.record_counter_jit_bailout();
-                None
-            }
-        }
-    }
-
     fn execute_function(
         &self,
         compiled: &CompiledUnit,
@@ -3471,7 +3401,7 @@ impl Vm {
                         output,
                         compiled,
                         stack,
-                        "E_PHP_RUNTIME_GENERATOR_BY_REF_YIELD_GAP: by-reference generator yields are not implemented in Prompt 35",
+                        "E_PHP_RUNTIME_GENERATOR_BY_REF_YIELD_GAP: by-reference generator yields are not implemented in generator-yield",
                     );
                 }
                 if args.iter().any(|arg| arg.reference.is_some()) {
@@ -3479,7 +3409,7 @@ impl Vm {
                         output,
                         compiled,
                         stack,
-                        "E_PHP_VM_UNSUPPORTED_GENERATOR_BY_REF_ARG: generator by-reference arguments are not implemented in Prompt 33",
+                        "E_PHP_VM_UNSUPPORTED_GENERATOR_BY_REF_ARG: generator by-reference arguments are not implemented in generator-argument",
                     );
                 }
                 let generator_args = args.into_iter().map(|arg| arg.value).collect();
@@ -4731,7 +4661,7 @@ impl Vm {
                                     compiled,
                                     stack,
                                     format!(
-                                        "E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER: property {}::${property} uses modifiers outside the Prompt 28 clone-with MVP",
+                                        "E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER: property {}::${property} uses modifiers outside the reflection-clone clone-with MVP",
                                         object.class_name()
                                     ),
                                 );
@@ -6740,7 +6670,7 @@ impl Vm {
                             let diagnostic = unsupported_feature(
                                 "E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE",
                                 format!(
-                                    "foreach by reference over {} is not implemented; Phase 5 supports local arrays only",
+                                    "foreach by reference over {} is not implemented; runtime-semantics supports local arrays only",
                                     value_type_name(&source)
                                 ),
                                 RuntimeSourceSpan::default(),
@@ -9010,7 +8940,7 @@ impl Vm {
                         output,
                         compiled,
                         stack,
-                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_start expects zero or one argument in Phase 6",
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_start expects zero or one argument in standard-library",
                     );
                 }
                 if let Some(callback) = values.first()
@@ -9020,7 +8950,7 @@ impl Vm {
                         output,
                         compiled,
                         stack,
-                        "E_PHP_VM_OUTPUT_BUFFER_CALLBACK_UNSUPPORTED: ob_start callbacks are not implemented in Phase 6",
+                        "E_PHP_VM_OUTPUT_BUFFER_CALLBACK_UNSUPPORTED: ob_start callbacks are not implemented in standard-library",
                     );
                 }
                 output.start_buffer();
@@ -10586,7 +10516,7 @@ impl Vm {
                 let diagnostic = unsupported_feature(
                     "E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE",
                     format!(
-                        "foreach over {} is not implemented; Phase 5 supports arrays, public-property objects, Iterator, IteratorAggregate, and generator MVP objects",
+                        "foreach over {} is not implemented; runtime-semantics supports arrays, public-property objects, Iterator, IteratorAggregate, and generator MVP objects",
                         value_type_name(&source)
                     ),
                     RuntimeSourceSpan::default(),
@@ -11031,7 +10961,7 @@ impl Vm {
                         compiled,
                         stack,
                         format!(
-                            "E_PHP_VM_UNSUPPORTED_YIELD_FROM_SOURCE: yield from over {} is not implemented; Phase 5 supports arrays and generator MVP objects",
+                            "E_PHP_VM_UNSUPPORTED_YIELD_FROM_SOURCE: yield from over {} is not implemented; runtime-semantics supports arrays and generator MVP objects",
                             value_type_name(&other)
                         ),
                     ));
@@ -12658,7 +12588,7 @@ impl Vm {
                     Ok(name) => name.to_string_lossy(),
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
-                let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+                let registry = php_std::ExtensionRegistry::standard_library();
                 VmResult::success(
                     output.clone(),
                     Some(Value::Bool(php_std::introspection::extension_loaded(
@@ -12763,7 +12693,7 @@ impl Vm {
                 self.call_get_declared_builtin(compiled, name, output, state)
             }
             "get_loaded_extensions" => {
-                let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+                let registry = php_std::ExtensionRegistry::standard_library();
                 VmResult::success(
                     output.clone(),
                     Some(php_std::introspection::get_loaded_extensions_value(
@@ -14497,7 +14427,7 @@ fn reflection_new_object(
                     Ok(reflection_closure_object(compiled, function_entry, captures)?)
                 }
                 Value::Callable(_) => Err(
-                    "E_PHP_VM_REFLECTION_UNSUPPORTED_CALLABLE: callable reflection supports user functions and closures in the Prompt 28 MVP"
+                    "E_PHP_VM_REFLECTION_UNSUPPORTED_CALLABLE: callable reflection supports user functions and closures in the reflection-clone MVP"
                         .to_owned(),
                 ),
                 _ => {
@@ -14557,7 +14487,7 @@ fn reflection_new_object(
                 .to_owned(),
         ),
         "reflectionparameter" => Err(
-            "E_PHP_VM_REFLECTION_PARAMETER_CONSTRUCTION: ReflectionParameter direct construction is outside the Prompt 27 MVP"
+            "E_PHP_VM_REFLECTION_PARAMETER_CONSTRUCTION: ReflectionParameter direct construction is outside the method-runtime MVP"
                 .to_owned(),
         ),
         "reflectionnamedtype" => Err(
@@ -15030,7 +14960,7 @@ fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> V
 }
 
 fn reflection_internal_function_object(function: &str) -> Result<ObjectRef, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry.enabled_php_function(function).ok_or_else(|| {
         format!("E_PHP_VM_REFLECTION_UNKNOWN_FUNCTION: function {function} is not defined")
     })?;
@@ -15074,7 +15004,7 @@ fn reflection_internal_function_object(function: &str) -> Result<ObjectRef, Stri
 }
 
 fn reflection_internal_class_object(class_name: &str) -> Result<ObjectRef, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry.enabled_class(class_name).ok_or_else(|| {
         format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
     })?;
@@ -15180,7 +15110,7 @@ fn reflection_internal_method_object(
     class_name: &str,
     method_name: &str,
 ) -> Result<ObjectRef, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry.enabled_class(class_name).ok_or_else(|| {
         format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
     })?;
@@ -15238,7 +15168,7 @@ fn reflection_internal_method_object(
 }
 
 fn reflection_extension_object(extension: &str) -> Result<ObjectRef, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry
         .extension_case_insensitive(extension)
         .ok_or_else(|| {
@@ -15256,7 +15186,7 @@ fn reflection_extension_object(extension: &str) -> Result<ObjectRef, String> {
 }
 
 fn reflection_extension_functions_value(extension: &str) -> Result<Value, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry
         .extension_case_insensitive(extension)
         .ok_or_else(|| {
@@ -15277,7 +15207,7 @@ fn reflection_extension_functions_value(extension: &str) -> Result<Value, String
 }
 
 fn reflection_extension_classes_value(extension: &str) -> Result<Value, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry
         .extension_case_insensitive(extension)
         .ok_or_else(|| {
@@ -15295,7 +15225,7 @@ fn reflection_extension_classes_value(extension: &str) -> Result<Value, String> 
 }
 
 fn reflection_extension_class_names_value(extension: &str) -> Result<Value, String> {
-    let registry = php_std::ExtensionRegistry::phase6_infrastructure();
+    let registry = php_std::ExtensionRegistry::standard_library();
     let descriptor = registry
         .extension_case_insensitive(extension)
         .ok_or_else(|| {
@@ -15333,7 +15263,7 @@ fn reflection_class_properties_value(
     class_name: &str,
 ) -> Result<Value, String> {
     let Some(class) = compiled.lookup_class(class_name) else {
-        php_std::ExtensionRegistry::phase6_infrastructure()
+        php_std::ExtensionRegistry::standard_library()
             .enabled_class(class_name)
             .ok_or_else(|| {
                 format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
@@ -15353,7 +15283,7 @@ fn reflection_class_constants_value(
     class_name: &str,
 ) -> Result<Value, String> {
     let Some(class) = compiled.lookup_class(class_name) else {
-        php_std::ExtensionRegistry::phase6_infrastructure()
+        php_std::ExtensionRegistry::standard_library()
             .enabled_class(class_name)
             .ok_or_else(|| {
                 format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
@@ -15377,7 +15307,7 @@ fn reflection_class_reflection_constants_value(
     class_name: &str,
 ) -> Result<Value, String> {
     let Some(class) = compiled.lookup_class(class_name) else {
-        php_std::ExtensionRegistry::phase6_infrastructure()
+        php_std::ExtensionRegistry::standard_library()
             .enabled_class(class_name)
             .ok_or_else(|| {
                 format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: class {class_name} is not defined")
@@ -16306,7 +16236,7 @@ fn validate_object_mvp(class: &RuntimeClassEntry) -> Result<(), String> {
     for method in &class.methods {
         if method.flags.is_abstract {
             return Err(format!(
-                "E_PHP_VM_UNSUPPORTED_METHOD_MODIFIER: method {}::{} is abstract outside the Prompt 16 concrete method MVP",
+                "E_PHP_VM_UNSUPPORTED_METHOD_MODIFIER: method {}::{} is abstract outside the concrete-method concrete method MVP",
                 class.name, method.name
             ));
         }
@@ -19091,7 +19021,7 @@ fn class_like_exists_direct(
         AutoloadClassLookupKind::Enum => class.flags.is_enum,
         AutoloadClassLookupKind::Trait => false,
         AutoloadClassLookupKind::Class => !class.flags.is_interface,
-    }) || php_std::ExtensionRegistry::phase6_infrastructure()
+    }) || php_std::ExtensionRegistry::standard_library()
         .enabled_class(class_name)
         .is_some_and(|class| match kind {
             AutoloadClassLookupKind::Interface => {
@@ -19118,7 +19048,7 @@ fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) 
 }
 
 fn predefined_constant_value(name: &str) -> Option<Value> {
-    php_std::ExtensionRegistry::phase6_infrastructure()
+    php_std::ExtensionRegistry::standard_library()
         .enabled_constant(name)
         .and_then(|constant| constant.value())
         .map(php_std::constants::constant_to_value)
@@ -19811,10 +19741,10 @@ fn php_uname_value(mode: &str) -> String {
         's' => "Phrust".to_string(),
         'n' => "localhost".to_string(),
         'r' => php_source::reference_php_version().to_string(),
-        'v' => "Phase6".to_string(),
+        'v' => "Stdlib".to_string(),
         'm' => "generic".to_string(),
         _ => format!(
-            "Phrust localhost {} Phase6 generic",
+            "Phrust localhost {} Stdlib generic",
             php_source::reference_php_version()
         ),
     }
@@ -19863,7 +19793,7 @@ fn process_unsupported_mock_result(
         output,
         name,
         "E_PHP_VM_PROCESS_RESOURCE_MOCK_UNSUPPORTED",
-        format!("{name}(): process resource APIs are not implemented by the Phase 6 mock"),
+        format!("{name}(): process resource APIs are not implemented by the standard-library mock"),
         process_failure_value(name),
         stack_trace,
     )
@@ -20835,7 +20765,7 @@ fn foreach_array_keys_from_local(
     let value = effective_value(&value);
     let Value::Array(array) = value else {
         return Err(format!(
-            "E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE: foreach by reference over {} is not implemented; Phase 5 supports local arrays only",
+            "E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE: foreach by reference over {} is not implemented; runtime-semantics supports local arrays only",
             value_type_name(&value)
         ));
     };
@@ -21180,7 +21110,8 @@ fn assign_globals_dim(
     };
     let ArrayKey::String(name) = first else {
         return Err(
-            "E_PHP_VM_GLOBALS_ASSIGN_KEY: $GLOBALS keys must be strings in Phase 5".to_owned(),
+            "E_PHP_VM_GLOBALS_ASSIGN_KEY: $GLOBALS keys must be strings in runtime-semantics"
+                .to_owned(),
         );
     };
     let name = name.to_string();
@@ -21603,11 +21534,11 @@ fn execute_bitwise(op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, Stri
             let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs) else {
                 unreachable!("guarded by string match");
             };
-            return Ok(Value::String(PhpString::from_bytes(bitwise_string_bytes(
+            Ok(Value::String(PhpString::from_bytes(bitwise_string_bytes(
                 op,
                 lhs.as_bytes(),
                 rhs.as_bytes(),
-            ))));
+            ))))
         }
         BinaryOp::BitAnd => Ok(Value::Int(to_int(lhs)? & to_int(rhs)?)),
         BinaryOp::BitOr => Ok(Value::Int(to_int(lhs)? | to_int(rhs)?)),
@@ -22391,7 +22322,7 @@ mod tests {
         assert_eq!(
             result.output.to_string_lossy(),
             format!(
-                "/tmp/composer\n/tmp/composer-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Phase6 generic\nphrust\n/changed\nunset\n",
+                "/tmp/composer\n/tmp/composer-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Stdlib generic\nphrust\n/changed\nunset\n",
                 php_source::reference_php_version(),
                 php_source::reference_php_version()
             )
@@ -22520,18 +22451,18 @@ mod tests {
             .expect("crate should live under workspace/crates/php_vm")
             .canonicalize()
             .expect("canonical workspace");
-        let vendor = workspace.join("tests/fixtures/phase6/composer/basic_project/vendor");
+        let vendor = workspace.join("tests/fixtures/stdlib/composer/basic_project/vendor");
         let autoload = vendor.join("autoload.php");
         let source = format!(
             "<?php
             ini_set('include_path', '{}');
             require '{}';
-            echo function_exists('phase6_basic_file_helper') ? \"files-loaded\\n\" : \"files-missing\\n\";
-            $psr = new Phase6\\Basic\\PsrGreeter();
+            echo function_exists('stdlib_basic_file_helper') ? \"files-loaded\\n\" : \"files-missing\\n\";
+            $psr = new Stdlib\\Basic\\PsrGreeter();
             echo $psr->message(), \"\\n\";
-            $mapped = new Phase6\\BasicClassmap\\MappedThing();
+            $mapped = new Stdlib\\BasicClassmap\\MappedThing();
             echo $mapped->label(), \"\\n\";
-            echo class_exists('Phase6\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
+            echo class_exists('Stdlib\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
             ",
             vendor.display(),
             autoload.display()
@@ -22572,21 +22503,21 @@ mod tests {
             .expect("crate should live under workspace/crates/php_vm")
             .canonicalize()
             .expect("canonical workspace");
-        let vendor = workspace.join("tests/fixtures/phase6/composer/basic_project/vendor");
+        let vendor = workspace.join("tests/fixtures/stdlib/composer/basic_project/vendor");
         let autoload = vendor.join("autoload.php");
         let source = format!(
             "<?php
             ini_set('include_path', '{}');
             include_once '{}';
             include_once '{}';
-            echo function_exists('phase6_basic_file_helper') ? \"files-first\\n\" : \"files-missing\\n\";
-            echo phase6_basic_file_helper('order'), \"\\n\";
-            $psr = new Phase6\\Basic\\PsrGreeter();
+            echo function_exists('stdlib_basic_file_helper') ? \"files-first\\n\" : \"files-missing\\n\";
+            echo stdlib_basic_file_helper('order'), \"\\n\";
+            $psr = new Stdlib\\Basic\\PsrGreeter();
             echo $psr->message(), \"\\n\";
-            $mapped = new Phase6\\BasicClassmap\\MappedThing();
+            $mapped = new Stdlib\\BasicClassmap\\MappedThing();
             echo $mapped->label(), \"\\n\";
             echo count(spl_autoload_functions()), \"\\n\";
-            echo class_exists('Phase6\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
+            echo class_exists('Stdlib\\\\Basic\\\\Missing', true) ? \"bad\\n\" : \"safe-missing\\n\";
             ",
             vendor.display(),
             autoload.display(),
@@ -22624,22 +22555,22 @@ mod tests {
     fn autoload_lookup_cache_records_hits_and_keeps_missing_autoload_side_effects() {
         let source = "<?php
             $autoloadCount = 0;
-            function phase7_counting_loader($class) {
+            function perf_counting_loader($class) {
                 global $autoloadCount;
                 $autoloadCount = $autoloadCount + 1;
             }
-            spl_autoload_register('phase7_counting_loader');
+            spl_autoload_register('perf_counting_loader');
             for ($i = 0; $i < 2; $i++) {
-                if (class_exists('Phase7MissingSideEffect', true)) {
+                if (class_exists('PerfMissingSideEffect', true)) {
                     echo 'bad';
                 } else {
                     echo 'miss';
                 }
             }
             echo ':', $autoloadCount, \"\\n\";
-            class Phase7PositiveCache {}
+            class PerfPositiveCache {}
             for ($i = 0; $i < 3; $i++) {
-                if (class_exists('Phase7PositiveCache', false)) {
+                if (class_exists('PerfPositiveCache', false)) {
                     echo 'hit';
                 } else {
                     echo 'bad';
@@ -22671,22 +22602,22 @@ mod tests {
             .canonicalize()
             .expect("canonical workspace");
         let class_file =
-            workspace.join("tests/fixtures/phase7/inline_cache/Phase7RegisteredCache.php");
+            workspace.join("tests/fixtures/performance/inline_cache/PerfRegisteredCache.php");
         let source = "<?php
-            function phase7_registered_exists() {
-                return class_exists('Phase7RegisteredCache', true);
+            function perf_registered_exists() {
+                return class_exists('PerfRegisteredCache', true);
             }
-            if (phase7_registered_exists()) {
+            if (perf_registered_exists()) {
                 echo 'bad';
             } else {
                 echo 'miss';
             }
             spl_autoload_register(function ($class) {
-                if (strtolower($class) === 'phase7registeredcache') {
+                if (strtolower($class) === 'perfregisteredcache') {
                     include '__CLASS_FILE__';
                 }
             });
-            if (phase7_registered_exists()) {
+            if (perf_registered_exists()) {
                 echo ':hit';
             } else {
                 echo ':bad';
@@ -22721,18 +22652,18 @@ mod tests {
             .canonicalize()
             .expect("canonical workspace");
         let class_file =
-            workspace.join("tests/fixtures/phase7/inline_cache/Phase7IncludedCache.php");
+            workspace.join("tests/fixtures/performance/inline_cache/PerfIncludedCache.php");
         let source = "<?php
-            function phase7_included_exists() {
-                return class_exists('Phase7IncludedCache', false);
+            function perf_included_exists() {
+                return class_exists('PerfIncludedCache', false);
             }
-            if (phase7_included_exists()) {
+            if (perf_included_exists()) {
                 echo 'bad';
             } else {
                 echo 'miss';
             }
             include '__CLASS_FILE__';
-            if (phase7_included_exists()) {
+            if (perf_included_exists()) {
                 echo ':hit';
             } else {
                 echo ':bad';
@@ -22761,7 +22692,7 @@ mod tests {
     #[test]
     fn include_path_inline_cache_records_hits_and_preserves_semantics() {
         let off = execute_fixture_file_with_options(
-            "tests/fixtures/phase7/inline_cache/include-path-cache.php",
+            "tests/fixtures/performance/inline_cache/include-path-cache.php",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::Off,
@@ -22769,7 +22700,7 @@ mod tests {
             },
         );
         let on = execute_fixture_file_with_options(
-            "tests/fixtures/phase7/inline_cache/include-path-cache.php",
+            "tests/fixtures/performance/inline_cache/include-path-cache.php",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -22803,7 +22734,8 @@ mod tests {
             .parent()
             .and_then(std::path::Path::parent)
             .expect("crate should live under workspace/crates/php_vm");
-        let lib_root = workspace.join("tests/fixtures/phase7/inline_cache/include-path-cache-lib");
+        let lib_root =
+            workspace.join("tests/fixtures/performance/inline_cache/include-path-cache-lib");
         let first = lib_root.join("first");
         let second = lib_root.join("second");
         let source = "<?php include 'chosen.php';";
@@ -23315,7 +23247,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_are_opt_in_and_cover_phase7_families() {
+    fn counters_are_opt_in_and_cover_perf_families() {
         let result = execute_source_with_options(
             "<?php function f($v) { return $v . 'x'; } class C { public $p = 0; } $a = [1]; $c = new C(); $ok = $c instanceof C; echo f($a[0]), $c->p;",
             VmOptions {
@@ -23424,12 +23356,12 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_int_leaf_hot_loop_executes_after_warmup() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + phase7_jit_add($i, 2); } echo $sum;";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + perf_jit_add($i, 2); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
                 collect_counters: true,
-                jit: JitMode::On,
+                jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
         );
@@ -23446,7 +23378,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_default_tiering_keeps_cold_function_interpreted() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(1, 2);";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } echo perf_jit_add(1, 2);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23467,7 +23399,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_threshold_tiering_compiles_hot_function() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 4; $i++) { $sum += phase7_jit_add($i, 2); } echo $sum;";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 4; $i++) { $sum += perf_jit_add($i, 2); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23494,7 +23426,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_eager_tiering_compiles_first_call_for_tests() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(5, 7);";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } echo perf_jit_add(5, 7);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23520,7 +23452,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_compile_budget_rejection_falls_back_to_interpreter() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } echo phase7_jit_add(5, 7);";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } echo perf_jit_add(5, 7);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23547,7 +23479,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_inline_arithmetic_executes_native_and_counts_fast_paths() {
-        let source = "<?php function phase7_jit_add_mul(int $a): int { return ($a + 2) * 3; } echo phase7_jit_add_mul(4);";
+        let source = "<?php function perf_jit_add_mul(int $a): int { return ($a + 2) * 3; } echo perf_jit_add_mul(4);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23580,7 +23512,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_array_fetch_executes_native_and_counts_fast_hit() {
-        let source = "<?php function phase7_packed_fetch(array $xs, int $i): int { return $xs[$i]; } $xs = [10, 20, 30]; echo phase7_packed_fetch($xs, 1);";
+        let source = "<?php function perf_packed_fetch(array $xs, int $i): int { return $xs[$i]; } $xs = [10, 20, 30]; echo perf_packed_fetch($xs, 1);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23610,7 +23542,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_array_fetch_bounds_exit_falls_back_to_interpreter() {
-        let source = "<?php function phase7_packed_fetch_bounds(array $xs, int $i): int { return $xs[$i]; } echo phase7_packed_fetch_bounds([10], 4);";
+        let source = "<?php function perf_packed_fetch_bounds(array $xs, int $i): int { return $xs[$i]; } echo perf_packed_fetch_bounds([10], 4);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23652,7 +23584,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_array_fetch_layout_exit_falls_back_for_mixed_array() {
-        let source = "<?php function phase7_packed_fetch_mixed(array $xs, int $i): int { return $xs[$i]; } $xs = [0 => 11, 'name' => 12]; echo phase7_packed_fetch_mixed($xs, 0);";
+        let source = "<?php function perf_packed_fetch_mixed(array $xs, int $i): int { return $xs[$i]; } $xs = [0 => 11, 'name' => 12]; echo perf_packed_fetch_mixed($xs, 0);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23689,7 +23621,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_foreach_sum_executes_native_and_counts_fast_hit() {
-        let source = "<?php function phase7_packed_foreach_sum(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum([10, 20, 30]);";
+        let source = "<?php function perf_packed_foreach_sum(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo perf_packed_foreach_sum([10, 20, 30]);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23725,7 +23657,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_foreach_sum_layout_exit_falls_back_for_mixed_element() {
-        let source = "<?php function phase7_packed_foreach_sum_mixed(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum_mixed([10, \"20\", 30]);";
+        let source = "<?php function perf_packed_foreach_sum_mixed(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo perf_packed_foreach_sum_mixed([10, \"20\", 30]);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23770,7 +23702,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_packed_foreach_sum_overflow_exit_falls_back_to_interpreter() {
-        let source = "<?php function phase7_packed_foreach_sum_overflow(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo phase7_packed_foreach_sum_overflow([9223372036854775807, 1]);";
+        let source = "<?php function perf_packed_foreach_sum_overflow(array $xs): int { $sum = 0; foreach ($xs as $x) { $sum += $x; } return $sum; } echo perf_packed_foreach_sum_overflow([9223372036854775807, 1]);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23813,7 +23745,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_known_strlen_executes_native_and_counts_fast_hit() {
-        let source = "<?php function phase7_known_strlen(string $s): int { return strlen($s); } echo phase7_known_strlen(\"hello\");";
+        let source = "<?php function perf_known_strlen(string $s): int { return strlen($s); } echo perf_known_strlen(\"hello\");";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23841,7 +23773,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_known_strlen_guard_exit_preserves_type_error() {
-        let source = "<?php function phase7_known_strlen_guard($s): int { return strlen($s); } try { echo phase7_known_strlen_guard([]); } catch (TypeError $e) { echo \"type-error\"; }";
+        let source = "<?php function perf_known_strlen_guard($s): int { return strlen($s); } try { echo perf_known_strlen_guard([]); } catch (TypeError $e) { echo \"type-error\"; }";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23882,7 +23814,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_known_count_executes_for_packed_and_mixed_arrays() {
-        let source = "<?php function phase7_known_count(array $xs): int { return count($xs); } echo phase7_known_count([10, 20, 30]), \":\", phase7_known_count([\"a\" => 1, 4 => 2]);";
+        let source = "<?php function perf_known_count(array $xs): int { return count($xs); } echo perf_known_count([10, 20, 30]), \":\", perf_known_count([\"a\" => 1, 4 => 2]);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23910,7 +23842,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_string_concat_executes_native_and_counts_fast_hit() {
-        let source = "<?php function phase7_string_concat(string $a, string $b): string { return $a . $b; } echo phase7_string_concat(\"hello\", \"-world\");";
+        let source = "<?php function perf_string_concat(string $a, string $b): string { return $a . $b; } echo perf_string_concat(\"hello\", \"-world\");";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -23939,7 +23871,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_string_concat_rejects_string_int_without_fast_hit() {
-        let source = "<?php function phase7_string_int_concat(string $a, int $b): string { return $a . $b; } echo phase7_string_int_concat(\"id-\", 42);";
+        let source = "<?php function perf_string_int_concat(string $a, int $b): string { return $a . $b; } echo perf_string_int_concat(\"id-\", 42);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -23976,7 +23908,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_string_concat_rejects_object_to_string_without_fast_hit() {
-        let source = "<?php class Phase7ConcatObject { public function __toString(): string { return 'object'; } } function phase7_object_concat($a, $b): string { return $a . $b; } echo phase7_object_concat(new Phase7ConcatObject(), '-tail');";
+        let source = "<?php class PerfConcatObject { public function __toString(): string { return 'object'; } } function perf_object_concat($a, $b): string { return $a . $b; } echo perf_object_concat(new PerfConcatObject(), '-tail');";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24013,7 +23945,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_helper_overflow_status_falls_back_to_interpreter() {
-        let source = "<?php function phase7_jit_overflow(int $a): int { return $a + 1; } echo phase7_jit_overflow(9223372036854775807);";
+        let source = "<?php function perf_jit_overflow(int $a): int { return $a + 1; } echo perf_jit_overflow(9223372036854775807);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24059,11 +23991,11 @@ mod tests {
     #[test]
     fn cranelift_type_switch_side_exits_blacklist_unstable_candidate() {
         let source = r#"<?php
-function phase7_jit_unstable_types(int $a): int { return $a + 1; }
-echo phase7_jit_unstable_types(1), "\n";
-echo phase7_jit_unstable_types("2"), "\n";
-echo phase7_jit_unstable_types("3"), "\n";
-echo phase7_jit_unstable_types(4), "\n";
+function perf_jit_unstable_types(int $a): int { return $a + 1; }
+echo perf_jit_unstable_types(1), "\n";
+echo perf_jit_unstable_types("2"), "\n";
+echo perf_jit_unstable_types("3"), "\n";
+echo perf_jit_unstable_types(4), "\n";
 "#;
         let off = execute_source_with_options(
             source,
@@ -24114,11 +24046,11 @@ echo phase7_jit_unstable_types(4), "\n";
     #[test]
     fn cranelift_blacklist_can_be_disabled_for_debugging() {
         let source = r#"<?php
-function phase7_jit_unstable_types_debug(int $a): int { return $a + 1; }
-echo phase7_jit_unstable_types_debug(1), "\n";
-echo phase7_jit_unstable_types_debug("2"), "\n";
-echo phase7_jit_unstable_types_debug("3"), "\n";
-echo phase7_jit_unstable_types_debug(4), "\n";
+function perf_jit_unstable_types_debug(int $a): int { return $a + 1; }
+echo perf_jit_unstable_types_debug(1), "\n";
+echo perf_jit_unstable_types_debug("2"), "\n";
+echo perf_jit_unstable_types_debug("3"), "\n";
+echo perf_jit_unstable_types_debug(4), "\n";
 "#;
         let result = execute_source_with_options(
             source,
@@ -24150,7 +24082,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_constant_return_executes_native_after_abi_check() {
-        let source = "<?php function phase7_const(): int { return 42; } echo phase7_const();";
+        let source = "<?php function perf_const(): int { return 42; } echo perf_const();";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24179,7 +24111,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_compile_cache_reuses_same_function() {
-        let source = "<?php function phase7_const(): int { return 42; } echo phase7_const(); echo phase7_const(); echo phase7_const();";
+        let source = "<?php function perf_const(): int { return 42; } echo perf_const(); echo perf_const(); echo perf_const();";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24219,7 +24151,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
         };
         let handle = php_jit::JitFunctionHandle::metadata_only(
             1,
-            "function.phase7_const".to_owned(),
+            "function.perf_const".to_owned(),
             php_jit::JitBackend::CraneliftExperiment,
         );
         cache.insert_compile_cache(base.clone(), handle, 1);
@@ -24258,7 +24190,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
         };
         let handle = php_jit::JitFunctionHandle::metadata_only(
             1,
-            "function.phase7_const".to_owned(),
+            "function.perf_const".to_owned(),
             php_jit::JitBackend::CraneliftExperiment,
         );
         cache.insert_compile_cache(key.clone(), handle, 1);
@@ -24276,12 +24208,12 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_rejected_leaf_falls_back_to_interpreter() {
-        let source = "<?php function phase7_jit_reject($value): int { return strlen($value); } $sum = 0; for ($i = 0; $i < 8; $i++) { $sum = $sum + phase7_jit_reject('abcd'); } echo $sum;";
+        let source = "<?php function perf_jit_reject($value): int { $items = []; $items[] = strlen($value); return $items[0]; } $sum = 0; for ($i = 0; $i < 8; $i++) { $sum = $sum + perf_jit_reject('abcd'); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
                 collect_counters: true,
-                jit: JitMode::On,
+                jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
         );
@@ -24298,7 +24230,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_on_off_output_is_identical() {
-        let source = "<?php function phase7_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 10; $i++) { $sum = $sum + phase7_jit_add($i, 3); } echo $sum;";
+        let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 10; $i++) { $sum = $sum + perf_jit_add($i, 3); } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24311,7 +24243,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
-                jit: JitMode::On,
+                jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
         );
@@ -24378,7 +24310,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn function_call_inline_cache_records_user_function_hits() {
-        let source = "<?php function phase7_ic_user($value) { return $value + 1; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = phase7_ic_user($sum); } echo $sum;";
+        let source = "<?php function perf_ic_user($value) { return $value + 1; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = perf_ic_user($sum); } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24427,7 +24359,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn function_call_inline_cache_handles_namespaced_functions() {
-        let source = "<?php namespace PhaseSevenIC; function hot() { return 2; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + hot(); } echo $sum;";
+        let source = "<?php namespace PerformanceIC; function hot() { return 2; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + hot(); } echo $sum;";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24447,7 +24379,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn function_call_inline_cache_invalidates_after_include_defined_function() {
         let result = execute_fixture_file_with_options(
-            "tests/fixtures/phase7/inline_cache/include-invalidation.php",
+            "tests/fixtures/performance/inline_cache/include-invalidation.php",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -24465,7 +24397,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn function_call_inline_cache_preserves_function_exists_introspection() {
-        let source = "<?php function phase7_ic_exists() { return 1; } for ($i = 0; $i < 12; $i++) { echo function_exists('strlen') ? 'b' : 'm'; echo function_exists('phase7_ic_exists') ? 'u' : 'm'; }";
+        let source = "<?php function perf_ic_exists() { return 1; } for ($i = 0; $i < 12; $i++) { echo function_exists('strlen') ? 'b' : 'm'; echo function_exists('perf_ic_exists') ? 'u' : 'm'; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24484,7 +24416,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_records_hot_loop_hits() {
-        let source = "<?php class Phase7MethodHot { public function value() { return 2; } } $object = new Phase7MethodHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value(); } echo $sum;";
+        let source = "<?php class PerfMethodHot { public function value() { return 2; } } $object = new PerfMethodHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value(); } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24514,7 +24446,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_handles_inherited_methods() {
-        let source = "<?php class Phase7MethodBase { public function value() { return 'B'; } } class Phase7MethodChild extends Phase7MethodBase {} $object = new Phase7MethodChild(); for ($i = 0; $i < 8; $i++) { echo $object->value(); }";
+        let source = "<?php class PerfMethodBase { public function value() { return 'B'; } } class PerfMethodChild extends PerfMethodBase {} $object = new PerfMethodChild(); for ($i = 0; $i < 8; $i++) { echo $object->value(); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24534,7 +24466,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_guard_fails_for_overridden_receivers() {
-        let source = "<?php class Phase7MethodA { public function value() { return 'A'; } } class Phase7MethodB extends Phase7MethodA { public function value() { return 'B'; } } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new Phase7MethodB(); $flip = false; } else { $object = new Phase7MethodA(); $flip = true; } echo $object->value(); }";
+        let source = "<?php class PerfMethodA { public function value() { return 'A'; } } class PerfMethodB extends PerfMethodA { public function value() { return 'B'; } } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new PerfMethodB(); $flip = false; } else { $object = new PerfMethodA(); $flip = true; } echo $object->value(); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24553,7 +24485,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_preserves_magic_call_fallback() {
-        let source = "<?php class Phase7MagicMethod { public function __call($name, $args) { return $name . count($args); } } $object = new Phase7MagicMethod(); for ($i = 0; $i < 4; $i++) { echo $object->missing(1, 2); }";
+        let source = "<?php class PerfMagicMethod { public function __call($name, $args) { return $name . count($args); } } $object = new PerfMagicMethod(); for ($i = 0; $i < 4; $i++) { echo $object->missing(1, 2); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24572,7 +24504,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_keeps_private_and_protected_visibility() {
-        let source = "<?php class Phase7MethodScopeBase { private function secret() { return 's'; } protected function inherited() { return 'p'; } public function callSecret() { return $this->secret(); } } class Phase7MethodScopeChild extends Phase7MethodScopeBase { public function callProtected() { return $this->inherited(); } } $object = new Phase7MethodScopeChild(); for ($i = 0; $i < 6; $i++) { echo $object->callSecret(), $object->callProtected(); }";
+        let source = "<?php class PerfMethodScopeBase { private function secret() { return 's'; } protected function inherited() { return 'p'; } public function callSecret() { return $this->secret(); } } class PerfMethodScopeChild extends PerfMethodScopeBase { public function callProtected() { return $this->inherited(); } } $object = new PerfMethodScopeChild(); for ($i = 0; $i < 6; $i++) { echo $object->callSecret(), $object->callProtected(); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24589,7 +24521,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
         assert_eq!(counters.method_ic_guard_failures, 0, "{counters:?}");
 
         let private = execute_source_with_options(
-            "<?php class Phase7MethodPrivate { private function secret() { return 1; } } (new Phase7MethodPrivate())->secret();",
+            "<?php class PerfMethodPrivate { private function secret() { return 1; } } (new PerfMethodPrivate())->secret();",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -24605,7 +24537,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_inline_cache_handles_trait_method_alias() {
-        let source = "<?php trait Phase7MethodTrait { public function base() { return 't'; } } class Phase7MethodTraitUser { use Phase7MethodTrait { base as alias; } } $object = new Phase7MethodTraitUser(); for ($i = 0; $i < 8; $i++) { echo $object->alias(); }";
+        let source = "<?php trait PerfMethodTrait { public function base() { return 't'; } } class PerfMethodTraitUser { use PerfMethodTrait { base as alias; } } $object = new PerfMethodTraitUser(); for ($i = 0; $i < 8; $i++) { echo $object->alias(); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24624,7 +24556,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_profiles_declared_monomorphic_final_method() {
-        let source = "<?php class Phase7MethodProfileFinal { final public function value(): int { return 7; } } $object = new Phase7MethodProfileFinal(); $sum = 0; for ($i = 0; $i < 4; $i++) { $sum = $sum + $object->value(); } echo $sum;";
+        let source = "<?php class PerfMethodProfileFinal { final public function value(): int { return 7; } } $object = new PerfMethodProfileFinal(); $sum = 0; for ($i = 0; $i < 4; $i++) { $sum = $sum + $object->value(); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24660,7 +24592,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_profiles_subclass_override_is_not_monomorphic() {
-        let source = "<?php class Phase7MethodProfileBase { public function value(): int { return 1; } } class Phase7MethodProfileChild extends Phase7MethodProfileBase { public function value(): int { return 2; } } function phase7_method_profile_value(Phase7MethodProfileBase $object): int { return $object->value(); } echo phase7_method_profile_value(new Phase7MethodProfileBase()), phase7_method_profile_value(new Phase7MethodProfileChild());";
+        let source = "<?php class PerfMethodProfileBase { public function value(): int { return 1; } } class PerfMethodProfileChild extends PerfMethodProfileBase { public function value(): int { return 2; } } function perf_method_profile_value(PerfMethodProfileBase $object): int { return $object->value(); } echo perf_method_profile_value(new PerfMethodProfileBase()), perf_method_profile_value(new PerfMethodProfileChild());";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24684,7 +24616,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn method_call_profiles_magic_call_fallback() {
-        let source = "<?php class Phase7MethodProfileMagic { public function __call($name, $args): int { return 42; } } $object = new Phase7MethodProfileMagic(); echo $object->missing(1, 2);";
+        let source = "<?php class PerfMethodProfileMagic { public function __call($name, $args): int { return 42; } } $object = new PerfMethodProfileMagic(); echo $object->missing(1, 2);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24709,7 +24641,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_method_direct_call_hits_after_initial_fallback() {
-        let source = "<?php class Phase7DirectMethodTest { public function value(int $x): int { return $x + 2; } } $object = new Phase7DirectMethodTest(); $sum = 0; for ($i = 0; $i < 8; $i++) { $sum += $object->value($i); } echo $sum;";
+        let source = "<?php class PerfDirectMethodTest { public function value(int $x): int { return $x + 2; } } $object = new PerfDirectMethodTest(); $sum = 0; for ($i = 0; $i < 8; $i++) { $sum += $object->value($i); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24734,7 +24666,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_method_direct_call_subclass_receiver_falls_back() {
-        let source = "<?php class Phase7DirectBaseTest { public function value(int $x): int { return $x + 1; } } class Phase7DirectChildTest extends Phase7DirectBaseTest { public function value(int $x): int { return $x + 10; } } $objects = [new Phase7DirectBaseTest(), new Phase7DirectChildTest(), new Phase7DirectBaseTest()]; $sum = 0; foreach ($objects as $i => $object) { $sum += $object->value($i); } echo $sum;";
+        let source = "<?php class PerfDirectBaseTest { public function value(int $x): int { return $x + 1; } } class PerfDirectChildTest extends PerfDirectBaseTest { public function value(int $x): int { return $x + 10; } } $objects = [new PerfDirectBaseTest(), new PerfDirectChildTest(), new PerfDirectBaseTest()]; $sum = 0; foreach ($objects as $i => $object) { $sum += $object->value($i); } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24759,7 +24691,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_method_direct_call_magic_path_stays_fallback() {
-        let source = "<?php class Phase7DirectMagicTest { public function __call(string $name, array $args): int { return strlen($name) + $args[0]; } } $object = new Phase7DirectMagicTest(); echo $object->missing(5);";
+        let source = "<?php class PerfDirectMagicTest { public function __call(string $name, array $args): int { return strlen($name) + $args[0]; } } $object = new PerfDirectMagicTest(); echo $object->missing(5);";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24783,7 +24715,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn cranelift_method_direct_call_propagates_callee_exception() {
-        let source = "<?php class Phase7DirectThrowerTest { public int $calls = 0; public function fail(): int { $this->calls = $this->calls + 1; if ($this->calls > 1) { throw new Exception(\"phase7-direct-method\"); } return $this->calls; } } $object = new Phase7DirectThrowerTest(); for ($i = 0; $i < 2; $i++) { echo $object->fail(), \"\\n\"; }";
+        let source = "<?php class PerfDirectThrowerTest { public int $calls = 0; public function fail(): int { $this->calls = $this->calls + 1; if ($this->calls > 1) { throw new Exception(\"performance-direct-method\"); } return $this->calls; } } $object = new PerfDirectThrowerTest(); for ($i = 0; $i < 2; $i++) { echo $object->fail(), \"\\n\"; }";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24803,7 +24735,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
             result
                 .status
                 .message()
-                .is_some_and(|message| message.contains("phase7-direct-method")),
+                .is_some_and(|message| message.contains("performance-direct-method")),
             "{:?}",
             result.status
         );
@@ -24814,7 +24746,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_records_public_hot_loop_hits() {
-        let source = "<?php class Phase7PropertyHot { public $value = 3; } $object = new Phase7PropertyHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
+        let source = "<?php class PerfPropertyHot { public $value = 3; } $object = new PerfPropertyHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -24844,7 +24776,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_profiles_declared_monomorphic_property() {
-        let source = "<?php class Phase7PropertyProfileHot { public $value = 3; } $object = new Phase7PropertyProfileHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
+        let source = "<?php class PerfPropertyProfileHot { public $value = 3; } $object = new PerfPropertyProfileHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value; } echo $sum;";
         let result = execute_source_with_options(
             source,
             VmOptions {
@@ -24876,7 +24808,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_handles_private_property_within_class() {
-        let source = "<?php class Phase7PropertyPrivate { private $value = 4; public function read() { return $this->value; } } $object = new Phase7PropertyPrivate(); for ($i = 0; $i < 8; $i++) { echo $object->read(); }";
+        let source = "<?php class PerfPropertyPrivate { private $value = 4; public function read() { return $this->value; } } $object = new PerfPropertyPrivate(); for ($i = 0; $i < 8; $i++) { echo $object->read(); }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24896,7 +24828,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_handles_inherited_property() {
-        let source = "<?php class Phase7PropertyBase { public $value = 'B'; } class Phase7PropertyChild extends Phase7PropertyBase {} $object = new Phase7PropertyChild(); for ($i = 0; $i < 8; $i++) { echo $object->value; }";
+        let source = "<?php class PerfPropertyBase { public $value = 'B'; } class PerfPropertyChild extends PerfPropertyBase {} $object = new PerfPropertyChild(); for ($i = 0; $i < 8; $i++) { echo $object->value; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24916,7 +24848,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_guard_fails_for_alternating_receivers() {
-        let source = "<?php class Phase7PropertyA { public $value = 'A'; } class Phase7PropertyB { public $value = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new Phase7PropertyB(); $flip = false; } else { $object = new Phase7PropertyA(); $flip = true; } echo $object->value; }";
+        let source = "<?php class PerfPropertyA { public $value = 'A'; } class PerfPropertyB { public $value = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { $object = new PerfPropertyB(); $flip = false; } else { $object = new PerfPropertyA(); $flip = true; } echo $object->value; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24936,7 +24868,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_profiles_polymorphic_and_megamorphic_receivers() {
         let polymorphic = execute_source_with_options(
-            "<?php class Phase7ProfilePolyA { public $value = 'A'; } class Phase7ProfilePolyB { public $value = 'B'; } function phase7_profile_read($object) { return $object->value; } echo phase7_profile_read(new Phase7ProfilePolyA()), phase7_profile_read(new Phase7ProfilePolyB());",
+            "<?php class PerfProfilePolyA { public $value = 'A'; } class PerfProfilePolyB { public $value = 'B'; } function perf_profile_read($object) { return $object->value; } echo perf_profile_read(new PerfProfilePolyA()), perf_profile_read(new PerfProfilePolyB());",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -24953,7 +24885,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
         assert!(json.contains("\"polymorphic_receiver\""), "{json}");
 
         let megamorphic = execute_source_with_options(
-            "<?php class Phase7ProfileMegaA { public $value = 'A'; } class Phase7ProfileMegaB { public $value = 'B'; } class Phase7ProfileMegaC { public $value = 'C'; } class Phase7ProfileMegaD { public $value = 'D'; } class Phase7ProfileMegaE { public $value = 'E'; } function phase7_profile_mega_read($object) { return $object->value; } echo phase7_profile_mega_read(new Phase7ProfileMegaA()), phase7_profile_mega_read(new Phase7ProfileMegaB()), phase7_profile_mega_read(new Phase7ProfileMegaC()), phase7_profile_mega_read(new Phase7ProfileMegaD()), phase7_profile_mega_read(new Phase7ProfileMegaE());",
+            "<?php class PerfProfileMegaA { public $value = 'A'; } class PerfProfileMegaB { public $value = 'B'; } class PerfProfileMegaC { public $value = 'C'; } class PerfProfileMegaD { public $value = 'D'; } class PerfProfileMegaE { public $value = 'E'; } function perf_profile_mega_read($object) { return $object->value; } echo perf_profile_mega_read(new PerfProfileMegaA()), perf_profile_mega_read(new PerfProfileMegaB()), perf_profile_mega_read(new PerfProfileMegaC()), perf_profile_mega_read(new PerfProfileMegaD()), perf_profile_mega_read(new PerfProfileMegaE());",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -24972,7 +24904,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_preserves_dynamic_property_fallback() {
-        let source = "<?php class Phase7DynamicProperty {} $object = new Phase7DynamicProperty(); $object->value = 'd'; for ($i = 0; $i < 6; $i++) { echo $object->value; }";
+        let source = "<?php class PerfDynamicProperty {} $object = new PerfDynamicProperty(); $object->value = 'd'; for ($i = 0; $i < 6; $i++) { echo $object->value; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -24992,7 +24924,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_profiles_dynamic_property_fallback() {
         let result = execute_source_with_options(
-            "<?php class Phase7ProfileDynamicProperty {} $object = new Phase7ProfileDynamicProperty(); $object->value = 'd'; echo $object->value;",
+            "<?php class PerfProfileDynamicProperty {} $object = new PerfProfileDynamicProperty(); $object->value = 'd'; echo $object->value;",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -25021,7 +24953,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_preserves_magic_get_fallback() {
-        let source = "<?php class Phase7MagicProperty { public function __get($name) { return $name . '!'; } } $object = new Phase7MagicProperty(); for ($i = 0; $i < 4; $i++) { echo $object->missing; }";
+        let source = "<?php class PerfMagicProperty { public function __get($name) { return $name . '!'; } } $object = new PerfMagicProperty(); for ($i = 0; $i < 4; $i++) { echo $object->missing; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25041,7 +24973,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_profiles_magic_get_reason() {
         let result = execute_source_with_options(
-            "<?php class Phase7ProfileMagicProperty { public function __get($name) { return $name . '!'; } } $object = new Phase7ProfileMagicProperty(); echo $object->missing;",
+            "<?php class PerfProfileMagicProperty { public function __get($name) { return $name . '!'; } } $object = new PerfProfileMagicProperty(); echo $object->missing;",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -25068,7 +25000,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn property_fetch_inline_cache_preserves_property_hook_fallback() {
-        let source = "<?php class Phase7HookProperty { public string $name { get { return 'hook'; } } } $object = new Phase7HookProperty(); for ($i = 0; $i < 4; $i++) { echo $object->name; }";
+        let source = "<?php class PerfHookProperty { public string $name { get { return 'hook'; } } } $object = new PerfHookProperty(); for ($i = 0; $i < 4; $i++) { echo $object->name; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25088,7 +25020,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_profiles_property_hook_reason() {
         let result = execute_source_with_options(
-            "<?php class Phase7ProfileHookProperty { public string $name { get { return 'hook'; } } } $object = new Phase7ProfileHookProperty(); echo $object->name;",
+            "<?php class PerfProfileHookProperty { public string $name { get { return 'hook'; } } } $object = new PerfProfileHookProperty(); echo $object->name;",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -25113,7 +25045,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_inline_cache_preserves_uninitialized_typed_property_error() {
         let result = execute_source_with_options(
-            "<?php class Phase7TypedProperty { public int $value; } $object = new Phase7TypedProperty(); echo $object->value;",
+            "<?php class PerfTypedProperty { public int $value; } $object = new PerfTypedProperty(); echo $object->value;",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -25134,7 +25066,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn property_fetch_profiles_uninitialized_typed_property_reason() {
         let result = execute_source_with_options(
-            "<?php class Phase7ProfileTypedProperty { public int $value; } $object = new Phase7ProfileTypedProperty(); echo $object->value;",
+            "<?php class PerfProfileTypedProperty { public int $value; } $object = new PerfProfileTypedProperty(); echo $object->value;",
             VmOptions {
                 collect_counters: true,
                 inline_caches: InlineCacheMode::On,
@@ -25157,7 +25089,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn class_static_inline_cache_records_repeated_class_constant_hits() {
-        let source = "<?php class Phase7ConstHot { public const VALUE = 5; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + Phase7ConstHot::VALUE; } echo $sum;";
+        let source = "<?php class PerfConstHot { public const VALUE = 5; } $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + PerfConstHot::VALUE; } echo $sum;";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -25187,7 +25119,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn class_static_inline_cache_handles_inherited_constant() {
-        let source = "<?php class Phase7ConstBase { public const VALUE = 'B'; } class Phase7ConstChild extends Phase7ConstBase {} for ($i = 0; $i < 8; $i++) { echo Phase7ConstChild::VALUE; }";
+        let source = "<?php class PerfConstBase { public const VALUE = 'B'; } class PerfConstChild extends PerfConstBase {} for ($i = 0; $i < 8; $i++) { echo PerfConstChild::VALUE; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25206,7 +25138,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn class_static_inline_cache_handles_enum_case_access() {
-        let source = "<?php enum Phase7CacheStatus: string { case Ready = 'ready'; } for ($i = 0; $i < 6; $i++) { echo Phase7CacheStatus::Ready->value; }";
+        let source = "<?php enum PerfCacheStatus: string { case Ready = 'ready'; } for ($i = 0; $i < 6; $i++) { echo PerfCacheStatus::Ready->value; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25225,7 +25157,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn class_static_inline_cache_reads_static_property_metadata_without_stale_value() {
-        let source = "<?php class Phase7StaticCache { public static $value = 1; } echo Phase7StaticCache::$value; Phase7StaticCache::$value = 7; for ($i = 0; $i < 6; $i++) { echo Phase7StaticCache::$value; }";
+        let source = "<?php class PerfStaticCache { public static $value = 1; } echo PerfStaticCache::$value; PerfStaticCache::$value = 7; for ($i = 0; $i < 6; $i++) { echo PerfStaticCache::$value; }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25245,7 +25177,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn class_static_inline_cache_guards_late_static_binding() {
-        let source = "<?php class Phase7LsbBase { public const VALUE = 'A'; public static function read() { return static::VALUE; } } class Phase7LsbChild extends Phase7LsbBase { public const VALUE = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { echo Phase7LsbChild::read(); $flip = false; } else { echo Phase7LsbBase::read(); $flip = true; } }";
+        let source = "<?php class PerfLsbBase { public const VALUE = 'A'; public static function read() { return static::VALUE; } } class PerfLsbChild extends PerfLsbBase { public const VALUE = 'B'; } $flip = false; for ($i = 0; $i < 8; $i++) { if ($flip) { echo PerfLsbChild::read(); $flip = false; } else { echo PerfLsbBase::read(); $flip = true; } }";
         let on = execute_source_with_options(
             source,
             VmOptions {
@@ -25264,7 +25196,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn inline_cache_type_changes_reach_polymorphic_and_megamorphic_without_output_changes() {
-        let source = "<?php class Phase7ProtoA { public $prop = 'A'; public function value() { return 'A'; } } class Phase7ProtoB { public $prop = 'B'; public function value() { return 'B'; } } class Phase7ProtoC { public $prop = 'C'; public function value() { return 'C'; } } class Phase7ProtoD { public $prop = 'D'; public function value() { return 'D'; } } class Phase7ProtoE { public $prop = 'E'; public function value() { return 'E'; } } function phase7_emit_proto($object) { echo $object->value(), $object->prop; } $a = new Phase7ProtoA(); $b = new Phase7ProtoB(); $c = new Phase7ProtoC(); $d = new Phase7ProtoD(); $e = new Phase7ProtoE(); phase7_emit_proto($a); phase7_emit_proto($b); phase7_emit_proto($a); phase7_emit_proto($b); phase7_emit_proto($c); phase7_emit_proto($d); phase7_emit_proto($e); phase7_emit_proto($a);";
+        let source = "<?php class PerfProtoA { public $prop = 'A'; public function value() { return 'A'; } } class PerfProtoB { public $prop = 'B'; public function value() { return 'B'; } } class PerfProtoC { public $prop = 'C'; public function value() { return 'C'; } } class PerfProtoD { public $prop = 'D'; public function value() { return 'D'; } } class PerfProtoE { public $prop = 'E'; public function value() { return 'E'; } } function perf_emit_proto($object) { echo $object->value(), $object->prop; } $a = new PerfProtoA(); $b = new PerfProtoB(); $c = new PerfProtoC(); $d = new PerfProtoD(); $e = new PerfProtoE(); perf_emit_proto($a); perf_emit_proto($b); perf_emit_proto($a); perf_emit_proto($b); perf_emit_proto($c); perf_emit_proto($d); perf_emit_proto($e); perf_emit_proto($a);";
         let off = execute_source_with_options(
             source,
             VmOptions {
@@ -26882,7 +26814,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
                 b"value".as_slice(),
             ),
             (
-                "<?php phase7_741_missing_internal();",
+                "<?php perf_741_missing_internal();",
                 ExitStatus::RuntimeError,
                 b"".as_slice(),
             ),
@@ -26915,7 +26847,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
-    fn reflection_internal_functions_expose_phase6_metadata() {
+    fn reflection_internal_functions_expose_stdlib_metadata() {
         let result = execute_source(
             "<?php $fn = new ReflectionFunction('count'); echo $fn->getName(), '|'; echo $fn->isInternal() ? 'internal|' : 'user|'; echo $fn->getFileName() === false ? 'nofile|' : 'file|'; echo $fn->getNumberOfParameters(), ':', $fn->getNumberOfRequiredParameters(), '|'; $params = $fn->getParameters(); echo $params[0]->getName(), ':', ($params[0]->hasType() ? $params[0]->getType()->getName() : 'none'), '|'; echo $fn->getReturnType()->getName(), '|', $fn->getExtensionName();",
         );
@@ -26953,7 +26885,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn reflection_members_expose_property_constant_and_attribute_metadata() {
         let result = execute_source(
-            "<?php #[RepeatMe('a'), RepeatMe('b')] class ReflectionPhase641 { protected const CODE = 42; public readonly string $name; } $class = new ReflectionClass(ReflectionPhase641::class); $property = $class->getProperty('name'); $constant = $class->getReflectionConstant('CODE'); $attributes = $class->getAttributes(); echo $property->getName(), '|', ($property->hasType() ? $property->getType()->getName() : 'none'), '|', ($property->isReadOnly() ? 'readonly' : 'mutable'), '|', $property->getModifiers(), '|'; echo $constant->getName(), '|', ($constant->isProtected() ? 'protected' : 'not-protected'), '|', $constant->getValue(), '|', ($constant->isEnumCase() ? 'enum' : 'constant'), '|'; echo $attributes[0]->getName(), ':', ($attributes[0]->isRepeated() ? 'repeated' : 'single'), '|', $attributes[1]->getName(), ':', ($attributes[1]->isRepeated() ? 'repeated' : 'single');",
+            "<?php #[RepeatMe('a'), RepeatMe('b')] class ReflectionStdlib41 { protected const CODE = 42; public readonly string $name; } $class = new ReflectionClass(ReflectionStdlib41::class); $property = $class->getProperty('name'); $constant = $class->getReflectionConstant('CODE'); $attributes = $class->getAttributes(); echo $property->getName(), '|', ($property->hasType() ? $property->getType()->getName() : 'none'), '|', ($property->isReadOnly() ? 'readonly' : 'mutable'), '|', $property->getModifiers(), '|'; echo $constant->getName(), '|', ($constant->isProtected() ? 'protected' : 'not-protected'), '|', $constant->getValue(), '|', ($constant->isEnumCase() ? 'enum' : 'constant'), '|'; echo $attributes[0]->getName(), ':', ($attributes[0]->isRepeated() ? 'repeated' : 'single'), '|', $attributes[1]->getName(), ':', ($attributes[1]->isRepeated() ? 'repeated' : 'single');",
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
@@ -26966,7 +26898,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     #[test]
     fn reflection_enum_backed_cases_are_distinct_and_queryable() {
         let result = execute_source(
-            "<?php enum ReflectionPhase641Status: string { #[CaseMark('ready')] case Ready = 'ready'; case Done = 'done'; } $enum = new ReflectionEnum(ReflectionPhase641Status::class); echo $enum->hasCase('Ready') ? 'has|' : 'missing|'; $case = $enum->getCase('Ready'); echo get_class($case), '|', $case->getName(), '|', $case->getBackingValue(), '|'; $direct = new ReflectionEnumBackedCase(ReflectionPhase641Status::class, 'Done'); echo get_class($direct), '|', $direct->getBackingValue(), '|'; $constant = (new ReflectionClass(ReflectionPhase641Status::class))->getReflectionConstant('Ready'); echo $constant->isEnumCase() ? 'enumcase' : 'constant';",
+            "<?php enum ReflectionStdlib41Status: string { #[CaseMark('ready')] case Ready = 'ready'; case Done = 'done'; } $enum = new ReflectionEnum(ReflectionStdlib41Status::class); echo $enum->hasCase('Ready') ? 'has|' : 'missing|'; $case = $enum->getCase('Ready'); echo get_class($case), '|', $case->getName(), '|', $case->getBackingValue(), '|'; $direct = new ReflectionEnumBackedCase(ReflectionStdlib41Status::class, 'Done'); echo get_class($direct), '|', $direct->getBackingValue(), '|'; $constant = (new ReflectionClass(ReflectionStdlib41Status::class))->getReflectionConstant('Ready'); echo $constant->isEnumCase() ? 'enumcase' : 'constant';",
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
@@ -26977,7 +26909,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
-    fn tokenizer_token_get_all_exposes_phase1_tokens() {
+    fn tokenizer_token_get_all_exposes_lexer_tokens() {
         let result = execute_source(
             "<?php $tokens = token_get_all('<?php echo $name + 1;'); echo token_name($tokens[0][0]), '|', $tokens[0][1], '|', $tokens[0][2], '|'; foreach ($tokens as $token) { if (is_array($token) && token_name($token[0]) === 'T_VARIABLE') { echo token_name($token[0]), ':', $token[1], '|'; } if ($token === '+') { echo 'symbol:+|'; } } echo token_name(-1);",
         );
@@ -27416,16 +27348,16 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     fn spl_object_storage_uses_runtime_object_identity() {
         let result = execute_source(
             r#"<?php
-            class Phase6Box {}
-            $a = new Phase6Box();
-            $b = new Phase6Box();
+            class StdlibBox {}
+            $a = new StdlibBox();
+            $b = new StdlibBox();
             $storage = new SplObjectStorage();
             $storage->attach($a, "alpha");
             $storage->attach($b, "beta");
             echo $storage->contains($a) ? "has-a|" : "missing|";
             echo $storage->offsetGet($b), "|", count($storage), "|";
             foreach ($storage as $index => $object) {
-                echo $index, ":", ($object instanceof Phase6Box) ? "box|" : "no|";
+                echo $index, ":", ($object instanceof StdlibBox) ? "box|" : "no|";
             }
             $storage->detach($a);
             echo count($storage);
@@ -27770,7 +27702,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
 
     #[test]
     fn eval_declarations_are_specific_known_gap() {
-        let result = execute_source("<?php eval('function prompt39_eval_fn() { return 1; }');");
+        let result = execute_source("<?php eval('function eval_runtime_fixture() { return 1; }');");
 
         assert!(!result.status.is_success());
         assert!(
@@ -27813,7 +27745,7 @@ echo phase7_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
-    fn unsupported_prompt31_known_gaps_surface_stable_runtime_ids() {
+    fn unsupported_known_gaps_surface_stable_runtime_ids() {
         let diagnostic_ids = [
             "E_PHP_IR_UNSUPPORTED_GENERATOR",
             "E_PHP_IR_UNSUPPORTED_YIELD_FROM",

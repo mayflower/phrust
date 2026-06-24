@@ -2,14 +2,14 @@
 
 ## Status
 
-Accepted for the Phase 7 Cranelift addendum.
+Accepted for the Performance Cranelift addendum.
 
 ## Context
 
 The safe Rust-facing JIT boundary already models VM handles, frame views,
 opaque heap values, callouts, bailouts, and exception markers. Native code
 cannot use those Rust enums and heap-backed `String`/`Vec` records directly.
-Prompt 07.CL.05 therefore needs a separate C-compatible runtime ABI that can be
+Work item.05 therefore needs a separate C-compatible runtime ABI that can be
 layout-tested and versioned.
 
 ## Decision
@@ -50,7 +50,7 @@ The current layout expectations are:
 | `JitCExit` | 48 | 8 |
 
 Any layout or tag change must update `JIT_RUNTIME_ABI_HASH`, tests, and this
-ADR in the same prompt.
+ADR in the same work item.
 
 ## Exit Semantics
 
@@ -62,12 +62,12 @@ ADR in the same prompt.
 - runtime helper call request.
 
 Resume points are encoded as block and instruction ids. `u32::MAX` means no
-resume point is available. Later side-exit prompts may refine reason-code
+resume point is available. Later side-exit work items may refine reason-code
 registries, but the ABI shape is already fixed and test-covered.
 
 ## Consequences
 
-Cranelift lowering and native-entry prompts can target stable C-compatible
+Cranelift lowering and native-entry work items can target stable C-compatible
 records while the VM continues to own all PHP runtime state. The safe Rust
 descriptors remain useful inside the engine, but they are not the native
 runtime ABI.

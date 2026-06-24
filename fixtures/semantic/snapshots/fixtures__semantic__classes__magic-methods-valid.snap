@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - class Prompt26MagicValid
+  - class MagicValidFixture
 hir_summary:
   statements: 26
   expressions: 30

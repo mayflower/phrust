@@ -1,4 +1,4 @@
-//! Internal fiber runtime state for Phase 5.
+//! Internal fiber runtime state for runtime-semantics.
 
 use crate::Value;
 use std::cell::RefCell;

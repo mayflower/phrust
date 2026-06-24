@@ -497,7 +497,7 @@ pub enum TokenKind {
     Eof,
 }
 
-/// Local Phase-1 tokenizer ID base.
+/// Local Lexer tokenizer ID base.
 ///
 /// PHP exposes tokenizer IDs as integers, but their numeric values are not a
 /// compatibility contract for this engine. The tokenizer extension derives

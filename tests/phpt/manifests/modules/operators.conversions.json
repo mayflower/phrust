@@ -1,6 +1,6 @@
 {
   "module": "operators.conversions",
-  "prompt": "09.12",
+  "slice": "09.12",
   "description": "Operators, scalar conversions, comparisons, numeric strings, increment/decrement, concat, assignment operators, and invalid operand warnings.",
   "scope": [
     "arithmetic operators",
@@ -67,9 +67,9 @@
     }
   ],
   "closure_gate": [
-    "nix develop -c just phpt-module-phase9 MODULE=operators.conversions",
-    "nix develop -c just phpt-full-regression-phase9",
-    "nix develop -c just phpt-verify-source-integrity-phase9",
-    "nix develop -c just verify-phase9"
+    "nix develop -c just phpt-module MODULE=operators.conversions",
+    "nix develop -c just phpt-full-regression",
+    "nix develop -c just phpt-verify-source-integrity",
+    "nix develop -c just verify-phpt"
   ]
 }

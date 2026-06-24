@@ -109,7 +109,7 @@ impl DiagnosticLabel {
     }
 }
 
-/// Semantic diagnostic emitted by Phase 3 checks.
+/// Semantic diagnostic emitted by Semantic frontend checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticDiagnostic {
     id: DiagnosticId,

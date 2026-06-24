@@ -1,12 +1,12 @@
 --TEST--
-Phase 9 generated regression: scalar operators and conversions
+Generated regression: scalar operators and conversions
 --DESCRIPTION--
 original php-src path: Zend/tests/concat/concat_002.phpt
 original source hash: 8930bdcfc75261fd13aff475dc89100ab5b2b1dd8bf397cc0ddf529eb138d0a8
 related originals:
 - Zend/tests/in-de-crement/increment_001_64bit.phpt (433a185b405a9a3a499497b74e7ead060de3e02fb1a20e94746e8044329d9ed6)
 generated timestamp: 20260624T000000Z
-generator version: phase9-operators-conversions-v1
+generator version: phpt-operators-conversions-v1
 reason: reduced arithmetic, bitwise, comparison, concat, truthiness, and overflow regression generated from reference output
 --FILE--
 <?php

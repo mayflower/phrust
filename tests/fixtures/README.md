@@ -1,6 +1,6 @@
 # Fixture Conventions
 
-Phase 0 keeps this directory empty except for documentation and `.gitkeep`
+Foundation keeps this directory empty except for documentation and `.gitkeep`
 markers.
 
 Future fixture names should follow:

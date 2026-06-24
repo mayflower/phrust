@@ -1,0 +1,155 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_full_phpt:
+        description: "Run the full PHPT regression gate"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v10
+
+      - name: Format
+        run: nix develop -c just fmt
+
+      - name: Clippy
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: nix develop -c cargo test --workspace
+
+  domain-gates:
+    name: ${{ matrix.gate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gate:
+          - verify-frontend
+          - verify-runtime
+          - verify-stdlib
+          - verify-performance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v10
+
+      - name: Run gate
+        run: nix develop -c just ${{ matrix.gate }}
+
+      - name: Upload gate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.gate }}-reports
+          if-no-files-found: ignore
+          path: |
+            target/**/*.json
+            target/**/*.md
+            target/**/*.txt
+            target/frontend-snapshots/**
+            target/runtime-diff/**
+
+  phpt-smoke:
+    name: phpt smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v10
+
+      - name: Test PHPT tooling
+        run: nix develop -c cargo test -p php_phpt_tools
+
+      - name: Build VM CLI
+        run: nix develop -c cargo build -p php_vm_cli --bin php-vm
+
+      - name: Run committed generated PHPT smoke tests
+        run: |
+          nix develop -c cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
+            --target target/debug/php-vm \
+            --target-mode php-vm \
+            --manifest tests/phpt/manifests/runner-smoke.jsonl \
+            --out target/phpt-work/ci/runner-smoke/results.jsonl \
+            --summary target/phpt-work/ci/runner-smoke/summary.md \
+            --php-src . \
+            --work-dir target/phpt-work/ci/runner-smoke \
+            --timeout-seconds 10
+
+      - name: Upload PHPT smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpt-smoke-reports
+          if-no-files-found: ignore
+          path: target/phpt-work/ci/**
+
+  full-phpt:
+    name: full phpt regression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_full_phpt == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v10
+
+      - name: Bootstrap pinned php-src
+        run: nix develop -c just bootstrap-ref
+
+      - name: Build VM CLI
+        run: nix develop -c cargo build -p php_vm_cli --bin php-vm
+
+      - name: Run full PHPT regression
+        run: nix develop -c just phpt-full-regression
+
+      - name: Upload full PHPT reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-phpt-reports
+          if-no-files-found: ignore
+          path: |
+            target/phpt-work/full-runs/**
+            docs/phpt/reports/full-baseline.md

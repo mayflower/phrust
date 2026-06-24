@@ -1,5 +1,5 @@
 <?php
-// phase4-runtime: corpus=pass
+// runtime-fixture: corpus=pass
 $root = "root";
 $settings = include (__DIR__ . "/lib/settings.php");
 include_once (__DIR__ . "/lib/routes.php");

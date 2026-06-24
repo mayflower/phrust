@@ -1,4 +1,4 @@
-//! Optional VM/runtime counters for Phase 7 performance instrumentation.
+//! Optional VM/runtime counters for performance performance instrumentation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -519,7 +519,7 @@ impl VmCounters {
             .or_default() += 1;
     }
 
-    // Reserved by 07.CL.04; later guard prompts start calling it.
+    // Reserved by 07.CL.04; later guard work start calling it.
     #[allow(dead_code)]
     pub(crate) fn record_jit_guard_failure(&mut self) {
         self.jit_guard_failures += 1;
@@ -546,15 +546,17 @@ impl VmCounters {
         self.jit_tiering_eager_functions += 1;
     }
 
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_tiering_blacklist_rejection(&mut self) {
         self.jit_tiering_blacklist_rejections += 1;
     }
 
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_tiering_budget_rejection(&mut self) {
         self.jit_tiering_budget_rejections += 1;
     }
 
-    // Reserved by 07.CL.04; later helper-call prompts start calling it.
+    // Reserved by 07.CL.04; later helper-call work start calling it.
     #[allow(dead_code)]
     pub(crate) fn record_jit_helper_call(&mut self) {
         self.jit_helper_calls += 1;
@@ -601,14 +603,17 @@ impl VmCounters {
         self.direct_call_fallbacks += 1;
     }
 
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_compile_cache_hit(&mut self) {
         self.jit_compile_cache_hits += 1;
     }
 
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_compile_cache_miss(&mut self) {
         self.jit_compile_cache_misses += 1;
     }
 
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_compile_cache_invalidation(&mut self) {
         self.jit_compile_cache_invalidations += 1;
     }
@@ -2061,7 +2066,7 @@ mod tests {
     };
 
     #[test]
-    fn counters_classify_required_phase7_families() {
+    fn counters_classify_required_perf_families() {
         let mut counters = VmCounters::default();
         counters.record_instruction(&InstructionKind::Binary {
             dst: RegId::new(0),
@@ -2487,10 +2492,10 @@ mod tests {
         counters.record_property_fetch_profile(PropertyFetchProfileObservation {
             callsite: "unit0:read:b0:i7".to_owned(),
             property: "value".to_owned(),
-            receiver_class: "phase7a".to_owned(),
+            receiver_class: "performancea".to_owned(),
             class_id: 1,
             declared_property_name: Some("value".to_owned()),
-            visibility_context: Some("phase7reader".to_owned()),
+            visibility_context: Some("performancereader".to_owned()),
             property_slot_index: Some(0),
             class_layout_version: 1,
             declared_visible_property: true,
@@ -2502,17 +2507,17 @@ mod tests {
         assert!(mono_json.contains("\"fast_path_eligible\": true"));
         assert!(mono_json.contains("\"class_ids\": [1]"));
         assert!(mono_json.contains("\"declared_property_names\": [\"value\"]"));
-        assert!(mono_json.contains("\"visibility_contexts\": [\"phase7reader\"]"));
+        assert!(mono_json.contains("\"visibility_contexts\": [\"performancereader\"]"));
         assert!(mono_json.contains("\"property_slot_indexes\": [0]"));
         assert!(mono_json.contains("\"class_layout_versions\": [1]"));
 
         counters.record_property_fetch_profile(PropertyFetchProfileObservation {
             callsite: "unit0:read:b0:i7".to_owned(),
             property: "value".to_owned(),
-            receiver_class: "phase7b".to_owned(),
+            receiver_class: "performanceb".to_owned(),
             class_id: 2,
             declared_property_name: Some("value".to_owned()),
-            visibility_context: Some("phase7reader".to_owned()),
+            visibility_context: Some("performancereader".to_owned()),
             property_slot_index: Some(1),
             class_layout_version: 2,
             has_magic_get: true,
@@ -2535,7 +2540,7 @@ mod tests {
         assert!(poly_json.contains("\"unstable_layout_version\""));
         assert!(poly_json.contains("\"uninitialized_typed_property\""));
         assert!(poly_json.contains("\"class_ids\": [1, 2]"));
-        assert!(poly_json.contains("\"receiver_classes\": [\"phase7a\", \"phase7b\"]"));
+        assert!(poly_json.contains("\"receiver_classes\": [\"performancea\", \"performanceb\"]"));
         assert!(poly_json.contains("\"property_slot_indexes\": [0, 1]"));
         assert!(poly_json.contains("\"class_layout_versions\": [1, 2]"));
         assert!(poly_json.contains("\"has_magic_get\": true"));
@@ -2550,12 +2555,12 @@ mod tests {
         counters.record_method_call_profile(MethodCallProfileObservation {
             callsite: "unit0:call:b0:i9".to_owned(),
             method: "value".to_owned(),
-            receiver_class: "phase7methoda".to_owned(),
+            receiver_class: "performancemethoda".to_owned(),
             class_id: 7,
-            declaring_class: Some("phase7methoda".to_owned()),
+            declaring_class: Some("performancemethoda".to_owned()),
             method_id: Some(11),
             method_slot_index: Some(0),
-            visibility_context: Some("phase7caller".to_owned()),
+            visibility_context: Some("performancecaller".to_owned()),
             override_layout_version: 3,
             method_is_final: true,
             simple_positional_arguments: true,
@@ -2568,11 +2573,11 @@ mod tests {
         assert!(mono_json.contains("\"state\": \"monomorphic\""));
         assert!(mono_json.contains("\"fast_path_eligible\": true"));
         assert!(mono_json.contains("\"class_ids\": [7]"));
-        assert!(mono_json.contains("\"receiver_classes\": [\"phase7methoda\"]"));
-        assert!(mono_json.contains("\"declaring_classes\": [\"phase7methoda\"]"));
+        assert!(mono_json.contains("\"receiver_classes\": [\"performancemethoda\"]"));
+        assert!(mono_json.contains("\"declaring_classes\": [\"performancemethoda\"]"));
         assert!(mono_json.contains("\"method_ids\": [11]"));
         assert!(mono_json.contains("\"method_slot_indexes\": [0]"));
-        assert!(mono_json.contains("\"visibility_contexts\": [\"phase7caller\"]"));
+        assert!(mono_json.contains("\"visibility_contexts\": [\"performancecaller\"]"));
         assert!(mono_json.contains("\"override_layout_versions\": [3]"));
         assert!(mono_json.contains("\"saw_final_method\": true"));
         assert!(mono_json.contains("\"saw_callee_jit_eligible\": true"));
@@ -2580,12 +2585,12 @@ mod tests {
         counters.record_method_call_profile(MethodCallProfileObservation {
             callsite: "unit0:call:b0:i9".to_owned(),
             method: "value".to_owned(),
-            receiver_class: "phase7methodb".to_owned(),
+            receiver_class: "performancemethodb".to_owned(),
             class_id: 8,
-            declaring_class: Some("phase7methodb".to_owned()),
+            declaring_class: Some("performancemethodb".to_owned()),
             method_id: Some(12),
             method_slot_index: Some(1),
-            visibility_context: Some("phase7caller".to_owned()),
+            visibility_context: Some("performancecaller".to_owned()),
             override_layout_version: 4,
             method_is_private: true,
             method_is_static: true,

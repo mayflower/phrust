@@ -8,11 +8,11 @@ Accepted
 
 The project needs a fixed PHP behavior target before any compatibility work can
 start. PHP patch releases may change syntax details, diagnostics, tests, or
-runtime behavior. Phase 0 must therefore freeze a concrete reference version.
+runtime behavior. Foundation must therefore freeze a concrete reference version.
 
 ## Decision
 
-Phase 0 targets PHP `8.5.7` from `https://github.com/php/php-src.git`, using
+Foundation targets PHP `8.5.7` from `https://github.com/php/php-src.git`, using
 Git tag `php-8.5.7`.
 
 The resolved commit will be written to `references/php-src.lock.toml` once the

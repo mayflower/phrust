@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="tf\n"
+// runtime-fixture: kind=valid expected_stdout="tf\n"
 if (true) {
     echo "t";
 }

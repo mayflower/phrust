@@ -26,7 +26,7 @@ pub struct PhptDiagnostic {
     pub range: SourceRange,
 }
 
-pub const PHASE9_SUPPORTED_SECTIONS: &[&str] = &[
+pub const PHPT_SUPPORTED_SECTIONS: &[&str] = &[
     "TEST",
     "DESCRIPTION",
     "CREDITS",
@@ -203,7 +203,7 @@ fn section_marker(line: &str) -> Option<String> {
 }
 
 fn is_supported_section(name: &str) -> bool {
-    PHASE9_SUPPORTED_SECTIONS.contains(&name)
+    PHPT_SUPPORTED_SECTIONS.contains(&name)
 }
 
 #[cfg(test)]
@@ -230,9 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_phase9_support_target_sections() {
+    fn parses_supported_target_sections() {
         let mut source = String::new();
-        for section in PHASE9_SUPPORTED_SECTIONS {
+        for section in PHPT_SUPPORTED_SECTIONS {
             source.push_str("--");
             source.push_str(section);
             source.push_str("--\nbody\n");
@@ -240,7 +240,7 @@ mod tests {
 
         let document = parse_phpt(&source);
 
-        assert_eq!(document.sections.len(), PHASE9_SUPPORTED_SECTIONS.len());
+        assert_eq!(document.sections.len(), PHPT_SUPPORTED_SECTIONS.len());
         assert!(document.sections.iter().all(|section| section.supported));
         assert!(
             document.diagnostics.is_empty(),

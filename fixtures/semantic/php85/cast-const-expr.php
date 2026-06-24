@@ -1,2 +1,2 @@
 <?php
-const PROMPT32_CAST = (string) 42;
+const SEMANTIC_CONST_EXPR_CAST = (string) 42;

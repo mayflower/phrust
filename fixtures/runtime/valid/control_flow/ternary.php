@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="yes|fallback|kept\n"
+// runtime-fixture: kind=valid expected_stdout="yes|fallback|kept\n"
 echo true ? "yes" : "no";
 echo "|";
 echo false ?: "fallback";

@@ -1,6 +1,6 @@
 <?php
 
-class Prompt26MagicInvalid
+class MagicInvalidFixture
 {
     public static function __toString(): string
     {

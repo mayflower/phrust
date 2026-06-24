@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - function prompt27_strict_types_valid
+  - function strict_types_valid_fixture
 hir_summary:
   statements: 3
   expressions: 3

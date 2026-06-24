@@ -1,4 +1,4 @@
-//! Selected PHPT smoke runner for Phase 4 and Phase 5.
+//! Selected PHPT smoke runner for runtime and runtime-semantics.
 
 use php_testkit::phpt::{PhptDisposition, PhptExpectation, PhptFile, expectf_matches};
 use serde::Serialize;
@@ -147,7 +147,7 @@ fn run() -> Result<PhptSmokeReport, String> {
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut fixtures_root = PathBuf::from("fixtures/phpt_smoke");
-    let mut out_dir = PathBuf::from("target/phase4/phpt-smoke");
+    let mut out_dir = PathBuf::from("target/runtime/phpt-smoke");
     let mut rust_vm = env::var_os("PHP_VM_CLI").map(PathBuf::from);
     let mut extra_phpt = Vec::new();
     let mut allowlist = None;
@@ -192,7 +192,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: run-phpt-smoke [--fixtures fixtures/phpt_smoke] [--out target/phase4/phpt-smoke] [--rust-vm target/debug/php-vm] [--extra-phpt path] [--allowlist fixtures/phase5/phpt_allowlist.toml]"
+                    "Usage: run-phpt-smoke [--fixtures fixtures/phpt_smoke] [--out target/runtime/phpt-smoke] [--rust-vm target/debug/php-vm] [--extra-phpt path] [--allowlist fixtures/runtime_semantics/phpt_allowlist.toml]"
                         .to_string(),
                 );
             }

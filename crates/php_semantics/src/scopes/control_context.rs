@@ -1,4 +1,4 @@
-//! Compile-time control-context tracking for Phase 3.
+//! Compile-time control-context tracking for Semantic frontend.
 
 use crate::diagnostics::{
     DiagnosticId, DiagnosticPhase, DiagnosticReporter, DiagnosticSeverity, SemanticDiagnostic,
@@ -103,7 +103,7 @@ pub enum ControlContextKind {
     GlobalFile,
 }
 
-/// Runs Phase 3 control-context validation over a source file syntax tree.
+/// Runs Semantic frontend control-context validation over a source file syntax tree.
 #[must_use]
 pub fn check_source_file(source_file: &SyntaxNode) -> Vec<SemanticDiagnostic> {
     let mut checker = ControlContextChecker::new();

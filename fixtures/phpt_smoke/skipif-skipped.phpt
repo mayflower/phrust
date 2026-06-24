@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT SKIPIF classification
+runtime PHPT SKIPIF classification
 --SKIPIF--
 <?php die("skip explicit smoke skip\n"); ?>
 --FILE--

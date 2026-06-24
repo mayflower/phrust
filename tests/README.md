@@ -1,8 +1,8 @@
 # Tests
 
-Phase 0 defines the future test layout but does not add real PHP fixtures.
+Foundation defines the future test layout but does not add real PHP fixtures.
 
-Later phases may add:
+Later layers may add:
 
 - Lexer differential fixtures compared against `token_get_all()`.
 - Parser accept/reject fixtures compared against `php -l`.

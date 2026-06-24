@@ -6,7 +6,7 @@ Accepted.
 
 ## Context
 
-Phase 7 introduces request-local quickening and inline-cache state for the
+Performance introduces request-local quickening and inline-cache state for the
 interpreter. ADR-0074 defines the shared quickening model, but inline caches
 need a narrower invalidation contract because their entries memoize PHP lookup
 results whose correctness depends on mutable request state.
@@ -18,7 +18,7 @@ configuration changes. A stale cache entry must never hide those effects.
 ## Decision
 
 Inline caches are a side-table layer owned by the VM. They are keyed by the
-compiled unit, function id, block id, instruction id, and cache slot id. Phase 7
+compiled unit, function id, block id, instruction id, and cache slot id. Performance
 does not encode cache entries in cached bytecode, persist them across requests,
 or make them visible to optimizer passes.
 
@@ -39,7 +39,7 @@ shutdown behavior.
 
 ## Scope
 
-Phase 7 inline caches may cover these lookup families:
+Performance inline caches may cover these lookup families:
 
 | Cache kind | Resolved target | Required guards |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ Phase 7 inline caches may cover these lookup families:
 | Autoload/class lookup IC | Class/interface/trait/enum id or stable negative lookup. | Normalized class-like name, class table epoch, autoload stack epoch, last autoload failure epoch, include/eval declaration epoch. |
 
 The first implementation should use the same side-table lifecycle as
-quickening. Later phases may add more compact slot layouts, but they must keep
+quickening. Later layers may add more compact slot layouts, but they must keep
 the invalidation semantics in this ADR.
 
 ## Non-Goals
@@ -63,7 +63,7 @@ state, Zend ABI emulation, or standard-library behavior changes.
 It also does not allow caches to skip PHP-visible behavior. Autoload invocation,
 include warnings, visibility errors, magic methods, property hooks, reference
 binding failures, and by-reference call errors remain baseline behavior unless
-a later prompt implements a guarded fast path with matching tests.
+a later work item implements a guarded fast path with matching tests.
 
 ## Invalidation Events
 
@@ -111,7 +111,7 @@ Inline caches start cold. After repeated identical successful lookups, the VM
 may install a monomorphic entry for one key/shape/target tuple.
 
 If a small fixed number of stable shapes repeatedly occurs at the same
-instruction, the entry may become polymorphic. The Phase 7 limit is four target
+instruction, the entry may become polymorphic. The Performance limit is four target
 arms unless a later ADR changes it. Polymorphic arms are checked in stable order
 and each arm carries its own dependency epochs.
 
@@ -120,13 +120,13 @@ is dominated by stale epochs, the entry becomes megamorphic or disabled.
 Megamorphic entries execute the baseline path and may keep only aggregate miss
 stats. They must not keep growing unbounded target vectors.
 
-The strategy favors under-caching over incorrect caching. It is valid for Phase
-7 to record cache slots and stats before installing any real fast path.
+The strategy favors under-caching over incorrect caching. It is valid for
+Performance to record cache slots and stats before installing any real fast path.
 
 ## Consequences
 
 Inline caches can remove repeated lookup work in hot interpreter paths while
 keeping the generic VM operation as the correctness boundary. The cost is
 explicit dependency tracking and broader invalidation tests. Documentation,
-stats, and side-table slots land before fast paths so each later cache prompt
+stats, and side-table slots land before fast paths so each later cache work item
 has a precise fallback contract.

@@ -1,5 +1,5 @@
 <?php
-class Prompt27Secret {
+class PrivateMethodFixture {
     private function hidden() {
         return 1;
     }
@@ -9,5 +9,5 @@ class Prompt27Secret {
     }
 }
 
-$secret = new Prompt27Secret();
+$secret = new PrivateMethodFixture();
 echo $secret->call_hidden(), "\n";

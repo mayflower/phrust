@@ -1,6 +1,6 @@
 <?php
 
-function hello_phase3(string $name): string
+function hello_semantic(string $name): string
 {
     return "Hello, " . $name;
 }

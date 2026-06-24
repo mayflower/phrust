@@ -318,14 +318,14 @@ ast_node!(StringNode, String);
 ast_node!(Encapsed, Encapsed);
 ast_node!(Heredoc, Heredoc);
 
-/// Compatibility name used by the semantic frontend prompts.
+/// Compatibility name used by the semantic frontend.
 pub type ParameterList<'tree> = ParamList<'tree>;
-/// Compatibility name used by the semantic frontend prompts.
+/// Compatibility name used by the semantic frontend.
 pub type Parameter<'tree> = Param<'tree>;
 /// Compatibility name for parser attribute groups.
 pub type AttributeList<'tree> = AttributeGroup<'tree>;
 /// Compatibility name for use items. The current CST stores item structure
-/// inside `USE_DECL`; Prompt 04 expands the declarative API around that shape.
+/// inside `USE_DECL`; the declarative API expands around that shape.
 pub type UseItem<'tree> = UseDecl<'tree>;
 /// Compatibility name for anonymous class expressions.
 pub type AnonymousClassExpr<'tree> = AnonymousClassDecl<'tree>;
@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt03_function_views_keep_source_spans() {
+    fn function_views_keep_source_spans() {
         let parse = parse_source_file("<?php function f(int $x): string { return \"x\"; }");
         assert!(!parse.has_errors());
         let root = source_file(parse.root()).expect("source file");
@@ -2086,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt04_declaration_and_member_views_cover_fixtures() {
+    fn declaration_and_member_views_cover_fixtures() {
         let uses = parse_source_file(include_str!(
             "../../../fixtures/parser/valid/use_declarations.php"
         ));

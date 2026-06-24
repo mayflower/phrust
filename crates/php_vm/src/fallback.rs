@@ -1,4 +1,4 @@
-//! Shared adaptive guard/fallback protocol for Phase 7 fast paths.
+//! Shared adaptive guard/fallback protocol for performance fast paths.
 
 /// Default number of guarded fallback calls before an installed specialization
 /// is dequickened into a baseline-only state.

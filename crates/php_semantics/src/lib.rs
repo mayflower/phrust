@@ -1,8 +1,8 @@
 //! PHP semantic frontend surface.
 //!
-//! Prompt 01 establishes the public API and verification skeleton. Detailed
+//! This crate exposes the public semantic analysis API and verification skeleton. Detailed
 //! declaration collection, HIR lowering, name resolution, and diagnostics are
-//! added in later Phase 3 prompts.
+//! added in later frontend checks.
 
 pub mod checks;
 pub mod db;
@@ -68,7 +68,7 @@ impl FrontendResult {
         &self.database
     }
 
-    /// Renders stable minimal JSON for Prompt 01 CLI and smoke tests.
+    /// Renders stable minimal JSON for frontend and runtime CLI and smoke tests.
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut out = String::new();
@@ -252,7 +252,7 @@ impl FrontendResult {
     }
 }
 
-/// Minimal module summary. Later prompts replace this with full HIR data.
+/// Minimal module summary. Later passes replace this with full HIR data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticModule {
     module_id: hir::ModuleId,
@@ -280,7 +280,7 @@ impl SemanticModule {
     }
 }
 
-/// Analyzes a PHP source string using the Phase 3 frontend pipeline.
+/// Analyzes a PHP source string using the Semantic frontend frontend pipeline.
 #[must_use]
 pub fn analyze_source(source: &str) -> FrontendResult {
     query::frontend::analyze_file(source, &query::frontend::FrontendOptions::default())
@@ -2155,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn json_contains_stable_prompt01_fields() {
+    fn json_contains_stable_initial_fields() {
         let result = analyze_source("<?php echo 1;\n");
         let json = result.to_json();
 

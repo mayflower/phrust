@@ -1,6 +1,6 @@
 <?php
 
-class Prompt26Base
+class SelfParentBase
 {
     public static function make(): static
     {
@@ -12,7 +12,7 @@ class Prompt26Base
     }
 }
 
-class Prompt26Child extends Prompt26Base
+class SelfParentChild extends SelfParentBase
 {
     public function ping(): void
     {

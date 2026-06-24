@@ -1,4 +1,4 @@
-//! Phase 6 PCRE2-backed helpers for ext/pcre MVP builtins.
+//! standard-library PCRE2-backed helpers for ext/pcre MVP builtins.
 
 use crate::{ArrayKey, PhpArray, PhpString, Value};
 use pcre2::bytes::{Captures, Regex, RegexBuilder};

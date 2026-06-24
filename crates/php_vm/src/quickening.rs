@@ -1,4 +1,4 @@
-//! Request-local quickening side table for Phase 7 adaptive execution.
+//! Request-local quickening side table for performance adaptive execution.
 
 use std::collections::BTreeMap;
 

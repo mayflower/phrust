@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = ROOT / "tests" / "fixtures" / "lexer"
 TOKENIZE_SCRIPT = ROOT / "scripts" / "tokenize-reference.php"
 DUMP_SCRIPT = ROOT / "scripts" / "dump-reference-tokens.php"
-OUTPUT = ROOT / "docs" / "phase-1" / "token-coverage.generated.md"
+OUTPUT = ROOT / "docs" / "lexer" / "token-coverage.generated.md"
 PINNED_PHP = ROOT / "third_party" / "php-src" / "sapi" / "cli" / "php"
 
 PARSER_CONTEXTUAL = {
@@ -131,7 +131,7 @@ def write_report(
             "",
             "- `covered` means the token appears in at least one reference-tokenized fixture.",
             "- `not-yet-covered` is explicit remaining fixture work, not a claim that the Rust lexer implements the token.",
-            "- `parser-contextual` tokens may depend on `TOKEN_PARSE` or parser-adjacent PHP context and are not hard-gated by Phase 1.",
+            "- `parser-contextual` tokens may depend on `TOKEN_PARSE` or parser-adjacent PHP context and are not hard-gated by Lexer.",
             "- `extension/config-dependent` tokens require runtime configuration or source forms that are tracked separately.",
         ]
     )

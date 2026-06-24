@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="12\n"
+// runtime-fixture: kind=valid expected_stdout="12\n"
 $i = 0;
 while ($i < 5) {
     $i++;

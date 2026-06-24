@@ -1,2 +1,2 @@
 <?php
-const PROMPT32_VOID_CAST = (void) 1;
+const SEMANTIC_CONST_EXPR_VOID_CAST = (void) 1;

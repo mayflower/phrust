@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn exception_diagnostics_preserve_severity_and_source_mapping() {
         let span = RuntimeSourceSpan {
-            file: Some("fixtures/phase5/errors/type-error-uncaught.php".to_owned()),
+            file: Some("fixtures/runtime_semantics/errors/type-error-uncaught.php".to_owned()),
             start: 12,
             end: 21,
         };

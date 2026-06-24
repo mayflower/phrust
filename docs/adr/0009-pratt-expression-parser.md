@@ -18,7 +18,7 @@ postfix, infix, and special forms are modeled with explicit binding powers.
 
 The initial implementation covers primary expressions, prefix expressions, and
 the common binary operator table documented in
-`docs/phase-2/expression-precedence.md`. `**` is right-associative. Simple
+`docs/parser/expression-precedence.md`. `**` is right-associative. Simple
 assignment is parsed as a low-precedence right-associative expression so valid
 statement fixtures remain accepted; compound assignment and ternary are the next
 extension points.

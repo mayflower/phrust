@@ -1,4 +1,4 @@
-//! Bounded PHP serialization MVP for Phase 6.
+//! Bounded PHP serialization MVP for standard-library.
 
 use crate::{ArrayKey, ClassEntry, ClassFlags, ObjectRef, PhpArray, PhpString, Value};
 
@@ -47,7 +47,7 @@ impl SerializationError {
     }
 }
 
-/// Serializes one runtime value in PHP's wire format for the Phase 6 MVP.
+/// Serializes one runtime value in PHP's wire format for the standard-library MVP.
 pub fn serialize(value: &Value) -> Result<PhpString, SerializationError> {
     let mut writer = Serializer::default();
     writer.write_value(value, 0)?;
@@ -209,7 +209,7 @@ impl Parser<'_> {
             b'a' => self.parse_array(depth),
             b'O' => self.parse_object(depth),
             b'R' | b'r' => Err(SerializationError::new(
-                "serialized reference records are a Phase 6 known gap",
+                "serialized reference records are a standard-library known gap",
             )),
             _ => Err(SerializationError::new("unsupported serialized type tag")),
         }

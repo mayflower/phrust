@@ -1,3 +1,3 @@
 <?php
-#[Prompt33Attribute(]
-function prompt33_broken_attribute(): void {}
+#[RecoveryAttribute(]
+function recovery_broken_attribute(): void {}

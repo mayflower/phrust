@@ -1,5 +1,5 @@
 <?php
-class Prompt27Box {
+class ThisPropertyMethodFixture {
     public $value;
 
     function __construct($value) {
@@ -15,5 +15,5 @@ class Prompt27Box {
     }
 }
 
-$box = new Prompt27Box(7);
+$box = new ThisPropertyMethodFixture(7);
 echo $box->get(), "|", $box->plus(5), "\n";

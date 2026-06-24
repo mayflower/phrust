@@ -518,7 +518,7 @@ mod tests {
 
     fn sample_info() -> FunctionArgInfo {
         FunctionArgInfo::new(
-            "phase6_sample",
+            "stdlib_sample",
             vec![
                 ParameterInfo::required("value", TypeSpec::one(ArgType::String)),
                 ParameterInfo::optional("limit", TypeSpec::one(ArgType::Int), DefaultValue::Int(3)),
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(error.diagnostic().id(), "E_PHP_STD_MISSING_ARGUMENT");
         assert_eq!(
             error.diagnostic().message(),
-            "phase6_sample() expects at least 1 argument, 0 given"
+            "stdlib_sample() expects at least 1 argument, 0 given"
         );
         assert_eq!(error.diagnostic().source_span().start, 3);
     }
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(error.diagnostic().id(), "E_PHP_STD_TOO_MANY_ARGUMENTS");
         assert_eq!(
             error.diagnostic().message(),
-            "phase6_sample() expects at most 2 arguments, 3 given"
+            "stdlib_sample() expects at most 2 arguments, 3 given"
         );
     }
 
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(error.diagnostic().id(), "E_PHP_STD_TYPE_ERROR");
         assert_eq!(
             error.diagnostic().message(),
-            "phase6_sample(): Argument $value must be of type string, array given"
+            "stdlib_sample(): Argument $value must be of type string, array given"
         );
     }
 
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn union_nullable_variadic_and_by_ref_metadata_are_modelable() {
         let info = FunctionArgInfo::new(
-            "phase6_meta",
+            "stdlib_meta",
             vec![
                 ParameterInfo::required(
                     "value",
@@ -613,7 +613,7 @@ mod tests {
     fn value_error_class_is_available_for_builtin_range_checks() {
         let error = ArginfoError::value_error(
             "E_PHP_STD_VALUE_ERROR",
-            "phase6_sample(): Argument $limit must be greater than 0",
+            "stdlib_sample(): Argument $limit must be greater than 0",
             span(),
         );
 

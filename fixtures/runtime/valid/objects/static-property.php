@@ -1,7 +1,7 @@
 <?php
-class Prompt27StaticProperty {
+class StaticPropertyFixture {
     static $value;
 }
 
-Prompt27StaticProperty::$value = 1;
-echo Prompt27StaticProperty::$value, "\n";
+StaticPropertyFixture::$value = 1;
+echo StaticPropertyFixture::$value, "\n";

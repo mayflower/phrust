@@ -4,7 +4,7 @@ semantic_ok: false
 diagnostics:
   []
 symbols:
-  - function prompt33_missing_name
+  - function recovery_missing_name
 hir_summary:
   statements: 1
   expressions: 1

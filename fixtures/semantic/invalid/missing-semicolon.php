@@ -1,6 +1,6 @@
 <?php
 
-function phase3_invalid(): int
+function semantic_invalid(): int
 {
     return 1
 }

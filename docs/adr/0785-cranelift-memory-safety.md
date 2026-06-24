@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 7.
+Accepted for Performance.
 
 ## Context
 
@@ -10,7 +10,7 @@ The Cranelift addendum now contains constrained native execution paths for a
 small set of hot shapes. Those paths produce raw executable function pointers
 through Cranelift's `JITModule` and enter them through a fixed `extern "C"` ABI.
 
-Phase 7 does not own a production executable-memory allocator, code-cache
+Performance does not own a production executable-memory allocator, code-cache
 reclamation scheme, Zend ABI, or native stack/frame integration. The safety
 boundary must therefore be explicit and conservative.
 
@@ -36,7 +36,7 @@ boundary must therefore be explicit and conservative.
 
 ## Consequences
 
-The accepted Phase 7 tradeoff is memory growth for native entries compiled
+The accepted Performance tradeoff is memory growth for native entries compiled
 during a process. That is safer than introducing premature reclamation for raw
 function pointers. A future production JIT must replace the leak with an
 explicit code-memory owner, handle invalidation, and platform-specific
@@ -51,9 +51,9 @@ original handle value is dropped:
 nix develop -c cargo test -p php_jit --features jit-cranelift cranelift_native_handle_copy_survives_original_handle_drop
 ```
 
-The full Prompt 07.CL.33 gates are:
+The full Work item.33 gates are:
 
 ```bash
 nix develop -c cargo test --workspace --features jit-cranelift
-nix develop -c just verify-phase7-cranelift
+nix develop -c just verify-cranelift
 ```

@@ -1,6 +1,6 @@
 # Recovery Fixtures
 
-These fixtures intentionally contain malformed PHP. They verify that Phase 3
+These fixtures intentionally contain malformed PHP. They verify that Semantic frontend
 can consume recovery CSTs from the parser without panics, infinite loops, or
 unbounded diagnostic cascades.
 

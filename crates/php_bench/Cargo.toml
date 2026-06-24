@@ -16,5 +16,5 @@ php_syntax = { path = "../php_syntax" }
 php_vm = { path = "../php_vm" }
 
 [[bench]]
-name = "phase7_hotpaths"
+name = "perf_hotpaths"
 harness = false

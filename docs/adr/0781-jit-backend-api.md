@@ -2,14 +2,14 @@
 
 ## Status
 
-Accepted for the Phase 7 Cranelift addendum.
+Accepted for the Performance Cranelift addendum.
 
 ## Context
 
-The Phase 7 JIT experiment originally exposed a small `JitEngine` and optional
+The Performance JIT experiment originally exposed a small `JitEngine` and optional
 Cranelift lowering helper from `php_jit`. That was enough for the default-off
 experiment, but the Cranelift big-wins addendum needs the VM and future tooling
-to speak to a backend-neutral contract. Otherwise each new prompt would leak
+to speak to a backend-neutral contract. Otherwise each new work item would leak
 Cranelift-specific assumptions into tiering, counters, side exits, and runtime
 helpers.
 
@@ -45,6 +45,6 @@ responsible for deciding whether a region can compile.
 ## Consequences
 
 The VM can depend on `php_jit` request/result types without importing
-Cranelift modules. Later prompts can add Cranelift execution, side exits, helper
+Cranelift modules. Later work items can add Cranelift execution, side exits, helper
 symbols, compile caches, and reports behind the trait without changing the
 interpreter source-of-truth rule.

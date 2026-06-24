@@ -1,8 +1,8 @@
 <?php
-class Prompt27StaticUtil {
+class StaticUtilFixture {
     static function name() {
         return "static-ok";
     }
 }
 
-echo Prompt27StaticUtil::name(), "\n";
+echo StaticUtilFixture::name(), "\n";

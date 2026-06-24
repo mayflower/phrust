@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Normalized PHP semantic-frontend reference result.
 ///
-/// Phase 3 uses `php -l` as the compile frontend acceptance oracle. The script
+/// Semantic frontend uses `php -l` as the compile frontend acceptance oracle. The script
 /// intentionally does not execute PHP source files.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PhpFrontendResult {

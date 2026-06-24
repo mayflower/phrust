@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="zeroone\n"
+// runtime-fixture: kind=valid expected_stdout="zeroone\n"
 $x = 0;
 switch ($x) {
     case 0:

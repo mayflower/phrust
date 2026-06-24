@@ -1,7 +1,7 @@
-//! Default-off Phase 7 JIT API.
+//! Default-off performance JIT API.
 //!
 //! Default builds use the stub backend and never allocate executable memory.
-//! The `jit-cranelift` feature enables a constrained Phase 7 experiment with
+//! The `jit-cranelift` feature enables a constrained performance experiment with
 //! explicit native-execution opt-in, ABI hash checks, verifier-backed Cranelift
 //! lowering, and documented unsafe call boundaries.
 
@@ -73,21 +73,12 @@ impl JitBackend {
 }
 
 /// Options for constructing a JIT engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct JitOptions {
     /// Runtime switch. Defaults off even when a backend feature is compiled.
     pub enabled: bool,
     /// Whether native execution is allowed for this process.
     pub allow_native_execution: bool,
-}
-
-impl Default for JitOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allow_native_execution: false,
-        }
-    }
 }
 
 /// Runtime-owned helper addresses the backend may call from generated code.
@@ -798,7 +789,7 @@ pub enum JitInvokeError {
     AbiHashMismatch { expected: u64, actual: u64 },
     /// Call arguments do not match the compiled signature.
     ArityMismatch { expected: u8, actual: u8 },
-    /// This prompt only exposes a tiny fixed-arity trampoline.
+    /// This module currently exposes a tiny fixed-arity trampoline.
     UnsupportedArity(u8),
     /// Native code returned a non-zero helper status.
     NativeStatus(i32),
@@ -868,7 +859,7 @@ impl JitCompileStatus {
 pub struct JitCompileResult {
     /// Compile status.
     pub status: JitCompileStatus,
-    /// Future compiled function handle. Always `None` in Prompt 07.49.
+    /// Future compiled function handle. Always `None` until native compilation is enabled.
     pub handle: Option<JitFunctionHandle>,
     /// Diagnostics suitable for logs and smoke reports.
     pub diagnostics: Vec<String>,
@@ -906,9 +897,9 @@ pub struct JitStats {
     pub native_execution_disabled: u64,
     /// Regions rejected by the skeleton before code generation.
     pub rejected: u64,
-    /// Native compile successes. Zero until native compile prompts enable it.
+    /// Native compile successes. Zero until native compilation work enable it.
     pub native_compiles: u64,
-    /// Executable memory allocations. Zero until native compile prompts enable it.
+    /// Executable memory allocations. Zero until native compilation work enable it.
     pub executable_memory_allocations: u64,
     /// Native code bytes emitted by successful compiles.
     pub native_code_bytes: u64,
@@ -1349,7 +1340,7 @@ mod tests {
 
     fn eligible_int_add_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/jit/eligible-int-add.php");
+        let file = builder.add_file("tests/fixtures/performance/jit/eligible-int-add.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("eligible_int_add", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -1378,8 +1369,8 @@ mod tests {
 
     fn typed_int_leaf_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file =
-            builder.add_file("tests/fixtures/phase7/cranelift/eligibility/eligible-int-leaf.php");
+        let file = builder
+            .add_file("tests/fixtures/performance/cranelift/eligibility/eligible-int-leaf.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("typed_int_leaf", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -1451,8 +1442,9 @@ mod tests {
 
     fn untyped_param_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder
-            .add_file("tests/fixtures/phase7/cranelift/eligibility/rejected-untyped-param.php");
+        let file = builder.add_file(
+            "tests/fixtures/performance/cranelift/eligibility/rejected-untyped-param.php",
+        );
         let span = IrSpan::new(file, 0, 0);
         let function =
             builder.start_function("rejected_untyped_param", FunctionFlags::default(), span);
@@ -1474,7 +1466,7 @@ mod tests {
 
     fn rejected_dynamic_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/jit/rejected-dynamic.php");
+        let file = builder.add_file("tests/fixtures/performance/jit/rejected-dynamic.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("rejected_dynamic", FunctionFlags::default(), span);
         builder.set_entry(function);

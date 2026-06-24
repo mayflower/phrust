@@ -1,4 +1,4 @@
-//! Lexical scope model for Phase 3 compile-time analysis.
+//! Lexical scope model for Semantic frontend compile-time analysis.
 
 pub mod control_context;
 
@@ -76,7 +76,7 @@ impl ScopeArena {
     }
 }
 
-/// Lexical scope families tracked by Phase 3.
+/// Lexical scope families tracked by Semantic frontend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeKind {
     /// Whole source file.
@@ -314,7 +314,7 @@ impl FunctionLikeKind {
     }
 }
 
-/// Capture mode marker. Phase 3 records shape only, not runtime capture values.
+/// Capture mode marker. Semantic frontend records shape only, not runtime capture values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
     /// Explicit closure `use ($x)`.

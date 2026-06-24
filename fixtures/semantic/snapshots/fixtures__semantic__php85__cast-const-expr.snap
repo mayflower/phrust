@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - constant PROMPT32_CAST
+  - constant SEMANTIC_CONST_EXPR_CAST
 hir_summary:
   statements: 0
   expressions: 2

@@ -1,9 +1,9 @@
-//! Opaque ordered PHP array storage for Phase 5.
+//! Opaque ordered PHP array storage for runtime-semantics.
 
 use crate::{PhpString, Value};
 use std::rc::{Rc, Weak};
 
-/// PHP array key after Phase 5 key normalization.
+/// PHP array key after runtime-semantics key normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArrayKey {
     /// Integer array key.
@@ -13,7 +13,7 @@ pub enum ArrayKey {
 }
 
 impl ArrayKey {
-    /// Converts a runtime value into a Phase 5 PHP array key.
+    /// Converts a runtime value into a runtime-semantics PHP array key.
     ///
     /// Supported conversions:
     /// - `int` remains an integer key;

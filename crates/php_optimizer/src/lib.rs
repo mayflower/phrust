@@ -1,6 +1,6 @@
-//! Phase 7 conservative optimizer framework.
+//! performance conservative optimizer framework.
 //!
-//! Prompt 07.17 introduced the pass pipeline. Prompt 07.19 adds the first
+//! The optimizer pass pipeline supports the first
 //! conservative optimization pass.
 
 use php_ir::instruction::TerminatorKind;
@@ -12,13 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
-/// Optimization level accepted by the Phase 7 CLI.
+/// Optimization level accepted by the performance CLI.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum OptimizationLevel {
     /// Exact legacy execution path: no optimizer pipeline is run.
     #[default]
     O0,
-    /// Conservative Phase 7 optimizer pipeline.
+    /// Conservative performance optimizer pipeline.
     O1,
     /// Reserved higher conservative pipeline.
     O2,
@@ -263,34 +263,28 @@ impl PassPipeline {
         Self { passes }
     }
 
-    /// Prompt 07.17 conservative no-op pipeline.
+    /// conservative no-op optimizer pipeline.
     #[must_use]
     pub fn noop() -> Self {
         Self::new(vec![
+            Box::new(NoopPass::new("perf_pre_verify_noop", PassPhase::PreVerify)),
             Box::new(NoopPass::new(
-                "phase7_pre_verify_noop",
-                PassPhase::PreVerify,
-            )),
-            Box::new(NoopPass::new(
-                "phase7_post_verify_noop",
+                "perf_post_verify_noop",
                 PassPhase::PostVerify,
             )),
         ])
     }
 
-    /// Current Phase 7 optimizer pipeline.
+    /// Current performance optimizer pipeline.
     #[must_use]
-    pub fn phase7() -> Self {
+    pub fn performance() -> Self {
         Self::new(vec![
-            Box::new(NoopPass::new(
-                "phase7_pre_verify_noop",
-                PassPhase::PreVerify,
-            )),
+            Box::new(NoopPass::new("perf_pre_verify_noop", PassPhase::PreVerify)),
             Box::new(ConstantFoldingPass),
             Box::new(PeepholeSimplify),
             Box::new(BranchSimplify),
             Box::new(NoopPass::new(
-                "phase7_post_verify_noop",
+                "perf_post_verify_noop",
                 PassPhase::PostVerify,
             )),
         ])
@@ -1359,7 +1353,7 @@ mod tests {
         let report = PassPipeline::noop()
             .run(
                 &mut unit,
-                &PassContext::new(OptimizationLevel::O1).with_disabled(["phase7_post_verify_noop"]),
+                &PassContext::new(OptimizationLevel::O1).with_disabled(["perf_post_verify_noop"]),
             )
             .expect("disabled pass should be skipped");
 
@@ -1372,7 +1366,7 @@ mod tests {
             .run(
                 &mut unit,
                 &PassContext::new(OptimizationLevel::O1)
-                    .with_enabled_only(["phase7_post_verify_noop"]),
+                    .with_enabled_only(["perf_post_verify_noop"]),
             )
             .expect("enabled-only pass should run");
 
@@ -1407,11 +1401,11 @@ mod tests {
     }
 
     #[test]
-    fn phase7_pipeline_runs_constant_folding_between_verifiers() {
+    fn perf_pipeline_runs_constant_folding_between_verifiers() {
         let mut unit = simple_unit();
-        let report = PassPipeline::phase7()
+        let report = PassPipeline::performance()
             .run(&mut unit, &PassContext::new(OptimizationLevel::O1))
-            .expect("phase7 pipeline should pass");
+            .expect("performance pipeline should pass");
 
         assert_eq!(report.enabled_pass_count(), 5);
         assert_eq!(report.passes[1].name, "constant_folding_safe_subset");

@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - function prompt29_const_expr_closure
+  - function const_expr_closure_fixture
 hir_summary:
   statements: 3
   expressions: 3

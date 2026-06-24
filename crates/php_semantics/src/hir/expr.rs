@@ -219,7 +219,7 @@ impl HirExprKind {
     }
 }
 
-/// Runtime effects that Phase 3 records but does not execute.
+/// Runtime effects that Semantic frontend records but does not execute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeferredEffects {
     may_load_file: bool,
@@ -269,7 +269,7 @@ impl DeferredEffects {
         self.may_execute_code
     }
 
-    /// Whether current-scope effects are deferred to runtime-aware phases.
+    /// Whether current-scope effects are deferred to runtime-aware layers.
     #[must_use]
     pub const fn scope_effect_deferred(self) -> bool {
         self.scope_effect_deferred

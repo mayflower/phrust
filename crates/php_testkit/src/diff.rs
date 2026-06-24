@@ -49,7 +49,7 @@ impl SemanticAcceptanceDiff {
     }
 }
 
-/// Phase 3 semantic frontend comparison status.
+/// Semantic frontend semantic frontend comparison status.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SemanticDiffStatus {
     /// Reference and Rust both accept.

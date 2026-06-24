@@ -1,0 +1,10 @@
+<?php
+// runtime-semantics: category=enums expect=pass
+enum Status {
+    case Draft;
+    case Published;
+}
+
+foreach (Status::cases() as $case) {
+    echo $case->name . "\n";
+}

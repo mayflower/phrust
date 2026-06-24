@@ -1,4 +1,4 @@
-//! Deterministic internal builtin registry for the Phase 4 VM.
+//! Deterministic internal builtin registry for the runtime VM.
 
 use crate::{
     ArrayKey, CallableValue, ClassEntry, ClassFlags, FilesystemCapabilities, NumericValue,
@@ -3669,7 +3669,7 @@ fn builtin_fprintf(
     }
     Err(BuiltinError::new(
         "E_PHP_RUNTIME_STREAM_GAP",
-        "builtin fprintf requires stream/resource support, which is not available in this Phase 6 slice",
+        "builtin fprintf requires stream/resource support, which is not available in this standard-library slice",
     ))
 }
 
@@ -7667,7 +7667,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_builtins_use_phase1_lexer_names_and_lines() {
+    fn tokenizer_builtins_use_lexer_lexer_names_and_lines() {
         let mut output = OutputBuffer::new();
         let tokens = call(
             "token_get_all",
@@ -7921,7 +7921,7 @@ mod tests {
 
     #[test]
     fn stat_builtins_are_restricted_to_allowed_roots() {
-        let root = std::env::temp_dir().join(format!("phrust-phase6-stat-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-stat-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let file = root.join("fixture.txt");
         std::fs::write(&file, b"fixture").expect("write fixture");
@@ -8018,7 +8018,7 @@ mod tests {
     #[test]
     fn file_handle_builtins_cover_read_write_seek_and_modes() {
         let root =
-            std::env::temp_dir().join(format!("phrust-phase6-fileio-{}", std::process::id()));
+            std::env::temp_dir().join(format!("phrust-stdlib-fileio-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
         let capabilities = FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]);
@@ -8307,7 +8307,7 @@ mod tests {
     #[test]
     fn file_operations_are_root_constrained_and_return_false() {
         let root =
-            std::env::temp_dir().join(format!("phrust-phase6-fileops-{}", std::process::id()));
+            std::env::temp_dir().join(format!("phrust-stdlib-fileops-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
         let capabilities = FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]);
@@ -8459,7 +8459,7 @@ mod tests {
 
     #[test]
     fn directory_handles_read_rewind_and_close_with_sorted_entries() {
-        let root = std::env::temp_dir().join(format!("phrust-phase6-dir-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
         std::fs::write(root.join("b.log"), b"b").expect("write fixture");
@@ -8549,7 +8549,7 @@ mod tests {
 
     #[test]
     fn scandir_glob_and_directory_capabilities_are_normalized() {
-        let root = std::env::temp_dir().join(format!("phrust-phase6-glob-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-glob-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("nested")).expect("create temp root");
         std::fs::write(root.join("b.log"), b"b").expect("write fixture");
@@ -8604,7 +8604,7 @@ mod tests {
 
     #[test]
     fn getcwd_and_chdir_are_request_local_to_builtin_context() {
-        let root = std::env::temp_dir().join(format!("phrust-phase6-cwd-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-cwd-{}", std::process::id()));
         let nested = root.join("nested");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&nested).expect("create temp root");
@@ -8636,7 +8636,7 @@ mod tests {
     #[test]
     fn stream_metadata_contents_copy_and_local_checks_are_capability_aware() {
         let root =
-            std::env::temp_dir().join(format!("phrust-phase6-streams-{}", std::process::id()));
+            std::env::temp_dir().join(format!("phrust-stdlib-streams-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
         let capabilities = FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]);
@@ -8784,7 +8784,7 @@ mod tests {
     #[test]
     fn stream_context_options_and_include_path_resolution_are_preserved() {
         let root = std::env::temp_dir().join(format!(
-            "phrust-phase6-stream-context-{}",
+            "phrust-stdlib-stream-context-{}",
             std::process::id()
         ));
         let lib = root.join("lib");
@@ -9315,7 +9315,7 @@ mod tests {
 
     #[test]
     fn symlink_stat_is_conditional_on_platform_support() {
-        let root = std::env::temp_dir().join(format!("phrust-phase6-lstat-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-lstat-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let target = root.join("target.txt");
         let link = root.join("link.txt");

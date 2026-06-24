@@ -15,7 +15,7 @@ large set of platform packages, so ad hoc setup would be fragile.
 Use Nix Flakes and `nix develop` as the primary development environment.
 
 `flake.lock` will be committed so developers and CI use the same Nix inputs.
-Docker is not the primary development environment for Phase 0.
+Docker is not the primary development environment for Foundation.
 
 The dev shell provides:
 
@@ -31,12 +31,12 @@ The dev shell provides:
 
 - Validation commands should run through `nix develop -c ...` once the flake
   exists.
-- CI should install Nix and run the same Phase 0 verification command.
+- CI should install Nix and run the same Foundation verification command.
 - Platform-specific tool differences should be expressed in `flake.nix`.
 
 ## Alternatives
 
-- Docker Compose as the primary development environment. Rejected for Phase 0
+- Docker Compose as the primary development environment. Rejected for Foundation
   because Nix Flakes are the required workflow.
 - Host-installed toolchains. Rejected because they are not reproducible enough.
 

@@ -1,10 +1,10 @@
-//! Byte-oriented PHP lexer surface for Phase 1.
+//! Byte-oriented PHP lexer surface for Lexer.
 //!
 //! This crate intentionally exposes only lexer and tokenization types. It does
 //! not contain a parser, AST/CST model, VM, runtime values, JIT, extensions, or
 //! Zend ABI emulation.
 //!
-//! The scanner covers the Phase 1 tokenization surface and records normalized
+//! The scanner covers the Lexer tokenization surface and records normalized
 //! PHP token names, original byte spans, start lines, and recoverable
 //! diagnostics.
 

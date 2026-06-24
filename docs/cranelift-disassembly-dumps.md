@@ -1,7 +1,7 @@
-# Phase 7 Cranelift Disassembly And Code-Size Dumps
+# Performance Cranelift Disassembly And Code-Size Dumps
 
-Optional prompt 07.CL.B adds a local diagnostic dump for Cranelift-generated
-code. It is deliberately outside the default Phase 7 and Cranelift verification
+Optional work item.B adds a local diagnostic dump for Cranelift-generated
+code. It is deliberately outside the default Performance and Cranelift verification
 gates because native disassembly is architecture-specific and should not decide
 CI success.
 
@@ -16,7 +16,7 @@ Cranelift Big-Win fixtures with `--jit=cranelift --jit-eager --jit-stats=json`
 and `--jit-dump-clif`, and writes all outputs under:
 
 ```text
-target/phase7/cranelift/disasm/
+target/performance/cranelift/disasm/
 ```
 
 Generated files include:
@@ -44,7 +44,7 @@ Each descriptor links the diagnostic artifacts to the VM compile-cache identity:
 
 ## Native Disassembly Status
 
-Phase 7 uses Cranelift `JITModule`, so native code is owned by the in-process
+Performance uses Cranelift `JITModule`, so native code is owned by the in-process
 JIT allocation. This repo does not expose an object file or a safe JIT-memory
 extraction API for `objdump`. The diagnostic therefore records
 `native_disassembly_status: skipped` and reports code size plus CLIF instead of

@@ -6,7 +6,7 @@ Accepted.
 
 ## Context
 
-Phase 7 introduces a bytecode/IR cache after the measurement and verifier
+Performance introduces a bytecode/IR cache after the measurement and verifier
 foundation. The cache is intended to make repeated frontend-to-IR loading
 faster for deterministic local runs and later CLI workflows. It must not change
 runtime semantics, skip diagnostics, or become a production Opcache clone.
@@ -18,8 +18,8 @@ created by a previous local run of this engine.
 ## Decision
 
 Use a small, versioned binary envelope owned by this project, with a length
-prefixed metadata header and a payload section. The first Phase 7 implementation
-serializes and validates header metadata only. A later prompt may add verified
+prefixed metadata header and a payload section. The first Performance implementation
+serializes and validates header metadata only. A later work item may add verified
 IR or VM bytecode payloads after the verifier and invalidation rules are in
 place.
 
@@ -30,7 +30,7 @@ behind a CLI flag, but cache use must remain optional and safely ignorable.
 ### Goals
 
 - Speed up repeat frontend, semantic, and IR load paths for unchanged inputs.
-- Preserve the Phase 0 through Phase 6 observable behavior baseline.
+- Preserve the Foundation through Standard library observable behavior baseline.
 - Make cache hits reproducible and explainable through explicit fingerprints.
 - Reject stale, corrupt, incompatible, or future cache artifacts cleanly.
 - Keep the format small enough for deterministic tests and focused audits.
@@ -63,7 +63,7 @@ The binary envelope starts with:
 | Header checksum | `u32` | Checksum over the metadata block. |
 | Payload checksum | `u32` | Checksum over the payload bytes. |
 
-The metadata block is encoded as deterministic JSON in Phase 7 because it keeps
+The metadata block is encoded as deterministic JSON in Performance because it keeps
 tests and diagnostics inspectable while the payload shape is still evolving. The
 metadata object must be serialized with stable field ordering by the cache crate.
 Payload bytes may later use a compact project-owned binary encoding, but the
@@ -74,7 +74,7 @@ Required metadata fields:
 | Field | Meaning |
 | --- | --- |
 | `engine_version` | Engine crate or workspace version that wrote the cache. |
-| `php_target_version` | Must be exactly `8.5.7` for Phase 7. |
+| `php_target_version` | Must be exactly `8.5.7` for Performance. |
 | `source_fingerprint` | Hash of the source bytes plus canonical source path identity when available. |
 | `compiler_fingerprint` | Hash of parser, semantic, IR, feature, and opt-level inputs. |
 | `abi_version` | Engine runtime/IR ABI compatibility version. |

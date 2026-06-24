@@ -1,4 +1,4 @@
-//! Scalar conversion and comparison helpers for Phase 4/5 execution.
+//! Scalar conversion and comparison helpers for runtime/5 execution.
 
 use crate::{
     PhpString, Value,
@@ -173,7 +173,7 @@ pub fn to_number(value: &Value) -> Result<NumericValue, String> {
     }
 }
 
-/// Strict identity for Phase 5 runtime values.
+/// Strict identity for runtime-semantics runtime values.
 pub fn identical(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, Value::Null) => true,
@@ -191,7 +191,7 @@ pub fn identical(left: &Value, right: &Value) -> bool {
     }
 }
 
-/// Loose equality for Phase 5 comparison cases.
+/// Loose equality for runtime-semantics comparison cases.
 pub fn equal(left: &Value, right: &Value) -> Result<bool, String> {
     match (left, right) {
         (Value::Array(left), Value::Array(right)) => arrays_equal(left, right),
@@ -207,7 +207,7 @@ pub fn equal(left: &Value, right: &Value) -> Result<bool, String> {
     }
 }
 
-/// Loose comparison for Phase 5 comparison cases.
+/// Loose comparison for runtime-semantics comparison cases.
 pub fn compare(left: &Value, right: &Value) -> Result<Ordering, String> {
     match (left, right) {
         (Value::Reference(left), Value::Reference(right)) if left.ptr_eq(right) => {

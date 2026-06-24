@@ -11,7 +11,7 @@ use php_ir::{BlockId, FunctionId, InstrId, LocalId, RegId};
 /// Version for the C-compatible runtime ABI records.
 pub const JIT_RUNTIME_ABI_VERSION: u32 = 1;
 
-/// Stable ABI fingerprint for Prompt 07.CL.05.
+/// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.

@@ -7,7 +7,7 @@ use crate::module::AttributeEntry;
 use crate::source_map::IrSpan;
 use serde::{Deserialize, Serialize};
 
-/// Minimal runtime type family enforced by the Prompt 30 VM.
+/// Minimal runtime type family enforced by the runtime-type VM.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IrReturnType {
@@ -63,7 +63,7 @@ pub struct IrParam {
     pub required: bool,
     /// Constant-pool default value for omitted optional arguments.
     pub default: Option<IrConstant>,
-    /// Optional Phase-3 lowered runtime type enforced by the VM MVP.
+    /// Optional Semantic frontend lowered runtime type enforced by the VM MVP.
     pub type_: Option<IrReturnType>,
     /// True when the callee aliases the caller argument into this parameter.
     pub by_ref: bool,

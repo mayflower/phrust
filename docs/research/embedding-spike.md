@@ -1,6 +1,6 @@
-# Phase 4 Embedding and WASI Spike
+# Runtime Embedding and WASI Spike
 
-This spike checks whether Phase 4 crate boundaries leave room for later
+This spike checks whether Runtime crate boundaries leave room for later
 embedding or `wasm32-wasi` experiments. It is not a WASI support commitment.
 
 ## Current Dependency Boundary
@@ -35,7 +35,7 @@ VM/runtime crates:
 - Running reference PHP binaries.
 
 The current `include` MVP still uses host filesystem paths through
-`IncludeLoader`. That is acceptable for Phase 4, but an embedded target should
+`IncludeLoader`. That is acceptable for Runtime, but an embedded target should
 provide an alternate loader backed by host callbacks, an in-memory file map, or
 a virtual filesystem.
 
@@ -52,11 +52,11 @@ a virtual filesystem.
 
 ## Small Boundary Check
 
-No large API split is needed in Phase 4. The existing boundaries are adequate
+No large API split is needed in Runtime. The existing boundaries are adequate
 for a later spike that compiles core crates for a restricted target, provided
 the CLI and testkit crates are excluded.
 
-## Phase 5 Follow-Ups
+## Runtime semantics Follow-Ups
 
 1. Add an explicit in-memory include loader fixture to prove host-independent
    include behavior.

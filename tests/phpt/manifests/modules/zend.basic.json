@@ -1,6 +1,6 @@
 {
   "module": "zend.basic",
-  "prompt": "09.11",
+  "slice": "09.11",
   "description": "Zend basic execution, output, scalar literals, var_dump, statement sequencing, and top-level return/exit basics.",
   "scope": [
     "Zend/tests/*",
@@ -29,9 +29,9 @@
     }
   ],
   "closure_gate": [
-    "nix develop -c just phpt-module-phase9 MODULE=zend.basic",
-    "nix develop -c just phpt-full-regression-phase9",
-    "nix develop -c just phpt-verify-source-integrity-phase9",
-    "nix develop -c just verify-phase9"
+    "nix develop -c just phpt-module MODULE=zend.basic",
+    "nix develop -c just phpt-full-regression",
+    "nix develop -c just phpt-verify-source-integrity",
+    "nix develop -c just verify-phpt"
   ]
 }

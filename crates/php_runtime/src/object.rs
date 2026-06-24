@@ -1,4 +1,4 @@
-//! Minimal object storage and class metadata for Phase 4.
+//! Minimal object storage and class metadata for runtime.
 
 use crate::Value;
 use std::cell::RefCell;
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Minimal runtime type adapter used by the VM for Phase 3 annotations.
+/// Minimal runtime type adapter used by the VM for Semantic frontend annotations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeType {
     /// `int`
@@ -218,7 +218,7 @@ pub struct ClassEnumCaseEntry {
 pub struct AttributeEntry {
     /// Source-spelled attribute name.
     pub name: String,
-    /// Resolved canonical class name, when Phase 3 resolved it.
+    /// Resolved canonical class name, when Semantic frontend resolved it.
     pub resolved_name: Option<String>,
     /// Runtime fallback class name, when PHP may resolve dynamically.
     pub fallback_name: Option<String>,
@@ -359,7 +359,7 @@ impl ObjectRef {
     /// Clears all stored properties as an internal GC action.
     ///
     /// This is not PHP-visible `unset()` semantics; it is only used by the
-    /// Phase 5 cycle-collection test hook after proving the object is not
+    /// runtime-semantics cycle-collection test hook after proving the object is not
     /// rooted.
     pub fn gc_clear_properties(&self) {
         self.storage.borrow_mut().properties.clear();
@@ -796,7 +796,7 @@ mod tests {
         );
 
         let enum_class = ClassEntry {
-            name: "prompt28status".to_owned(),
+            name: "runtime_status_fixture".to_owned(),
             parent: None,
             interfaces: vec!["unitenum".to_owned(), "backedenum".to_owned()],
             methods: Vec::new(),

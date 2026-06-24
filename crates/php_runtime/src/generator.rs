@@ -1,4 +1,4 @@
-//! Internal generator runtime state for Phase 5.
+//! Internal generator runtime state for runtime-semantics.
 
 use crate::Value;
 use std::cell::RefCell;

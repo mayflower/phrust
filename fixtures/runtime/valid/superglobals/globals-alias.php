@@ -1,10 +1,10 @@
 <?php
-// phase5-runtime: expect=pass
+// runtime-fixture: expect=pass
 $x = 1;
-function phase4_write_global() {
+function runtime_write_global() {
     global $x;
     $x = 2;
 }
-phase4_write_global();
+runtime_write_global();
 echo $x;
 echo "\n";

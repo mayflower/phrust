@@ -1,4 +1,4 @@
-//! Local include/require loader for the Phase 4 VM MVP.
+//! Local include/require loader for the runtime VM MVP.
 
 use std::fs;
 use std::path::{Path, PathBuf};

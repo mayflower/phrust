@@ -1,5 +1,5 @@
 <?php
-// phase4-runtime: corpus=pass
+// runtime-fixture: corpus=pass
 $config = [
     "env" => "prod",
     "database" => [

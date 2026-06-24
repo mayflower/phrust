@@ -1,4 +1,4 @@
-//! Minimal runtime autoload registry for Phase 5.
+//! Minimal runtime autoload registry for runtime-semantics.
 
 use crate::CallableValue;
 

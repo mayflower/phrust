@@ -74,7 +74,7 @@ impl SourceText {
     }
 }
 
-/// Returns the pinned PHP reference version for Phase 0.
+/// Returns the pinned PHP reference version for Foundation.
 #[must_use]
 pub const fn reference_php_version() -> &'static str {
     "8.5.7"
@@ -85,7 +85,7 @@ mod tests {
     use super::{BytePos, LineCol, SourceText, TextRange, reference_php_version};
 
     #[test]
-    fn exposes_phase0_reference_version() {
+    fn exposes_foundation_reference_version() {
         assert_eq!(reference_php_version(), "8.5.7");
     }
 

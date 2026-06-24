@@ -1,4 +1,4 @@
-//! PHP 8.5.7 core and platform constants for Phase 6.
+//! PHP 8.5.7 core and platform constants for standard-library.
 
 use php_runtime::{FloatValue, PhpString, Value};
 
@@ -118,7 +118,7 @@ mod tests {
     use crate::ExtensionRegistry;
 
     #[test]
-    fn version_constants_match_phase0_target() {
+    fn version_constants_match_foundation_target() {
         assert_eq!(PHP_VERSION, "8.5.7");
         assert_eq!(PHP_VERSION_ID, 80507);
         assert_eq!(PHP_MAJOR_VERSION, 8);
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn core_constants_are_registered_with_values() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+        let registry = ExtensionRegistry::standard_library();
         let version_id = registry
             .enabled_constant("PHP_VERSION_ID")
             .expect("PHP_VERSION_ID");
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn json_constants_are_enabled_with_json_extension() {
-        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        let mut registry = ExtensionRegistry::standard_library();
         assert_eq!(
             registry
                 .enabled_constant("JSON_ERROR_NONE")

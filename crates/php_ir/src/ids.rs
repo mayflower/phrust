@@ -1,4 +1,4 @@
-//! Stable typed IDs for Phase 4 IR arenas.
+//! Stable typed IDs for runtime IR arenas.
 
 macro_rules! id_type {
     ($name:ident) => {

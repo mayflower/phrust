@@ -2,14 +2,14 @@
 
 Date: 2026-06-23.
 
-Status: Accepted for Phase 7 Cranelift addendum Prompt 07.CL.14.
+Status: Accepted for Performance Cranelift addendum Work item.14.
 
 ## Context
 
 The Cranelift backend now has constrained native execution for constant integer
 returns and helper-call integer arithmetic. Helper calls can detect runtime
 conditions, such as integer overflow, where native output must not be trusted.
-Before later prompts add inline fast paths and guards, the VM/JIT boundary needs
+Before later work items add inline fast paths and guards, the VM/JIT boundary needs
 a stable side-exit ABI, reporting model, and interpreter fallback rule.
 
 ## Decision
@@ -40,7 +40,7 @@ using the existing IR `BlockId` and `InstrId` types. The C-facing `JitCExit`
 record carries the same information as `u32` fields with `u32::MAX` as the
 "not available" sentinel.
 
-For Prompt 07.CL.14, helper-call side exits do not resume in the middle of a
+For Work item.14, helper-call side exits do not resume in the middle of a
 compiled region. The VM discards the native out slot and re-runs the selected
 function through the interpreter from the normal entry point. Future inline
 fast paths may provide a precise resume block/instruction only when the
@@ -67,14 +67,14 @@ The interpreter frame remains the authoritative PHP state.
 - Exception or fatal-error state must be reported through a side-exit reason or
   a later runtime diagnostic channel before interpreter fallback observes it.
 
-No OSR is introduced by this prompt. Side exits return to interpreter fallback
+No OSR is introduced by this work item. Side exits return to interpreter fallback
 only; they do not transfer execution into another compiled region.
 
 ## Reporting And Validation
 
 `just cranelift-guard-report` runs a deterministic side-exit fixture that
 overflows inside a checked helper call, verifies JIT off/on output parity, and
-writes `target/phase7/cranelift/guard-report.json`. The report records
+writes `target/performance/cranelift/guard-report.json`. The report records
 `side_exits`, `side_exit_reasons`, `guard_failures`, and bailout counters.
 
 The required validation gates are:
@@ -88,6 +88,6 @@ nix develop -c cargo test --workspace --features jit-cranelift
 ## Consequences
 
 Later guard, inline-arithmetic, loop, array, string, property, and method
-prompts can add precise side-exit points without changing the stable reason
+work items can add precise side-exit points without changing the stable reason
 spelling or counter schema. Unsupported or ambiguous live state remains a
 compile-time ineligibility reason instead of a runtime resume guess.

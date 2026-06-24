@@ -1,4 +1,4 @@
-//! Phase 3 frontend to Phase 4 IR lowering skeleton.
+//! Semantic frontend frontend to runtime IR lowering skeleton.
 
 use crate::builder::IrBuilder;
 use crate::constants::IrConstant;
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 pub enum UnsupportedFeature {
     /// Generator functions and `yield` expressions.
     Generator,
-    /// `yield from` delegation has generator semantics beyond Phase 4.
+    /// `yield from` delegation has generator semantics beyond runtime.
     YieldFrom,
     /// Fiber construction is runtime-sensitive.
     Fiber,
@@ -56,7 +56,7 @@ pub enum UnsupportedFeature {
     PropertyHooks,
     /// Full PHP references and Copy-on-Write semantics are deferred.
     FullReferences,
-    /// HIR statement family not yet lowered by Phase 4.
+    /// HIR statement family not yet lowered by runtime.
     HirStatement,
     /// `for` headers with multiple expressions in one section are deferred.
     ForHeaderMultiExpression,
@@ -64,11 +64,11 @@ pub enum UnsupportedFeature {
     DynamicLoopControlLevel,
     /// Dynamic function calls are deferred until callable semantics are stable.
     DynamicFunctionCall,
-    /// By-reference parameters are outside the Prompt 14 call-frame subset.
+    /// By-reference parameters are outside the call-frame subset.
     ByReferenceParameter,
-    /// By-reference returns are recorded by Phase 3 but not executable yet.
+    /// By-reference returns are recorded by Semantic frontend but not executable yet.
     ByReferenceReturn,
-    /// Parameter defaults not proven foldable by Phase 3 are not executed by
+    /// Parameter defaults not proven foldable by Semantic frontend are not executed by
     /// the VM.
     AdvancedParameter,
     /// Array spread/unpack is deferred until array merge semantics are modeled.
@@ -204,7 +204,7 @@ impl<'a> LoweringContext<'a> {
     }
 }
 
-/// One Phase 4 lowering diagnostic.
+/// One runtime lowering diagnostic.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LoweringDiagnostic {
     /// Stable machine-readable diagnostic ID.
@@ -356,7 +356,7 @@ impl TraitVisibility {
     }
 }
 
-/// Lowers a Phase 3 frontend result into a minimal Phase 4 IR unit.
+/// Lowers a Semantic frontend frontend result into a minimal runtime IR unit.
 #[must_use]
 pub fn lower_frontend_result(
     frontend: &FrontendResult,
@@ -473,7 +473,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     declaration.span(),
-                    "global const initializer is not a folded Phase 3 constant expression",
+                    "global const initializer is not a folded Semantic frontend constant expression",
                 );
                 continue;
             };
@@ -538,7 +538,7 @@ impl LoweringContext<'_> {
                     feature,
                     self.span_for(SourceMappedId::from(class_like_id)),
                     format!(
-                        "class-like kind `{}` is not executable in the Prompt 31 known-gap layer",
+                        "class-like kind `{}` is not executable in the known-gap known-gap layer",
                         class_like.kind().as_str()
                     ),
                 );
@@ -665,7 +665,7 @@ impl LoweringContext<'_> {
                                 UnsupportedFeature::ObjectMethodModifier,
                                 self.span_for(SourceMappedId::from(method_id)),
                                 format!(
-                                    "method `{method_name}` is abstract outside the Prompt 16 concrete method MVP"
+                                    "method `{method_name}` is abstract outside the concrete-method concrete method MVP"
                                 ),
                             );
                         }
@@ -680,7 +680,7 @@ impl LoweringContext<'_> {
                             self.unsupported(
                                 UnsupportedFeature::Generator,
                                 signature.span(),
-                                "generator methods are not executable in the Prompt 26 object MVP",
+                                "generator methods are not executable in the object-runtime object MVP",
                             );
                             continue;
                         }
@@ -688,7 +688,7 @@ impl LoweringContext<'_> {
                             self.unsupported(
                                 UnsupportedFeature::ByReferenceReturn,
                                 signature.span(),
-                                "by-reference method returns are not executable in the Prompt 26 object MVP",
+                                "by-reference method returns are not executable in the object-runtime object MVP",
                             );
                             continue;
                         }
@@ -924,7 +924,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::ByReferenceParameter,
                     param.span(),
-                    "by-reference method parameters are not executable in the Prompt 27 method MVP",
+                    "by-reference method parameters are not executable in the method-runtime method MVP",
                 );
             }
             let local_name = local_name(param.name()).to_owned();
@@ -934,7 +934,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::AdvancedParameter,
                     param.span(),
-                    "method parameter default is not a folded Phase 3 constant expression",
+                    "method parameter default is not a folded Semantic frontend constant expression",
                 );
             }
             let attributes = self.lower_parameter_attributes(builder, param.attributes());
@@ -1280,7 +1280,7 @@ impl LoweringContext<'_> {
                         self.unsupported(
                             UnsupportedFeature::Generator,
                             signature.span(),
-                            "generator trait methods are not executable in the Prompt 19 trait MVP",
+                            "generator trait methods are not executable in the trait-composition trait MVP",
                         );
                         continue;
                     }
@@ -1300,21 +1300,21 @@ impl LoweringContext<'_> {
                     self.unsupported(
                         UnsupportedFeature::TraitRuntime,
                         self.span_for(SourceMappedId::from(property_id)),
-                        "trait properties are not executable in the Prompt 19 trait-method composition layer",
+                        "trait properties are not executable in the trait-composition trait-method composition layer",
                     );
                 }
                 Some(ClassLikeMemberId::ClassConstant(const_id)) => {
                     self.unsupported(
                         UnsupportedFeature::TraitRuntime,
                         self.span_for(SourceMappedId::from(const_id)),
-                        "trait constants are not executable in the Prompt 19 trait-method composition layer",
+                        "trait constants are not executable in the trait-composition trait-method composition layer",
                     );
                 }
                 Some(ClassLikeMemberId::TraitUse(trait_use_id)) => {
                     self.unsupported(
                         UnsupportedFeature::TraitRuntime,
                         self.span_for(SourceMappedId::from(trait_use_id)),
-                        "nested trait uses are not executable in the Prompt 19 trait-method composition layer",
+                        "nested trait uses are not executable in the trait-composition trait-method composition layer",
                     );
                 }
                 _ => {}
@@ -1399,7 +1399,7 @@ impl LoweringContext<'_> {
                     self.unsupported(
                         UnsupportedFeature::AdvancedParameter,
                         param.span(),
-                        "parameter default is not a folded Phase 3 constant expression",
+                        "parameter default is not a folded Semantic frontend constant expression",
                     );
                 }
                 let attributes = self.lower_parameter_attributes(builder, param.attributes());
@@ -1936,7 +1936,7 @@ impl LoweringContext<'_> {
                         self.unsupported(
                             UnsupportedFeature::HirStatement,
                             self.span_for(SourceMappedId::from(variable)),
-                            "dynamic global variables are not lowered to IR in Phase 5",
+                            "dynamic global variables are not lowered to IR in runtime-semantics",
                         );
                         return None;
                     };
@@ -1978,7 +1978,7 @@ impl LoweringContext<'_> {
                     self.unsupported(
                         UnsupportedFeature::HirStatement,
                         range,
-                        "dynamic global variables are not lowered to IR in Phase 5",
+                        "dynamic global variables are not lowered to IR in runtime-semantics",
                     );
                     return None;
                 }
@@ -2292,7 +2292,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 self.span_for(SourceMappedId::from(value_target)),
-                "foreach value target must be a simple local variable in Phase 4",
+                "foreach value target must be a simple local variable in runtime",
             );
             return block;
         };
@@ -2301,7 +2301,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     self.span_for(SourceMappedId::from(key_target)),
-                    "foreach key target must be a simple local variable in Phase 4",
+                    "foreach key target must be a simple local variable in runtime",
                 );
                 return block;
             };
@@ -2588,7 +2588,7 @@ impl LoweringContext<'_> {
                     UnsupportedFeature::CatchType,
                     self.span_for(SourceMappedId::from(stmt_id)),
                     format!(
-                        "catch types {:?} are outside the Prompt 29 exception MVP",
+                        "catch types {:?} are outside the exception exception MVP",
                         catch.types
                     ),
                 );
@@ -2839,7 +2839,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     self.span_for(SourceMappedId::from(expr)),
-                    "unset only supports locals, properties, and local array dimensions in Phase 5",
+                    "unset only supports locals, properties, and local array dimensions in runtime-semantics",
                 );
                 continue;
             };
@@ -2847,7 +2847,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     self.span_for(SourceMappedId::from(expr)),
-                    "unset of append dimension is invalid for the Phase 4 MVP",
+                    "unset of append dimension is invalid for the runtime MVP",
                 );
                 continue;
             }
@@ -3112,7 +3112,7 @@ impl LoweringContext<'_> {
                         self.unsupported(
                             UnsupportedFeature::ClassLikeObject,
                             range,
-                            "dynamic instanceof targets are not executable in the Prompt 20 interface layer",
+                            "dynamic instanceof targets are not executable in the interface interface layer",
                         );
                         return None;
                     };
@@ -3364,7 +3364,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "new expression class name is not static in the Prompt 26 object MVP",
+                "new expression class name is not static in the object-runtime object MVP",
             );
             return None;
         };
@@ -3443,7 +3443,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "nullsafe property fetch is outside the Prompt 26 object MVP",
+                "nullsafe property fetch is outside the object-runtime object MVP",
             );
             return None;
         }
@@ -3453,7 +3453,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "dynamic property fetch is outside the Prompt 26 object MVP",
+                "dynamic property fetch is outside the object-runtime object MVP",
             );
             return None;
         };
@@ -3656,7 +3656,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::ArraySpread,
                     self.span_for(SourceMappedId::from(element)),
-                    "array spread is a known gap for Phase 4 array literals",
+                    "array spread is a known gap for runtime array literals",
                 );
                 continue;
             }
@@ -3738,7 +3738,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::Reflection,
                 site.range,
-                "reflection functions are not executable in the Prompt 31 known-gap layer",
+                "reflection functions are not executable in the known-gap known-gap layer",
             );
             return None;
         }
@@ -3802,7 +3802,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::MethodCall,
                 site.range,
-                "nullsafe method calls are a known gap in the Prompt 27 object MVP",
+                "nullsafe method calls are a known gap in the method-runtime object MVP",
             );
             return None;
         }
@@ -3810,7 +3810,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::MethodCall,
                 site.range,
-                "method call target is dynamic or missing in the Prompt 27 object MVP",
+                "method call target is dynamic or missing in the method-runtime object MVP",
             );
             return None;
         };
@@ -3933,7 +3933,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "clone-with requires an object expression and replacement array in the Prompt 28 MVP",
+                "clone-with requires an object expression and replacement array in the reflection-clone MVP",
             );
             return None;
         };
@@ -4013,7 +4013,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                format!("{name} currently supports exactly one operand in the Phase 4 MVP"),
+                format!("{name} currently supports exactly one operand in the runtime MVP"),
             );
             return None;
         }
@@ -4030,7 +4030,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     self.span_for(SourceMappedId::from(arg)),
-                    format!("{name} append dimensions are outside the Phase 4 MVP"),
+                    format!("{name} append dimensions are outside the runtime MVP"),
                 );
                 return None;
             }
@@ -4102,7 +4102,7 @@ impl LoweringContext<'_> {
                 UnsupportedFeature::HirStatement,
                 site.range,
                 format!(
-                    "{name} only supports locals, properties, and local array dimensions in Phase 5"
+                    "{name} only supports locals, properties, and local array dimensions in runtime-semantics"
                 ),
             );
             return None;
@@ -4554,7 +4554,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::AdvancedParameter,
                     param.span(),
-                    "parameter default is not a folded Phase 3 constant expression",
+                    "parameter default is not a folded Semantic frontend constant expression",
                 );
             }
             let attributes = self.lower_parameter_attributes(builder, param.attributes());
@@ -4620,7 +4620,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "literal kind is not lowered to IR in Prompt 10",
+                "literal kind is not lowered to IR in literal-lowering",
             );
             return None;
         };
@@ -5210,7 +5210,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "only simple variable assignment is lowered to IR in Prompt 11",
+                "only simple variable assignment is lowered to IR in local-variable",
             );
             return None;
         };
@@ -5539,7 +5539,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "by-reference assignment target must be a simple local variable in the Prompt 23 MVP",
+                "by-reference assignment target must be a simple local variable in the reference-assignment MVP",
             );
             return None;
         };
@@ -5574,7 +5574,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "by-reference assignment source must be a simple local variable in the Prompt 23 MVP",
+                "by-reference assignment source must be a simple local variable in the reference-assignment MVP",
             );
             return None;
         };
@@ -5924,7 +5924,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
-                "only simple variable increment/decrement is lowered to IR in Prompt 11",
+                "only simple variable increment/decrement is lowered to IR in local-variable",
             );
             return None;
         };
@@ -6187,7 +6187,7 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::StaticProperty,
                 self.span_for(SourceMappedId::from(expr)),
-                "static access target or member is missing in the Prompt 27 object MVP",
+                "static access target or member is missing in the method-runtime object MVP",
             );
             return None;
         };
@@ -6568,7 +6568,7 @@ impl LoweringContext<'_> {
                 self.unsupported(
                     UnsupportedFeature::DynamicLoopControlLevel,
                     self.span_for(SourceMappedId::from(expr)),
-                    "dynamic break/continue levels are not lowered in the Prompt 12 MVP",
+                    "dynamic break/continue levels are not lowered in the control-flow MVP",
                 );
                 None
             }
@@ -7232,17 +7232,17 @@ mod tests {
     #[test]
     fn functions_lower_namespaced_declaration_table_and_call() {
         let frontend = analyze_source(
-            "<?php namespace PhaseSevenIC; function hot() { return 2; } echo hot();",
+            "<?php namespace PerformanceIC; function hot() { return 2; } echo hot();",
         );
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
         assert_eq!(result.unit.function_table.len(), 1);
-        assert_eq!(result.unit.function_table[0].name, "phasesevenic\\hot");
+        assert_eq!(result.unit.function_table[0].name, "performanceic\\hot");
         let snapshot = result.unit.to_snapshot_text();
-        assert!(snapshot.contains("function_name \"phasesevenic\\\\hot\" => function:1"));
-        assert!(snapshot.contains("\"phasesevenic\\\\hot\""));
+        assert!(snapshot.contains("function_name \"performanceic\\\\hot\" => function:1"));
+        assert!(snapshot.contains("\"performanceic\\\\hot\""));
     }
 
     #[test]
@@ -7309,7 +7309,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_prompt31_feature_ids_are_machine_readable() {
+    fn unsupported_feature_ids_are_machine_readable() {
         let expected = [
             (
                 UnsupportedFeature::Generator,
@@ -7353,7 +7353,7 @@ mod tests {
     }
 
     #[test]
-    fn former_prompt31_constructs_lower_without_unsupported_diagnostics() {
+    fn formerly_unsupported_constructs_lower_without_unsupported_diagnostics() {
         let cases = [
             "<?php function gen() { yield from []; }",
             "<?php spl_autoload_register(function ($class) {});",

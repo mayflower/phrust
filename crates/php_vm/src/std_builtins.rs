@@ -1,4 +1,4 @@
-//! Minimal VM bridge for the Phase 6 `php_std` builtin ABI.
+//! Minimal VM bridge for the standard-library `php_std` builtin ABI.
 
 use php_runtime::{OutputBuffer, RuntimeSourceSpan as VmRuntimeSourceSpan, Value};
 use php_std::abi::{
@@ -7,10 +7,10 @@ use php_std::abi::{
 
 use crate::vm::VmResult;
 
-/// Calls a `php_std` builtin through the Phase 6 ABI.
+/// Calls a `php_std` builtin through the standard-library ABI.
 ///
 /// This is intentionally not wired into all VM builtin dispatch yet. It proves
-/// the ABI boundary and `VmResult` conversion while existing Phase 5 builtins
+/// the ABI boundary and `VmResult` conversion while existing runtime-semantics builtins
 /// continue to use their current runtime path.
 pub fn call_php_std_builtin(
     builtin: &impl BuiltinFunction,

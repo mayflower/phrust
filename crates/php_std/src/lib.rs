@@ -1,7 +1,7 @@
-//! Phase 6 standard-library registry infrastructure.
+//! standard-library standard-library registry infrastructure.
 //!
 //! This crate owns metadata for PHP 8.5.7 internal extensions, functions,
-//! constants, and classes. Prompt 06.03 intentionally keeps it infrastructure
+//! constants, and classes. This crate intentionally keeps it infrastructure
 //! only: no PHP-visible function implementation is exposed from here yet.
 
 pub mod abi;
@@ -301,9 +301,9 @@ impl ExtensionRegistry {
         }
     }
 
-    /// Returns the default Phase 6 infrastructure registry.
+    /// Returns the default standard-library infrastructure registry.
     #[must_use]
-    pub fn phase6_infrastructure() -> Self {
+    pub fn standard_library() -> Self {
         Self::from_extensions([
             ExtensionDescriptor::new("core")
                 .with_constant(ConstantDescriptor::with_value(
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn infrastructure_registry_exposes_no_php_visible_functions() {
-        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        let mut registry = ExtensionRegistry::standard_library();
         registry.enable_extension("test").expect("enable test");
 
         assert!(
@@ -1305,8 +1305,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_encoding_hash_url_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_encoding_hash_url_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "base64_decode",
@@ -1335,8 +1335,8 @@ mod tests {
     }
 
     #[test]
-    fn optional_hash_and_random_extensions_track_phase6_symbols() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn optional_hash_and_random_extensions_track_stdlib_symbols() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in ["hash", "hash_hmac"] {
             assert!(
@@ -1355,8 +1355,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_formatting_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_formatting_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in ["fprintf", "printf", "sprintf", "vprintf", "vsprintf"] {
             assert!(
@@ -1367,8 +1367,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_array_basic_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_array_basic_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "array_all",
@@ -1423,8 +1423,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_math_numeric_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_math_numeric_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "abs",
@@ -1450,8 +1450,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_symbol_introspection_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_symbol_introspection_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "defined",
@@ -1488,8 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_ini_config_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_ini_config_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in ["ini_get", "ini_set", "ini_get_all", "get_cfg_var"] {
             assert!(
@@ -1500,8 +1500,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_platform_check_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_platform_check_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "extension_loaded",
@@ -1526,8 +1526,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_process_surface_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_process_surface_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "proc_open",
@@ -1548,8 +1548,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_error_handling_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_error_handling_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "error_reporting",
@@ -1575,8 +1575,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_output_buffering_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_output_buffering_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "ob_start",
@@ -1596,8 +1596,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_environment_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_environment_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "getenv",
@@ -1614,8 +1614,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_stream_resource_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_stream_resource_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in ["get_resource_id", "get_resource_type", "is_resource"] {
             assert!(
@@ -1626,8 +1626,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_path_and_stat_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_path_and_stat_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "basename",
@@ -1655,8 +1655,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_file_io_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_file_io_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "fopen",
@@ -1690,8 +1690,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_directory_glob_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_directory_glob_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "opendir",
@@ -1711,8 +1711,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_registry_tracks_phase6_stream_context_functions() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn standard_registry_tracks_stdlib_stream_context_functions() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "stream_get_wrappers",
@@ -1734,8 +1734,8 @@ mod tests {
     }
 
     #[test]
-    fn json_extension_tracks_phase6_symbols() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn json_extension_tracks_stdlib_symbols() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "json_decode",
@@ -1774,8 +1774,8 @@ mod tests {
     }
 
     #[test]
-    fn pcre_extension_tracks_phase6_symbols() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn pcre_extension_tracks_stdlib_symbols() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "preg_grep",
@@ -1809,8 +1809,8 @@ mod tests {
     }
 
     #[test]
-    fn date_extension_tracks_phase6_timezone_symbols() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn date_extension_tracks_stdlib_timezone_symbols() {
+        let registry = ExtensionRegistry::standard_library();
 
         for name in [
             "date",
@@ -1845,8 +1845,8 @@ mod tests {
     }
 
     #[test]
-    fn spl_extension_tracks_phase6_basis_symbols() {
-        let registry = ExtensionRegistry::phase6_infrastructure();
+    fn spl_extension_tracks_stdlib_basis_symbols() {
+        let registry = ExtensionRegistry::standard_library();
 
         assert!(registry.is_extension_enabled("spl"));
         for name in [
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[test]
     fn unknown_extension_mutation_is_rejected() {
-        let mut registry = ExtensionRegistry::phase6_infrastructure();
+        let mut registry = ExtensionRegistry::standard_library();
         assert_eq!(
             registry.enable_extension("missing"),
             Err(RegistryError::UnknownExtension("missing"))

@@ -1,4 +1,4 @@
-//! Optional Cranelift IR lowering and native-entry prototype for Phase 7.
+//! Optional Cranelift IR lowering and native-entry prototype for performance.
 //!
 //! This module is compiled only with `jit-cranelift`. It produces and verifies
 //! Cranelift IR text for constrained integer, array, string, property, and
@@ -82,7 +82,7 @@ struct NativeHelperCompileResult {
 
 fn leak_jit_module_for_handle_lifetime(module: JITModule) {
     // Keep Cranelift-owned executable memory alive for every copied
-    // `JitFunctionHandle`. Phase 7 intentionally leaks the module instead of
+    // `JitFunctionHandle`. performance intentionally leaks the module instead of
     // exposing a reclamation path that could invalidate raw function pointers.
     let leaked_module: &'static mut JITModule = Box::leak(Box::new(module));
     let _ = leaked_module;
@@ -533,7 +533,7 @@ pub struct CraneliftLoweringStats {
     pub verified: bool,
 }
 
-/// Standalone CLIF smoke result for Prompt 07.CL.08.
+/// Standalone CLIF smoke result for Cranelift CLIF.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CraneliftClifSmokeResult {
     /// Stable smoke function name.
@@ -4040,7 +4040,7 @@ mod tests {
 
     fn arithmetic_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/jit/eligible-int-add.php");
+        let file = builder.add_file("tests/fixtures/performance/jit/eligible-int-add.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_arithmetic", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4096,7 +4096,7 @@ mod tests {
 
     fn constant_return_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/cranelift/native/return-42.php");
+        let file = builder.add_file("tests/fixtures/performance/cranelift/native/return-42.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_const_return", FunctionFlags::default(), span);
         builder.set_return_type(function, Some(IrReturnType::Int));
@@ -4111,8 +4111,8 @@ mod tests {
 
     fn helper_arithmetic_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file =
-            builder.add_file("tests/fixtures/phase7/cranelift/helper-call/add-mul-expression.php");
+        let file = builder
+            .add_file("tests/fixtures/performance/cranelift/helper-call/add-mul-expression.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_helper_add_mul", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4165,7 +4165,8 @@ mod tests {
 
     fn helper_overflow_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/cranelift/helper-call/overflow-add.php");
+        let file =
+            builder.add_file("tests/fixtures/performance/cranelift/helper-call/overflow-add.php");
         let span = IrSpan::new(file, 0, 0);
         let function =
             builder.start_function("jit_helper_overflow", FunctionFlags::default(), span);
@@ -4205,7 +4206,7 @@ mod tests {
     fn packed_array_fetch_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
         let file =
-            builder.add_file("tests/fixtures/phase7/cranelift/arrays/packed-fetch-valid.php");
+            builder.add_file("tests/fixtures/performance/cranelift/arrays/packed-fetch-valid.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_packed_fetch", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4251,7 +4252,8 @@ mod tests {
 
     fn known_strlen_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/cranelift/known-calls/strlen-valid.php");
+        let file =
+            builder.add_file("tests/fixtures/performance/cranelift/known-calls/strlen-valid.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_known_strlen", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4291,7 +4293,7 @@ mod tests {
     fn string_concat_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
         let file =
-            builder.add_file("tests/fixtures/phase7/cranelift/string-concat/two-strings.php");
+            builder.add_file("tests/fixtures/performance/cranelift/string-concat/two-strings.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_string_concat", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4338,7 +4340,7 @@ mod tests {
     fn packed_foreach_int_sum_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
         let file = builder
-            .add_file("tests/fixtures/phase7/cranelift/arrays/packed-foreach-sum-all-int.php");
+            .add_file("tests/fixtures/performance/cranelift/arrays/packed-foreach-sum-all-int.php");
         let span = IrSpan::new(file, 0, 0);
         let function =
             builder.start_function("jit_packed_foreach_sum", FunctionFlags::default(), span);
@@ -4542,7 +4544,7 @@ mod tests {
 
     fn unsupported_binary_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/jit/rejected-dynamic.php");
+        let file = builder.add_file("tests/fixtures/performance/jit/rejected-dynamic.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_division", FunctionFlags::default(), span);
         builder.set_entry(function);
@@ -4571,7 +4573,7 @@ mod tests {
 
     fn bool_return_fixture() -> (php_ir::IrUnit, FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(0));
-        let file = builder.add_file("tests/fixtures/phase7/jit/rejected-dynamic.php");
+        let file = builder.add_file("tests/fixtures/performance/jit/rejected-dynamic.php");
         let span = IrSpan::new(file, 0, 0);
         let function = builder.start_function("jit_bool", FunctionFlags::default(), span);
         builder.set_entry(function);

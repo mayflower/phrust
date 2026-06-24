@@ -1,4 +1,4 @@
-//! Lowering context shared by Phase 3 collector passes.
+//! Lowering context shared by Semantic frontend collector passes.
 
 use crate::diagnostics::{DiagnosticReporter, SemanticDiagnostic};
 

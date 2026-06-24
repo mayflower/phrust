@@ -2,26 +2,26 @@
 
 ## Status
 
-Accepted as an experimental, default-off Phase 7 path.
+Accepted as an experimental, default-off Performance path.
 
 ## Context
 
-Phase 7 is a correctness-preserving performance phase. The interpreter, IR
+Performance is a correctness-preserving optimization layer. The interpreter, IR
 verifier, optimizer, quickening layer, inline caches, and runtime fast paths
 already provide the semantic baseline for PHP 8.5.7 behavior. A JIT experiment
-can only be useful if it consumes the existing Phase 3/4/7 pipeline and never
-becomes a second frontend, a second semantic model, or the only execution
+can only be useful if it consumes the existing frontend-to-runtime pipeline and
+never becomes a second frontend, a second semantic model, or the only execution
 strategy.
 
 Cranelift is the candidate backend because it is Rust-native, embeddable, has a
 stable IR API surface compared with hand-written machine code, and supports
 multiple host architectures through one backend. It also lets this repository
 test a real native-code path without committing to Zend Opcache JIT internals or
-platform-specific assembly in Phase 7.
+platform-specific assembly in Performance.
 
 ## Decision
 
-Phase 7 may add a `jit-cranelift` experiment, default off. The experiment is
+Performance may add a `jit-cranelift` experiment, default off. The experiment is
 allowed to add JIT API scaffolding, eligibility analysis, ABI types, smoke
 gates, optional Cranelift-backed IR lowering for a tiny subset, and guarded
 safe execution prototypes that remain interpreter-fallback-first. The default
@@ -65,7 +65,7 @@ The JIT ABI is a narrow boundary between VM-owned state and native code:
 
 No raw internal Rust reference may be stored by JIT code or survive past the
 call boundary. If `unsafe` becomes necessary, it must be isolated in a small
-module with invariants documented in `docs/safety-audit-phase7.md`.
+module with invariants documented in `docs/performance-safety-audit.md`.
 
 ## Guards and Deoptimization
 
@@ -80,7 +80,7 @@ The first JIT tier uses conservative guards:
 - guard and bailout counters are emitted so `jit-smoke` can prove fallback is
   exercised without depending on wall-clock timing.
 
-Phase 7 does not require speculative object, array, method, property, reference,
+Performance does not require speculative object, array, method, property, reference,
 or exception deoptimization.
 
 ## Code Cache Lifecycle
@@ -92,7 +92,7 @@ source/IR mismatch, unsupported platform, feature disable, failed verification,
 or guard instability.
 
 Persistent OPcache-style native code sharing, preloading, process-wide eviction,
-and FPM/SAPI worker lifecycle are outside Phase 7.
+and FPM/SAPI worker lifecycle are outside Performance.
 
 ## Safety Model
 
@@ -113,7 +113,7 @@ The safety model requires:
 
 ## Platform Boundaries
 
-The required Phase 7 behavior is portable skip or fallback. A host without
+The required Performance behavior is portable skip or fallback. A host without
 Cranelift support, executable-memory support, or a verified W^X implementation
 must compile feature-off and pass `jit-smoke` as skipped/default-off. Feature-on
 native execution may be limited to explicitly documented targets after tests
@@ -126,9 +126,9 @@ must default to `--jit=off` once a CLI switch exists. Enabling the feature is no
 the same as enabling execution; runtime flags and eligibility must still permit
 or reject each region.
 
-Prompt 07.52 adds optional dependencies on `cranelift-codegen` and
+Work item adds optional dependencies on `cranelift-codegen` and
 `cranelift-frontend` behind this feature. The current prototype builds and
-verifies Cranelift IR text. Prompt 07.53 adds `--jit=on` integration for hot,
+verifies Cranelift IR text. Work item adds `--jit=on` integration for hot,
 eligible integer leaf functions; after warmup the VM calls the Cranelift lowerer
 as compile proof and executes only a guarded safe-Rust integer evaluator. It
 does not emit executable memory, does not return native function pointers, and
@@ -138,7 +138,7 @@ runtime values.
 ## Abort Criteria
 
 The JIT experiment must stay disabled, be reverted, or be handed off to a later
-phase if any of these happen:
+layer if any of these happen:
 
 - JIT output, stderr, exit code, diagnostics, exception class, or
   timing-independent side effects diverge from interpreter output.
@@ -153,7 +153,7 @@ phase if any of these happen:
 
 ## Consequences
 
-This decision allows later Phase 7 prompts to add `php_jit`, eligibility, ABI
+This decision allows later Performance work items to add `php_jit`, eligibility, ABI
 types, smoke gates, and optional Cranelift compilation. It does not authorize a
 production JIT, shared native-code cache, Zend JIT compatibility, or any
 semantic shortcut for speed.

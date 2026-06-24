@@ -1,9 +1,9 @@
-//! Phase 6 Date/Time helpers.
+//! standard-library Date/Time helpers.
 
 use crate::{ClassEntry, ClassFlags, ObjectRef, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Deterministic Phase 6 timezone identifiers.
+/// Deterministic standard-library timezone identifiers.
 pub const TIMEZONE_IDENTIFIERS: &[&str] = &[
     "Africa/Johannesburg",
     "America/Chicago",
@@ -19,7 +19,7 @@ pub const TIMEZONE_IDENTIFIERS: &[&str] = &[
 /// Default timezone used when no request-local override is set.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
-/// Returns true when the identifier is in the deterministic Phase 6 registry.
+/// Returns true when the identifier is in the deterministic standard-library registry.
 #[must_use]
 pub fn is_valid_timezone(identifier: &str) -> bool {
     TIMEZONE_IDENTIFIERS.contains(&identifier)

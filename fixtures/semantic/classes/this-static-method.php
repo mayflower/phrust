@@ -1,6 +1,6 @@
 <?php
 
-class Prompt26StaticThis
+class StaticThisFixture
 {
     public static function deferred(): mixed
     {

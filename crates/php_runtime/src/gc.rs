@@ -1,4 +1,4 @@
-//! GC metadata and cycle-candidate scanning for Phase 5.
+//! GC metadata and cycle-candidate scanning for runtime-semantics.
 //!
 //! This module is intentionally a debug/test surface, not a PHP-visible API.
 //! It snapshots the current runtime graph without collecting anything. The VM
@@ -8,7 +8,7 @@
 use crate::{CallableValue, Slot, Value, WeakArrayHandle, WeakObjectHandle, WeakReferenceHandle};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Refcounted runtime entity kind known to the Phase 5 GC skeleton.
+/// Refcounted runtime entity kind known to the runtime-semantics GC skeleton.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum GcEntityKind {
     /// Ordered PHP array storage.
@@ -184,7 +184,7 @@ pub struct GcCollectResult {
 ///
 /// This is not a production allocator. It tracks weak handles discovered from
 /// explicit test values and can break unrooted object/reference cycles so tests
-/// can prove the Prompt 32 collector skeleton is not permanently retaining
+/// can prove the collector collector skeleton is not permanently retaining
 /// simple cycles.
 #[derive(Clone, Debug, Default)]
 pub struct GcTrackedHeap {

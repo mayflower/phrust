@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="fallback|value\n"
+// runtime-fixture: kind=valid expected_stdout="fallback|value\n"
 $value = "value";
 echo $missing ?? "fallback";
 echo "|";

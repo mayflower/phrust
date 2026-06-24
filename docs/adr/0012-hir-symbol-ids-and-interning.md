@@ -6,9 +6,9 @@ Accepted
 
 ## Context
 
-Phase 3 needs stable semantic identities for declarations, names, scopes, HIR
+Semantic frontend needs stable semantic identities for declarations, names, scopes, HIR
 nodes, types, and attributes. CST identity alone is not enough for semantic
-diagnostics or Phase 4 handoff.
+diagnostics or Runtime handoff.
 
 ## Decision
 
@@ -19,6 +19,6 @@ and are serializable for snapshots.
 ## Consequences
 
 - Semantic output can be inspected without walking raw CST nodes.
-- Phase 4 can consume HIR and semantic metadata directly.
+- Runtime can consume HIR and semantic metadata directly.
 - IDs are not promised to be stable across separate analysis runs unless a
   later incremental layer defines that contract.

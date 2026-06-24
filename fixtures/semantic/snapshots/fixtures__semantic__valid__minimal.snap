@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - function phase3_minimal
+  - function semantic_minimal
 hir_summary:
   statements: 2
   expressions: 2

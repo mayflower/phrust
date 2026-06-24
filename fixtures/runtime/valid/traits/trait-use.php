@@ -1,6 +1,6 @@
 <?php
-// phase5: kind=pass id=trait-use
-trait Phase4TraitGap
+// runtime-fixture: kind=pass id=trait-use
+trait RuntimeTraitGap
 {
     public function label(): string
     {
@@ -8,9 +8,9 @@ trait Phase4TraitGap
     }
 }
 
-class Phase4UsesTraitGap
+class RuntimeUsesTraitGap
 {
-    use Phase4TraitGap;
+    use RuntimeTraitGap;
 }
 
-echo (new Phase4UsesTraitGap())->label();
+echo (new RuntimeUsesTraitGap())->label();

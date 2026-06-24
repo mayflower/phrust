@@ -1,4 +1,4 @@
-//! Conservative JIT eligibility analysis for Phase 7.
+//! Conservative JIT eligibility analysis for performance.
 //!
 //! The analysis deliberately accepts only a tiny primitive, leaf-function IR
 //! subset. Anything with PHP-visible dynamic behavior is rejected or marked
@@ -10,7 +10,7 @@ use php_ir::{
     IrFunction, IrParam, IrReturnType, IrUnit, Operand, UnaryOp,
 };
 
-/// Stable candidate kind assigned by the Phase 7 eligibility analyzer.
+/// Stable candidate kind assigned by the performance eligibility analyzer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JitCandidateKind {
     /// A conservative leaf function containing only int-local operations.
@@ -45,7 +45,7 @@ impl JitCandidateKind {
 /// Eligibility state for one JIT candidate region.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JitEligibility {
-    /// Region is inside the Phase 7 primitive subset.
+    /// Region is inside the performance primitive subset.
     Eligible,
     /// Region is outside the subset for a stable, machine-readable reason.
     Rejected { reason: JitEligibilityReason },
@@ -214,7 +214,7 @@ impl JitEligibilityReport {
     }
 }
 
-/// Analyzes one function in a unit for Phase 7 JIT eligibility.
+/// Analyzes one function in a unit for performance JIT eligibility.
 #[must_use]
 pub fn analyze_jit_eligibility(unit: &IrUnit, function: FunctionId) -> JitEligibilityReport {
     let Some(ir_function) = unit.functions.get(function.index()) else {
@@ -1359,7 +1359,7 @@ fn check_function_shape(
     if function.flags.is_generator {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_GENERATOR",
-            "generators are outside the Phase 7 JIT subset",
+            "generators are outside the performance JIT subset",
         ));
     }
     if function.flags.is_closure && !function.captures.is_empty() {
@@ -1371,7 +1371,7 @@ fn check_function_shape(
     if function.returns_by_ref {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_BY_REF_RETURN",
-            "by-reference returns are outside the Phase 7 JIT subset",
+            "by-reference returns are outside the performance JIT subset",
         ));
     }
     if function.blocks.is_empty() {

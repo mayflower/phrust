@@ -1,4 +1,4 @@
-//! Phase 4 VM CLI.
+//! VM CLI.
 
 use php_bytecode_cache::{
     CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-mod todo_phase4;
+mod todo_cli;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_COMPILE_ERROR: i32 = 2;
@@ -95,7 +95,7 @@ where
         return Err("dump-cranelift-clif does not accept arguments".to_string());
     }
     let result = php_jit::build_trivial_add_clif_smoke().map_err(|error| error.to_string())?;
-    let output_dir = workspace_relative_path("target/phase7/cranelift");
+    let output_dir = workspace_relative_path("target/performance/cranelift");
     fs::create_dir_all(&output_dir).map_err(|error| {
         format!(
             "{}: failed to create CLIF output directory: {error}",
@@ -288,11 +288,9 @@ where
         };
         write_counters_json(path.clone(), counters)?;
     }
-    if run_options.jit_stats.is_json() && result.counters.is_some() {
-        let counters = result
-            .counters
-            .as_ref()
-            .expect("checked is_some before writing jit stats");
+    if run_options.jit_stats.is_json()
+        && let Some(counters) = result.counters.as_ref()
+    {
         write_jit_stats_json(stderr, counters, &run_options, &jit_eligibility_json)?;
     }
     if let Some(path) = run_options.tiering_stats_json {
@@ -452,7 +450,7 @@ fn compile_pipeline_with_optimization(
         && lowering.diagnostics.is_empty()
         && lowering.verification.is_ok()
     {
-        let report = PassPipeline::phase7()
+        let report = PassPipeline::performance()
             .run(&mut lowering.unit, &PassContext::new(opt_level))
             .map_err(|error| format!("{path}: optimizer failed: {error}"))?;
         lowering.verification = verify_unit(&lowering.unit);
@@ -1139,7 +1137,6 @@ fn parse_jit_mode(value: &str) -> Result<JitMode, String> {
         "off" => Ok(JitMode::Off),
         "noop" => Ok(JitMode::Noop),
         "cranelift" => Ok(JitMode::Cranelift),
-        "on" => Ok(JitMode::On),
         _ => Err(format!(
             "unsupported jit mode `{value}`; expected off, noop, or cranelift"
         )),
@@ -1276,7 +1273,7 @@ fn store_bytecode_cache(
     }
     let header = CacheHeader::new(
         env!("CARGO_PKG_VERSION"),
-        "phase7-ir-cache-abi-1",
+        "performance-ir-cache-abi-1",
         rust_target_label(),
         context.fingerprint.clone(),
     );
@@ -1303,7 +1300,7 @@ fn store_bytecode_cache(
 }
 
 fn default_bytecode_cache_dir() -> PathBuf {
-    PathBuf::from("target/phase7/bytecode-cache")
+    PathBuf::from("target/performance/bytecode-cache")
 }
 
 fn cache_file_for(cache_dir: &Path, fingerprint: &CacheFingerprint) -> Result<PathBuf, String> {
@@ -1620,7 +1617,7 @@ fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
-        todo_phase4::cli_skeleton_status()
+        todo_cli::cli_skeleton_status()
     )
     .map_err(|error| error.to_string())
 }
@@ -2008,7 +2005,7 @@ mod tests {
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn dump_cranelift_clif_writes_verified_standalone_smoke() {
-        let output = workspace_root().join("target/phase7/cranelift/trivial_add.clif");
+        let output = workspace_root().join("target/performance/cranelift/trivial_add.clif");
         let _ = fs::remove_file(&output);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2083,13 +2080,13 @@ mod tests {
         );
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"hello phase4\n");
+        assert_eq!(stdout, b"hello runtime\n");
     }
 
     #[test]
-    fn opt_level_one_reports_phase7_optimizer_passes() {
+    fn opt_level_one_reports_perf_optimizer_passes() {
         let pipeline = compile_pipeline_with_optimization(
-            &fixture("tests/fixtures/phase7/perf_smoke/arithmetic.php"),
+            &fixture("tests/fixtures/performance/perf_smoke/arithmetic.php"),
             OptimizationLevel::O1,
         )
         .expect("fixture should compile");
@@ -2098,18 +2095,18 @@ mod tests {
         let report = pipeline.optimizer.expect("level 1 should run optimizer");
         assert_eq!(report.level, OptimizationLevel::O1);
         assert_eq!(report.enabled_pass_count(), 5);
-        assert_eq!(report.passes[0].name, "phase7_pre_verify_noop");
+        assert_eq!(report.passes[0].name, "perf_pre_verify_noop");
         assert_eq!(report.passes[1].name, "constant_folding_safe_subset");
         assert_eq!(report.passes[2].name, "peephole_simplify");
         assert_eq!(report.passes[3].name, "branch_simplify");
-        assert_eq!(report.passes[4].name, "phase7_post_verify_noop");
+        assert_eq!(report.passes[4].name, "perf_post_verify_noop");
         assert!(report.passes.iter().all(|pass| pass.source_spans_preserved));
     }
 
     #[test]
     fn opt_level_zero_has_no_optimizer_report() {
         let pipeline = compile_pipeline_with_optimization(
-            &fixture("tests/fixtures/phase7/perf_smoke/arithmetic.php"),
+            &fixture("tests/fixtures/performance/perf_smoke/arithmetic.php"),
             OptimizationLevel::O0,
         )
         .expect("fixture should compile");
@@ -2119,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn run_opt_level_zero_and_one_are_identical_for_phase7_fixtures() {
+    fn run_opt_level_zero_and_one_are_identical_for_perf_fixtures() {
         for fixture in optimizer_fixture_paths() {
             let mut stdout_zero = Vec::new();
             let mut stderr_zero = Vec::new();
@@ -2284,7 +2281,7 @@ mod tests {
         );
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"hello phase4\n");
+        assert_eq!(stdout, b"hello runtime\n");
         assert!(stderr.is_empty());
         let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
         let _ = std::fs::remove_file(&path);
@@ -2318,7 +2315,7 @@ mod tests {
         );
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"hello phase4\n");
+        assert_eq!(stdout, b"hello runtime\n");
         assert!(stderr.is_empty());
         let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
         let _ = std::fs::remove_file(&path);
@@ -2336,7 +2333,7 @@ mod tests {
                 "run".to_string(),
                 "--jit=noop".to_string(),
                 "--jit-threshold=5".to_string(),
-                "--jit-dump-clif=target/phase7/cranelift/noop.clif".to_string(),
+                "--jit-dump-clif=target/performance/cranelift/noop.clif".to_string(),
                 "--jit-stats=json".to_string(),
                 fixture("fixtures/runtime/valid/hello.php"),
             ],
@@ -2345,7 +2342,7 @@ mod tests {
         );
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"hello phase4\n");
+        assert_eq!(stdout, b"hello runtime\n");
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains("\"mode\":\"noop\""));
         assert!(stderr.contains("\"threshold\":5"));
@@ -2353,7 +2350,7 @@ mod tests {
         assert!(stderr.contains("\"max_compile_us\":18446744073709551615"));
         assert!(stderr.contains("\"max_functions\":18446744073709551615"));
         assert!(stderr.contains("\"blacklist\":\"on\""));
-        assert!(stderr.contains("\"dump_clif\":\"target/phase7/cranelift/noop.clif\""));
+        assert!(stderr.contains("\"dump_clif\":\"target/performance/cranelift/noop.clif\""));
         assert!(stderr.contains("\"side_exit_reasons\":{}"));
         assert!(stderr.contains("\"blacklisted_regions\":0"));
         assert!(stderr.contains("\"blacklist_reasons\":{}"));
@@ -2393,19 +2390,19 @@ mod tests {
     fn cranelift_jit_stats_reports_eligibility_json_for_fixtures() {
         let fixtures = [
             (
-                "tests/fixtures/phase7/cranelift/eligibility/eligible-int-leaf.php",
+                "tests/fixtures/performance/cranelift/eligibility/eligible-int-leaf.php",
                 "\"candidate_kind\":\"IntLeafCandidate\"",
             ),
             (
-                "tests/fixtures/phase7/cranelift/eligibility/rejected-array-op.php",
+                "tests/fixtures/performance/cranelift/eligibility/rejected-array-op.php",
                 "JIT_ELIGIBILITY_REJECT_ARRAY_OPCODE",
             ),
             (
-                "tests/fixtures/phase7/cranelift/eligibility/rejected-call.php",
+                "tests/fixtures/performance/cranelift/eligibility/rejected-call.php",
                 "JIT_ELIGIBILITY_REJECT_CALL_OPCODE",
             ),
             (
-                "tests/fixtures/phase7/cranelift/eligibility/rejected-untyped-param.php",
+                "tests/fixtures/performance/cranelift/eligibility/rejected-untyped-param.php",
                 "JIT_ELIGIBILITY_REJECT_UNTYPED_PARAM",
             ),
         ];
@@ -2514,7 +2511,7 @@ mod tests {
         let args = vec![
             "--bytecode-cache=read-write".to_string(),
             "--bytecode-cache-dir".to_string(),
-            "target/phase7/cli-cache".to_string(),
+            "target/performance/cli-cache".to_string(),
             "--bytecode-cache-stats".to_string(),
             "--clear-bytecode-cache".to_string(),
             "--opt-level=1".to_string(),
@@ -2527,7 +2524,7 @@ mod tests {
             "2".to_string(),
             "--jit-eager".to_string(),
             "--jit-blacklist=off".to_string(),
-            "--jit-dump-clif=target/phase7/cranelift/run.clif".to_string(),
+            "--jit-dump-clif=target/performance/cranelift/run.clif".to_string(),
             "--jit-stats=json".to_string(),
             "--tiering=off".to_string(),
             "--tiering-function-threshold=3".to_string(),
@@ -2536,7 +2533,7 @@ mod tests {
             "--tiering-ic-stability-threshold=5".to_string(),
             "--tiering-guard-failure-threshold".to_string(),
             "6".to_string(),
-            "--tiering-stats-json=target/phase7/tiering.json".to_string(),
+            "--tiering-stats-json=target/performance/tiering.json".to_string(),
             "fixtures/runtime/valid/hello.php".to_string(),
         ];
 
@@ -2545,7 +2542,7 @@ mod tests {
         assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::ReadWrite);
         assert_eq!(
             options.bytecode_cache.dir,
-            Some(PathBuf::from("target/phase7/cli-cache"))
+            Some(PathBuf::from("target/performance/cli-cache"))
         );
         assert!(options.bytecode_cache.stats);
         assert!(options.bytecode_cache.clear);
@@ -2557,7 +2554,7 @@ mod tests {
         assert_eq!(options.jit_blacklist, JitBlacklistMode::Off);
         assert_eq!(
             options.jit_dump_clif,
-            Some("target/phase7/cranelift/run.clif".to_string())
+            Some("target/performance/cranelift/run.clif".to_string())
         );
         assert_eq!(options.jit_stats, JitStatsMode::Json);
         assert!(!options.tiering.enabled);
@@ -2571,7 +2568,7 @@ mod tests {
         assert_eq!(options.tiering.guard_failure_threshold, 6);
         assert_eq!(
             options.tiering_stats_json,
-            Some("target/phase7/tiering.json".to_string())
+            Some("target/performance/tiering.json".to_string())
         );
     }
 
@@ -2594,7 +2591,7 @@ mod tests {
         );
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"hello phase4\n");
+        assert_eq!(stdout, b"hello runtime\n");
         assert!(stderr.is_empty());
         let json = std::fs::read_to_string(&path).expect("tiering JSON should be written");
         let _ = std::fs::remove_file(&path);
@@ -2607,7 +2604,7 @@ mod tests {
     fn run_bytecode_cache_first_write_then_second_read_hits() {
         let cache_dir = cache_test_dir("write-read");
         reset_dir(&cache_dir);
-        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let fixture = fixture("tests/fixtures/performance/bytecode_cache/simple.php");
 
         let first = run_cache_fixture_with_mode(&fixture, &cache_dir, "0", "write");
         assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
@@ -2646,7 +2643,7 @@ mod tests {
     fn run_bytecode_cache_opt_level_change_misses() {
         let cache_dir = cache_test_dir("opt-level-change");
         reset_dir(&cache_dir);
-        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let fixture = fixture("tests/fixtures/performance/bytecode_cache/simple.php");
 
         let first = run_cache_fixture(&fixture, &cache_dir, "0");
         assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
@@ -2663,7 +2660,7 @@ mod tests {
     fn run_bytecode_cache_corrupt_cache_does_not_block_execution() {
         let cache_dir = cache_test_dir("corrupt");
         reset_dir(&cache_dir);
-        let fixture = fixture("tests/fixtures/phase7/bytecode_cache/simple.php");
+        let fixture = fixture("tests/fixtures/performance/bytecode_cache/simple.php");
 
         let first = run_cache_fixture(&fixture, &cache_dir, "0");
         assert_eq!(first.0, EXIT_SUCCESS, "{}", first.2);
@@ -2680,7 +2677,7 @@ mod tests {
 
     #[test]
     fn run_bytecode_cache_rejects_non_hex_digest_path_component() {
-        let cache_dir = PathBuf::from("target/phase7/cli-cache");
+        let cache_dir = PathBuf::from("target/performance/cli-cache");
         let mut fingerprint = CacheFingerprint::from_inputs(
             CacheFingerprintInput::new(b"<?php echo 1;\n", env!("CARGO_PKG_VERSION"), "test")
                 .with_feature_flag("bytecode_cache", true),
@@ -2758,7 +2755,7 @@ mod tests {
         assert!(stdout.contains("## VM Output"));
         assert!(stdout.contains("## Runtime Diagnostics"));
         assert!(stdout.contains("## Known-Gap Status"));
-        assert!(stdout.contains("hello phase4"));
+        assert!(stdout.contains("hello runtime"));
     }
 
     #[test]
@@ -2930,7 +2927,7 @@ mod tests {
 
     fn cache_test_dir(name: &str) -> PathBuf {
         workspace_root().join(format!(
-            "target/phase7/cli-cache-tests/{}-{}",
+            "target/performance/cli-cache-tests/{}-{}",
             name,
             std::process::id()
         ))
@@ -2953,8 +2950,8 @@ mod tests {
     fn optimizer_fixture_paths() -> Vec<String> {
         let mut fixtures = Vec::new();
         for dir in [
-            workspace_root().join("tests/fixtures/phase7/perf_smoke"),
-            workspace_root().join("tests/fixtures/phase7/bytecode_cache"),
+            workspace_root().join("tests/fixtures/performance/perf_smoke"),
+            workspace_root().join("tests/fixtures/performance/bytecode_cache"),
         ] {
             for entry in fs::read_dir(&dir).expect("read optimizer fixture dir") {
                 let path = entry.expect("read optimizer fixture entry").path();

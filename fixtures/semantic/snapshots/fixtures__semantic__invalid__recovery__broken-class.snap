@@ -4,7 +4,7 @@ semantic_ok: false
 diagnostics:
   []
 symbols:
-  - class Prompt33BrokenClass
+  - class RecoveryBrokenClass
 hir_summary:
   statements: 0
   expressions: 0

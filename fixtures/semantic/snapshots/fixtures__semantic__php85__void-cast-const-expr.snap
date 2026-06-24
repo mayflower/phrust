@@ -5,13 +5,13 @@ diagnostics:
   - id: E_PHP_INVALID_VOID_CAST
     severity: error
     phase: hir_lowering
-    span: 33..41
+    span: 44..52
   - id: N_PHP_RUNTIME_CHECK_DEFERRED
     severity: note
     phase: hir_lowering
-    span: 33..41
+    span: 44..52
 symbols:
-  - constant PROMPT32_VOID_CAST
+  - constant SEMANTIC_CONST_EXPR_VOID_CAST
 hir_summary:
   statements: 0
   expressions: 2

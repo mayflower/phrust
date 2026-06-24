@@ -8,7 +8,7 @@ Accepted
 
 The project needs `php-src` as a reference oracle, but committing a full source
 copy would increase repository size and create license/provenance complexity.
-Phase 0 only needs a local checkout, lockfile, and metadata.
+Foundation only needs a local checkout, lockfile, and metadata.
 
 ## Decision
 
@@ -35,7 +35,7 @@ live under `references/`.
 - Commit a vendored `php-src` copy. Rejected because it is large and creates
   unnecessary provenance risk.
 - Use a Git submodule. Deferred; it adds workflow complexity and is not needed
-  for Phase 0.
+  for Foundation.
 - Use a source tarball with a checksum. Deferred; it is viable but less
   convenient for metadata extraction and source inspection.
 

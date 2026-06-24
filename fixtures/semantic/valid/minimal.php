@@ -1,6 +1,6 @@
 <?php
 
-function phase3_minimal(): int
+function semantic_minimal(): int
 {
     return 1;
 }

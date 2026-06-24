@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - constant PROMPT29_CONST_EXPR_NEW
+  - constant SEMANTIC_CONST_EXPR_CONST_EXPR_NEW
 hir_summary:
   statements: 0
   expressions: 2

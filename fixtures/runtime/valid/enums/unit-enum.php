@@ -1,8 +1,8 @@
 <?php
-// phase5: kind=pass id=unit-enum
-enum Phase4StatusGap
+// runtime-fixture: kind=pass id=unit-enum
+enum RuntimeStatusGap
 {
     case Ready;
 }
 
-echo Phase4StatusGap::Ready->name;
+echo RuntimeStatusGap::Ready->name;

@@ -7,7 +7,7 @@ diagnostics:
     phase: declaration_collection
     span: 22..36
 symbols:
-  - function prompt27_strict_types_late
+  - function strict_types_late_fixture
 hir_summary:
   statements: 4
   expressions: 4

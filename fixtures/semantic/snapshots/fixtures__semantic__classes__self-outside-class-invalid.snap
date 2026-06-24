@@ -5,9 +5,9 @@ diagnostics:
   - id: E_PHP_INVALID_CLASS_CONTEXT_NAME
     severity: error
     phase: class_like_validation
-    span: 52..56
+    span: 51..55
 symbols:
-  - function prompt26_self_outside
+  - function self_outside_fixture
 hir_summary:
   statements: 2
   expressions: 5

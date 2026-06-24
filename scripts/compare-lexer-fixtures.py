@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential fixture harness for Phase 1 lexer work."""
+"""Differential fixture harness for Lexer lexer work."""
 
 from __future__ import annotations
 

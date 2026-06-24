@@ -1,3 +1,3 @@
 <?php
-// phase4: kind=valid expected_stdout="hello phase4\n"
-echo "hello phase4\n";
+// runtime-fixture: kind=valid expected_stdout="hello runtime\n"
+echo "hello runtime\n";

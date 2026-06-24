@@ -1,4 +1,4 @@
-//! Runtime fixture differential runner for Phase 4.
+//! Runtime fixture differential runner for runtime.
 
 use php_testkit::normalize_output::normalize_runtime_stderr;
 use php_testkit::runtime_fixture::{
@@ -102,7 +102,7 @@ fn run() -> Result<RuntimeReport, String> {
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut fixtures_root = PathBuf::from("fixtures/runtime");
-    let mut out_dir = PathBuf::from("target/phase4/runtime-diff");
+    let mut out_dir = PathBuf::from("target/runtime/runtime-diff");
     let mut rust_vm = env::var_os("PHP_VM_CLI").map(PathBuf::from);
     let args = args.into_iter().collect::<Vec<_>>();
     let mut index = 0;
@@ -131,7 +131,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             }
             "--help" | "-h" => {
                 return Err(
-                    "Usage: compare-runtime [--fixtures fixtures/runtime] [--out target/phase4/runtime-diff] [--rust-vm target/debug/php-vm]"
+                    "Usage: compare-runtime [--fixtures fixtures/runtime] [--out target/runtime/runtime-diff] [--rust-vm target/debug/php-vm]"
                         .to_string(),
                 );
             }

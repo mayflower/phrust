@@ -1,4 +1,4 @@
-//! Phase 3 HIR skeleton.
+//! Semantic frontend HIR skeleton.
 
 pub mod arena;
 pub mod attributes;

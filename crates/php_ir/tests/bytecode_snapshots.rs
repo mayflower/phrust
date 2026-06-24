@@ -78,7 +78,7 @@ fn lowered_include_snapshot_is_stable() {
     assert_eq!(actual, expected);
 }
 
-const PHASE5_INTERNAL_CLASS_SNAPSHOT: &str = concat!(
+const RUNTIME_SEMANTICS_INTERNAL_CLASS_SNAPSHOT: &str = concat!(
     "  class:0 \"traversable\" parent=None interfaces=[] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
     "  class:1 \"iterator\" parent=None interfaces=[\"traversable\"] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
     "  class:2 \"iteratoraggregate\" parent=None interfaces=[\"traversable\"] methods=0 properties=0 constructor=none flags=abstract:true final:false readonly:false interface:true span=file:0@0..0\n",
@@ -92,7 +92,7 @@ const PHASE5_INTERNAL_CLASS_SNAPSHOT: &str = concat!(
 fn lowered_expected(snapshot: &str) -> String {
     snapshot.replace(
         "classes:\nfunction_table:",
-        &format!("classes:\n{PHASE5_INTERNAL_CLASS_SNAPSHOT}function_table:"),
+        &format!("classes:\n{RUNTIME_SEMANTICS_INTERNAL_CLASS_SNAPSHOT}function_table:"),
     )
 }
 

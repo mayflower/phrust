@@ -1,7 +1,7 @@
 <?php
-class Prompt28PrivateCloneWith {
+class PrivateCloneWithFixture {
     private $value;
 }
 
-$original = new Prompt28PrivateCloneWith();
+$original = new PrivateCloneWithFixture();
 $copy = clone($original, ["value" => 1]);

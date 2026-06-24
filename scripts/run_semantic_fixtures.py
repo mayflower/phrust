@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Phase 3 semantic fixtures through the Rust frontend skeleton."""
+"""Run Semantic frontend semantic fixtures through the Rust frontend skeleton."""
 
 from __future__ import annotations
 

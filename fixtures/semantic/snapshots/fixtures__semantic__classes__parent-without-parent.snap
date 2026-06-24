@@ -5,9 +5,9 @@ diagnostics:
   - id: E_PHP_INVALID_CLASS_CONTEXT_NAME
     severity: error
     phase: class_like_validation
-    span: 79..85
+    span: 78..84
 symbols:
-  - class Prompt26NoParent
+  - class NoParentFixture
 hir_summary:
   statements: 2
   expressions: 5

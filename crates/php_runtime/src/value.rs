@@ -13,7 +13,7 @@ pub enum CallableValue {
         /// Normalized function name.
         name: String,
     },
-    /// Phase 4 closure value. The function ID is stored as its stable raw IR ID
+    /// runtime closure value. The function ID is stored as its stable raw IR ID
     /// to keep `php_runtime` independent from `php_ir`.
     Closure {
         /// Raw `php_ir::FunctionId`.
@@ -183,7 +183,7 @@ impl Value {
         }
     }
 
-    /// Creates a Phase 4 closure callable value.
+    /// Creates a runtime closure callable value.
     #[must_use]
     pub fn closure(function: u32, captures: Vec<ClosureCaptureValue>) -> Self {
         Self::Callable(CallableValue::Closure { function, captures })
@@ -217,7 +217,7 @@ impl Value {
         })
     }
 
-    /// Returns closure payload when this value is a Phase 4 closure.
+    /// Returns closure payload when this value is a runtime closure.
     #[must_use]
     pub const fn as_closure(&self) -> Option<(u32, &Vec<ClosureCaptureValue>)> {
         match self {

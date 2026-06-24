@@ -1,8 +1,8 @@
-//! Phase 4 runtime boundary.
+//! Runtime boundary.
 //!
 //! This crate will own runtime values, output buffering, runtime diagnostics,
 //! exit classification, tables, builtins, and controlled runtime context. At
-//! Prompt 07 it exposes the minimal scalar value and output model used by the
+//! runtime scalar it exposes the minimal scalar value and output model used by the
 //! first VM slices.
 
 pub mod array;
@@ -27,7 +27,7 @@ pub mod resource;
 pub mod serialization;
 pub mod status;
 pub mod string;
-pub mod todo_phase4;
+pub mod todo_runtime;
 pub mod tokenizer;
 pub mod types;
 pub mod value;
@@ -86,22 +86,22 @@ pub use resource::{
 pub use serialization::{SerializationError, UnserializeOptions, serialize, unserialize};
 pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
-pub use todo_phase4::{Phase4RuntimeTodo, runtime_skeleton_status};
+pub use todo_runtime::{RuntimeTodo, runtime_skeleton_status};
 pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
 pub use value::{CallableValue, ClosureCaptureValue, FloatValue, Value};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CallableValue, ExecutionStatus, ExitStatus, OutputBuffer, Phase4RuntimeTodo, PhpString,
-        Value, runtime_skeleton_status,
+        CallableValue, ExecutionStatus, ExitStatus, OutputBuffer, PhpString, RuntimeTodo, Value,
+        runtime_skeleton_status,
     };
 
     #[test]
-    fn exposes_prompt01_runtime_skeleton() {
-        let todo = Phase4RuntimeTodo::new("values, diagnostics, output, and context");
+    fn exposes_runtime_skeleton() {
+        let todo = RuntimeTodo::new("values, diagnostics, output, and context");
         assert_eq!(todo.area(), "values, diagnostics, output, and context");
-        assert_eq!(runtime_skeleton_status(), "phase4-runtime-skeleton");
+        assert_eq!(runtime_skeleton_status(), "runtime-skeleton");
         assert_eq!(
             php_testkit::reference_checkout_path(),
             "third_party/php-src"
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_values_cover_prompt15_creation_variants() {
+    fn callable_values_cover_creation_variants() {
         let user = Value::user_function_callable("foo");
         let builtin = Value::internal_builtin_callable("trim");
         let method = Value::method_callable_placeholder("C::m");

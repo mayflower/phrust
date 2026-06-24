@@ -1,6 +1,6 @@
 <?php
 
-class Prompt26NoParent
+class NoParentFixture
 {
     public function ping(): void
     {

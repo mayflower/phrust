@@ -124,7 +124,7 @@ mod tests {
             }
             RuntimeReferenceRun::Completed(output) => {
                 assert_eq!(output.exit_code, Some(0));
-                assert_eq!(output.stdout, "hello phase4\n");
+                assert_eq!(output.stdout, "hello runtime\n");
                 assert!(!output.timeout);
             }
             RuntimeReferenceRun::Error { reason } => panic!("{reason}"),

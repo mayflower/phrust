@@ -2,17 +2,17 @@
 
 ## Status
 
-Accepted as a Phase 7 addendum scope record.
+Accepted as a Performance addendum scope record.
 
 ## Context
 
-Phase 7 already contains a conservative, default-off JIT experiment described
+Performance already contains a conservative, default-off JIT experiment described
 by `docs/adr/0076-cranelift-jit-experiment.md`. That experiment proves the
 repository can keep Cranelift optional while preserving interpreter fallback,
 but it does not yet define a complete big-win plan for native-code-backed
 optimization work.
 
-The Cranelift addendum starts after the Phase 7 counter, benchmark, tiering,
+The Cranelift addendum starts after the Performance counter, benchmark, tiering,
 quickening, inline-cache, and initial JIT surfaces exist. It must keep the same
 pipeline:
 
@@ -27,7 +27,7 @@ semantics.
 
 ## Decision
 
-The addendum may extend Phase 7 with a backend-neutral JIT API and a
+The addendum may extend Performance with a backend-neutral JIT API and a
 Cranelift-backed implementation for a small set of high-value regions. The
 feature stays default-off, Cranelift dependencies stay behind `jit-cranelift`,
 and every optimized path needs a deterministic interpreter fallback and
@@ -71,7 +71,7 @@ This addendum does not authorize:
 | JIT memory ownership | Keep executable memory absent until a small owner type, lifecycle tests, and W^X or equivalent policy are documented and audited. |
 | ABI unsafety | Use `repr(C)` boundary types for VM handles, values, callouts, and exits. Do not pass raw Rust references into native code. |
 | Side exits | Every guard failure, unsupported value, helper failure, and stale metadata case must return a structured side-exit reason and resume the interpreter at a known safe point. |
-| Platform support | Unsupported hosts must skip or fall back cleanly. Standard Phase 7 verification must not require native JIT support. |
+| Platform support | Unsupported hosts must skip or fall back cleanly. Standard Performance verification must not require native JIT support. |
 | Semantic drift | Every optimized fixture must pass `--jit=off` versus `--jit=on` comparisons before any performance report is accepted. |
 | Benchmark noise | Machine-readable reports must store environment metadata, feature flags, counters, and correctness status. Wall-clock data stays advisory unless paired with stable correctness evidence. |
 
@@ -90,6 +90,6 @@ Each big-win path is complete only when it has:
 ## Consequences
 
 The addendum can incrementally grow native-code coverage without changing the
-Phase 7 default behavior. It also creates a stricter stop rule: if a prompt
-cannot prove correctness with the relevant diff and smoke gates, the next prompt
+Performance default behavior. It also creates a stricter stop rule: if a work item
+cannot prove correctness with the relevant diff and smoke gates, the next work item
 must not start.

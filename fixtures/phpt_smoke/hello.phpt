@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT hello
+runtime PHPT hello
 --FILE--
 <?php
 echo "hello phpt\n";

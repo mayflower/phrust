@@ -1272,7 +1272,7 @@ fn php_tag_space_len(cursor: &crate::cursor::Cursor<'_>, offset: usize) -> usize
     }
 }
 
-/// Lexes an entire source string with placeholder Phase 1 behavior.
+/// Lexes an entire source string with placeholder Lexer behavior.
 #[must_use]
 pub fn lex_all(source: &str, config: LexerConfig) -> LexResult {
     let mut lexer = Lexer::new(source, config);

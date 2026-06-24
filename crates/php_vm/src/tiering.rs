@@ -1,4 +1,4 @@
-//! Request-local tiering policy and stats for Phase 7 adaptive execution.
+//! Request-local tiering policy and stats for performance adaptive execution.
 
 use std::collections::BTreeMap;
 
@@ -166,11 +166,11 @@ impl TieringState {
         let hotness = self.functions.entry(function.raw()).or_default();
         hotness.entries = hotness.entries.saturating_add(1);
 
-        let jit_enabled = matches!(jit, JitMode::Cranelift | JitMode::LegacyOn);
+        let jit_enabled = matches!(jit, JitMode::Cranelift);
         let hot_by_entry = hotness.entries >= self.options.function_entry_threshold;
         let hot_by_backedge = hotness.backedges >= self.options.loop_backedge_threshold;
         let guards_stable = self.stats.guard_failure_score < self.options.guard_failure_threshold;
-        let tier = if jit_enabled
+        if jit_enabled
             && guards_stable
             && (self.options.jit_eager || hot_by_entry || hot_by_backedge)
         {
@@ -193,8 +193,7 @@ impl TieringState {
             self.stats.tier0_interpreter_entries =
                 self.stats.tier0_interpreter_entries.saturating_add(1);
             ExecutionTier::Interpreter
-        };
-        tier
+        }
     }
 
     pub fn record_loop_backedge(
@@ -301,7 +300,7 @@ mod tests {
         });
 
         assert_eq!(
-            state.record_function_entry(FunctionId::new(1), QuickeningMode::On, JitMode::On),
+            state.record_function_entry(FunctionId::new(1), QuickeningMode::On, JitMode::Cranelift),
             ExecutionTier::Interpreter
         );
         assert_eq!(state.stats().tiering_disabled_entries, 1);
@@ -400,7 +399,7 @@ mod tests {
         });
 
         assert_eq!(
-            state.record_function_entry(FunctionId::new(1), QuickeningMode::On, JitMode::On),
+            state.record_function_entry(FunctionId::new(1), QuickeningMode::On, JitMode::Cranelift),
             ExecutionTier::Interpreter
         );
         assert_eq!(state.stats().guard_failure_score, 2);

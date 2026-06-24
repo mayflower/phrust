@@ -1,6 +1,6 @@
-# Phase 7 Cranelift CLIF Dump
+# Performance Cranelift CLIF Dump
 
-Prompt 07.CL.08 adds a standalone Cranelift IR smoke that does not consume PHP
+Work item.08 adds a standalone Cranelift IR smoke that does not consume PHP
 IR and does not execute native code. The smoke builds one deterministic
 function:
 
@@ -22,7 +22,7 @@ The command runs `php-vm dump-cranelift-clif` with the `jit-cranelift` feature
 enabled and writes:
 
 ```text
-target/phase7/cranelift/trivial_add.clif
+target/performance/cranelift/trivial_add.clif
 ```
 
 `target/` output is generated evidence and must not be committed.
@@ -40,4 +40,4 @@ contain:
 The command fails if the Cranelift verifier rejects the generated function.
 Because this smoke is standalone, a passing dump does not prove PHP IR lowering,
 JIT eligibility, native execution, side exits, helper calls, or runtime
-correctness. Those are later addendum prompts.
+correctness. Those are later addendum work items.

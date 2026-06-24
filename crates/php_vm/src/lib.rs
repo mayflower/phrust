@@ -1,7 +1,7 @@
-//! Phase 4 interpreter VM boundary.
+//! Interpreter VM boundary.
 //!
 //! This crate will own compiled units, frames, registers, dispatch, calls,
-//! control flow, exceptions, includes, tracing, and VM results. Prompt 01 keeps
+//! control flow, exceptions, includes, tracing, and VM results. The current layer keeps
 //! it as a compile-tested skeleton only.
 
 pub mod compiled_unit;
@@ -14,7 +14,7 @@ pub mod literal_pool;
 pub mod quickening;
 pub mod std_builtins;
 pub mod tiering;
-pub mod todo_phase4;
+pub mod todo_runtime;
 pub mod vm;
 
 pub use compiled_unit::CompiledUnit;
@@ -37,26 +37,23 @@ pub use quickening::{
     QuickeningTable,
 };
 pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
-pub use todo_phase4::{Phase4VmTodo, vm_skeleton_status};
+pub use todo_runtime::{VmTodo, vm_skeleton_status};
 pub use vm::{JitBlacklistMode, JitMode, Vm, VmOptions, VmResult};
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase4VmTodo, vm_skeleton_status};
+    use super::{VmTodo, vm_skeleton_status};
 
     #[test]
-    fn exposes_prompt01_vm_skeleton() {
-        let todo = Phase4VmTodo::new("compiled units, frames, registers, and dispatch");
+    fn exposes_vm_skeleton() {
+        let todo = VmTodo::new("compiled units, frames, registers, and dispatch");
         assert_eq!(
             todo.area(),
             "compiled units, frames, registers, and dispatch"
         );
-        assert_eq!(vm_skeleton_status(), "phase4-vm-skeleton");
-        assert_eq!(php_ir::ir_skeleton_status(), "phase4-ir-core-model");
-        assert_eq!(
-            php_runtime::runtime_skeleton_status(),
-            "phase4-runtime-skeleton"
-        );
+        assert_eq!(vm_skeleton_status(), "vm-skeleton");
+        assert_eq!(php_ir::ir_skeleton_status(), "ir-core-model");
+        assert_eq!(php_runtime::runtime_skeleton_status(), "runtime-skeleton");
         assert_eq!(
             php_testkit::reference_checkout_path(),
             "third_party/php-src"

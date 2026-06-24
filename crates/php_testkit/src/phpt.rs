@@ -1,4 +1,4 @@
-//! Minimal PHPT metadata parser for selected Phase 4 smoke tests.
+//! Minimal PHPT metadata parser for selected runtime smoke tests.
 //!
 //! This is intentionally not a replacement for PHP's `run-tests.php`. It
 //! supports only the small section and `EXPECTF` subset needed by

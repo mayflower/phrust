@@ -101,8 +101,8 @@ impl RuntimeFixture {
         for line in source.lines().take(8) {
             let Some(metadata) = line
                 .trim()
-                .strip_prefix("// phase4-runtime:")
-                .or_else(|| line.trim().strip_prefix("# phase4-runtime:"))
+                .strip_prefix("// runtime-fixture:")
+                .or_else(|| line.trim().strip_prefix("# runtime-fixture:"))
             else {
                 continue;
             };
@@ -161,7 +161,7 @@ pub enum RuntimeComparisonStatus {
     KnownGap,
 }
 
-/// JSON shape for Phase 4 runtime comparison results.
+/// JSON shape for runtime runtime comparison results.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeComparisonResult {
     /// Fixture path.
@@ -239,7 +239,7 @@ mod tests {
         let path = dir.join("fixture.php");
         std::fs::write(
             &path,
-            "<?php\n// phase4-runtime: expect=known_gap php_ref_required=true normalize=path_lines known_gap=E_TEST args=one,two\n",
+            "<?php\n// runtime-fixture: expect=known_gap php_ref_required=true normalize=path_lines known_gap=E_TEST args=one,two\n",
         )
         .expect("fixture write");
 
@@ -260,7 +260,7 @@ mod tests {
             file: "fixtures/runtime/valid/hello.php".to_owned(),
             reference: Some(RuntimeSideResult {
                 exit_code: Some(0),
-                stdout: "hello phase4\n".to_owned(),
+                stdout: "hello runtime\n".to_owned(),
                 stderr_normalized: String::new(),
             }),
             rust: None,

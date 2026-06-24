@@ -4,17 +4,17 @@ Date: 2026-06-23
 
 ## Status
 
-Accepted for Phase 7.
+Accepted for Performance.
 
 ## Context
 
-Phase 7 Cranelift execution must stay conservative. Compiling on the first
+Performance Cranelift execution must stay conservative. Compiling on the first
 call makes correctness fixtures convenient, but it is not a suitable default
 policy for normal execution because cold functions pay compile cost before
 there is evidence that native execution is useful.
 
 The VM already records request-local function entries, loop backedges, guard
-failures, blacklist decisions, and JIT counters. Prompt 07.CL.29 connects those
+failures, blacklist decisions, and JIT counters. Work item.29 connects those
 signals into the first explicit Cranelift tiering policy.
 
 ## Decision
@@ -56,6 +56,6 @@ The default CLI no longer compiles eligible Cranelift functions on their first
 call. Tests and validation gates that intentionally need first-call compilation
 must pass `--jit-eager`.
 
-This policy is request-local in Phase 7. A future process-global compile cache
+This policy is request-local in Performance. A future process-global compile cache
 or persistent policy must be introduced by a later ADR and must preserve the
 same fallback semantics.

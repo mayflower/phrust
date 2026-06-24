@@ -156,7 +156,7 @@ pub enum IncludeKind {
     RequireOnce,
 }
 
-/// Supported Prompt 03 instruction set.
+/// Supported IR snapshot instruction set.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "opcode", rename_all = "snake_case")]
 pub enum InstructionKind {

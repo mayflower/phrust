@@ -1,5 +1,5 @@
 <?php
-// phase4: kind=valid expected_stdout="one\n"
+// runtime-fixture: kind=valid expected_stdout="one\n"
 $x = 1;
 echo match ($x) {
     0 => "zero",

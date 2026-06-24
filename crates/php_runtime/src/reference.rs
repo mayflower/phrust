@@ -101,7 +101,7 @@ impl ReferenceCell {
     /// Clears this cell as an internal GC action.
     ///
     /// This is not PHP-visible `unset()` semantics; it is only used by the
-    /// Phase 5 cycle-collection test hook after proving the cell is not rooted.
+    /// runtime-semantics cycle-collection test hook after proving the cell is not rooted.
     pub fn gc_clear(&self) {
         self.set(Value::Uninitialized);
     }
@@ -161,7 +161,7 @@ impl Slot {
     }
 
     /// Converts an ordinary slot into a reference cell or returns its existing
-    /// cell. This is the only Phase 4 operation that creates local aliases.
+    /// cell. This is the only runtime operation that creates local aliases.
     pub fn ensure_reference_cell(&mut self) -> ReferenceCell {
         match self {
             Self::Value(value) => {
@@ -179,7 +179,7 @@ impl Slot {
     }
 }
 
-/// Backwards-compatible exported name for Phase 4 slot users.
+/// Backwards-compatible exported name for runtime slot users.
 pub type ValueSlot = Slot;
 
 /// Backwards-compatible exported name for earlier placeholder references.

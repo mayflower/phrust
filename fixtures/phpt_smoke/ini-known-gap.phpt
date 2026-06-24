@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT INI known gap classification
+runtime PHPT INI known gap classification
 --INI--
 precision=14
 --FILE--

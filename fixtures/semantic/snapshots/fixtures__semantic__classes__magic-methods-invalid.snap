@@ -5,13 +5,13 @@ diagnostics:
   - id: E_PHP_INVALID_MAGIC_METHOD_SIGNATURE
     severity: error
     phase: class_like_validation
-    span: 40..114
+    span: 39..113
   - id: E_PHP_INVALID_MAGIC_METHOD_SIGNATURE
     severity: error
     phase: class_like_validation
-    span: 120..196
+    span: 119..195
 symbols:
-  - class Prompt26MagicInvalid
+  - class MagicInvalidFixture
 hir_summary:
   statements: 4
   expressions: 5

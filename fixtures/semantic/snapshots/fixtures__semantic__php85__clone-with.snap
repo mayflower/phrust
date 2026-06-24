@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - class Prompt29CloneWithSubject
+  - class CloneWithSubjectFixture
 hir_summary:
   statements: 2
   expressions: 12

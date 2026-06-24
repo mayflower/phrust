@@ -1,6 +1,6 @@
 <?php
 
-function prompt26_self_outside(): void
+function self_outside_fixture(): void
 {
     self::make();
 }

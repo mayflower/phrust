@@ -1,4 +1,4 @@
-//! Small typed arena used by the Phase 3 HIR skeleton.
+//! Small typed arena used by the Semantic frontend HIR skeleton.
 
 use crate::hir::ids::HirId;
 use core::marker::PhantomData;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-out_dir="${PHRUST_RUNTIME_CORPUS_OUT_DIR:-target/phase4/runtime-corpus-smoke}"
+out_dir="${PHRUST_RUNTIME_CORPUS_OUT_DIR:-target/runtime/runtime-corpus-smoke}"
 vm="${PHP_VM_CLI:-target/debug/php-vm}"
 extra_limit="${PHRUST_RUNTIME_CORPUS_EXTRA_LIMIT:-25}"
 mkdir -p "$out_dir"
@@ -201,4 +201,4 @@ if [[ "$actual_failures" -ne 0 ]]; then
   exit 1
 fi
 
-record "[ok] Phase 4 runtime corpus smoke passed."
+record "[ok] runtime runtime corpus smoke passed."

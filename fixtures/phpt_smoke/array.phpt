@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT array
+runtime PHPT array
 --FILE--
 <?php
 $items = ["first" => 1, "second" => 2];

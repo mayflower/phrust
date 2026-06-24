@@ -6,7 +6,7 @@ use crate::ids::{ClassId, ConstId, FileId, FunctionId, UnitId};
 use crate::source_map::{IrSourceMap, IrSpan};
 use serde::{Deserialize, Serialize};
 
-/// Version marker for the Phase 4 IR snapshot shape.
+/// Version marker for the runtime IR snapshot shape.
 pub const IR_VERSION: u32 = 1;
 
 /// Source file table entry.
@@ -18,7 +18,7 @@ pub struct FileEntry {
     pub path: String,
 }
 
-/// Class table entry used by the object/runtime prompts.
+/// Class table entry used by the object and runtime lowering.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClassEntry {
     /// Class ID.
@@ -45,7 +45,7 @@ pub struct ClassEntry {
     pub enum_backing_type: Option<ClassEnumBackingType>,
     /// Constructor method function ID, when present.
     pub constructor: Option<FunctionId>,
-    /// Class flags captured from Phase 3.
+    /// Class flags captured from Semantic frontend.
     pub flags: ClassFlags,
     /// Source span for the class declaration.
     pub span: IrSpan,
@@ -75,7 +75,7 @@ pub struct ClassMethodEntry {
     pub origin_class: String,
     /// Method implementation function.
     pub function: FunctionId,
-    /// Method flags captured from Phase 3.
+    /// Method flags captured from Semantic frontend.
     pub flags: ClassMethodFlags,
     /// Attribute metadata attached to this method declaration.
     pub attributes: Vec<AttributeEntry>,
@@ -103,11 +103,11 @@ pub struct ClassPropertyEntry {
     pub name: String,
     /// Constant-pool default when the MVP can lower it.
     pub default: Option<ConstId>,
-    /// Optional Phase-3 lowered runtime type enforced by the VM MVP.
+    /// Optional Semantic frontend lowered runtime type enforced by the VM MVP.
     pub type_: Option<IrReturnType>,
-    /// Property flags captured from Phase 3.
+    /// Property flags captured from Semantic frontend.
     pub flags: ClassPropertyFlags,
-    /// Property hook functions captured from Phase 3.
+    /// Property hook functions captured from Semantic frontend.
     pub hooks: ClassPropertyHooks,
     /// Attribute metadata attached to this property declaration.
     pub attributes: Vec<AttributeEntry>,
@@ -150,7 +150,7 @@ pub struct ClassConstantEntry {
     pub name: String,
     /// Constant-pool value when the MVP can lower it.
     pub value: Option<ConstId>,
-    /// Constant flags captured from Phase 3.
+    /// Constant flags captured from Semantic frontend.
     pub flags: ClassConstantFlags,
     /// Attribute metadata attached to this class constant declaration.
     pub attributes: Vec<AttributeEntry>,
@@ -190,7 +190,7 @@ pub struct ClassEnumCaseEntry {
 pub struct AttributeEntry {
     /// Source-spelled attribute name.
     pub name: String,
-    /// Resolved canonical class name, when Phase 3 resolved it.
+    /// Resolved canonical class name, when Semantic frontend resolved it.
     pub resolved_name: Option<String>,
     /// Runtime fallback class name, when PHP may resolve dynamically.
     pub fallback_name: Option<String>,

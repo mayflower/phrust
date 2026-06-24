@@ -1,4 +1,4 @@
-//! Request-local inline-cache side table for Phase 7.
+//! Request-local inline-cache side table for performance.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use php_ir::{
     instruction::InstructionKind,
 };
 
-/// Small fixed guard-list size for experimental Phase 7 polymorphic method and
+/// Small fixed guard-list size for experimental performance polymorphic method and
 /// property inline caches.
 pub const POLYMORPHIC_INLINE_CACHE_LIMIT: usize = 4;
 
@@ -714,6 +714,10 @@ impl InlineCacheTable {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_function_call(
         &mut self,
         unit_key: u64,
@@ -742,6 +746,10 @@ impl InlineCacheTable {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
+    )]
     pub fn lookup_method_call(
         &mut self,
         unit_key: u64,
@@ -849,6 +857,10 @@ impl InlineCacheTable {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_method_call(
         &mut self,
         unit_key: u64,
@@ -950,6 +962,10 @@ impl InlineCacheTable {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
+    )]
     pub fn lookup_property_fetch(
         &mut self,
         unit_key: u64,
@@ -1067,6 +1083,10 @@ impl InlineCacheTable {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_property_fetch(
         &mut self,
         unit_key: u64,
@@ -1170,6 +1190,10 @@ impl InlineCacheTable {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
+    )]
     pub fn lookup_class_constant_static_property(
         &mut self,
         unit_key: u64,
@@ -1252,6 +1276,10 @@ impl InlineCacheTable {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_class_constant_static_property(
         &mut self,
         unit_key: u64,
@@ -1400,6 +1428,10 @@ impl InlineCacheTable {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_include_path(
         &mut self,
         unit_key: u64,
@@ -1510,6 +1542,10 @@ impl InlineCacheTable {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
     pub fn install_autoload_class_lookup(
         &mut self,
         unit_key: u64,
@@ -1704,7 +1740,7 @@ mod tests {
             function,
             block,
             instruction,
-            "phase7_fn",
+            "perf_fn",
             InvalidationEpoch::new(1),
             FunctionCallCacheTarget::CurrentUnit { function },
         );
@@ -1713,7 +1749,7 @@ mod tests {
             function,
             block,
             instruction,
-            "phase7_fn",
+            "perf_fn",
             InvalidationEpoch::new(2),
         );
 
@@ -1741,14 +1777,14 @@ mod tests {
             function,
             block,
             instruction,
-            "phase7_fn_a",
+            "perf_fn_a",
             InvalidationEpoch::new(1),
             FunctionCallCacheTarget::CurrentUnit { function },
         );
 
         let mut saw_megamorphic = false;
         let mut saw_disabled = false;
-        for name in ["phase7_fn_b", "phase7_fn_c", "phase7_fn_d", "phase7_fn_e"] {
+        for name in ["perf_fn_b", "perf_fn_c", "perf_fn_d", "perf_fn_e"] {
             let (target, event) = table.lookup_function_call(
                 7,
                 function,
@@ -1798,13 +1834,13 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7method",
-            Some("phase7caller"),
+            "performancemethod",
+            Some("performancecaller"),
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "phase7method".to_owned(),
+                receiver_class: "performancemethod".to_owned(),
                 receiver_class_id: 7,
-                declaring_class: "Phase7Method".to_owned(),
+                declaring_class: "PerfMethod".to_owned(),
                 function,
             },
         );
@@ -1814,8 +1850,8 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7method",
-            Some("phase7caller"),
+            "performancemethod",
+            Some("performancecaller"),
             InvalidationEpoch::new(4),
         );
 
@@ -1839,13 +1875,13 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7methoda",
+            "performancemethoda",
             None,
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "phase7methoda".to_owned(),
+                receiver_class: "performancemethoda".to_owned(),
                 receiver_class_id: 7,
-                declaring_class: "Phase7MethodA".to_owned(),
+                declaring_class: "PerfMethodA".to_owned(),
                 function,
             },
         );
@@ -1855,7 +1891,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7methodb",
+            "performancemethodb",
             None,
             InvalidationEpoch::new(4),
         );
@@ -1880,13 +1916,13 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7method",
+            "performancemethod",
             None,
             InvalidationEpoch::new(4),
             MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "phase7method".to_owned(),
+                receiver_class: "performancemethod".to_owned(),
                 receiver_class_id: 7,
-                declaring_class: "Phase7Method".to_owned(),
+                declaring_class: "PerfMethod".to_owned(),
                 function,
             },
         );
@@ -1896,7 +1932,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7method",
+            "performancemethod",
             None,
             InvalidationEpoch::new(5),
         );
@@ -1916,8 +1952,8 @@ mod tests {
 
         table.observe_slot(9, function, block, instruction, InlineCacheKind::MethodCall);
         for (receiver, function_id) in [
-            ("phase7methoda", FunctionId::new(1)),
-            ("phase7methodb", FunctionId::new(2)),
+            ("performancemethoda", FunctionId::new(1)),
+            ("performancemethodb", FunctionId::new(2)),
         ] {
             table.install_method_call(
                 9,
@@ -1943,7 +1979,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7methodb",
+            "performancemethodb",
             None,
             InvalidationEpoch::new(4),
         );
@@ -1966,11 +2002,11 @@ mod tests {
 
         table.observe_slot(9, function, block, instruction, InlineCacheKind::MethodCall);
         for receiver in [
-            "phase7methoda",
-            "phase7methodb",
-            "phase7methodc",
-            "phase7methodd",
-            "phase7methode",
+            "performancemethoda",
+            "performancemethodb",
+            "performancemethodc",
+            "performancemethodd",
+            "performancemethode",
         ] {
             table.install_method_call(
                 9,
@@ -1996,7 +2032,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7methoda",
+            "performancemethoda",
             None,
             InvalidationEpoch::new(4),
         );
@@ -2029,12 +2065,12 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7box",
+            "performancebox",
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "phase7box".to_owned(),
-                declaring_class: "Phase7Box".to_owned(),
+                receiver_class: "performancebox".to_owned(),
+                declaring_class: "PerfBox".to_owned(),
                 property: "value".to_owned(),
                 storage_name: "value".to_owned(),
             },
@@ -2045,7 +2081,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7box",
+            "performancebox",
             Some("different_scope_allowed_for_public"),
             InvalidationEpoch::new(6),
         );
@@ -2076,12 +2112,12 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7boxa",
+            "performanceboxa",
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "phase7boxa".to_owned(),
-                declaring_class: "Phase7BoxA".to_owned(),
+                receiver_class: "performanceboxa".to_owned(),
+                declaring_class: "PerfBoxA".to_owned(),
                 property: "value".to_owned(),
                 storage_name: "value".to_owned(),
             },
@@ -2092,7 +2128,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7boxb",
+            "performanceboxb",
             None,
             InvalidationEpoch::new(6),
         );
@@ -2123,12 +2159,12 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7box",
+            "performancebox",
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "phase7box".to_owned(),
-                declaring_class: "Phase7Box".to_owned(),
+                receiver_class: "performancebox".to_owned(),
+                declaring_class: "PerfBox".to_owned(),
                 property: "value".to_owned(),
                 storage_name: "value".to_owned(),
             },
@@ -2139,7 +2175,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7box",
+            "performancebox",
             None,
             InvalidationEpoch::new(7),
         );
@@ -2164,7 +2200,7 @@ mod tests {
             instruction,
             InlineCacheKind::PropertyFetch,
         );
-        for receiver in ["phase7boxa", "phase7boxb"] {
+        for receiver in ["performanceboxa", "performanceboxb"] {
             table.install_property_fetch(
                 11,
                 function,
@@ -2189,7 +2225,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7boxb",
+            "performanceboxb",
             Some("public_scope"),
             InvalidationEpoch::new(6),
         );
@@ -2218,11 +2254,11 @@ mod tests {
             InlineCacheKind::PropertyFetch,
         );
         for receiver in [
-            "phase7boxa",
-            "phase7boxb",
-            "phase7boxc",
-            "phase7boxd",
-            "phase7boxe",
+            "performanceboxa",
+            "performanceboxb",
+            "performanceboxc",
+            "performanceboxd",
+            "performanceboxe",
         ] {
             table.install_property_fetch(
                 11,
@@ -2248,7 +2284,7 @@ mod tests {
             block,
             instruction,
             "value",
-            "phase7boxa",
+            "performanceboxa",
             None,
             InvalidationEpoch::new(6),
         );
@@ -2281,14 +2317,14 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::ClassConstant,
-            "phase7class",
+            "performanceclass",
             "VALUE",
             None,
             InvalidationEpoch::new(8),
             ClassConstantStaticPropertyCacheTarget::CurrentUnit {
                 kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
-                resolved_class: "phase7class".to_owned(),
-                declaring_class: "Phase7Class".to_owned(),
+                resolved_class: "performanceclass".to_owned(),
+                declaring_class: "PerfClass".to_owned(),
                 member: "VALUE".to_owned(),
             },
         );
@@ -2298,7 +2334,7 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::ClassConstant,
-            "phase7class",
+            "performanceclass",
             "VALUE",
             Some("public_scope_ignored"),
             InvalidationEpoch::new(8),
@@ -2333,14 +2369,14 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::StaticProperty,
-            "phase7a",
+            "performancea",
             "value",
             None,
             InvalidationEpoch::new(8),
             ClassConstantStaticPropertyCacheTarget::CurrentUnit {
                 kind: ClassConstantStaticPropertyCacheKind::StaticProperty,
-                resolved_class: "phase7a".to_owned(),
-                declaring_class: "Phase7A".to_owned(),
+                resolved_class: "performancea".to_owned(),
+                declaring_class: "PerfA".to_owned(),
                 member: "value".to_owned(),
             },
         );
@@ -2350,7 +2386,7 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::StaticProperty,
-            "phase7b",
+            "performanceb",
             "value",
             None,
             InvalidationEpoch::new(8),
@@ -2385,14 +2421,14 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::EnumCase,
-            "phase7enum",
+            "performanceenum",
             "Ready",
             None,
             InvalidationEpoch::new(8),
             ClassConstantStaticPropertyCacheTarget::CurrentUnit {
                 kind: ClassConstantStaticPropertyCacheKind::EnumCase,
-                resolved_class: "phase7enum".to_owned(),
-                declaring_class: "Phase7Enum".to_owned(),
+                resolved_class: "performanceenum".to_owned(),
+                declaring_class: "PerfEnum".to_owned(),
                 member: "Ready".to_owned(),
             },
         );
@@ -2402,7 +2438,7 @@ mod tests {
             block,
             instruction,
             ClassConstantStaticPropertyCacheKind::EnumCase,
-            "phase7enum",
+            "performanceenum",
             "Ready",
             None,
             InvalidationEpoch::new(9),
@@ -2425,7 +2461,7 @@ mod tests {
         let mut table = InlineCacheTable::default();
         let request = AutoloadClassLookupCacheKey {
             kind: AutoloadClassLookupKind::Class,
-            normalized_name: "phase7\\cache\\thing".to_owned(),
+            normalized_name: "performance\\cache\\thing".to_owned(),
             autoload_enabled: true,
             autoload_stack_depth: 0,
             include_path_config: "vendor".to_owned(),
@@ -2452,7 +2488,7 @@ mod tests {
             request.clone(),
             epochs,
             AutoloadClassLookupCacheTarget::Positive {
-                display_name: "Phase7\\Cache\\Thing".to_owned(),
+                display_name: "Perf\\Cache\\Thing".to_owned(),
             },
         );
         let (target, event) =
@@ -2461,7 +2497,7 @@ mod tests {
         assert_eq!(
             target,
             Some(AutoloadClassLookupCacheTarget::Positive {
-                display_name: "Phase7\\Cache\\Thing".to_owned(),
+                display_name: "Perf\\Cache\\Thing".to_owned(),
             })
         );
         assert_eq!(event.kind, Some(InlineCacheKind::AutoloadClassLookup));
@@ -2477,7 +2513,7 @@ mod tests {
         let mut table = InlineCacheTable::default();
         let request = AutoloadClassLookupCacheKey {
             kind: AutoloadClassLookupKind::Class,
-            normalized_name: "phase7\\cache\\thing".to_owned(),
+            normalized_name: "performance\\cache\\thing".to_owned(),
             autoload_enabled: false,
             autoload_stack_depth: 0,
             include_path_config: ".".to_owned(),
@@ -2522,7 +2558,7 @@ mod tests {
         let mut table = InlineCacheTable::default();
         let request = AutoloadClassLookupCacheKey {
             kind: AutoloadClassLookupKind::Class,
-            normalized_name: "phase7\\cache\\late".to_owned(),
+            normalized_name: "performance\\cache\\late".to_owned(),
             autoload_enabled: false,
             autoload_stack_depth: 0,
             include_path_config: ".".to_owned(),

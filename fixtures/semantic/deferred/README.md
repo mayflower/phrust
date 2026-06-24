@@ -6,7 +6,7 @@ metadata.
 Example rules: literal include paths, dynamic include paths, require, and eval.
 
 Reference classification: accepted by PHP lint; runtime execution is not part
-of Phase 3.
+of Semantic frontend.
 
 Rust diagnostic IDs: `N_PHP_RUNTIME_CHECK_DEFERRED`.
 

@@ -12,7 +12,7 @@ bytes and would make differential testing harder.
 
 ## Decision
 
-The Phase 1 lexer is byte-oriented and lossless. Tokens record byte spans into
+The Lexer lexer is byte-oriented and lossless. Tokens record byte spans into
 the original source and expose line information as derived comparison data.
 
 ## Consequences
@@ -28,7 +28,7 @@ the original source and expose line information as derived comparison data.
 - Character-oriented lexer. Rejected because PHP source compatibility is byte
   based.
 - Token text copied into every token. Rejected because spans are enough and
-  cheaper for Phase 1.
+  cheaper for Lexer.
 
 ## Date
 

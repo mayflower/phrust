@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - function prompt27_encoding
+  - function encoding_declare_fixture
 hir_summary:
   statements: 3
   expressions: 2

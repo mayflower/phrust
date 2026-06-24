@@ -1,4 +1,4 @@
-//! Safe Rust ABI used by the VM to call Phase 6 standard-library builtins.
+//! Safe Rust ABI used by the VM to call standard-library standard-library builtins.
 
 use php_runtime::{
     OutputBuffer, ReferenceCell, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, Value,
@@ -15,7 +15,7 @@ pub trait BuiltinFunction {
     /// Stable normalized PHP function name.
     fn name(&self) -> &'static str;
 
-    /// Invokes the builtin through the Phase 6 ABI.
+    /// Invokes the builtin through the standard-library ABI.
     fn call(&self, context: &mut CallContext<'_>) -> BuiltinResult;
 }
 

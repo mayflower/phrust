@@ -1,10 +1,10 @@
 <?php
-class Prompt28CloneWithBox {
+class CloneWithBoxFixture {
     public $name;
     public $count;
 }
 
-$original = new Prompt28CloneWithBox();
+$original = new CloneWithBoxFixture();
 $original->name = "old";
 $original->count = 1;
 $copy = clone($original, ["name" => "new", "count" => 2]);

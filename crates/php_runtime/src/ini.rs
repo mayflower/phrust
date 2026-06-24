@@ -1,4 +1,4 @@
-//! Deterministic Phase 6 INI/config registry.
+//! Deterministic standard-library INI/config registry.
 
 /// One supported INI entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9,7 +9,7 @@ pub struct IniEntrySnapshot {
     pub global_value: String,
     /// Current per-request value.
     pub local_value: String,
-    /// PHP-style access mask. The Phase 6 MVP treats supported entries as all.
+    /// PHP-style access mask. The standard-library MVP treats supported entries as all.
     pub access: i64,
 }
 

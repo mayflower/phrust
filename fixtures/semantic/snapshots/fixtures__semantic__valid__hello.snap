@@ -4,7 +4,7 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - function hello_phase3
+  - function hello_semantic
 hir_summary:
   statements: 2
   expressions: 5

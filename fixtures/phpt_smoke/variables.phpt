@@ -1,5 +1,5 @@
 --TEST--
-Phase 4 PHPT variables
+runtime PHPT variables
 --FILE--
 <?php
 $value = 7;

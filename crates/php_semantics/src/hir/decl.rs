@@ -30,7 +30,7 @@ impl HirDecl {
     }
 }
 
-/// Declaration families used by later lowering prompts.
+/// Declaration families used by later lowering passes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HirDeclKind {
     /// Namespace declaration.

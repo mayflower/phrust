@@ -1,0 +1,2 @@
+[known_gaps]
+STDLIB-GAP-CORPUS-REFLECTION-ATTRIBUTES = "Reflection attribute corpus coverage depends on standard-library reflected attribute metadata and remains explicit until constructor/target parity is complete."

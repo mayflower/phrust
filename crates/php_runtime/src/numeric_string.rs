@@ -48,7 +48,7 @@ impl NumericStringValue {
     }
 }
 
-/// PHP numeric-string class in the Phase 5 conversion subset.
+/// PHP numeric-string class in the runtime-semantics conversion subset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NumericStringKind {
     /// The whole trimmed string is an integer numeric string.
@@ -145,7 +145,7 @@ pub fn take_cache_stats() -> NumericStringCacheStats {
     })
 }
 
-/// Classifies a byte string using the Phase 5 PHP numeric-string subset.
+/// Classifies a byte string using the runtime-semantics PHP numeric-string subset.
 #[must_use]
 pub fn classify(bytes: &[u8]) -> NumericString {
     let start = bytes

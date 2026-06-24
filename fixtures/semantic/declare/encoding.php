@@ -1,7 +1,7 @@
 <?php
 declare(encoding="UTF-8");
 
-function prompt27_encoding(): string
+function encoding_declare_fixture(): string
 {
     return "ok";
 }

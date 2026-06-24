@@ -1,7 +1,7 @@
-//! Phase 4 bytecode/IR boundary.
+//! runtime bytecode/IR boundary.
 //!
 //! The IR is register-based and organized into basic blocks. It is the stable
-//! handoff shape between Phase 3 HIR and the Phase 4 VM. This crate does not
+//! handoff shape between Semantic frontend HIR and the runtime VM. This crate does not
 //! lower HIR yet.
 
 pub mod block;
@@ -42,7 +42,7 @@ pub use verify::{VerificationError, VerificationErrorCode, verify_unit};
 /// Stable status string used by early wiring tests.
 #[must_use]
 pub const fn ir_skeleton_status() -> &'static str {
-    "phase4-ir-core-model"
+    "ir-core-model"
 }
 
 #[cfg(test)]
@@ -117,6 +117,6 @@ mod tests {
 
     #[test]
     fn status_reflects_core_model() {
-        assert_eq!(ir_skeleton_status(), "phase4-ir-core-model");
+        assert_eq!(ir_skeleton_status(), "ir-core-model");
     }
 }

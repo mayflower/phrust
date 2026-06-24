@@ -1,4 +1,4 @@
 <?php
-function prompt29_const_expr_closure($value = static function (): int {
+function const_expr_closure_fixture($value = static function (): int {
     return 1;
 }): void {}

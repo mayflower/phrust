@@ -1,5 +1,5 @@
 <?php
-// phase4-runtime: corpus=pass
+// runtime-fixture: corpus=pass
 function corpus_home(): string
 {
     return "home:index";

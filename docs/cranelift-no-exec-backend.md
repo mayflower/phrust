@@ -2,14 +2,14 @@
 
 Date: 2026-06-23.
 
-Prompt 07.CL.07 added `CraneliftNoExecBackend`, a feature-gated backend adapter
-behind `jit-cranelift`. Prompt 07.CL.12 keeps the type name for compatibility
+Work item.07 added `CraneliftNoExecBackend`, a feature-gated backend adapter
+behind `jit-cranelift`. Work item.12 keeps the type name for compatibility
 but extends the backend with the first executable subset: constant integer
-return leaf functions. Prompt 07.CL.13 adds helper-call integer add/mul native
+return leaf functions. Work item.13 adds helper-call integer add/mul native
 execution while preserving interpreter fallback as the correctness boundary.
-Prompt 07.CL.17 replaces that executable arithmetic path for eligible
+Work item.17 replaces that executable arithmetic path for eligible
 add/sub/mul with inline checked Cranelift integer operations.
-Prompt 07.CL.18 extends the inline path to simple branches and counted loops
+Work item.18 extends the inline path to simple branches and counted loops
 over eligible integer operations.
 
 ## Behavior
@@ -31,13 +31,13 @@ The backend implements `JitBackendApi` and can:
 - attach the runtime ABI hash and native code byte count to the JIT handle;
 - report deterministic diagnostics for smoke gates.
 
-For Prompt 07.CL.12, native execution is restricted to ordinary leaf functions
+For Work item.12, native execution is restricted to ordinary leaf functions
 with plain `int` parameters, an explicit `int` return type, and a body made only
 of integer constants, moves, no-ops, and a return. All other shapes may still be
 lowered to verified CLIF for diagnostics, but they return
 `JitCompileStatus::Rejected` and execute through the interpreter.
 
-For Prompt 07.CL.13, native helper-call execution is restricted to ordinary
+For Work item.13, native helper-call execution is restricted to ordinary
 leaf functions with plain `int` parameters, an explicit `int` return type, and a
 single block containing integer constants, local loads, moves, add, mul, and
 return. Add and mul are never lowered as inline raw integer operations. They
@@ -45,7 +45,7 @@ call `phrust_jit_i64_add_checked` or `phrust_jit_i64_mul_checked`, check the
 returned status immediately, and return non-zero status to the VM when the
 interpreter must resume.
 
-For Prompt 07.CL.17, the same eligible single-block arithmetic subset lowers
+For Work item.17, the same eligible single-block arithmetic subset lowers
 add, sub, and mul to Cranelift `sadd_overflow`, `ssub_overflow`, and
 `smul_overflow`. Non-overflowing operations continue in native code and report
 `fast_path_hits`. Overflow returns a stable overflow status through the native
@@ -53,7 +53,7 @@ ABI so the VM records an `overflow` side exit, `overflow_exits`, and
 `slow_path_calls` before interpreter fallback. The inline path does not perform
 float coercion or weak numeric-string conversion.
 
-For Prompt 07.CL.18, the native subset accepts simple multi-block CFGs made of
+For Work item.18, the native subset accepts simple multi-block CFGs made of
 conditional branches over int comparisons, unconditional jumps, returns, and
 counted loops whose loop variable, bound, and body are all in the eligible int
 subset. The lowering uses Cranelift blocks for PHP IR blocks, Cranelift

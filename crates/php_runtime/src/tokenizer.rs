@@ -1,4 +1,4 @@
-//! Tokenizer extension helpers backed by the Phase 1 lexer.
+//! Tokenizer extension helpers backed by the Lexer lexer.
 
 use crate::{ArrayKey, BuiltinError, PhpArray, Value};
 use php_lexer::{
@@ -51,7 +51,7 @@ pub fn token_name_for_id(id: i64) -> Option<&'static str> {
         .map(|name| name.as_php_name())
 }
 
-/// Tokenizes source code with the existing Phase 1 lexer.
+/// Tokenizes source code with the existing Lexer lexer.
 pub fn tokenize(source: &str, flags: i64) -> Result<Vec<TokenizerToken>, BuiltinError> {
     let config = LexerConfig {
         token_parse: flags & TOKEN_PARSE != 0,

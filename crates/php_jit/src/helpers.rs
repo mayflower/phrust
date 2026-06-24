@@ -259,7 +259,7 @@ fn write_checked_result(out: *mut i64, value: Option<i64>) -> i32 {
 
 /// Checked PHP integer addition helper for Cranelift helper-call lowering.
 ///
-/// SAFETY: The unmangled symbol is part of the stable Phase 7 helper registry.
+/// SAFETY: The unmangled symbol is part of the stable performance helper registry.
 /// Its C ABI, argument order, and status/out-pointer contract are documented in
 /// `JIT_HELPER_SYMBOLS` and validated by registry layout tests.
 #[unsafe(no_mangle)]
@@ -269,7 +269,7 @@ pub extern "C" fn phrust_jit_i64_add_checked(lhs: i64, rhs: i64, out: *mut i64) 
 
 /// Checked PHP integer multiplication helper for Cranelift helper-call lowering.
 ///
-/// SAFETY: The unmangled symbol is part of the stable Phase 7 helper registry.
+/// SAFETY: The unmangled symbol is part of the stable performance helper registry.
 /// Its C ABI, argument order, and status/out-pointer contract are documented in
 /// `JIT_HELPER_SYMBOLS` and validated by registry layout tests.
 #[unsafe(no_mangle)]

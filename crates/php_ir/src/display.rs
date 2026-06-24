@@ -194,7 +194,7 @@ impl IrUnit {
         out
     }
 
-    /// Compatibility alias for early Prompt 03 tests and callers.
+    /// Compatibility alias for early IR snapshot tests and callers.
     #[must_use]
     pub fn to_debug_text(&self) -> String {
         self.to_snapshot_text()

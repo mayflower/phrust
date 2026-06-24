@@ -1,8 +1,8 @@
 # Semantic Fixtures
 
-Semantic fixtures exercise the Phase 3 frontend harness. They are intentionally
-small and deterministic. Broad semantic rule coverage is added in later Phase 3
-prompts.
+Semantic fixtures exercise the Semantic frontend frontend harness. They are intentionally
+small and deterministic. Broad semantic rule coverage is added in later Semantic frontend
+fixture sets.
 
 Current categories:
 
@@ -47,9 +47,9 @@ classification, expected Rust diagnostic IDs, and known gaps.
 Deterministic snapshots are generated under `fixtures/semantic/snapshots/` by
 `scripts/run_semantic_fixtures.py --write-snapshots`.
 `declarations/duplicate-class-invalid.php` is a semantic-only reject: PHP lint
-accepts it, but Phase 3 reports the safe same-file duplicate class declaration.
+accepts it, but Semantic frontend reports the safe same-file duplicate class declaration.
 `control_flow/goto-invalid-known-gap.php` is a known reference-only reject:
-PHP lint rejects jumping into a loop, while Phase 3 currently records goto
+PHP lint rejects jumping into a loop, while Semantic frontend currently records goto
 labels but does not yet model goto target-entry restrictions.
 The `types` fixtures match the pinned PHP 8.5.7 acceptance oracle; no
 type-specific known gap is currently recorded.
@@ -60,7 +60,7 @@ The class-context fixtures match the pinned PHP 8.5.7 acceptance oracle for
 lint-accepted but runtime-sensitive.
 The declare fixtures match the pinned PHP 8.5.7 acceptance oracle for
 `strict_types` placement and values. Runtime effects of `strict_types`, `ticks`,
-and `encoding` are metadata-only in Phase 3.
+and `encoding` are metadata-only in Semantic frontend.
 The deferred fixtures match PHP lint acceptance while emitting note-level
 runtime-deferred diagnostics. Analysis does not touch the filesystem, import
 symbols from included files, or execute eval code.

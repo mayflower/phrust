@@ -13,8 +13,8 @@ use php_phpt_tools::phpt::{PhptSection, parse_phpt};
 const DEFAULT_MANIFEST: &str = "tests/phpt/manifests/php-src-hashes.jsonl";
 const DEFAULT_SYMBOLS: &str = "tests/phpt/manifests/php-src-symbols.jsonl";
 const DEFAULT_PHPT_CORPUS: &str = "tests/phpt/manifests/phpt-corpus.jsonl";
-const DEFAULT_PHPT_REPORT: &str = "docs/phase9/reports/phpt-corpus-summary.md";
-const GENERATOR_VERSION: &str = "phase9-generate-v1";
+const DEFAULT_PHPT_REPORT: &str = "docs/phpt/reports/phpt-corpus-summary.md";
+const GENERATOR_VERSION: &str = "phpt-generate-v1";
 
 fn main() {
     let code = match run(env::args().skip(1), &mut io::stdout(), &mut io::stderr()) {
@@ -89,7 +89,7 @@ fn verify_source<W: Write, E: Write>(
     let options = SourceOptions::parse(args)?;
     if !options.manifest.is_file() {
         return Err(format!(
-            "{}: source hash manifest does not exist; run `just phpt-source-index-phase9`",
+            "{}: source hash manifest does not exist; run `just phpt-source-index`",
             options.manifest.display()
         ));
     }
@@ -397,7 +397,7 @@ fn baseline_results<W: Write, E: Write>(
         if !regressions.is_empty() {
             writeln!(
                 stderr,
-                "Phase 9 full regression detected {} new or changed failure fingerprints",
+                "PHPT full regression detected {} new or changed failure fingerprints",
                 regressions.len()
             )
             .map_err(|error| error.to_string())?;
@@ -751,7 +751,7 @@ fn lookup_symbol<W: Write, E: Write>(
     let options = LookupOptions::parse(args)?;
     if !options.symbols.is_file() {
         return Err(format!(
-            "{}: source symbol index does not exist; run `just phpt-source-index-phase9`",
+            "{}: source symbol index does not exist; run `just phpt-source-index`",
             options.symbols.display()
         ));
     }
@@ -1138,7 +1138,7 @@ impl BaselineOptions {
             corpus: corpus.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_CORPUS)),
             known_failures: known_failures
                 .unwrap_or_else(|| PathBuf::from("tests/phpt/manifests/full-known-failures.jsonl")),
-            report: report.unwrap_or_else(|| PathBuf::from("docs/phase9/reports/full-baseline.md")),
+            report: report.unwrap_or_else(|| PathBuf::from("docs/phpt/reports/full-baseline.md")),
             previous_known_failures,
             previous_results,
             timestamp: timestamp
@@ -2002,22 +2002,23 @@ fn env_args(sections: &[PhptSection]) -> Vec<(String, String)> {
     env
 }
 
-fn context_from_sections(
-    sections: &[PhptSection],
-) -> (
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-    Vec<String>,
-    Option<&str>,
-) {
-    (
-        ini_args(sections),
-        env_args(sections),
-        section(sections, "ARGS")
+#[derive(Debug)]
+struct PhptExecutionContext<'a> {
+    ini: Vec<(String, String)>,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+    stdin: Option<&'a str>,
+}
+
+fn context_from_sections(sections: &[PhptSection]) -> PhptExecutionContext<'_> {
+    PhptExecutionContext {
+        ini: ini_args(sections),
+        env: env_args(sections),
+        args: section(sections, "ARGS")
             .map(|section| split_phpt_args(&section.body))
             .unwrap_or_default(),
-        section(sections, "STDIN").map(|section| section.body.as_str()),
-    )
+        stdin: section(sections, "STDIN").map(|section| section.body.as_str()),
+    }
 }
 
 fn split_phpt_args(args: &str) -> Vec<String> {
@@ -2284,8 +2285,16 @@ fn run_reference_body(
     fs::create_dir_all(work_dir).map_err(|error| format!("{}: {error}", work_dir.display()))?;
     let script = work_dir.join("test.php");
     fs::write(&script, body).map_err(|error| format!("{}: {error}", script.display()))?;
-    let (ini, env, args, stdin) = context_from_sections(sections);
-    run_php(options, &script, work_dir, &ini, &env, &args, stdin)
+    let context = context_from_sections(sections);
+    run_php(
+        options,
+        &script,
+        work_dir,
+        &context.ini,
+        &context.env,
+        &context.args,
+        context.stdin,
+    )
 }
 
 fn reduce_body_by_reference_equivalence(
@@ -2344,7 +2353,7 @@ fn render_generated_phpt(
     let mut out = String::new();
     out.push_str("--TEST--\n");
     out.push_str(&format!(
-        "Phase 9 generated {kind}: {}\n",
+        "PHPT generated {kind}: {}\n",
         first_non_empty_line(&entry.title)
     ));
     out.push_str("--DESCRIPTION--\n");
@@ -2633,9 +2642,9 @@ fn missing_feature_guess(result: &PhptRunResult) -> String {
 }
 
 const LITERAL_KIND_UNSUPPORTED_DIAGNOSTIC: &str =
-    "E_PHP_IR_UNSUPPORTED_HIR_STATEMENT: literal kind is not lowered to IR in Prompt 10";
+    "E_PHP_IR_UNSUPPORTED_HIR_STATEMENT: literal kind is not lowered to IR";
 const ADVANCED_PARAMETER_UNFOLDED_DIAGNOSTIC: &str =
-    "parameter default is not a folded Phase 3 constant expression";
+    "parameter default is not a folded Semantic frontend constant expression";
 
 fn is_related_known_failure_evolution(
     previous: Option<&PhptRunResult>,
@@ -2684,7 +2693,7 @@ fn render_baseline_report(
     }
 
     let mut out = String::new();
-    out.push_str("# Phase 9 Full PHPT Baseline\n\n");
+    out.push_str("# PHPT Full PHPT Baseline\n\n");
     out.push_str(&format!("Generated: `{timestamp}`\n\n"));
     out.push_str("## Totals\n\n");
     out.push_str("| Outcome | Count |\n| --- | ---: |\n");
@@ -2707,7 +2716,7 @@ fn render_baseline_report(
     }
     out.push_str("\n## Policy\n\n");
     out.push_str(
-        "Module prompts may reduce known failures, but must not add new failures or mutate unrelated fingerprints without explanation.\n",
+        "Module work may reduce known failures, but must not add new failures or mutate unrelated fingerprints without explanation.\n",
     );
     out
 }
@@ -2758,7 +2767,7 @@ fn render_run_summary(results: &[PhptRunResult]) -> String {
         *counts.entry(result.outcome.clone()).or_default() += 1;
     }
     let mut out = String::new();
-    out.push_str("# Phase 9 PHPT Run Summary\n\n");
+    out.push_str("# PHPT Run Summary\n\n");
     out.push_str("| Outcome | Count |\n| --- | ---: |\n");
     for (outcome, count) in counts {
         out.push_str(&format!("| {outcome} | {count} |\n"));
@@ -2985,8 +2994,8 @@ fn render_phpt_summary(entries: &[PhptEntry]) -> String {
     }
 
     let mut out = String::new();
-    out.push_str("# Phase 9 PHPT Corpus Summary\n\n");
-    out.push_str("Generated by `just phpt-index-phase9` from the pinned php-src checkout.\n\n");
+    out.push_str("# PHPT Corpus Summary\n\n");
+    out.push_str("Generated by `just phpt-index` from the pinned php-src checkout.\n\n");
     out.push_str(&format!("- Total PHPT files: {}\n", entries.len()));
     out.push_str(&format!("- Tests with SKIPIF: {skipif}\n"));
     out.push_str(&format!("- Tests with CLEAN: {clean}\n"));

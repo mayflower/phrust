@@ -32,7 +32,7 @@ behavior are authoritative for compatibility decisions.
 
 ## Consequences
 
-- Later phases must compare behavior against the pinned reference.
+- Later layers must compare behavior against the pinned reference.
 - Reference metadata and hashes may be stored under `references/`.
 - The full `php-src` checkout remains local under `third_party/` and is not
   committed.

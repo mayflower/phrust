@@ -12,7 +12,7 @@ fallbacks.
 
 ## Decision
 
-Phase 3 models names by kind and resolves them using current namespace and
+Semantic frontend models names by kind and resolves them using current namespace and
 import tables. Class-like, function, and constant imports are tracked
 separately. Runtime-sensitive fallback is represented explicitly as deferred
 metadata rather than hidden as a successful compile-time lookup.

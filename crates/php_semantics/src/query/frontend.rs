@@ -1,4 +1,4 @@
-//! Cache-friendly Phase 3 frontend entry points.
+//! Cache-friendly Semantic frontend frontend entry points.
 
 use crate::hir::{HirModule, ModuleId};
 use crate::{FrontendDatabase, FrontendResult, SemanticModule, TARGET_PHP_VERSION};
@@ -132,7 +132,7 @@ pub fn create_module(database: &mut FrontendDatabase, root_kind: String, source:
 }
 
 /// Collects declarations. The current implementation also drives the fused
-/// Phase 3 name-resolution, HIR-lowering, and check passes.
+/// Semantic frontend name-resolution, HIR-lowering, and check passes.
 #[must_use]
 pub fn collect_declarations(
     root: SourceFile,
@@ -160,7 +160,7 @@ pub fn run_checks() -> Vec<crate::SemanticDiagnostic> {
     Vec::new()
 }
 
-/// Analyzes a PHP source string using query-shaped Phase 3 frontend stages.
+/// Analyzes a PHP source string using query-shaped Semantic frontend frontend stages.
 #[must_use]
 pub fn analyze_file(source: &str, options: &FrontendOptions) -> FrontendResult {
     let file_id = FileId::new("<memory>");

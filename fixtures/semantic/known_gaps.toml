@@ -1,11 +1,11 @@
 [[gap]]
 fixture = "fixtures/semantic/control_flow/goto-invalid-known-gap.php"
 reason = "Full PHP goto boundary validation deferred until CFG pass."
-phase = "phase3"
-expected_resolution_phase = "phase4-control-flow"
+area = "frontend"
+expected_resolution_phase = "runtime-control-flow"
 
 [[gap]]
 fixture = "fixtures/semantic/declarations/duplicate-class-invalid.php"
 reason = "Rust performs a deterministic same-file duplicate class declaration check that PHP lint defers until compile/runtime loading."
-phase = "phase3"
-expected_resolution_phase = "phase4-declaration-linking"
+area = "frontend"
+expected_resolution_phase = "runtime-declaration-linking"

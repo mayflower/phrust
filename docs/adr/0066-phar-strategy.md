@@ -1,8 +1,8 @@
-# ADR-0066: Phase 6 PHAR Strategy
+# ADR-0066: Standard library PHAR Strategy
 
 ## Status
 
-Accepted for Phase 6.
+Accepted for Standard library.
 
 ## Context
 
@@ -12,15 +12,15 @@ metadata, stream-wrapper integration for `phar://`, stub execution,
 signature/hash validation decisions, and interaction with process, filesystem,
 network, and plugin/script capabilities.
 
-Phase 6 already requires Composer source-mode smokes because they exercise the
+Standard library already requires Composer source-mode smokes because they exercise the
 same userland bootstrap and standard-library surface without making PHAR a
 mandatory runtime feature. Source mode also keeps network, plugin, script, and
 host shell behavior outside required gates.
 
 ## Decision
 
-PHAR support is not implemented as a required Phase 6 feature. Composer source
-mode remains the mandatory Composer gate. A later optional prompt may add a
+PHAR support is not implemented as a required Standard library feature. Composer source
+mode remains the mandatory Composer gate. A later optional work item may add a
 read-only PHAR MVP, but only after it defines the archive format subset,
 wrapper behavior, diagnostics, and security boundaries.
 
@@ -36,12 +36,12 @@ The optional read-only MVP, if accepted later, should be limited to:
 
 ## Consequences
 
-- `composer.phar` is rejected by Phase 6 source-mode tooling instead of being
+- `composer.phar` is rejected by Standard library source-mode tooling instead of being
   treated as a half-supported input.
 - PHAR-related Composer requirements are tracked as
-  `PHASE6-GAP-PHAR-REQUIRED`.
+  `STDLIB-GAP-PHAR-REQUIRED`.
 - No PHAR parser, stream wrapper, or archive execution path is added silently in
-  Phase 6.
+  Standard library.
 - The required Composer proof path remains `composer-smoke`,
   `composer-smoke-platform`, `composer-smoke-autoload`, and
   `composer-smoke-source`.

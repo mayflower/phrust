@@ -4,8 +4,8 @@ semantic_ok: true
 diagnostics:
   []
 symbols:
-  - class Prompt26Base
-  - class Prompt26Child
+  - class SelfParentBase
+  - class SelfParentChild
 hir_summary:
   statements: 7
   expressions: 16

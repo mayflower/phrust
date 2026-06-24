@@ -40,7 +40,7 @@ impl HirType {
     }
 }
 
-/// Type families produced by Phase 3 type lowering.
+/// Type families produced by Semantic frontend type lowering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HirTypeKind {
     /// Lowering could not produce a complete type.

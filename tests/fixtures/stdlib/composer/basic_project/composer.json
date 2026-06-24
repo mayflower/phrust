@@ -1,0 +1,14 @@
+{
+  "name": "stdlib/basic-project",
+  "autoload": {
+    "psr-4": {
+      "Stdlib\\Basic\\": "src/"
+    },
+    "classmap": [
+      "lib/MappedThing.php"
+    ],
+    "files": [
+      "files/helpers.php"
+    ]
+  }
+}

@@ -1,11 +1,11 @@
-# Phase 4 PHPT Smoke Fixtures
+# runtime PHPT Smoke Fixtures
 
-These fixtures are small, local `.phpt` files for the Phase 4 smoke runner.
+These fixtures are small, local `.phpt` files for the runtime smoke runner.
 They are not copied from PHP's upstream test suite and are not intended to
 exercise the full `run-tests.php` feature set.
 
 `just phpt-smoke` parses the supported sections, writes each `--FILE--` body to
-`target/phase4/phpt-smoke/generated/`, runs it through `php-vm`, and compares
+`target/runtime/phpt-smoke/generated/`, runs it through `php-vm`, and compares
 stdout with `--EXPECT--` or the small `--EXPECTF--` subset implemented by
 `php_testkit::phpt`.
 

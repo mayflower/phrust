@@ -1,9 +1,9 @@
 <?php
-class Prompt27Returner {
+class MethodReturnFixture {
     function answer() {
         return 42;
     }
 }
 
-$returner = new Prompt27Returner();
+$returner = new MethodReturnFixture();
 echo $returner->answer(), "\n";
