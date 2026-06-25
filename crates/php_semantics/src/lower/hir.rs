@@ -1025,6 +1025,20 @@ impl HirLowerer<'_> {
                     node.text_range(),
                 );
                 rest = after_arrow[property_len..].trim();
+                if let Some(after_open) = rest.strip_prefix('(')
+                    && let Some(after_close) = after_open.strip_prefix(')')
+                {
+                    current = self.alloc_expr(
+                        HirExprKind::MethodCall {
+                            receiver: None,
+                            method: Some(current),
+                            args: Vec::new(),
+                            nullsafe: false,
+                        },
+                        node.text_range(),
+                    );
+                    rest = after_close.trim();
+                }
                 continue;
             }
             break;
@@ -1062,6 +1076,41 @@ impl HirLowerer<'_> {
                         nullsafe: has_descendant_token_text(node, "?->"),
                     },
                     node.text_range(),
+                ));
+                return;
+            }
+            "CALL_EXPR" => {
+                let Some(previous) = *current else {
+                    *current = Some(self.missing_expr(node, "missing construct call target"));
+                    return;
+                };
+                let args = self.call_args(node);
+                let previous_kind = self
+                    .database
+                    .module(self.module_id)
+                    .and_then(|module| module.expressions().get(previous))
+                    .map(|expr| expr.kind().as_str())
+                    .unwrap_or_default();
+                let kind = if previous_kind == "property_fetch" {
+                    HirExprKind::MethodCall {
+                        receiver: None,
+                        method: Some(previous),
+                        args,
+                        nullsafe: has_descendant_token_text(node, "?->"),
+                    }
+                } else {
+                    HirExprKind::Call {
+                        callee: Some(previous),
+                        args,
+                    }
+                };
+                let start = self
+                    .frontend_span(previous)
+                    .map(|span| span.start().to_usize())
+                    .unwrap_or_else(|| node.text_range().start().to_usize());
+                *current = Some(self.alloc_expr(
+                    kind,
+                    TextRange::new(start, node.text_range().end().to_usize()),
                 ));
                 return;
             }
@@ -1797,6 +1846,50 @@ mod tests {
         });
 
         assert!(has_binary_dim, "array dim should preserve `$counter - 1`");
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_exit_method_call_operand() {
+        let source = "<?php try {} catch (Exception $e) { exit($e->getMessage()); }\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let exit_operand = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Exit { expr: Some(expr) } => Some(*expr),
+                _ => None,
+            })
+            .expect("exit operand");
+
+        assert!(
+            matches!(
+                module.expressions()[exit_operand].kind(),
+                HirExprKind::MethodCall { .. }
+            ),
+            "exit operand should preserve method calls"
+        );
+        assert!(
+            !matches!(
+                module.expressions()[exit_operand].kind(),
+                HirExprKind::Missing
+            ),
+            "exit operand should not lower to missing"
+        );
         assert!(reporter.into_diagnostics().is_empty());
     }
 }
