@@ -117,9 +117,53 @@ fn float_to_php_string(value: f64) -> String {
         }
     } else if FLOAT_STRING_PRECISION.with(Cell::get) == 0 {
         format!("{value:.0}")
+    } else if value != 0.0 {
+        let abs = value.abs();
+        if !(1e-4..1e14).contains(&abs) {
+            return php_scientific_float_string(value);
+        }
+        php_decimal_float_string(value)
     } else {
-        value.to_string()
+        "0".to_owned()
     }
+}
+
+fn php_decimal_float_string(value: f64) -> String {
+    let output = value.to_string();
+    if output == "-0" {
+        "0".to_owned()
+    } else {
+        output
+    }
+}
+
+fn php_scientific_float_string(value: f64) -> String {
+    let precision = FLOAT_STRING_PRECISION.with(Cell::get).clamp(1, 17) as usize;
+    let decimals = precision.saturating_sub(1);
+    let mut output = format!("{value:.decimals$E}");
+    if let Some(exponent_index) = output.find('E') {
+        let mut mantissa = output[..exponent_index].to_owned();
+        let exponent = &output[exponent_index + 1..];
+        while mantissa.ends_with('0') {
+            mantissa.pop();
+        }
+        if mantissa.ends_with('.') {
+            mantissa.pop();
+        }
+        let sign = exponent
+            .strip_prefix('+')
+            .map(|digits| ("", digits))
+            .or_else(|| exponent.strip_prefix('-').map(|digits| ("-", digits)))
+            .unwrap_or(("", exponent));
+        let digits = sign.1.trim_start_matches('0');
+        output = format!(
+            "{}E{}{}",
+            mantissa,
+            sign.0,
+            if digits.is_empty() { "0" } else { digits }
+        );
+    }
+    output
 }
 
 /// Converts a value to an integer using explicit PHP cast rules in the subset.

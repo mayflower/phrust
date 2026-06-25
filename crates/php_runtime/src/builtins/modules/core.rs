@@ -2501,7 +2501,11 @@ pub(in crate::builtins::modules) fn builtin_wordwrap(
         .map_err(|message| conversion_error("wordwrap", message))?
         .unwrap_or(false);
     if break_string.is_empty() {
-        return Err(value_error("wordwrap", "break string must not be empty"));
+        return Err(argument_value_error(
+            "wordwrap",
+            "#3 ($break)",
+            "must not be empty",
+        ));
     }
     if width == 0 && cut {
         return Err(argument_value_error(
@@ -2512,6 +2516,12 @@ pub(in crate::builtins::modules) fn builtin_wordwrap(
     }
     if width < 0 && cut {
         return Ok(Value::string(wordwrap_negative_cut_bytes(
+            input.as_bytes(),
+            break_string.as_bytes(),
+        )));
+    }
+    if width == 0 {
+        return Ok(Value::string(wordwrap_zero_width_bytes(
             input.as_bytes(),
             break_string.as_bytes(),
         )));
@@ -2533,22 +2543,47 @@ pub(in crate::builtins::modules) fn builtin_substr_replace(
     if !(3..=4).contains(&args.len()) {
         return Err(arity_error("substr_replace", "three or four argument(s)"));
     }
-    let replacement = string_arg("substr_replace", &args[1])?;
-    let offset = int_arg("substr_replace", &args[2])?;
-    let length = args
-        .get(3)
-        .map(|value| int_arg("substr_replace", value))
-        .transpose()?;
     match deref_value(&args[0]) {
-        Value::Array(array) => Ok(Value::Array(PhpArray::from_packed(
-            array
-                .iter()
-                .map(|(_, value)| {
-                    substr_replace_one("substr_replace", value, &replacement, offset, length)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        subject => substr_replace_one("substr_replace", &subject, &replacement, offset, length),
+        Value::Array(array) => {
+            let mut result = PhpArray::new();
+            for (index, (key, value)) in array.iter().enumerate() {
+                let replacement = substr_replace_indexed_string_arg(&args[1], index)?;
+                let offset = substr_replace_indexed_int_arg(&args[2], index)?.unwrap_or(0);
+                let length = args
+                    .get(3)
+                    .map(|value| substr_replace_indexed_int_arg(value, index))
+                    .transpose()?
+                    .flatten();
+                let replaced =
+                    substr_replace_one("substr_replace", value, &replacement, offset, length)?;
+                result.insert(key.clone(), replaced);
+            }
+            Ok(Value::Array(result))
+        }
+        subject => {
+            if matches!(deref_value(&args[2]), Value::Array(_)) {
+                return Err(BuiltinError::new(
+                    "E_PHP_RUNTIME_BUILTIN_TYPE",
+                    "substr_replace(): Argument #3 ($offset) cannot be an array when working on a single string",
+                ));
+            }
+            if args
+                .get(3)
+                .is_some_and(|value| matches!(deref_value(value), Value::Array(_)))
+            {
+                return Err(BuiltinError::new(
+                    "E_PHP_RUNTIME_BUILTIN_TYPE",
+                    "substr_replace(): Argument #4 ($length) cannot be an array when working on a single string",
+                ));
+            }
+            let replacement = substr_replace_indexed_string_arg(&args[1], 0)?;
+            let offset = int_arg("substr_replace", &args[2])?;
+            let length = args
+                .get(3)
+                .map(|value| int_arg("substr_replace", value))
+                .transpose()?;
+            substr_replace_one("substr_replace", &subject, &replacement, offset, length)
+        }
     }
 }
 
@@ -2563,13 +2598,23 @@ pub(in crate::builtins::modules) fn builtin_convert_uuencode(
 }
 
 pub(in crate::builtins::modules) fn builtin_convert_uudecode(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("convert_uudecode", &args, 1)?;
     let input = string_arg("convert_uudecode", &args[0])?;
-    Ok(uudecode_bytes(input.as_bytes()).map_or(Value::Bool(false), Value::string))
+    Ok(uudecode_bytes(input.as_bytes()).map_or_else(
+        || {
+            context.php_warning(
+                "E_PHP_RUNTIME_INVALID_UUENCODED_STRING",
+                "convert_uudecode(): Argument #1 ($data) is not a valid uuencoded string",
+                span,
+            );
+            Value::Bool(false)
+        },
+        Value::string,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6378,6 +6423,31 @@ fn substr_replace_one(
     Ok(Value::string(output))
 }
 
+fn substr_replace_indexed_string_arg(
+    value: &Value,
+    index: usize,
+) -> Result<PhpString, BuiltinError> {
+    match deref_value(value) {
+        Value::Array(array) => array.packed_element(index).map_or_else(
+            || Ok(PhpString::from_bytes(Vec::new())),
+            |value| string_arg("substr_replace", value),
+        ),
+        other => string_arg("substr_replace", &other),
+    }
+}
+
+fn substr_replace_indexed_int_arg(
+    value: &Value,
+    index: usize,
+) -> Result<Option<i64>, BuiltinError> {
+    match deref_value(value) {
+        Value::Array(array) => array
+            .packed_element(index)
+            .map_or(Ok(None), |value| int_arg("substr_replace", value).map(Some)),
+        other => int_arg("substr_replace", &other).map(Some),
+    }
+}
+
 fn stripslashes_bytes(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0;
@@ -6919,6 +6989,18 @@ fn wordwrap_bytes(input: &[u8], width: usize, break_string: &[u8], cut: bool) ->
     output
 }
 
+fn wordwrap_zero_width_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for byte in input {
+        if byte.is_ascii_whitespace() {
+            output.extend_from_slice(break_string);
+        } else {
+            output.push(*byte);
+        }
+    }
+    output
+}
+
 fn wordwrap_negative_cut_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in input {
@@ -6937,7 +7019,8 @@ fn wordwrap_negative_cut_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
 fn wordwrap_line(line: &[u8], width: usize, break_string: &[u8], cut: bool, output: &mut Vec<u8>) {
     let mut start = 0usize;
     while line.len().saturating_sub(start) > width {
-        let search = &line[start..start + width.min(line.len() - start)];
+        let search_end = start + (width + 1).min(line.len() - start);
+        let search = &line[start..search_end];
         if let Some(space) = search.iter().rposition(|byte| byte.is_ascii_whitespace()) {
             if space > 0 {
                 output.extend_from_slice(&line[start..start + space]);
@@ -6955,14 +7038,16 @@ fn wordwrap_line(line: &[u8], width: usize, break_string: &[u8], cut: bool, outp
             }
         } else if cut {
             output.extend_from_slice(&line[start..start + width]);
-            if line[start + width..].starts_with(break_string) {
+            if line[start..start + width].ends_with(break_string) {
+                start += width;
+            } else if line[start + width..].starts_with(break_string) {
                 output.extend_from_slice(break_string);
                 start += width + break_string.len();
             } else {
                 output.extend_from_slice(break_string);
                 start += width;
             }
-            while line.get(start).is_some_and(u8::is_ascii_whitespace) {
+            if line.get(start).is_some_and(u8::is_ascii_whitespace) {
                 start += 1;
             }
         } else if let Some(space) = line[start + width..]
@@ -7008,6 +7093,9 @@ fn uuencode_sixbit(value: u8) -> u8 {
 }
 
 fn uudecode_bytes(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return None;
+    }
     let mut output = Vec::new();
     for raw_line in input.split(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
@@ -7017,6 +7105,10 @@ fn uudecode_bytes(input: &[u8]) -> Option<Vec<u8>> {
         let length = uudecode_sixbit(*line.first()?) as usize;
         if length == 0 {
             return Some(output);
+        }
+        let encoded_len = length.div_ceil(3) * 4;
+        if line.len().saturating_sub(1) < encoded_len {
+            return None;
         }
         let mut decoded = Vec::with_capacity(length);
         for group in line[1..].chunks(4) {
@@ -8180,11 +8272,11 @@ impl DebugFormatter {
             Value::Float(value) => {
                 output.write_test_str(&format!("float({})\n", php_float_debug_string(*value)));
             }
-            Value::String(value) => output.write_test_str(&format!(
-                "string({}) \"{}\"\n",
-                value.len(),
-                value.to_string_lossy()
-            )),
+            Value::String(value) => {
+                output.write_test_str(&format!("string({}) \"", value.len()));
+                output.write_php_string(value);
+                output.write_test_str("\"\n");
+            }
             Value::Array(array) => {
                 output.write_test_str(&format!("array({}) {{\n", array.len()));
                 for (key, element) in array.iter() {

@@ -11916,8 +11916,8 @@ impl Vm {
                     compiled,
                     stack,
                     format!(
-                        "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP: object {} does not define __toString",
-                        object.class_name()
+                        "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP: Object of class {} could not be converted to string",
+                        class.display_name
                     ),
                 ));
             }
@@ -20404,15 +20404,18 @@ fn builtin_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_RUNTIME_BUILTIN_ARITY" => "ArgumentCountError",
         "E_PHP_RUNTIME_BUILTIN_TYPE" => "TypeError",
         "E_PHP_RUNTIME_BUILTIN_VALUE" => "ValueError",
+        "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP" => "Error",
         "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES" => "TypeError",
         _ => return None,
     };
-    make_exception_object(
-        class_name,
-        &Value::string(diagnostic.message().as_bytes().to_vec()),
-    )
-    .ok()
-    .map(Value::Object)
+    let message = diagnostic
+        .message()
+        .split_once(": ")
+        .filter(|(prefix, _)| prefix.starts_with("E_"))
+        .map_or_else(|| diagnostic.message(), |(_, message)| message);
+    make_exception_object(class_name, &Value::string(message.as_bytes().to_vec()))
+        .ok()
+        .map(Value::Object)
 }
 
 impl Default for Vm {
