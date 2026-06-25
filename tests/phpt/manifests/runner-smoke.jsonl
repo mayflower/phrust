@@ -1,4 +1,13 @@
 {"path":"tests/phpt/generated/runner_smoke/hello.phpt","source":"generated"}
 {"path":"tests/phpt/generated/runner_smoke/expectf.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/expectregex.phpt","source":"generated"}
 {"path":"tests/phpt/generated/runner_smoke/skipif.phpt","source":"generated"}
 {"path":"tests/phpt/generated/runner_smoke/clean.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/fileeof.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/file_external.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/ini.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/env.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/args.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/stdin.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/xfail.phpt","source":"generated"}
+{"path":"tests/phpt/generated/runner_smoke/metadata_sections.phpt","source":"generated"}

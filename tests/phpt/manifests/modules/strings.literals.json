@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"strings.literals",
+  "priority":7,
+  "selected_manifest":"tests/phpt/manifests/modules/strings.literals.selected.jsonl",
+  "corpus_count":9,
+  "pass_count":0,
+  "skip_count":0,
+  "fail_count":9,
+  "bork_count":0,
+  "known_failure_count":9,
+  "scope":["string literal decoding","heredoc/nowdoc","string interpolation basics"],
+  "non_scope":["full ext/standard string API"],
+  "target_gates":["nix develop -c just verify-frontend"],
+  "next_step":"Separate frontend literal gaps from runtime string builtin gaps."
+}

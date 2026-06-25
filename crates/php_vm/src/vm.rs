@@ -24,10 +24,10 @@ use crate::quickening::{
 use crate::tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 use php_ir::constants::IrConstant;
 use php_ir::function::{IrFunction, IrParam, IrReturnType};
-use php_ir::ids::{BlockId, ConstId, FunctionId, InstrId, LocalId};
+use php_ir::ids::{BlockId, ConstId, FunctionId, InstrId, LocalId, RegId};
 use php_ir::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, Instruction,
-    InstructionKind, IrCallArg, TerminatorKind, UnaryOp,
+    InstructionKind, IrCallArg, IrDiagnosticSeverity, TerminatorKind, UnaryOp,
 };
 use php_ir::module::IrUnit;
 use php_ir::operand::Operand;
@@ -46,10 +46,10 @@ use php_runtime::{
     FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
     OutputBuffer, PhpArray, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
     RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Value,
-    compare, division_by_zero_mvp, equal, identical, reset_float_string_precision,
-    runtime_type_name, set_float_string_precision, to_bool, to_float, to_int, to_number, to_string,
-    undefined_function, undefined_variable_warning, unsupported_feature,
-    value_matches_runtime_type, value_type_name,
+    compare, division_by_zero_mvp, emit_php_diagnostic, equal, error_reporting_allows_level,
+    identical, reset_float_string_precision, runtime_type_name, set_float_string_precision,
+    to_arithmetic_number, to_bool, to_float, to_int, to_number, to_string, undefined_function,
+    undefined_variable_warning, unsupported_feature, value_matches_runtime_type, value_type_name,
 };
 #[cfg(test)]
 use php_runtime::{GcEntityId, GcEntityKind};
@@ -268,6 +268,7 @@ fn output_preallocation_hint(unit: &IrUnit) -> usize {
         })
         .filter_map(|constant| match constant {
             IrConstant::String(value) => Some(value.len()),
+            IrConstant::StringBytes(value) => Some(value.len()),
             _ => None,
         })
         .sum()
@@ -910,11 +911,15 @@ struct ExecutionState {
     dynamic_units: Vec<CompiledUnit>,
     dynamic_functions: Vec<DynamicFunctionEntry>,
     dynamic_classes: Vec<DynamicClassEntry>,
+    user_constants: HashMap<String, Value>,
     ini: IniRegistry,
     env: Vec<(String, String)>,
     resources: ResourceTable,
+    stdin: Option<php_runtime::ResourceRef>,
+    strtok_state: php_runtime::StrtokState,
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
+    diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 impl ExecutionState {
@@ -1366,6 +1371,11 @@ impl Vm {
             env: self.options.runtime_context.env.clone(),
             ..ExecutionState::default()
         };
+        state.stdin = Some(
+            state
+                .resources
+                .register_stdin(self.options.runtime_context.stdin.clone()),
+        );
         apply_float_string_precision(&state.ini);
         seed_runtime_globals(&mut state.globals, &self.options.runtime_context);
         let mut result = self.execute_function(
@@ -1390,6 +1400,7 @@ impl Vm {
         if self.options.trace_runtime {
             self.record_gc_root_trace_event(&stack, &state);
         }
+        result.diagnostics.extend(state.diagnostics);
         output.flush_all_buffers();
         let output_len = output.len();
         let output_stats = output.stats();
@@ -2377,6 +2388,7 @@ impl Vm {
         name: &str,
         values: Vec<Value>,
         output: &mut OutputBuffer,
+        stack: &mut CallStack,
         state: &mut ExecutionState,
         compiled: &CompiledUnit,
     ) -> VmResult {
@@ -2388,6 +2400,12 @@ impl Vm {
             return result;
         }
         self.record_array_count_fast_path_if_applicable(name, &values);
+        let values = match self
+            .coerce_internal_builtin_string_args(name, values, compiled, output, stack, state)
+        {
+            Ok(values) => values,
+            Err(result) => return result,
+        };
         execute_builtin_entry(
             entry,
             values,
@@ -2416,6 +2434,28 @@ impl Vm {
             output.clone(),
             Some(Value::Int(array.len() as i64)),
         ))
+    }
+
+    fn coerce_internal_builtin_string_args(
+        &self,
+        name: &str,
+        mut values: Vec<Value>,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Vec<Value>, VmResult> {
+        for &index in internal_builtin_string_arg_positions(name, values.len()) {
+            let Some(value) = values.get(index).cloned() else {
+                continue;
+            };
+            if !value_needs_vm_string_coercion(&value) {
+                continue;
+            }
+            let coerced = self.value_to_string(compiled, &value, output, stack, state)?;
+            values[index] = Value::String(coerced);
+        }
+        Ok(values)
     }
 
     fn record_counter_local_slot_fast_path(&self, hit: bool) {
@@ -2648,8 +2688,14 @@ impl Vm {
 
     fn warm_literal_pool(&self, unit: &IrUnit) {
         for constant in &unit.constants {
-            if let IrConstant::String(value) = constant {
-                self.intern_str(value);
+            match constant {
+                IrConstant::String(value) => {
+                    self.intern_str(value);
+                }
+                IrConstant::StringBytes(value) => {
+                    self.intern_bytes(value);
+                }
+                _ => {}
             }
         }
         for function in &unit.functions {
@@ -2734,6 +2780,7 @@ impl Vm {
             IrConstant::Int(value) => Value::Int(*value),
             IrConstant::Float(value) => Value::float(*value),
             IrConstant::String(value) => Value::String(self.intern_str(value)),
+            IrConstant::StringBytes(value) => Value::String(self.intern_bytes(value)),
         }
     }
 
@@ -3556,11 +3603,13 @@ impl Vm {
                         }
                     }
                     InstructionKind::FetchConst { dst, name } => {
-                        let value = if let Some(constant) = compiled.lookup_constant(name) {
-                            self.inline_constant_value(constant)
-                        } else if name == "PHP_VERSION" {
-                            Value::String(self.intern_str(php_source::reference_php_version()))
-                        } else if let Some(value) = predefined_constant_value(name) {
+                        let value = if name == "STDIN" {
+                            let resource = state
+                                .stdin
+                                .get_or_insert_with(|| state.resources.register_stdin(Vec::new()))
+                                .clone();
+                            Value::Resource(resource)
+                        } else if let Some(value) = global_constant_value(compiled, state, name) {
                             value
                         } else {
                             return self.runtime_error(
@@ -3629,11 +3678,33 @@ impl Vm {
                         };
                         let value = match value {
                             Some(value) => value,
-                            None => match self
-                                .execute_binary(compiled, *op, &lhs, &rhs, output, stack, state)
-                            {
+                            None => match self.execute_binary(
+                                compiled,
+                                *op,
+                                &lhs,
+                                &rhs,
+                                runtime_source_span(compiled, instruction.span),
+                                output,
+                                stack,
+                                state,
+                            ) {
                                 Ok(value) => value,
                                 Err(result) => {
+                                    if let Some(throwable) = builtin_error_throwable(&result) {
+                                        if let Some(target) = handle_throw(
+                                            compiled,
+                                            throwable.clone(),
+                                            &mut exception_handlers,
+                                            stack,
+                                            &mut pending_control,
+                                        ) {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        return self.handle_uncaught_exception(
+                                            compiled, output, stack, state, throwable,
+                                        );
+                                    }
                                     return result;
                                 }
                             },
@@ -3759,12 +3830,12 @@ impl Vm {
                             self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
                                 stack, *local,
                             ));
-                            match stack
+                            let local_value = stack
                                 .current()
                                 .expect("frame was pushed")
                                 .locals
-                                .get(*local)
-                            {
+                                .get(*local);
+                            match local_value {
                                 Some(Value::Uninitialized) if is_this_local(function, *local) => {
                                     return self.runtime_error(
                                         output,
@@ -3773,15 +3844,53 @@ impl Vm {
                                         "E_PHP_VM_THIS_OUTSIDE_METHOD: $this is not available outside an instance method",
                                     );
                                 }
-                                Some(Value::Uninitialized) => {
-                                    diagnostics.push(undefined_variable_warning(
-                                        format!("local:{}", local.raw()),
-                                        RuntimeSourceSpan::default(),
-                                        stack_trace(compiled, stack),
-                                    ));
+                                Some(Value::Uninitialized)
+                                    if load_local_is_pre_call_by_ref_out_param(
+                                        &block.instructions,
+                                        instruction_index,
+                                        *dst,
+                                        *local,
+                                    ) =>
+                                {
                                     Value::Null
                                 }
-                                Some(value) => value.clone(),
+                                Some(Value::Uninitialized) => {
+                                    let local_name = function
+                                        .locals
+                                        .get(local.index())
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("local:{}", local.raw()));
+                                    let diagnostic = undefined_variable_warning(
+                                        local_name,
+                                        runtime_source_span(compiled, instruction.span),
+                                        stack_trace(compiled, stack),
+                                    );
+                                    let handled = match self.dispatch_error_handler(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        php_runtime::PHP_E_WARNING,
+                                        &diagnostic,
+                                    ) {
+                                        Ok(handled) => handled,
+                                        Err(result) => return result,
+                                    };
+                                    if !handled
+                                        && error_reporting_allows(state, php_runtime::PHP_E_WARNING)
+                                    {
+                                        emit_vm_diagnostic(
+                                            output,
+                                            state,
+                                            &diagnostic,
+                                            php_runtime::PhpDiagnosticChannel::Warning,
+                                            php_runtime::PHP_E_WARNING,
+                                        );
+                                        diagnostics.push(diagnostic);
+                                    }
+                                    Value::Null
+                                }
+                                Some(value) => value,
                                 None => {
                                     return self.runtime_error(
                                         output,
@@ -6799,6 +6908,55 @@ impl Vm {
                             return result;
                         }
                     }
+                    InstructionKind::EmitDiagnostic {
+                        severity,
+                        diagnostic_id,
+                        message,
+                        leading_newline,
+                    } => {
+                        let (runtime_severity, channel, level) = match severity {
+                            IrDiagnosticSeverity::Warning => (
+                                RuntimeSeverity::Warning,
+                                php_runtime::PhpDiagnosticChannel::Warning,
+                                php_runtime::PHP_E_WARNING,
+                            ),
+                            IrDiagnosticSeverity::Deprecation => (
+                                RuntimeSeverity::Deprecation,
+                                php_runtime::PhpDiagnosticChannel::Deprecated,
+                                php_runtime::PHP_E_DEPRECATED,
+                            ),
+                        };
+                        let diagnostic = RuntimeDiagnostic::new(
+                            diagnostic_id.clone(),
+                            runtime_severity,
+                            message.clone(),
+                            runtime_source_span(compiled, instruction.span),
+                            stack_trace(compiled, stack),
+                            None,
+                        );
+                        let handled = match self.dispatch_error_handler(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            level,
+                            &diagnostic,
+                        ) {
+                            Ok(handled) => handled,
+                            Err(result) => return result,
+                        };
+                        if !handled && error_reporting_allows(state, level) {
+                            emit_vm_diagnostic_with_options(
+                                output,
+                                state,
+                                &diagnostic,
+                                channel,
+                                level,
+                                *leading_newline,
+                            );
+                            diagnostics.push(diagnostic);
+                        }
+                    }
                     InstructionKind::Yield { dst, key, value } => {
                         let key = match key {
                             Some(key) => match read_operand(unit, stack, *key) {
@@ -8528,6 +8686,7 @@ impl Vm {
                     &name,
                     values,
                     output,
+                    stack,
                     state,
                     compiled,
                 )
@@ -8851,14 +9010,6 @@ impl Vm {
             },
             None => php_std::constants::E_USER_NOTICE,
         };
-        if level == php_std::constants::E_USER_ERROR {
-            return self.runtime_error(
-                output,
-                compiled,
-                stack,
-                format!("E_PHP_VM_USER_ERROR: {message}"),
-            );
-        }
         if !is_supported_user_error_level(level) {
             return self.runtime_error(
                 output,
@@ -8868,57 +9019,104 @@ impl Vm {
             );
         }
 
-        let reported = error_reporting_allows(state, level);
-        let handler = state
-            .error_handlers
-            .last()
-            .cloned()
-            .filter(|entry| reported && (entry.levels == -1 || (entry.levels & level) != 0));
-        if let Some(handler) = handler {
-            let result = self.call_callable(
-                compiled,
-                Value::Callable(handler.callback),
-                vec![
-                    CallArgument::positional(Value::Int(level)),
-                    CallArgument::positional(Value::string(message.clone())),
-                    CallArgument::positional(Value::string("")),
-                    CallArgument::positional(Value::Int(0)),
-                ],
-                output,
-                stack,
-                state,
-            );
-            if !result.status.is_success() {
-                return result;
+        let diagnostic = RuntimeDiagnostic::new(
+            error_level_diagnostic_id(level),
+            error_level_severity(level),
+            message.clone(),
+            RuntimeSourceSpan::default(),
+            stack_trace(compiled, stack),
+            Some(if level == php_std::constants::E_USER_ERROR {
+                php_runtime::PhpReferenceClassification::FatalError
+            } else {
+                php_runtime::PhpReferenceClassification::Warning
+            }),
+        );
+        let handled = if level == php_std::constants::E_USER_ERROR {
+            false
+        } else {
+            match self.dispatch_error_handler(compiled, output, stack, state, level, &diagnostic) {
+                Ok(handled) => handled,
+                Err(result) => return result,
             }
-            let handled = result
-                .return_value
-                .as_ref()
-                .is_some_and(|value| to_bool(value).unwrap_or(false));
-            if handled {
-                return VmResult::success(output.clone(), Some(Value::Bool(true)));
-            }
+        };
+        if handled {
+            return VmResult::success(output.clone(), Some(Value::Bool(true)));
         }
 
-        if reported && display_errors_enabled(state) {
-            output.write_php_string(&PhpString::from(
-                format!("{}: {}\n", error_level_display_name(level), message).into_bytes(),
-            ));
+        let reported = error_reporting_allows(state, level);
+        if reported {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                error_level_channel(level),
+                level,
+            );
+        }
+        if level == php_std::constants::E_USER_ERROR {
+            return VmResult::runtime_error_with_diagnostic(
+                output.clone(),
+                format!("E_PHP_VM_USER_ERROR: {message}"),
+                diagnostic,
+            );
         }
 
         let diagnostics = if reported {
-            vec![RuntimeDiagnostic::new(
-                error_level_diagnostic_id(level),
-                error_level_severity(level),
-                message,
-                RuntimeSourceSpan::default(),
-                stack_trace(compiled, stack),
-                Some(php_runtime::PhpReferenceClassification::Warning),
-            )]
+            vec![diagnostic]
         } else {
             Vec::new()
         };
         VmResult::success_with_diagnostics(output.clone(), Some(Value::Bool(true)), diagnostics)
+    }
+
+    fn dispatch_error_handler(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        level: i64,
+        diagnostic: &RuntimeDiagnostic,
+    ) -> Result<bool, VmResult> {
+        let Some(handler) = state
+            .error_handlers
+            .last()
+            .cloned()
+            .filter(|entry| entry.levels == -1 || (entry.levels & level) != 0)
+        else {
+            return Ok(false);
+        };
+        let callback = handler.callback;
+        let span = diagnostic.source_span();
+        let args = trim_error_handler_args(
+            compiled,
+            state,
+            &callback,
+            vec![
+                Value::Int(level),
+                Value::string(diagnostic.message()),
+                Value::string(span.file.clone().unwrap_or_default()),
+                Value::Int(span.start as i64),
+            ],
+        )
+        .into_iter()
+        .map(CallArgument::positional)
+        .collect();
+        let result = self.call_callable(
+            compiled,
+            Value::Callable(callback),
+            args,
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            return Err(result);
+        }
+        Ok(!matches!(
+            result.return_value.as_ref(),
+            Some(Value::Bool(false))
+        ))
     }
 
     fn call_output_buffering_builtin(
@@ -9836,6 +10034,7 @@ impl Vm {
                 &normalized,
                 values,
                 output,
+                stack,
                 state,
                 compiled,
             );
@@ -9999,7 +10198,9 @@ impl Vm {
                     {
                         return self.runtime_error(output, compiled, stack, message);
                     }
-                    self.execute_internal_registry_builtin(&name, values, output, state, compiled)
+                    self.execute_internal_registry_builtin(
+                        &name, values, output, stack, state, compiled,
+                    )
                 }
             },
         }
@@ -11676,6 +11877,10 @@ impl Vm {
             Value::Object(object) => {
                 self.object_to_string(compiled, object.clone(), output, stack, state)
             }
+            Value::Array(_) => {
+                write_array_to_string_warning(output, state);
+                Ok(PhpString::from_bytes(b"Array".to_vec()))
+            }
             Value::Reference(cell) => {
                 self.value_to_string(compiled, &cell.get(), output, stack, state)
             }
@@ -11910,6 +12115,7 @@ impl Vm {
         op: BinaryOp,
         lhs: &Value,
         rhs: &Value,
+        source_span: RuntimeSourceSpan,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -11926,11 +12132,25 @@ impl Vm {
                 Ok(Value::String(PhpString::from_bytes(bytes)))
             }
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                let lhs = to_number(lhs)
+                if has_array_operand(lhs) || has_array_operand(rhs) {
+                    return Err(unsupported_operand_types_error(
+                        output,
+                        compiled,
+                        stack,
+                        lhs,
+                        op,
+                        rhs,
+                        source_span,
+                    ));
+                }
+                let lhs = to_arithmetic_number(lhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
-                let rhs = to_number(rhs)
+                let rhs = to_arithmetic_number(rhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
-                execute_arithmetic(op, lhs, rhs)
+                if lhs.leading_numeric_string || rhs.leading_numeric_string {
+                    write_non_numeric_value_warning(output, state);
+                }
+                execute_arithmetic(op, lhs.value, rhs.value)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))
             }
             BinaryOp::BitAnd
@@ -11965,7 +12185,7 @@ impl Vm {
                 .map_err(|message| self.runtime_error(output, compiled, stack, message)),
             CastKind::Int => match src {
                 Value::Object(object) => {
-                    write_object_numeric_cast_warning(output, object, "int");
+                    write_object_numeric_cast_warning(output, state, object, "int");
                     Ok(Value::Int(1))
                 }
                 _ => to_int(src)
@@ -11974,7 +12194,7 @@ impl Vm {
             },
             CastKind::Float => match src {
                 Value::Object(object) => {
-                    write_object_numeric_cast_warning(output, object, "float");
+                    write_object_numeric_cast_warning(output, state, object, "float");
                     Ok(Value::float(1.0))
                 }
                 _ => to_float(src)
@@ -12541,10 +12761,32 @@ impl Vm {
                 VmResult::success(
                     output.clone(),
                     Some(Value::Bool(
-                        compiled.lookup_constant(&constant_name).is_some()
-                            || predefined_constant_value(&constant_name).is_some(),
+                        global_constant_value(compiled, state, &constant_name).is_some(),
                     )),
                 )
+            }
+            "define" => {
+                if values.len() < 2 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: define expects name and value",
+                    );
+                }
+                let constant_name = match to_string(&values[0]) {
+                    Ok(name) => name.to_string_lossy(),
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                };
+                if constant_name.is_empty()
+                    || global_constant_value(compiled, state, &constant_name).is_some()
+                {
+                    return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                }
+                state
+                    .user_constants
+                    .insert(constant_name, effective_value(&values[1]));
+                VmResult::success(output.clone(), Some(Value::Bool(true)))
             }
             "constant" => {
                 let Some(constant_name) = values.first() else {
@@ -12559,11 +12801,7 @@ impl Vm {
                     Ok(name) => name.to_string_lossy(),
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
-                let value = if let Some(constant) = compiled.lookup_constant(&constant_name) {
-                    inline_constant_value(constant)
-                } else if let Some(value) = predefined_constant_value(&constant_name) {
-                    value
-                } else {
+                let Some(value) = global_constant_value(compiled, state, &constant_name) else {
                     return self.runtime_error(
                         output,
                         compiled,
@@ -13689,7 +13927,8 @@ fn internal_throwable_display_name(class_name: &str) -> String {
 
 fn internal_throwable_parent(class_name: &str) -> Option<&'static str> {
     match normalize_class_name(class_name).as_str() {
-        "typeerror" | "valueerror" | "argumentcounterror" | "fibererror" => Some("Error"),
+        "typeerror" | "valueerror" | "fibererror" => Some("Error"),
+        "argumentcounterror" => Some("TypeError"),
         "logicexception" | "runtimeexception" => Some("Exception"),
         "badfunctioncallexception"
         | "domainexception"
@@ -14749,6 +14988,12 @@ fn reflection_method_value(
             }
             "getdefaultvalue" => Ok(object.get_property("default").unwrap_or(Value::Null)),
             "isoptional" => Ok(reflection_bool_property(object, "optional")),
+            "isvariadic" => Ok(reflection_bool_property(object, "variadic")),
+            "ispassedbyreference" => Ok(reflection_bool_property(object, "by_ref")),
+            "canbepassedbyvalue" => Ok(Value::Bool(!matches!(
+                object.get_property("by_ref"),
+                Some(Value::Bool(true))
+            ))),
             "allowsnull" => Ok(reflection_bool_property(object, "allows_null")),
             _ => Err(format!(
                 "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
@@ -14789,138 +15034,92 @@ fn reflection_method_value(
 struct InternalReflectionParam {
     name: &'static str,
     type_name: Option<&'static str>,
+    allows_null: bool,
     optional: bool,
     default: Value,
+    by_ref: bool,
+    variadic: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct InternalReflectionSignature {
     return_type: Option<&'static str>,
-    params: &'static [InternalReflectionParam],
+    return_allows_null: bool,
+    params: Vec<InternalReflectionParam>,
 }
 
-const INTERNAL_PARAM_VALUE: InternalReflectionParam = InternalReflectionParam {
-    name: "value",
-    type_name: Some("mixed"),
-    optional: false,
-    default: Value::Null,
-};
-
-const INTERNAL_PARAM_STRING: InternalReflectionParam = InternalReflectionParam {
-    name: "string",
-    type_name: Some("string"),
-    optional: false,
-    default: Value::Null,
-};
-
-const INTERNAL_PARAM_MODE: InternalReflectionParam = InternalReflectionParam {
-    name: "mode",
-    type_name: Some("int"),
-    optional: true,
-    default: Value::Int(0),
-};
-
-const INTERNAL_PARAM_FLAGS: InternalReflectionParam = InternalReflectionParam {
-    name: "flags",
-    type_name: Some("int"),
-    optional: true,
-    default: Value::Int(0),
-};
-
-const INTERNAL_PARAM_DEPTH: InternalReflectionParam = InternalReflectionParam {
-    name: "depth",
-    type_name: Some("int"),
-    optional: true,
-    default: Value::Int(512),
-};
-
-const INTERNAL_PARAM_OBJECT: InternalReflectionParam = InternalReflectionParam {
-    name: "object",
-    type_name: Some("object"),
-    optional: false,
-    default: Value::Null,
-};
-
-const INTERNAL_PARAM_FORMAT: InternalReflectionParam = InternalReflectionParam {
-    name: "format",
-    type_name: Some("string"),
-    optional: false,
-    default: Value::Null,
-};
-
-const COUNT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_VALUE, INTERNAL_PARAM_MODE];
-const STRLEN_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_STRING];
-const JSON_ENCODE_PARAMS: &[InternalReflectionParam] = &[
-    INTERNAL_PARAM_VALUE,
-    INTERNAL_PARAM_FLAGS,
-    INTERNAL_PARAM_DEPTH,
-];
-const SPL_OBJECT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_OBJECT];
-const FORMAT_PARAMS: &[InternalReflectionParam] = &[INTERNAL_PARAM_FORMAT];
-
 fn internal_function_signature(name: &str) -> InternalReflectionSignature {
-    match normalize_function_name(name).as_str() {
-        "count" | "sizeof" => InternalReflectionSignature {
-            return_type: Some("int"),
-            params: COUNT_PARAMS,
-        },
-        "strlen" => InternalReflectionSignature {
-            return_type: Some("int"),
-            params: STRLEN_PARAMS,
-        },
-        "json_encode" => InternalReflectionSignature {
-            return_type: Some("string|false"),
-            params: JSON_ENCODE_PARAMS,
-        },
-        "spl_object_id" => InternalReflectionSignature {
-            return_type: Some("int"),
-            params: SPL_OBJECT_PARAMS,
-        },
-        "spl_object_hash" => InternalReflectionSignature {
-            return_type: Some("string"),
-            params: SPL_OBJECT_PARAMS,
-        },
-        _ => InternalReflectionSignature {
-            return_type: Some("mixed"),
-            params: &[],
-        },
+    if let Some(metadata) = php_std::generated::arginfo::function_metadata(name) {
+        return signature_from_params(metadata.return_type, metadata.params);
+    }
+    InternalReflectionSignature {
+        return_type: Some("mixed"),
+        return_allows_null: true,
+        params: Vec::new(),
     }
 }
 
 fn internal_method_signature(class_name: &str, method_name: &str) -> InternalReflectionSignature {
-    match (
-        normalize_class_name(class_name).as_str(),
-        normalize_method_name(method_name).as_str(),
-    ) {
-        ("arrayobject", "count") | ("arrayiterator", "count") | ("splfixedarray", "count") => {
-            InternalReflectionSignature {
-                return_type: Some("int"),
-                params: &[],
-            }
+    if let Some(metadata) = php_std::generated::arginfo::method_metadata(class_name, method_name) {
+        return signature_from_params(metadata.return_type, metadata.params);
+    }
+    InternalReflectionSignature {
+        return_type: Some("mixed"),
+        return_allows_null: true,
+        params: Vec::new(),
+    }
+}
+
+fn signature_from_params(
+    return_type: &'static str,
+    params: &'static [php_std::generated::arginfo::GeneratedParamMetadata],
+) -> InternalReflectionSignature {
+    InternalReflectionSignature {
+        return_type: reflection_type_name(return_type),
+        return_allows_null: reflection_type_allows_null(return_type),
+        params: params
+            .iter()
+            .map(|param| InternalReflectionParam {
+                name: param.name,
+                type_name: reflection_type_name(param.type_decl),
+                allows_null: reflection_type_allows_null(param.type_decl),
+                optional: param.optional,
+                default: reflection_default_value(param.default_value),
+                by_ref: param.by_ref,
+                variadic: param.variadic,
+            })
+            .collect(),
+    }
+}
+
+fn reflection_type_name(type_decl: &'static str) -> Option<&'static str> {
+    let type_decl = type_decl.trim();
+    if type_decl.is_empty() {
+        return None;
+    }
+    Some(type_decl.strip_prefix('?').unwrap_or(type_decl))
+}
+
+fn reflection_type_allows_null(type_decl: &str) -> bool {
+    let lower = type_decl.to_ascii_lowercase();
+    lower == "mixed" || lower == "null" || lower.starts_with('?') || lower.contains("|null")
+}
+
+fn reflection_default_value(default: Option<&str>) -> Value {
+    let Some(default) = default else {
+        return Value::Null;
+    };
+    match default {
+        "null" | "NULL" => Value::Null,
+        "false" | "FALSE" => Value::Bool(false),
+        "true" | "TRUE" => Value::Bool(true),
+        value if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 => {
+            Value::String(PhpString::from(&value[1..value.len() - 1]))
         }
-        ("arrayobject", "getarraycopy") | ("arrayiterator", "getarraycopy") => {
-            InternalReflectionSignature {
-                return_type: Some("array"),
-                params: &[],
-            }
+        value if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 => {
+            Value::String(PhpString::from(&value[1..value.len() - 1]))
         }
-        ("splfileinfo", "getfilename")
-        | ("splfileinfo", "getpathname")
-        | ("splfileobject", "fgets")
-        | ("splfileobject", "current")
-        | ("spltempfileobject", "fgets")
-        | ("spltempfileobject", "current") => InternalReflectionSignature {
-            return_type: Some("string"),
-            params: &[],
-        },
-        ("datetime", "format") => InternalReflectionSignature {
-            return_type: Some("string"),
-            params: FORMAT_PARAMS,
-        },
-        _ => InternalReflectionSignature {
-            return_type: Some("mixed"),
-            params: &[],
-        },
+        value => value.parse::<i64>().map_or(Value::Null, Value::Int),
     }
 }
 
@@ -14936,7 +15135,7 @@ fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> V
                 (
                     "type",
                     param.type_name.map_or(Value::Null, |type_name| {
-                        reflection_named_type_value(type_name, type_name == "mixed", true)
+                        reflection_named_type_value(type_name, param.allows_null, true)
                     }),
                 ),
                 ("has_default", Value::Bool(has_default)),
@@ -14949,9 +15148,11 @@ fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> V
                     },
                 ),
                 ("optional", Value::Bool(param.optional)),
+                ("by_ref", Value::Bool(param.by_ref)),
+                ("variadic", Value::Bool(param.variadic)),
                 (
                     "allows_null",
-                    Value::Bool(param.type_name.is_none_or(|type_name| type_name == "mixed")),
+                    Value::Bool(param.type_name.is_none_or(|_| param.allows_null)),
                 ),
             ],
         )));
@@ -14972,7 +15173,7 @@ fn reflection_internal_function_object(function: &str) -> Result<ObjectRef, Stri
             ("attributes", empty_array_value()),
             (
                 "parameters",
-                reflection_internal_parameters_value(signature.params),
+                reflection_internal_parameters_value(&signature.params),
             ),
             ("parameter_count", Value::Int(signature.params.len() as i64)),
             (
@@ -14988,7 +15189,7 @@ fn reflection_internal_function_object(function: &str) -> Result<ObjectRef, Stri
             (
                 "return_type",
                 signature.return_type.map_or(Value::Null, |name| {
-                    reflection_named_type_value(name, name == "mixed", true)
+                    reflection_named_type_value(name, signature.return_allows_null, true)
                 }),
             ),
             ("file", Value::Bool(false)),
@@ -15064,46 +15265,19 @@ fn internal_class_interfaces(class_name: &str) -> Vec<String> {
 }
 
 fn internal_class_methods(class_name: &str) -> Vec<InternalClassMethod> {
-    match normalize_class_name(class_name).as_str() {
-        "arrayobject" => vec![
-            InternalClassMethod { name: "count" },
-            InternalClassMethod {
-                name: "getArrayCopy",
-            },
-        ],
-        "arrayiterator" => vec![
-            InternalClassMethod { name: "count" },
-            InternalClassMethod {
-                name: "getArrayCopy",
-            },
-        ],
-        "splfixedarray" => vec![InternalClassMethod { name: "count" }],
-        "splfileinfo" => vec![
-            InternalClassMethod {
-                name: "getFilename",
-            },
-            InternalClassMethod {
-                name: "getPathname",
-            },
-        ],
-        "splfileobject" | "spltempfileobject" => vec![
-            InternalClassMethod {
-                name: "getFilename",
-            },
-            InternalClassMethod {
-                name: "getPathname",
-            },
-            InternalClassMethod { name: "fgets" },
-            InternalClassMethod { name: "current" },
-        ],
-        "datetime" => vec![InternalClassMethod { name: "format" }],
-        _ => Vec::new(),
-    }
+    php_std::generated::arginfo::class_methods(class_name)
+        .into_iter()
+        .map(|method| InternalClassMethod {
+            name: method.name,
+            is_static: method.is_static,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
 struct InternalClassMethod {
     name: &'static str,
+    is_static: bool,
 }
 
 fn reflection_internal_method_object(
@@ -15133,7 +15307,7 @@ fn reflection_internal_method_object(
             ("attributes", empty_array_value()),
             (
                 "parameters",
-                reflection_internal_parameters_value(signature.params),
+                reflection_internal_parameters_value(&signature.params),
             ),
             ("parameter_count", Value::Int(signature.params.len() as i64)),
             (
@@ -15149,7 +15323,7 @@ fn reflection_internal_method_object(
             (
                 "return_type",
                 signature.return_type.map_or(Value::Null, |name| {
-                    reflection_named_type_value(name, name == "mixed", true)
+                    reflection_named_type_value(name, signature.return_allows_null, true)
                 }),
             ),
             ("file", Value::Bool(false)),
@@ -15158,7 +15332,7 @@ fn reflection_internal_method_object(
             ("is_public", Value::Bool(true)),
             ("is_private", Value::Bool(false)),
             ("is_protected", Value::Bool(false)),
-            ("is_static", Value::Bool(false)),
+            ("is_static", Value::Bool(method.is_static)),
             ("is_abstract", Value::Bool(false)),
             ("is_final", Value::Bool(false)),
             ("is_internal", Value::Bool(true)),
@@ -18751,7 +18925,8 @@ fn is_autoload_builtin_name(name: &str) -> bool {
 fn is_symbol_introspection_builtin_name(name: &str) -> bool {
     matches!(
         name,
-        "defined"
+        "define"
+            | "defined"
             | "constant"
             | "extension_loaded"
             | "function_exists"
@@ -19047,6 +19222,20 @@ fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) 
     Some(entry.unit_index)
 }
 
+fn global_constant_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    name: &str,
+) -> Option<Value> {
+    if let Some(constant) = compiled.lookup_constant(name) {
+        Some(inline_constant_value(constant))
+    } else if let Some(value) = state.user_constants.get(name) {
+        Some(value.clone())
+    } else {
+        predefined_constant_value(name)
+    }
+}
+
 fn predefined_constant_value(name: &str) -> Option<Value> {
     php_std::ExtensionRegistry::standard_library()
         .enabled_constant(name)
@@ -19090,6 +19279,58 @@ fn ini_get_all_array(registry: &IniRegistry, details: bool) -> PhpArray {
     output
 }
 
+fn trim_error_handler_args(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    callback: &CallableValue,
+    values: Vec<Value>,
+) -> Vec<Value> {
+    let Some(max_args) = error_handler_callback_max_args(compiled, state, callback) else {
+        return values;
+    };
+    values.into_iter().take(max_args).collect()
+}
+
+fn error_handler_callback_max_args(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    callback: &CallableValue,
+) -> Option<usize> {
+    match callback {
+        CallableValue::UserFunction { name } => {
+            if let Some(function) = compiled
+                .lookup_function(name)
+                .and_then(|function| compiled.unit().functions.get(function.index()))
+            {
+                return Some(user_function_max_positional_args(function));
+            }
+            dynamic_function_in_state(state, name).and_then(|(owner, function)| {
+                owner
+                    .unit()
+                    .functions
+                    .get(function.index())
+                    .map(user_function_max_positional_args)
+            })
+        }
+        CallableValue::Closure { function, .. } => compiled
+            .unit()
+            .functions
+            .get(FunctionId::new(*function).index())
+            .map(user_function_max_positional_args),
+        CallableValue::InternalBuiltin { .. }
+        | CallableValue::MethodPlaceholder { .. }
+        | CallableValue::UnresolvedDynamic { .. } => None,
+    }
+}
+
+fn user_function_max_positional_args(function: &IrFunction) -> usize {
+    if function.params.iter().any(|param| param.variadic) {
+        usize::MAX
+    } else {
+        function.params.len()
+    }
+}
+
 fn current_error_reporting(state: &ExecutionState) -> i64 {
     state
         .ini
@@ -19099,8 +19340,7 @@ fn current_error_reporting(state: &ExecutionState) -> i64 {
 }
 
 fn error_reporting_allows(state: &ExecutionState, level: i64) -> bool {
-    let mask = current_error_reporting(state);
-    mask == -1 || (mask & level) != 0
+    error_reporting_allows_level(current_error_reporting(state), level)
 }
 
 fn display_errors_enabled(state: &ExecutionState) -> bool {
@@ -19108,6 +19348,49 @@ fn display_errors_enabled(state: &ExecutionState) -> bool {
         state.ini.get("display_errors"),
         Some("") | Some("0") | Some("Off") | Some("off")
     )
+}
+
+fn diagnostic_display_options(state: &ExecutionState) -> php_runtime::PhpDiagnosticDisplayOptions {
+    php_runtime::PhpDiagnosticDisplayOptions {
+        display_errors: display_errors_enabled(state),
+        error_reporting: current_error_reporting(state),
+        ..php_runtime::PhpDiagnosticDisplayOptions::default()
+    }
+}
+
+fn emit_vm_diagnostic(
+    output: &mut OutputBuffer,
+    state: &ExecutionState,
+    diagnostic: &RuntimeDiagnostic,
+    channel: php_runtime::PhpDiagnosticChannel,
+    level: i64,
+) -> bool {
+    emit_vm_diagnostic_with_options(output, state, diagnostic, channel, level, true)
+}
+
+fn emit_vm_diagnostic_with_options(
+    output: &mut OutputBuffer,
+    state: &ExecutionState,
+    diagnostic: &RuntimeDiagnostic,
+    channel: php_runtime::PhpDiagnosticChannel,
+    level: i64,
+    leading_newline: bool,
+) -> bool {
+    let mut options = diagnostic_display_options(state);
+    options.leading_newline = leading_newline;
+    emit_php_diagnostic(output, diagnostic, channel, level, options)
+}
+
+fn runtime_source_span(compiled: &CompiledUnit, span: php_ir::IrSpan) -> RuntimeSourceSpan {
+    RuntimeSourceSpan {
+        file: compiled
+            .unit()
+            .files
+            .get(span.file.index())
+            .map(|file| file.path.clone()),
+        start: span.start,
+        end: span.end,
+    }
 }
 
 fn is_supported_user_error_level(level: i64) -> bool {
@@ -19120,12 +19403,12 @@ fn is_supported_user_error_level(level: i64) -> bool {
     )
 }
 
-fn error_level_display_name(level: i64) -> &'static str {
+fn error_level_channel(level: i64) -> php_runtime::PhpDiagnosticChannel {
     match level {
-        php_std::constants::E_USER_NOTICE => "Notice",
-        php_std::constants::E_USER_DEPRECATED => "Deprecated",
-        php_std::constants::E_USER_ERROR => "Fatal error",
-        _ => "Warning",
+        php_std::constants::E_USER_NOTICE => php_runtime::PhpDiagnosticChannel::Notice,
+        php_std::constants::E_USER_DEPRECATED => php_runtime::PhpDiagnosticChannel::Deprecated,
+        php_std::constants::E_USER_ERROR => php_runtime::PhpDiagnosticChannel::FatalError,
+        _ => php_runtime::PhpDiagnosticChannel::Warning,
     }
 }
 
@@ -19949,6 +20232,59 @@ fn is_supported_builtin(name: &str) -> bool {
     BuiltinRegistry::new().contains(name)
 }
 
+fn value_needs_vm_string_coercion(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => true,
+        Value::Reference(cell) => value_needs_vm_string_coercion(&cell.get()),
+        _ => false,
+    }
+}
+
+fn internal_builtin_string_arg_positions(name: &str, arity: usize) -> &'static [usize] {
+    match name {
+        "addslashes"
+        | "bin2hex"
+        | "crc32"
+        | "hex2bin"
+        | "htmlentities"
+        | "htmlspecialchars"
+        | "htmlspecialchars_decode"
+        | "lcfirst"
+        | "ltrim"
+        | "md5"
+        | "ord"
+        | "pack"
+        | "rawurldecode"
+        | "rawurlencode"
+        | "rtrim"
+        | "sha1"
+        | "stripslashes"
+        | "stripcslashes"
+        | "strlen"
+        | "strrev"
+        | "strtolower"
+        | "strtoupper"
+        | "strval"
+        | "trim"
+        | "ucfirst"
+        | "urlencode"
+        | "urldecode" => &[0],
+        "explode" | "str_contains" | "str_ends_with" | "str_starts_with" | "strstr" | "stristr"
+        | "strpbrk" | "strpos" | "stripos" | "strrchr" | "strrpos" | "strripos"
+        | "substr_count" | "strcmp" | "strcasecmp" | "strnatcmp" | "strnatcasecmp"
+        | "version_compare" => &[0, 1],
+        "str_repeat" | "str_pad" | "substr" | "substr_compare" | "strncmp" | "strncasecmp"
+        | "strspn" | "strcspn" => &[0, 1],
+        "strtr" if arity == 2 => &[0],
+        "str_replace" | "strtr" | "substr_replace" => &[0, 1, 2],
+        "printf" | "sprintf" | "vprintf" | "vsprintf" => &[0],
+        "fprintf" | "vfprintf" => &[1],
+        "ucwords" => &[0, 1],
+        "unpack" => &[0, 1],
+        _ => &[],
+    }
+}
+
 fn internal_function_dispatch_cacheable(name: &str) -> bool {
     name == "count"
         || name == "strlen"
@@ -20002,6 +20338,7 @@ fn execute_builtin_entry(
     source_span: RuntimeSourceSpan,
 ) -> VmResult {
     let include_path = state_include_path(state);
+    let diagnostic_display = diagnostic_display_options(state);
     let mut context = BuiltinContext::with_runtime(
         output,
         runtime_context.cwd.clone(),
@@ -20009,20 +20346,31 @@ fn execute_builtin_entry(
         Some(&mut state.resources),
     );
     context.set_include_path(include_path);
-    match (entry.function())(&mut context, args, source_span) {
-        Ok(value) => VmResult::success(context.output().clone(), Some(value)),
-        Err(error) => VmResult::runtime_error_with_diagnostic(
-            context.output().clone(),
-            error.display_message(),
-            RuntimeDiagnostic::new(
+    context.set_diagnostic_display(diagnostic_display);
+    context.set_strtok_state(&mut state.strtok_state);
+    let result = (entry.function())(&mut context, args, source_span.clone());
+    let output = context.output().clone();
+    let mut diagnostics = context.take_diagnostics();
+    match result {
+        Ok(value) => VmResult::success_with_diagnostics(output, Some(value), diagnostics),
+        Err(error) => {
+            let error_diagnostic = RuntimeDiagnostic::new(
                 error.diagnostic_id(),
                 RuntimeSeverity::FatalError,
                 error.message().to_owned(),
-                RuntimeSourceSpan::default(),
+                source_span,
                 Vec::new(),
                 None,
-            ),
-        ),
+            );
+            diagnostics.push(error_diagnostic.clone());
+            let mut result = VmResult::runtime_error_with_diagnostic(
+                output,
+                error.display_message(),
+                error_diagnostic,
+            );
+            result.diagnostics = diagnostics;
+            result
+        }
     }
 }
 
@@ -20053,8 +20401,10 @@ fn builtin_source_span(compiled: &CompiledUnit) -> RuntimeSourceSpan {
 fn builtin_error_throwable(result: &VmResult) -> Option<Value> {
     let diagnostic = result.diagnostics.first()?;
     let class_name = match diagnostic.id() {
+        "E_PHP_RUNTIME_BUILTIN_ARITY" => "ArgumentCountError",
         "E_PHP_RUNTIME_BUILTIN_TYPE" => "TypeError",
         "E_PHP_RUNTIME_BUILTIN_VALUE" => "ValueError",
+        "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES" => "TypeError",
         _ => return None,
     };
     make_exception_object(
@@ -20081,6 +20431,7 @@ fn constant_value(unit: &IrUnit, constant: ConstId) -> Result<Value, String> {
         IrConstant::Int(value) => Value::Int(*value),
         IrConstant::Float(value) => Value::float(*value),
         IrConstant::String(value) => Value::String(PhpString::from_test_str(value)),
+        IrConstant::StringBytes(value) => Value::String(PhpString::from_bytes(value.clone())),
     })
 }
 
@@ -20091,6 +20442,7 @@ fn inline_constant_value(constant: &IrConstant) -> Value {
         IrConstant::Int(value) => Value::Int(*value),
         IrConstant::Float(value) => Value::float(*value),
         IrConstant::String(value) => Value::String(PhpString::from_test_str(value)),
+        IrConstant::StringBytes(value) => Value::String(PhpString::from_bytes(value.clone())),
     }
 }
 
@@ -20821,6 +21173,43 @@ fn is_globals_local(function: &IrFunction, local: LocalId) -> bool {
         .is_some_and(|name| name == "GLOBALS")
 }
 
+fn load_local_is_pre_call_by_ref_out_param(
+    instructions: &[Instruction],
+    instruction_index: usize,
+    dst: RegId,
+    local: LocalId,
+) -> bool {
+    let loaded = Operand::Register(dst);
+    for instruction in instructions.iter().skip(instruction_index + 1) {
+        match &instruction.kind {
+            InstructionKind::Nop => continue,
+            InstructionKind::LoadConst { dst: next_dst, .. }
+            | InstructionKind::FetchConst { dst: next_dst, .. }
+            | InstructionKind::LoadLocal { dst: next_dst, .. }
+            | InstructionKind::LoadLocalQuiet { dst: next_dst, .. } => {
+                if *next_dst == dst {
+                    return false;
+                }
+                continue;
+            }
+            InstructionKind::CallFunction { args, .. }
+            | InstructionKind::CallMethod { args, .. }
+            | InstructionKind::CallStaticMethod { args, .. }
+            | InstructionKind::CallClosure { args, .. }
+            | InstructionKind::CallCallable { args, .. }
+            | InstructionKind::NewObject { args, .. }
+            | InstructionKind::BindReferenceFromCall { args, .. } => {
+                return args.iter().any(|arg| {
+                    arg.value == loaded
+                        && arg.by_ref_local.is_some_and(|arg_local| arg_local == local)
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn read_call_args(
     unit: &IrUnit,
     stack: &CallStack,
@@ -21515,6 +21904,57 @@ fn execute_arithmetic(op: BinaryOp, lhs: NumericValue, rhs: NumericValue) -> Res
     }
 }
 
+fn has_array_operand(value: &Value) -> bool {
+    match value {
+        Value::Array(_) => true,
+        Value::Reference(cell) => has_array_operand(&cell.get()),
+        _ => false,
+    }
+}
+
+fn unsupported_operand_types_error(
+    output: &OutputBuffer,
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    lhs: &Value,
+    op: BinaryOp,
+    rhs: &Value,
+    source_span: RuntimeSourceSpan,
+) -> VmResult {
+    let message = format!(
+        "Unsupported operand types: {} {} {}",
+        value_type_name(lhs),
+        binary_operator_symbol(op),
+        value_type_name(rhs)
+    );
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES",
+        RuntimeSeverity::FatalError,
+        message.clone(),
+        source_span,
+        stack_trace(compiled, stack),
+        Some(php_runtime::PhpReferenceClassification::TypeError),
+    );
+    VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic)
+}
+
+fn binary_operator_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Concat => ".",
+        BinaryOp::Pow => "**",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+    }
+}
+
 fn execute_power(lhs: NumericValue, rhs: NumericValue) -> Result<Value, String> {
     if let (NumericValue::Int(lhs), NumericValue::Int(rhs)) = (lhs, rhs)
         && rhs >= 0
@@ -21567,14 +22007,69 @@ fn execute_bitwise(op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, Stri
     }
 }
 
-fn write_object_numeric_cast_warning(output: &mut OutputBuffer, object: &ObjectRef, target: &str) {
-    output.write_php_string(&PhpString::from(
+fn write_object_numeric_cast_warning(
+    output: &mut OutputBuffer,
+    state: &mut ExecutionState,
+    object: &ObjectRef,
+    target: &str,
+) {
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_OBJECT_NUMERIC_CAST_WARNING",
+        RuntimeSeverity::Warning,
         format!(
-            "\nWarning: Object of class {} could not be converted to {target} in <unknown> on line 0\n",
+            "Object of class {} could not be converted to {target}",
             object.class_name()
-        )
-        .into_bytes(),
-    ));
+        ),
+        RuntimeSourceSpan::default(),
+        Vec::new(),
+        Some(php_runtime::PhpReferenceClassification::Warning),
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Warning,
+        php_runtime::PHP_E_WARNING,
+    );
+    state.diagnostics.push(diagnostic);
+}
+
+fn write_non_numeric_value_warning(output: &mut OutputBuffer, state: &mut ExecutionState) {
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_NON_NUMERIC_STRING_WARNING",
+        RuntimeSeverity::Warning,
+        "A non-numeric value encountered",
+        RuntimeSourceSpan::default(),
+        Vec::new(),
+        Some(php_runtime::PhpReferenceClassification::Warning),
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Warning,
+        php_runtime::PHP_E_WARNING,
+    );
+    state.diagnostics.push(diagnostic);
+}
+
+fn write_array_to_string_warning(output: &mut OutputBuffer, state: &mut ExecutionState) {
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING",
+        RuntimeSeverity::Warning,
+        "Array to string conversion",
+        RuntimeSourceSpan::default(),
+        Vec::new(),
+        Some(php_runtime::PhpReferenceClassification::Warning),
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Warning,
+        php_runtime::PHP_E_WARNING,
+    );
+    state.diagnostics.push(diagnostic);
 }
 
 fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
@@ -21833,6 +22328,24 @@ mod tests {
     }
 
     #[test]
+    fn constants_execute_define_userland_fetches() {
+        let result = execute_source(
+            "<?php
+            var_dump(define('LOCAL_DYNAMIC', 'ok'));
+            var_dump(defined('LOCAL_DYNAMIC'));
+            echo LOCAL_DYNAMIC, '|', constant('LOCAL_DYNAMIC'), '|';
+            var_dump(define('LOCAL_DYNAMIC', 'again'));
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\nbool(true)\nok|ok|bool(false)\n"
+        );
+    }
+
+    #[test]
     fn constants_execute_builtin_php_version() {
         let result = execute_source("<?php echo PHP_VERSION;");
 
@@ -21841,6 +22354,14 @@ mod tests {
             result.output.as_bytes(),
             php_source::reference_php_version().as_bytes()
         );
+    }
+
+    #[test]
+    fn inline_html_after_close_tag_is_emitted() {
+        let result = execute_source("<?php echo \"before\\n\"; ?>\n\nDONE\n");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"before\n\nDONE\n");
     }
 
     #[test]
@@ -22090,7 +22611,10 @@ mod tests {
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "handler:hidden\ndone\n");
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "handler:hidden\nhandler:masked\ndone\n"
+        );
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_USER_WARNING");
     }
@@ -22143,7 +22667,9 @@ mod tests {
         );
 
         assert!(!result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "");
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("Fatal error: fatal in "));
+        assert!(output.contains(" on line "));
         assert!(
             result
                 .status
@@ -22156,6 +22682,10 @@ mod tests {
     fn direct_builtin_type_and_value_errors_are_catchable_throwables() {
         let result = execute_source(
             "<?php
+            try { strlen(); } catch (ArgumentCountError $e) { echo 'arity'; }
+            echo '|';
+            try { strlen(); } catch (TypeError $e) { echo 'arity-type'; }
+            echo '|';
             try { strlen([]); } catch (TypeError $e) { echo 'type'; }
             echo '|';
             try { explode('', 'abc'); } catch (ValueError $e) { echo 'value'; }
@@ -22163,7 +22693,25 @@ mod tests {
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "type|value");
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "arity|arity-type|type|value"
+        );
+    }
+
+    #[test]
+    fn invalid_array_operand_errors_are_catchable_type_errors() {
+        let result = execute_source(
+            "<?php
+            try { [] - []; } catch (TypeError $e) { echo 'invalid:', $e->getMessage(); }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "invalid:Unsupported operand types: array - array"
+        );
     }
 
     #[test]
@@ -22268,6 +22816,32 @@ mod tests {
 
         assert!(!throwing.status.is_success(), "{:?}", throwing.status);
         assert_eq!(throwing.output.to_string_lossy(), "before|");
+    }
+
+    #[test]
+    fn internal_string_builtins_use_userland_to_string() {
+        let result = execute_source(
+            "<?php
+            class S {
+                public function __toString(): string {
+                    return 'abc';
+                }
+            }
+            echo strlen(new S()), '|', strtoupper(new S()), '|', strpos(new S(), 'b');
+            echo '|', strtr('abc', new S(), 'XYZ');
+            try {
+                strtr('abc', new S());
+            } catch (TypeError $e) {
+                echo '|', $e->getMessage();
+            }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "3|ABC|1|XYZ|strtr(): Argument #2 ($from) must be of type array, s given"
+        );
     }
 
     #[test]
@@ -26091,11 +26665,19 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
-    fn variables_undefined_fetch_reads_null_in_mvp() {
+    fn variables_undefined_fetch_warns_and_reads_null() {
         let result = execute_source("<?php echo $missing, \"x\";");
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.as_bytes(), b"x");
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("Warning: Undefined variable $missing in "));
+        assert!(output.contains(" on line "));
+        assert!(output.ends_with("x"));
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].id(),
+            "E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING"
+        );
     }
 
     #[test]
@@ -26109,6 +26691,21 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(alias.status.is_success(), "{:?}", alias.status);
         assert_eq!(alias.output.as_bytes(), b"23");
+
+        let undefined_source =
+            execute_source("<?php $a = $ref =& $val; var_dump($a); $c =& $missing; echo $c;");
+
+        assert!(
+            undefined_source.status.is_success(),
+            "{:?}",
+            undefined_source.status
+        );
+        assert_eq!(undefined_source.output.as_bytes(), b"NULL\n");
+        assert!(
+            undefined_source.diagnostics.is_empty(),
+            "{:?}",
+            undefined_source.diagnostics
+        );
     }
 
     #[test]
@@ -26202,6 +26799,18 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"unset|2|7");
+
+        let dynamic_key = execute_source(
+            "<?php $closure = function() { return \"k\"; }; $a = [\"k\" => [\"d\" => 1]]; unset($a[$closure()][\"d\"]); echo isset($a[\"k\"][\"d\"]) ? \"bad\" : \"unset\";",
+        );
+
+        assert!(dynamic_key.status.is_success(), "{:?}", dynamic_key.status);
+        assert_eq!(dynamic_key.output.as_bytes(), b"unset");
+        assert!(
+            dynamic_key.diagnostics.is_empty(),
+            "{:?}",
+            dynamic_key.diagnostics
+        );
     }
 
     #[test]
@@ -26855,7 +27464,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.as_bytes(),
-            b"count|internal|nofile|2:1|value:mixed|int|standard"
+            b"count|internal|nofile|2:1|value:Countable|array|int|standard"
         );
     }
 
@@ -27787,6 +28396,10 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(print.status.is_success(), "{:?}", print.status);
         assert_eq!(print.output.as_bytes(), b"x1");
 
+        let exit = execute_source("<?php echo \"before\\n\"; exit; echo \"after\\n\";");
+        assert!(exit.status.is_success(), "{:?}", exit.status);
+        assert_eq!(exit.output.as_bytes(), b"before\n");
+
         let dump = execute_source(
             "<?php function dump_args(...$args) { var_dump($args); } var_dump(null, true, 7, \"hi\"); dump_args(1, \"x\");",
         );
@@ -27918,13 +28531,78 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         let warning = execute_source("<?php echo $missing, \"ok\";");
         assert!(warning.status.is_success(), "{:?}", warning.status);
-        assert_eq!(warning.output.as_bytes(), b"ok");
+        let warning_output = warning.output.to_string_lossy();
+        assert!(warning_output.contains("Warning: Undefined variable $missing in "));
+        assert!(warning_output.contains(" on line "));
+        assert!(warning_output.ends_with("ok"));
         assert_eq!(warning.diagnostics.len(), 1);
         assert_eq!(
             warning.diagnostics[0].id(),
             "E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING"
         );
         assert_eq!(warning.diagnostics[0].severity(), RuntimeSeverity::Warning);
+
+        let deprecated_interpolation = execute_source("<?php $name = 'P'; echo \"${name}HP\";");
+        assert!(
+            deprecated_interpolation.status.is_success(),
+            "{:?}",
+            deprecated_interpolation.status
+        );
+        let deprecated_output = deprecated_interpolation.output.to_string_lossy();
+        assert!(
+            deprecated_output.contains(
+                "Deprecated: Using ${var} in strings is deprecated, use {$var} instead in "
+            ),
+            "{deprecated_output}"
+        );
+        assert!(deprecated_output.ends_with("PHP"), "{deprecated_output}");
+        assert_eq!(deprecated_interpolation.diagnostics.len(), 1);
+        assert_eq!(
+            deprecated_interpolation.diagnostics[0].id(),
+            "E_PHP_RUNTIME_DEPRECATED_DOLLAR_BRACE_INTERPOLATION"
+        );
+        assert_eq!(
+            deprecated_interpolation.diagnostics[0].severity(),
+            RuntimeSeverity::Deprecation
+        );
+
+        let leading_numeric = execute_source("<?php var_dump(1 + '2x');");
+        assert!(
+            leading_numeric.status.is_success(),
+            "{:?}",
+            leading_numeric.status
+        );
+        assert_eq!(
+            leading_numeric.output.to_string_lossy(),
+            "\nWarning: A non-numeric value encountered in <unknown> on line 0\nint(3)\n"
+        );
+        assert_eq!(
+            leading_numeric.diagnostics[0].id(),
+            "E_PHP_RUNTIME_NON_NUMERIC_STRING_WARNING"
+        );
+        assert_eq!(
+            leading_numeric.diagnostics[0].severity(),
+            RuntimeSeverity::Warning
+        );
+
+        let array_to_string = execute_source("<?php echo [1, 2], \"\\ndone\";");
+        assert!(
+            array_to_string.status.is_success(),
+            "{:?}",
+            array_to_string.status
+        );
+        let array_to_string_output = array_to_string.output.to_string_lossy();
+        assert!(array_to_string_output.contains("Warning: Array to string conversion in "));
+        assert!(array_to_string_output.contains(" on line "));
+        assert!(array_to_string_output.ends_with("Array\ndone"));
+        assert_eq!(
+            array_to_string.diagnostics[0].id(),
+            "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING"
+        );
+        assert_eq!(
+            array_to_string.diagnostics[0].severity(),
+            RuntimeSeverity::Warning
+        );
 
         let unsupported = Vm::with_options(VmOptions {
             verify_ir: false,

@@ -31,8 +31,10 @@ pub const PHPT_SUPPORTED_SECTIONS: &[&str] = &[
     "DESCRIPTION",
     "CREDITS",
     "EXTENSIONS",
+    "FLAKY",
     "SKIPIF",
     "XFAIL",
+    "XLEAK",
     "CONFLICTS",
     "INI",
     "ENV",
@@ -54,6 +56,7 @@ pub const PHPT_SUPPORTED_SECTIONS: &[&str] = &[
     "EXPECTREGEX_EXTERNAL",
     "EXPECTHEADERS",
     "CLEAN",
+    "WHITESPACE_SENSITIVE",
     "REDIRECTTEST",
 ];
 

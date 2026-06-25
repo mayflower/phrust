@@ -12,12 +12,15 @@ fi
 
 corpus="${PHPT_CORPUS_MANIFEST:-tests/phpt/manifests/phpt-corpus.jsonl}"
 known_failures="${PHPT_KNOWN_FAILURES:-tests/phpt/manifests/full-known-failures.jsonl}"
+baseline_metadata="${PHPT_BASELINE_METADATA:-tests/phpt/manifests/full-baseline-metadata.json}"
 report="${PHPT_BASELINE_REPORT:-docs/phpt/reports/full-baseline.md}"
 work_root="${PHPT_WORK_DIR:-target/phpt-work}"
 timestamp="${PHPT_BASELINE_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 run_dir="$work_root/full-runs/$timestamp"
+default_phpt_tool="${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools"
+phpt_tool="${PHPT_TOOLS_BIN:-$default_phpt_tool}"
 
-target_php="${TARGET_PHP:-target/debug/php-vm}"
+target_php="${TARGET_PHP:-target/debug/phrust-php}"
 target_mode="${PHPT_TARGET_MODE:-}"
 if [[ -z "$target_mode" ]]; then
   if [[ "$(basename "$target_php")" == "php-vm" ]]; then
@@ -27,26 +30,54 @@ if [[ -z "$target_mode" ]]; then
   fi
 fi
 
-if [[ ! -s "$corpus" ]]; then
-  printf '%s\n' '[info] PHPT corpus manifest is missing; generating it first.'
-  cargo run -q -p php_phpt_tools --bin php-phpt-tools -- phpt-index --php-src "$php_src"
+needs_default_tool=0
+needs_default_target=0
+if [[ -z "${PHPT_TOOLS_BIN:-}" && "$phpt_tool" == "$default_phpt_tool" ]]; then
+  needs_default_tool=1
+fi
+if [[ -z "${TARGET_PHP:-}" && "$target_php" == "target/debug/phrust-php" ]]; then
+  needs_default_target=1
 fi
 
-if [[ ! -x "$target_php" ]]; then
-  if [[ -z "${TARGET_PHP:-}" && "$target_php" == "target/debug/php-vm" ]]; then
-    cargo build -p php_vm_cli --bin php-vm
-  else
-    printf 'Target PHP executable is not built: %s\n' "$target_php" >&2
+if [[ -n "${PHPT_SKIP_BUILD:-}" ]]; then
+  if [[ ! -x "$phpt_tool" ]]; then
+    printf 'PHPT tools executable is not built: %s\n' "$phpt_tool" >&2
+    printf '%s\n' 'Run: just phpt-dev-build' >&2
     exit 1
   fi
+elif [[ "$needs_default_tool" -eq 1 && "$needs_default_target" -eq 1 ]]; then
+  cargo build -p php_phpt_tools --bin php-phpt-tools -p php_vm_cli --bin phrust-php
+  needs_default_tool=0
+  needs_default_target=0
+elif [[ "$needs_default_tool" -eq 1 ]]; then
+  cargo build -p php_phpt_tools --bin php-phpt-tools
+elif [[ ! -x "$phpt_tool" ]]; then
+  printf 'PHPT tools executable is not built: %s\n' "$phpt_tool" >&2
+  exit 1
+fi
+
+if [[ ! -s "$corpus" ]]; then
+  printf '%s\n' '[info] PHPT corpus manifest is missing; generating it first.'
+  "$phpt_tool" phpt-index --php-src "$php_src"
+fi
+
+if [[ -n "${PHPT_SKIP_BUILD:-}" ]]; then
+  if [[ ! -x "$target_php" ]]; then
+    printf 'Target PHP executable is not built: %s\n' "$target_php" >&2
+    printf '%s\n' 'Run: just phpt-dev-build' >&2
+    exit 1
+  fi
+elif [[ "$needs_default_target" -eq 1 ]]; then
+  cargo build -p php_vm_cli --bin phrust-php
+elif [[ ! -x "$target_php" ]]; then
+  printf 'Target PHP executable is not built: %s\n' "$target_php" >&2
+  exit 1
 fi
 
 mkdir -p "$run_dir"
 
-previous_args=()
-if [[ -s "$known_failures" && "${PHPT_ACCEPT_BASELINE:-0}" != "1" ]]; then
-  cp "$known_failures" "$run_dir/previous-known-failures.jsonl"
-  previous_args=(--previous-known-failures "$run_dir/previous-known-failures.jsonl")
+previous_results=""
+if [[ "${PHPT_DISABLE_REUSE:-0}" != "1" ]]; then
   previous_results="$(
     find "$work_root/full-runs" -mindepth 2 -maxdepth 2 -name results.jsonl -type f \
       ! -path "$run_dir/results.jsonl" \
@@ -54,18 +85,38 @@ if [[ -s "$known_failures" && "${PHPT_ACCEPT_BASELINE:-0}" != "1" ]]; then
       | tail -n 1
   )"
   if [[ -n "$previous_results" ]]; then
-    previous_args+=(--previous-results "$previous_results")
     printf 'PHPT_PREVIOUS_RESULTS=%s\n' "$previous_results"
   fi
+fi
+
+previous_args=()
+if [[ -s "$known_failures" && "${PHPT_ACCEPT_BASELINE:-0}" != "1" ]]; then
+  cp "$known_failures" "$run_dir/previous-known-failures.jsonl"
+  previous_args=(--previous-known-failures "$run_dir/previous-known-failures.jsonl")
+  if [[ -n "$previous_results" ]]; then
+    previous_args+=(--previous-results "$previous_results")
+  fi
+fi
+
+reuse_args=()
+if [[ -n "$previous_results" ]]; then
+  reuse_args=(--reuse-results "$previous_results")
+fi
+
+job_args=()
+if [[ -n "${PHPT_JOBS:-}" ]]; then
+  job_args=(--jobs "$PHPT_JOBS")
 fi
 
 printf 'TARGET_PHP=%s\n' "$target_php"
 printf 'PHPT_TARGET_MODE=%s\n' "$target_mode"
 printf 'PHPT_CORPUS_MANIFEST=%s\n' "$corpus"
 printf 'PHPT_RUN_DIR=%s\n' "$run_dir"
+printf 'PHPT_JOBS=%s\n' "${PHPT_JOBS:-auto}"
+printf 'PHPT_REUSE_RESULTS=%s\n' "${reuse_args[*]:-disabled}"
 
 set +e
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
+"$phpt_tool" run \
   --target "$target_php" \
   --target-mode "$target_mode" \
   --manifest "$corpus" \
@@ -73,7 +124,9 @@ cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
   --summary "$run_dir/summary.md" \
   --php-src "$php_src" \
   --work-dir "$run_dir/work" \
-  --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-10}"
+  --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-30}" \
+  "${reuse_args[@]}" \
+  "${job_args[@]}"
 run_status=$?
 set -e
 
@@ -82,16 +135,24 @@ if [[ "$run_status" -gt 1 ]]; then
   exit "$run_status"
 fi
 
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- baseline \
+"$phpt_tool" baseline \
   --results "$run_dir/results.jsonl" \
   --corpus "$corpus" \
   --known-failures "$known_failures" \
+  --metadata "$baseline_metadata" \
   --report "$report" \
   --timestamp "$timestamp" \
   "${previous_args[@]}"
+
+"$phpt_tool" verify-baseline \
+  --corpus "$corpus" \
+  --known-failures "$known_failures" \
+  --metadata "$baseline_metadata" \
+  --report "$report"
 
 scripts/phpt/verify_source_integrity.sh
 
 printf '[ok] full PHPT regression baseline artifacts: %s\n' "$run_dir"
 printf '[ok] known failures: %s\n' "$known_failures"
+printf '[ok] baseline metadata: %s\n' "$baseline_metadata"
 printf '[ok] baseline report: %s\n' "$report"

@@ -38,29 +38,24 @@ case "$mode" in
   target)
     target_php="${TARGET_PHP:-}"
     if [[ -z "$target_php" ]]; then
-      if [[ -x target/debug/phrust-php ]]; then
-        target_php="target/debug/phrust-php"
-      elif [[ -x target/debug/php-vm ]]; then
-        target_php="target/debug/php-vm"
-      else
-        target_php="target/debug/phrust-php"
-      fi
+      target_php="target/debug/phrust-php"
     fi
     printf 'TARGET_PHP=%s\n' "$target_php"
     printf 'PHPT_WORK_DIR=%s\n' "$work_dir"
-    if [[ ! -x "$target_php" ]]; then
-      printf '%s\n' '[todo] PHPT_TARGET_CLI_COMPAT: Target PHP CLI compatibility binary is not built yet.'
-      printf '%s\n' '[todo] Later PHPT CLI/SAPI work must provide -v and -r support before official PHPT execution.'
-      exit 0
+    if [[ -z "${TARGET_PHP:-}" && "$target_php" == "target/debug/phrust-php" ]]; then
+      cargo build -p php_vm_cli --bin phrust-php
+    elif [[ ! -x "$target_php" ]]; then
+      printf 'Target PHP executable is not built: %s\n' "$target_php" >&2
+      exit 1
     fi
-    version_out="$("$target_php" -v 2>&1 || true)"
-    run_out="$("$target_php" -r 'echo "ok\n";' 2>&1 || true)"
+    version_out="$("$target_php" -v 2>&1)"
+    run_out="$("$target_php" -r 'echo "ok\n";' 2>&1)"
     if [[ "$version_out" != *"PHP"* || "$run_out" != "ok" ]]; then
-      printf '%s\n' '[todo] PHPT_TARGET_CLI_COMPAT: Target PHP lacks required PHP CLI flags.'
-      printf '%s\n' '[todo] Required smoke: TARGET_PHP -v and TARGET_PHP -r '\''echo "ok\n";'\'''
+      printf '%s\n' '[fail] Target PHP lacks required PHP CLI flags.' >&2
+      printf '%s\n' '[fail] Required smoke: TARGET_PHP -v and TARGET_PHP -r '\''echo "ok\n";'\''' >&2
       printf 'TARGET_PHP -v output:\n%s\n' "$version_out"
       printf 'TARGET_PHP -r output:\n%s\n' "$run_out"
-      exit 0
+      exit 1
     fi
     printf '%s\n' '[ok] Target PHP supports -v and -r.'
     ;;

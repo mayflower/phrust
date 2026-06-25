@@ -132,6 +132,12 @@ impl IrBuilder {
         self.unit.functions[function.index()].returns_by_ref
     }
 
+    /// Returns the shape flags for a function.
+    #[must_use]
+    pub fn function_flags(&self, function: FunctionId) -> FunctionFlags {
+        self.unit.functions[function.index()].flags
+    }
+
     /// Compatibility helper for early manual IR tests.
     pub fn push_required_param(
         &mut self,

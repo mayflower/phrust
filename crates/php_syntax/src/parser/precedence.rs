@@ -129,6 +129,12 @@ fn is_comparison_operator(kind: SyntaxKind) -> bool {
 /// Prefix operator right binding power.
 pub const PREFIX_RIGHT_BP: u8 = 125;
 
+/// Print construct right binding power.
+///
+/// PHP's `print` construct binds lower than most expression operators,
+/// including concatenation, but higher than `and`, `xor`, and `or`.
+pub const PRINT_RIGHT_BP: u8 = 31;
+
 #[cfg(test)]
 mod tests {
     use super::{Associativity, binary_operator};

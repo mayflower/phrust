@@ -15,6 +15,9 @@ pub(crate) fn parse_array_expression(parser: &mut Parser<'_>) -> bool {
     if parser.at(named(TokenName::Array)) || parser.at(named(TokenName::List)) {
         let array = parser.start();
         parser.bump();
+        while parser.current().is_trivia() {
+            parser.bump();
+        }
         if parser.at(symbol(b'(')) {
             parser.bump();
             parse_array_pairs_until(parser, b')');
@@ -37,8 +40,11 @@ pub(crate) fn parse_array_expression(parser: &mut Parser<'_>) -> bool {
 pub(crate) fn parse_dim_fetch_tail(parser: &mut Parser<'_>, _open: u8, close: u8) {
     let fetch = parser.start();
     parser.bump();
-    while !parser.is_eof() && !parser.at(symbol(close)) {
-        parser.bump();
+    if !parser.at(symbol(close)) && !expressions::parse_expression(parser) {
+        parser.error_expected("expected dimension expression", &["expression"]);
+        while !parser.is_eof() && !parser.at(symbol(close)) {
+            parser.bump();
+        }
     }
     if parser.at(symbol(close)) {
         parser.bump();
@@ -97,5 +103,23 @@ fn parse_array_pairs_until(parser: &mut Parser<'_>, close: u8) {
                 parser.bump();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_source_file;
+
+    #[test]
+    fn long_array_allows_trivia_before_open_paren() {
+        let source = "<?php $xs = array (1, 2); $ys = list ($a, $b);\n";
+        let parse = parse_source_file(source);
+
+        assert_eq!(parse.reconstructed_text(), source);
+        assert!(
+            parse.diagnostics().is_empty(),
+            "unexpected diagnostics: {:#?}",
+            parse.diagnostics()
+        );
     }
 }

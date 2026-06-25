@@ -5,10 +5,10 @@ use crate::constants::IrConstant;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::function::{FunctionFlags, IrCapture, IrParam, IrReturnType};
-use crate::ids::{BlockId, FileId, FunctionId, LocalId, UnitId};
+use crate::ids::{BlockId, FileId, FunctionId, LocalId, RegId, UnitId};
 use crate::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, InstructionKind,
-    IrCallArg, UnaryOp,
+    IrCallArg, IrDiagnosticSeverity, UnaryOp,
 };
 use crate::module::{
     AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
@@ -176,6 +176,7 @@ pub struct LoweringContext<'a> {
     class_names: HashMap<FunctionId, String>,
     method_names: HashMap<FunctionId, String>,
     source_text: SourceText,
+    early_diagnostics: HashMap<FunctionId, Vec<EarlyDiagnostic>>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -194,6 +195,7 @@ impl<'a> LoweringContext<'a> {
             class_names: HashMap::new(),
             method_names: HashMap::new(),
             source_text,
+            early_diagnostics: HashMap::new(),
         }
     }
 
@@ -201,6 +203,60 @@ impl<'a> LoweringContext<'a> {
     #[must_use]
     pub fn diagnostics(&self) -> &[LoweringDiagnostic] {
         &self.diagnostics
+    }
+
+    fn record_early_diagnostic(
+        &mut self,
+        function: FunctionId,
+        expr: ExprId,
+        span: IrSpan,
+        severity: IrDiagnosticSeverity,
+        diagnostic_id: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.early_diagnostics
+            .entry(function)
+            .or_default()
+            .push(EarlyDiagnostic {
+                origin: format!("hir:expr:{}", expr.raw()),
+                span,
+                severity,
+                diagnostic_id: diagnostic_id.into(),
+                message: message.into(),
+            });
+    }
+
+    fn emit_early_diagnostics(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+    ) {
+        let Some(diagnostics) = self.early_diagnostics.remove(&function) else {
+            return;
+        };
+        for diagnostic in diagnostics {
+            let instruction = builder.emit(
+                function,
+                block,
+                InstructionKind::EmitDiagnostic {
+                    severity: diagnostic.severity,
+                    diagnostic_id: diagnostic.diagnostic_id,
+                    message: diagnostic.message,
+                    leading_newline: false,
+                },
+                diagnostic.span,
+            );
+            builder.add_source_map(
+                IrSourceMapTarget::Instruction {
+                    function,
+                    block,
+                    instruction,
+                },
+                diagnostic.origin,
+                diagnostic.span,
+            );
+        }
     }
 }
 
@@ -247,6 +303,15 @@ struct LoopTargets {
 struct LoweredExpr {
     register: crate::ids::RegId,
     block: BlockId,
+}
+
+#[derive(Clone, Debug)]
+struct EarlyDiagnostic {
+    origin: String,
+    span: IrSpan,
+    severity: IrDiagnosticSeverity,
+    diagnostic_id: String,
+    message: String,
 }
 
 #[derive(Clone, Debug)]
@@ -383,12 +448,21 @@ pub fn lower_frontend_result(
         },
         span_from_range(file, module_span),
     );
+    let prelude_block = builder.append_block(function);
     let block = builder.append_block(function);
     let null_const = builder.intern_constant(IrConstant::Null);
     let module_ir_span = span_from_range(file, module_span);
     let module_origin = format!("hir:module:{}", frontend.module().module_id().raw());
     builder.add_source_map(
         IrSourceMapTarget::Function { function },
+        module_origin.clone(),
+        module_ir_span,
+    );
+    builder.add_source_map(
+        IrSourceMapTarget::Block {
+            function,
+            block: prelude_block,
+        },
         module_origin.clone(),
         module_ir_span,
     );
@@ -439,10 +513,20 @@ pub fn lower_frontend_result(
                 function,
                 block: current_block,
             },
-            module_origin,
+            module_origin.clone(),
             module_ir_span,
         );
     }
+    context.emit_early_diagnostics(&mut builder, function, prelude_block);
+    builder.terminate_jump(function, prelude_block, block, module_ir_span);
+    builder.add_source_map(
+        IrSourceMapTarget::Terminator {
+            function,
+            block: prelude_block,
+        },
+        module_origin,
+        module_ir_span,
+    );
     builder.set_entry(function);
     let unit = builder.finish();
     let verification = verify_unit(&unit);
@@ -1776,7 +1860,10 @@ impl LoweringContext<'_> {
         };
         let kind = statement.kind().clone();
         match kind {
-            HirStmtKind::Missing | HirStmtKind::InlineHtml { .. } => block,
+            HirStmtKind::Missing => block,
+            HirStmtKind::InlineHtml { text } => {
+                self.lower_inline_html_stmt(builder, function, block, stmt_id, text)
+            }
             HirStmtKind::Block { statements } => {
                 let mut current = block;
                 for stmt in statements {
@@ -1788,21 +1875,32 @@ impl LoweringContext<'_> {
                 current
             }
             HirStmtKind::Expr { expr } => {
-                if let Some(expr) = expr
-                    && let Some(value) = self.lower_expr_to_register(builder, function, block, expr)
-                {
-                    let span =
-                        span_from_range(self.file, self.span_for(SourceMappedId::from(expr)));
-                    let discard = builder.emit(
-                        function,
-                        value.block,
-                        InstructionKind::Discard {
-                            src: Operand::Register(value.register),
-                        },
-                        span,
-                    );
-                    self.add_expr_source_map(builder, function, value.block, discard, expr, span);
-                    return value.block;
+                if let Some(expr) = expr {
+                    if self.lower_top_level_exit_stmt(builder, function, block, expr, module) {
+                        return block;
+                    }
+                    if let Some(value) = self.lower_expr_to_register(builder, function, block, expr)
+                    {
+                        let span =
+                            span_from_range(self.file, self.span_for(SourceMappedId::from(expr)));
+                        let discard = builder.emit(
+                            function,
+                            value.block,
+                            InstructionKind::Discard {
+                                src: Operand::Register(value.register),
+                            },
+                            span,
+                        );
+                        self.add_expr_source_map(
+                            builder,
+                            function,
+                            value.block,
+                            discard,
+                            expr,
+                            span,
+                        );
+                        return value.block;
+                    }
                 }
                 block
             }
@@ -2053,6 +2151,39 @@ impl LoweringContext<'_> {
         );
         self.add_expr_source_map(builder, function, value.block, echo, expr, span);
         value.block
+    }
+
+    fn lower_inline_html_stmt(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+        stmt_id: StmtId,
+        text: String,
+    ) -> BlockId {
+        if text.is_empty() {
+            return block;
+        }
+        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
+        let constant = builder.intern_constant(ir_string_constant(text.into_bytes()));
+        let instruction = builder.emit(
+            function,
+            block,
+            InstructionKind::Echo {
+                src: Operand::Constant(constant),
+            },
+            span,
+        );
+        builder.add_source_map(
+            IrSourceMapTarget::Instruction {
+                function,
+                block,
+                instruction,
+            },
+            format!("hir:stmt:{}", stmt_id.raw()),
+            span,
+        );
+        block
     }
 
     fn lower_if_stmt(
@@ -2478,6 +2609,76 @@ impl LoweringContext<'_> {
         };
         self.jump_if_open(builder, function, block, target, span);
         block
+    }
+
+    fn lower_top_level_exit_stmt(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+        expr: ExprId,
+        module: &php_semantics::hir::HirModule,
+    ) -> bool {
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        let HirExprKind::Exit { expr: exit_expr } = expression.kind() else {
+            return false;
+        };
+        let range = self.span_for(SourceMappedId::from(expr));
+        if !builder.function_flags(function).is_top_level {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                range,
+                "non-top-level exit requires process-wide control-flow support",
+            );
+            return false;
+        }
+
+        let span = span_from_range(self.file, range);
+        let mut exit_block = block;
+        if let Some(exit_expr) = *exit_expr
+            && !self.is_numeric_exit_literal(module, exit_expr)
+        {
+            let Some(value) = self.lower_expr_to_register(builder, function, block, exit_expr)
+            else {
+                return false;
+            };
+            exit_block = value.block;
+            let echo = builder.emit(
+                function,
+                exit_block,
+                InstructionKind::Echo {
+                    src: Operand::Register(value.register),
+                },
+                span,
+            );
+            self.add_expr_source_map(builder, function, exit_block, echo, exit_expr, span);
+        }
+        builder.terminate_return(function, exit_block, None, span);
+        builder.add_source_map(
+            IrSourceMapTarget::Terminator {
+                function,
+                block: exit_block,
+            },
+            format!("hir:expr:{}", expr.raw()),
+            span,
+        );
+        true
+    }
+
+    fn is_numeric_exit_literal(
+        &self,
+        module: &php_semantics::hir::HirModule,
+        expr: ExprId,
+    ) -> bool {
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        let HirExprKind::Literal { text } = expression.kind() else {
+            return false;
+        };
+        text.bytes().all(|byte| byte.is_ascii_digit())
     }
 
     fn lower_return_stmt(
@@ -2972,6 +3173,36 @@ impl LoweringContext<'_> {
         let kind = expression.kind().clone();
         match kind {
             HirExprKind::Literal { text } => {
+                if let Some(callable_name) = zero_arg_variable_call_name(&text) {
+                    let callee_local = builder.intern_local(function, callable_name);
+                    let callee = builder.alloc_register(function);
+                    let load = builder.emit(
+                        function,
+                        block,
+                        InstructionKind::LoadLocal {
+                            dst: callee,
+                            local: callee_local,
+                        },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, block, load, expr, span);
+                    let dst = builder.alloc_register(function);
+                    let call = builder.emit(
+                        function,
+                        block,
+                        InstructionKind::CallCallable {
+                            dst,
+                            callee: Operand::Register(callee),
+                            args: Vec::new(),
+                        },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, block, call, expr, span);
+                    return Some(LoweredExpr {
+                        register: dst,
+                        block,
+                    });
+                }
                 if text.starts_with('$') {
                     let local = builder.intern_local(function, local_name(&text));
                     let dst = builder.alloc_register(function);
@@ -3017,6 +3248,36 @@ impl LoweringContext<'_> {
                 })
             }
             HirExprKind::Variable { name } => {
+                if let Some(callable_name) = zero_arg_variable_call_name(&name) {
+                    let callee_local = builder.intern_local(function, callable_name);
+                    let callee = builder.alloc_register(function);
+                    let load = builder.emit(
+                        function,
+                        block,
+                        InstructionKind::LoadLocal {
+                            dst: callee,
+                            local: callee_local,
+                        },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, block, load, expr, span);
+                    let dst = builder.alloc_register(function);
+                    let call = builder.emit(
+                        function,
+                        block,
+                        InstructionKind::CallCallable {
+                            dst,
+                            callee: Operand::Register(callee),
+                            args: Vec::new(),
+                        },
+                        span,
+                    );
+                    self.add_expr_source_map(builder, function, block, call, expr, span);
+                    return Some(LoweredExpr {
+                        register: dst,
+                        block,
+                    });
+                }
                 let local = builder.intern_local(function, local_name(&name));
                 let dst = builder.alloc_register(function);
                 let instruction = builder.emit(
@@ -3041,6 +3302,9 @@ impl LoweringContext<'_> {
                 operator,
                 expr: inner,
             } => {
+                if operator == "@" {
+                    return self.lower_error_suppression_to_register(builder, site, inner);
+                }
                 if let Some(cast) = cast_kind(&operator) {
                     return self.lower_cast_to_register(builder, site, inner, cast);
                 }
@@ -4616,6 +4880,9 @@ impl LoweringContext<'_> {
         site: LowerSite,
         text: &str,
     ) -> Option<LoweredExpr> {
+        if let Some(parts) = interpolated_literal_parts(text) {
+            return self.lower_interpolated_literal_to_register(builder, site, parts);
+        }
         let Some(constant) = literal_constant(text) else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
@@ -4640,6 +4907,240 @@ impl LoweringContext<'_> {
         Some(LoweredExpr {
             register,
             block: site.block,
+        })
+    }
+
+    fn lower_interpolated_literal_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        parts: Vec<InterpolatedPart>,
+    ) -> Option<LoweredExpr> {
+        let current = site.block;
+        let mut value = None::<RegId>;
+        for part in parts {
+            let part_register = match part {
+                InterpolatedPart::Bytes(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let register = builder.alloc_register(site.function);
+                    let constant = builder.intern_constant(ir_string_constant(bytes));
+                    let instruction = builder.emit_load_const(
+                        site.function,
+                        current,
+                        register,
+                        constant,
+                        site.span,
+                    );
+                    self.add_expr_source_map(
+                        builder,
+                        site.function,
+                        current,
+                        instruction,
+                        site.expr,
+                        site.span,
+                    );
+                    register
+                }
+                InterpolatedPart::Variable {
+                    name,
+                    dim,
+                    deprecated_dollar_brace,
+                } => {
+                    if deprecated_dollar_brace {
+                        if builder.function_flags(site.function).is_top_level {
+                            self.record_early_diagnostic(
+                                site.function,
+                                site.expr,
+                                site.span,
+                                IrDiagnosticSeverity::Deprecation,
+                                "E_PHP_RUNTIME_DEPRECATED_DOLLAR_BRACE_INTERPOLATION",
+                                "Using ${var} in strings is deprecated, use {$var} instead",
+                            );
+                        } else {
+                            let instruction = builder.emit(
+                                site.function,
+                                current,
+                                InstructionKind::EmitDiagnostic {
+                                    severity: IrDiagnosticSeverity::Deprecation,
+                                    diagnostic_id:
+                                        "E_PHP_RUNTIME_DEPRECATED_DOLLAR_BRACE_INTERPOLATION"
+                                            .to_owned(),
+                                    message:
+                                        "Using ${var} in strings is deprecated, use {$var} instead"
+                                            .to_owned(),
+                                    leading_newline: true,
+                                },
+                                site.span,
+                            );
+                            self.add_expr_source_map(
+                                builder,
+                                site.function,
+                                current,
+                                instruction,
+                                site.expr,
+                                site.span,
+                            );
+                        }
+                    }
+                    let base_register = builder.alloc_register(site.function);
+                    let local = builder.intern_local(site.function, name);
+                    let instruction = builder.emit(
+                        site.function,
+                        current,
+                        InstructionKind::LoadLocal {
+                            dst: base_register,
+                            local,
+                        },
+                        site.span,
+                    );
+                    self.add_expr_source_map(
+                        builder,
+                        site.function,
+                        current,
+                        instruction,
+                        site.expr,
+                        site.span,
+                    );
+                    if let Some(dim) = dim {
+                        let key_register = builder.alloc_register(site.function);
+                        let key_constant = match dim {
+                            InterpolatedDim::Variable(name) => {
+                                let local = builder.intern_local(site.function, name);
+                                let instruction = builder.emit(
+                                    site.function,
+                                    current,
+                                    InstructionKind::LoadLocal {
+                                        dst: key_register,
+                                        local,
+                                    },
+                                    site.span,
+                                );
+                                self.add_expr_source_map(
+                                    builder,
+                                    site.function,
+                                    current,
+                                    instruction,
+                                    site.expr,
+                                    site.span,
+                                );
+                                None
+                            }
+                            InterpolatedDim::Int(value) => Some(IrConstant::Int(value)),
+                            InterpolatedDim::String(value) => Some(IrConstant::String(value)),
+                        };
+                        if let Some(constant) = key_constant {
+                            let constant = builder.intern_constant(constant);
+                            let instruction = builder.emit_load_const(
+                                site.function,
+                                current,
+                                key_register,
+                                constant,
+                                site.span,
+                            );
+                            self.add_expr_source_map(
+                                builder,
+                                site.function,
+                                current,
+                                instruction,
+                                site.expr,
+                                site.span,
+                            );
+                        }
+                        let register = builder.alloc_register(site.function);
+                        let instruction = builder.emit(
+                            site.function,
+                            current,
+                            InstructionKind::FetchDim {
+                                dst: register,
+                                array: Operand::Register(base_register),
+                                key: Operand::Register(key_register),
+                                quiet: false,
+                            },
+                            site.span,
+                        );
+                        self.add_expr_source_map(
+                            builder,
+                            site.function,
+                            current,
+                            instruction,
+                            site.expr,
+                            site.span,
+                        );
+                        register
+                    } else {
+                        base_register
+                    }
+                }
+            };
+
+            value = Some(if let Some(left) = value {
+                let dst = builder.alloc_register(site.function);
+                let instruction = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::Binary {
+                        dst,
+                        op: BinaryOp::Concat,
+                        lhs: Operand::Register(left),
+                        rhs: Operand::Register(part_register),
+                    },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    instruction,
+                    site.expr,
+                    site.span,
+                );
+                dst
+            } else {
+                part_register
+            });
+        }
+
+        let register = if let Some(register) = value {
+            let dst = builder.alloc_register(site.function);
+            let instruction = builder.emit(
+                site.function,
+                current,
+                InstructionKind::Cast {
+                    dst,
+                    kind: CastKind::String,
+                    src: Operand::Register(register),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                current,
+                instruction,
+                site.expr,
+                site.span,
+            );
+            dst
+        } else {
+            let register = builder.alloc_register(site.function);
+            let constant = builder.intern_constant(IrConstant::String(String::new()));
+            let instruction =
+                builder.emit_load_const(site.function, current, register, constant, site.span);
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                current,
+                instruction,
+                site.expr,
+                site.span,
+            );
+            register
+        };
+        Some(LoweredExpr {
+            register,
+            block: current,
         })
     }
 
@@ -5063,6 +5564,54 @@ impl LoweringContext<'_> {
                 })
             }
             _ => self.lower_expr_to_register(builder, site.function, site.block, left),
+        }
+    }
+
+    fn lower_error_suppression_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        inner: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(inner) = inner else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "error suppression expression is missing its operand",
+            );
+            return None;
+        };
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(inner)?;
+        match expression.kind() {
+            HirExprKind::Variable { name } => {
+                let local = builder.intern_local(site.function, local_name(name));
+                let dst = builder.alloc_register(site.function);
+                let range = self.span_for(SourceMappedId::from(inner));
+                let span = span_from_range(self.file, range);
+                let instruction = builder.emit(
+                    site.function,
+                    site.block,
+                    InstructionKind::LoadLocalQuiet { dst, local },
+                    span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    site.block,
+                    instruction,
+                    inner,
+                    span,
+                );
+                Some(LoweredExpr {
+                    register: dst,
+                    block: site.block,
+                })
+            }
+            _ => self.lower_expr_to_register(builder, site.function, site.block, inner),
         }
     }
 
@@ -6740,6 +7289,15 @@ fn local_name(name: &str) -> &str {
     name.strip_prefix('$').unwrap_or(name)
 }
 
+fn zero_arg_variable_call_name(name: &str) -> Option<&str> {
+    let name = local_name(name);
+    let callable_name = name.strip_suffix("()")?;
+    if callable_name.is_empty() || callable_name.contains('(') || callable_name.contains(')') {
+        return None;
+    }
+    Some(callable_name)
+}
+
 fn trait_resolution_name(name: &HirNameResolution) -> String {
     normalize_class_name(
         name.resolved()
@@ -6898,8 +7456,11 @@ fn literal_constant(text: &str) -> Option<IrConstant> {
     if trimmed.eq_ignore_ascii_case("false") {
         return Some(IrConstant::Bool(false));
     }
-    if let Some(string) = quoted_literal_body(trimmed) {
-        return Some(IrConstant::String(string));
+    if let Some(bytes) = quoted_literal_body(trimmed) {
+        return Some(ir_string_constant(bytes));
+    }
+    if let Some(bytes) = heredoc_literal_body(trimmed) {
+        return Some(ir_string_constant(bytes));
     }
 
     let numeric = trimmed.replace('_', "");
@@ -6946,14 +7507,21 @@ fn parse_php_int_literal(text: &str) -> Option<i64> {
     Some(if negative { -parsed } else { parsed })
 }
 
-fn quoted_literal_body(text: &str) -> Option<String> {
+fn ir_string_constant(bytes: Vec<u8>) -> IrConstant {
+    match String::from_utf8(bytes) {
+        Ok(value) => IrConstant::String(value),
+        Err(error) => IrConstant::StringBytes(error.into_bytes()),
+    }
+}
+
+fn quoted_literal_body(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
     let quote = *bytes.first()?;
     if bytes.len() < 2 || (quote != b'\'' && quote != b'"') || bytes.last().copied() != Some(quote)
     {
         return None;
     }
-    let body = &text[1..text.len() - 1];
+    let body = &bytes[1..bytes.len() - 1];
     Some(if quote == b'\'' {
         unescape_single_quoted_php_string(body)
     } else {
@@ -6961,53 +7529,438 @@ fn quoted_literal_body(text: &str) -> Option<String> {
     })
 }
 
-fn unescape_single_quoted_php_string(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut chars = body.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('\\') => out.push('\\'),
-                Some('\'') => out.push('\''),
-                Some(next) => {
-                    out.push('\\');
-                    out.push(next);
+fn heredoc_literal_body(text: &str) -> Option<Vec<u8>> {
+    let info = heredoc_body_info(text)?;
+    if info.nowdoc {
+        Some(info.body.to_vec())
+    } else {
+        Some(unescape_heredoc_php_string(info.body))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeredocBodyInfo<'a> {
+    body: &'a [u8],
+    nowdoc: bool,
+}
+
+fn heredoc_body_info(text: &str) -> Option<HeredocBodyInfo<'_>> {
+    let bytes = text.as_bytes();
+    if !bytes.starts_with(b"<<<") {
+        return None;
+    }
+    let first_newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&bytes[..first_newline]).ok()?.trim();
+    let marker = header.strip_prefix("<<<")?.trim();
+    if marker.is_empty() {
+        return None;
+    }
+    let nowdoc = marker.starts_with('\'') && marker.ends_with('\'') && marker.len() >= 2;
+    let body_start = first_newline + 1;
+    let body_and_end = &bytes[body_start..];
+    let end_line_start = body_and_end
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(body_start, |offset| body_start + offset + 1);
+    if end_line_start < body_start {
+        return None;
+    }
+    let mut body_end = end_line_start.saturating_sub(usize::from(end_line_start > body_start));
+    if body_end > body_start && bytes.get(body_end - 1).copied() == Some(b'\r') {
+        body_end -= 1;
+    }
+    Some(HeredocBodyInfo {
+        body: &bytes[body_start..body_end],
+        nowdoc,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InterpolatedPart {
+    Bytes(Vec<u8>),
+    Variable {
+        name: String,
+        dim: Option<InterpolatedDim>,
+        deprecated_dollar_brace: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InterpolatedDim {
+    Variable(String),
+    Int(i64),
+    String(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedInterpolatedVariable {
+    name: String,
+    dim: Option<InterpolatedDim>,
+    end: usize,
+    deprecated_dollar_brace: bool,
+}
+
+fn interpolated_literal_parts(text: &str) -> Option<Vec<InterpolatedPart>> {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    let (body, decode_escaped_quote) =
+        if bytes.first().copied() == Some(b'"') && bytes.last().copied() == Some(b'"') {
+            (&bytes[1..bytes.len() - 1], true)
+        } else {
+            let heredoc = heredoc_body_info(trimmed)?;
+            if heredoc.nowdoc {
+                return None;
+            }
+            (heredoc.body, false)
+        };
+    parse_interpolated_double_quoted_body(body, decode_escaped_quote)
+}
+
+fn parse_interpolated_double_quoted_body(
+    body: &[u8],
+    decode_escaped_quote: bool,
+) -> Option<Vec<InterpolatedPart>> {
+    let mut parts = Vec::new();
+    let mut chunk_start = 0;
+    let mut index = 0;
+    while index < body.len() {
+        if body[index] == b'\\' {
+            index += usize::from(index + 1 < body.len()) + 1;
+            continue;
+        }
+        let parsed = if body[index] == b'$' {
+            parse_deprecated_dollar_brace_interpolated_variable(body, index).or_else(|| {
+                parse_simple_interpolated_variable(body, index).map(|mut parsed| {
+                    parsed.deprecated_dollar_brace = false;
+                    parsed
+                })
+            })
+        } else if body[index] == b'{' && body.get(index + 1).copied() == Some(b'$') {
+            parse_braced_interpolated_variable(body, index)
+        } else {
+            None
+        };
+        let Some(parsed) = parsed else {
+            index += 1;
+            continue;
+        };
+        parts.push(InterpolatedPart::Bytes(
+            unescape_double_quoted_php_string_with_quote_mode(
+                &body[chunk_start..index],
+                decode_escaped_quote,
+            ),
+        ));
+        parts.push(InterpolatedPart::Variable {
+            name: parsed.name,
+            dim: parsed.dim,
+            deprecated_dollar_brace: parsed.deprecated_dollar_brace,
+        });
+        index = parsed.end;
+        chunk_start = parsed.end;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(InterpolatedPart::Bytes(
+        unescape_double_quoted_php_string_with_quote_mode(
+            &body[chunk_start..],
+            decode_escaped_quote,
+        ),
+    ));
+    Some(parts)
+}
+
+fn parse_simple_interpolated_variable(
+    bytes: &[u8],
+    start: usize,
+) -> Option<ParsedInterpolatedVariable> {
+    let mut index = start + 1;
+    if !is_php_variable_start(bytes.get(index).copied()?) {
+        return None;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .copied()
+        .is_some_and(is_php_variable_continue)
+    {
+        index += 1;
+    }
+    let name = std::str::from_utf8(&bytes[start + 1..index])
+        .ok()?
+        .to_string();
+    let (dim, end) = parse_interpolated_dim(bytes, index)
+        .map(|(dim, end)| (Some(dim), end))
+        .unwrap_or((None, index));
+    Some(ParsedInterpolatedVariable {
+        name,
+        dim,
+        end,
+        deprecated_dollar_brace: false,
+    })
+}
+
+fn parse_braced_interpolated_variable(
+    bytes: &[u8],
+    start: usize,
+) -> Option<ParsedInterpolatedVariable> {
+    let mut parsed = parse_simple_interpolated_variable(bytes, start + 1)?;
+    if bytes.get(parsed.end).copied() != Some(b'}') {
+        return None;
+    }
+    parsed.end += 1;
+    Some(parsed)
+}
+
+fn parse_deprecated_dollar_brace_interpolated_variable(
+    bytes: &[u8],
+    start: usize,
+) -> Option<ParsedInterpolatedVariable> {
+    if bytes.get(start).copied() != Some(b'$') || bytes.get(start + 1).copied() != Some(b'{') {
+        return None;
+    }
+    let mut index = start + 2;
+    if !is_php_variable_start(bytes.get(index).copied()?) {
+        return None;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .copied()
+        .is_some_and(is_php_variable_continue)
+    {
+        index += 1;
+    }
+    if bytes.get(index).copied() != Some(b'}') {
+        return None;
+    }
+    Some(ParsedInterpolatedVariable {
+        name: std::str::from_utf8(&bytes[start + 2..index])
+            .ok()?
+            .to_string(),
+        dim: None,
+        end: index + 1,
+        deprecated_dollar_brace: true,
+    })
+}
+
+fn parse_interpolated_dim(bytes: &[u8], start: usize) -> Option<(InterpolatedDim, usize)> {
+    if bytes.get(start).copied() != Some(b'[') {
+        return None;
+    }
+    let end = bytes[start + 1..]
+        .iter()
+        .position(|byte| *byte == b']')
+        .map(|offset| start + 1 + offset)?;
+    let inner = &bytes[start + 1..end];
+    if inner.is_empty() {
+        return None;
+    }
+    let dim = if inner.first().copied() == Some(b'$') {
+        let parsed = parse_simple_interpolated_variable(inner, 0)?;
+        if parsed.end != inner.len() || parsed.dim.is_some() {
+            return None;
+        }
+        InterpolatedDim::Variable(parsed.name)
+    } else if inner.iter().all(u8::is_ascii_digit) {
+        InterpolatedDim::Int(std::str::from_utf8(inner).ok()?.parse().ok()?)
+    } else if is_quoted_interpolated_dim(inner) {
+        InterpolatedDim::String(
+            std::str::from_utf8(&inner[1..inner.len() - 1])
+                .ok()?
+                .to_string(),
+        )
+    } else if inner.first().copied().is_some_and(is_php_variable_start)
+        && inner.iter().skip(1).copied().all(is_php_variable_continue)
+    {
+        InterpolatedDim::String(std::str::from_utf8(inner).ok()?.to_string())
+    } else {
+        return None;
+    };
+    Some((dim, end + 1))
+}
+
+fn is_quoted_interpolated_dim(inner: &[u8]) -> bool {
+    inner.len() >= 2
+        && matches!(
+            (inner.first().copied(), inner.last().copied()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        )
+}
+
+fn is_php_variable_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic() || byte >= 0x80
+}
+
+fn is_php_variable_continue(byte: u8) -> bool {
+    is_php_variable_start(byte) || byte.is_ascii_digit()
+}
+
+fn unescape_single_quoted_php_string(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut index = 0;
+    while index < body.len() {
+        let byte = body[index];
+        if byte == b'\\' {
+            match body.get(index + 1).copied() {
+                Some(b'\\') => {
+                    out.push(b'\\');
+                    index += 2;
                 }
-                None => out.push('\\'),
+                Some(b'\'') => {
+                    out.push(b'\'');
+                    index += 2;
+                }
+                Some(next) => {
+                    out.push(b'\\');
+                    out.push(next);
+                    index += 2;
+                }
+                None => {
+                    out.push(b'\\');
+                    index += 1;
+                }
             }
         } else {
-            out.push(ch);
+            out.push(byte);
+            index += 1;
         }
     }
     out
 }
 
-fn unescape_double_quoted_php_string(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut chars = body.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
+fn unescape_double_quoted_php_string(body: &[u8]) -> Vec<u8> {
+    unescape_double_quoted_php_string_with_quote_mode(body, true)
+}
+
+fn unescape_heredoc_php_string(body: &[u8]) -> Vec<u8> {
+    unescape_double_quoted_php_string_with_quote_mode(body, false)
+}
+
+fn unescape_double_quoted_php_string_with_quote_mode(
+    body: &[u8],
+    decode_escaped_quote: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut index = 0;
+    while index < body.len() {
+        let byte = body[index];
+        if byte != b'\\' {
+            out.push(byte);
+            index += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\u{0b}'),
-            Some('e') => out.push('\u{1b}'),
-            Some('f') => out.push('\u{0c}'),
-            Some('\\') => out.push('\\'),
-            Some('$') => out.push('$'),
-            Some('"') => out.push('"'),
-            Some(next) => {
-                out.push('\\');
+        let Some(next) = body.get(index + 1).copied() else {
+            out.push(b'\\');
+            index += 1;
+            continue;
+        };
+        match next {
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'e' => out.push(0x1b),
+            b'f' => out.push(0x0c),
+            b'\\' => out.push(b'\\'),
+            b'$' => out.push(b'$'),
+            b'"' if decode_escaped_quote => out.push(b'"'),
+            b'"' => {
+                out.push(b'\\');
+                out.push(b'"');
+            }
+            b'x' | b'X' => {
+                let (value, consumed) = decode_hex_escape(&body[index + 2..]);
+                if consumed == 0 {
+                    out.push(b'\\');
+                    out.push(next);
+                    index += 2;
+                    continue;
+                }
+                out.push(value);
+                index += 2 + consumed;
+                continue;
+            }
+            b'u' if body.get(index + 2).copied() == Some(b'{') => {
+                if let Some((bytes, consumed)) = decode_unicode_escape(&body[index + 3..]) {
+                    out.extend_from_slice(&bytes);
+                    index += 3 + consumed;
+                    continue;
+                }
+                out.push(b'\\');
                 out.push(next);
             }
-            None => out.push('\\'),
+            b'0'..=b'7' => {
+                let (value, consumed) = decode_octal_escape(&body[index + 1..]);
+                out.push(value);
+                index += 1 + consumed;
+                continue;
+            }
+            _ => {
+                out.push(b'\\');
+                out.push(next);
+            }
         }
+        index += 2;
     }
     out
+}
+
+fn decode_hex_escape(bytes: &[u8]) -> (u8, usize) {
+    let mut value = 0u8;
+    let mut consumed = 0;
+    for byte in bytes.iter().take(2).copied() {
+        let Some(nibble) = hex_nibble(byte) else {
+            break;
+        };
+        value = (value << 4) | nibble;
+        consumed += 1;
+    }
+    (value, consumed)
+}
+
+fn decode_octal_escape(bytes: &[u8]) -> (u8, usize) {
+    let mut value = 0u16;
+    let mut consumed = 0;
+    for byte in bytes.iter().take(3).copied() {
+        if !(b'0'..=b'7').contains(&byte) {
+            break;
+        }
+        value = (value << 3) | u16::from(byte - b'0');
+        consumed += 1;
+    }
+    (value as u8, consumed)
+}
+
+fn decode_unicode_escape(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut value = 0u32;
+    let mut consumed = 0;
+    for byte in bytes.iter().copied() {
+        if byte == b'}' {
+            if consumed == 0 {
+                return None;
+            }
+            let ch = char::from_u32(value)?;
+            let mut encoded = [0; 4];
+            return Some((
+                ch.encode_utf8(&mut encoded).as_bytes().to_vec(),
+                consumed + 1,
+            ));
+        }
+        let nibble = hex_nibble(byte)?;
+        value = value.checked_mul(16)?.checked_add(u32::from(nibble))?;
+        consumed += 1;
+    }
+    None
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -7047,6 +8000,45 @@ mod tests {
         assert!(snapshot.contains("echo r0"));
         assert!(snapshot.contains("source_map:"));
         assert!(snapshot.contains("instr function:0 block:0 instr:0 <= hir:expr:0"));
+    }
+
+    #[test]
+    fn lower_top_level_exit_statement_terminates_script() {
+        let frontend = analyze_source("<?php echo 'before'; exit; echo 'after';");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("echo r0"), "{snapshot}");
+        assert!(snapshot.contains("return"), "{snapshot}");
+        assert!(!snapshot.contains("after"), "{snapshot}");
+    }
+
+    #[test]
+    fn lower_top_level_exit_message_emits_before_terminating_script() {
+        let frontend = analyze_source("<?php die('skip platform'); echo 'after';");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("string \"skip platform\""), "{snapshot}");
+        assert!(snapshot.contains("echo r"), "{snapshot}");
+        assert!(snapshot.contains("return"), "{snapshot}");
+        assert!(!snapshot.contains("after"), "{snapshot}");
+    }
+
+    #[test]
+    fn error_suppressed_variable_load_lowers_quietly() {
+        let frontend = analyze_source("<?php echo @$missing;");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("load_local_quiet"), "{snapshot}");
+        assert!(!snapshot.contains("unsupported"), "{snapshot}");
     }
 
     #[test]
@@ -7129,6 +8121,157 @@ mod tests {
                 .constants
                 .contains(&IrConstant::String("b\\c".to_string()))
         );
+        assert_eq!(
+            quoted_literal_body(r#""\0\x0n\141""#),
+            Some(b"\0\0na".to_vec())
+        );
+        assert_eq!(
+            quoted_literal_body(r#""\u{41}\xFF""#),
+            Some(vec![b'A', 0xff])
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String("a\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn literals_keep_binary_php_string_bytes() {
+        let frontend = analyze_source("<?php echo \"\\xFF\\0\";");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::StringBytes(vec![0xff, 0]))
+        );
+    }
+
+    #[test]
+    fn literals_lower_heredoc_and_nowdoc_bodies() {
+        let frontend = analyze_source(
+            "<?php $a = <<<TXT\nhello\\n\nTXT; $b = <<<'TXT'\nhello\\n\nTXT; echo $a, $b;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String("hello\n".to_string()))
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String("hello\\n".to_string()))
+        );
+
+        let frontend = analyze_source("<?php $a = <<<TXT\n\\\"quotes\nTXT; $b = \"\\\"quotes\";");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String("\\\"quotes".to_string()))
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String("\"quotes".to_string()))
+        );
+    }
+
+    #[test]
+    fn literals_lower_simple_interpolation_to_concat() {
+        let frontend = analyze_source("<?php $counter = 3; echo \"-- Iteration $counter --\\n\";");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains(" concat "), "{snapshot}");
+        assert!(snapshot.contains("cast r"), "{snapshot}");
+        assert!(snapshot.contains(" string "), "{snapshot}");
+        assert!(snapshot.contains("local:0 $counter"), "{snapshot}");
+        assert!(
+            interpolated_literal_parts("\"a {$counter} b\"").is_some(),
+            "braced simple interpolation should be recognized"
+        );
+    }
+
+    #[test]
+    fn deprecated_dollar_brace_interpolation_lowers_diagnostic() {
+        let frontend =
+            analyze_source("<?php $counter = 3; echo \"-- Iteration ${counter} --\\n\";");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains("emit_diagnostic Deprecation"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("E_PHP_RUNTIME_DEPRECATED_DOLLAR_BRACE_INTERPOLATION"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains(" concat "), "{snapshot}");
+        assert!(snapshot.contains("local:0 $counter"), "{snapshot}");
+
+        let parts = interpolated_literal_parts("\"a {$counter} ${counter} b\"")
+            .expect("interpolated parts");
+        assert!(matches!(
+            &parts[1],
+            InterpolatedPart::Variable {
+                deprecated_dollar_brace: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[3],
+            InterpolatedPart::Variable {
+                deprecated_dollar_brace: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn simple_array_dim_interpolation_lowers_fetch_dim() {
+        let frontend = analyze_source(
+            "<?php $needles = ['Hello world']; $i = 0; echo \"Position of '$needles[$i]'\\n\";",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("fetch_dim r"), "{snapshot}");
+        assert!(snapshot.contains("local:0 $needles"), "{snapshot}");
+        assert!(snapshot.contains("local:1 $i"), "{snapshot}");
+
+        let parts = interpolated_literal_parts("\"Position of '$needles[$i]'\"").expect("parts");
+        assert!(matches!(
+            &parts[1],
+            InterpolatedPart::Variable {
+                name,
+                dim: Some(InterpolatedDim::Variable(dim)),
+                ..
+            } if name == "needles" && dim == "i"
+        ));
     }
 
     #[test]
@@ -7146,6 +8289,37 @@ mod tests {
         assert!(snapshot.contains("store_local local:0"));
         assert!(snapshot.contains("load_local r"));
         assert!(snapshot.contains("binary r"));
+    }
+
+    #[test]
+    fn dim_fetch_lowers_binary_index_expression() {
+        let frontend = analyze_source(
+            "<?php $args_array = array(array(0), array(-1, 1)); $counter = 1; var_dump($args_array[$counter - 1]);",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("local:0 $args_array"), "{snapshot}");
+        assert!(snapshot.contains("local:1 $counter"), "{snapshot}");
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+        assert!(snapshot.contains("fetch_dim r"), "{snapshot}");
+    }
+
+    #[test]
+    fn array_literal_preserves_nested_keyed_array_as_append_value() {
+        let frontend = analyze_source("<?php $xs = array(array(12 => \"12twelve\"));");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("array_insert"), "{snapshot}");
+        assert!(
+            !snapshot.contains("array element is missing its value"),
+            "{snapshot}"
+        );
     }
 
     #[test]

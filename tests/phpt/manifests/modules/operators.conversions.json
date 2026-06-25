@@ -1,75 +1,16 @@
 {
-  "module": "operators.conversions",
-  "slice": "09.12",
-  "description": "Operators, scalar conversions, comparisons, numeric strings, increment/decrement, concat, assignment operators, and invalid operand warnings.",
-  "scope": [
-    "arithmetic operators",
-    "bitwise operators",
-    "comparison operators",
-    "boolean conversion and truthiness",
-    "string-to-number and numeric string behavior",
-    "increment/decrement",
-    "concat and assignment operators",
-    "warnings/errors caused by invalid operands"
-  ],
-  "selected_manifest": "tests/phpt/manifests/modules/operators.conversions.selected.jsonl",
-  "generated_manifest": "tests/phpt/manifests/operators.conversions-generated.jsonl",
-  "selected_originals": [
-    {
-      "path": "Zend/tests/string_to_number_comparison.phpt",
-      "source_hash": "c50f1cd9d9a36635662220516c3734e73e2d9957e7c4587a4cf60686b455a60b",
-      "reason": "PHP 8 numeric-string comparison rules, non-finite float labels, json_encode float normalization, and precision-sensitive string conversion."
-    },
-    {
-      "path": "Zend/tests/concat/concat_002.phpt",
-      "source_hash": "8930bdcfc75261fd13aff475dc89100ab5b2b1dd8bf397cc0ddf529eb138d0a8",
-      "reason": "Concat and concat-assignment behavior across scalar operands."
-    },
-    {
-      "path": "Zend/tests/type_coercion/type_casts/cast_to_bool.phpt",
-      "source_hash": "0a37b5e4b00d7a898f88a291c942f5b1ce206d3655981d7d8ada514bd3505a98",
-      "reason": "Boolean conversion and truthiness matrix."
-    },
-    {
-      "path": "Zend/tests/type_coercion/type_casts/cast_to_int.phpt",
-      "source_hash": "5a2a4047d1ed8f4d7c9e5c6c9e3e0960517dd8330be2098bed3a3193aa1fd755",
-      "reason": "Integer casts from strings, numbers, arrays, resources, booleans, null, and objects with warning."
-    },
-    {
-      "path": "Zend/tests/type_coercion/type_casts/cast_to_double.phpt",
-      "source_hash": "e4bb7e0ea2813e7cbf40dd44950869e67c87a8562d04a5be723b9bc67f9a2f70",
-      "reason": "Float casts from strings, numbers, arrays, resources, booleans, null, and objects with warning."
-    },
-    {
-      "path": "Zend/tests/in-de-crement/increment_001_64bit.phpt",
-      "source_hash": "433a185b405a9a3a499497b74e7ead060de3e02fb1a20e94746e8044329d9ed6",
-      "reason": "64-bit integer increment overflow promotion to float."
-    }
-  ],
-  "selected_generated": [
-    {
-      "path": "tests/phpt/generated/operators.conversions/regression-operators_scalar_matrix-8930bdcfc752.phpt",
-      "original_path": "Zend/tests/concat/concat_002.phpt",
-      "original_source_hash": "8930bdcfc75261fd13aff475dc89100ab5b2b1dd8bf397cc0ddf529eb138d0a8",
-      "reason": "Reduced arithmetic, bitwise, comparison, concat, truthiness, and overflow regression generated from reference output."
-    },
-    {
-      "path": "tests/phpt/generated/operators.conversions/regression-string_number_precision-c50f1cd9d9a3.phpt",
-      "original_path": "Zend/tests/string_to_number_comparison.phpt",
-      "original_source_hash": "c50f1cd9d9a36635662220516c3734e73e2d9957e7c4587a4cf60686b455a60b",
-      "reason": "Reduced precision-sensitive numeric-string comparison regression generated from reference output."
-    },
-    {
-      "path": "tests/phpt/generated/operators.conversions/regression-object_numeric_casts-5a2a4047d1ed.phpt",
-      "original_path": "Zend/tests/type_coercion/type_casts/cast_to_int.phpt",
-      "original_source_hash": "5a2a4047d1ed8f4d7c9e5c6c9e3e0960517dd8330be2098bed3a3193aa1fd755",
-      "reason": "Reduced object-to-int/object-to-float cast regression generated from reference output."
-    }
-  ],
-  "closure_gate": [
-    "nix develop -c just phpt-module MODULE=operators.conversions",
-    "nix develop -c just phpt-full-regression",
-    "nix develop -c just phpt-verify-source-integrity",
-    "nix develop -c just verify-phpt"
-  ]
+  "schema_version":"phpt-module-plan-v1",
+  "module":"operators.conversions",
+  "priority":5,
+  "selected_manifest":"tests/phpt/manifests/modules/operators.conversions.selected.jsonl",
+  "corpus_count":7,
+  "pass_count":7,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["arithmetic","bitwise operators","comparison","boolean conversion","numeric-string conversion","concat","assignment operators","increment/decrement","leading numeric string warnings","object numeric casts"],
+  "non_scope":["array union semantics","array/object concat beyond __toString smoke coverage","full TypeError/Throwable catch semantics for non-numeric operands","pipe operator","nullsafe operator","property hooks","fiber error suppression","performance-only concat stress"],
+  "target_gates":["nix develop -c just phpt-module MODULE=operators.conversions"],
+  "next_step":"Keep the selected scalar conversion gate green while later modules expand arrays, objects, and diagnostics."
 }

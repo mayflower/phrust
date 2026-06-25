@@ -101,6 +101,23 @@ pub const E_USER_DEPRECATED: i64 = 16384;
 /// PHP 8.x `E_ALL`.
 pub const E_ALL: i64 = 32767;
 
+/// `parse_url()` component selector for the URL scheme.
+pub const PHP_URL_SCHEME: i64 = 0;
+/// `parse_url()` component selector for the URL host.
+pub const PHP_URL_HOST: i64 = 1;
+/// `parse_url()` component selector for the URL port.
+pub const PHP_URL_PORT: i64 = 2;
+/// `parse_url()` component selector for the URL user.
+pub const PHP_URL_USER: i64 = 3;
+/// `parse_url()` component selector for the URL password.
+pub const PHP_URL_PASS: i64 = 4;
+/// `parse_url()` component selector for the URL path.
+pub const PHP_URL_PATH: i64 = 5;
+/// `parse_url()` component selector for the URL query.
+pub const PHP_URL_QUERY: i64 = 6;
+/// `parse_url()` component selector for the URL fragment.
+pub const PHP_URL_FRAGMENT: i64 = 7;
+
 /// Converts registry constant metadata into a runtime value.
 #[must_use]
 pub fn constant_to_value(value: ConstantValue) -> Value {

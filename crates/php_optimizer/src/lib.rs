@@ -655,6 +655,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::InitStaticLocal { .. }
         | InstructionKind::Discard { .. }
         | InstructionKind::Echo { .. }
+        | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::EnterTry { .. }
         | InstructionKind::LeaveTry
         | InstructionKind::EndFinally { .. }

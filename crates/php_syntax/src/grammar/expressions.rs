@@ -3,7 +3,7 @@
 use crate::grammar::{arrays, classes, functions, named, names, php85, strings, symbol, variables};
 use crate::parser::core::Parser;
 use crate::parser::precedence::{
-    PREFIX_RIGHT_BP, TERNARY_BP, binary_operator, is_assignment_operator,
+    PREFIX_RIGHT_BP, PRINT_RIGHT_BP, TERNARY_BP, binary_operator, is_assignment_operator,
 };
 use crate::recovery;
 use crate::{SyntaxKind, SyntaxNodeKind};
@@ -372,6 +372,10 @@ fn parse_construct_expression(parser: &mut Parser<'_>) {
     } else if token == named(TokenName::Exit) {
         if !at_expression_stop(parser) {
             let _has_argument = parse_expression_bp(parser, PREFIX_RIGHT_BP);
+        }
+    } else if token == named(TokenName::Print) {
+        if !parse_expression_bp(parser, PRINT_RIGHT_BP) {
+            parser.error_expected("expected construct expression argument", &["expression"]);
         }
     } else if !parse_expression_bp(parser, PREFIX_RIGHT_BP) {
         parser.error_expected("expected construct expression argument", &["expression"]);

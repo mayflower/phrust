@@ -571,6 +571,40 @@ impl ResourceRef {
         Ok(())
     }
 
+    /// Truncates writable stream buffers to `length` bytes.
+    pub fn truncate(&self, length: usize) -> Result<(), StreamOpenError> {
+        let mut state = self.0.borrow_mut();
+        if state.kind == ResourceKind::Closed {
+            return Err(StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_CLOSED",
+                "cannot truncate a closed stream",
+            ));
+        }
+        if !state.flags.writable {
+            return Err(StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_NOT_WRITABLE",
+                "stream is not writable",
+            ));
+        }
+        match &mut state.data {
+            StreamData::Memory { buffer, cursor }
+            | StreamData::Stdio { buffer, cursor }
+            | StreamData::File { buffer, cursor, .. } => {
+                buffer.resize(length, 0);
+                if *cursor > length {
+                    *cursor = length;
+                }
+            }
+            StreamData::Directory { .. } | StreamData::Context { .. } => {
+                return Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_NOT_WRITABLE",
+                    "resource is not a writable byte stream",
+                ));
+            }
+        }
+        flush_file_data(&state.data)
+    }
+
     /// Returns the current stream cursor.
     pub fn tell(&self) -> Result<usize, StreamOpenError> {
         let state = self.0.borrow();
@@ -770,6 +804,15 @@ impl ResourceTable {
                 buffer: Vec::new(),
                 cursor: 0,
             },
+        )
+    }
+
+    /// Registers a deterministic CLI stdin stream.
+    pub fn register_stdin(&mut self, buffer: Vec<u8>) -> ResourceRef {
+        self.register_stream_data(
+            StreamFlags::new(true, false, false),
+            StreamMetadata::new("PHP", "stream", "r", "php://stdin"),
+            StreamData::Stdio { buffer, cursor: 0 },
         )
     }
 

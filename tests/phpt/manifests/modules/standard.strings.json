@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"standard.strings",
+  "priority":13,
+  "selected_manifest":"tests/phpt/manifests/modules/standard.strings.selected.jsonl",
+  "corpus_count":727,
+  "pass_count":81,
+  "skip_count":0,
+  "fail_count":621,
+  "bork_count":0,
+  "known_failure_count":621,
+  "scope":["ext/standard string builtins"],
+  "non_scope":["frontend literal decoding"],
+  "target_gates":["nix develop -c just phpt-module MODULE=standard.strings"],
+  "next_step":"Close common binary-safe string functions against Reference PHP."
+}

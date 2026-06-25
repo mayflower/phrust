@@ -24,7 +24,7 @@ pub use function::{FunctionFlags, IrCapture, IrFunction, IrParam, IrReturnType};
 pub use ids::{BlockId, ClassId, ConstId, FileId, FunctionId, InstrId, LocalId, RegId, UnitId};
 pub use instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, Instruction,
-    InstructionKind, UnaryOp,
+    InstructionKind, IrDiagnosticSeverity, UnaryOp,
 };
 pub use lower::{
     LoweringContext, LoweringDiagnostic, LoweringOptions, LoweringResult, UnsupportedFeature,

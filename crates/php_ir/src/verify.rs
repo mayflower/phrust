@@ -249,6 +249,7 @@ fn verify_instruction(
     verify_span(unit, instruction.span, errors);
     match &instruction.kind {
         InstructionKind::Nop
+        | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
         InstructionKind::LoadConst { dst, constant } => {
@@ -902,6 +903,7 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
         | InstructionKind::EmptyLocal { .. }
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::ForeachInitRef { .. }
+        | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
         InstructionKind::Move { src, .. }
@@ -1104,6 +1106,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::ArrayInsert { .. }
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::UnsetDim { .. }
+        | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
     }

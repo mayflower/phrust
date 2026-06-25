@@ -68,6 +68,8 @@ pub struct RuntimeContext {
     pub argv: Vec<String>,
     /// Controlled environment entries. Host env is never imported implicitly.
     pub env: Vec<(String, String)>,
+    /// Deterministic bytes exposed through CLI stdin resources.
+    pub stdin: Vec<u8>,
     /// Minimal include path placeholder.
     pub include_path: Vec<PathBuf>,
     /// Minimal ini-like options.
@@ -86,6 +88,7 @@ impl Default for RuntimeContext {
             cwd: PathBuf::from("."),
             argv: Vec::new(),
             env: Vec::new(),
+            stdin: Vec::new(),
             include_path: vec![PathBuf::from(".")],
             ini: RuntimeIniOptions::default(),
             strict_types: Vec::new(),
@@ -145,6 +148,13 @@ impl RuntimeContext {
     pub fn with_env(mut self, mut env: Vec<(String, String)>) -> Self {
         env.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         self.env = env;
+        self
+    }
+
+    /// Sets deterministic stdin bytes for CLI-style execution.
+    #[must_use]
+    pub fn with_stdin(mut self, stdin: Vec<u8>) -> Self {
+        self.stdin = stdin;
         self
     }
 

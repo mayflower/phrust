@@ -1,3 +1,3 @@
 # Manual deterministic overrides for scripts/stdlib/generate_arginfo.py.
-# Format: name=<function> return=<type> required=<count>
-name=strlen return=int
+# Format: name=<function> return=<type> required=<count> reason=<short-id>
+name=strlen return=int reason=historical-smoke-anchor

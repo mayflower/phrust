@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"standard.variables",
+  "priority":15,
+  "selected_manifest":"tests/phpt/manifests/modules/standard.variables.selected.jsonl",
+  "corpus_count":446,
+  "pass_count":8,
+  "skip_count":2,
+  "fail_count":435,
+  "bork_count":0,
+  "known_failure_count":435,
+  "scope":["variable inspection and conversion builtins"],
+  "non_scope":["general VM symbol-table redesign"],
+  "target_gates":["nix develop -c just phpt-module MODULE=standard.variables"],
+  "next_step":"Stabilize var_dump/print_r/serialization-adjacent value rendering."
+}

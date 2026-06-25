@@ -86,6 +86,10 @@ impl<'db> ModuleDeclarationCollector<'db> {
         self.ensure_global_block(source_file.text_range());
         for child in syntax_child_nodes(source_file) {
             if InlineHtmlStmt::cast(child).is_some() {
+                self.collect_hir_in_node_with_scope(
+                    child,
+                    TypeLoweringScope::new(None, Default::default()),
+                );
                 self.push_global_item(TopLevelItem::new(
                     TopLevelItemKind::InlineHtml,
                     child.text_range(),

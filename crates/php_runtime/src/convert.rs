@@ -22,6 +22,16 @@ pub enum NumericValue {
     Float(f64),
 }
 
+/// Numeric operand conversion result for arithmetic operators.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArithmeticNumber {
+    /// Converted numeric value.
+    pub value: NumericValue,
+    /// True when the operand was a leading numeric string and PHP must emit
+    /// "A non-numeric value encountered" while still using the numeric prefix.
+    pub leading_numeric_string: bool,
+}
+
 /// Resets request-local float-to-string precision to PHP's default.
 pub fn reset_float_string_precision() {
     set_float_string_precision(DEFAULT_FLOAT_STRING_PRECISION);
@@ -173,6 +183,19 @@ pub fn to_number(value: &Value) -> Result<NumericValue, String> {
     }
 }
 
+/// Converts a value to a PHP numeric arithmetic operand and preserves whether
+/// a leading numeric string warning is required.
+pub fn to_arithmetic_number(value: &Value) -> Result<ArithmeticNumber, String> {
+    match value {
+        Value::String(value) => arithmetic_numeric_string_with_warning(value),
+        Value::Reference(cell) => to_arithmetic_number(&cell.get()),
+        _ => to_number(value).map(|value| ArithmeticNumber {
+            value,
+            leading_numeric_string: false,
+        }),
+    }
+}
+
 /// Strict identity for runtime-semantics runtime values.
 pub fn identical(left: &Value, right: &Value) -> bool {
     match (left, right) {
@@ -307,6 +330,10 @@ fn comparison_numeric_string(value: &PhpString) -> Option<NumericValue> {
 }
 
 fn arithmetic_numeric_string(value: &PhpString) -> Result<NumericValue, String> {
+    arithmetic_numeric_string_with_warning(value).map(|number| number.value)
+}
+
+fn arithmetic_numeric_string_with_warning(value: &PhpString) -> Result<ArithmeticNumber, String> {
     let classified = classify_php_string(value);
     match (classified.kind, classified.value) {
         (
@@ -314,13 +341,19 @@ fn arithmetic_numeric_string(value: &PhpString) -> Result<NumericValue, String> 
             | NumericStringKind::FloatString
             | NumericStringKind::LeadingNumeric,
             Some(NumericStringValue::Int(value)),
-        ) => Ok(NumericValue::Int(value)),
+        ) => Ok(ArithmeticNumber {
+            value: NumericValue::Int(value),
+            leading_numeric_string: classified.kind == NumericStringKind::LeadingNumeric,
+        }),
         (
             NumericStringKind::IntString
             | NumericStringKind::FloatString
             | NumericStringKind::LeadingNumeric,
             Some(NumericStringValue::Float(value)),
-        ) => Ok(NumericValue::Float(value)),
+        ) => Ok(ArithmeticNumber {
+            value: NumericValue::Float(value),
+            leading_numeric_string: classified.kind == NumericStringKind::LeadingNumeric,
+        }),
         _ => Err(
             "E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number"
                 .to_owned(),
@@ -470,6 +503,17 @@ mod tests {
             NumericValue::Int(12)
         );
         assert!(to_number(&Value::string(b"abc".to_vec())).is_err());
+    }
+
+    #[test]
+    fn arithmetic_number_preserves_leading_numeric_warning_flag() {
+        let clean = to_arithmetic_number(&Value::string(b"42".to_vec())).unwrap();
+        assert_eq!(clean.value, NumericValue::Int(42));
+        assert!(!clean.leading_numeric_string);
+
+        let leading = to_arithmetic_number(&Value::string(b"42abc".to_vec())).unwrap();
+        assert_eq!(leading.value, NumericValue::Int(42));
+        assert!(leading.leading_numeric_string);
     }
 
     #[test]

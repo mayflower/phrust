@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"date",
+  "priority":19,
+  "selected_manifest":"tests/phpt/manifests/modules/date.selected.jsonl",
+  "corpus_count":687,
+  "pass_count":11,
+  "skip_count":1,
+  "fail_count":675,
+  "bork_count":0,
+  "known_failure_count":675,
+  "scope":["date/time builtins and DateTime MVP"],
+  "non_scope":["complete timelib natural-language parity"],
+  "target_gates":["nix develop -c just phpt-module MODULE=date"],
+  "next_step":"Stabilize timezone persistence and common formatting/parsing."
+}

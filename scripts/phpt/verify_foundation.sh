@@ -32,14 +32,23 @@ for path in "${required_dirs[@]}"; do
   fi
 done
 
-grep -q 'Module green' docs/phpt/README.md
-grep -q 'Full-run no-regression' docs/phpt/README.md
-grep -q 'Final strict green' docs/phpt/README.md
-grep -q 'read-only input' docs/phpt/source-integrity.md
-grep -q 'navigation aid' docs/phpt/source-lookup.md
-grep -q 'PHPT_TARGET_CLI_COMPAT' docs/phpt/binary-discovery.md
-grep -q 'official `run-tests.php` wrapper' docs/phpt/official-runner.md
-grep -q 'complete discovered PHPT corpus' docs/phpt/full-phpt-gate.md
+require_text() {
+  local needle="$1"
+  local path="$2"
+  if ! grep -q "$needle" "$path"; then
+    printf 'PHPT foundation missing required text in %s: %s\n' "$path" "$needle" >&2
+    exit 1
+  fi
+}
+
+require_text 'Module green' docs/phpt/README.md
+require_text 'Full-run no-regression' docs/phpt/README.md
+require_text 'Final strict green' docs/phpt/README.md
+require_text 'read-only input' docs/phpt/source-integrity.md
+require_text 'navigation aid' docs/phpt/source-lookup.md
+require_text 'phrust-php' docs/phpt/binary-discovery.md
+require_text 'official `run-tests.php` wrapper' docs/phpt/official-runner.md
+require_text 'complete discovered PHPT corpus' docs/phpt/full-phpt-gate.md
 
 if [[ -f tests/phpt/manifests/php-src-hashes.jsonl && ! -s tests/phpt/manifests/php-src-hashes.jsonl ]]; then
   printf '%s\n' 'PHPT source hash manifest exists but is empty.' >&2

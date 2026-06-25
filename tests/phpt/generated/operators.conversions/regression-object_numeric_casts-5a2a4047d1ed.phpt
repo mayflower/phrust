@@ -20,7 +20,6 @@ $o = new test;
 var_dump((int) $o);
 var_dump((float) $o);
 --EXPECTF--
-
 Warning: Object of class test could not be converted to int in %s on line %d
 int(1)
 

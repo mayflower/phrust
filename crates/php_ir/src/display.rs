@@ -280,6 +280,7 @@ fn format_constant(constant: &IrConstant) -> String {
         IrConstant::Int(value) => format!("int {value}"),
         IrConstant::Float(value) => format!("float {value:?}"),
         IrConstant::String(value) => format!("string {value:?}"),
+        IrConstant::StringBytes(value) => format!("string_bytes {value:?}"),
     }
 }
 
@@ -490,6 +491,14 @@ fn format_instruction(kind: &InstructionKind) -> String {
         ),
         InstructionKind::Discard { src } => format!("discard {}", format_operand(src)),
         InstructionKind::Echo { src } => format!("echo {}", format_operand(src)),
+        InstructionKind::EmitDiagnostic {
+            severity,
+            diagnostic_id,
+            message,
+            leading_newline,
+        } => format!(
+            "emit_diagnostic {severity:?} {diagnostic_id:?} {message:?} leading_newline={leading_newline}"
+        ),
         InstructionKind::Yield { dst, key, value } => {
             let key = key
                 .as_ref()

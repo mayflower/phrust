@@ -488,8 +488,8 @@ impl HirLowerer<'_> {
             }
             Some(ExprNode::ArrayPair(_)) => {
                 let exprs = self.expr_children(node);
-                let has_key = has_descendant_token_text(node, "=>");
-                let unpack = has_descendant_token_text(node, "...");
+                let has_key = has_direct_token_text(node, "=>");
+                let unpack = has_direct_token_text(node, "...");
                 HirExprKind::ArrayPair {
                     key: has_key.then(|| exprs.first().copied()).flatten(),
                     value: if has_key {
@@ -581,7 +581,7 @@ impl HirLowerer<'_> {
                 }
             }
             "exit" | "die" => HirExprKind::Exit {
-                expr: self.first_expr_child(node, false),
+                expr: self.optional_construct_operand_expr(node),
             },
             "print" => HirExprKind::BuiltinCall {
                 name: keyword,
@@ -931,6 +931,20 @@ impl HirLowerer<'_> {
             self.collect_construct_operand_chain(child, &mut current);
         }
         current.unwrap_or_else(|| self.placeholder_expr(node))
+    }
+
+    fn optional_construct_operand_expr(&mut self, node: &SyntaxNode) -> Option<ExprId> {
+        let source = source_text_no_trivia(node);
+        let rest = source
+            .strip_prefix("exit")
+            .or_else(|| source.strip_prefix("die"))
+            .unwrap_or(&source)
+            .trim();
+        if rest.is_empty() || rest == "()" {
+            None
+        } else {
+            Some(self.construct_operand_expr(node))
+        }
     }
 
     fn simple_construct_operand_expr(&mut self, node: &SyntaxNode) -> Option<ExprId> {
@@ -1471,6 +1485,12 @@ fn source_text_no_trivia(node: &SyntaxNode) -> String {
         .join("")
 }
 
+fn has_direct_token_text(node: &SyntaxNode, expected: &str) -> bool {
+    syntax_child_tokens(node)
+        .filter(|token| !token.kind().is_trivia())
+        .any(|token| token.text() == expected)
+}
+
 fn is_quoted_construct_operand(text: &str) -> bool {
     let Some(first) = text.chars().next() else {
         return false;
@@ -1588,6 +1608,7 @@ fn is_operator_token_text(text: &str) -> bool {
             | "xor"
             | "instanceof"
             | "!"
+            | "@"
             | "~"
             | "=="
             | "==="
@@ -1744,6 +1765,38 @@ mod tests {
                 dim: Some(_)
             }
         ));
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_array_dim_fetch_expression_operand() {
+        let source = "<?php $args_array[$counter - 1];\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let has_binary_dim = module.expressions().iter().any(|(_, expr)| {
+            let HirExprKind::DimFetch { dim: Some(dim), .. } = expr.kind() else {
+                return false;
+            };
+            matches!(
+                module.expressions()[*dim].kind(),
+                HirExprKind::Binary { operator, .. } if operator == "-"
+            )
+        });
+
+        assert!(has_binary_dim, "array dim should preserve `$counter - 1`");
         assert!(reporter.into_diagnostics().is_empty());
     }
 }

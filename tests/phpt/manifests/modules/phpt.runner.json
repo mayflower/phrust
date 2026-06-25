@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"phpt.runner",
+  "priority":2,
+  "selected_manifest":"tests/phpt/manifests/modules/phpt.runner.selected.jsonl",
+  "corpus_count":0,
+  "pass_count":0,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":437,
+  "known_failure_count":437,
+  "scope":["PHPT section handling","expectation matching","runner BORK reduction"],
+  "non_scope":["VM feature implementation"],
+  "target_gates":["nix develop -c just phpt-runner-smoke"],
+  "next_step":"Reduce runner-owned BORKs before attributing failures to the engine."
+}

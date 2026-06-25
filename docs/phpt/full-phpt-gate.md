@@ -45,14 +45,187 @@ nix develop -c just phpt-full-regression
 
 The command runs the complete discovered PHPT corpus from
 `tests/phpt/manifests/phpt-corpus.jsonl`, writes machine results to
-`target/phpt-work/full-runs/<timestamp>/results.jsonl`, and updates
-`tests/phpt/manifests/full-known-failures.jsonl` plus
-`docs/phpt/reports/full-baseline.md`.
+`target/phpt-work/full-runs/<timestamp>/results.jsonl`, and updates the
+committed baseline files:
 
-The default target is `target/debug/php-vm` in `php-vm` mode. This uses
-`php-vm run <file>` rather than a PHP CLI-compatible shim. Set `TARGET_PHP` and
-`PHPT_TARGET_MODE=php-cli` for a PHP CLI-compatible executable.
+- `tests/phpt/manifests/full-baseline-metadata.json`
+- `tests/phpt/manifests/full-known-failures.jsonl`
+- `docs/phpt/reports/full-baseline.md`
+
+The default target is `target/debug/phrust-php` in `php-cli` mode. This is the
+PHP-compatible PHPT target binary. Set
+`TARGET_PHP=target/debug/php-vm PHPT_TARGET_MODE=php-vm` only when deliberately
+checking the internal developer CLI path.
+
+The full-corpus gate uses a 30 second per-test timeout by default because the
+corpus contains stress tests where a 10 second local timeout is load-sensitive.
+Override with `PHPT_TIMEOUT_SECONDS=<seconds>` when deliberately tightening or
+debugging timeout behavior.
+
+The runner executes PHPT cases in parallel by default, capped at 16 jobs. Override
+the job count with `PHPT_JOBS=<n>` when debugging load-sensitive timeouts or when
+CI capacity is constrained. Results are written in manifest order so the JSONL
+output remains deterministic across job counts.
+
+## Fast Iteration
+
+Use the narrow module loop while implementing one runtime area:
+
+```bash
+nix develop
+just phpt-dev-build
+just phpt-dev-module MODULE=standard.strings
+```
+
+`phpt-dev-build` builds the PHPT runner and `phrust-php` once with local Cargo
+incremental mode enabled and bypasses `sccache`, because `sccache` rejects
+incremental compilation. `just phpt-dev-shell` opens one Nix shell, runs that
+build once, and leaves the shell open for repeated `just phpt-fast ...` or
+`just phpt-rerun-failures ...` commands; when it is already running inside
+`nix develop`, it reuses the current environment instead of nesting another
+dev shell. Use `phpt-build` for the normal
+deterministic cached build path. `phpt-build` and `phpt-dev-build` build the
+PHPT runner and target binary in one Cargo invocation so dependency planning and
+link setup are paid once.
+
+`phpt-dev-module` runs the selected module against already-built binaries with
+`PHPT_SKIP_BUILD=1`, strict previous-result reuse for both Reference PHP and
+Target PHP, `PHPT_TIMEOUT_SECONDS=10`, and
+`PHPT_WORK_DIR=/private/tmp/phrust-phpt-work` by default. Strict reuse remains
+fingerprint based, so a changed runner binary, target binary, timeout, target
+mode, PHPT source, external file body, or expectation text invalidates the
+cached entry.
+
+`phpt-fast` runs the target-only loop with `PHPT_SKIP_BUILD=1`, strict
+previous-result reuse, `PHPT_TIMEOUT_SECONDS=3`, and
+`PHPT_WORK_DIR=/private/tmp/phrust-phpt-work` by default. Keeping the shell open
+avoids paying the `nix develop -c` startup cost for every focused iteration.
+
+The full gate also supports the same build split for local iteration:
+
+```bash
+nix develop
+just phpt-dev-build
+just phpt-full-fast
+```
+
+`phpt-full-fast` is the local no-build wrapper around `phpt-full-regression`.
+It writes under `/private/tmp/phrust-phpt-work` by default and expects the PHPT
+runner plus target binary to already exist from `just phpt-dev-build`.
+
+When previous full-run results exist, `phpt-full-regression` passes the latest
+`results.jsonl` to the PHPT tool as a strict reuse cache unless
+`PHPT_DISABLE_REUSE=1` is set. The cache key includes target mode, timeout,
+target binary fingerprint, PHPT runner fingerprint, PHPT source, external file
+body, and expectation text. Reused entries are therefore limited to unchanged
+runner/target/test inputs; changed binaries or changed PHPT content are rerun.
+Set `PHPT_MANIFEST=<path>` to run the same Reference PHP plus Target PHP module
+comparison against a focused manifest without generating or rewriting source
+fixtures.
+
+When debugging one failure cluster, narrow the module manifest without writing
+generated files into the source tree:
+
+```bash
+just phpt-fast MODULE=standard.strings PATTERN=substr_count
+just phpt-fast MODULE=standard.strings FILE=ext/standard/tests/strings/substr_count_error.phpt
+```
+
+`PATTERN` selects matching manifest lines from the module manifest. `FILE`
+creates a one-entry manifest for either an upstream php-src-relative PHPT path
+or a repository-local generated PHPT path. Focused runs write their results
+below `module-runs/<module>/focus/<selector>/`, so a single-test loop no longer
+overwrites the full module `module-runs/<module>/target/results.jsonl` cache.
+Set `PHPT_REUSE_LAST=0` when a cold focused run is needed for timing or cache
+debugging.
+
+After one full module pass exists, rerun only the latest non-green outcomes:
+
+```bash
+just phpt-rerun-failures MODULE=standard.strings
+```
+
+The command derives a temporary manifest from the previous module
+`results.jsonl`, excluding `PASS`, `SKIP`, and `XFAIL`, then writes the rerun
+report below `module-runs/<module>/rerun-failures/`.
+
+For local iteration only, `just phpt-dev-fast ...` enables
+`PHPT_DEV_REUSE_PASS=1`. That mode may reuse previous `PASS` results across a
+changed target binary when the PHPT input, expectation, target mode, and timeout
+are unchanged. It never reuses previous non-green outcomes. Final verification
+targets do not set this flag.
+
+`php-phpt-tools run` accepts `--reuse-results <results.jsonl>` or
+`PHPT_REUSE_RESULTS=<results.jsonl>`. A result is reused only when the PHPT path,
+PHPT source, external `FILE_EXTERNAL` or expectation body, Target PHP binary,
+PHPT runner binary, target mode, and timeout match the cached fingerprint. The
+output JSONL still contains one result per manifest entry in manifest order.
+
+`just phpt-full-regression` automatically points the runner at the latest
+previous full-run `results.jsonl` when one exists. Set `PHPT_DISABLE_REUSE=1`
+for a deliberately cold full-corpus run. Runner or VM code changes invalidate
+the cache through binary fingerprints, so strict no-regression checks remain
+comparable.
+
+For runner-only changes, use the narrower smoke gate first:
+
+```bash
+nix develop -c just phpt-runner-smoke
+```
+
+That gate covers generic PHPT section handling, expectation variants, expected
+failures, and runner-provided execution context without requiring a full corpus
+run.
 
 When an accepted known-failure manifest already exists, the command compares the
 new full run with that baseline and rejects new or changed failure fingerprints.
 Set `PHPT_ACCEPT_BASELINE=1` only when intentionally accepting a new baseline.
+The variable must remain explicit; normal verification must not accept new
+known failures implicitly.
+
+## Baseline Schema
+
+`full-baseline-metadata.json` is the versioned contract for fresh-checkout
+verification. Schema `phpt-full-baseline-v1` contains:
+
+- `timestamp`
+- `corpus_count`
+- `pass_count`
+- `skip_count`
+- `fail_count`
+- `bork_count`
+- `known_failure_count`
+- `failure_manifest`
+
+`full-known-failures.jsonl` contains one stable fingerprint per known non-green
+case. Each line has these fields:
+
+- `path`
+- `module_tag`
+- `outcome`
+- `failure_fingerprint`
+- `primary_missing_feature_guess`
+- `owner_module`
+- `first_seen_timestamp`
+
+`docs/phpt/reports/full-baseline.md` is the concise human report for the same
+baseline. It must agree with the metadata and machine manifest.
+
+## Fresh Checkout Check
+
+```bash
+nix develop -c just phpt-verify-baseline
+```
+
+The check verifies that:
+
+- report totals match `full-baseline-metadata.json`;
+- the corpus manifest count matches `corpus_count`;
+- `full-known-failures.jsonl` contains `known_failure_count` entries;
+- `FAIL` and `BORK` counts in the manifest match metadata;
+- if the report has any non-green outcomes, the machine-readable known-failure
+  manifest is not empty.
+
+`just verify-phpt` includes this check, so a fresh checkout can prove that the
+committed Full-PHPT no-regression baseline is internally consistent without
+requiring local `target/phpt-work` artifacts.

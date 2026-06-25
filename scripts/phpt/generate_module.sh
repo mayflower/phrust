@@ -53,15 +53,24 @@ fi
 timestamp="${PHPT_GENERATED_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 manifest="tests/phpt/manifests/${safe_module}-generated.jsonl"
 run_dir="target/phpt-work/module-runs/${safe_module}/reference-generated"
+default_phpt_tool="${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools"
+phpt_tool="${PHPT_TOOLS_BIN:-$default_phpt_tool}"
 
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- generate \
+if [[ -z "${PHPT_TOOLS_BIN:-}" && "$phpt_tool" == "$default_phpt_tool" ]]; then
+  cargo build -q -p php_phpt_tools --bin php-phpt-tools
+elif [[ ! -x "$phpt_tool" ]]; then
+  printf 'PHPT tools executable is not built: %s\n' "$phpt_tool" >&2
+  exit 1
+fi
+
+"$phpt_tool" generate \
   --module "$module" \
   --php-src "$php_src" \
   --reference "$reference_php" \
   --timestamp "$timestamp" \
   "${args[@]}"
 
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
+"$phpt_tool" run \
   --target "$reference_php" \
   --target-mode php-cli \
   --manifest "$manifest" \

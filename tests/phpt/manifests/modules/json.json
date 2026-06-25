@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"json",
+  "priority":17,
+  "selected_manifest":"tests/phpt/manifests/modules/json.selected.jsonl",
+  "corpus_count":88,
+  "pass_count":9,
+  "skip_count":0,
+  "fail_count":79,
+  "bork_count":0,
+  "known_failure_count":79,
+  "scope":["json_encode","json_decode","json last-error state"],
+  "non_scope":["full JsonSerializable without object model readiness"],
+  "target_gates":["nix develop -c just phpt-module MODULE=json"],
+  "next_step":"Close request-local JSON error state and common flags."
+}

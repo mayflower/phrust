@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"objects.classes",
+  "priority":10,
+  "selected_manifest":"tests/phpt/manifests/modules/objects.classes.selected.jsonl",
+  "corpus_count":2136,
+  "pass_count":136,
+  "skip_count":0,
+  "fail_count":1999,
+  "bork_count":0,
+  "known_failure_count":2000,
+  "scope":["classes","properties","methods","visibility","magic","traits","enums"],
+  "non_scope":["Reflection API completion"],
+  "target_gates":["nix develop -c just phpt-module MODULE=zend.objects"],
+  "next_step":"Stabilize constructor/property/method basics before magic behavior."
+}

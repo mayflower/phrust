@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"phpt.foundation",
+  "priority":1,
+  "selected_manifest":"tests/phpt/manifests/modules/phpt.foundation.selected.jsonl",
+  "corpus_count":0,
+  "pass_count":0,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["baseline metadata","source integrity","full-regression bookkeeping"],
+  "non_scope":["runtime semantics","standard library behavior"],
+  "target_gates":["nix develop -c just verify-phpt"],
+  "next_step":"Keep committed baseline, corpus, and source-integrity manifests consistent."
+}

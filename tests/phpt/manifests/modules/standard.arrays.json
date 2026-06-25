@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"standard.arrays",
+  "priority":12,
+  "selected_manifest":"tests/phpt/manifests/modules/standard.arrays.selected.jsonl",
+  "corpus_count":821,
+  "pass_count":85,
+  "skip_count":0,
+  "fail_count":735,
+  "bork_count":0,
+  "known_failure_count":735,
+  "scope":["ext/standard array builtins"],
+  "non_scope":["array COW engine work"],
+  "target_gates":["nix develop -c just phpt-module MODULE=standard.arrays"],
+  "next_step":"Implement array builtins after array data model gaps are closed."
+}

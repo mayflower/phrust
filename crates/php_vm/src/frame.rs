@@ -84,6 +84,9 @@ impl LocalFile {
         let Some(source_slot) = self.locals.get_mut(source.index()) else {
             return Err(format!("invalid local local:{}", source.raw()));
         };
+        if source_slot.is_uninitialized() {
+            source_slot.write(Value::Null);
+        }
         let cell: ReferenceCell = source_slot.ensure_reference_cell();
         let target_slot = self
             .locals

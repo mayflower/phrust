@@ -38,6 +38,49 @@ cases for one runtime area.
 Full PHPT gate: a complete corpus run compared against the accepted known
 failure baseline after each module batch.
 
+Fast PHPT iteration: keep a `nix develop` shell open, run `just phpt-dev-build`
+after code changes that affect binaries, then run `just phpt-dev-module
+MODULE=<module>` for the full module comparison or `just phpt-fast
+MODULE=<module>` for target-only feedback. Use `PATTERN=<text>` or
+`FILE=<path>` with `phpt-fast` to run one failure cluster or one PHPT while
+debugging. Focused runs write separate results and do not overwrite the module
+cache. Use `just phpt-rerun-failures MODULE=<module>` to rerun only the latest
+non-green module outcomes, or `just phpt-dev-fast ...` for the explicit local
+`PHPT_DEV_REUSE_PASS=1` path that can reuse unchanged previous PASS results
+across binary changes. The fast targets use an external work directory by
+default, enable strict previous-result reuse, propagate `PHPT_JOBS`, and skip
+rebuilds so small runtime changes can be checked without paying full-corpus or
+repeated shell startup cost. `just phpt-build` remains the normal deterministic
+build command, and `php-phpt-tools run --reuse-results <results.jsonl>` also
+reuses unchanged test outcomes by strict fingerprint. The full regression
+script uses the latest previous run automatically unless `PHPT_DISABLE_REUSE=1`
+is set; after `just phpt-dev-build`, use `just phpt-full-fast` to reuse the
+already-built PHPT binaries for a local full-gate check.
+
+## Runner Compatibility
+
+`just phpt-runner-smoke` is the focused gate for PHPT runner behavior. It runs
+generated runner fixtures against the pinned Reference PHP CLI and currently
+covers:
+
+- `SKIPIF`
+- `CLEAN`
+- `EXPECT`
+- `EXPECTF`
+- `EXPECTREGEX`
+- `XFAIL`
+- `INI`
+- `ENV`
+- `ARGS`
+- `STDIN`
+- `FILEEOF`
+- `FILE_EXTERNAL`
+- metadata-only sections `FLAKY`, `WHITESPACE_SENSITIVE`, and `XLEAK`
+
+The runner classifies remaining BORKs separately from VM/runtime failures so
+PHPT infrastructure gaps are fixed before module work attributes failures to
+the engine.
+
 ## Required Layout
 
 ```text

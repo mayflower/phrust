@@ -12,6 +12,7 @@ pub mod context;
 pub mod convert;
 pub mod datetime;
 pub mod diagnostic;
+pub mod error_output;
 pub mod fiber;
 pub mod gc;
 pub mod generator;
@@ -36,19 +37,26 @@ pub use array::{ArrayEntry, ArrayKey, PhpArray, WeakArrayHandle};
 pub use autoload::AutoloadRegistry;
 pub use builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinRegistry,
-    BuiltinResult, InternalFunction, RuntimeSourceSpan,
+    BuiltinResult, InternalFunction, RuntimeSourceSpan, StrtokState,
 };
 pub use context::{
     ErrorReporting, ProcessCapability, RuntimeContext, RuntimeIniOptions, StrictTypesInfo,
 };
 pub use convert::{
-    NumericValue, compare, equal, identical, reset_float_string_precision,
-    set_float_string_precision, to_bool, to_float, to_int, to_number, to_string,
+    ArithmeticNumber, NumericValue, compare, equal, identical, reset_float_string_precision,
+    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
+    to_string,
 };
 pub use diagnostic::{
     PhpReferenceClassification, RuntimeDiagnostic, RuntimeError, RuntimeSeverity,
     RuntimeStackFrame, division_by_zero_mvp, type_error_mvp, undefined_function,
     undefined_variable_warning, unsupported_feature,
+};
+pub use error_output::{
+    PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,
+    PHP_E_USER_NOTICE, PHP_E_USER_WARNING, PHP_E_WARNING, PhpDiagnosticChannel,
+    PhpDiagnosticDisplayOptions, PhpDiagnosticLocation, emit_php_diagnostic,
+    error_reporting_allows_level, format_php_diagnostic_line,
 };
 pub use fiber::{FiberRef, FiberState};
 pub use gc::{

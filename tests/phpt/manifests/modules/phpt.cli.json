@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"phpt.cli",
+  "priority":3,
+  "selected_manifest":"tests/phpt/manifests/modules/phpt.cli.selected.jsonl",
+  "corpus_count":350,
+  "pass_count":2,
+  "skip_count":0,
+  "fail_count":274,
+  "bork_count":0,
+  "known_failure_count":275,
+  "scope":["target binary discovery","PHP CLI compatible invocation","argv/stdin/ini plumbing"],
+  "non_scope":["full SAPI emulation","CGI/FPM behavior"],
+  "target_gates":["nix develop -c just phpt-target-smoke"],
+  "next_step":"Keep target invocation deterministic for upstream PHPT execution."
+}

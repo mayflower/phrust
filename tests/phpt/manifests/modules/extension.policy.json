@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"extension.policy",
+  "priority":22,
+  "selected_manifest":"tests/phpt/manifests/modules/extension.policy.selected.jsonl",
+  "corpus_count":9006,
+  "pass_count":263,
+  "skip_count":52,
+  "fail_count":8434,
+  "bork_count":0,
+  "known_failure_count":8447,
+  "scope":["non-core extension classification","must-fix vs optional/out-of-scope routing"],
+  "non_scope":["large extension implementation"],
+  "target_gates":["nix develop -c just phpt-triage"],
+  "next_step":"Classify extension failures without hiding them from full regression."
+}

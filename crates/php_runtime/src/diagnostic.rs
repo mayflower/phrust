@@ -234,7 +234,7 @@ pub fn undefined_variable_warning(
     RuntimeDiagnostic::new(
         "E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING",
         RuntimeSeverity::Warning,
-        format!("undefined variable ${name}"),
+        format!("Undefined variable ${name}"),
         source_span,
         stack_trace,
         Some(PhpReferenceClassification::Warning),

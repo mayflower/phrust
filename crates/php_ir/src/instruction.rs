@@ -156,6 +156,16 @@ pub enum IncludeKind {
     RequireOnce,
 }
 
+/// Non-fatal PHP diagnostic severity emitted by IR.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrDiagnosticSeverity {
+    /// PHP warning.
+    Warning,
+    /// PHP deprecation.
+    Deprecation,
+}
+
 /// Supported IR snapshot instruction set.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "opcode", rename_all = "snake_case")]
@@ -239,6 +249,13 @@ pub enum InstructionKind {
     Discard { src: Operand },
     /// Emit a value to stdout.
     Echo { src: Operand },
+    /// Emit a non-fatal PHP diagnostic.
+    EmitDiagnostic {
+        severity: IrDiagnosticSeverity,
+        diagnostic_id: String,
+        message: String,
+        leading_newline: bool,
+    },
     /// Suspend a generator with an optional key and yielded value.
     Yield {
         dst: RegId,

@@ -302,6 +302,22 @@ mod tests {
     }
 
     #[test]
+    fn print_construct_keeps_concat_operand() {
+        let source = "<?php print(bin2hex($char)).\" => \".bin2hex($char).\"\\n\";";
+        let parse = parse_source_file(source);
+        let debug = parse.debug_tree();
+
+        assert!(
+            !parse.has_errors(),
+            "unexpected parser diagnostics: {:?}",
+            parse.diagnostics()
+        );
+        assert!(debug.contains("CONSTRUCT_EXPR"));
+        assert!(debug.contains("BINARY_EXPR"));
+        assert_eq!(parse.reconstructed_text(), source);
+    }
+
+    #[test]
     fn source_file_grammar_models_php_and_html_segments() {
         let source = "<p>A</p><?php echo 1; ?><?= $b ?><p>C</p>";
         let parse = parse_source_file(source);

@@ -75,7 +75,16 @@ fi
 printf 'PHP_SRC_DIR=%s\n' "$php_src_abs"
 printf 'PHPT_MANIFEST=%s\n' "$manifest"
 
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
+default_phpt_tool="${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools"
+phpt_tool="${PHPT_TOOLS_BIN:-$default_phpt_tool}"
+if [[ -z "${PHPT_TOOLS_BIN:-}" && "$phpt_tool" == "$default_phpt_tool" ]]; then
+  cargo build -q -p php_phpt_tools --bin php-phpt-tools
+elif [[ ! -x "$phpt_tool" ]]; then
+  printf 'PHPT tools executable is not built: %s\n' "$phpt_tool" >&2
+  exit 1
+fi
+
+"$phpt_tool" run \
   --target "$target_php" \
   --manifest "$manifest" \
   --out "$rust_dir/results.jsonl" \

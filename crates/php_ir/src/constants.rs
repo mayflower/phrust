@@ -16,4 +16,6 @@ pub enum IrConstant {
     Float(f64),
     /// PHP string bytes represented as UTF-8 for the MVP.
     String(String),
+    /// PHP string bytes that cannot be represented losslessly as UTF-8.
+    StringBytes(Vec<u8>),
 }

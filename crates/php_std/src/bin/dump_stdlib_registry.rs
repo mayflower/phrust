@@ -23,10 +23,23 @@ fn main() {
             .filter(|function| function.visibility() == SymbolVisibility::PhpVisible)
             .collect::<Vec<_>>();
         for (index, function) in functions.iter().enumerate() {
+            let arginfo = function.arginfo();
             print!(
-                "        {{\"name\": \"{}\", \"runtime_builtin\": {}}}",
+                "        {{\"name\": \"{}\", \"runtime_builtin\": {}, \"arginfo_source\": {}, \"required_parameters\": {}, \"total_parameters\": {}, \"variadic\": {}}}",
                 json_escape(function.name()),
-                builtins.get(function.name()).is_some()
+                builtins.get(function.name()).is_some(),
+                arginfo
+                    .map(|metadata| format!("\"{}\"", json_escape(metadata.source)))
+                    .unwrap_or_else(|| "null".to_owned()),
+                arginfo
+                    .map(|metadata| metadata
+                        .params
+                        .iter()
+                        .filter(|param| !param.optional)
+                        .count())
+                    .unwrap_or(0),
+                arginfo.map_or(0, |metadata| metadata.params.len()),
+                arginfo.is_some_and(|metadata| metadata.params.iter().any(|param| param.variadic))
             );
             println!("{}", comma(index, functions.len()));
         }

@@ -1971,6 +1971,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::Cast { .. } => "cast",
         InstructionKind::Discard { .. } => "discard",
         InstructionKind::Echo { .. } => "echo",
+        InstructionKind::EmitDiagnostic { .. } => "emit_diagnostic",
         InstructionKind::Yield { .. } => "yield",
         InstructionKind::YieldFrom { .. } => "yield_from",
         InstructionKind::CallFunction { .. } => "call_function",

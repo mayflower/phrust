@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"filesystem.streams",
+  "priority":11,
+  "selected_manifest":"tests/phpt/manifests/modules/filesystem.streams.selected.jsonl",
+  "corpus_count":1194,
+  "pass_count":28,
+  "skip_count":4,
+  "fail_count":1100,
+  "bork_count":0,
+  "known_failure_count":1100,
+  "scope":["local filesystem","streams","resources","include_path","include/require"],
+  "non_scope":["network streams","PHAR streams"],
+  "target_gates":["nix develop -c just phpt-module MODULE=filesystem.streams"],
+  "next_step":"Keep filesystem policy root-constrained and deterministic."
+}

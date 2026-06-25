@@ -5,16 +5,61 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use php_phpt_tools::expect::{ExpectationKind, match_expectation};
-use php_phpt_tools::phpt::{PhptSection, parse_phpt};
+use php_phpt_tools::phpt::{PhptDocument, PhptSection, parse_phpt};
 
 const DEFAULT_MANIFEST: &str = "tests/phpt/manifests/php-src-hashes.jsonl";
 const DEFAULT_SYMBOLS: &str = "tests/phpt/manifests/php-src-symbols.jsonl";
 const DEFAULT_PHPT_CORPUS: &str = "tests/phpt/manifests/phpt-corpus.jsonl";
 const DEFAULT_PHPT_REPORT: &str = "docs/phpt/reports/phpt-corpus-summary.md";
+const DEFAULT_PHPT_BASELINE_METADATA: &str = "tests/phpt/manifests/full-baseline-metadata.json";
+const DEFAULT_PHPT_TRIAGE_REPORT: &str = "docs/phpt/reports/triage.md";
+const DEFAULT_PHPT_MODULE_PRIORITY: &str = "tests/phpt/manifests/module-priority.json";
+const DEFAULT_PHPT_MODULE_DOCS_DIR: &str = "docs/phpt/modules";
+const DEFAULT_PHPT_MODULE_MANIFESTS_DIR: &str = "tests/phpt/manifests/modules";
 const GENERATOR_VERSION: &str = "phpt-generate-v1";
+const PHP_RUN_TESTS_INI_DEFAULTS: &[(&str, &str)] = &[
+    ("output_handler", ""),
+    ("open_basedir", ""),
+    ("disable_functions", ""),
+    ("output_buffering", "Off"),
+    ("error_reporting", "32767"),
+    ("fatal_error_backtraces", "Off"),
+    ("display_errors", "1"),
+    ("display_startup_errors", "1"),
+    ("log_errors", "0"),
+    ("html_errors", "0"),
+    ("report_zend_debug", "0"),
+    ("docref_root", ""),
+    ("docref_ext", ".html"),
+    ("error_prepend_string", ""),
+    ("error_append_string", ""),
+    ("auto_prepend_file", ""),
+    ("auto_append_file", ""),
+    ("ignore_repeated_errors", "0"),
+    ("precision", "14"),
+    ("serialize_precision", "-1"),
+    ("memory_limit", "128M"),
+    ("opcache.fast_shutdown", "0"),
+    ("opcache.file_update_protection", "0"),
+    ("opcache.revalidate_freq", "0"),
+    ("opcache.jit_hot_loop", "1"),
+    ("opcache.jit_hot_func", "1"),
+    ("opcache.jit_hot_return", "1"),
+    ("opcache.jit_hot_side_exit", "1"),
+    ("opcache.jit_max_root_traces", "100000"),
+    ("opcache.jit_max_side_traces", "100000"),
+    ("opcache.jit_max_exit_counters", "100000"),
+    ("opcache.protect_memory", "1"),
+    ("zend.assertions", "1"),
+    ("zend.exception_ignore_args", "0"),
+    ("zend.exception_string_param_max_len", "15"),
+    ("short_open_tag", "0"),
+    ("date.timezone", "UTC"),
+];
 
 fn main() {
     let code = match run(env::args().skip(1), &mut io::stdout(), &mut io::stderr()) {
@@ -46,7 +91,10 @@ where
         "lookup-symbol" => lookup_symbol(&args[1..], stdout, stderr),
         "phpt-index" => phpt_index(&args[1..], stdout),
         "run" => run_phpt_manifest(&args[1..], stdout),
+        "rerun-manifest" => rerun_manifest(&args[1..], stdout),
         "baseline" => baseline_results(&args[1..], stdout, stderr),
+        "verify-baseline" => verify_baseline(&args[1..], stdout, stderr),
+        "triage" => triage_phpt_baseline(&args[1..], stdout),
         "generate" => generate_module_tests(&args[1..], stdout),
         "verify-source" => verify_source(&args[1..], stdout, stderr),
         "--help" | "-h" | "help" => {
@@ -147,7 +195,7 @@ fn verify_source<W: Write, E: Write>(
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "usage: php-phpt-tools <source-index|symbol-index|lookup-symbol|phpt-index|run|baseline|generate|verify-source> [options]"
+        "usage: php-phpt-tools <source-index|symbol-index|lookup-symbol|phpt-index|run|rerun-manifest|baseline|verify-baseline|triage|generate|verify-source> [options]"
     )
     .map_err(|error| error.to_string())
 }
@@ -205,26 +253,56 @@ fn run_phpt_manifest<W: Write>(args: &[String], stdout: &mut W) -> Result<i32, S
     if let Some(parent) = options.summary.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
-    let mut results = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
-        match run_one_phpt(&options, path, index) {
-            Ok(result) => results.push(result),
-            Err(error) => results.push(PhptRunResult {
-                path: path.to_string(),
-                outcome: "BORK".to_string(),
-                detail: error,
-            }),
-        }
+    let context = RunContext::new(options)?;
+    let jobs = context.options.jobs.min(paths.len()).max(1);
+    let cached_count = context.cached_results.len();
+    writeln!(
+        stdout,
+        "[info] running {} PHPT tests with {} job(s)",
+        paths.len(),
+        jobs
+    )
+    .map_err(|error| error.to_string())?;
+    if cached_count > 0 {
+        writeln!(
+            stdout,
+            "[info] loaded {cached_count} reusable PHPT result candidate(s)"
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let results = if jobs == 1 {
+        run_phpt_paths_serial(&context, &paths)
+    } else {
+        run_phpt_paths_parallel(&context, &paths, jobs)
+    };
+    let reused = results
+        .iter()
+        .filter(|result| result.cache_status.as_deref() == Some("hit"))
+        .count();
+    let dev_reused = results
+        .iter()
+        .filter(|result| result.cache_status.as_deref() == Some("dev-pass-hit"))
+        .count();
+    if reused > 0 {
+        writeln!(stdout, "[info] reused {reused} PHPT result(s) from cache")
+            .map_err(|error| error.to_string())?;
+    }
+    if dev_reused > 0 {
+        writeln!(
+            stdout,
+            "[info] reused {dev_reused} passing PHPT result(s) with dev input cache"
+        )
+        .map_err(|error| error.to_string())?;
     }
     let mut jsonl = String::new();
     for result in &results {
         jsonl.push_str(&result.to_json_line());
         jsonl.push('\n');
     }
-    fs::write(&options.out, jsonl)
-        .map_err(|error| format!("{}: {error}", options.out.display()))?;
-    fs::write(&options.summary, render_run_summary(&results))
-        .map_err(|error| format!("{}: {error}", options.summary.display()))?;
+    fs::write(&context.options.out, jsonl)
+        .map_err(|error| format!("{}: {error}", context.options.out.display()))?;
+    fs::write(&context.options.summary, render_run_summary(&results))
+        .map_err(|error| format!("{}: {error}", context.options.summary.display()))?;
     let failed = results
         .iter()
         .filter(|result| !matches!(result.outcome.as_str(), "PASS" | "SKIP" | "XFAIL"))
@@ -234,11 +312,94 @@ fn run_phpt_manifest<W: Write>(args: &[String], stdout: &mut W) -> Result<i32, S
         "[ok] ran {} PHPT tests with {} non-green outcomes; reports: {} {}",
         results.len(),
         failed,
-        options.out.display(),
-        options.summary.display()
+        context.options.out.display(),
+        context.options.summary.display()
     )
     .map_err(|error| error.to_string())?;
     Ok(if failed == 0 { 0 } else { 1 })
+}
+
+fn rerun_manifest<W: Write>(args: &[String], stdout: &mut W) -> Result<i32, String> {
+    let options = RerunManifestOptions::parse(args)?;
+    let results = read_run_results(&options.results)?;
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for result in results {
+        if matches!(result.outcome.as_str(), "PASS" | "SKIP" | "XFAIL") {
+            continue;
+        }
+        if seen.insert(result.path.clone()) {
+            paths.push(result.path);
+        }
+    }
+    if let Some(parent) = options.out.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let mut out = String::new();
+    for path in &paths {
+        out.push_str(&format!("{{\"path\":\"{}\"}}\n", escape_json(path)));
+    }
+    fs::write(&options.out, out).map_err(|error| format!("{}: {error}", options.out.display()))?;
+    writeln!(
+        stdout,
+        "[ok] wrote {} non-green PHPT path(s) from {} to {}",
+        paths.len(),
+        options.results.display(),
+        options.out.display()
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(0)
+}
+
+fn run_phpt_paths_serial(context: &RunContext, paths: &[String]) -> Vec<PhptRunResult> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| run_one_phpt_result(context, path, index))
+        .collect()
+}
+
+fn run_phpt_paths_parallel(
+    context: &RunContext,
+    paths: &[String],
+    jobs: usize,
+) -> Vec<PhptRunResult> {
+    let next_index = Mutex::new(0usize);
+    let results = Mutex::new(vec![None; paths.len()]);
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let index = {
+                        let mut next = next_index.lock().expect("PHPT work queue lock poisoned");
+                        if *next >= paths.len() {
+                            return;
+                        }
+                        let index = *next;
+                        *next += 1;
+                        index
+                    };
+                    let result = run_one_phpt_result(context, &paths[index], index);
+                    results.lock().expect("PHPT result lock poisoned")[index] = Some(result);
+                }
+            });
+        }
+    });
+
+    results
+        .into_inner()
+        .expect("PHPT result lock poisoned")
+        .into_iter()
+        .map(|result| result.expect("PHPT worker did not write a result"))
+        .collect()
+}
+
+fn run_one_phpt_result(context: &RunContext, manifest_path: &str, index: usize) -> PhptRunResult {
+    match run_one_phpt(context, manifest_path, index) {
+        Ok(result) => result,
+        Err(error) => PhptRunResult::new(manifest_path, "BORK", error),
+    }
 }
 
 fn read_manifest_paths(path: &Path) -> Result<Vec<String>, String> {
@@ -273,6 +434,7 @@ fn baseline_results<W: Write, E: Write>(
     let options = BaselineOptions::parse(args)?;
     let results = read_run_results(&options.results)?;
     let corpus = read_corpus_modules(&options.corpus)?;
+    let accepting_baseline = env::var("PHPT_ACCEPT_BASELINE").as_deref() == Ok("1");
     let previous_failures = if let Some(previous) = &options.previous_known_failures {
         if previous.is_file() {
             read_known_failures(previous)?
@@ -322,6 +484,10 @@ fn baseline_results<W: Write, E: Write>(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let previous_path_first_seen = previous_failures
+        .iter()
+        .map(|failure| (failure.path.clone(), failure.first_seen_timestamp.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut failures = results
         .iter()
         .filter(|result| !matches!(result.outcome.as_str(), "PASS" | "SKIP" | "XFAIL"))
@@ -349,6 +515,17 @@ fn baseline_results<W: Write, E: Write>(
                         })
                         .cloned()
                 })
+                .or_else(|| {
+                    previous_path_first_seen
+                        .get(&result.path)
+                        .filter(|_| {
+                            is_related_known_failure_evolution(
+                                previous_results.get(&result.path),
+                                current_results.get(&result.path).copied(),
+                            )
+                        })
+                        .cloned()
+                })
                 .unwrap_or_else(|| options.timestamp.clone());
             KnownFailure {
                 path: result.path.clone(),
@@ -362,6 +539,15 @@ fn baseline_results<W: Write, E: Write>(
         })
         .collect::<Vec<_>>();
     failures.sort_by(|left, right| left.path.cmp(&right.path));
+
+    if previous_failures.is_empty() && !failures.is_empty() && !accepting_baseline {
+        writeln!(
+            stderr,
+            "refusing to create a non-green PHPT baseline without PHPT_ACCEPT_BASELINE=1"
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(1);
+    }
 
     if !previous_failures.is_empty() {
         let mut previous_keys = previous_failures
@@ -413,7 +599,19 @@ fn baseline_results<W: Write, E: Write>(
         }
     }
 
+    if !accepting_baseline {
+        writeln!(
+            stdout,
+            "[ok] PHPT full regression matched accepted baseline; set PHPT_ACCEPT_BASELINE=1 to update committed baseline files"
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(0);
+    }
+
     if let Some(parent) = options.known_failures.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    if let Some(parent) = options.metadata.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     if let Some(parent) = options.report.parent() {
@@ -426,6 +624,14 @@ fn baseline_results<W: Write, E: Write>(
     }
     fs::write(&options.known_failures, jsonl)
         .map_err(|error| format!("{}: {error}", options.known_failures.display()))?;
+    let metadata = BaselineMetadata::from_results(
+        &results,
+        failures.len(),
+        &options.timestamp,
+        &options.known_failures,
+    );
+    fs::write(&options.metadata, metadata.to_json())
+        .map_err(|error| format!("{}: {error}", options.metadata.display()))?;
     fs::write(
         &options.report,
         render_baseline_report(&results, &failures, &options.timestamp),
@@ -433,10 +639,167 @@ fn baseline_results<W: Write, E: Write>(
     .map_err(|error| format!("{}: {error}", options.report.display()))?;
     writeln!(
         stdout,
-        "[ok] wrote {} known failures to {} and report {}",
+        "[ok] wrote {} known failures to {}, metadata {}, and report {}",
         failures.len(),
         options.known_failures.display(),
+        options.metadata.display(),
         options.report.display()
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(0)
+}
+
+fn verify_baseline<W: Write, E: Write>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String> {
+    let options = VerifyBaselineOptions::parse(args)?;
+    let corpus = read_manifest_paths(&options.corpus)?;
+    let failures = read_known_failures(&options.known_failures)?;
+    let metadata = read_baseline_metadata(&options.metadata)?;
+    let report = read_baseline_report_totals(&options.report)?;
+
+    let mut errors = Vec::new();
+    if metadata.schema_version != "phpt-full-baseline-v1" {
+        errors.push(format!(
+            "{}: unsupported schema_version `{}`",
+            options.metadata.display(),
+            metadata.schema_version
+        ));
+    }
+    if metadata.corpus_count != corpus.len() {
+        errors.push(format!(
+            "baseline corpus_count mismatch: metadata={} corpus={}",
+            metadata.corpus_count,
+            corpus.len()
+        ));
+    }
+    if metadata.known_failure_count != failures.len() {
+        errors.push(format!(
+            "known_failure_count mismatch: metadata={} manifest={}",
+            metadata.known_failure_count,
+            failures.len()
+        ));
+    }
+
+    let failure_counts = count_known_failure_outcomes(&failures);
+    let manifest_fail = *failure_counts.get("FAIL").unwrap_or(&0);
+    let manifest_bork = *failure_counts.get("BORK").unwrap_or(&0);
+    if metadata.fail_count != manifest_fail {
+        errors.push(format!(
+            "FAIL count mismatch: metadata={} manifest={manifest_fail}",
+            metadata.fail_count
+        ));
+    }
+    if metadata.bork_count != manifest_bork {
+        errors.push(format!(
+            "BORK count mismatch: metadata={} manifest={manifest_bork}",
+            metadata.bork_count
+        ));
+    }
+
+    compare_report_total("PASS", metadata.pass_count, &report, &mut errors);
+    compare_report_total("SKIP", metadata.skip_count, &report, &mut errors);
+    compare_report_total("FAIL", metadata.fail_count, &report, &mut errors);
+    compare_report_total("BORK", metadata.bork_count, &report, &mut errors);
+    if metadata.timestamp != report.timestamp {
+        errors.push(format!(
+            "timestamp mismatch: metadata={} report={}",
+            metadata.timestamp, report.timestamp
+        ));
+    }
+
+    let non_green = report
+        .outcomes
+        .iter()
+        .filter(|(outcome, _)| !matches!(outcome.as_str(), "PASS" | "SKIP" | "XFAIL"))
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    if non_green > 0 && failures.is_empty() {
+        errors.push(format!(
+            "{} reports {non_green} non-green outcomes but {} is empty",
+            options.report.display(),
+            options.known_failures.display()
+        ));
+    }
+    if metadata.fail_count + metadata.bork_count != metadata.known_failure_count {
+        errors.push(format!(
+            "known_failure_count must equal fail_count + bork_count: {} != {} + {}",
+            metadata.known_failure_count, metadata.fail_count, metadata.bork_count
+        ));
+    }
+    if metadata.corpus_count
+        != metadata.pass_count + metadata.skip_count + metadata.fail_count + metadata.bork_count
+    {
+        errors.push(format!(
+            "corpus_count must equal PASS + SKIP + FAIL + BORK: {} != {} + {} + {} + {}",
+            metadata.corpus_count,
+            metadata.pass_count,
+            metadata.skip_count,
+            metadata.fail_count,
+            metadata.bork_count
+        ));
+    }
+
+    for (index, failure) in failures.iter().enumerate() {
+        if failure.path.is_empty()
+            || failure.module_tag.is_empty()
+            || failure.outcome.is_empty()
+            || failure.failure_fingerprint.is_empty()
+            || failure.primary_missing_feature_guess.is_empty()
+            || failure.owner_module.is_empty()
+            || failure.first_seen_timestamp.is_empty()
+        {
+            errors.push(format!(
+                "{}:{}: known failure has an empty required field",
+                options.known_failures.display(),
+                index + 1
+            ));
+            break;
+        }
+    }
+
+    if !errors.is_empty() {
+        for error in &errors {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+        }
+        return Ok(1);
+    }
+
+    writeln!(
+        stdout,
+        "[ok] verified PHPT baseline: {} corpus entries, {} known non-green fingerprints",
+        metadata.corpus_count, metadata.known_failure_count
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(0)
+}
+
+fn triage_phpt_baseline<W: Write>(args: &[String], stdout: &mut W) -> Result<i32, String> {
+    let options = TriageOptions::parse(args)?;
+    let corpus = read_phpt_entries(&options.corpus)?;
+    let failures = read_known_failures(&options.known_failures)?;
+    let metadata = read_baseline_metadata(&options.metadata)?;
+    let results = match &options.results {
+        Some(path) if path.is_file() => read_run_results(path)?,
+        Some(path) => {
+            return Err(format!(
+                "{}: PHPT result file does not exist",
+                path.display()
+            ));
+        }
+        None => Vec::new(),
+    };
+    let triage = build_triage(&corpus, &failures, &results);
+
+    write_triage_outputs(&options, &metadata, &triage)?;
+    writeln!(
+        stdout,
+        "[ok] wrote PHPT triage report {}, priority manifest {}, and {} module plans",
+        options.report.display(),
+        options.priority.display(),
+        MODULE_PLAN.len()
     )
     .map_err(|error| error.to_string())?;
     Ok(0)
@@ -487,8 +850,12 @@ fn generate_module_tests<W: Write>(args: &[String], stdout: &mut W) -> Result<i3
         work_dir: options.work_dir.join("reference"),
         out: options.work_dir.join("unused-results.jsonl"),
         summary: options.work_dir.join("unused-summary.md"),
+        reuse_results: None,
+        dev_reuse_pass: false,
         timeout: options.timeout,
+        jobs: 1,
     };
+    let reference_context = RunContext::new(reference_options.clone())?;
 
     let mut generated = Vec::new();
     let mut smoke_candidates = selected
@@ -506,7 +873,7 @@ fn generate_module_tests<W: Write>(args: &[String], stdout: &mut W) -> Result<i3
         {
             break;
         }
-        if run_one_phpt(&reference_options, &entry.path, generated.len())?.outcome != "PASS" {
+        if run_one_phpt(&reference_context, &entry.path, generated.len())?.outcome != "PASS" {
             continue;
         }
         if let Some(case) = build_generated_case(
@@ -597,24 +964,39 @@ fn generate_module_tests<W: Write>(args: &[String], stdout: &mut W) -> Result<i3
 }
 
 fn run_one_phpt(
-    options: &RunOptions,
+    context: &RunContext,
     manifest_path: &str,
     index: usize,
 ) -> Result<PhptRunResult, String> {
+    let options = &context.options;
     let phpt_path = resolve_phpt_path(&options.php_src, manifest_path);
     let source = fs::read_to_string(&phpt_path)
         .map_err(|error| format!("{}: {error}", phpt_path.display()))?;
     let document = parse_phpt(&source);
+    let cache_key = phpt_result_cache_key(context, manifest_path, &source, &document, &phpt_path)?;
+    let input_cache_key =
+        phpt_result_input_cache_key(context, manifest_path, &source, &document, &phpt_path)?;
+    if let Some(cached) = context.cached_results.get(manifest_path)
+        && cached.cache_key.as_deref() == Some(cache_key.as_str())
+    {
+        return Ok(cached.clone().mark_cache_hit());
+    }
+    if context.options.dev_reuse_pass
+        && let Some(cached) = context.cached_results.get(manifest_path)
+        && cached.outcome == "PASS"
+        && cached.input_cache_key.as_deref() == Some(input_cache_key.as_str())
+    {
+        return Ok(cached.clone().mark_dev_pass_cache_hit());
+    }
     if let Some(diagnostic) = document
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.id == "PHPT_UNSUPPORTED_SECTION")
     {
-        return Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "BORK".to_string(),
-            detail: diagnostic.message.clone(),
-        });
+        return Ok(
+            PhptRunResult::new(manifest_path, "BORK", diagnostic.message.clone())
+                .with_cache_keys(cache_key, input_cache_key),
+        );
     }
     let work_dir =
         options
@@ -631,20 +1013,22 @@ fn run_one_phpt(
         let skip = run_php(options, &skip_path, &work_dir, &[], &[], &[], None)?;
         if skip.stdout.to_ascii_lowercase().starts_with("skip") {
             run_clean_if_present(options, &document.sections, &work_dir)?;
-            return Ok(PhptRunResult {
-                path: manifest_path.to_string(),
-                outcome: "SKIP".to_string(),
-                detail: first_non_empty_line(&skip.stdout),
-            });
+            return Ok(PhptRunResult::new(
+                manifest_path,
+                "SKIP",
+                first_non_empty_line(&skip.stdout),
+            )
+            .with_cache_keys(cache_key, input_cache_key));
         }
     }
 
     let Some(file_body) = file_body(&document.sections, &phpt_path)? else {
-        return Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "BORK".to_string(),
-            detail: "missing FILE, FILEEOF, or FILE_EXTERNAL".to_string(),
-        });
+        return Ok(PhptRunResult::new(
+            manifest_path,
+            "BORK",
+            "missing FILE, FILEEOF, or FILE_EXTERNAL",
+        )
+        .with_cache_keys(cache_key, input_cache_key));
     };
     let test_path = work_dir.join("test.php");
     fs::write(&test_path, file_body)
@@ -655,37 +1039,33 @@ fn run_one_phpt(
         .map(|section| split_phpt_args(&section.body))
         .unwrap_or_default();
     let stdin = section(&document.sections, "STDIN").map(|section| section.body.as_str());
+    let xfail =
+        section(&document.sections, "XFAIL").map(|section| first_non_empty_line(&section.body));
     let output = run_php(options, &test_path, &work_dir, &ini, &env, &args, stdin)?;
     run_clean_if_present(options, &document.sections, &work_dir)?;
 
-    if output.status != 0 {
-        return Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "FAIL".to_string(),
-            detail: format!(
-                "target exited with status {}; stderr={}",
-                output.status, output.stderr
-            ),
-        });
-    }
     let Some((kind, expected)) = expectation(&document.sections, &phpt_path)? else {
-        return Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "BORK".to_string(),
-            detail: "missing expectation section".to_string(),
-        });
+        return Ok(
+            PhptRunResult::new(manifest_path, "BORK", "missing expectation section")
+                .with_cache_keys(cache_key, input_cache_key),
+        );
     };
     let matched = match_expectation(
         kind,
-        &normalize_expected(&expected),
-        &normalize_expected(&output.stdout),
+        &normalize_expected_output(&expected),
+        &normalize_actual_output(&output.stdout),
     );
     if matched.matched {
-        Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "PASS".to_string(),
-            detail: String::new(),
-        })
+        if let Some(reason) = xfail {
+            return Ok(PhptRunResult::new(
+                manifest_path,
+                "FAIL",
+                format!("XFAIL test unexpectedly passed: {reason}"),
+            )
+            .with_cache_keys(cache_key, input_cache_key));
+        }
+        Ok(PhptRunResult::new(manifest_path, "PASS", String::new())
+            .with_cache_keys(cache_key, input_cache_key))
     } else {
         let detail = matched
             .diff
@@ -696,11 +1076,22 @@ fn run_one_phpt(
                 )
             })
             .unwrap_or_else(|| "output did not match".to_string());
-        Ok(PhptRunResult {
-            path: manifest_path.to_string(),
-            outcome: "FAIL".to_string(),
-            detail,
-        })
+        let detail = if output.status != 0 {
+            format!(
+                "{detail}; target exited with status {}; stderr={}",
+                output.status, output.stderr
+            )
+        } else {
+            detail
+        };
+        Ok(PhptRunResult::new(
+            manifest_path,
+            if xfail.is_some() { "XFAIL" } else { "FAIL" },
+            xfail
+                .map(|reason| format!("expected failure: {reason}; {detail}"))
+                .unwrap_or(detail),
+        )
+        .with_cache_keys(cache_key, input_cache_key))
     }
 }
 
@@ -865,7 +1256,7 @@ struct PhptIndexOptions {
     report: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RunOptions {
     target: PathBuf,
     target_mode: TargetMode,
@@ -874,7 +1265,24 @@ struct RunOptions {
     work_dir: PathBuf,
     out: PathBuf,
     summary: PathBuf,
+    reuse_results: Option<PathBuf>,
+    dev_reuse_pass: bool,
     timeout: Duration,
+    jobs: usize,
+}
+
+#[derive(Debug)]
+struct RunContext {
+    options: RunOptions,
+    target_fingerprint: String,
+    runner_fingerprint: String,
+    cached_results: BTreeMap<String, PhptRunResult>,
+}
+
+#[derive(Debug)]
+struct RerunManifestOptions {
+    results: PathBuf,
+    out: PathBuf,
 }
 
 #[derive(Debug)]
@@ -882,10 +1290,32 @@ struct BaselineOptions {
     results: PathBuf,
     corpus: PathBuf,
     known_failures: PathBuf,
+    metadata: PathBuf,
     report: PathBuf,
     previous_known_failures: Option<PathBuf>,
     previous_results: Option<PathBuf>,
     timestamp: String,
+}
+
+#[derive(Debug)]
+struct VerifyBaselineOptions {
+    corpus: PathBuf,
+    known_failures: PathBuf,
+    metadata: PathBuf,
+    report: PathBuf,
+}
+
+#[derive(Debug)]
+struct TriageOptions {
+    corpus: PathBuf,
+    known_failures: PathBuf,
+    metadata: PathBuf,
+    results: Option<PathBuf>,
+    report: PathBuf,
+    priority: PathBuf,
+    modules_dir: PathBuf,
+    module_manifests_dir: PathBuf,
+    selected_limit: usize,
 }
 
 #[derive(Debug)]
@@ -913,8 +1343,11 @@ impl RunOptions {
         let mut work_dir = None;
         let mut out = None;
         let mut summary = None;
+        let mut reuse_results = None;
         let mut target_mode = None;
         let mut timeout = None;
+        let mut jobs = None;
+        let mut dev_reuse_pass = false;
         let mut index = 0usize;
         while index < args.len() {
             let arg = &args[index];
@@ -968,12 +1401,29 @@ impl RunOptions {
                             .ok_or_else(|| "--summary requires a path".to_string())?,
                     ));
                 }
+                "--reuse-results" => {
+                    index += 1;
+                    reuse_results =
+                        Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                            "--reuse-results requires a path".to_string()
+                        })?));
+                }
                 "--timeout-seconds" => {
                     index += 1;
                     timeout = Some(parse_duration_seconds(
                         args.get(index)
                             .ok_or_else(|| "--timeout-seconds requires a number".to_string())?,
                     )?);
+                }
+                "--jobs" => {
+                    index += 1;
+                    jobs = Some(parse_jobs(
+                        args.get(index)
+                            .ok_or_else(|| "--jobs requires a number".to_string())?,
+                    )?);
+                }
+                "--dev-reuse-pass" => {
+                    dev_reuse_pass = true;
                 }
                 _ if arg.starts_with("--target=") => {
                     target = Some(PathBuf::from(arg.trim_start_matches("--target=")));
@@ -997,10 +1447,22 @@ impl RunOptions {
                 _ if arg.starts_with("--summary=") => {
                     summary = Some(PathBuf::from(arg.trim_start_matches("--summary=")));
                 }
+                _ if arg.starts_with("--reuse-results=") => {
+                    reuse_results = Some(PathBuf::from(arg.trim_start_matches("--reuse-results=")));
+                }
                 _ if arg.starts_with("--timeout-seconds=") => {
                     timeout = Some(parse_duration_seconds(
                         arg.trim_start_matches("--timeout-seconds="),
                     )?);
+                }
+                _ if arg.starts_with("--jobs=") => {
+                    jobs = Some(parse_jobs(arg.trim_start_matches("--jobs="))?);
+                }
+                _ if arg.starts_with("--dev-reuse-pass=") => {
+                    dev_reuse_pass = parse_bool_flag(
+                        arg.trim_start_matches("--dev-reuse-pass="),
+                        "--dev-reuse-pass",
+                    )?;
                 }
                 _ => return Err(format!("unknown run option `{arg}`")),
             }
@@ -1030,6 +1492,9 @@ impl RunOptions {
             out: out.unwrap_or_else(|| PathBuf::from("target/phpt-work/module-runs/results.jsonl")),
             summary: summary
                 .unwrap_or_else(|| PathBuf::from("target/phpt-work/module-runs/summary.md")),
+            reuse_results: reuse_results
+                .or_else(|| env::var_os("PHPT_REUSE_RESULTS").map(PathBuf::from)),
+            dev_reuse_pass: dev_reuse_pass || env_flag("PHPT_DEV_REUSE_PASS"),
             timeout: timeout
                 .or_else(|| {
                     env::var("PHPT_TIMEOUT_SECONDS")
@@ -1037,6 +1502,52 @@ impl RunOptions {
                         .and_then(|value| parse_duration_seconds(&value).ok())
                 })
                 .unwrap_or_else(|| Duration::from_secs(10)),
+            jobs: jobs
+                .or_else(|| {
+                    env::var("PHPT_JOBS")
+                        .ok()
+                        .and_then(|value| parse_jobs(&value).ok())
+                })
+                .unwrap_or_else(default_phpt_jobs),
+        })
+    }
+}
+
+impl RerunManifestOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut results = None;
+        let mut out = None;
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--results" => {
+                    index += 1;
+                    results = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--results requires a path".to_string())?,
+                    ));
+                }
+                "--out" => {
+                    index += 1;
+                    out = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--out requires a path".to_string())?,
+                    ));
+                }
+                _ if arg.starts_with("--results=") => {
+                    results = Some(PathBuf::from(arg.trim_start_matches("--results=")));
+                }
+                _ if arg.starts_with("--out=") => {
+                    out = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+                }
+                _ => return Err(format!("unknown rerun-manifest option `{arg}`")),
+            }
+            index += 1;
+        }
+        Ok(Self {
+            results: results.ok_or_else(|| "rerun-manifest requires --results".to_string())?,
+            out: out.ok_or_else(|| "rerun-manifest requires --out".to_string())?,
         })
     }
 }
@@ -1046,6 +1557,7 @@ impl BaselineOptions {
         let mut results = None;
         let mut corpus = None;
         let mut known_failures = None;
+        let mut metadata = None;
         let mut report = None;
         let mut previous_known_failures = None;
         let mut previous_results = None;
@@ -1074,6 +1586,13 @@ impl BaselineOptions {
                         Some(PathBuf::from(args.get(index).ok_or_else(|| {
                             "--known-failures requires a path".to_string()
                         })?));
+                }
+                "--metadata" => {
+                    index += 1;
+                    metadata = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--metadata requires a path".to_string())?,
+                    ));
                 }
                 "--report" => {
                     index += 1;
@@ -1114,6 +1633,9 @@ impl BaselineOptions {
                     known_failures =
                         Some(PathBuf::from(arg.trim_start_matches("--known-failures=")));
                 }
+                _ if arg.starts_with("--metadata=") => {
+                    metadata = Some(PathBuf::from(arg.trim_start_matches("--metadata=")));
+                }
                 _ if arg.starts_with("--report=") => {
                     report = Some(PathBuf::from(arg.trim_start_matches("--report=")));
                 }
@@ -1138,12 +1660,213 @@ impl BaselineOptions {
             corpus: corpus.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_CORPUS)),
             known_failures: known_failures
                 .unwrap_or_else(|| PathBuf::from("tests/phpt/manifests/full-known-failures.jsonl")),
+            metadata: metadata.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_BASELINE_METADATA)),
             report: report.unwrap_or_else(|| PathBuf::from("docs/phpt/reports/full-baseline.md")),
             previous_known_failures,
             previous_results,
             timestamp: timestamp
                 .or_else(|| env::var("PHPT_BASELINE_TIMESTAMP").ok())
                 .unwrap_or_else(|| "unknown".to_string()),
+        })
+    }
+}
+
+impl VerifyBaselineOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut corpus = None;
+        let mut known_failures = None;
+        let mut metadata = None;
+        let mut report = None;
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--corpus" => {
+                    index += 1;
+                    corpus = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--corpus requires a path".to_string())?,
+                    ));
+                }
+                "--known-failures" => {
+                    index += 1;
+                    known_failures =
+                        Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                            "--known-failures requires a path".to_string()
+                        })?));
+                }
+                "--metadata" => {
+                    index += 1;
+                    metadata = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--metadata requires a path".to_string())?,
+                    ));
+                }
+                "--report" => {
+                    index += 1;
+                    report = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--report requires a path".to_string())?,
+                    ));
+                }
+                _ if arg.starts_with("--corpus=") => {
+                    corpus = Some(PathBuf::from(arg.trim_start_matches("--corpus=")));
+                }
+                _ if arg.starts_with("--known-failures=") => {
+                    known_failures =
+                        Some(PathBuf::from(arg.trim_start_matches("--known-failures=")));
+                }
+                _ if arg.starts_with("--metadata=") => {
+                    metadata = Some(PathBuf::from(arg.trim_start_matches("--metadata=")));
+                }
+                _ if arg.starts_with("--report=") => {
+                    report = Some(PathBuf::from(arg.trim_start_matches("--report=")));
+                }
+                _ => return Err(format!("unknown verify-baseline option `{arg}`")),
+            }
+            index += 1;
+        }
+        Ok(Self {
+            corpus: corpus.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_CORPUS)),
+            known_failures: known_failures
+                .unwrap_or_else(|| PathBuf::from("tests/phpt/manifests/full-known-failures.jsonl")),
+            metadata: metadata.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_BASELINE_METADATA)),
+            report: report.unwrap_or_else(|| PathBuf::from("docs/phpt/reports/full-baseline.md")),
+        })
+    }
+}
+
+impl TriageOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut corpus = None;
+        let mut known_failures = None;
+        let mut metadata = None;
+        let mut results = None;
+        let mut report = None;
+        let mut priority = None;
+        let mut modules_dir = None;
+        let mut module_manifests_dir = None;
+        let mut selected_limit = None;
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--corpus" => {
+                    index += 1;
+                    corpus = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--corpus requires a path".to_string())?,
+                    ));
+                }
+                "--known-failures" => {
+                    index += 1;
+                    known_failures =
+                        Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                            "--known-failures requires a path".to_string()
+                        })?));
+                }
+                "--metadata" => {
+                    index += 1;
+                    metadata = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--metadata requires a path".to_string())?,
+                    ));
+                }
+                "--results" => {
+                    index += 1;
+                    results = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--results requires a path".to_string())?,
+                    ));
+                }
+                "--report" => {
+                    index += 1;
+                    report = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--report requires a path".to_string())?,
+                    ));
+                }
+                "--priority" => {
+                    index += 1;
+                    priority = Some(PathBuf::from(
+                        args.get(index)
+                            .ok_or_else(|| "--priority requires a path".to_string())?,
+                    ));
+                }
+                "--modules-dir" => {
+                    index += 1;
+                    modules_dir =
+                        Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                            "--modules-dir requires a path".to_string()
+                        })?));
+                }
+                "--module-manifests-dir" => {
+                    index += 1;
+                    module_manifests_dir =
+                        Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                            "--module-manifests-dir requires a path".to_string()
+                        })?));
+                }
+                "--selected-limit" => {
+                    index += 1;
+                    selected_limit = Some(parse_usize(
+                        args.get(index)
+                            .ok_or_else(|| "--selected-limit requires a number".to_string())?,
+                        "--selected-limit",
+                    )?);
+                }
+                _ if arg.starts_with("--corpus=") => {
+                    corpus = Some(PathBuf::from(arg.trim_start_matches("--corpus=")));
+                }
+                _ if arg.starts_with("--known-failures=") => {
+                    known_failures =
+                        Some(PathBuf::from(arg.trim_start_matches("--known-failures=")));
+                }
+                _ if arg.starts_with("--metadata=") => {
+                    metadata = Some(PathBuf::from(arg.trim_start_matches("--metadata=")));
+                }
+                _ if arg.starts_with("--results=") => {
+                    results = Some(PathBuf::from(arg.trim_start_matches("--results=")));
+                }
+                _ if arg.starts_with("--report=") => {
+                    report = Some(PathBuf::from(arg.trim_start_matches("--report=")));
+                }
+                _ if arg.starts_with("--priority=") => {
+                    priority = Some(PathBuf::from(arg.trim_start_matches("--priority=")));
+                }
+                _ if arg.starts_with("--modules-dir=") => {
+                    modules_dir = Some(PathBuf::from(arg.trim_start_matches("--modules-dir=")));
+                }
+                _ if arg.starts_with("--module-manifests-dir=") => {
+                    module_manifests_dir = Some(PathBuf::from(
+                        arg.trim_start_matches("--module-manifests-dir="),
+                    ));
+                }
+                _ if arg.starts_with("--selected-limit=") => {
+                    selected_limit = Some(parse_usize(
+                        arg.trim_start_matches("--selected-limit="),
+                        "--selected-limit",
+                    )?);
+                }
+                _ => return Err(format!("unknown triage option `{arg}`")),
+            }
+            index += 1;
+        }
+        let results = results
+            .or_else(|| env::var_os("PHPT_RESULTS").map(PathBuf::from))
+            .or_else(latest_full_results);
+        Ok(Self {
+            corpus: corpus.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_CORPUS)),
+            known_failures: known_failures
+                .unwrap_or_else(|| PathBuf::from("tests/phpt/manifests/full-known-failures.jsonl")),
+            metadata: metadata.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_BASELINE_METADATA)),
+            results,
+            report: report.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_TRIAGE_REPORT)),
+            priority: priority.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_MODULE_PRIORITY)),
+            modules_dir: modules_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_MODULE_DOCS_DIR)),
+            module_manifests_dir: module_manifests_dir
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_PHPT_MODULE_MANIFESTS_DIR)),
+            selected_limit: selected_limit.unwrap_or(200),
         })
     }
 }
@@ -1372,6 +2095,39 @@ impl GenerateOptions {
     }
 }
 
+impl RunContext {
+    fn new(options: RunOptions) -> Result<Self, String> {
+        let target_fingerprint = file_fingerprint(&options.target)?;
+        let runner_fingerprint = env::current_exe()
+            .ok()
+            .and_then(|path| file_fingerprint(&path).ok())
+            .unwrap_or_else(|| "runner=unknown".to_string());
+        let cached_results = match &options.reuse_results {
+            Some(path) if path.is_file() => read_run_results(path)?
+                .into_iter()
+                .filter(|result| result.cache_key.is_some())
+                .map(|mut result| {
+                    result.cache_status = None;
+                    (result.path.clone(), result)
+                })
+                .collect(),
+            Some(path) => {
+                return Err(format!(
+                    "PHPT reuse result file does not exist: {}",
+                    path.display()
+                ));
+            }
+            None => BTreeMap::new(),
+        };
+        Ok(Self {
+            options,
+            target_fingerprint,
+            runner_fingerprint,
+            cached_results,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetMode {
     PhpCli,
@@ -1379,6 +2135,13 @@ enum TargetMode {
 }
 
 impl TargetMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PhpCli => "php-cli",
+            Self::PhpVm => "php-vm",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "php-cli" => Ok(Self::PhpCli),
@@ -1395,16 +2158,64 @@ struct PhptRunResult {
     path: String,
     outcome: String,
     detail: String,
+    cache_key: Option<String>,
+    input_cache_key: Option<String>,
+    cache_status: Option<String>,
 }
 
 impl PhptRunResult {
+    fn new(path: impl Into<String>, outcome: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            outcome: outcome.into(),
+            detail: detail.into(),
+            cache_key: None,
+            input_cache_key: None,
+            cache_status: None,
+        }
+    }
+
+    fn with_cache_keys(mut self, cache_key: String, input_cache_key: String) -> Self {
+        self.cache_key = Some(cache_key);
+        self.input_cache_key = Some(input_cache_key);
+        self.cache_status = Some("miss".to_string());
+        self
+    }
+
+    fn mark_cache_hit(mut self) -> Self {
+        self.cache_status = Some("hit".to_string());
+        self
+    }
+
+    fn mark_dev_pass_cache_hit(mut self) -> Self {
+        self.cache_status = Some("dev-pass-hit".to_string());
+        self
+    }
+
     fn to_json_line(&self) -> String {
-        format!(
-            "{{\"path\":\"{}\",\"outcome\":\"{}\",\"detail\":\"{}\"}}",
+        let mut line = format!(
+            "{{\"path\":\"{}\",\"outcome\":\"{}\",\"detail\":\"{}\"",
             escape_json(&self.path),
             escape_json(&self.outcome),
             escape_json(&self.detail)
-        )
+        );
+        if let Some(cache_key) = &self.cache_key {
+            line.push_str(&format!(",\"cache_key\":\"{}\"", escape_json(cache_key)));
+        }
+        if let Some(input_cache_key) = &self.input_cache_key {
+            line.push_str(&format!(
+                ",\"input_cache_key\":\"{}\"",
+                escape_json(input_cache_key)
+            ));
+        }
+        if let Some(cache_status) = &self.cache_status {
+            line.push_str(&format!(
+                ",\"cache_status\":\"{}\"",
+                escape_json(cache_status)
+            ));
+        }
+        line.push('}');
+        line
     }
 
     fn from_json_line(line: &str) -> Result<Self, String> {
@@ -1412,6 +2223,9 @@ impl PhptRunResult {
             path: extract_json_string(line, "path")?,
             outcome: extract_json_string(line, "outcome")?,
             detail: extract_json_string(line, "detail")?,
+            cache_key: extract_optional_json_string(line, "cache_key")?,
+            input_cache_key: extract_optional_json_string(line, "input_cache_key")?,
+            cache_status: extract_optional_json_string(line, "cache_status")?,
         })
     }
 }
@@ -1425,6 +2239,19 @@ struct KnownFailure {
     primary_missing_feature_guess: String,
     owner_module: String,
     first_seen_timestamp: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BaselineMetadata {
+    schema_version: String,
+    timestamp: String,
+    corpus_count: usize,
+    pass_count: usize,
+    skip_count: usize,
+    fail_count: usize,
+    bork_count: usize,
+    known_failure_count: usize,
+    failure_manifest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1444,6 +2271,360 @@ struct GeneratedCase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReductionMode {
     LineRemoval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModulePlanSpec {
+    name: &'static str,
+    scope: &'static [&'static str],
+    non_scope: &'static [&'static str],
+    source_places: &'static [&'static str],
+    target_gates: &'static [&'static str],
+    next_step: &'static str,
+    leverage: usize,
+}
+
+const MODULE_PLAN: &[ModulePlanSpec] = &[
+    ModulePlanSpec {
+        name: "phpt.foundation",
+        scope: &[
+            "baseline metadata",
+            "source integrity",
+            "full-regression bookkeeping",
+        ],
+        non_scope: &["runtime semantics", "standard library behavior"],
+        source_places: &["scripts/phpt/", "crates/php_phpt_tools/"],
+        target_gates: &["nix develop -c just verify-phpt"],
+        next_step: "Keep committed baseline, corpus, and source-integrity manifests consistent.",
+        leverage: 100,
+    },
+    ModulePlanSpec {
+        name: "phpt.runner",
+        scope: &[
+            "PHPT section handling",
+            "expectation matching",
+            "runner BORK reduction",
+        ],
+        non_scope: &["VM feature implementation"],
+        source_places: &["crates/php_phpt_tools/src/", "scripts/phpt/"],
+        target_gates: &["nix develop -c just phpt-runner-smoke"],
+        next_step: "Reduce runner-owned BORKs before attributing failures to the engine.",
+        leverage: 98,
+    },
+    ModulePlanSpec {
+        name: "phpt.cli",
+        scope: &[
+            "target binary discovery",
+            "PHP CLI compatible invocation",
+            "argv/stdin/ini plumbing",
+        ],
+        non_scope: &["full SAPI emulation", "CGI/FPM behavior"],
+        source_places: &["crates/php_vm_cli/", "scripts/phpt/"],
+        target_gates: &["nix develop -c just phpt-target-smoke"],
+        next_step: "Keep target invocation deterministic for upstream PHPT execution.",
+        leverage: 96,
+    },
+    ModulePlanSpec {
+        name: "zend.basic",
+        scope: &[
+            "top-level execution",
+            "scalar literals",
+            "numeric literal separators",
+            "echo",
+            "print",
+            "statement sequencing",
+            "top-level return",
+            "top-level exit",
+            "basic var_dump output",
+        ],
+        non_scope: &[
+            "dynamic variables",
+            "objects",
+            "extensions",
+            "advanced type system",
+            "exact string-to-float formatting edge cases",
+        ],
+        source_places: &["Zend/tests/", "crates/php_vm/", "crates/php_runtime/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=zend.basic"],
+        next_step: "Keep the selected zend.basic gate green while later modules expand runtime semantics.",
+        leverage: 94,
+    },
+    ModulePlanSpec {
+        name: "operators.conversions",
+        scope: &[
+            "arithmetic",
+            "bitwise operators",
+            "comparison",
+            "boolean conversion",
+            "numeric-string conversion",
+            "concat",
+            "assignment operators",
+            "increment/decrement",
+            "leading numeric string warnings",
+            "object numeric casts",
+        ],
+        non_scope: &[
+            "array union semantics",
+            "array/object concat beyond __toString smoke coverage",
+            "full TypeError/Throwable catch semantics for non-numeric operands",
+            "pipe operator",
+            "nullsafe operator",
+            "property hooks",
+            "fiber error suppression",
+            "performance-only concat stress",
+        ],
+        source_places: &["Zend/tests/", "crates/php_runtime/", "crates/php_vm/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=operators.conversions"],
+        next_step: "Keep the selected scalar conversion gate green while later modules expand arrays, objects, and diagnostics.",
+        leverage: 92,
+    },
+    ModulePlanSpec {
+        name: "diagnostics.output",
+        scope: &[
+            "warnings",
+            "notices",
+            "fatal formatting",
+            "display_errors",
+            "output channels",
+        ],
+        non_scope: &["exact wording for intentionally unsupported extensions"],
+        source_places: &["crates/php_runtime/", "crates/php_vm/"],
+        target_gates: &["nix develop -c just verify-runtime"],
+        next_step: "Centralize runtime diagnostic rendering and continuation semantics.",
+        leverage: 90,
+    },
+    ModulePlanSpec {
+        name: "strings.literals",
+        scope: &[
+            "string literal decoding",
+            "heredoc/nowdoc",
+            "string interpolation basics",
+        ],
+        non_scope: &["full ext/standard string API"],
+        source_places: &[
+            "crates/php_lexer/",
+            "crates/php_syntax/",
+            "crates/php_runtime/",
+        ],
+        target_gates: &["nix develop -c just verify-frontend"],
+        next_step: "Separate frontend literal gaps from runtime string builtin gaps.",
+        leverage: 88,
+    },
+    ModulePlanSpec {
+        name: "arrays.references",
+        scope: &[
+            "ordered arrays",
+            "key conversion",
+            "references",
+            "copy-on-write",
+            "foreach",
+        ],
+        non_scope: &["SPL collection classes"],
+        source_places: &["crates/php_runtime/", "crates/php_vm/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.arrays"],
+        next_step: "Close array data-model and reference/COW gaps before array builtins.",
+        leverage: 86,
+    },
+    ModulePlanSpec {
+        name: "functions.callables",
+        scope: &[
+            "user functions",
+            "closures",
+            "callables",
+            "arity",
+            "type coercion",
+        ],
+        non_scope: &["Reflection API surface"],
+        source_places: &[
+            "crates/php_semantics/",
+            "crates/php_runtime/",
+            "crates/php_vm/",
+        ],
+        target_gates: &["nix develop -c just phpt-module MODULE=zend.functions"],
+        next_step: "Use generated arginfo for builtin arity and parameter metadata.",
+        leverage: 84,
+    },
+    ModulePlanSpec {
+        name: "objects.classes",
+        scope: &[
+            "classes",
+            "properties",
+            "methods",
+            "visibility",
+            "magic",
+            "traits",
+            "enums",
+        ],
+        non_scope: &["Reflection API completion"],
+        source_places: &[
+            "crates/php_semantics/",
+            "crates/php_runtime/",
+            "crates/php_vm/",
+        ],
+        target_gates: &["nix develop -c just phpt-module MODULE=zend.objects"],
+        next_step: "Stabilize constructor/property/method basics before magic behavior.",
+        leverage: 82,
+    },
+    ModulePlanSpec {
+        name: "filesystem.streams",
+        scope: &[
+            "local filesystem",
+            "streams",
+            "resources",
+            "include_path",
+            "include/require",
+        ],
+        non_scope: &["network streams", "PHAR streams"],
+        source_places: &[
+            "ext/standard/tests/file/",
+            "ext/standard/tests/streams/",
+            "crates/php_runtime/",
+        ],
+        target_gates: &["nix develop -c just phpt-module MODULE=filesystem.streams"],
+        next_step: "Keep filesystem policy root-constrained and deterministic.",
+        leverage: 80,
+    },
+    ModulePlanSpec {
+        name: "standard.arrays",
+        scope: &["ext/standard array builtins"],
+        non_scope: &["array COW engine work"],
+        source_places: &["ext/standard/tests/array/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.arrays"],
+        next_step: "Implement array builtins after array data model gaps are closed.",
+        leverage: 78,
+    },
+    ModulePlanSpec {
+        name: "standard.strings",
+        scope: &["ext/standard string builtins"],
+        non_scope: &["frontend literal decoding"],
+        source_places: &["ext/standard/tests/strings/", "tests/strings/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.strings"],
+        next_step: "Close common binary-safe string functions against Reference PHP.",
+        leverage: 76,
+    },
+    ModulePlanSpec {
+        name: "standard.math",
+        scope: &["math and numeric standard builtins"],
+        non_scope: &["operator conversion semantics"],
+        source_places: &["ext/standard/tests/math/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.math"],
+        next_step: "Use php-src arginfo and Reference PHP for edge-case numeric behavior.",
+        leverage: 74,
+    },
+    ModulePlanSpec {
+        name: "standard.variables",
+        scope: &["variable inspection and conversion builtins"],
+        non_scope: &["general VM symbol-table redesign"],
+        source_places: &[
+            "ext/standard/tests/general_functions/",
+            "ext/standard/tests/array/",
+        ],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.variables"],
+        next_step: "Stabilize var_dump/print_r/serialization-adjacent value rendering.",
+        leverage: 72,
+    },
+    ModulePlanSpec {
+        name: "standard.serialization",
+        scope: &["serialize", "unserialize", "value persistence"],
+        non_scope: &["session module persistence"],
+        source_places: &["ext/standard/tests/serialize/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=standard.serialization"],
+        next_step: "Implement serialization after arrays/objects are stable.",
+        leverage: 70,
+    },
+    ModulePlanSpec {
+        name: "json",
+        scope: &["json_encode", "json_decode", "json last-error state"],
+        non_scope: &["full JsonSerializable without object model readiness"],
+        source_places: &["ext/json/tests/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=json"],
+        next_step: "Close request-local JSON error state and common flags.",
+        leverage: 68,
+    },
+    ModulePlanSpec {
+        name: "pcre",
+        scope: &["preg_* builtins backed by PCRE2"],
+        non_scope: &["PCRE JIT/callout parity"],
+        source_places: &["ext/pcre/tests/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=pcre"],
+        next_step: "Use PCRE2 while documenting unsupported modifier/callout gaps.",
+        leverage: 66,
+    },
+    ModulePlanSpec {
+        name: "date",
+        scope: &["date/time builtins and DateTime MVP"],
+        non_scope: &["complete timelib natural-language parity"],
+        source_places: &["ext/date/tests/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=date"],
+        next_step: "Stabilize timezone persistence and common formatting/parsing.",
+        leverage: 64,
+    },
+    ModulePlanSpec {
+        name: "spl",
+        scope: &["core SPL interfaces and common collections"],
+        non_scope: &["full SPL API parity"],
+        source_places: &["ext/spl/tests/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=spl"],
+        next_step: "Build on stable object, array, iterator, and filesystem layers.",
+        leverage: 62,
+    },
+    ModulePlanSpec {
+        name: "reflection",
+        scope: &["Reflection metadata for functions, classes, methods, properties, attributes"],
+        non_scope: &["fake metadata not backed by frontend/runtime/arginfo"],
+        source_places: &["ext/reflection/tests/"],
+        target_gates: &["nix develop -c just phpt-module MODULE=reflection"],
+        next_step: "Expose generated arginfo and semantic metadata through Reflection APIs.",
+        leverage: 60,
+    },
+    ModulePlanSpec {
+        name: "extension.policy",
+        scope: &[
+            "non-core extension classification",
+            "must-fix vs optional/out-of-scope routing",
+        ],
+        non_scope: &["large extension implementation"],
+        source_places: &[
+            "ext/dom/",
+            "ext/xml/",
+            "ext/soap/",
+            "ext/intl/",
+            "ext/gd/",
+            "ext/opcache/",
+        ],
+        target_gates: &["nix develop -c just phpt-triage"],
+        next_step: "Classify extension failures without hiding them from full regression.",
+        leverage: 58,
+    },
+];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ModuleTriageStats {
+    corpus_count: usize,
+    pass_count: usize,
+    skip_count: usize,
+    fail_count: usize,
+    bork_count: usize,
+    known_failure_count: usize,
+    failure_clusters: BTreeMap<String, usize>,
+    bork_subclasses: BTreeMap<String, usize>,
+    relevant_paths: Vec<String>,
+}
+
+impl ModuleTriageStats {
+    fn non_green(&self) -> usize {
+        self.fail_count + self.bork_count
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PhptTriage {
+    modules: BTreeMap<String, ModuleTriageStats>,
+    raw_modules: BTreeMap<String, ModuleTriageStats>,
+    failure_clusters: BTreeMap<String, usize>,
+    unsupported_guesses: BTreeMap<String, usize>,
+    bork_subclasses: BTreeMap<String, usize>,
+    has_result_counts: bool,
 }
 
 impl KnownFailure {
@@ -1472,6 +2653,72 @@ impl KnownFailure {
             )?,
             owner_module: extract_json_string(line, "owner_module")?,
             first_seen_timestamp: extract_json_string(line, "first_seen_timestamp")?,
+        })
+    }
+}
+
+impl BaselineMetadata {
+    fn from_results(
+        results: &[PhptRunResult],
+        known_failure_count: usize,
+        timestamp: &str,
+        failure_manifest: &Path,
+    ) -> Self {
+        let mut outcomes = BTreeMap::<String, usize>::new();
+        for result in results {
+            *outcomes.entry(result.outcome.clone()).or_default() += 1;
+        }
+        Self {
+            schema_version: "phpt-full-baseline-v1".to_string(),
+            timestamp: timestamp.to_string(),
+            corpus_count: results.len(),
+            pass_count: *outcomes.get("PASS").unwrap_or(&0),
+            skip_count: *outcomes.get("SKIP").unwrap_or(&0),
+            fail_count: *outcomes.get("FAIL").unwrap_or(&0),
+            bork_count: *outcomes.get("BORK").unwrap_or(&0),
+            known_failure_count,
+            failure_manifest: failure_manifest.to_string_lossy().replace('\\', "/"),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"schema_version\":\"{}\",\n",
+                "  \"timestamp\":\"{}\",\n",
+                "  \"corpus_count\":{},\n",
+                "  \"pass_count\":{},\n",
+                "  \"skip_count\":{},\n",
+                "  \"fail_count\":{},\n",
+                "  \"bork_count\":{},\n",
+                "  \"known_failure_count\":{},\n",
+                "  \"failure_manifest\":\"{}\"\n",
+                "}}\n"
+            ),
+            escape_json(&self.schema_version),
+            escape_json(&self.timestamp),
+            self.corpus_count,
+            self.pass_count,
+            self.skip_count,
+            self.fail_count,
+            self.bork_count,
+            self.known_failure_count,
+            escape_json(&self.failure_manifest)
+        )
+    }
+
+    fn from_json(source: &str) -> Result<Self, String> {
+        Ok(Self {
+            schema_version: extract_json_string(source, "schema_version")?,
+            timestamp: extract_json_string(source, "timestamp")?,
+            corpus_count: extract_json_usize(source, "corpus_count")?,
+            pass_count: extract_json_usize(source, "pass_count")?,
+            skip_count: extract_json_usize(source, "skip_count")?,
+            fail_count: extract_json_usize(source, "fail_count")?,
+            bork_count: extract_json_usize(source, "bork_count")?,
+            known_failure_count: extract_json_usize(source, "known_failure_count")?,
+            failure_manifest: extract_json_string(source, "failure_manifest")?,
         })
     }
 }
@@ -1931,6 +3178,68 @@ fn file_body(sections: &[PhptSection], phpt_path: &Path) -> Result<Option<String
     Ok(None)
 }
 
+fn phpt_result_cache_key(
+    context: &RunContext,
+    manifest_path: &str,
+    phpt_source: &str,
+    document: &PhptDocument,
+    phpt_path: &Path,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"phpt-run-cache-v1\0");
+    hasher.update(manifest_path.as_bytes());
+    hasher.update(b"\0target-mode=");
+    hasher.update(context.options.target_mode.as_str().as_bytes());
+    hasher.update(b"\0timeout=");
+    hasher.update(context.options.timeout.as_secs().to_string().as_bytes());
+    hasher.update(b"\0target=");
+    hasher.update(context.target_fingerprint.as_bytes());
+    hasher.update(b"\0runner=");
+    hasher.update(context.runner_fingerprint.as_bytes());
+    hasher.update(b"\0phpt=");
+    hasher.update(phpt_source.as_bytes());
+    if let Some(file_body) = file_body(&document.sections, phpt_path)? {
+        hasher.update(b"\0file-body=");
+        hasher.update(file_body.as_bytes());
+    }
+    if let Some((kind, expected)) = expectation(&document.sections, phpt_path)? {
+        hasher.update(b"\0expectation-kind=");
+        hasher.update(format!("{kind:?}").as_bytes());
+        hasher.update(b"\0expectation=");
+        hasher.update(expected.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn phpt_result_input_cache_key(
+    context: &RunContext,
+    manifest_path: &str,
+    phpt_source: &str,
+    document: &PhptDocument,
+    phpt_path: &Path,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"phpt-run-input-cache-v1\0");
+    hasher.update(manifest_path.as_bytes());
+    hasher.update(b"\0target-mode=");
+    hasher.update(context.options.target_mode.as_str().as_bytes());
+    hasher.update(b"\0timeout=");
+    hasher.update(context.options.timeout.as_secs().to_string().as_bytes());
+    hasher.update(b"\0phpt=");
+    hasher.update(phpt_source.as_bytes());
+    if let Some(file_body) = file_body(&document.sections, phpt_path)? {
+        hasher.update(b"\0file-body=");
+        hasher.update(file_body.as_bytes());
+    }
+    if let Some((kind, expected)) = expectation(&document.sections, phpt_path)? {
+        hasher.update(b"\0expectation-kind=");
+        hasher.update(format!("{kind:?}").as_bytes());
+        hasher.update(b"\0expectation=");
+        hasher.update(expected.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn expectation(
     sections: &[PhptSection],
     phpt_path: &Path,
@@ -2062,10 +3371,11 @@ fn run_php(
         fs::canonicalize(script).map_err(|error| format!("{}: {error}", script.display()))?;
     let mut command = Command::new(&target);
     command.current_dir(cwd);
+    let ini = php_run_tests_ini_args(ini);
     match options.target_mode {
         TargetMode::PhpCli => {
             command.arg("-n");
-            for (name, value) in ini {
+            for (name, value) in &ini {
                 command.arg("-d").arg(format!("{name}={value}"));
             }
             command.arg(script);
@@ -2076,7 +3386,7 @@ fn run_php(
             for (name, value) in envs {
                 command.arg("--env").arg(format!("{name}={value}"));
             }
-            for (name, value) in ini {
+            for (name, value) in &ini {
                 command
                     .arg("--env")
                     .arg(format!("PHPT_INI_{}={value}", sanitize_env_name(name)));
@@ -2142,12 +3452,50 @@ fn run_php(
     })
 }
 
-fn normalize_expected(value: &str) -> String {
+fn php_run_tests_ini_args(test_ini: &[(String, String)]) -> Vec<(String, String)> {
+    let mut ini = PHP_RUN_TESTS_INI_DEFAULTS
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    ini.extend(test_ini.iter().cloned());
+    ini
+}
+
+fn normalize_expected_output(value: &str) -> String {
+    normalize_output(value, false)
+}
+
+fn normalize_actual_output(value: &str) -> String {
+    normalize_output(value, true)
+}
+
+fn normalize_output(value: &str, strip_php_cli_diagnostic_prefix: bool) -> String {
     let mut normalized = value.replace("\r\n", "\n");
-    while normalized.ends_with('\n') {
-        normalized.pop();
+    if strip_php_cli_diagnostic_prefix
+        && normalized.starts_with('\n')
+        && starts_with_php_cli_diagnostic(&normalized[1..])
+    {
+        normalized.remove(0);
     }
-    normalized
+    php_run_tests_trim(&normalized).to_string()
+}
+
+fn php_run_tests_trim(value: &str) -> &str {
+    value.trim_matches(|ch| matches!(ch, '\0' | ' ' | '\n' | '\r' | '\t' | '\u{000B}'))
+}
+
+fn starts_with_php_cli_diagnostic(value: &str) -> bool {
+    [
+        "Deprecated:",
+        "Fatal error:",
+        "Notice:",
+        "Parse error:",
+        "Recoverable fatal error:",
+        "Strict Standards:",
+        "Warning:",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
 }
 
 fn read_phpt_corpus(path: &Path) -> Result<Vec<PhptEntry>, String> {
@@ -2471,6 +3819,22 @@ fn read_run_results(path: &Path) -> Result<Vec<PhptRunResult>, String> {
     Ok(results)
 }
 
+fn read_phpt_entries(path: &Path) -> Result<Vec<PhptEntry>, String> {
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut entries = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(
+            PhptEntry::from_json_line(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))?,
+        );
+    }
+    Ok(entries)
+}
+
 fn read_known_failures(path: &Path) -> Result<Vec<KnownFailure>, String> {
     let source =
         fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -2485,6 +3849,722 @@ fn read_known_failures(path: &Path) -> Result<Vec<KnownFailure>, String> {
         );
     }
     Ok(failures)
+}
+
+fn latest_full_results() -> Option<PathBuf> {
+    let root = Path::new("target/phpt-work/full-runs");
+    let entries = fs::read_dir(root).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("results.jsonl"))
+        .filter(|path| path.is_file())
+        .max()
+}
+
+fn read_baseline_metadata(path: &Path) -> Result<BaselineMetadata, String> {
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    BaselineMetadata::from_json(&source).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+#[derive(Debug)]
+struct BaselineReportTotals {
+    timestamp: String,
+    outcomes: BTreeMap<String, usize>,
+}
+
+fn read_baseline_report_totals(path: &Path) -> Result<BaselineReportTotals, String> {
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let timestamp = source
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Generated: `")
+                .and_then(|rest| rest.strip_suffix('`'))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| format!("{}: missing Generated timestamp", path.display()))?;
+    let mut outcomes = BTreeMap::new();
+    let mut in_totals = false;
+    for line in source.lines() {
+        if line == "## Totals" {
+            in_totals = true;
+            continue;
+        }
+        if in_totals && line.starts_with("## ") {
+            break;
+        }
+        if !in_totals || !line.starts_with('|') {
+            continue;
+        }
+        let cells = line
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if cells.len() != 2 || cells[0] == "Outcome" || cells[0].starts_with("---") {
+            continue;
+        }
+        let count = cells[1].parse::<usize>().map_err(|error| {
+            format!(
+                "{}: invalid outcome count `{}` for `{}`: {error}",
+                path.display(),
+                cells[1],
+                cells[0]
+            )
+        })?;
+        outcomes.insert(cells[0].to_string(), count);
+    }
+    if outcomes.is_empty() {
+        return Err(format!("{}: missing Totals outcome table", path.display()));
+    }
+    Ok(BaselineReportTotals {
+        timestamp,
+        outcomes,
+    })
+}
+
+fn count_known_failure_outcomes(failures: &[KnownFailure]) -> BTreeMap<String, usize> {
+    let mut outcomes = BTreeMap::new();
+    for failure in failures {
+        *outcomes.entry(failure.outcome.clone()).or_default() += 1;
+    }
+    outcomes
+}
+
+fn build_triage(
+    corpus: &[PhptEntry],
+    failures: &[KnownFailure],
+    results: &[PhptRunResult],
+) -> PhptTriage {
+    let mut triage = PhptTriage {
+        has_result_counts: !results.is_empty(),
+        ..PhptTriage::default()
+    };
+    let corpus_by_path = corpus
+        .iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let result_by_path = results
+        .iter()
+        .map(|result| (result.path.clone(), result))
+        .collect::<BTreeMap<_, _>>();
+
+    for entry in corpus {
+        let module = plan_module_for_entry(entry, None);
+        let stats = triage.modules.entry(module.to_string()).or_default();
+        stats.corpus_count += 1;
+        remember_relevant_path(stats, &entry.path);
+
+        let raw_stats = triage.raw_modules.entry(entry.module.clone()).or_default();
+        raw_stats.corpus_count += 1;
+        remember_relevant_path(raw_stats, &entry.path);
+    }
+
+    for result in results {
+        let entry = corpus_by_path.get(&result.path).copied();
+        let module = entry
+            .map(|entry| plan_module_for_entry(entry, Some(result)))
+            .unwrap_or_else(|| plan_module_for_path(&result.path, "unknown", Some(result)));
+        add_outcome(&mut triage.modules, module, &result.outcome);
+        let raw_module = entry
+            .map(|entry| entry.module.as_str())
+            .unwrap_or("unknown");
+        add_outcome(&mut triage.raw_modules, raw_module, &result.outcome);
+    }
+
+    for failure in failures {
+        let result = result_by_path.get(&failure.path).copied();
+        let module = corpus_by_path
+            .get(&failure.path)
+            .map(|entry| plan_module_for_entry(entry, result))
+            .unwrap_or_else(|| plan_module_for_path(&failure.path, &failure.module_tag, result));
+        let stats = triage.modules.entry(module.to_string()).or_default();
+        stats.known_failure_count += 1;
+        remember_priority_path(stats, &failure.path);
+        *stats
+            .failure_clusters
+            .entry(failure.primary_missing_feature_guess.clone())
+            .or_default() += 1;
+        if failure.outcome == "BORK" {
+            *stats
+                .bork_subclasses
+                .entry(classify_bork(result.map(|result| result.detail.as_str())))
+                .or_default() += 1;
+        }
+
+        let raw_stats = triage
+            .raw_modules
+            .entry(failure.owner_module.clone())
+            .or_default();
+        raw_stats.known_failure_count += 1;
+        remember_priority_path(raw_stats, &failure.path);
+        *raw_stats
+            .failure_clusters
+            .entry(failure.primary_missing_feature_guess.clone())
+            .or_default() += 1;
+
+        *triage
+            .failure_clusters
+            .entry(failure.primary_missing_feature_guess.clone())
+            .or_default() += 1;
+        if failure
+            .primary_missing_feature_guess
+            .contains("unsupported")
+        {
+            *triage
+                .unsupported_guesses
+                .entry(failure.primary_missing_feature_guess.clone())
+                .or_default() += 1;
+        }
+        if failure.outcome == "BORK" {
+            *triage
+                .bork_subclasses
+                .entry(classify_bork(result.map(|result| result.detail.as_str())))
+                .or_default() += 1;
+        }
+
+        if !triage.has_result_counts {
+            add_outcome(&mut triage.modules, module, &failure.outcome);
+            add_outcome(
+                &mut triage.raw_modules,
+                &failure.owner_module,
+                &failure.outcome,
+            );
+        }
+    }
+
+    triage
+}
+
+fn remember_relevant_path(stats: &mut ModuleTriageStats, path: &str) {
+    if stats.relevant_paths.iter().any(|known| known == path) {
+        return;
+    }
+    if stats.relevant_paths.len() < 500 {
+        stats.relevant_paths.push(path.to_string());
+    }
+}
+
+fn remember_priority_path(stats: &mut ModuleTriageStats, path: &str) {
+    if let Some(index) = stats.relevant_paths.iter().position(|known| known == path) {
+        let path = stats.relevant_paths.remove(index);
+        stats.relevant_paths.insert(0, path);
+        return;
+    }
+    stats.relevant_paths.insert(0, path.to_string());
+    if stats.relevant_paths.len() > 500 {
+        stats.relevant_paths.pop();
+    }
+}
+
+fn add_outcome(modules: &mut BTreeMap<String, ModuleTriageStats>, module: &str, outcome: &str) {
+    let stats = modules.entry(module.to_string()).or_default();
+    match outcome {
+        "PASS" => stats.pass_count += 1,
+        "SKIP" => stats.skip_count += 1,
+        "FAIL" => stats.fail_count += 1,
+        "BORK" => stats.bork_count += 1,
+        _ => {}
+    }
+}
+
+fn classify_bork(detail: Option<&str>) -> String {
+    let Some(detail) = detail else {
+        return "unknown-bork".to_string();
+    };
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("unsupported phpt section `phpdbg`")
+        || lower.contains("unsupported phpt section `cgi`")
+    {
+        "missing-target-cli-capability".to_string()
+    } else if lower.contains("unsupported section") || lower.contains("unsupported phpt section") {
+        "unsupported-section".to_string()
+    } else if lower.contains("file_external") {
+        "unsupported-file-external".to_string()
+    } else if lower.contains("expect") {
+        "unsupported-expectation".to_string()
+    } else if lower.contains("stdin")
+        || lower.contains("args")
+        || lower.contains("env")
+        || lower.contains("ini")
+        || lower.contains("clean")
+    {
+        "unsupported-runner-io".to_string()
+    } else if lower.contains("stream did not contain valid utf-8") {
+        "malformed-or-non-utf8-phpt".to_string()
+    } else if lower.contains("malformed") || lower.contains("missing") {
+        "malformed-or-incomplete-phpt".to_string()
+    } else if lower.contains("extension") {
+        "extension-policy".to_string()
+    } else {
+        "other-bork".to_string()
+    }
+}
+
+fn plan_module_for_entry(entry: &PhptEntry, result: Option<&PhptRunResult>) -> &'static str {
+    plan_module_for_path(&entry.path, &entry.module, result)
+}
+
+fn plan_module_for_path(
+    path: &str,
+    corpus_module: &str,
+    result: Option<&PhptRunResult>,
+) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if result
+        .map(|result| result.outcome == "BORK")
+        .unwrap_or(false)
+    {
+        return "phpt.runner";
+    }
+    if lower.starts_with("sapi/") || lower.contains("argv") || lower.contains("stdin") {
+        return "phpt.cli";
+    }
+    if lower.contains("arrayaccess")
+        || lower.contains("reference")
+        || lower.contains("foreach")
+        || lower.contains("cow")
+    {
+        return "arrays.references";
+    }
+    if lower.contains("callable")
+        || lower.contains("closure")
+        || lower.contains("function")
+        || lower.contains("variadic")
+    {
+        return "functions.callables";
+    }
+    if lower.contains("class")
+        || lower.contains("object")
+        || lower.contains("trait")
+        || lower.contains("enum")
+        || lower.contains("magic")
+    {
+        return "objects.classes";
+    }
+    if corpus_module == "filesystem" || corpus_module == "streams" {
+        return "filesystem.streams";
+    }
+    match corpus_module {
+        "standard.arrays" => "standard.arrays",
+        "standard.strings" => "standard.strings",
+        "json" => "json",
+        "pcre" => "pcre",
+        "date" => "date",
+        "spl" => "spl",
+        "reflection" => "reflection",
+        "zend"
+            if lower.contains("concat")
+                || lower.contains("compare")
+                || lower.contains("operator")
+                || lower.contains("add_")
+                || lower.contains("sub_")
+                || lower.contains("mul_")
+                || lower.contains("div_") =>
+        {
+            "operators.conversions"
+        }
+        "zend" => "zend.basic",
+        "standard" if lower.contains("math") || lower.contains("round") => "standard.math",
+        "standard" if lower.contains("serialize") => "standard.serialization",
+        "standard" if lower.contains("string") || lower.contains("/strings/") => "standard.strings",
+        "standard" => "standard.variables",
+        "unknown" if lower.contains("/strings/") || lower.starts_with("tests/strings/") => {
+            "strings.literals"
+        }
+        "unknown" => "extension.policy",
+        _ => "extension.policy",
+    }
+}
+
+fn write_triage_outputs(
+    options: &TriageOptions,
+    metadata: &BaselineMetadata,
+    triage: &PhptTriage,
+) -> Result<(), String> {
+    if let Some(parent) = options.report.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    if let Some(parent) = options.priority.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    fs::create_dir_all(&options.modules_dir)
+        .map_err(|error| format!("{}: {error}", options.modules_dir.display()))?;
+    fs::create_dir_all(&options.module_manifests_dir)
+        .map_err(|error| format!("{}: {error}", options.module_manifests_dir.display()))?;
+
+    fs::write(&options.report, render_triage_report(metadata, triage))
+        .map_err(|error| format!("{}: {error}", options.report.display()))?;
+    fs::write(&options.priority, render_module_priority_json(triage))
+        .map_err(|error| format!("{}: {error}", options.priority.display()))?;
+    fs::write(
+        options.modules_dir.join("README.md"),
+        render_modules_readme(triage),
+    )
+    .map_err(|error| {
+        format!(
+            "{}: {error}",
+            options.modules_dir.join("README.md").display()
+        )
+    })?;
+
+    for (index, spec) in MODULE_PLAN.iter().enumerate() {
+        let stats = triage.modules.get(spec.name).cloned().unwrap_or_default();
+        let safe_module = safe_path_component(spec.name);
+        let doc_path = options.modules_dir.join(format!("{safe_module}.md"));
+        let manifest_path = options
+            .module_manifests_dir
+            .join(format!("{safe_module}.json"));
+        let selected_manifest_path = options
+            .module_manifests_dir
+            .join(format!("{safe_module}.selected.jsonl"));
+        fs::write(
+            &doc_path,
+            render_module_doc(spec, index + 1, &stats, &selected_manifest_path),
+        )
+        .map_err(|error| format!("{}: {error}", doc_path.display()))?;
+        fs::write(
+            &manifest_path,
+            render_module_manifest(spec, index + 1, &stats, &selected_manifest_path),
+        )
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        fs::write(
+            &selected_manifest_path,
+            render_selected_manifest(&stats, options.selected_limit),
+        )
+        .map_err(|error| format!("{}: {error}", selected_manifest_path.display()))?;
+    }
+    Ok(())
+}
+
+fn render_triage_report(metadata: &BaselineMetadata, triage: &PhptTriage) -> String {
+    let mut out = String::new();
+    out.push_str("# PHPT Triage\n\n");
+    out.push_str(&format!(
+        "Baseline `{}` covers {} PHPTs: {} PASS, {} SKIP, {} FAIL, {} BORK.\n\n",
+        metadata.timestamp,
+        metadata.corpus_count,
+        metadata.pass_count,
+        metadata.skip_count,
+        metadata.fail_count,
+        metadata.bork_count
+    ));
+    if triage.has_result_counts {
+        out.push_str(
+            "Per-module PASS/SKIP counts are based on the latest available full-run results.\n\n",
+        );
+    } else {
+        out.push_str("Per-module PASS/SKIP counts are unavailable because no full-run results were provided; FAIL/BORK counts come from the committed known-failure baseline.\n\n");
+    }
+
+    out.push_str("## Top Failing Modules\n\n");
+    out.push_str("| Module | Priority | Corpus | PASS | SKIP | FAIL | BORK | Known non-green |\n");
+    out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for (priority, spec, stats) in prioritized_modules(triage).into_iter().take(20) {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            spec.name,
+            priority,
+            stats.corpus_count,
+            stats.pass_count,
+            stats.skip_count,
+            stats.fail_count,
+            stats.bork_count,
+            stats.known_failure_count
+        ));
+    }
+
+    out.push_str("\n## Top Failure Clusters\n\n");
+    render_count_table(&mut out, "Cluster", &triage.failure_clusters, 20);
+
+    out.push_str("\n## Top Unsupported Feature Guesses\n\n");
+    render_count_table(&mut out, "Guess", &triage.unsupported_guesses, 20);
+
+    out.push_str("\n## BORK Subclasses\n\n");
+    render_count_table(&mut out, "Subclass", &triage.bork_subclasses, 20);
+
+    out.push_str("\n## Next Module Candidates\n\n");
+    out.push_str("| Rank | Module | Reason |\n| ---: | --- | --- |\n");
+    for (rank, (_priority, spec, stats)) in prioritized_modules(triage)
+        .into_iter()
+        .filter(|(_, _, stats)| stats.non_green() > 0)
+        .take(10)
+        .enumerate()
+    {
+        out.push_str(&format!(
+            "| {} | {} | {} non-green, leverage {} |\n",
+            rank + 1,
+            spec.name,
+            stats.non_green(),
+            spec.leverage
+        ));
+    }
+
+    out.push_str("\n## Raw Corpus Module Counts\n\n");
+    out.push_str("| Module | Corpus | PASS | SKIP | FAIL | BORK | Known non-green |\n");
+    out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    let mut raw = triage.raw_modules.iter().collect::<Vec<_>>();
+    raw.sort_by(|left, right| {
+        right
+            .1
+            .known_failure_count
+            .cmp(&left.1.known_failure_count)
+            .then_with(|| left.0.cmp(right.0))
+    });
+    for (module, stats) in raw.into_iter().take(40) {
+        out.push_str(&format!(
+            "| {module} | {} | {} | {} | {} | {} | {} |\n",
+            stats.corpus_count,
+            stats.pass_count,
+            stats.skip_count,
+            stats.fail_count,
+            stats.bork_count,
+            stats.known_failure_count
+        ));
+    }
+    out
+}
+
+fn render_count_table(
+    out: &mut String,
+    label: &str,
+    counts: &BTreeMap<String, usize>,
+    limit: usize,
+) {
+    out.push_str(&format!("| {label} | Count |\n| --- | ---: |\n"));
+    let mut rows = counts.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    for (name, count) in rows.into_iter().take(limit) {
+        out.push_str(&format!("| {name} | {count} |\n"));
+    }
+    if counts.is_empty() {
+        out.push_str("| none | 0 |\n");
+    }
+}
+
+fn prioritized_modules(
+    triage: &PhptTriage,
+) -> Vec<(usize, &'static ModulePlanSpec, ModuleTriageStats)> {
+    let mut rows = MODULE_PLAN
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            (
+                index + 1,
+                spec,
+                triage.modules.get(spec.name).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.2.non_green().cmp(&left.2.non_green()))
+            .then_with(|| right.1.leverage.cmp(&left.1.leverage))
+            .then_with(|| left.1.name.cmp(right.1.name))
+    });
+    rows
+}
+
+fn render_module_priority_json(triage: &PhptTriage) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"schema_version\":\"phpt-module-priority-v1\",\n");
+    out.push_str(&format!(
+        "  \"has_result_counts\":{},\n",
+        if triage.has_result_counts {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    out.push_str("  \"modules\":[\n");
+    for (row_index, (priority, spec, stats)) in prioritized_modules(triage).into_iter().enumerate()
+    {
+        if row_index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"priority\":{},\n", priority));
+        out.push_str(&format!(
+            "      \"module\":\"{}\",\n",
+            escape_json(spec.name)
+        ));
+        out.push_str(&format!("      \"leverage\":{},\n", spec.leverage));
+        out.push_str(&format!("      \"corpus_count\":{},\n", stats.corpus_count));
+        out.push_str(&format!("      \"pass_count\":{},\n", stats.pass_count));
+        out.push_str(&format!("      \"skip_count\":{},\n", stats.skip_count));
+        out.push_str(&format!("      \"fail_count\":{},\n", stats.fail_count));
+        out.push_str(&format!("      \"bork_count\":{},\n", stats.bork_count));
+        out.push_str(&format!(
+            "      \"known_failure_count\":{},\n",
+            stats.known_failure_count
+        ));
+        out.push_str(&format!(
+            "      \"next_step\":\"{}\"\n",
+            escape_json(spec.next_step)
+        ));
+        out.push_str("    }");
+    }
+    out.push_str("\n  ]\n}\n");
+    out
+}
+
+fn render_modules_readme(triage: &PhptTriage) -> String {
+    let mut out = String::new();
+    out.push_str("# PHPT Module Plan\n\n");
+    out.push_str("This directory contains the functional module plan for PHPT-driven runtime completion. The order is based on core language dependencies, failure volume, and expected leverage across later modules.\n\n");
+    out.push_str("| Priority | Module | Corpus | PASS | SKIP | FAIL | BORK | Next step |\n");
+    out.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |\n");
+    for (priority, spec, stats) in prioritized_modules(triage) {
+        out.push_str(&format!(
+            "| {} | [{}]({}.md) | {} | {} | {} | {} | {} | {} |\n",
+            priority,
+            spec.name,
+            safe_path_component(spec.name),
+            stats.corpus_count,
+            stats.pass_count,
+            stats.skip_count,
+            stats.fail_count,
+            stats.bork_count,
+            spec.next_step
+        ));
+    }
+    out
+}
+
+fn render_module_doc(
+    spec: &ModulePlanSpec,
+    priority: usize,
+    stats: &ModuleTriageStats,
+    selected_manifest: &Path,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", spec.name));
+    out.push_str(&format!("- Priority: {priority}\n"));
+    out.push_str(&format!(
+        "- Selected manifest: `{}`\n",
+        selected_manifest.display()
+    ));
+    out.push_str(&format!(
+        "- Current counts: {} PASS, {} SKIP, {} FAIL, {} BORK from {} corpus candidates\n",
+        stats.pass_count, stats.skip_count, stats.fail_count, stats.bork_count, stats.corpus_count
+    ));
+    out.push_str("\n## Scope\n\n");
+    for item in spec.scope {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("\n## Non-Scope\n\n");
+    for item in spec.non_scope {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("\n## Relevant PHPT Paths\n\n");
+    for path in stats.relevant_paths.iter().take(40) {
+        out.push_str(&format!("- `{path}`\n"));
+    }
+    if stats.relevant_paths.is_empty() {
+        out.push_str("- none identified yet\n");
+    }
+    out.push_str("\n## Relevant php-src Source Areas\n\n");
+    for item in spec.source_places {
+        out.push_str(&format!("- `{item}`\n"));
+    }
+    out.push_str("\n## Target Gates\n\n");
+    for gate in spec.target_gates {
+        out.push_str(&format!("- `{gate}`\n"));
+    }
+    out.push_str("\n## Known Gaps\n\n");
+    if stats.failure_clusters.is_empty() {
+        out.push_str("- no known non-green fingerprints assigned in the current baseline\n");
+    } else {
+        let mut clusters = stats.failure_clusters.iter().collect::<Vec<_>>();
+        clusters.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (cluster, count) in clusters {
+            out.push_str(&format!("- `{cluster}`: {count}\n"));
+        }
+    }
+    out.push_str("\n## Next Step\n\n");
+    out.push_str(spec.next_step);
+    out.push('\n');
+    out
+}
+
+fn render_module_manifest(
+    spec: &ModulePlanSpec,
+    priority: usize,
+    stats: &ModuleTriageStats,
+    selected_manifest: &Path,
+) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\":\"phpt-module-plan-v1\",\n",
+            "  \"module\":\"{}\",\n",
+            "  \"priority\":{},\n",
+            "  \"selected_manifest\":\"{}\",\n",
+            "  \"corpus_count\":{},\n",
+            "  \"pass_count\":{},\n",
+            "  \"skip_count\":{},\n",
+            "  \"fail_count\":{},\n",
+            "  \"bork_count\":{},\n",
+            "  \"known_failure_count\":{},\n",
+            "  \"scope\":{},\n",
+            "  \"non_scope\":{},\n",
+            "  \"target_gates\":{},\n",
+            "  \"next_step\":\"{}\"\n",
+            "}}\n"
+        ),
+        escape_json(spec.name),
+        priority,
+        escape_json(&selected_manifest.to_string_lossy().replace('\\', "/")),
+        stats.corpus_count,
+        stats.pass_count,
+        stats.skip_count,
+        stats.fail_count,
+        stats.bork_count,
+        stats.known_failure_count,
+        json_str_array(spec.scope),
+        json_str_array(spec.non_scope),
+        json_str_array(spec.target_gates),
+        escape_json(spec.next_step)
+    )
+}
+
+fn render_selected_manifest(stats: &ModuleTriageStats, limit: usize) -> String {
+    let mut out = String::new();
+    for path in stats.relevant_paths.iter().take(limit) {
+        out.push_str(&format!("{{\"path\":\"{}\"}}\n", escape_json(path)));
+    }
+    out
+}
+
+fn json_str_array(values: &[&str]) -> String {
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(value));
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+fn compare_report_total(
+    outcome: &str,
+    expected: usize,
+    report: &BaselineReportTotals,
+    errors: &mut Vec<String>,
+) {
+    let actual = *report.outcomes.get(outcome).unwrap_or(&0);
+    if expected != actual {
+        errors.push(format!(
+            "{outcome} count mismatch: metadata={expected} report={actual}"
+        ));
+    }
 }
 
 fn read_corpus_modules(path: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -2645,6 +4725,8 @@ const LITERAL_KIND_UNSUPPORTED_DIAGNOSTIC: &str =
     "E_PHP_IR_UNSUPPORTED_HIR_STATEMENT: literal kind is not lowered to IR";
 const ADVANCED_PARAMETER_UNFOLDED_DIAGNOSTIC: &str =
     "parameter default is not a folded Semantic frontend constant expression";
+const VM_STEP_LIMIT_DIAGNOSTIC: &str = "VM step limit exceeded";
+const PHPT_TIMEOUT_DIAGNOSTIC: &str = "PHPT_TIMEOUT after";
 
 fn is_related_known_failure_evolution(
     previous: Option<&PhptRunResult>,
@@ -2658,18 +4740,64 @@ fn is_related_known_failure_evolution(
     {
         return false;
     }
+    if previous.outcome == "BORK" && current.outcome == "FAIL" {
+        return true;
+    }
     previous
         .detail
         .contains(LITERAL_KIND_UNSUPPORTED_DIAGNOSTIC)
         || previous
             .detail
             .contains(ADVANCED_PARAMETER_UNFOLDED_DIAGNOSTIC)
+        || related_runtime_limit_failure(previous, current)
+        || related_target_exit_expectation_detail(previous, current)
         || (previous
             .detail
             .starts_with("output did not match expectation")
             && current
                 .detail
                 .starts_with("output did not match expectation"))
+}
+
+fn related_runtime_limit_failure(previous: &PhptRunResult, current: &PhptRunResult) -> bool {
+    let previous_limited = previous.detail.contains(VM_STEP_LIMIT_DIAGNOSTIC)
+        || previous.detail.contains(PHPT_TIMEOUT_DIAGNOSTIC);
+    let current_limited = current.detail.contains(VM_STEP_LIMIT_DIAGNOSTIC)
+        || current.detail.contains(PHPT_TIMEOUT_DIAGNOSTIC);
+    previous_limited && current_limited
+}
+
+fn related_target_exit_expectation_detail(
+    previous: &PhptRunResult,
+    current: &PhptRunResult,
+) -> bool {
+    if !previous.detail.starts_with("target exited with status ")
+        || !current
+            .detail
+            .starts_with("output did not match expectation")
+        || !current.detail.contains("; target exited with status ")
+    {
+        return false;
+    }
+    let Some(previous_stderr) = stderr_payload(&previous.detail) else {
+        return false;
+    };
+    let Some(current_stderr) = stderr_payload(&current.detail) else {
+        return false;
+    };
+    normalize_failure_detail_for_fingerprint(previous_stderr)
+        == normalize_failure_detail_for_fingerprint(current_stderr)
+}
+
+fn stderr_payload(detail: &str) -> Option<&str> {
+    detail
+        .find("; stderr=")
+        .map(|offset| &detail[offset + "; stderr=".len()..])
+        .or_else(|| {
+            detail
+                .find("stderr=")
+                .map(|offset| &detail[offset + "stderr=".len()..])
+        })
 }
 
 fn render_baseline_report(
@@ -2729,6 +4857,40 @@ fn parse_duration_seconds(value: &str) -> Result<Duration, String> {
         return Err("timeout must be greater than zero".to_string());
     }
     Ok(Duration::from_secs(seconds))
+}
+
+fn parse_jobs(value: &str) -> Result<usize, String> {
+    let jobs = parse_usize(value, "jobs")?;
+    if jobs == 0 {
+        return Err("jobs must be greater than zero".to_string());
+    }
+    Ok(jobs)
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
+}
+
+fn parse_bool_flag(value: &str, name: &str) -> Result<bool, String> {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Ok(false),
+        _ => Err(format!(
+            "invalid {name} value `{value}`; expected true or false"
+        )),
+    }
+}
+
+fn default_phpt_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 16)
 }
 
 fn parse_usize(value: &str, name: &str) -> Result<usize, String> {
@@ -3225,6 +5387,17 @@ fn hash_file(path: &Path) -> Result<(u64, String), String> {
     Ok((size, format!("{:x}", hasher.finalize())))
 }
 
+fn file_fingerprint(path: &Path) -> Result<String, String> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (size, sha256) = hash_file(path)?;
+    Ok(format!(
+        "{}:{}:{}",
+        canonical.to_string_lossy().replace('\\', "/"),
+        size,
+        sha256
+    ))
+}
+
 fn default_php_src_dir() -> PathBuf {
     let preferred = PathBuf::from("third_party/php-src-8.5.7");
     if preferred.is_dir() {
@@ -3288,6 +5461,14 @@ fn extract_json_string(line: &str, key: &str) -> Result<String, String> {
         }
     }
     Err(format!("unterminated string field `{key}`"))
+}
+
+fn extract_optional_json_string(line: &str, key: &str) -> Result<Option<String>, String> {
+    let needle = format!("\"{key}\":\"");
+    if !line.contains(&needle) {
+        return Ok(None);
+    }
+    extract_json_string(line, key).map(Some)
 }
 
 fn extract_json_bool(line: &str, key: &str) -> Result<bool, String> {
@@ -3374,6 +5555,13 @@ fn extract_json_u64(line: &str, key: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid numeric field `{key}`: {error}"))
 }
 
+fn extract_json_usize(line: &str, key: &str) -> Result<usize, String> {
+    extract_json_u64(line, key).and_then(|value| {
+        usize::try_from(value)
+            .map_err(|error| format!("numeric field `{key}` is too large: {error}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3390,6 +5578,235 @@ mod tests {
         assert_eq!(
             ManifestEntry::from_json_line(&entry.to_json_line()).unwrap(),
             entry
+        );
+    }
+
+    #[test]
+    fn baseline_metadata_json_roundtrips() {
+        let metadata = BaselineMetadata {
+            schema_version: "phpt-full-baseline-v1".to_string(),
+            timestamp: "20260624T125543Z".to_string(),
+            corpus_count: 21_548,
+            pass_count: 1_056,
+            skip_count: 64,
+            fail_count: 19_973,
+            bork_count: 455,
+            known_failure_count: 20_428,
+            failure_manifest: "tests/phpt/manifests/full-known-failures.jsonl".to_string(),
+        };
+
+        assert_eq!(
+            BaselineMetadata::from_json(&metadata.to_json()).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn parses_baseline_report_totals() {
+        let report = "# PHPT Full PHPT Baseline\n\nGenerated: `20260624T125543Z`\n\n## Totals\n\n| Outcome | Count |\n| --- | ---: |\n| BORK | 455 |\n| FAIL | 19973 |\n| PASS | 1056 |\n| SKIP | 64 |\n\n## Top Failure Clusters\n";
+        let path = std::env::temp_dir().join(format!(
+            "phrust-baseline-report-test-{}.md",
+            std::process::id()
+        ));
+        fs::write(&path, report).unwrap();
+        let totals = read_baseline_report_totals(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(totals.timestamp, "20260624T125543Z");
+        assert_eq!(totals.outcomes.get("BORK"), Some(&455));
+        assert_eq!(totals.outcomes.get("FAIL"), Some(&19_973));
+        assert_eq!(totals.outcomes.get("PASS"), Some(&1_056));
+        assert_eq!(totals.outcomes.get("SKIP"), Some(&64));
+    }
+
+    #[test]
+    fn parses_run_jobs() {
+        assert_eq!(parse_jobs("1").unwrap(), 1);
+        assert_eq!(parse_jobs("8").unwrap(), 8);
+        assert!(parse_jobs("0").is_err());
+        assert!(parse_jobs("many").is_err());
+    }
+
+    #[test]
+    fn parses_run_reuse_results() {
+        let options = RunOptions::parse(&[
+            "--target".to_string(),
+            "target/debug/php-vm".to_string(),
+            "--manifest".to_string(),
+            "tests/phpt/manifests/runner-smoke.jsonl".to_string(),
+            "--reuse-results".to_string(),
+            "target/phpt-work/full-runs/previous/results.jsonl".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options.reuse_results.as_deref(),
+            Some(Path::new(
+                "target/phpt-work/full-runs/previous/results.jsonl"
+            ))
+        );
+        assert!(!options.dev_reuse_pass);
+    }
+
+    #[test]
+    fn parses_run_dev_reuse_pass() {
+        let options = RunOptions::parse(&[
+            "--target".to_string(),
+            "target/debug/php-vm".to_string(),
+            "--manifest".to_string(),
+            "tests/phpt/manifests/runner-smoke.jsonl".to_string(),
+            "--dev-reuse-pass".to_string(),
+        ])
+        .unwrap();
+
+        assert!(options.dev_reuse_pass);
+    }
+
+    #[test]
+    fn normalizes_actual_php_cli_diagnostic_leading_blank_line() {
+        assert_eq!(
+            normalize_actual_output("\r\nWarning: example\n"),
+            "Warning: example"
+        );
+        assert_eq!(
+            normalize_actual_output("\nDeprecated: example\n"),
+            "Deprecated: example"
+        );
+        assert_eq!(normalize_actual_output("\nuser output\n"), "user output");
+        assert_eq!(
+            normalize_expected_output("\nWarning: example\n"),
+            "Warning: example"
+        );
+        assert_eq!(php_run_tests_trim("\0\t\n out \r\n"), "out");
+    }
+
+    #[test]
+    fn php_run_tests_ini_defaults_precede_test_ini_overrides() {
+        let ini = php_run_tests_ini_args(&[
+            ("memory_limit".to_string(), "64M".to_string()),
+            ("include_path".to_string(), "fixtures".to_string()),
+        ]);
+
+        assert!(ini.contains(&("report_zend_debug".to_string(), "0".to_string())));
+        assert!(
+            ini.iter()
+                .position(|entry| entry == &("memory_limit".to_string(), "128M".to_string()))
+                .unwrap()
+                < ini
+                    .iter()
+                    .position(|entry| entry == &("memory_limit".to_string(), "64M".to_string()))
+                    .unwrap()
+        );
+        assert_eq!(
+            ini.last(),
+            Some(&("include_path".to_string(), "fixtures".to_string()))
+        );
+    }
+
+    #[test]
+    fn phpt_run_result_json_preserves_optional_cache_fields() {
+        let result = PhptRunResult::new("Zend/tests/example.phpt", "PASS", "")
+            .with_cache_keys("abc".into(), "input-abc".into());
+        let parsed = PhptRunResult::from_json_line(&result.to_json_line()).unwrap();
+
+        assert_eq!(parsed.path, "Zend/tests/example.phpt");
+        assert_eq!(parsed.cache_key.as_deref(), Some("abc"));
+        assert_eq!(parsed.input_cache_key.as_deref(), Some("input-abc"));
+        assert_eq!(parsed.cache_status.as_deref(), Some("miss"));
+
+        let legacy = PhptRunResult::from_json_line(
+            "{\"path\":\"Zend/tests/legacy.phpt\",\"outcome\":\"FAIL\",\"detail\":\"old\"}",
+        )
+        .unwrap();
+        assert_eq!(legacy.cache_key, None);
+        assert_eq!(legacy.input_cache_key, None);
+        assert_eq!(legacy.cache_status, None);
+    }
+
+    #[test]
+    fn rerun_manifest_keeps_only_non_green_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("phrust-rerun-manifest-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let results = dir.join("results.jsonl");
+        let out = dir.join("rerun.jsonl");
+        fs::write(
+            &results,
+            [
+                PhptRunResult::new("a.phpt", "PASS", "").to_json_line(),
+                PhptRunResult::new("b.phpt", "FAIL", "x").to_json_line(),
+                PhptRunResult::new("c.phpt", "BORK", "x").to_json_line(),
+                PhptRunResult::new("b.phpt", "FAIL", "x").to_json_line(),
+                PhptRunResult::new("d.phpt", "SKIP", "x").to_json_line(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let status = rerun_manifest(
+            &[
+                "--results".to_string(),
+                results.display().to_string(),
+                "--out".to_string(),
+                out.display().to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            fs::read_to_string(&out).unwrap(),
+            "{\"path\":\"b.phpt\"}\n{\"path\":\"c.phpt\"}\n"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn triage_keeps_array_builtins_separate_from_reference_core() {
+        assert_eq!(
+            plan_module_for_path(
+                "ext/standard/tests/array/array_chunk.phpt",
+                "standard.arrays",
+                None
+            ),
+            "standard.arrays"
+        );
+        assert_eq!(
+            plan_module_for_path("Zend/tests/foreach/foreach_by_ref.phpt", "zend", None),
+            "arrays.references"
+        );
+        assert_eq!(
+            plan_module_for_path("ext/spl/tests/arrayAccess_001.phpt", "spl", None),
+            "arrays.references"
+        );
+    }
+
+    #[test]
+    fn triage_classifies_common_bork_subclasses() {
+        assert_eq!(
+            classify_bork(Some("unsupported section --POST--")),
+            "unsupported-section"
+        );
+        assert_eq!(
+            classify_bork(Some("unsupported PHPT section `PHPDBG`")),
+            "missing-target-cli-capability"
+        );
+        assert_eq!(
+            classify_bork(Some("FILE_EXTERNAL is not supported")),
+            "unsupported-file-external"
+        );
+        assert_eq!(
+            classify_bork(Some("test.phpt: stream did not contain valid UTF-8")),
+            "malformed-or-non-utf8-phpt"
+        );
+        assert_eq!(
+            classify_bork(Some("malformed PHPT: missing --FILE--")),
+            "malformed-or-incomplete-phpt"
+        );
+        assert_eq!(
+            classify_bork(Some("STDIN and ARGS are unsupported")),
+            "unsupported-runner-io"
         );
     }
 
@@ -3440,46 +5857,69 @@ mod tests {
 
     #[test]
     fn classifies_known_failure_evolution_as_related_changes() {
-        let previous = PhptRunResult {
-            path: "Zend/tests/example.phpt".to_string(),
-            outcome: "FAIL".to_string(),
-            detail: format!(
-                "target exited with status 2; stderr={LITERAL_KIND_UNSUPPORTED_DIAGNOSTIC}"
-            ),
-        };
-        let current = PhptRunResult {
-            path: "Zend/tests/example.phpt".to_string(),
-            outcome: "FAIL".to_string(),
-            detail: "target exited with status 3; stderr=runtime_error: undefined function getdate"
-                .to_string(),
-        };
-        let unrelated_path = PhptRunResult {
-            path: "Zend/tests/other.phpt".to_string(),
-            outcome: "FAIL".to_string(),
-            detail: current.detail.clone(),
-        };
-        let passing_current = PhptRunResult {
-            path: previous.path.clone(),
-            outcome: "PASS".to_string(),
-            detail: String::new(),
-        };
-        let previous_advanced_parameter = PhptRunResult {
-            path: previous.path.clone(),
-            outcome: "FAIL".to_string(),
-            detail: format!(
-                "target exited with status 2; stderr={ADVANCED_PARAMETER_UNFOLDED_DIAGNOSTIC}"
-            ),
-        };
-        let previous_output = PhptRunResult {
-            path: previous.path.clone(),
-            outcome: "FAIL".to_string(),
-            detail: "output did not match expectation first_mismatch=Some(100)".to_string(),
-        };
-        let current_output = PhptRunResult {
-            path: previous.path.clone(),
-            outcome: "FAIL".to_string(),
-            detail: "output did not match expectation first_mismatch=Some(200)".to_string(),
-        };
+        let previous = PhptRunResult::new(
+            "Zend/tests/example.phpt",
+            "FAIL",
+            format!("target exited with status 2; stderr={LITERAL_KIND_UNSUPPORTED_DIAGNOSTIC}"),
+        );
+        let current = PhptRunResult::new(
+            "Zend/tests/example.phpt",
+            "FAIL",
+            "target exited with status 3; stderr=runtime_error: undefined function getdate",
+        );
+        let unrelated_path =
+            PhptRunResult::new("Zend/tests/other.phpt", "FAIL", current.detail.clone());
+        let passing_current = PhptRunResult::new(previous.path.clone(), "PASS", String::new());
+        let previous_advanced_parameter = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            format!("target exited with status 2; stderr={ADVANCED_PARAMETER_UNFOLDED_DIAGNOSTIC}"),
+        );
+        let previous_output = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "output did not match expectation first_mismatch=Some(100)",
+        );
+        let current_output = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "output did not match expectation first_mismatch=Some(200)",
+        );
+        let previous_step_limit = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "target exited with status 3; stderr=runtime_error: VM step limit exceeded",
+        );
+        let current_timeout = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "target exited with status 124; stderr=PHPT_TIMEOUT after 30s",
+        );
+        let previous_bork = PhptRunResult::new(
+            previous.path.clone(),
+            "BORK",
+            "unsupported PHPT section `FLAKY`",
+        );
+        let current_after_runner_support = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "output did not match expectation",
+        );
+        let previous_target_exit = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "target exited with status 3; stderr=/tmp/repo/target/phpt-work/full-runs/a/work/target/case-1-2/test.php: runtime_error: undefined function highlight_string",
+        );
+        let current_expectation_then_exit = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "output did not match expectation first_mismatch=Some(0) expected=`done` actual=``; target exited with status 255; stderr=/tmp/repo/target/phpt-work/full-runs/b/work/target/case-9-8/test.php: runtime_error: undefined function highlight_string",
+        );
+        let current_changed_stderr = PhptRunResult::new(
+            previous.path.clone(),
+            "FAIL",
+            "output did not match expectation first_mismatch=Some(0) expected=`done` actual=``; target exited with status 255; stderr=/tmp/repo/target/phpt-work/full-runs/b/work/target/case-9-8/test.php: runtime_error: undefined function different",
+        );
 
         assert!(is_related_known_failure_evolution(
             Some(&previous),
@@ -3492,6 +5932,22 @@ mod tests {
         assert!(is_related_known_failure_evolution(
             Some(&previous_output),
             Some(&current_output)
+        ));
+        assert!(is_related_known_failure_evolution(
+            Some(&previous_step_limit),
+            Some(&current_timeout)
+        ));
+        assert!(is_related_known_failure_evolution(
+            Some(&previous_bork),
+            Some(&current_after_runner_support)
+        ));
+        assert!(is_related_known_failure_evolution(
+            Some(&previous_target_exit),
+            Some(&current_expectation_then_exit)
+        ));
+        assert!(!is_related_known_failure_evolution(
+            Some(&previous_target_exit),
+            Some(&current_changed_stderr)
         ));
         assert!(!is_related_known_failure_evolution(
             Some(&previous),

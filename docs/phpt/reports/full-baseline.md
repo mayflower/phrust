@@ -1,6 +1,6 @@
 # PHPT Full PHPT Baseline
 
-Generated: `20260624T125543Z`
+Generated: `20260624T210848Z`
 
 ## Totals
 
@@ -15,12 +15,12 @@ Generated: `20260624T125543Z`
 
 | Cluster | Count |
 | --- | ---: |
-| runtime-error-or-diagnostic | 11400 |
+| runtime-error-or-diagnostic | 11402 |
 | runtime-unsupported-feature | 6185 |
 | runtime-output-mismatch | 2315 |
 | needs-triage | 320 |
 | frontend-parse-or-compile | 187 |
-| runtime-timeout | 21 |
+| runtime-timeout | 19 |
 
 ## Top Failing Modules
 

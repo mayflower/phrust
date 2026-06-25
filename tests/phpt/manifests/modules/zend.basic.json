@@ -1,37 +1,16 @@
 {
-  "module": "zend.basic",
-  "slice": "09.11",
-  "description": "Zend basic execution, output, scalar literals, var_dump, statement sequencing, and top-level return/exit basics.",
-  "scope": [
-    "Zend/tests/*",
-    "basic language tests tagged as literals/output",
-    "echo/print",
-    "scalar null/bool/int/float/string literals",
-    "basic var_dump, var_export, and print_r output where already supported",
-    "statement sequencing",
-    "top-level return/exit basics"
-  ],
-  "selected_manifest": "tests/phpt/manifests/modules/zend.basic.selected.jsonl",
-  "generated_manifest": "tests/phpt/manifests/zend.basic-generated.jsonl",
-  "selected_originals": [
-    {
-      "path": "Zend/tests/numeric_literal_separator/numeric_literal_separator_001.phpt",
-      "source_hash": "e7854d36777eda6250e02933451e2ae35ebfbd4814267ddd833a843663eda9e1",
-      "reason": "Scalar int/float literal separators across decimal, exponent, hex, binary, and legacy octal forms with var_dump output."
-    }
-  ],
-  "selected_generated": [
-    {
-      "path": "tests/phpt/generated/zend.basic/regression-numeric_literal_separator_001-e7854d367777.phpt",
-      "original_path": "Zend/tests/numeric_literal_separator/numeric_literal_separator_001.phpt",
-      "original_source_hash": "e7854d36777eda6250e02933451e2ae35ebfbd4814267ddd833a843663eda9e1",
-      "reason": "Reduced scalar-literal regression generated from reference output."
-    }
-  ],
-  "closure_gate": [
-    "nix develop -c just phpt-module MODULE=zend.basic",
-    "nix develop -c just phpt-full-regression",
-    "nix develop -c just phpt-verify-source-integrity",
-    "nix develop -c just verify-phpt"
-  ]
+  "schema_version":"phpt-module-plan-v1",
+  "module":"zend.basic",
+  "priority":4,
+  "selected_manifest":"tests/phpt/manifests/modules/zend.basic.selected.jsonl",
+  "corpus_count":3509,
+  "pass_count":274,
+  "skip_count":1,
+  "fail_count":3226,
+  "bork_count":0,
+  "known_failure_count":3227,
+  "scope":["top-level execution","scalar literals","numeric literal separators","echo","print","statement sequencing","top-level return","top-level exit","basic var_dump output"],
+  "non_scope":["dynamic variables","objects","extensions","advanced type system","exact string-to-float formatting edge cases"],
+  "target_gates":["nix develop -c just phpt-module MODULE=zend.basic"],
+  "next_step":"Keep the selected zend.basic gate green while later modules expand runtime semantics."
 }

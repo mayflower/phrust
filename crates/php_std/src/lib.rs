@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod arginfo;
 pub mod constants;
+pub mod generated;
 pub mod introspection;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +146,12 @@ impl FunctionDescriptor {
     pub const fn visibility(&self) -> SymbolVisibility {
         self.visibility
     }
+
+    /// Generated php-src stub metadata for this function, when available.
+    #[must_use]
+    pub fn arginfo(&self) -> Option<&'static generated::arginfo::GeneratedFunctionMetadata> {
+        generated::arginfo::function_metadata(self.name)
+    }
 }
 
 /// Descriptor for an internal constant symbol.
@@ -197,6 +204,14 @@ impl ConstantDescriptor {
     pub const fn value(&self) -> Option<ConstantValue> {
         self.value
     }
+
+    /// Generated php-src stub metadata for this constant, when available.
+    #[must_use]
+    pub fn source_metadata(
+        &self,
+    ) -> Option<&'static generated::arginfo::GeneratedConstantMetadata> {
+        generated::arginfo::constant_metadata(None, self.name)
+    }
 }
 
 /// Registry-safe constant value.
@@ -247,6 +262,12 @@ impl ClassDescriptor {
     #[must_use]
     pub const fn kind(&self) -> ClassKind {
         self.kind
+    }
+
+    /// Generated php-src stub metadata for this class-like symbol, when available.
+    #[must_use]
+    pub fn source_metadata(&self) -> Option<&'static generated::arginfo::GeneratedClassMetadata> {
+        generated::arginfo::class_metadata(self.name)
     }
 }
 
@@ -628,6 +649,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("opendir", "standard"))
                 .with_function(FunctionDescriptor::php("ord", "standard"))
                 .with_function(FunctionDescriptor::php("pathinfo", "standard"))
+                .with_function(FunctionDescriptor::php("parse_url", "standard"))
                 .with_function(FunctionDescriptor::php("passthru", "standard"))
                 .with_function(FunctionDescriptor::php("pclose", "standard"))
                 .with_function(FunctionDescriptor::php("php_sapi_name", "standard"))
@@ -730,7 +752,47 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("var_export", "standard"))
                 .with_function(FunctionDescriptor::php("version_compare", "standard"))
                 .with_function(FunctionDescriptor::php("vprintf", "standard"))
-                .with_function(FunctionDescriptor::php("vsprintf", "standard")),
+                .with_function(FunctionDescriptor::php("vsprintf", "standard"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_SCHEME",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_SCHEME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_HOST",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_HOST),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_PORT",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_PORT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_USER",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_USER),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_PASS",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_PASS),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_PATH",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_PATH),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_QUERY",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_QUERY),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_URL_FRAGMENT",
+                    "standard",
+                    ConstantValue::Int(constants::PHP_URL_FRAGMENT),
+                )),
             ExtensionDescriptor::new("json")
                 .with_function(FunctionDescriptor::php("json_decode", "json"))
                 .with_function(FunctionDescriptor::php("json_encode", "json"))
@@ -1242,6 +1304,7 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_runtime::{BuiltinCompatibility, BuiltinRegistry};
 
     #[test]
     fn registry_iteration_is_deterministic() {
@@ -1321,6 +1384,7 @@ mod tests {
             "http_build_query",
             "md5",
             "ord",
+            "parse_url",
             "rawurldecode",
             "rawurlencode",
             "sha1",
@@ -1330,6 +1394,30 @@ mod tests {
             assert!(
                 registry.enabled_php_function(name).is_some(),
                 "{name} should be registered as a standard function"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_parse_url_component_constants() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for (name, expected) in [
+            ("PHP_URL_SCHEME", constants::PHP_URL_SCHEME),
+            ("PHP_URL_HOST", constants::PHP_URL_HOST),
+            ("PHP_URL_PORT", constants::PHP_URL_PORT),
+            ("PHP_URL_USER", constants::PHP_URL_USER),
+            ("PHP_URL_PASS", constants::PHP_URL_PASS),
+            ("PHP_URL_PATH", constants::PHP_URL_PATH),
+            ("PHP_URL_QUERY", constants::PHP_URL_QUERY),
+            ("PHP_URL_FRAGMENT", constants::PHP_URL_FRAGMENT),
+        ] {
+            assert_eq!(
+                registry
+                    .enabled_constant(name)
+                    .and_then(ConstantDescriptor::value),
+                Some(ConstantValue::Int(expected)),
+                "{name} should be registered with its PHP value"
             );
         }
     }
@@ -1910,6 +1998,42 @@ mod tests {
                 Some(ClassKind::Class)
             ));
         }
+    }
+
+    #[test]
+    fn visible_stdlib_functions_have_generated_arginfo() {
+        let registry = ExtensionRegistry::standard_library();
+        let missing = registry
+            .extensions()
+            .flat_map(ExtensionDescriptor::functions)
+            .filter(|function| function.visibility() == SymbolVisibility::PhpVisible)
+            .filter(|function| function.arginfo().is_none())
+            .map(FunctionDescriptor::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            missing,
+            ["print"],
+            "`print` is a PHP language construct; visible function descriptors should otherwise have generated php-src arginfo"
+        );
+    }
+
+    #[test]
+    fn runtime_builtin_registry_entries_have_generated_arginfo() {
+        let missing = BuiltinRegistry::new()
+            .entries()
+            .iter()
+            .copied()
+            .filter(|entry| entry.compatibility() == BuiltinCompatibility::Php)
+            .filter(|entry| generated::arginfo::function_metadata(entry.name()).is_none())
+            .map(php_runtime::BuiltinEntry::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            missing,
+            ["print"],
+            "`print` is a PHP language construct; all function builtins should have generated php-src arginfo"
+        );
     }
 
     #[test]

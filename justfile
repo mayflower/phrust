@@ -56,9 +56,20 @@ help:
       '  just phpt-runner-smoke    Run PHPT runner tests' \
       '  just phpt-reference-smoke Run Reference PHP smoke' \
       '  just phpt-target-smoke    Run Target PHP smoke' \
+      '  just phpt-build           Build PHPT runner and target binaries' \
+      '  just phpt-dev-build       Build PHPT binaries with local incremental mode' \
+      '  just phpt-dev-shell       Open one nix shell after building PHPT dev binaries' \
       '  just phpt-generate-module MODULE=<module>  Generate module tests' \
       '  just phpt-module MODULE=<module>           Run a module batch' \
+      '  just phpt-dev-module MODULE=<module>       Run module batch after dev build' \
+      '  just phpt-module-target MODULE=<module>    Run target-only module batch' \
+      '  just phpt-fast MODULE=<module> [FILE=<path>|PATTERN=<text>]  Run fast target-only module loop' \
+      '  just phpt-dev-fast MODULE=<module> [...]   Run fast loop with explicit dev PASS reuse' \
+      '  just phpt-rerun-failures MODULE=<module>   Rerun only last non-green module outcomes' \
+      '  just phpt-triage         Generate PHPT triage report and module plan' \
       '  just phpt-full-regression Run the full PHPT no-regression gate' \
+      '  just phpt-full-fast      Run full PHPT gate after dev build' \
+      '  just phpt-verify-baseline Verify committed PHPT full baseline files' \
       '  just phpt-verify-source-integrity Verify pinned php-src was not mutated'
 
 fmt:
@@ -133,6 +144,7 @@ verify-performance:
 
 verify-phpt:
     scripts/phpt/verify_foundation.sh
+    @just phpt-verify-baseline
     scripts/phpt/verify_source_integrity.sh
     cargo test -p php_phpt_tools
 
@@ -242,11 +254,13 @@ ref-tokenizer-check:
     fi
 
 phpt-index *args:
-    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- phpt-index {{args}}
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools phpt-index {{args}}
 
 phpt-source-index *args:
-    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- source-index {{args}}
-    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- symbol-index {{args}}
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools source-index {{args}}
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools symbol-index {{args}}
 
 phpt-runner-smoke *args:
     scripts/phpt/runner_smoke.sh
@@ -257,20 +271,61 @@ phpt-reference-smoke *args:
 phpt-target-smoke *args:
     scripts/phpt/binary_smoke.sh target
 
+phpt-build:
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools -p php_vm_cli --bin phrust-php
+
+phpt-dev-build:
+    RUSTC_WRAPPER= CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}" cargo build -q -p php_phpt_tools --bin php-phpt-tools -p php_vm_cli --bin phrust-php
+
+phpt-dev-shell:
+    @if [[ -n "${IN_NIX_SHELL:-}" ]]; then \
+      just phpt-dev-build; \
+      exec "${SHELL:-bash}"; \
+    else \
+      nix develop -c bash -lc 'just phpt-dev-build; exec "${SHELL:-bash}"'; \
+    fi
+
 phpt-generate-module *args:
     scripts/phpt/generate_module.sh {{args}}
 
 phpt-module *args:
     scripts/phpt/module_run.sh {{args}}
 
+phpt-dev-module *args:
+    @PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-10}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_run.sh {{args}}
+
+phpt-module-target *args:
+    scripts/phpt/module_target.sh {{args}}
+
+phpt-fast *args:
+    @PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
+
+phpt-dev-fast *args:
+    @PHPT_SKIP_BUILD=1 PHPT_DEV_REUSE_PASS=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
+
+phpt-rerun-failures *args:
+    @PHPT_SKIP_BUILD=1 PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/rerun_failures.sh {{args}}
+
 phpt-full-regression *args:
     scripts/phpt/full_regression.sh {{args}}
+
+phpt-full-fast *args:
+    @PHPT_SKIP_BUILD=1 PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-30}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/full_regression.sh {{args}}
+
+phpt-triage *args:
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools triage {{args}}
+
+phpt-verify-baseline:
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools verify-baseline
 
 phpt-verify-source-integrity:
     scripts/phpt/verify_source_integrity.sh
 
 phpt-source-lookup *args:
-    cargo run -q -p php_phpt_tools --bin php-phpt-tools -- lookup-symbol {{args}}
+    cargo build -q -p php_phpt_tools --bin php-phpt-tools
+    ${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools lookup-symbol {{args}}
 
 phpt-official-smoke *args:
     scripts/phpt/official_smoke.sh {{args}}
@@ -281,8 +336,9 @@ stdlib-docs:
 stdlib-coverage:
     scripts/stdlib-coverage.sh
 
-generate-arginfo php_src="third_party/php-src" out="target/stdlib/generated/arginfo.rs":
+generate-arginfo php_src="third_party/php-src" out="crates/php_std/src/generated/arginfo.rs":
     scripts/stdlib/generate_arginfo.py --php-src "{{php_src}}" --overrides fixtures/stdlib/arginfo_overrides.txt --out "{{out}}"
+    rustfmt --edition 2024 "{{out}}"
 
 diff-stdlib:
     cargo build -q -p php_vm_cli --bin php-vm
@@ -459,12 +515,14 @@ runtime-fixtures:
     test "$code" -eq 3; \
     grep -q 'E_PHP_RUNTIME_UNDEFINED_CONSTANT' "$tmp_dir/constants-undefined.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/known_gaps/variables/undefined.php > "$tmp_dir/variables-undefined.out" 2> "$tmp_dir/variables-undefined.err"; \
-    printf 'x\n' > "$tmp_dir/variables-undefined.expected"; \
-    cmp "$tmp_dir/variables-undefined.expected" "$tmp_dir/variables-undefined.out"; \
+    sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/variables-undefined.out" > "$tmp_dir/variables-undefined.normalized"; \
+    printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/known_gaps/variables/undefined.php on line <line>\nx\n' "$PWD" > "$tmp_dir/variables-undefined.expected"; \
+    cmp "$tmp_dir/variables-undefined.expected" "$tmp_dir/variables-undefined.normalized"; \
     grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/variables-undefined.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/errors/warning-continuation.php > "$tmp_dir/errors-warning-continuation.out" 2> "$tmp_dir/errors-warning-continuation.err"; \
-    printf 'ok\n' > "$tmp_dir/errors-warning-continuation.expected"; \
-    cmp "$tmp_dir/errors-warning-continuation.expected" "$tmp_dir/errors-warning-continuation.out"; \
+    sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/errors-warning-continuation.out" > "$tmp_dir/errors-warning-continuation.normalized"; \
+    printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/valid/errors/warning-continuation.php on line <line>\nok\n' "$PWD" > "$tmp_dir/errors-warning-continuation.expected"; \
+    cmp "$tmp_dir/errors-warning-continuation.expected" "$tmp_dir/errors-warning-continuation.normalized"; \
     grep -q 'runtime-diagnostic:' "$tmp_dir/errors-warning-continuation.err"; \
     grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/errors-warning-continuation.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/control_flow/if-true-false.php > "$tmp_dir/control-if.out"; \

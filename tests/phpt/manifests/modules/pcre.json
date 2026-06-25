@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"pcre",
+  "priority":18,
+  "selected_manifest":"tests/phpt/manifests/modules/pcre.selected.jsonl",
+  "corpus_count":165,
+  "pass_count":36,
+  "skip_count":1,
+  "fail_count":126,
+  "bork_count":0,
+  "known_failure_count":126,
+  "scope":["preg_* builtins backed by PCRE2"],
+  "non_scope":["PCRE JIT/callout parity"],
+  "target_gates":["nix develop -c just phpt-module MODULE=pcre"],
+  "next_step":"Use PCRE2 while documenting unsupported modifier/callout gaps."
+}

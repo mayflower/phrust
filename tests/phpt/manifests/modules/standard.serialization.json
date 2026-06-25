@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"standard.serialization",
+  "priority":16,
+  "selected_manifest":"tests/phpt/manifests/modules/standard.serialization.selected.jsonl",
+  "corpus_count":126,
+  "pass_count":10,
+  "skip_count":0,
+  "fail_count":115,
+  "bork_count":0,
+  "known_failure_count":115,
+  "scope":["serialize","unserialize","value persistence"],
+  "non_scope":["session module persistence"],
+  "target_gates":["nix develop -c just phpt-module MODULE=standard.serialization"],
+  "next_step":"Implement serialization after arrays/objects are stable."
+}

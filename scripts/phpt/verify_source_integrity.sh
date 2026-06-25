@@ -8,8 +8,8 @@ if [[ -z "$php_src" ]]; then
   elif [[ -d third_party/php-src ]]; then
     php_src="third_party/php-src"
   else
-    printf '%s\n' 'No pinned php-src checkout found. Set PHP_SRC_DIR or bootstrap the reference checkout.' >&2
-    exit 1
+    printf '%s\n' '[skip] no pinned php-src checkout found; set PHP_SRC_DIR or run `just bootstrap-ref` for source-integrity verification.'
+    exit 0
   fi
 fi
 
@@ -32,4 +32,13 @@ if [[ ! -f "$manifest" ]]; then
   exit 0
 fi
 
-cargo run -q -p php_phpt_tools --bin php-phpt-tools -- verify-source --php-src "$php_src" --manifest "$manifest"
+default_phpt_tool="${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools"
+phpt_tool="${PHPT_TOOLS_BIN:-$default_phpt_tool}"
+if [[ -z "${PHPT_TOOLS_BIN:-}" && "$phpt_tool" == "$default_phpt_tool" ]]; then
+  cargo build -q -p php_phpt_tools --bin php-phpt-tools
+elif [[ ! -x "$phpt_tool" ]]; then
+  printf 'PHPT tools executable is not built: %s\n' "$phpt_tool" >&2
+  exit 1
+fi
+
+"$phpt_tool" verify-source --php-src "$php_src" --manifest "$manifest"

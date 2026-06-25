@@ -81,6 +81,15 @@ pub fn expectf_to_regex(pattern: &str) -> Result<Regex, String> {
     let mut index = 0usize;
     while index < pattern.len() {
         let rest = &pattern[index..];
+        if rest.starts_with("%r") {
+            if let Some(end) = pattern[index + 2..].find("%r") {
+                out.push_str("(?:");
+                out.push_str(&pattern[index + 2..index + 2 + end]);
+                out.push(')');
+                index += end + 4;
+                continue;
+            }
+        }
         if let Some(regex) = expectf_placeholder(rest) {
             out.push_str(regex.pattern);
             index += regex.width;
@@ -120,15 +129,24 @@ fn expectf_placeholder(rest: &str) -> Option<Placeholder> {
     let placeholder = chars.next()?;
     let pattern = match placeholder {
         '%' => "%",
+        'e' => {
+            if cfg!(windows) {
+                "\\\\"
+            } else {
+                "/"
+            }
+        }
         's' => "[^\\r\\n]+",
-        'S' => "\\S+",
+        'S' => "[^\\r\\n]*",
         'd' => "\\d+",
         'i' => "[+-]?\\d+",
         'f' => "[+-]?(?:\\d+\\.\\d*|\\d*\\.\\d+|\\d+)(?:[Ee][+-]?\\d+)?",
         'x' => "[0-9A-Fa-f]+",
         'w' => "\\s*",
-        'a' => ".+",
-        'A' => ".*",
+        'a' => ".+?",
+        'A' => ".*?",
+        'c' => ".",
+        '0' => "\\x00",
         _ => return None,
     };
     Some(Placeholder { pattern, width: 2 })
@@ -197,6 +215,36 @@ mod tests {
         assert!(match_expectation(ExpectationKind::ExpectF, "a%Aend", "a\nmiddle\nend").matched);
         assert!(match_expectation(ExpectationKind::ExpectF, "a%aend", "a\nx\nend").matched);
         assert!(!match_expectation(ExpectationKind::ExpectF, "a%aend", "aend").matched);
+    }
+
+    #[test]
+    fn expectf_matches_php_run_tests_placeholders() {
+        assert!(match_expectation(ExpectationKind::ExpectF, "a%0b", "a\0b").matched);
+        assert!(
+            match_expectation(ExpectationKind::ExpectF, "prefix%Ssuffix", "prefixsuffix").matched
+        );
+        assert!(match_expectation(ExpectationKind::ExpectF, "a%cb", "aXb").matched);
+        assert!(!match_expectation(ExpectationKind::ExpectF, "a%cb", "aXYb").matched);
+
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        assert!(
+            match_expectation(
+                ExpectationKind::ExpectF,
+                "root%edir",
+                &format!("root{separator}dir")
+            )
+            .matched
+        );
+    }
+
+    #[test]
+    fn expectf_supports_raw_regex_regions() {
+        assert!(
+            match_expectation(ExpectationKind::ExpectF, "value=%r[a-z]+%r", "value=abc").matched
+        );
+        assert!(
+            !match_expectation(ExpectationKind::ExpectF, "value=%r[a-z]+%r", "value=123").matched
+        );
     }
 
     #[test]

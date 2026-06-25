@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"arrays.references",
+  "priority":8,
+  "selected_manifest":"tests/phpt/manifests/modules/arrays.references.selected.jsonl",
+  "corpus_count":273,
+  "pass_count":13,
+  "skip_count":0,
+  "fail_count":260,
+  "bork_count":0,
+  "known_failure_count":260,
+  "scope":["ordered arrays","key conversion","references","copy-on-write","foreach"],
+  "non_scope":["SPL collection classes"],
+  "target_gates":["nix develop -c just phpt-module MODULE=standard.arrays"],
+  "next_step":"Close array data-model and reference/COW gaps before array builtins."
+}
