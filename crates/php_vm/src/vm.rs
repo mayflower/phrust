@@ -20346,6 +20346,7 @@ fn execute_builtin_entry(
         Some(&mut state.resources),
     );
     context.set_include_path(include_path);
+    context.set_ini_registry(state.ini.clone());
     context.set_diagnostic_display(diagnostic_display);
     context.set_strtok_state(&mut state.strtok_state);
     let result = (entry.function())(&mut context, args, source_span.clone());

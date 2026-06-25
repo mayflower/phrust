@@ -2476,9 +2476,9 @@ pub(in crate::builtins::modules) fn builtin_strnatcasecmp(
 }
 
 pub(in crate::builtins::modules) fn builtin_wordwrap(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(1..=4).contains(&args.len()) {
         return Err(arity_error("wordwrap", "one to four argument(s)"));
@@ -2527,6 +2527,13 @@ pub(in crate::builtins::modules) fn builtin_wordwrap(
         )));
     }
     let width = if width <= 0 { 1 } else { width as usize };
+    wordwrap_check_memory_limit(
+        context,
+        input.as_bytes(),
+        width,
+        break_string.as_bytes(),
+        &span,
+    )?;
     Ok(Value::string(wordwrap_bytes(
         input.as_bytes(),
         width,
@@ -7001,6 +7008,73 @@ fn wordwrap_zero_width_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
     output
 }
 
+fn wordwrap_check_memory_limit(
+    context: &mut BuiltinContext<'_>,
+    input: &[u8],
+    width: usize,
+    break_string: &[u8],
+    span: &RuntimeSourceSpan,
+) -> Result<(), BuiltinError> {
+    let Some(limit) = context
+        .ini_get("memory_limit")
+        .and_then(parse_php_memory_limit_bytes)
+    else {
+        return Ok(());
+    };
+    let Some(estimated) = wordwrap_worst_case_output_len(input.len(), width, break_string.len())
+    else {
+        return wordwrap_memory_limit_error(context, limit, usize::MAX, span);
+    };
+    if estimated <= limit {
+        return Ok(());
+    }
+    wordwrap_memory_limit_error(context, limit, estimated.saturating_sub(input.len()), span)
+}
+
+fn wordwrap_worst_case_output_len(
+    input_len: usize,
+    width: usize,
+    break_len: usize,
+) -> Option<usize> {
+    if input_len == 0 || width == 0 || break_len == 0 {
+        return Some(input_len);
+    }
+    let breaks = input_len.saturating_sub(1) / width;
+    input_len.checked_add(breaks.checked_mul(break_len)?)
+}
+
+fn wordwrap_memory_limit_error(
+    context: &mut BuiltinContext<'_>,
+    limit: usize,
+    allocation: usize,
+    span: &RuntimeSourceSpan,
+) -> Result<(), BuiltinError> {
+    let file = span.file.as_deref().unwrap_or("<unknown>");
+    let line = span.start;
+    let message = format!(
+        "Allowed memory size of {limit} bytes exhausted (tried to allocate {allocation} bytes)"
+    );
+    context.output().write_test_str(&format!(
+        "\nFatal error: {message} in {file} on line {line}\n"
+    ));
+    Err(BuiltinError::new("E_PHP_RUNTIME_MEMORY_LIMIT", message))
+}
+
+fn parse_php_memory_limit_bytes(value: &str) -> Option<usize> {
+    let value = value.trim();
+    if value.is_empty() || value == "-1" {
+        return None;
+    }
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024usize * 1024 * 1024),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024usize * 1024),
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
+        _ => (value, 1usize),
+    };
+    let bytes = number.trim().parse::<usize>().ok()?;
+    bytes.checked_mul(multiplier)
+}
+
 fn wordwrap_negative_cut_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in input {
@@ -8941,6 +9015,28 @@ mod tests {
             ),
             Value::string("123|==1234567890|==123")
         );
+    }
+
+    #[test]
+    fn wordwrap_reports_memory_limit_before_huge_break_allocation() {
+        let mut output = OutputBuffer::new();
+        let error = call_error(
+            "wordwrap",
+            vec![
+                Value::string(vec![b'x'; 65_534]),
+                Value::Int(1),
+                Value::string(vec![b'x'; 65_535]),
+            ],
+            &mut output,
+        );
+
+        assert_eq!(
+            error,
+            "Allowed memory size of 134217728 bytes exhausted (tried to allocate 4294705155 bytes)"
+        );
+        let output = output.to_string_lossy();
+        assert!(output.contains("Fatal error: Allowed memory size of 134217728 bytes exhausted"));
+        assert!(output.contains("(tried to allocate 4294705155 bytes)"));
     }
 
     #[test]

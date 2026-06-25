@@ -1,7 +1,7 @@
 //! Runtime services passed to internal builtins.
 
 use crate::{
-    FilesystemCapabilities, OutputBuffer, PHP_E_DEPRECATED, PHP_E_WARNING, PcreCache,
+    FilesystemCapabilities, IniRegistry, OutputBuffer, PHP_E_DEPRECATED, PHP_E_WARNING, PcreCache,
     PhpDiagnosticChannel, PhpDiagnosticDisplayOptions, ResourceTable, RuntimeDiagnostic,
     RuntimeSeverity, datetime, emit_php_diagnostic, pcre,
 };
@@ -101,6 +101,7 @@ pub struct BuiltinContext<'a> {
     output: &'a mut OutputBuffer,
     cwd: PathBuf,
     include_path: Vec<PathBuf>,
+    ini: IniRegistry,
     default_timezone: String,
     filesystem: FilesystemCapabilities,
     resources: Option<&'a mut ResourceTable>,
@@ -122,6 +123,7 @@ impl<'a> BuiltinContext<'a> {
             output,
             cwd: PathBuf::from("."),
             include_path: vec![PathBuf::from(".")],
+            ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
             filesystem: FilesystemCapabilities::none(),
             resources: None,
@@ -148,6 +150,7 @@ impl<'a> BuiltinContext<'a> {
             output,
             cwd: cwd.into(),
             include_path: vec![PathBuf::from(".")],
+            ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
             filesystem,
             resources,
@@ -251,6 +254,17 @@ impl<'a> BuiltinContext<'a> {
     /// Sets request-local include path entries.
     pub fn set_include_path(&mut self, include_path: Vec<PathBuf>) {
         self.include_path = include_path;
+    }
+
+    /// Reads a request-local INI option visible to standard-library builtins.
+    #[must_use]
+    pub fn ini_get(&self, name: &str) -> Option<&str> {
+        self.ini.get(name)
+    }
+
+    /// Sets request-local INI options visible to standard-library builtins.
+    pub fn set_ini_registry(&mut self, ini: IniRegistry) {
+        self.ini = ini;
     }
 
     /// Current request-local default timezone.
