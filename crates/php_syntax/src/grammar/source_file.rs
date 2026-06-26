@@ -81,4 +81,15 @@ mod tests {
         assert!(debug.contains("ECHO_STMT"));
         assert!(debug.contains("T_OPEN_TAG_WITH_ECHO"));
     }
+
+    #[test]
+    fn parses_integer_braced_variable_names() {
+        let source = "<?php ${10} = 42; var_dump(${10});";
+        let parse = parse_source_file(source);
+        let debug = parse.debug_tree();
+
+        assert_eq!(parse.reconstructed_text(), source);
+        assert!(parse.diagnostics().is_empty(), "{:#?}", parse.diagnostics());
+        assert_eq!(debug.matches("VARIABLE").count(), 2);
+    }
 }

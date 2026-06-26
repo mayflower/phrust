@@ -77,6 +77,27 @@
 
 - `nix develop -c just phpt-module MODULE=zend.basic`
 
+## Current Module Gate Status
+
+Last focused run on 2026-06-26:
+
+- Generated basis subset:
+  `PHPT_MANIFEST=tests/phpt/manifests/zend.basic-generated.jsonl nix develop -c just phpt-module MODULE=zend.basic`
+  - 5 PASS
+  - 0 SKIP
+  - 0 FAIL
+  - 0 BORK
+- Full selected module gate:
+  `nix develop -c just phpt-module MODULE=zend.basic`
+  - Reference: 200 PASS, 0 non-green
+  - Target: 12 PASS, 14 SKIP, 174 FAIL
+
+Closed basis gaps:
+
+- namespaced calls to global internal functions, e.g. `namespace Foo; strlen(...)`
+- integer braced variable names, e.g. `${10}`
+- PHP array union for `array + array`
+
 ## Known Gaps
 
 - `runtime-error-or-diagnostic`: 1386
@@ -85,6 +106,13 @@
 - `frontend-parse-or-compile`: 43
 - `runtime-timeout`: 9
 
+The current selected module still includes features outside the basis scope:
+WeakMap/WeakReference, advanced type declarations and variance, traits,
+advanced parameter defaults, INI parsing helpers, exact floating-point string
+formatting, and diagnostic wording parity.
+
 ## Next Step
 
-Keep the selected zend.basic gate green while later modules expand runtime semantics.
+Reduce the selected manifest to the documented basis scope or continue with the
+next highest-leverage in-scope failures before treating broader WeakMap,
+type-system, object, and INI cases as part of this module.

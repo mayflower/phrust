@@ -7518,6 +7518,14 @@ fn include_kind(kind: &str) -> Option<IncludeKind> {
 }
 
 fn local_name(name: &str) -> &str {
+    if let Some(inner) = name
+        .strip_prefix("${")
+        .and_then(|name| name.strip_suffix('}'))
+        && !inner.is_empty()
+        && inner.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return inner;
+    }
     name.strip_prefix('$').unwrap_or(name)
 }
 
@@ -8506,6 +8514,18 @@ mod tests {
             interpolated_literal_parts("\"a {$counter} b\"").is_some(),
             "braced simple interpolation should be recognized"
         );
+    }
+
+    #[test]
+    fn integer_braced_variable_names_lower_to_stable_local_slot() {
+        let frontend = analyze_source("<?php ${10} = 42; echo ${10};");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("local:0 $10"), "{snapshot}");
+        assert_eq!(snapshot.matches("local:0 $10").count(), 1, "{snapshot}");
     }
 
     #[test]

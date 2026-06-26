@@ -11193,10 +11193,10 @@ impl Vm {
                 name: name.to_owned(),
             });
         }
-        if BuiltinRegistry::new().contains(name) {
+        if let Some(name) = internal_registry_builtin_call_name(name) {
             return Some(FunctionCallCacheTarget::Builtin {
                 kind: FunctionCallBuiltinKind::InternalRegistry,
-                name: name.to_owned(),
+                name,
             });
         }
         None
@@ -13245,6 +13245,11 @@ impl Vm {
                 Ok(Value::String(PhpString::from_bytes(bytes)))
             }
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                if op == BinaryOp::Add
+                    && let Some(union) = try_array_union(lhs, rhs)
+                {
+                    return Ok(union);
+                }
                 if has_array_operand(lhs) || has_array_operand(rhs) {
                     return Err(unsupported_operand_types_error(
                         output,
@@ -24030,12 +24035,40 @@ fn execute_arithmetic(op: BinaryOp, lhs: NumericValue, rhs: NumericValue) -> Res
     }
 }
 
+fn internal_registry_builtin_call_name(name: &str) -> Option<String> {
+    let registry = BuiltinRegistry::new();
+    if registry.contains(name) {
+        return Some(name.to_owned());
+    }
+    let short = name.rsplit_once('\\')?.1;
+    if short.is_empty() {
+        return None;
+    }
+    registry.contains(short).then(|| short.to_owned())
+}
+
 fn has_array_operand(value: &Value) -> bool {
     match value {
         Value::Array(_) => true,
         Value::Reference(cell) => has_array_operand(&cell.get()),
         _ => false,
     }
+}
+
+fn try_array_union(lhs: &Value, rhs: &Value) -> Option<Value> {
+    let Value::Array(lhs) = effective_value(lhs) else {
+        return None;
+    };
+    let Value::Array(rhs) = effective_value(rhs) else {
+        return None;
+    };
+    let mut result = lhs.clone();
+    for (key, value) in rhs.iter() {
+        if result.get(key).is_none() {
+            result.insert(key.clone(), effective_value(value));
+        }
+    }
+    Some(Value::Array(result))
 }
 
 fn unsupported_operand_types_error(
@@ -27152,6 +27185,24 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn function_calls_fallback_to_global_internal_builtin_from_namespace() {
+        let result = execute_source("<?php namespace Foo; echo strlen('abc');");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"3");
+    }
+
+    #[test]
+    fn function_calls_prefer_namespaced_user_function_over_builtin_fallback() {
+        let result = execute_source(
+            "<?php namespace Foo; function strlen($value) { return 7; } echo strlen('abc');",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"7");
+    }
+
+    #[test]
     fn function_call_inline_cache_invalidates_after_include_defined_function() {
         let result = execute_fixture_file_with_options(
             "tests/fixtures/performance/inline_cache/include-invalidation.php",
@@ -28854,6 +28905,27 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"3x");
+    }
+
+    #[test]
+    fn variables_execute_integer_braced_names() {
+        let result = execute_source("<?php ${10} = 42; var_dump(${10});");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"int(42)\n");
+    }
+
+    #[test]
+    fn binary_add_executes_php_array_union() {
+        let result = execute_source(
+            "<?php $a = [0 => 'left', 'k' => 'keep']; $b = [0 => 'right', 1 => 'new', 'k' => 'drop']; var_dump($a + $b);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "array(3) {\n  [0]=>\n  string(4) \"left\"\n  [\"k\"]=>\n  string(4) \"keep\"\n  [1]=>\n  string(3) \"new\"\n}\n"
+        );
     }
 
     #[test]
