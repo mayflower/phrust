@@ -5305,7 +5305,14 @@ pub(in crate::builtins::modules) fn builtin_var_dump(
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    let mut formatter = DebugFormatter::default();
+    let serialize_precision = context
+        .ini_get("serialize_precision")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(-1);
+    let mut formatter = DebugFormatter {
+        serialize_precision,
+        ..DebugFormatter::default()
+    };
     for value in &args {
         formatter.write_var_dump_value(context.output(), value, 0);
     }
@@ -9694,10 +9701,22 @@ fn runtime_type_name(value: &Value) -> &'static str {
     }
 }
 
-#[derive(Default)]
 struct DebugFormatter {
     active_references: BTreeSet<usize>,
     active_arrays: BTreeSet<usize>,
+    /// `serialize_precision` ini value applied to var_dump floats (`-1` selects
+    /// the shortest round-trippable representation).
+    serialize_precision: i32,
+}
+
+impl Default for DebugFormatter {
+    fn default() -> Self {
+        Self {
+            active_references: BTreeSet::new(),
+            active_arrays: BTreeSet::new(),
+            serialize_precision: -1,
+        }
+    }
 }
 
 impl DebugFormatter {
@@ -9708,7 +9727,10 @@ impl DebugFormatter {
             Value::Bool(false) => output.write_test_str("bool(false)\n"),
             Value::Int(value) => output.write_test_str(&format!("int({value})\n")),
             Value::Float(value) => {
-                output.write_test_str(&format!("float({})\n", php_float_debug_string(*value)));
+                output.write_test_str(&format!(
+                    "float({})\n",
+                    php_float_debug_string(*value, self.serialize_precision)
+                ));
             }
             Value::String(value) => {
                 output.write_test_str(&format!("string({}) \"", value.len()));
@@ -9984,7 +10006,7 @@ fn write_export_single_quoted_string(output: &mut OutputBuffer, text: &str) {
     output.write_test_str("'");
 }
 
-fn php_float_debug_string(value: FloatValue) -> String {
+fn php_float_debug_string(value: FloatValue, serialize_precision: i32) -> String {
     let value = value.to_f64();
     if value.is_nan() {
         return "NAN".to_owned();
@@ -9997,6 +10019,12 @@ fn php_float_debug_string(value: FloatValue) -> String {
         };
     }
 
+    // serialize_precision >= 1 selects PHP's `%.*G` formatting; -1 (and 0, which
+    // PHP maps to the shortest mode here) selects the shortest round-trip form.
+    if serialize_precision >= 1 {
+        return php_gcvt(value, serialize_precision as usize);
+    }
+
     if value != 0.0 {
         let abs = value.abs();
         if !(1e-4..1e17).contains(&abs) {
@@ -10004,6 +10032,56 @@ fn php_float_debug_string(value: FloatValue) -> String {
         }
     }
     value.to_string()
+}
+
+/// Reimplements PHP's `php_gcvt` (a `%.*G`-style conversion) used by var_dump
+/// and serialize when `serialize_precision` is a positive number of significant
+/// digits: trailing zeros are stripped, and scientific notation is chosen when
+/// the decimal point falls before -4 or after `ndigit` significant digits.
+fn php_gcvt(value: f64, ndigit: usize) -> String {
+    let ndigit = ndigit.max(1);
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let negative = value < 0.0;
+    let abs = value.abs();
+    // Significant digits + exponent via scientific formatting.
+    let scientific = format!("{:.*E}", ndigit - 1, abs);
+    let exponent: i32 = scientific
+        .split_once('E')
+        .and_then(|(_, exp)| exp.parse().ok())
+        .unwrap_or(0);
+    let decimal_point = exponent + 1;
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if decimal_point < -4 || decimal_point > ndigit as i32 {
+        let (mantissa, _) = scientific
+            .split_once('E')
+            .unwrap_or((scientific.as_str(), ""));
+        let mut mantissa = mantissa
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned();
+        if !mantissa.contains('.') {
+            mantissa.push_str(".0");
+        }
+        out.push_str(&mantissa);
+        out.push('E');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        out.push_str(&exponent.abs().to_string());
+    } else {
+        let decimals = (ndigit as i32 - decimal_point).max(0) as usize;
+        let fixed = format!("{abs:.decimals$}");
+        let fixed = if fixed.contains('.') {
+            fixed.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            fixed.as_str()
+        };
+        out.push_str(fixed);
+    }
+    out
 }
 
 fn php_float_debug_scientific_string(value: f64) -> String {

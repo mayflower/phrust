@@ -15,6 +15,8 @@ pub struct CliIniOptions {
     pub include_path: Option<Vec<PathBuf>>,
     pub display_errors: Option<bool>,
     pub error_reporting: Option<i64>,
+    /// Raw `-d name=value` ini overrides forwarded to the runtime registry.
+    pub overrides: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +151,7 @@ fn runtime_context_for(
             .with_cwd(input.cwd.clone())
             .with_include_path(include_path)
             .with_env(input.env.clone())
+            .with_ini_overrides(input.ini.overrides.clone())
             .with_stdin(input.stdin.clone());
     if let Some(mask) = input.ini.error_reporting {
         context.ini.error_reporting = ErrorReporting { mask };

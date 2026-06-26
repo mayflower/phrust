@@ -74,6 +74,9 @@ pub struct RuntimeContext {
     pub include_path: Vec<PathBuf>,
     /// Minimal ini-like options.
     pub ini: RuntimeIniOptions,
+    /// Generic `-d name=value` ini overrides applied to the per-request registry
+    /// (e.g. `serialize_precision`), in addition to the typed options above.
+    pub ini_overrides: Vec<(String, String)>,
     /// Strict-types metadata collected by future frontend integration.
     pub strict_types: Vec<StrictTypesInfo>,
     /// Host filesystem capability policy for stream and filesystem builtins.
@@ -91,6 +94,7 @@ impl Default for RuntimeContext {
             stdin: Vec::new(),
             include_path: vec![PathBuf::from(".")],
             ini: RuntimeIniOptions::default(),
+            ini_overrides: Vec::new(),
             strict_types: Vec::new(),
             filesystem: FilesystemCapabilities::none(),
             process: ProcessCapability::Disabled,
@@ -124,6 +128,13 @@ impl RuntimeContext {
         self
     }
 
+    /// Sets generic ini overrides (e.g. from CLI `-d name=value`).
+    #[must_use]
+    pub fn with_ini_overrides(mut self, overrides: Vec<(String, String)>) -> Self {
+        self.ini_overrides = overrides;
+        self
+    }
+
     /// Builds the per-request INI registry from deterministic context fields.
     #[must_use]
     pub fn ini_registry(&self) -> IniRegistry {
@@ -140,6 +151,9 @@ impl RuntimeContext {
             "display_errors",
             if self.ini.display_errors { "1" } else { "0" },
         );
+        for (name, value) in &self.ini_overrides {
+            let _ = registry.set(name, value.clone());
+        }
         registry
     }
 

@@ -267,7 +267,10 @@ fn parse_define(value: &str) -> (String, String) {
 }
 
 fn ini_options(defines: &[(String, String)]) -> CliIniOptions {
-    let mut options = CliIniOptions::default();
+    let mut options = CliIniOptions {
+        overrides: defines.to_vec(),
+        ..CliIniOptions::default()
+    };
     for (name, value) in defines {
         match name.as_str() {
             "include_path" => {

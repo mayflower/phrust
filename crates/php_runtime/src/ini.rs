@@ -99,7 +99,7 @@ fn default_entries() -> [(&'static str, &'static str); 8] {
         ("include_path", "."),
         ("memory_limit", "128M"),
         ("precision", "14"),
-        ("serialize_precision", "14"),
+        ("serialize_precision", "-1"),
     ]
 }
 
