@@ -357,9 +357,7 @@ impl PhpArray {
     /// Advances the internal pointer by one element.
     pub fn next_pointer(&mut self) -> Option<Value> {
         let storage = self.storage_mut();
-        let Some(current) = storage.internal_pointer else {
-            return None;
-        };
+        let current = storage.internal_pointer?;
         let next = current.saturating_add(1);
         if next >= storage.entries.len() {
             storage.internal_pointer = None;

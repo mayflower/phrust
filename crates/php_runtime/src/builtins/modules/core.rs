@@ -9669,12 +9669,12 @@ impl DebugFormatter {
                     output.write_test_str("*RECURSION*\n");
                     return;
                 }
-                if let Value::Array(array) = cell.get() {
-                    if self.active_arrays.contains(&array.gc_debug_id()) {
-                        output.write_test_str("*RECURSION*\n");
-                        self.active_references.remove(&id);
-                        return;
-                    }
+                if let Value::Array(array) = cell.get()
+                    && self.active_arrays.contains(&array.gc_debug_id())
+                {
+                    output.write_test_str("*RECURSION*\n");
+                    self.active_references.remove(&id);
+                    return;
                 }
                 output.write_test_str("&");
                 self.write_var_dump_value(output, &cell.get(), indent);

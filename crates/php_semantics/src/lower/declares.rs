@@ -146,12 +146,11 @@ fn unquote_string(text: &str) -> String {
     } else {
         0
     };
-    if text.len() >= quote_start + 2 {
-        if (bytes[quote_start] == b'"' && bytes[text.len() - 1] == b'"')
-            || (bytes[quote_start] == b'\'' && bytes[text.len() - 1] == b'\'')
-        {
-            return text[quote_start + 1..text.len() - 1].to_owned();
-        }
+    if text.len() >= quote_start + 2
+        && ((bytes[quote_start] == b'"' && bytes[text.len() - 1] == b'"')
+            || (bytes[quote_start] == b'\'' && bytes[text.len() - 1] == b'\''))
+    {
+        return text[quote_start + 1..text.len() - 1].to_owned();
     }
     text.to_owned()
 }

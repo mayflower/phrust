@@ -1240,7 +1240,7 @@ struct CallPropertyTarget {
 
 enum InternalBuiltinArgError {
     Message(String),
-    Fatal(VmResult),
+    Fatal(Box<VmResult>),
 }
 
 struct MultisortArraySpec {
@@ -9227,7 +9227,7 @@ impl Vm {
                     Err(InternalBuiltinArgError::Message(message)) => {
                         return self.runtime_error(output, compiled, stack, message);
                     }
-                    Err(InternalBuiltinArgError::Fatal(result)) => return result,
+                    Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                 };
                 if name == "var_dump"
                     && let Some(message) = debug_info_gap_message(compiled, &values)
@@ -10597,9 +10597,9 @@ impl Vm {
             .map(|spec| spec.entries.len())
             .expect("checked non-empty");
         if specs.iter().any(|spec| spec.entries.len() != len) {
-            return Err(ArrayCallbackError::Message(format!(
-                "E_PHP_RUNTIME_BUILTIN_VALUE: Array sizes are inconsistent"
-            )));
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_RUNTIME_BUILTIN_VALUE: Array sizes are inconsistent".to_string(),
+            ));
         }
 
         let mut order = (0..len).collect::<Vec<_>>();
@@ -10904,8 +10904,8 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
-        let left = self.sort_regular_comparable_value(compiled, left, output, stack, state)?;
-        let right = self.sort_regular_comparable_value(compiled, right, output, stack, state)?;
+        let left = Self::sort_regular_comparable_value(left);
+        let right = Self::sort_regular_comparable_value(right);
         if matches!((&left, &right), (Value::Object(_), Value::Object(_))) {
             return compare(&left, &right)
                 .map_err(|message| ArrayCallbackError::Message(format!("sort: {message}")));
@@ -10918,19 +10918,10 @@ impl Vm {
             .map_err(|message| ArrayCallbackError::Message(format!("sort: {message}")))
     }
 
-    fn sort_regular_comparable_value(
-        &self,
-        compiled: &CompiledUnit,
-        value: &Value,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, ArrayCallbackError> {
+    fn sort_regular_comparable_value(value: &Value) -> Value {
         match value {
-            Value::Reference(cell) => {
-                self.sort_regular_comparable_value(compiled, &cell.get(), output, stack, state)
-            }
-            other => Ok(other.clone()),
+            Value::Reference(cell) => Self::sort_regular_comparable_value(&cell.get()),
+            other => other.clone(),
         }
     }
 
@@ -11106,7 +11097,7 @@ impl Vm {
                 Err(InternalBuiltinArgError::Message(message)) => {
                     return self.runtime_error(output, compiled, stack, message);
                 }
-                Err(InternalBuiltinArgError::Fatal(result)) => return result,
+                Err(InternalBuiltinArgError::Fatal(result)) => return *result,
             };
             if normalized == "var_dump"
                 && let Some(message) = debug_info_gap_message(compiled, &values)
@@ -11277,7 +11268,7 @@ impl Vm {
                         Err(InternalBuiltinArgError::Message(message)) => {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        Err(InternalBuiltinArgError::Fatal(result)) => return result,
+                        Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                     };
                     if name == "var_dump"
                         && let Some(message) = debug_info_gap_message(compiled, &values)
@@ -11688,25 +11679,24 @@ impl Vm {
                 ),
             );
         }
-        if method_entry.flags.is_private || method_entry.flags.is_protected {
-            if let Err(message) =
+        if (method_entry.flags.is_private || method_entry.flags.is_protected)
+            && let Err(message) =
                 validate_method_callable(compiled, stack, declaring_class, method_entry)
-            {
-                return match self.call_magic_instance_method(
-                    compiled,
-                    object.clone(),
-                    "__call",
-                    method,
-                    args,
-                    output,
-                    stack,
-                    state,
-                ) {
-                    Ok(Some(result)) => result,
-                    Ok(None) => self.runtime_error(output, compiled, stack, message),
-                    Err(result) => result,
-                };
-            }
+        {
+            return match self.call_magic_instance_method(
+                compiled,
+                object.clone(),
+                "__call",
+                method,
+                args,
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => self.runtime_error(output, compiled, stack, message),
+                Err(result) => result,
+            };
         }
         if let Err(message) =
             validate_method_callable(compiled, stack, declaring_class, method_entry)
@@ -23507,7 +23497,7 @@ fn call_builtin_args_to_positional(
                 values.push(Value::Reference(ReferenceCell::new(arg.value)));
                 continue;
             }
-            return Err(InternalBuiltinArgError::Fatal(
+            return Err(InternalBuiltinArgError::Fatal(Box::new(
                 internal_builtin_by_ref_temporary_fatal_result(
                     output,
                     compiled,
@@ -23516,7 +23506,7 @@ fn call_builtin_args_to_positional(
                     index + 1,
                     param_name,
                 ),
-            ));
+            )));
         }
         values.push(arg.value);
     }

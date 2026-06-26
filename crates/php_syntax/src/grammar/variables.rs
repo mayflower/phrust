@@ -7,8 +7,8 @@ use php_lexer::TokenName;
 
 /// Parses a simple variable such as `$x`.
 pub(crate) fn parse_simple_variable(parser: &mut Parser<'_>) -> bool {
-    if !parser.at(named(TokenName::Variable))
-        && !(parser.at(symbol(b'$')) && parser.nth(1) == symbol(b'{'))
+    if !(parser.at(named(TokenName::Variable))
+        || parser.at(symbol(b'$')) && parser.nth(1) == symbol(b'{'))
     {
         return false;
     }
