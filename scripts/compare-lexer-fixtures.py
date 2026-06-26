@@ -21,6 +21,7 @@ FIXTURE_DIR = ROOT / "tests" / "fixtures" / "lexer"
 TOKENIZE_SCRIPT = ROOT / "scripts" / "tokenize-reference.php"
 PINNED_PHP = ROOT / "third_party" / "php-src" / "sapi" / "cli" / "php"
 DEFAULT_ALLOWLIST = ROOT / "tests" / "fixtures" / "lexer" / "allowlist.toml"
+EXPECTED_PHP_VERSION = "8.5.7"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,19 @@ def find_php() -> str | None:
     if PINNED_PHP.exists() and os.access(PINNED_PHP, os.X_OK):
         return str(PINNED_PHP)
     return shutil.which("php")
+
+
+def php_version(php: str) -> str | None:
+    process = subprocess.run(
+        [php, "-r", "echo PHP_VERSION;"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        return None
+    return process.stdout.strip()
 
 
 def tokenize_reference(php: str, fixture: Path) -> dict[str, Any]:
@@ -191,6 +205,15 @@ def main() -> int:
     if php is None:
         print(
             "[skip] no PHP binary found; set REFERENCE_PHP or build the pinned reference",
+            file=sys.stderr,
+        )
+        return 0
+
+    version = php_version(php)
+    if version != EXPECTED_PHP_VERSION:
+        print(
+            f"[skip] lexer fixture comparison requires PHP {EXPECTED_PHP_VERSION}; "
+            f"{php} reports {version or 'unknown'}",
             file=sys.stderr,
         )
         return 0
