@@ -96,22 +96,7 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@v10
 
       - name: Test PHPT tooling
-        run: nix develop -c cargo test -p php_phpt_tools
-
-      - name: Build VM CLI
-        run: nix develop -c cargo build -p php_vm_cli --bin php-vm
-
-      - name: Run committed generated PHPT smoke tests
-        run: |
-          nix develop -c cargo run -q -p php_phpt_tools --bin php-phpt-tools -- run \
-            --target target/debug/php-vm \
-            --target-mode php-vm \
-            --manifest tests/phpt/manifests/runner-smoke.jsonl \
-            --out target/phpt-work/ci/runner-smoke/results.jsonl \
-            --summary target/phpt-work/ci/runner-smoke/summary.md \
-            --php-src . \
-            --work-dir target/phpt-work/ci/runner-smoke \
-            --timeout-seconds 10
+        run: nix develop -c just ci-phpt-smoke
 
       - name: Upload PHPT smoke reports
         if: always()

@@ -253,8 +253,8 @@ SOURCE_FILE @0..723
                   T_LNUMBER @323..324 line=27 text="1"
                 T_WHITESPACE @324..325 line=27 text=" "
               T_DOUBLE_ARROW @325..327 line=27 text="=>"
-              EXPR @327..329
-                T_WHITESPACE @327..328 line=27 text=" "
+              T_WHITESPACE @327..328 line=27 text=" "
+              EXPR @328..329
                 LITERAL @328..329
                   T_LNUMBER @328..329 line=27 text="2"
             , @329..330 line=27 text=","
@@ -265,8 +265,8 @@ SOURCE_FILE @0..723
                   T_LNUMBER @331..332 line=27 text="3"
                 T_WHITESPACE @332..333 line=27 text=" "
               T_DOUBLE_ARROW @333..335 line=27 text="=>"
-              EXPR @335..337
-                T_WHITESPACE @335..336 line=27 text=" "
+              T_WHITESPACE @335..336 line=27 text=" "
+              EXPR @336..337
                 LITERAL @336..337
                   T_LNUMBER @336..337 line=27 text="4"
             ] @337..338 line=27 text="]"

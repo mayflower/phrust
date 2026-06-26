@@ -3959,10 +3959,7 @@ fn capture_stdio(sections: &[PhptSection]) -> CaptureStdio {
     }
 }
 
-fn stdin_from_sections<'a>(
-    sections: &'a [PhptSection],
-    capture_stdio: CaptureStdio,
-) -> Option<&'a str> {
+fn stdin_from_sections(sections: &[PhptSection], capture_stdio: CaptureStdio) -> Option<&str> {
     section(sections, "STDIN")
         .map(|section| section.body.as_str())
         .or_else(|| capture_stdio.stdin.then_some(""))

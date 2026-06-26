@@ -81,14 +81,14 @@ pub fn expectf_to_regex(pattern: &str) -> Result<Regex, String> {
     let mut index = 0usize;
     while index < pattern.len() {
         let rest = &pattern[index..];
-        if rest.starts_with("%r") {
-            if let Some(end) = pattern[index + 2..].find("%r") {
-                out.push_str("(?:");
-                out.push_str(&normalize_pcre_regex(&pattern[index + 2..index + 2 + end]));
-                out.push(')');
-                index += end + 4;
-                continue;
-            }
+        if rest.starts_with("%r")
+            && let Some(end) = pattern[index + 2..].find("%r")
+        {
+            out.push_str("(?:");
+            out.push_str(&normalize_pcre_regex(&pattern[index + 2..index + 2 + end]));
+            out.push(')');
+            index += end + 4;
+            continue;
         }
         if let Some(regex) = expectf_placeholder(rest) {
             out.push_str(regex.pattern);
@@ -169,9 +169,9 @@ fn looks_like_quantifier<I>(chars: &I) -> bool
 where
     I: Iterator<Item = char> + Clone,
 {
-    let mut clone = chars.clone();
+    let clone = chars.clone();
     let mut saw_digit = false;
-    while let Some(ch) = clone.next() {
+    for ch in clone {
         match ch {
             '0'..='9' => saw_digit = true,
             ',' => {}

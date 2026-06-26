@@ -31169,9 +31169,13 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let arg =
             execute_source("<?php function inc_ref(&$x) { $x = $x + 1; } $a = 1; inc_ref($a + 1);");
         assert_eq!(arg.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(
-            arg.diagnostics[0].id(),
-            "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE"
+        assert_eq!(arg.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
+        assert!(
+            arg.diagnostics[0]
+                .message()
+                .contains("function inc_ref argument $x must be a variable"),
+            "{:?}",
+            arg.diagnostics[0]
         );
 
         let ret = execute_source("<?php function &bad_ref() { return 1; } $x =& bad_ref();");

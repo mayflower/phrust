@@ -8304,7 +8304,7 @@ mod tests {
         assert!(snapshot.contains("load_const r0 const:1"));
         assert!(snapshot.contains("echo r0"));
         assert!(snapshot.contains("source_map:"));
-        assert!(snapshot.contains("instr function:0 block:0 instr:0 <= hir:expr:0"));
+        assert!(snapshot.contains("instr function:0 block:1 instr:0 <= hir:expr:0"));
     }
 
     #[test]

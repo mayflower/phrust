@@ -121,17 +121,17 @@
             pcre2
           ];
 
-          linuxPackages = with pkgs; [
+          linuxDevPackages = with pkgs; [
             gdb
             mold
             valgrind
-            linuxPackages.perf
+            perf
             shellcheck
           ] ++ nativeBuildPackages;
         in
         {
           default = pkgs.mkShellNoCC {
-            packages = commonPackages ++ linuxPackages;
+            packages = commonPackages ++ linuxDevPackages;
 
             PHP_REF_SERIES = "8.5";
             PHP_REF_VERSION = "8.5.7";

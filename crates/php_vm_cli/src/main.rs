@@ -278,7 +278,7 @@ where
     stdout
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
-    write_runtime_diagnostics(stderr, path, &result.diagnostics)?;
+    write_runtime_diagnostics(stderr, path, &result)?;
     if run_options.trace || run_options.trace_runtime {
         write_trace(stderr, &result.trace)?;
     }
@@ -563,9 +563,13 @@ fn write_status<W: Write>(
 fn write_runtime_diagnostics<W: Write>(
     stderr: &mut W,
     path: &str,
-    diagnostics: &[php_runtime::RuntimeDiagnostic],
+    result: &php_vm::VmResult,
 ) -> Result<(), String> {
-    for diagnostic in diagnostics {
+    let php_output = result.output.to_string_lossy();
+    for diagnostic in &result.diagnostics {
+        if result.status.is_success() && php_output.contains(diagnostic.message()) {
+            continue;
+        }
         writeln!(
             stderr,
             "{path}: runtime-diagnostic: {}",
@@ -2888,6 +2892,50 @@ mod tests {
         );
         assert!(
             stderr.contains("\"stack\":[{\"function\":\"main\"}]"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn successful_warning_output_does_not_emit_internal_runtime_diagnostics() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                fixture("tests/fixtures/stdlib/_harness/stdlib/array_flip_warning.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("Warning: array_flip()"), "{stdout}");
+        assert!(!stdout.contains("runtime-diagnostic:"), "{stdout}");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(!stderr.contains("runtime-diagnostic:"), "{stderr}");
+    }
+
+    #[test]
+    fn successful_unrendered_warning_keeps_structured_diagnostic() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                fixture("fixtures/runtime/valid/arrays/missing-key.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"x\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("runtime-diagnostic:"), "{stderr}");
+        assert!(
+            stderr.contains("E_PHP_RUNTIME_UNDEFINED_ARRAY_KEY_WARNING"),
             "{stderr}"
         );
     }

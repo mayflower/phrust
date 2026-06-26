@@ -85,7 +85,9 @@ SOURCE_FILE @0..254
                 T_VARIABLE @141..147 line=8 text="$items"
               ARRAY_DIM_FETCH_EXPR @147..150
                 [ @147..148 line=8 text="["
-                T_LNUMBER @148..149 line=8 text="0"
+                EXPR @148..149
+                  LITERAL @148..149
+                    T_LNUMBER @148..149 line=8 text="0"
                 ] @149..150 line=8 text="]"
             ; @150..151 line=8 text=";"
           T_WHITESPACE @151..152 line=8 text="\n"

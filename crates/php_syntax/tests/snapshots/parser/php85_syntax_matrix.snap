@@ -119,8 +119,8 @@ SOURCE_FILE @0..364
                           T_CONSTANT_ENCAPSED_STRING @184..190 line=10 text="\"name\""
                         T_WHITESPACE @190..191 line=10 text=" "
                       T_DOUBLE_ARROW @191..193 line=10 text="=>"
-                      EXPR @193..199
-                        T_WHITESPACE @193..194 line=10 text=" "
+                      T_WHITESPACE @193..194 line=10 text=" "
+                      EXPR @194..199
                         STRING @194..199
                           T_CONSTANT_ENCAPSED_STRING @194..199 line=10 text="\"new\""
                     ] @199..200 line=10 text="]"

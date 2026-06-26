@@ -1582,12 +1582,15 @@ fn check_instruction(
             id,
         )),
         InstructionKind::NewObject { .. }
+        | InstructionKind::DynamicNewObject { .. }
         | InstructionKind::CloneObject { .. }
         | InstructionKind::CloneWith { .. }
         | InstructionKind::InstanceOf { .. }
         | InstructionKind::FetchProperty { .. }
         | InstructionKind::IssetProperty { .. }
         | InstructionKind::EmptyProperty { .. }
+        | InstructionKind::IssetPropertyDim { .. }
+        | InstructionKind::EmptyPropertyDim { .. }
         | InstructionKind::UnsetProperty { .. }
         | InstructionKind::FetchStaticProperty { .. }
         | InstructionKind::FetchClassConstant { .. }
@@ -1604,6 +1607,7 @@ fn check_instruction(
         | InstructionKind::InitStaticLocal { .. }
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::Echo { .. }
+        | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => rejected.push(JitEligibilityReason::instruction(
             "JIT_ELIGIBILITY_REJECT_OBSERVABLE_OPCODE",

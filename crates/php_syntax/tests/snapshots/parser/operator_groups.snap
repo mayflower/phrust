@@ -293,28 +293,28 @@ SOURCE_FILE @0..369
             T_VARIABLE @305..314 line=13 text="$keywords"
           T_WHITESPACE @314..315 line=13 text=" "
           = @315..316 line=13 text="="
-          BINARY_EXPR @316..339
+          EXPR @316..320
             T_WHITESPACE @316..317 line=13 text=" "
             VARIABLE @317..319
               T_VARIABLE @317..319 line=13 text="$a"
             T_WHITESPACE @319..320 line=13 text=" "
-            T_LOGICAL_AND @320..323 line=13 text="and"
-            EXPR @323..327
-              T_WHITESPACE @323..324 line=13 text=" "
-              VARIABLE @324..326
-                T_VARIABLE @324..326 line=13 text="$b"
-              T_WHITESPACE @326..327 line=13 text=" "
-            T_LOGICAL_XOR @327..330 line=13 text="xor"
-            EXPR @330..334
-              T_WHITESPACE @330..331 line=13 text=" "
-              VARIABLE @331..333
-                T_VARIABLE @331..333 line=13 text="$c"
-              T_WHITESPACE @333..334 line=13 text=" "
-            T_LOGICAL_OR @334..336 line=13 text="or"
-            EXPR @336..339
-              T_WHITESPACE @336..337 line=13 text=" "
-              VARIABLE @337..339
-                T_VARIABLE @337..339 line=13 text="$d"
+          T_LOGICAL_AND @320..323 line=13 text="and"
+          EXPR @323..327
+            T_WHITESPACE @323..324 line=13 text=" "
+            VARIABLE @324..326
+              T_VARIABLE @324..326 line=13 text="$b"
+            T_WHITESPACE @326..327 line=13 text=" "
+          T_LOGICAL_XOR @327..330 line=13 text="xor"
+          EXPR @330..334
+            T_WHITESPACE @330..331 line=13 text=" "
+            VARIABLE @331..333
+              T_VARIABLE @331..333 line=13 text="$c"
+            T_WHITESPACE @333..334 line=13 text=" "
+          T_LOGICAL_OR @334..336 line=13 text="or"
+          EXPR @336..339
+            T_WHITESPACE @336..337 line=13 text=" "
+            VARIABLE @337..339
+              T_VARIABLE @337..339 line=13 text="$d"
         ; @339..340 line=13 text=";"
       T_WHITESPACE @340..341 line=13 text="\n"
       EXPR_STMT @341..368

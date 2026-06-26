@@ -43,6 +43,18 @@ nix develop -c just verify-phpt
 The narrowest relevant gate should be used while iterating. Run the broader
 domain gate before handing off a change that affects that layer.
 
+Install the versioned git hooks once per checkout:
+
+```bash
+nix develop -c just install-hooks
+```
+
+The pre-commit hook runs formatting, clippy, and the PHPT consistency gate. The
+pre-push hook runs `just ci-local`, which mirrors the default GitHub Actions
+checks without the manual full-PHPT regression job. `PHRUST_SKIP_GIT_HOOKS=1`
+is available only for exceptional cases where the equivalent checks have been
+run manually.
+
 ## Running PHP Code
 
 The developer VM CLI is `php-vm`:
@@ -148,11 +160,20 @@ The default CI path runs:
 - `cargo test --workspace`.
 - Domain verification gates for frontend, runtime, standard library, and
   performance behavior.
-- A self-contained PHPT smoke run over committed generated fixtures.
+- A self-contained PHPT smoke no-regression run over committed generated
+  fixtures. Current accepted target non-green outcomes are listed in
+  `tests/phpt/manifests/runner-smoke-known-non-green.jsonl`; any new FAIL or
+  BORK rejects CI.
 
 The full PHPT regression gate is available as a manual workflow dispatch input
 because it bootstraps the pinned reference checkout and is substantially heavier
 than the pull-request smoke path.
+
+Local CI parity:
+
+```bash
+nix develop -c just ci-local
+```
 
 ## Documentation
 

@@ -97,7 +97,9 @@ SOURCE_FILE @0..297
             T_VARIABLE @97..99 line=8 text="$a"
           ARRAY_DIM_FETCH_EXPR @99..102
             [ @99..100 line=8 text="["
-            T_LNUMBER @100..101 line=8 text="0"
+            EXPR @100..101
+              LITERAL @100..101
+                T_LNUMBER @100..101 line=8 text="0"
             ] @101..102 line=8 text="]"
         ; @102..103 line=8 text=";"
       T_WHITESPACE @103..104 line=8 text="\n"
@@ -198,7 +200,9 @@ SOURCE_FILE @0..297
             ) @225..226 line=17 text=")"
           ARRAY_DIM_FETCH_EXPR @226..229
             [ @226..227 line=17 text="["
-            T_LNUMBER @227..228 line=17 text="0"
+            EXPR @227..228
+              LITERAL @227..228
+                T_LNUMBER @227..228 line=17 text="0"
             ] @228..229 line=17 text="]"
           PROPERTY_FETCH_EXPR @229..235
             T_NULLSAFE_OBJECT_OPERATOR @229..232 line=17 text="?->"
@@ -235,7 +239,9 @@ SOURCE_FILE @0..297
             T_VARIABLE @267..273 line=20 text="$items"
           ARRAY_DIM_FETCH_EXPR @273..278
             [ @273..274 line=20 text="["
-            T_CONSTANT_ENCAPSED_STRING @274..277 line=20 text="\"x\""
+            EXPR @274..277
+              STRING @274..277
+                T_CONSTANT_ENCAPSED_STRING @274..277 line=20 text="\"x\""
             ] @277..278 line=20 text="]"
           POSTFIX_EXPR @278..280
             T_INC @278..280 line=20 text="++"
@@ -250,7 +256,9 @@ SOURCE_FILE @0..297
                 T_VARIABLE @284..290 line=21 text="$items"
               ARRAY_DIM_FETCH_EXPR @290..295
                 [ @290..291 line=21 text="["
-                T_CONSTANT_ENCAPSED_STRING @291..294 line=21 text="\"x\""
+                EXPR @291..294
+                  STRING @291..294
+                    T_CONSTANT_ENCAPSED_STRING @291..294 line=21 text="\"x\""
                 ] @294..295 line=21 text="]"
         ; @295..296 line=21 text=";"
       T_WHITESPACE @296..297 line=21 text="\n"

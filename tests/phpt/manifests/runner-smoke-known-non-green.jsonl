@@ -1,0 +1,3 @@
+{"path":"tests/phpt/generated/runner_smoke/capture_stdio.phpt","outcome":"FAIL","reason":"php-vm target does not yet provide STDERR stream constant for this generated runner smoke"}
+{"path":"tests/phpt/generated/runner_smoke/clean.phpt","outcome":"FAIL","reason":"php-vm target does not yet satisfy this generated CLEAN/file side-effect smoke"}
+{"path":"tests/phpt/generated/runner_smoke/stdin.phpt","outcome":"FAIL","reason":"php-vm target does not yet provide script STDIN contents for this generated runner smoke"}

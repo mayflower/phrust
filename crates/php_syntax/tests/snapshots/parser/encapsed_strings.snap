@@ -35,8 +35,8 @@ SOURCE_FILE @0..201
                     T_CONSTANT_ENCAPSED_STRING @30..35 line=4 text="\"key\""
                   T_WHITESPACE @35..36 line=4 text=" "
                 T_DOUBLE_ARROW @36..38 line=4 text="=>"
-                EXPR @38..46
-                  T_WHITESPACE @38..39 line=4 text=" "
+                T_WHITESPACE @38..39 line=4 text=" "
+                EXPR @39..46
                   STRING @39..46
                     T_CONSTANT_ENCAPSED_STRING @39..46 line=4 text="\"value\""
               ] @46..47 line=4 text="]"

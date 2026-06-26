@@ -70,7 +70,12 @@ help:
       '  just phpt-full-regression Run the full PHPT no-regression gate with PHPT_RUN_FULL=1' \
       '  just phpt-full-fast      Run full PHPT gate after dev build with explicit local reuse' \
       '  just phpt-verify-baseline Verify committed PHPT full baseline files' \
-      '  just phpt-verify-source-integrity Verify pinned php-src was not mutated'
+      '  just phpt-verify-source-integrity Verify pinned php-src was not mutated' \
+      '  just install-hooks       Install versioned git hooks' \
+      '  just ci-local            Run the local GitHub Actions parity gate'
+
+install-hooks:
+    scripts/git/install-hooks.sh
 
 fmt:
     cargo fmt --all --check
@@ -99,6 +104,25 @@ verify:
     @just verify-stdlib
     @just verify-performance
     @just verify-phpt
+
+ci-rust:
+    @just fmt
+    @just lint
+    @just test
+
+ci-domain-gates:
+    @just verify-frontend
+    @just verify-runtime
+    @just verify-stdlib
+    @just verify-performance
+
+ci-phpt-smoke:
+    scripts/phpt/ci_smoke.sh
+
+ci-local:
+    @just ci-rust
+    @just ci-domain-gates
+    @just ci-phpt-smoke
 
 verify-frontend:
     @just lexer-fixtures
@@ -518,13 +542,12 @@ runtime-fixtures:
     sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/variables-undefined.out" > "$tmp_dir/variables-undefined.normalized"; \
     printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/known_gaps/variables/undefined.php on line <line>\nx\n' "$PWD" > "$tmp_dir/variables-undefined.expected"; \
     cmp "$tmp_dir/variables-undefined.expected" "$tmp_dir/variables-undefined.normalized"; \
-    grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/variables-undefined.err"; \
+    test ! -s "$tmp_dir/variables-undefined.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/errors/warning-continuation.php > "$tmp_dir/errors-warning-continuation.out" 2> "$tmp_dir/errors-warning-continuation.err"; \
     sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/errors-warning-continuation.out" > "$tmp_dir/errors-warning-continuation.normalized"; \
     printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/valid/errors/warning-continuation.php on line <line>\nok\n' "$PWD" > "$tmp_dir/errors-warning-continuation.expected"; \
     cmp "$tmp_dir/errors-warning-continuation.expected" "$tmp_dir/errors-warning-continuation.normalized"; \
-    grep -q 'runtime-diagnostic:' "$tmp_dir/errors-warning-continuation.err"; \
-    grep -q 'E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING' "$tmp_dir/errors-warning-continuation.err"; \
+    test ! -s "$tmp_dir/errors-warning-continuation.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/control_flow/if-true-false.php > "$tmp_dir/control-if.out"; \
     printf 'tf\n' > "$tmp_dir/control-if.expected"; \
     cmp "$tmp_dir/control-if.expected" "$tmp_dir/control-if.out"; \
