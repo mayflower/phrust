@@ -14132,6 +14132,14 @@ impl Vm {
             "method_exists" => {
                 self.call_method_exists_builtin(compiled, values, output, stack, state)
             }
+            "is_callable" => {
+                let value = values.first().cloned().unwrap_or(Value::Null);
+                let syntax_only = values
+                    .get(1)
+                    .is_some_and(|value| to_bool(value).unwrap_or(false));
+                let callable = value_is_callable(compiled, state, &value, syntax_only);
+                VmResult::success(output.clone(), Some(Value::Bool(callable)))
+            }
             "property_exists" => {
                 self.call_property_exists_builtin(compiled, values, output, stack, state)
             }
@@ -20249,6 +20257,7 @@ fn is_symbol_introspection_builtin_name(name: &str) -> bool {
             | "enum_exists"
             | "method_exists"
             | "property_exists"
+            | "is_callable"
             | "is_subclass_of"
             | "get_class"
             | "get_class_methods"
@@ -21515,6 +21524,62 @@ fn stack_trace(compiled: &CompiledUnit, stack: &CallStack) -> Vec<RuntimeStackFr
             RuntimeStackFrame::new(name)
         })
         .collect()
+}
+
+/// Determines whether a value is callable, matching PHP's `is_callable`. When
+/// `syntax_only` is set, only the structural shape (string, or `[target, name]`
+/// array) is checked, not whether the target actually exists.
+fn value_is_callable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+    syntax_only: bool,
+) -> bool {
+    match effective_value(value) {
+        // Closures, first-class callables, and resolved function/builtin callables.
+        Value::Callable(_) => true,
+        Value::Object(object) => {
+            lookup_method_in_state(compiled, state, &object.class_name(), "__invoke")
+                .map(|method| method.is_some())
+                .unwrap_or(false)
+        }
+        Value::String(name) => {
+            let name = name.to_string_lossy();
+            if syntax_only {
+                return true;
+            }
+            if let Some((class, method)) = name.split_once("::") {
+                lookup_method_in_state(compiled, state, class, method)
+                    .map(|method| method.is_some())
+                    .unwrap_or(false)
+            } else {
+                let normalized = normalize_function_name(&name);
+                compiled.lookup_function(&normalized).is_some()
+                    || dynamic_function_in_state(state, &normalized).is_some()
+                    || BuiltinRegistry::new().contains(&normalized)
+            }
+        }
+        Value::Array(array) => {
+            let (Some(target), Some(method)) =
+                (array.get(&ArrayKey::Int(0)), array.get(&ArrayKey::Int(1)))
+            else {
+                return false;
+            };
+            let Ok(method) = to_string(method) else {
+                return false;
+            };
+            let Ok(class) = class_name_from_object_or_string(target) else {
+                return false;
+            };
+            if syntax_only {
+                return true;
+            }
+            lookup_method_in_state(compiled, state, &class, &method.to_string_lossy())
+                .map(|method| method.is_some())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn resolve_callable(compiled: &CompiledUnit, callable: &CallableKind) -> Value {
