@@ -36,6 +36,8 @@ const SORT_FLAG_CASE: i64 = 8;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("boolval", builtin_boolval, BuiltinCompatibility::Php),
+    BuiltinEntry::new("uniqid", builtin_uniqid, BuiltinCompatibility::Php),
+    BuiltinEntry::new("usleep", builtin_usleep, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "error_reporting",
         builtin_error_handling_requires_vm,
@@ -1928,6 +1930,64 @@ pub(in crate::builtins::modules) fn builtin_quotemeta(
             out.push(b'\\');
         }
         out.push(byte);
+    }
+    Ok(Value::string(out))
+}
+
+pub(in crate::builtins::modules) fn builtin_usleep(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("usleep", &args, 1)?;
+    let micros = int_arg("usleep", &args[0])?;
+    if micros < 0 {
+        return Err(value_error(
+            "usleep",
+            "Argument #1 ($microseconds) must be greater than or equal to 0",
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+    Ok(Value::Null)
+}
+
+/// Monotonic per-process counter mixed into `uniqid(..., true)` so that two
+/// back-to-back calls always differ even within the same microsecond.
+static UNIQID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(in crate::builtins::modules) fn builtin_uniqid(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 2 {
+        return Err(arity_error("uniqid", "zero to two argument(s)"));
+    }
+    let mut out = match args.first() {
+        Some(value) => string_arg("uniqid", value)?.into_bytes(),
+        None => Vec::new(),
+    };
+    let more_entropy = match args.get(1) {
+        Some(value) => to_bool(value).map_err(|message| conversion_error("uniqid", message))?,
+        None => false,
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| value_error("uniqid", "system time is before UNIX epoch"))?;
+    // PHP: "%s%08x%05x" of seconds (low 32 bits) and microseconds.
+    let sec = now.as_secs() & 0xFFFF_FFFF;
+    let usec = now.subsec_micros();
+    out.extend_from_slice(format!("{sec:08x}{usec:05x}").as_bytes());
+    if more_entropy {
+        // PHP appends "%.8F" of a small random float; we derive a value in
+        // [0, 10) from the sub-microsecond clock and a per-call counter so it
+        // is well-formed (always 10 chars) and unique between calls.
+        let counter = UNIQID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mixed = u64::from(now.subsec_nanos())
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(counter);
+        let entropy = (mixed % 1_000_000_000) as f64 / 100_000_000.0;
+        out.extend_from_slice(format!("{entropy:.8}").as_bytes());
     }
     Ok(Value::string(out))
 }
