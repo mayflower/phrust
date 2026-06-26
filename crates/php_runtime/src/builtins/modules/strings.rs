@@ -152,6 +152,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("strncmp", core::builtin_strncmp, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "quotemeta",
+        core::builtin_quotemeta,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("strpbrk", core::builtin_strpbrk, BuiltinCompatibility::Php),
     BuiltinEntry::new("strpos", core::builtin_strpos, BuiltinCompatibility::Php),
     BuiltinEntry::new("strrev", core::builtin_strrev, BuiltinCompatibility::Php),

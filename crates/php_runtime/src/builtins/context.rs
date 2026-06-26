@@ -58,8 +58,13 @@ impl StrtokState {
             self.offset += 1;
         }
         if self.offset >= self.input.len() {
+            // We reached the end while skipping leading delimiters. Because a
+            // token's terminating delimiter is now consumed eagerly (see below),
+            // reaching the end without skipping any further delimiter is a clean
+            // exhaustion; skipping one or more extra trailing delimiters leaves a
+            // grace state where the next bare strtok() warns, matching PHP.
             self.mode = if self.input.is_empty()
-                || (self.emitted_token && self.offset.saturating_sub(skipped_start) <= 1)
+                || (self.emitted_token && self.offset.saturating_sub(skipped_start) == 0)
             {
                 StrtokMode::Exhausted
             } else {
@@ -71,9 +76,16 @@ impl StrtokState {
         while self.offset < self.input.len() && !delimiters.contains(&self.input[self.offset]) {
             self.offset += 1;
         }
+        let token = self.input[start..self.offset].to_vec();
+        // Consume the delimiter that terminated this token so the next call (which
+        // may use a different delimiter set) does not re-read it, matching PHP's
+        // php_strtok_r, which advances the saved pointer past the delimiter.
+        if self.offset < self.input.len() {
+            self.offset += 1;
+        }
         self.mode = StrtokMode::Active;
         self.emitted_token = true;
-        Some(self.input[start..self.offset].to_vec())
+        Some(token)
     }
 }
 
@@ -344,5 +356,33 @@ pub(in crate::builtins) const fn json_error_message(code: i64) -> &'static str {
         JSON_ERROR_SYNTAX => "Syntax error",
         JSON_ERROR_UTF8 => "Malformed UTF-8 characters, possibly incorrectly encoded",
         _ => "Unknown error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StrtokState;
+
+    #[test]
+    fn strtok_consumes_terminating_delimiter_across_delimiter_sets() {
+        // Regression: each strtok() call must advance past the delimiter that
+        // terminated the previous token, so a later call with a different
+        // delimiter set does not re-read it. Mirrors tests/strings/001.phpt.
+        let mut state = StrtokState::default();
+        state.reset(b"testing 1/2\\3".to_vec());
+        assert_eq!(state.next_token(b" "), Some(b"testing".to_vec()));
+        assert_eq!(state.next_token(b"/"), Some(b"1".to_vec()));
+        assert_eq!(state.next_token(b"\\"), Some(b"2".to_vec()));
+        assert_eq!(state.next_token(b"."), Some(b"3".to_vec()));
+        assert_eq!(state.next_token(b" "), None);
+    }
+
+    #[test]
+    fn strtok_skips_leading_and_repeated_delimiters() {
+        let mut state = StrtokState::default();
+        state.reset(b"a,,b".to_vec());
+        assert_eq!(state.next_token(b","), Some(b"a".to_vec()));
+        assert_eq!(state.next_token(b","), Some(b"b".to_vec()));
+        assert_eq!(state.next_token(b","), None);
     }
 }

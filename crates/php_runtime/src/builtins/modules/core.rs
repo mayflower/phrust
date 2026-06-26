@@ -1912,6 +1912,26 @@ pub(in crate::builtins::modules) fn builtin_strrev(
     Ok(Value::string(bytes))
 }
 
+pub(in crate::builtins::modules) fn builtin_quotemeta(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("quotemeta", &args, 1)?;
+    let input = string_arg("quotemeta", &args[0])?.into_bytes();
+    let mut out = Vec::with_capacity(input.len());
+    for &byte in &input {
+        if matches!(
+            byte,
+            b'.' | b'\\' | b'+' | b'*' | b'?' | b'[' | b'^' | b']' | b'$' | b'(' | b')'
+        ) {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    Ok(Value::string(out))
+}
+
 pub(in crate::builtins::modules) fn builtin_bin2hex(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -9130,6 +9150,14 @@ fn format_printf_value(
     context: &mut BuiltinContext<'_>,
     span: RuntimeSourceSpan,
 ) -> Result<Vec<u8>, BuiltinError> {
+    // PHP prints non-finite floats as bare `INF`/`-INF`/`NaN` for the float
+    // specifiers, ignoring width, zero-fill, precision, and the `+` flag, so
+    // bypass the normal formatting and padding path.
+    if matches!(spec.specifier, b'f' | b'F' | b'e' | b'E' | b'g' | b'G')
+        && let Some(text) = non_finite_float_text(float_arg(name, value)?)
+    {
+        return Ok(text.as_bytes().to_vec());
+    }
     let bytes = match spec.specifier {
         b's' => {
             let mut bytes = string_cast_value(context, value, span)
@@ -9193,12 +9221,22 @@ fn format_signed_decimal(
     Ok(format_numeric_sign(name, spec, negative, digits))
 }
 
+/// PHP renders non-finite floats as bare `INF`, `-INF`, or `NaN`.
+fn non_finite_float_text(value: f64) -> Option<&'static str> {
+    if value.is_finite() {
+        None
+    } else if value.is_nan() {
+        Some("NaN")
+    } else if value.is_sign_negative() {
+        Some("-INF")
+    } else {
+        Some("INF")
+    }
+}
+
 fn format_float_decimal(name: &str, spec: &PrintfSpec, value: f64) -> Result<String, BuiltinError> {
-    if !value.is_finite() {
-        return Err(value_error(
-            name,
-            "non-finite float formatting is not implemented",
-        ));
+    if let Some(text) = non_finite_float_text(value) {
+        return Ok(text.to_string());
     }
     let precision = spec.precision.unwrap_or(6);
     let negative = value.is_sign_negative();
@@ -9211,11 +9249,8 @@ fn format_float_scientific(
     spec: &PrintfSpec,
     value: f64,
 ) -> Result<String, BuiltinError> {
-    if !value.is_finite() {
-        return Err(value_error(
-            name,
-            "non-finite float formatting is not implemented",
-        ));
+    if let Some(text) = non_finite_float_text(value) {
+        return Ok(text.to_string());
     }
     let precision = spec.precision.unwrap_or(6);
     let negative = value.is_sign_negative();
@@ -9225,11 +9260,8 @@ fn format_float_scientific(
 }
 
 fn format_float_general(name: &str, spec: &PrintfSpec, value: f64) -> Result<String, BuiltinError> {
-    if !value.is_finite() {
-        return Err(value_error(
-            name,
-            "non-finite float formatting is not implemented",
-        ));
+    if let Some(text) = non_finite_float_text(value) {
+        return Ok(text.to_string());
     }
     let precision = spec.precision.unwrap_or(6).max(1);
     let negative = value.is_sign_negative();
@@ -9994,6 +10026,78 @@ mod tests {
             .expect_err("builtin should fail")
             .message()
             .to_owned()
+    }
+
+    #[test]
+    fn quotemeta_escapes_regex_metacharacters() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call("quotemeta", vec![Value::string("1+1=2")], &mut output),
+            Value::string("1\\+1=2")
+        );
+        assert_eq!(
+            call(
+                "quotemeta",
+                vec![Value::string("a.b\\c+d*e?f[g^h]i$j(k)l")],
+                &mut output,
+            ),
+            Value::string("a\\.b\\\\c\\+d\\*e\\?f\\[g\\^h\\]i\\$j\\(k\\)l")
+        );
+        assert_eq!(
+            call("quotemeta", vec![Value::string("")], &mut output),
+            Value::string("")
+        );
+        assert_eq!(
+            call("quotemeta", vec![Value::string("no specials")], &mut output),
+            Value::string("no specials")
+        );
+    }
+
+    #[test]
+    fn sprintf_renders_non_finite_floats_without_padding() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "sprintf",
+                vec![
+                    Value::string("%f|%e|%g"),
+                    Value::float(f64::INFINITY),
+                    Value::float(f64::INFINITY),
+                    Value::float(f64::INFINITY),
+                ],
+                &mut output,
+            ),
+            Value::string("INF|INF|INF")
+        );
+        assert_eq!(
+            call(
+                "sprintf",
+                vec![Value::string("%.17g"), Value::float(f64::NEG_INFINITY)],
+                &mut output,
+            ),
+            Value::string("-INF")
+        );
+        assert_eq!(
+            call(
+                "sprintf",
+                vec![Value::string("%f"), Value::float(f64::NAN)],
+                &mut output,
+            ),
+            Value::string("NaN")
+        );
+        // PHP ignores width, zero-fill, and the `+` flag for non-finite floats.
+        assert_eq!(
+            call(
+                "sprintf",
+                vec![
+                    Value::string("[%08.2f][%+f]"),
+                    Value::float(f64::INFINITY),
+                    Value::float(f64::INFINITY),
+                ],
+                &mut output,
+            ),
+            Value::string("[INF][INF]")
+        );
     }
 
     fn call_with_fs(

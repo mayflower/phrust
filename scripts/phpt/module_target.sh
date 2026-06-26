@@ -181,7 +181,7 @@ if [[ -n "$reuse_results" ]]; then
     --work-dir "$target_dir/work" \
     --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-10}" \
     --reuse-results "$reuse_results" \
-    "${dev_reuse_args[@]}" \
+    ${dev_reuse_args[@]+"${dev_reuse_args[@]}"} \
     "${job_args[@]}"
   target_status=$?
 else
@@ -194,7 +194,7 @@ else
     --php-src "$php_src" \
     --work-dir "$target_dir/work" \
     --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-10}" \
-    "${dev_reuse_args[@]}" \
+    ${dev_reuse_args[@]+"${dev_reuse_args[@]}"} \
     "${job_args[@]}"
   target_status=$?
 fi
