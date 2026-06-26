@@ -4282,6 +4282,8 @@ mod tests {
                     value: Operand::Register(r0),
                     unpack: false,
                     by_ref_local: Some(local_s),
+                    by_ref_dim: None,
+                    by_ref_property: None,
                 }],
             },
             span,

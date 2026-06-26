@@ -498,6 +498,7 @@ impl HirLowerer<'_> {
                         exprs.first().copied()
                     },
                     unpack,
+                    by_ref: array_pair_is_by_ref(node),
                 }
             }
             Some(ExprNode::Match(_)) => HirExprKind::Match {
@@ -1338,11 +1339,13 @@ impl HirLowerer<'_> {
             }
             if child.kind().name() == "CALL_EXPR"
                 && let Some(callee) = out.last().copied()
-                && self
-                    .database
-                    .source_map()
-                    .span(callee)
-                    .is_some_and(|span| span.end() == child.text_range().start())
+                && self.database.source_map().span(callee).is_some_and(|span| {
+                    only_trivia_between(
+                        node,
+                        span.end().to_usize(),
+                        child.text_range().start().to_usize(),
+                    )
+                })
             {
                 let Some(previous) = out.pop() else {
                     continue;
@@ -1534,10 +1537,33 @@ fn source_text_no_trivia(node: &SyntaxNode) -> String {
         .join("")
 }
 
+fn only_trivia_between(node: &SyntaxNode, left_end: usize, right_start: usize) -> bool {
+    if left_end > right_start {
+        return false;
+    }
+    descendant_tokens::<TokenView<'_>>(node)
+        .filter(|token| {
+            let range = token.text_range();
+            range.start().to_usize() >= left_end && range.end().to_usize() <= right_start
+        })
+        .all(|token| token.kind().is_trivia())
+}
+
 fn has_direct_token_text(node: &SyntaxNode, expected: &str) -> bool {
     syntax_child_tokens(node)
         .filter(|token| !token.kind().is_trivia())
         .any(|token| token.text() == expected)
+}
+
+fn array_pair_is_by_ref(node: &SyntaxNode) -> bool {
+    syntax_child_tokens(node)
+        .filter(|token| !token.kind().is_trivia())
+        .any(|token| {
+            let name = token.kind().name();
+            token.text() == "&"
+                || name == "T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG"
+                || name == "T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG"
+        })
 }
 
 fn is_quoted_construct_operand(text: &str) -> bool {
@@ -1846,6 +1872,55 @@ mod tests {
         });
 
         assert!(has_binary_dim, "array dim should preserve `$counter - 1`");
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_logical_and_assignment_with_php_precedence() {
+        let source = "<?php function cmp($a) { is_array($a) and $a = count($a); }\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let has_logical_and_assignment = module.expressions().iter().any(|(_, expr)| {
+            let HirExprKind::Binary {
+                operator,
+                left: Some(left),
+                right: Some(right),
+                ..
+            } = expr.kind()
+            else {
+                return false;
+            };
+            operator == "and"
+                && matches!(
+                    module.expressions()[*left].kind(),
+                    HirExprKind::Call {
+                        callee: Some(_),
+                        ..
+                    }
+                )
+                && matches!(
+                    module.expressions()[*right].kind(),
+                    HirExprKind::Assign { operator, .. } if operator == "="
+                )
+        });
+
+        assert!(
+            has_logical_and_assignment,
+            "`and` should bind looser than assignment"
+        );
         assert!(reporter.into_diagnostics().is_empty());
     }
 

@@ -1,14 +1,14 @@
 //! Semantic frontend frontend to runtime IR lowering skeleton.
 
 use crate::builder::IrBuilder;
-use crate::constants::IrConstant;
+use crate::constants::{IrConstant, IrConstantArrayEntry};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::function::{FunctionFlags, IrCapture, IrParam, IrReturnType};
 use crate::ids::{BlockId, FileId, FunctionId, LocalId, RegId, UnitId};
 use crate::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, InstructionKind,
-    IrCallArg, IrDiagnosticSeverity, UnaryOp,
+    IrCallArg, IrCallDimTarget, IrCallPropertyTarget, IrDiagnosticSeverity, UnaryOp,
 };
 use crate::module::{
     AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
@@ -345,6 +345,14 @@ struct DimAssignmentTarget {
 struct PropertyAssignmentTarget {
     receiver: ExprId,
     property: String,
+}
+
+#[derive(Clone, Debug)]
+struct PropertyDimTarget {
+    receiver: ExprId,
+    property: String,
+    dims: Vec<ExprId>,
+    append: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -742,17 +750,6 @@ impl LoweringContext<'_> {
                             .name()
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| method_name.clone());
-                        if method.modifiers().is_abstract()
-                            && class_like.kind() != ClassLikeKind::Interface
-                        {
-                            self.unsupported(
-                                UnsupportedFeature::ObjectMethodModifier,
-                                self.span_for(SourceMappedId::from(method_id)),
-                                format!(
-                                    "method `{method_name}` is abstract outside the concrete-method concrete method MVP"
-                                ),
-                            );
-                        }
                         let Some(signature) = method
                             .signature_index()
                             .and_then(|index| module.signatures().get(index))
@@ -1422,14 +1419,11 @@ impl LoweringContext<'_> {
                     && const_expr.is_allowed()
             })
             .map(|(_, const_expr)| {
-                if let Some(value) = const_expr.folded_value() {
-                    return ir_constant_from_const_value(value);
-                }
-                let expr = module.expressions().get(const_expr.expr_id())?;
-                match expr.kind() {
-                    HirExprKind::Literal { text } => literal_constant(text),
-                    _ => None,
-                }
+                constant_from_expr(module, const_expr.expr_id()).or_else(|| {
+                    const_expr
+                        .folded_value()
+                        .and_then(ir_constant_from_const_value)
+                })
             })
             .collect()
     }
@@ -1720,16 +1714,11 @@ impl LoweringContext<'_> {
         if !accepts_context(const_expr.context()) || !const_expr.is_allowed() {
             return None;
         }
-        let constant = if let Some(value) = const_expr.folded_value() {
-            ir_constant_from_const_value(value)?
-        } else {
-            let expr = module.expressions().get(const_expr.expr_id())?;
-            match expr.kind() {
-                HirExprKind::Literal { text } => literal_constant(text)?,
-                _ => return None,
-            }
-        };
-        Some(constant)
+        constant_from_expr(module, const_expr.expr_id()).or_else(|| {
+            const_expr
+                .folded_value()
+                .and_then(ir_constant_from_const_value)
+        })
     }
 
     fn lower_return_type(&self, return_type: Option<&ReturnType>) -> Option<IrReturnType> {
@@ -3944,9 +3933,14 @@ impl LoweringContext<'_> {
             let Some(expression) = module.expressions().get(element) else {
                 continue;
             };
-            let (key, value, unpack) = match expression.kind() {
-                HirExprKind::ArrayPair { key, value, unpack } => (*key, *value, *unpack),
-                _ => (None, Some(element), false),
+            let (key, value, unpack, by_ref) = match expression.kind() {
+                HirExprKind::ArrayPair {
+                    key,
+                    value,
+                    unpack,
+                    by_ref,
+                } => (*key, *value, *unpack, *by_ref),
+                _ => (None, Some(element), false, false),
             };
             if unpack {
                 self.unsupported(
@@ -3972,6 +3966,21 @@ impl LoweringContext<'_> {
                 );
                 continue;
             };
+            let by_ref_local = if by_ref {
+                match self.variable_local(builder, site.function, value) {
+                    Some(local) => Some(local),
+                    None => {
+                        self.unsupported(
+                            UnsupportedFeature::ArrayElementReference,
+                            self.span_for(SourceMappedId::from(element)),
+                            "array literal by-reference elements require a simple local variable",
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let value = self.lower_expr_to_register(builder, site.function, current, value)?;
             current = value.block;
             let instruction = builder.emit(
@@ -3981,6 +3990,7 @@ impl LoweringContext<'_> {
                     array: dst,
                     key,
                     value: Operand::Register(value.register),
+                    by_ref_local,
                 },
                 site.span,
             );
@@ -4009,8 +4019,98 @@ impl LoweringContext<'_> {
         let mut current = site.block;
         let mut operands = Vec::with_capacity(args.len());
         for arg in args {
-            let value = self.lower_expr_to_register(builder, site.function, current, arg.value)?;
-            current = value.block;
+            let dim_target = (!arg.unpack)
+                .then(|| self.dim_assignment_target(builder, site.function, arg.value))
+                .flatten()
+                .filter(|target| !target.append && !target.dims.is_empty());
+            let property_target = (!arg.unpack)
+                .then(|| self.property_assignment_target(arg.value))
+                .flatten();
+            let (value, by_ref_dim, by_ref_property) = if let Some(target) = dim_target {
+                let mut dims = Vec::with_capacity(target.dims.len());
+                for dim in &target.dims {
+                    let dim_value =
+                        self.lower_expr_to_register(builder, site.function, current, *dim)?;
+                    current = dim_value.block;
+                    dims.push(Operand::Register(dim_value.register));
+                }
+                let mut array = Operand::Local(target.local);
+                let mut last = None;
+                for dim in &dims {
+                    let dst = builder.alloc_register(site.function);
+                    let instruction = builder.emit(
+                        site.function,
+                        current,
+                        InstructionKind::FetchDim {
+                            dst,
+                            array,
+                            key: *dim,
+                            quiet: false,
+                        },
+                        site.span,
+                    );
+                    self.add_expr_source_map(
+                        builder,
+                        site.function,
+                        current,
+                        instruction,
+                        arg.value,
+                        site.span,
+                    );
+                    array = Operand::Register(dst);
+                    last = Some(dst);
+                }
+                (
+                    LoweredExpr {
+                        register: last.expect("dimension target has at least one dimension"),
+                        block: current,
+                    },
+                    Some(IrCallDimTarget {
+                        local: target.local,
+                        dims,
+                    }),
+                    None,
+                )
+            } else if let Some(target) = property_target {
+                let object =
+                    self.lower_expr_to_register(builder, site.function, current, target.receiver)?;
+                current = object.block;
+                let dst = builder.alloc_register(site.function);
+                let instruction = builder.emit(
+                    site.function,
+                    current,
+                    InstructionKind::FetchProperty {
+                        dst,
+                        object: Operand::Register(object.register),
+                        property: target.property.clone(),
+                    },
+                    site.span,
+                );
+                self.add_expr_source_map(
+                    builder,
+                    site.function,
+                    current,
+                    instruction,
+                    arg.value,
+                    site.span,
+                );
+                (
+                    LoweredExpr {
+                        register: dst,
+                        block: current,
+                    },
+                    None,
+                    Some(IrCallPropertyTarget {
+                        object: Operand::Register(object.register),
+                        property: target.property,
+                    }),
+                )
+            } else {
+                let value =
+                    self.lower_expr_to_register(builder, site.function, current, arg.value)?;
+                current = value.block;
+                (value, None, None)
+            };
             operands.push(IrCallArg {
                 name: arg.name.clone(),
                 value: Operand::Register(value.register),
@@ -4018,6 +4118,8 @@ impl LoweringContext<'_> {
                 by_ref_local: (!arg.unpack)
                     .then(|| self.variable_local(builder, site.function, arg.value))
                     .flatten(),
+                by_ref_dim,
+                by_ref_property,
             });
         }
         Some((operands, current))
@@ -4348,6 +4450,53 @@ impl LoweringContext<'_> {
                 InstructionKind::EmptyDim {
                     dst,
                     local: target.local,
+                    dims,
+                }
+            };
+            let emitted = builder.emit(site.function, current, instruction, site.span);
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                current,
+                emitted,
+                site.expr,
+                site.span,
+            );
+            return Some(LoweredExpr {
+                register: dst,
+                block: current,
+            });
+        } else if let Some(target) = self.property_dim_target(arg) {
+            if target.append || target.dims.is_empty() {
+                self.unsupported(
+                    UnsupportedFeature::HirStatement,
+                    self.span_for(SourceMappedId::from(arg)),
+                    format!("{name} append property dimensions are outside the runtime MVP"),
+                );
+                return None;
+            }
+            let object =
+                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let mut current = object.block;
+            let mut dims = Vec::with_capacity(target.dims.len());
+            for dim in target.dims {
+                let dim_value =
+                    self.lower_expr_to_register(builder, site.function, current, dim)?;
+                current = dim_value.block;
+                dims.push(Operand::Register(dim_value.register));
+            }
+            let instruction = if name == "isset" {
+                InstructionKind::IssetPropertyDim {
+                    dst,
+                    object: Operand::Register(object.register),
+                    property: target.property,
+                    dims,
+                }
+            } else {
+                InstructionKind::EmptyPropertyDim {
+                    dst,
+                    object: Operand::Register(object.register),
+                    property: target.property,
                     dims,
                 }
             };
@@ -4836,13 +4985,6 @@ impl LoweringContext<'_> {
             );
         }
         for param in signature.parameters() {
-            if param.flags().is_by_ref() {
-                self.unsupported(
-                    UnsupportedFeature::ByReferenceParameter,
-                    param.span(),
-                    "by-reference closure parameters are deferred until closure call-frame aliasing is modeled",
-                );
-            }
             let local_name = local_name(param.name()).to_owned();
             let local = builder.intern_local(function, &local_name);
             let default = self.lower_param_default(param);
@@ -5385,11 +5527,12 @@ impl LoweringContext<'_> {
         let true_block = builder.append_block(site.function);
         let after_block = builder.append_block(site.function);
         let dst = builder.alloc_register(site.function);
-        builder.terminate_jump_if_true(
+        builder.terminate_jump_if(
             site.function,
             condition_value.block,
             Operand::Register(condition_value.register),
             true_block,
+            false_block,
             site.span,
         );
 
@@ -6836,6 +6979,39 @@ impl LoweringContext<'_> {
         }
     }
 
+    fn property_dim_target(&self, expr: ExprId) -> Option<PropertyDimTarget> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        match expression.kind() {
+            HirExprKind::DimFetch { receiver, dim } => {
+                let receiver = (*receiver)?;
+                let mut target = if let Some(property) = self.property_assignment_target(receiver) {
+                    PropertyDimTarget {
+                        receiver: property.receiver,
+                        property: property.property,
+                        dims: Vec::new(),
+                        append: false,
+                    }
+                } else {
+                    self.property_dim_target(receiver)?
+                };
+                if target.append {
+                    return None;
+                }
+                if let Some(dim) = dim {
+                    target.dims.push(*dim);
+                } else {
+                    target.append = true;
+                }
+                Some(target)
+            }
+            _ => None,
+        }
+    }
+
     fn statement_id_for_span(&self, span: TextRange) -> Option<StmtId> {
         let module = self
             .frontend
@@ -7467,6 +7643,42 @@ fn ranges_overlap(lhs: TextRange, rhs: TextRange) -> bool {
     lhs.start().to_usize() < rhs.end().to_usize() && rhs.start().to_usize() < lhs.end().to_usize()
 }
 
+fn constant_from_expr(module: &HirModule, expr_id: ExprId) -> Option<IrConstant> {
+    let expr = module.expressions().get(expr_id)?;
+    match expr.kind() {
+        HirExprKind::Literal { text } => literal_constant(text),
+        HirExprKind::Name { resolution } => language_constant(resolution.source()),
+        HirExprKind::Array { elements } => {
+            let mut entries = Vec::with_capacity(elements.len());
+            for element_id in elements {
+                let element = module.expressions().get(*element_id)?;
+                match element.kind() {
+                    HirExprKind::ArrayPair {
+                        key,
+                        value,
+                        unpack,
+                        by_ref,
+                    } => {
+                        if *unpack || *by_ref {
+                            return None;
+                        }
+                        entries.push(IrConstantArrayEntry {
+                            key: key.and_then(|key| constant_from_expr(module, key)),
+                            value: constant_from_expr(module, (*value)?)?,
+                        });
+                    }
+                    _ => entries.push(IrConstantArrayEntry {
+                        key: None,
+                        value: constant_from_expr(module, *element_id)?,
+                    }),
+                }
+            }
+            Some(IrConstant::Array(entries))
+        }
+        _ => None,
+    }
+}
+
 fn ir_constant_from_const_value(value: &ConstValue) -> Option<IrConstant> {
     match value {
         ConstValue::Null => Some(IrConstant::Null),
@@ -7548,12 +7760,19 @@ fn ir_string_constant(bytes: Vec<u8>) -> IrConstant {
 
 fn quoted_literal_body(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    let quote = *bytes.first()?;
-    if bytes.len() < 2 || (quote != b'\'' && quote != b'"') || bytes.last().copied() != Some(quote)
+    let quote_start = if matches!(bytes, [b'b' | b'B', b'\'' | b'"', ..]) {
+        1
+    } else {
+        0
+    };
+    let quote = *bytes.get(quote_start)?;
+    if bytes.len() < quote_start + 2
+        || (quote != b'\'' && quote != b'"')
+        || bytes.last().copied() != Some(quote)
     {
         return None;
     }
-    let body = &bytes[1..bytes.len() - 1];
+    let body = &bytes[quote_start + 1..bytes.len() - 1];
     Some(if quote == b'\'' {
         unescape_single_quoted_php_string(body)
     } else {
@@ -8019,6 +8238,30 @@ mod tests {
     }
 
     #[test]
+    fn global_array_const_initializers_lower_to_ir_constants() {
+        let frontend = analyze_source(r#"<?php const EXPECTED = ["x" => "y", 2 => "z"];"#);
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert_eq!(result.unit.constant_table.len(), 1);
+        let value = &result.unit.constants[result.unit.constant_table[0].value.index()];
+        assert_eq!(
+            value,
+            &IrConstant::Array(vec![
+                IrConstantArrayEntry {
+                    key: Some(IrConstant::String("x".to_string())),
+                    value: IrConstant::String("y".to_string()),
+                },
+                IrConstantArrayEntry {
+                    key: Some(IrConstant::Int(2)),
+                    value: IrConstant::String("z".to_string()),
+                },
+            ])
+        );
+    }
+
+    #[test]
     fn lower_echo_literal_statement_emits_load_const_and_echo() {
         let frontend = analyze_source("<?php echo 1;");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
@@ -8378,6 +8621,20 @@ mod tests {
         assert!(snapshot.contains("block:2"));
         assert!(snapshot.contains("string \"t\""));
         assert!(snapshot.contains("string \"f\""));
+    }
+
+    #[test]
+    fn ternary_after_if_uses_explicit_false_target() {
+        let frontend = analyze_source(
+            "<?php function cmp($a, $b) { if ($a == $b) { return 0; } return ($a < $b) ? -1 : 1; }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("jump_if r"));
+        assert!(snapshot.contains(" block:"));
     }
 
     #[test]

@@ -142,7 +142,7 @@ jobs:
         run: nix develop -c cargo build -p php_vm_cli --bin php-vm
 
       - name: Run full PHPT regression
-        run: nix develop -c just phpt-full-regression
+        run: PHPT_RUN_FULL=1 nix develop -c just phpt-full-regression
 
       - name: Upload full PHPT reports
         if: always()

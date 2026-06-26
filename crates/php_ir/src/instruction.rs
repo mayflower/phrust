@@ -126,6 +126,28 @@ pub struct IrCallArg {
     pub unpack: bool,
     /// Caller local when this argument can satisfy a by-reference parameter.
     pub by_ref_local: Option<LocalId>,
+    /// Caller array dimension when this argument can satisfy a by-reference parameter.
+    pub by_ref_dim: Option<IrCallDimTarget>,
+    /// Caller property when this argument can satisfy a by-reference parameter.
+    pub by_ref_property: Option<IrCallPropertyTarget>,
+}
+
+/// Array-dimension lvalue metadata for a call argument.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IrCallDimTarget {
+    /// Root caller local.
+    pub local: LocalId,
+    /// Evaluated dimension operands.
+    pub dims: Vec<Operand>,
+}
+
+/// Property lvalue metadata for a call argument.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IrCallPropertyTarget {
+    /// Evaluated object operand.
+    pub object: Operand,
+    /// Static property name.
+    pub property: String,
 }
 
 /// Callable kind encoded in IR before VM resolution/execution.
@@ -378,6 +400,20 @@ pub enum InstructionKind {
         object: Operand,
         property: String,
     },
+    /// Tests whether an instance property array dimension exists and is not null.
+    IssetPropertyDim {
+        dst: RegId,
+        object: Operand,
+        property: String,
+        dims: Vec<Operand>,
+    },
+    /// Tests whether an instance property array dimension is empty.
+    EmptyPropertyDim {
+        dst: RegId,
+        object: Operand,
+        property: String,
+        dims: Vec<Operand>,
+    },
     /// Unsets an instance property slot.
     UnsetProperty { object: Operand, property: String },
     /// Fetches a static property by class and static property name.
@@ -413,6 +449,7 @@ pub enum InstructionKind {
         array: RegId,
         key: Option<Operand>,
         value: Operand,
+        by_ref_local: Option<LocalId>,
     },
     /// General array dimension fetch.
     FetchDim {

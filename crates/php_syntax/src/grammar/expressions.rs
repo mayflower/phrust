@@ -415,12 +415,10 @@ fn parse_new_expression(parser: &mut Parser<'_>) {
 
     if parser.at(named(TokenName::Class)) {
         classes::parse_anonymous_class(parser);
-    } else if names::parse_name(parser) || parse_static_class_name(parser) {
-        bump_trivia(parser);
-        if parser.at(symbol(b'(')) {
-            parse_call_tail(parser);
-        }
-    } else if parse_dynamic_new_class_reference(parser) {
+    } else if names::parse_name(parser)
+        || parse_static_class_name(parser)
+        || parse_dynamic_new_class_reference(parser)
+    {
         bump_trivia(parser);
         if parser.at(symbol(b'(')) {
             parse_call_tail(parser);

@@ -1996,6 +1996,8 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::FetchProperty { .. } => "fetch_property",
         InstructionKind::IssetProperty { .. } => "isset_property",
         InstructionKind::EmptyProperty { .. } => "empty_property",
+        InstructionKind::IssetPropertyDim { .. } => "isset_property_dim",
+        InstructionKind::EmptyPropertyDim { .. } => "empty_property_dim",
         InstructionKind::UnsetProperty { .. } => "unset_property",
         InstructionKind::FetchStaticProperty { .. } => "fetch_static_property",
         InstructionKind::FetchClassConstant { .. } => "fetch_class_constant",

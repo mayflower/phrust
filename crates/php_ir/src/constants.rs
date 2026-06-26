@@ -18,4 +18,15 @@ pub enum IrConstant {
     String(String),
     /// PHP string bytes that cannot be represented losslessly as UTF-8.
     StringBytes(Vec<u8>),
+    /// PHP array literal whose keys and values are constant-pool values.
+    Array(Vec<IrConstantArrayEntry>),
+}
+
+/// One constant PHP array entry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct IrConstantArrayEntry {
+    /// Explicit key. `None` means append with the next integer key.
+    pub key: Option<IrConstant>,
+    /// Stored value.
+    pub value: IrConstant,
 }

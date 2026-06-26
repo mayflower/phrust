@@ -4,6 +4,7 @@ use crate::{ArrayKey, PhpArray, PhpString, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
@@ -912,7 +913,7 @@ fn open_php_stream(
             StreamMetadata::new(
                 "PHP",
                 target.to_ascii_uppercase(),
-                mode,
+                php_memory_stream_metadata_mode(mode),
                 format!("php://{target}"),
             ),
             StreamData::Memory {
@@ -959,6 +960,14 @@ fn open_php_stream(
     }
 }
 
+fn php_memory_stream_metadata_mode(mode: &str) -> String {
+    if mode.contains('b') || mode.contains('t') {
+        return mode.to_string();
+    }
+
+    format!("{mode}b")
+}
+
 fn open_file_stream(
     table: &mut ResourceTable,
     path: &str,
@@ -992,14 +1001,14 @@ fn open_file_stream(
         std::fs::write(&normalized, []).map_err(|error| {
             StreamOpenError::new(
                 "E_PHP_RUNTIME_STREAM_OPEN",
-                format!("failed to truncate `{}`: {error}", normalized.display()),
+                format!("Failed to open stream: {}", php_io_error_message(&error)),
             )
         })?;
     } else if parsed_mode.writable && !normalized.exists() {
         std::fs::write(&normalized, []).map_err(|error| {
             StreamOpenError::new(
                 "E_PHP_RUNTIME_STREAM_OPEN",
-                format!("failed to create `{}`: {error}", normalized.display()),
+                format!("Failed to open stream: {}", php_io_error_message(&error)),
             )
         })?;
     }
@@ -1009,20 +1018,29 @@ fn open_file_stream(
         std::fs::read(&normalized).map_err(|error| {
             StreamOpenError::new(
                 "E_PHP_RUNTIME_STREAM_OPEN",
-                format!("failed to open `{}`: {error}", normalized.display()),
+                format!("Failed to open stream: {}", php_io_error_message(&error)),
             )
         })?
     };
     let cursor = if parsed_mode.append { buffer.len() } else { 0 };
     Ok(table.register_stream_data(
         parsed_mode.flags(),
-        StreamMetadata::new("plainfile", "stream", mode, normalized.to_string_lossy()),
+        StreamMetadata::new("plainfile", "STDIO", mode, normalized.to_string_lossy()),
         StreamData::File {
             path: normalized,
             buffer,
             cursor,
         },
     ))
+}
+
+fn php_io_error_message(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        _ => error.to_string(),
+    }
 }
 
 fn flush_file_data(data: &StreamData) -> Result<(), StreamOpenError> {
@@ -1119,6 +1137,7 @@ mod tests {
                 .open(&mut table, uri, "w+", Path::new("."), &capabilities)
                 .expect("php memory/temp opens");
             assert_eq!(resource.metadata().wrapper_type, "PHP");
+            assert_eq!(resource.metadata().mode, "w+b");
             assert_eq!(resource.flags(), StreamFlags::new(true, true, true));
             assert_eq!(resource.write_bytes(b"stdlib").expect("write"), 6);
             resource.rewind().expect("rewind");

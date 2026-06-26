@@ -48,12 +48,13 @@ cache. Use `just phpt-rerun-failures MODULE=<module>` to rerun only the latest
 non-green module outcomes, or `just phpt-dev-fast ...` for the explicit local
 `PHPT_DEV_REUSE_PASS=1` path that can reuse unchanged previous PASS results
 across binary changes. The fast targets use an external work directory by
-default, enable strict previous-result reuse, propagate `PHPT_JOBS`, and skip
-rebuilds so small runtime changes can be checked without paying full-corpus or
-repeated shell startup cost. `just phpt-build` remains the normal deterministic
+default, enable strict previous-result reuse, and skip rebuilds so small runtime
+changes can be checked without paying full-corpus or repeated shell startup
+cost. PHPT runs are serial by default; set `PHPT_JOBS=<n>` only for an
+intentional parallel batch. `just phpt-build` remains the normal deterministic
 build command, and `php-phpt-tools run --reuse-results <results.jsonl>` also
-reuses unchanged test outcomes by strict fingerprint. The full regression
-script uses the latest previous run automatically unless `PHPT_DISABLE_REUSE=1`
+reuses unchanged test outcomes by strict fingerprint. The full regression script
+uses the latest previous run automatically unless `PHPT_DISABLE_REUSE=1`
 is set; after `just phpt-dev-build`, use `just phpt-full-fast` to reuse the
 already-built PHPT binaries for a local full-gate check.
 

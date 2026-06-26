@@ -349,15 +349,26 @@ impl ArgumentValidator {
             ));
         }
         if !variadic && args.len() > info.params().len() {
-            return Err(ArginfoError::type_error(
-                "E_PHP_STD_TOO_MANY_ARGUMENTS",
+            let expected = if required == info.params().len() {
+                format!(
+                    "{}() expects exactly {} argument{}, {} given",
+                    info.name(),
+                    info.params().len(),
+                    plural(info.params().len()),
+                    args.len()
+                )
+            } else {
                 format!(
                     "{}() expects at most {} argument{}, {} given",
                     info.name(),
                     info.params().len(),
                     plural(info.params().len()),
                     args.len()
-                ),
+                )
+            };
+            return Err(ArginfoError::type_error(
+                "E_PHP_STD_TOO_MANY_ARGUMENTS",
+                expected,
                 span,
             ));
         }
@@ -369,7 +380,7 @@ impl ArgumentValidator {
             } else {
                 info.params().last().expect("variadic param exists")
             };
-            values.push(self.coerce(info.name(), param, arg, span.clone())?);
+            values.push(self.coerce(info.name(), index, param, arg, span.clone())?);
         }
 
         for param in info.params().iter().skip(args.len()) {
@@ -388,6 +399,7 @@ impl ArgumentValidator {
     fn coerce(
         &self,
         function: &str,
+        index: usize,
         param: &ParameterInfo,
         value: &Value,
         span: RuntimeSourceSpan,
@@ -401,6 +413,9 @@ impl ArgumentValidator {
             }
         }
         if self.mode == CoercionMode::Weak {
+            if let Some(value) = weak_coerce_int_float_union(param.type_spec(), value) {
+                return Ok(value);
+            }
             for atom in param.type_spec().atoms() {
                 if let Some(value) = weak_coerce(*atom, value) {
                     return Ok(value);
@@ -410,8 +425,9 @@ impl ArgumentValidator {
         Err(ArginfoError::type_error(
             "E_PHP_STD_TYPE_ERROR",
             format!(
-                "{}(): Argument ${} must be of type {}, {} given",
+                "{}(): Argument #{} (${}) must be of type {}, {} given",
                 function,
+                index + 1,
                 param.name(),
                 param.type_spec().display(),
                 value_type(value)
@@ -560,10 +576,28 @@ fn weak_coerce(atom: ArgType, value: &Value) -> Option<Value> {
     }
 }
 
+fn weak_coerce_int_float_union(type_spec: &TypeSpec, value: &Value) -> Option<Value> {
+    if !type_spec.atoms().contains(&ArgType::Int) || !type_spec.atoms().contains(&ArgType::Float) {
+        return None;
+    }
+    let Value::String(string) = value else {
+        return None;
+    };
+    let bytes = string.as_bytes();
+    if bytes
+        .iter()
+        .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+    {
+        return to_float(value).ok().map(Value::float);
+    }
+    None
+}
+
 fn value_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
-        Value::Bool(_) => "bool",
+        Value::Bool(true) => "true",
+        Value::Bool(false) => "false",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
         Value::String(_) => "string",
@@ -638,6 +672,35 @@ mod tests {
     }
 
     #[test]
+    fn validates_too_many_args_for_fixed_arity_with_exactly_message() {
+        let info = FunctionArgInfo::new(
+            "fixed_sample",
+            vec![
+                ParameterInfo::required("left", TypeSpec::one(ArgType::String)),
+                ParameterInfo::required("right", TypeSpec::one(ArgType::Array)),
+            ],
+            TypeSpec::one(ArgType::Bool),
+        );
+        let error = ArgumentValidator::new(CoercionMode::Weak)
+            .validate(
+                &info,
+                &[
+                    Value::String(PhpString::from("x")),
+                    Value::Array(Default::default()),
+                    Value::Int(2),
+                ],
+                span(),
+            )
+            .expect_err("too many args");
+
+        assert_eq!(error.diagnostic().id(), "E_PHP_STD_TOO_MANY_ARGUMENTS");
+        assert_eq!(
+            error.diagnostic().message(),
+            "fixed_sample() expects exactly 2 arguments, 3 given"
+        );
+    }
+
+    #[test]
     fn validates_wrong_type_with_snapshot_message() {
         let error = ArgumentValidator::new(CoercionMode::Strict)
             .validate(&sample_info(), &[Value::Array(Default::default())], span())
@@ -646,7 +709,28 @@ mod tests {
         assert_eq!(error.diagnostic().id(), "E_PHP_STD_TYPE_ERROR");
         assert_eq!(
             error.diagnostic().message(),
-            "stdlib_sample(): Argument $value must be of type string, array given"
+            "stdlib_sample(): Argument #1 ($value) must be of type string, array given"
+        );
+    }
+
+    #[test]
+    fn validates_bool_type_names_with_php_truth_values() {
+        let error = ArgumentValidator::new(CoercionMode::Strict)
+            .validate(&sample_info(), &[Value::Bool(true)], span())
+            .expect_err("wrong type");
+
+        assert_eq!(
+            error.diagnostic().message(),
+            "stdlib_sample(): Argument #1 ($value) must be of type string, true given"
+        );
+
+        let error = ArgumentValidator::new(CoercionMode::Strict)
+            .validate(&sample_info(), &[Value::Bool(false)], span())
+            .expect_err("wrong type");
+
+        assert_eq!(
+            error.diagnostic().message(),
+            "stdlib_sample(): Argument #1 ($value) must be of type string, false given"
         );
     }
 
@@ -660,6 +744,25 @@ mod tests {
             validated.values(),
             &[Value::String(PhpString::from("42")), Value::Int(3),]
         );
+    }
+
+    #[test]
+    fn weak_int_float_union_keeps_decimal_numeric_strings_as_float() {
+        let metadata = crate::generated::arginfo::function_metadata("range").expect("range");
+        let info = FunctionArgInfo::from_generated(metadata).expect("runtime arginfo");
+        let validated = ArgumentValidator::new(CoercionMode::Weak)
+            .validate(
+                &info,
+                &[
+                    Value::String(PhpString::from("1")),
+                    Value::String(PhpString::from("2")),
+                    Value::String(PhpString::from("0.1")),
+                ],
+                span(),
+            )
+            .expect("validated");
+
+        assert_eq!(validated.values()[2], Value::float(0.1));
     }
 
     #[test]

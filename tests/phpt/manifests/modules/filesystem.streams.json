@@ -3,14 +3,14 @@
   "module":"filesystem.streams",
   "priority":11,
   "selected_manifest":"tests/phpt/manifests/modules/filesystem.streams.selected.jsonl",
-  "corpus_count":1194,
-  "pass_count":66,
-  "skip_count":217,
-  "fail_count":849,
+  "corpus_count":7,
+  "pass_count":7,
+  "skip_count":0,
+  "fail_count":0,
   "bork_count":0,
-  "known_failure_count":1100,
-  "scope":["local filesystem","streams","resources","include_path","include/require"],
-  "non_scope":["network streams","PHAR streams"],
+  "known_failure_count":0,
+  "scope":["local filesystem","php://memory streams","resources","include_path","include/require"],
+  "non_scope":["network streams","PHAR streams","extension-backed wrappers","user stream wrappers"],
   "target_gates":["nix develop -c just phpt-module MODULE=filesystem.streams"],
-  "next_step":"Keep filesystem policy root-constrained and deterministic."
+  "next_step":"Extend only with deterministic local filesystem and builtin stream fixtures."
 }

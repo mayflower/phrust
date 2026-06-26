@@ -77,7 +77,8 @@ fn parse_array_pairs_until(parser: &mut Parser<'_>, close: u8) {
         }
 
         let pair = parser.start();
-        if parser.at(named(TokenName::Ellipsis))
+        if parser.at(symbol(b'&'))
+            || parser.at(named(TokenName::Ellipsis))
             || parser.at(named(TokenName::AmpersandFollowedByVarOrVararg))
             || parser.at(named(TokenName::AmpersandNotFollowedByVarOrVararg))
         {
@@ -89,6 +90,14 @@ fn parse_array_pairs_until(parser: &mut Parser<'_>, close: u8) {
         }
         if parser.at(named(TokenName::DoubleArrow)) {
             parser.bump();
+            bump_trivia(parser);
+            if parser.at(symbol(b'&'))
+                || parser.at(named(TokenName::AmpersandFollowedByVarOrVararg))
+                || parser.at(named(TokenName::AmpersandNotFollowedByVarOrVararg))
+            {
+                parser.bump();
+                bump_trivia(parser);
+            }
             if !expressions::parse_expression(parser) {
                 parser.error_expected("expected array value after `=>`", &["expression"]);
             }
@@ -106,6 +115,12 @@ fn parse_array_pairs_until(parser: &mut Parser<'_>, close: u8) {
     }
 }
 
+fn bump_trivia(parser: &mut Parser<'_>) {
+    while parser.current().is_trivia() {
+        parser.bump();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parse_source_file;
@@ -113,6 +128,19 @@ mod tests {
     #[test]
     fn long_array_allows_trivia_before_open_paren() {
         let source = "<?php $xs = array (1, 2); $ys = list ($a, $b);\n";
+        let parse = parse_source_file(source);
+
+        assert_eq!(parse.reconstructed_text(), source);
+        assert!(
+            parse.diagnostics().is_empty(),
+            "unexpected diagnostics: {:#?}",
+            parse.diagnostics()
+        );
+    }
+
+    #[test]
+    fn keyed_array_values_allow_references() {
+        let source = "<?php $xs = array(1 => &$value); $ys = [2 => &$other];\n";
         let parse = parse_source_file(source);
 
         assert_eq!(parse.reconstructed_text(), source);

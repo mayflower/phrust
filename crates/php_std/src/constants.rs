@@ -135,6 +135,21 @@ pub const SORT_NATURAL: i64 = 6;
 /// Case-insensitive string/natural sort modifier.
 pub const SORT_FLAG_CASE: i64 = 8;
 
+/// Locale category for all locale settings.
+pub const LC_ALL: i64 = 6;
+/// Locale category for character classification and conversion.
+pub const LC_CTYPE: i64 = 0;
+/// Locale category for numeric formatting.
+pub const LC_NUMERIC: i64 = 1;
+/// Locale category for date/time formatting.
+pub const LC_TIME: i64 = 2;
+/// Locale category for string collation.
+pub const LC_COLLATE: i64 = 3;
+/// Locale category for monetary formatting.
+pub const LC_MONETARY: i64 = 4;
+/// Locale category for localized messages.
+pub const LC_MESSAGES: i64 = 5;
+
 /// Lowercase key conversion flag.
 pub const CASE_LOWER: i64 = 0;
 /// Uppercase key conversion flag.
@@ -230,6 +245,8 @@ mod tests {
         assert_eq!(SORT_LOCALE_STRING, 5);
         assert_eq!(SORT_NATURAL, 6);
         assert_eq!(SORT_FLAG_CASE, 8);
+        assert_eq!(LC_ALL, 6);
+        assert_eq!(LC_CTYPE, 0);
         assert_eq!(CASE_LOWER, 0);
         assert_eq!(CASE_UPPER, 1);
         assert_eq!(COUNT_NORMAL, 0);

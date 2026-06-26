@@ -40,7 +40,7 @@ and summary reports under `docs/phpt/reports/`.
 ## PHPT Command
 
 ```bash
-nix develop -c just phpt-full-regression
+PHPT_RUN_FULL=1 nix develop -c just phpt-full-regression
 ```
 
 The command runs the complete discovered PHPT corpus from
@@ -62,10 +62,10 @@ corpus contains stress tests where a 10 second local timeout is load-sensitive.
 Override with `PHPT_TIMEOUT_SECONDS=<seconds>` when deliberately tightening or
 debugging timeout behavior.
 
-The runner executes PHPT cases in parallel by default, capped at 16 jobs. Override
-the job count with `PHPT_JOBS=<n>` when debugging load-sensitive timeouts or when
-CI capacity is constrained. Results are written in manifest order so the JSONL
-output remains deterministic across job counts.
+The runner executes PHPT cases serially by default. Opt into parallel execution
+with `PHPT_JOBS=<n>` or `php-phpt-tools run --jobs <n>` only for an intentional
+batch run. Results are written in manifest order so the JSONL output remains
+deterministic across job counts.
 
 ## Fast Iteration
 
@@ -110,8 +110,17 @@ just phpt-full-fast
 ```
 
 `phpt-full-fast` is the local no-build wrapper around `phpt-full-regression`.
-It writes under `/private/tmp/phrust-phpt-work` by default and expects the PHPT
-runner plus target binary to already exist from `just phpt-dev-build`.
+It writes under `/private/tmp/phrust-phpt-work` by default, enables local PASS
+reuse, and expects the PHPT runner plus target binary to already exist from
+`just phpt-dev-build`. Because it can reuse previous passing results across a
+changed target binary, it is an iteration shortcut, not the final committed
+baseline gate.
+
+The strict full-corpus gate refuses to start unless `PHPT_RUN_FULL=1` is set.
+This prevents accidental 20k+ PHPT runs during local debugging. Use focused
+module, file, pattern, or rerun-failures targets while iterating, and reserve
+`PHPT_RUN_FULL=1 just phpt-full-regression` for an intentional final
+no-regression check.
 
 When previous full-run results exist, `phpt-full-regression` passes the latest
 `results.jsonl` to the PHPT tool as a strict reuse cache unless
@@ -149,11 +158,11 @@ The command derives a temporary manifest from the previous module
 `results.jsonl`, excluding `PASS`, `SKIP`, and `XFAIL`, then writes the rerun
 report below `module-runs/<module>/rerun-failures/`.
 
-For local iteration only, `just phpt-dev-fast ...` enables
-`PHPT_DEV_REUSE_PASS=1`. That mode may reuse previous `PASS` results across a
-changed target binary when the PHPT input, expectation, target mode, and timeout
-are unchanged. It never reuses previous non-green outcomes. Final verification
-targets do not set this flag.
+For local iteration only, `just phpt-dev-fast ...` and `just phpt-full-fast`
+enable `PHPT_DEV_REUSE_PASS=1`. That mode may reuse previous `PASS` results
+across a changed target binary when the PHPT input, expectation, target mode,
+and timeout are unchanged. It never reuses previous non-green outcomes. Final
+verification targets do not set this flag.
 
 `php-phpt-tools run` accepts `--reuse-results <results.jsonl>` or
 `PHPT_REUSE_RESULTS=<results.jsonl>`. A result is reused only when the PHPT path,

@@ -67,8 +67,8 @@ help:
       '  just phpt-dev-fast MODULE=<module> [...]   Run fast loop with explicit dev PASS reuse' \
       '  just phpt-rerun-failures MODULE=<module>   Rerun only last non-green module outcomes' \
       '  just phpt-triage         Generate PHPT triage report and module plan' \
-      '  just phpt-full-regression Run the full PHPT no-regression gate' \
-      '  just phpt-full-fast      Run full PHPT gate after dev build' \
+      '  just phpt-full-regression Run the full PHPT no-regression gate with PHPT_RUN_FULL=1' \
+      '  just phpt-full-fast      Run full PHPT gate after dev build with explicit local reuse' \
       '  just phpt-verify-baseline Verify committed PHPT full baseline files' \
       '  just phpt-verify-source-integrity Verify pinned php-src was not mutated'
 
@@ -298,10 +298,10 @@ phpt-module-target *args:
     scripts/phpt/module_target.sh {{args}}
 
 phpt-fast *args:
-    @PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
+    @PHPT_REQUIRE_FOCUS=1 PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
 
 phpt-dev-fast *args:
-    @PHPT_SKIP_BUILD=1 PHPT_DEV_REUSE_PASS=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
+    @PHPT_REQUIRE_FOCUS=1 PHPT_SKIP_BUILD=1 PHPT_DEV_REUSE_PASS=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_target.sh {{args}}
 
 phpt-rerun-failures *args:
     @PHPT_SKIP_BUILD=1 PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-3}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/rerun_failures.sh {{args}}
@@ -310,7 +310,7 @@ phpt-full-regression *args:
     scripts/phpt/full_regression.sh {{args}}
 
 phpt-full-fast *args:
-    @PHPT_SKIP_BUILD=1 PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-30}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/full_regression.sh {{args}}
+    @PHPT_RUN_FULL=1 PHPT_SKIP_BUILD=1 PHPT_DEV_REUSE_PASS=1 PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-30}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/full_regression.sh {{args}}
 
 phpt-triage *args:
     cargo build -q -p php_phpt_tools --bin php-phpt-tools

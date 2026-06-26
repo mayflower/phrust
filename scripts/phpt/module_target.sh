@@ -81,6 +81,12 @@ if [[ -n "$focus_file" && -n "$focus_pattern" ]]; then
   exit 2
 fi
 
+if [[ -n "${PHPT_REQUIRE_FOCUS:-}" && "${PHPT_REQUIRE_FOCUS:-}" != "0" && -z "$focus_file" && -z "$focus_pattern" ]]; then
+  printf '%s\n' 'Focused PHPT run requires FILE=... or PATTERN=....' >&2
+  printf '%s\n' 'Use just phpt-module-target MODULE=<module> for a full target-only module run.' >&2
+  exit 2
+fi
+
 if [[ -n "$focus_file" ]]; then
   focus_slug="$(printf 'file-%s' "$focus_file" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
   target_dir="$module_dir/focus/$focus_slug"
@@ -161,10 +167,7 @@ if [[ -n "${PHPT_DEV_REUSE_PASS:-}" && "${PHPT_DEV_REUSE_PASS:-}" != "0" ]]; the
   dev_reuse_args=(--dev-reuse-pass)
 fi
 
-job_args=()
-if [[ -n "${PHPT_JOBS:-}" ]]; then
-  job_args=(--jobs "$PHPT_JOBS")
-fi
+job_args=(--jobs "${PHPT_JOBS:-1}")
 
 set +e
 if [[ -n "$reuse_results" ]]; then
@@ -200,6 +203,11 @@ set -e
 if [[ "$target_status" -gt 1 ]]; then
   printf 'target module run failed before producing a report: status %s\n' "$target_status" >&2
   exit "$target_status"
+fi
+
+if [[ "$target_status" -eq 1 ]]; then
+  printf 'target module run produced non-green outcomes; see %s\n' "$target_dir/summary.md" >&2
+  exit 1
 fi
 
 printf '[ok] target-only module PHPT report for %s\n' "$module"

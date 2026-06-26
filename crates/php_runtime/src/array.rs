@@ -99,6 +99,7 @@ struct ArrayStorage {
     entries: Vec<ArrayEntry>,
     next_append_key: Option<i64>,
     packed_len: Option<usize>,
+    internal_pointer: Option<usize>,
 }
 
 impl Default for ArrayStorage {
@@ -107,6 +108,7 @@ impl Default for ArrayStorage {
             entries: Vec::new(),
             next_append_key: None,
             packed_len: Some(0),
+            internal_pointer: None,
         }
     }
 }
@@ -158,6 +160,7 @@ impl PhpArray {
                 entries: Vec::new(),
                 next_append_key: None,
                 packed_len: Some(0),
+                internal_pointer: None,
             }),
         }
     }
@@ -245,6 +248,9 @@ impl PhpArray {
             && matches!(key, ArrayKey::Int(value) if value == old_len as i64);
         storage.entries.push(ArrayEntry { key, value });
         storage.packed_len = remains_packed.then_some(old_len + 1);
+        if storage.internal_pointer.is_none() {
+            storage.internal_pointer = Some(0);
+        }
         None
     }
 
@@ -261,6 +267,9 @@ impl PhpArray {
             value,
         });
         storage.packed_len = remains_packed.then_some(old_len + 1);
+        if storage.internal_pointer.is_none() {
+            storage.internal_pointer = Some(0);
+        }
         key
     }
 
@@ -301,8 +310,83 @@ impl PhpArray {
                             None
                         };
                 }
+                adjust_pointer_after_remove(storage, index);
                 value
             })
+    }
+
+    /// Returns the current internal-pointer value.
+    #[must_use]
+    pub fn pointer_value(&self) -> Option<Value> {
+        self.storage
+            .internal_pointer
+            .and_then(|index| self.storage.entries.get(index))
+            .map(ArrayEntry::value)
+            .cloned()
+    }
+
+    /// Returns the current internal-pointer key.
+    #[must_use]
+    pub fn pointer_key(&self) -> Option<ArrayKey> {
+        self.storage
+            .internal_pointer
+            .and_then(|index| self.storage.entries.get(index))
+            .map(ArrayEntry::key)
+            .cloned()
+    }
+
+    /// Moves the internal pointer to the first element.
+    pub fn reset_pointer(&mut self) -> Option<Value> {
+        let storage = self.storage_mut();
+        if storage.entries.is_empty() {
+            storage.internal_pointer = None;
+            return None;
+        }
+        storage.internal_pointer = Some(0);
+        storage.entries.first().map(ArrayEntry::value).cloned()
+    }
+
+    /// Moves the internal pointer to the last element.
+    pub fn end_pointer(&mut self) -> Option<Value> {
+        let storage = self.storage_mut();
+        let last = storage.entries.len().checked_sub(1)?;
+        storage.internal_pointer = Some(last);
+        storage.entries.get(last).map(ArrayEntry::value).cloned()
+    }
+
+    /// Advances the internal pointer by one element.
+    pub fn next_pointer(&mut self) -> Option<Value> {
+        let storage = self.storage_mut();
+        let Some(current) = storage.internal_pointer else {
+            return None;
+        };
+        let next = current.saturating_add(1);
+        if next >= storage.entries.len() {
+            storage.internal_pointer = None;
+            return None;
+        }
+        storage.internal_pointer = Some(next);
+        storage.entries.get(next).map(ArrayEntry::value).cloned()
+    }
+
+    /// Moves the internal pointer one element backwards.
+    pub fn prev_pointer(&mut self) -> Option<Value> {
+        let storage = self.storage_mut();
+        let Some(current) = storage.internal_pointer else {
+            let last = storage.entries.len().checked_sub(1)?;
+            storage.internal_pointer = Some(last);
+            return storage.entries.get(last).map(ArrayEntry::value).cloned();
+        };
+        let Some(previous) = current.checked_sub(1) else {
+            storage.internal_pointer = None;
+            return None;
+        };
+        storage.internal_pointer = Some(previous);
+        storage
+            .entries
+            .get(previous)
+            .map(ArrayEntry::value)
+            .cloned()
     }
 
     /// Iterates in insertion order.
@@ -360,6 +444,21 @@ fn bump_append_key(storage: &mut ArrayStorage, key: &ArrayKey) {
             storage.next_append_key = Some(next);
         }
     }
+}
+
+fn adjust_pointer_after_remove(storage: &mut ArrayStorage, removed_index: usize) {
+    let Some(pointer) = storage.internal_pointer else {
+        return;
+    };
+    storage.internal_pointer = if storage.entries.is_empty() {
+        None
+    } else if pointer > removed_index {
+        Some(pointer - 1)
+    } else if pointer >= storage.entries.len() {
+        None
+    } else {
+        Some(pointer)
+    };
 }
 
 fn normalize_string_key(value: &PhpString) -> Option<i64> {

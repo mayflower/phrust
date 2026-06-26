@@ -1511,13 +1511,20 @@ fn push_expression_kind_json(out: &mut String, kind: &hir::HirExprKind) {
             out.push_str(",\"elements\":");
             push_expr_ids_json(out, elements);
         }
-        hir::HirExprKind::ArrayPair { key, value, unpack } => {
+        hir::HirExprKind::ArrayPair {
+            key,
+            value,
+            unpack,
+            by_ref,
+        } => {
             out.push_str(",\"key\":");
             push_optional_expr_id_json(out, *key);
             out.push_str(",\"value\":");
             push_optional_expr_id_json(out, *value);
             out.push_str(",\"unpack\":");
             out.push_str(if *unpack { "true" } else { "false" });
+            out.push_str(",\"by_ref\":");
+            out.push_str(if *by_ref { "true" } else { "false" });
         }
         hir::HirExprKind::Unary { operator, expr }
         | hir::HirExprKind::Cast {

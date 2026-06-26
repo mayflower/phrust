@@ -606,6 +606,8 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::FetchProperty { dst, .. }
         | InstructionKind::IssetProperty { dst, .. }
         | InstructionKind::EmptyProperty { dst, .. }
+        | InstructionKind::IssetPropertyDim { dst, .. }
+        | InstructionKind::EmptyPropertyDim { dst, .. }
         | InstructionKind::FetchStaticProperty { dst, .. }
         | InstructionKind::FetchClassConstant { dst, .. }
         | InstructionKind::AssignProperty { dst, .. }

@@ -106,10 +106,7 @@ work_root="${PHPT_WORK_DIR:-target/phpt-work}"
 reference_dir="$work_root/module-runs/${safe_module}/reference"
 target_dir="$work_root/module-runs/${safe_module}/target"
 
-job_args=()
-if [[ -n "${PHPT_JOBS:-}" ]]; then
-  job_args=(--jobs "$PHPT_JOBS")
-fi
+job_args=(--jobs "${PHPT_JOBS:-1}")
 
 reference_reuse_args=()
 if [[ "${PHPT_DISABLE_REFERENCE_REUSE:-0}" != "1" && -s "$reference_dir/results.jsonl" ]]; then
@@ -154,6 +151,11 @@ if [[ "$target_status" -gt 1 ]]; then
 fi
 
 scripts/phpt/verify_source_integrity.sh
+
+if [[ "$target_status" -eq 1 ]]; then
+  printf 'target module run produced non-green outcomes; see %s\n' "$target_dir/summary.md" >&2
+  exit 1
+fi
 
 printf '[ok] module PHPT reports for %s\n' "$module"
 printf '[ok] reference: %s\n' "$reference_dir"

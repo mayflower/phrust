@@ -50,10 +50,10 @@ impl BinaryOperator {
 #[must_use]
 pub fn binary_operator(kind: SyntaxKind) -> Option<BinaryOperator> {
     let operator = match kind {
-        kind if is_assignment_operator(kind) => BinaryOperator::right(kind, 5),
         kind if kind == named(TokenName::LogicalOr) => BinaryOperator::left(kind, 10),
         kind if kind == named(TokenName::LogicalXor) => BinaryOperator::left(kind, 20),
         kind if kind == named(TokenName::LogicalAnd) => BinaryOperator::left(kind, 30),
+        kind if is_assignment_operator(kind) => BinaryOperator::right(kind, 35),
         kind if kind == named(TokenName::Coalesce) => BinaryOperator::right(kind, 40),
         kind if kind == named(TokenName::BooleanOr) => BinaryOperator::left(kind, 50),
         kind if kind == named(TokenName::BooleanAnd) => BinaryOperator::left(kind, 60),
@@ -84,7 +84,7 @@ fn is_bitwise_and_operator(kind: SyntaxKind) -> bool {
 }
 
 /// Ternary/elvis binding power.
-pub const TERNARY_BP: u8 = 6;
+pub const TERNARY_BP: u8 = 36;
 
 /// Returns true for assignment operators.
 #[must_use]

@@ -140,12 +140,17 @@ fn declare_value(token: &SyntaxToken) -> DeclareValue {
 }
 
 fn unquote_string(text: &str) -> String {
-    if text.len() >= 2 {
-        let bytes = text.as_bytes();
-        if (bytes[0] == b'"' && bytes[text.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[text.len() - 1] == b'\'')
+    let bytes = text.as_bytes();
+    let quote_start = if matches!(bytes, [b'b' | b'B', b'\'' | b'"', ..]) {
+        1
+    } else {
+        0
+    };
+    if text.len() >= quote_start + 2 {
+        if (bytes[quote_start] == b'"' && bytes[text.len() - 1] == b'"')
+            || (bytes[quote_start] == b'\'' && bytes[text.len() - 1] == b'\'')
         {
-            return text[1..text.len() - 1].to_owned();
+            return text[quote_start + 1..text.len() - 1].to_owned();
         }
     }
     text.to_owned()

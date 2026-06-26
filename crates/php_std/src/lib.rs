@@ -524,6 +524,41 @@ impl ExtensionRegistry {
                     ConstantValue::Int(constants::SORT_FLAG_CASE),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
+                    "LC_ALL",
+                    "standard",
+                    ConstantValue::Int(constants::LC_ALL),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_CTYPE",
+                    "standard",
+                    ConstantValue::Int(constants::LC_CTYPE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_NUMERIC",
+                    "standard",
+                    ConstantValue::Int(constants::LC_NUMERIC),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_TIME",
+                    "standard",
+                    ConstantValue::Int(constants::LC_TIME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_COLLATE",
+                    "standard",
+                    ConstantValue::Int(constants::LC_COLLATE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_MONETARY",
+                    "standard",
+                    ConstantValue::Int(constants::LC_MONETARY),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LC_MESSAGES",
+                    "standard",
+                    ConstantValue::Int(constants::LC_MESSAGES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
                     "CASE_LOWER",
                     "standard",
                     ConstantValue::Int(constants::CASE_LOWER),

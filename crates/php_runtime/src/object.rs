@@ -233,8 +233,10 @@ pub struct AttributeEntry {
 #[derive(Debug)]
 struct ObjectStorage {
     class_name: String,
+    display_name: String,
     properties: HashMap<String, Value>,
     property_order: Vec<String>,
+    property_debug_labels: HashMap<String, String>,
 }
 
 /// Reference to runtime object storage.
@@ -278,6 +280,13 @@ impl ObjectRef {
     /// Creates an object with properties initialized from the class entry.
     #[must_use]
     pub fn new(class: &ClassEntry) -> Self {
+        Self::new_with_display_name(class, class.name.clone())
+    }
+
+    /// Creates an object with an explicit source-spelled display class name.
+    #[must_use]
+    pub fn new_with_display_name(class: &ClassEntry, display_name: impl Into<String>) -> Self {
+        let display_name = display_name.into();
         let property_entries = class
             .properties
             .iter()
@@ -289,6 +298,16 @@ impl ObjectRef {
             })
             .map(|property| (property.name.clone(), property.default.clone()))
             .collect::<Vec<_>>();
+        let property_debug_labels = class
+            .properties
+            .iter()
+            .map(|property| {
+                (
+                    property.name.clone(),
+                    property_debug_label(property, &display_name),
+                )
+            })
+            .collect();
         let property_order = property_entries
             .iter()
             .map(|(name, _)| name.clone())
@@ -298,8 +317,10 @@ impl ObjectRef {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: class.name.clone(),
+                display_name,
                 properties,
                 property_order,
+                property_debug_labels,
             })),
         }
     }
@@ -331,6 +352,12 @@ impl ObjectRef {
         self.storage.borrow().class_name.clone()
     }
 
+    /// Returns the source-spelled display class name for diagnostics and dumps.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.storage.borrow().display_name.clone()
+    }
+
     /// Creates a new object identity with a shallow copy of the property map.
     #[must_use]
     pub fn clone_shallow(&self) -> Self {
@@ -339,8 +366,10 @@ impl ObjectRef {
             id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: storage.class_name.clone(),
+                display_name: storage.display_name.clone(),
                 properties: storage.properties.clone(),
                 property_order: storage.property_order.clone(),
+                property_debug_labels: storage.property_debug_labels.clone(),
             })),
         }
     }
@@ -359,6 +388,17 @@ impl ObjectRef {
             storage.property_order.push(name.clone());
         }
         storage.properties.insert(name, value);
+    }
+
+    /// Returns the `var_dump` property label for a stored property name.
+    #[must_use]
+    pub fn property_debug_label(&self, name: &str) -> String {
+        self.storage
+            .borrow()
+            .property_debug_labels
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| format!("\"{name}\""))
     }
 
     /// Removes a property value, returning whether it existed.
@@ -405,6 +445,22 @@ impl fmt::Debug for ObjectRef {
             .field("id", &self.id)
             .field("class_name", &self.class_name())
             .finish()
+    }
+}
+
+fn property_debug_label(property: &ClassPropertyEntry, display_class: &str) -> String {
+    if property.flags.is_private {
+        let name = property
+            .name
+            .strip_prefix("private:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(_, name)| name)
+            .unwrap_or(property.name.as_str());
+        format!("\"{name}\":\"{display_class}\":private")
+    } else if property.flags.is_protected {
+        format!("\"{}\":protected", property.name)
+    } else {
+        format!("\"{}\"", property.name)
     }
 }
 

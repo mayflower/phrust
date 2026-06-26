@@ -971,8 +971,7 @@ fn run_one_phpt(
 ) -> Result<PhptRunResult, String> {
     let options = &context.options;
     let phpt_path = resolve_phpt_path(&options.php_src, manifest_path);
-    let source = fs::read_to_string(&phpt_path)
-        .map_err(|error| format!("{}: {error}", phpt_path.display()))?;
+    let source = read_phpt_source_lossy(&phpt_path)?;
     let document = parse_phpt(&source);
     let cache_key = phpt_result_cache_key(context, manifest_path, &source, &document, &phpt_path)?;
     let input_cache_key =
@@ -1095,6 +1094,11 @@ fn run_one_phpt(
         )
         .with_cache_keys(cache_key, input_cache_key))
     }
+}
+
+fn read_phpt_source_lossy(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn symbol_index<W: Write>(args: &[String], stdout: &mut W) -> Result<i32, String> {
@@ -5085,10 +5089,7 @@ fn parse_bool_flag(value: &str, name: &str) -> Result<bool, String> {
 }
 
 fn default_phpt_jobs() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 16)
+    1
 }
 
 fn parse_usize(value: &str, name: &str) -> Result<usize, String> {
@@ -5843,6 +5844,11 @@ mod tests {
     }
 
     #[test]
+    fn default_run_jobs_is_serial() {
+        assert_eq!(default_phpt_jobs(), 1);
+    }
+
+    #[test]
     fn parses_run_reuse_results() {
         let options = RunOptions::parse(&[
             "--target".to_string(),
@@ -6110,6 +6116,24 @@ mod tests {
             classify_bork(Some("STDIN and ARGS are unsupported")),
             "unsupported-runner-io"
         );
+    }
+
+    #[test]
+    fn phpt_runner_reads_non_utf8_sources_lossily() {
+        let path = env::temp_dir().join(format!(
+            "phrust-non-utf8-phpt-{}-{}.phpt",
+            std::process::id(),
+            "locale"
+        ));
+        fs::write(
+            &path,
+            b"--TEST--\nlocale \xE9\n--FILE--\n<?php echo 'ok';\n--EXPECT--\nok\n",
+        )
+        .unwrap();
+        let source = read_phpt_source_lossy(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(source.contains("--FILE--"));
+        assert!(source.contains('\u{fffd}'));
     }
 
     #[test]

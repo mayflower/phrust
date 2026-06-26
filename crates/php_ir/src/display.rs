@@ -281,6 +281,21 @@ fn format_constant(constant: &IrConstant) -> String {
         IrConstant::Float(value) => format!("float {value:?}"),
         IrConstant::String(value) => format!("string {value:?}"),
         IrConstant::StringBytes(value) => format!("string_bytes {value:?}"),
+        IrConstant::Array(entries) => {
+            let entries = entries
+                .iter()
+                .map(|entry| {
+                    let key = entry
+                        .key
+                        .as_ref()
+                        .map(format_constant)
+                        .unwrap_or_else(|| "append".to_string());
+                    format!("{key}=>{}", format_constant(&entry.value))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("array [{entries}]")
+        }
     }
 }
 
@@ -311,6 +326,22 @@ fn format_call_arg(arg: &IrCallArg) -> String {
     out.push_str(&format_operand(&arg.value));
     if let Some(local) = arg.by_ref_local {
         out.push_str(&format!(" by_ref=local:{}", local.raw()));
+    }
+    if let Some(dim) = &arg.by_ref_dim {
+        let dims = dim
+            .dims
+            .iter()
+            .map(format_operand)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(" by_ref_dim=local:{}[{}]", dim.local.raw(), dims));
+    }
+    if let Some(property) = &arg.by_ref_property {
+        out.push_str(&format!(
+            " by_ref_property={}->${}",
+            format_operand(&property.object),
+            property.property
+        ));
     }
     out
 }
@@ -719,6 +750,30 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_operand(object),
             property
         ),
+        InstructionKind::IssetPropertyDim {
+            dst,
+            object,
+            property,
+            dims,
+        } => format!(
+            "isset_property_dim r{} {} ${} [{}]",
+            dst.raw(),
+            format_operand(object),
+            property,
+            format_operands(dims)
+        ),
+        InstructionKind::EmptyPropertyDim {
+            dst,
+            object,
+            property,
+            dims,
+        } => format!(
+            "empty_property_dim r{} {} ${} [{}]",
+            dst.raw(),
+            format_operand(object),
+            property,
+            format_operands(dims)
+        ),
         InstructionKind::UnsetProperty { object, property } => {
             format!("unset_property {} ${}", format_operand(object), property)
         }
@@ -767,17 +822,26 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_operand(value)
         ),
         InstructionKind::NewArray { dst } => format!("new_array r{}", dst.raw()),
-        InstructionKind::ArrayInsert { array, key, value } => {
+        InstructionKind::ArrayInsert {
+            array,
+            key,
+            value,
+            by_ref_local,
+        } => {
             let key = key
                 .as_ref()
                 .map(format_operand)
                 .unwrap_or_else(|| "append".to_owned());
-            format!(
+            let mut out = format!(
                 "array_insert r{} {} {}",
                 array.raw(),
                 key,
                 format_operand(value)
-            )
+            );
+            if let Some(local) = by_ref_local {
+                out.push_str(&format!(" by_ref=local:{}", local.raw()));
+            }
+            out
         }
         InstructionKind::FetchDim {
             dst,

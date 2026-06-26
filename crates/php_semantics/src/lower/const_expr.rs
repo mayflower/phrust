@@ -435,6 +435,7 @@ fn parse_decimal_int(text: &str) -> Option<i64> {
 }
 
 fn parse_single_quoted_string(text: &str) -> Option<String> {
+    let text = strip_binary_string_prefix(text);
     let body = text.strip_prefix('\'')?.strip_suffix('\'')?;
     let mut out = String::new();
     let mut chars = body.chars();
@@ -457,6 +458,7 @@ fn parse_single_quoted_string(text: &str) -> Option<String> {
 }
 
 fn parse_double_quoted_string_without_interpolation(text: &str) -> Option<String> {
+    let text = strip_binary_string_prefix(text);
     let body = text.strip_prefix('"')?.strip_suffix('"')?;
     let mut out = String::new();
     let mut chars = body.chars();
@@ -486,6 +488,15 @@ fn parse_double_quoted_string_without_interpolation(text: &str) -> Option<String
         }
     }
     Some(out)
+}
+
+fn strip_binary_string_prefix(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if matches!(bytes, [b'b' | b'B', b'\'' | b'"', ..]) {
+        &text[1..]
+    } else {
+        text
+    }
 }
 
 fn is_promoted_parameter(node: &SyntaxNode) -> bool {

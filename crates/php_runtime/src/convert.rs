@@ -106,7 +106,7 @@ pub fn to_string(value: &Value) -> Result<PhpString, String> {
     }
 }
 
-fn float_to_php_string(value: f64) -> String {
+pub(crate) fn float_to_php_string(value: f64) -> String {
     if value.is_nan() {
         "NAN".to_owned()
     } else if value.is_infinite() {
@@ -129,7 +129,26 @@ fn float_to_php_string(value: f64) -> String {
 }
 
 fn php_decimal_float_string(value: f64) -> String {
-    let output = value.to_string();
+    let precision = FLOAT_STRING_PRECISION.with(Cell::get).clamp(1, 17) as usize;
+    let abs = value.abs();
+    let integer_digits = if abs >= 1.0 {
+        abs.log10().floor() as usize + 1
+    } else {
+        0
+    };
+    let decimals = precision.saturating_sub(integer_digits);
+    let mut output = format!("{value:.decimals$}");
+    if output == "-0" {
+        return "0".to_owned();
+    }
+    if output.contains('.') {
+        while output.ends_with('0') {
+            output.pop();
+        }
+        if output.ends_with('.') {
+            output.pop();
+        }
+    }
     if output == "-0" {
         "0".to_owned()
     } else {
@@ -152,9 +171,9 @@ fn php_scientific_float_string(value: f64) -> String {
         }
         let sign = exponent
             .strip_prefix('+')
-            .map(|digits| ("", digits))
+            .map(|digits| ("+", digits))
             .or_else(|| exponent.strip_prefix('-').map(|digits| ("-", digits)))
-            .unwrap_or(("", exponent));
+            .unwrap_or(("+", exponent));
         let digits = sign.1.trim_start_matches('0');
         output = format!(
             "{}E{}{}",
@@ -436,7 +455,12 @@ fn arrays_compare(left: &crate::PhpArray, right: &crate::PhpArray) -> Result<Ord
     }
     for (left_key, left_value) in left.iter() {
         let Some(right_value) = right.get(left_key) else {
-            return Ok(Ordering::Greater);
+            let right_key = right
+                .iter()
+                .map(|(key, _)| key)
+                .next()
+                .expect("equal length arrays are not empty when a key is missing");
+            return Ok(compare_array_keys(left_key, right_key));
         };
         let ordering = compare(left_value, right_value)?;
         if ordering != Ordering::Equal {
@@ -444,6 +468,17 @@ fn arrays_compare(left: &crate::PhpArray, right: &crate::PhpArray) -> Result<Ord
         }
     }
     Ok(Ordering::Equal)
+}
+
+fn compare_array_keys(left: &crate::ArrayKey, right: &crate::ArrayKey) -> Ordering {
+    match (left, right) {
+        (crate::ArrayKey::Int(left), crate::ArrayKey::Int(right)) => left.cmp(right),
+        (crate::ArrayKey::String(left), crate::ArrayKey::String(right)) => {
+            left.as_bytes().cmp(right.as_bytes())
+        }
+        (crate::ArrayKey::Int(_), crate::ArrayKey::String(_)) => Ordering::Less,
+        (crate::ArrayKey::String(_), crate::ArrayKey::Int(_)) => Ordering::Greater,
+    }
 }
 
 fn objects_equal(left: &crate::ObjectRef, right: &crate::ObjectRef) -> Result<bool, String> {
@@ -476,7 +511,25 @@ fn objects_compare(left: &crate::ObjectRef, right: &crate::ObjectRef) -> Result<
         Ordering::Equal => {}
         ordering => return Ok(ordering),
     }
-    Ok(left.id().cmp(&right.id()))
+    let left_properties = left.properties_snapshot();
+    let right_properties = right.properties_snapshot();
+    match left_properties.len().cmp(&right_properties.len()) {
+        Ordering::Equal => {}
+        ordering => return Ok(ordering),
+    }
+    for ((left_name, left_value), (right_name, right_value)) in
+        left_properties.iter().zip(right_properties.iter())
+    {
+        match left_name.cmp(right_name) {
+            Ordering::Equal => {}
+            ordering => return Ok(ordering),
+        }
+        let ordering = compare(left_value, right_value)?;
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(Ordering::Equal)
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -498,6 +551,10 @@ fn type_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AttributeEntry, ClassConstantEntry, ClassEntry, ClassEnumCaseEntry, ClassFlags,
+        ClassPropertyEntry, ClassPropertyFlags, ClassPropertyHooks, ObjectRef,
+    };
 
     #[test]
     fn convert_truthiness_matches_scalar_mvp() {
@@ -523,6 +580,39 @@ mod tests {
         assert_eq!(
             to_string(&Value::string(b"x".to_vec())).unwrap().as_bytes(),
             b"x"
+        );
+    }
+
+    #[test]
+    fn objects_compare_by_properties_for_same_class() {
+        let class = ClassEntry {
+            name: "sample".to_string(),
+            parent: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            properties: vec![ClassPropertyEntry {
+                name: "class_value".to_string(),
+                default: Value::Null,
+                type_: None,
+                flags: ClassPropertyFlags::default(),
+                hooks: ClassPropertyHooks::default(),
+                attributes: Vec::<AttributeEntry>::new(),
+            }],
+            constants: Vec::<ClassConstantEntry>::new(),
+            enum_cases: Vec::<ClassEnumCaseEntry>::new(),
+            attributes: Vec::<AttributeEntry>::new(),
+            enum_backing_type: None,
+            constructor_id: None,
+            flags: ClassFlags::default(),
+        };
+        let low = ObjectRef::new(&class);
+        low.set_property("class_value".to_string(), Value::Int(-5));
+        let high = ObjectRef::new(&class);
+        high.set_property("class_value".to_string(), Value::Int(11));
+
+        assert_eq!(
+            compare(&Value::Object(low), &Value::Object(high)).unwrap(),
+            Ordering::Less
         );
     }
 
@@ -587,6 +677,12 @@ mod tests {
             b"NAN"
         );
         assert_eq!(to_string(&Value::float(1.75)).unwrap().as_bytes(), b"1.75");
+        assert_eq!(
+            to_string(&Value::float(1.7000000000000002))
+                .unwrap()
+                .as_bytes(),
+            b"1.7"
+        );
         set_float_string_precision(0);
         assert_eq!(to_string(&Value::float(1.75)).unwrap().as_bytes(), b"2");
         reset_float_string_precision();
@@ -671,6 +767,42 @@ mod tests {
 
         assert!(equal(&first, &reordered).unwrap());
         assert!(!identical(&first, &reordered));
+    }
+
+    #[test]
+    fn compare_arrays_orders_disjoint_integer_and_string_keys_consistently() {
+        let string_keys = {
+            let mut array = crate::PhpArray::new();
+            array.insert(
+                crate::ArrayKey::String(crate::PhpString::from("a")),
+                Value::string("orange"),
+            );
+            array.insert(
+                crate::ArrayKey::String(crate::PhpString::from("b")),
+                Value::string("banana"),
+            );
+            array.insert(
+                crate::ArrayKey::String(crate::PhpString::from("c")),
+                Value::string("apple"),
+            );
+            Value::Array(array)
+        };
+        let integer_keys = {
+            let mut array = crate::PhpArray::new();
+            array.insert(crate::ArrayKey::Int(0), Value::string("first"));
+            array.insert(crate::ArrayKey::Int(5), Value::string("second"));
+            array.insert(crate::ArrayKey::Int(6), Value::string("third"));
+            Value::Array(array)
+        };
+
+        assert_eq!(
+            compare(&string_keys, &integer_keys).unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare(&integer_keys, &string_keys).unwrap(),
+            Ordering::Less
+        );
     }
 
     #[test]

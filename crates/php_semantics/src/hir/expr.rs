@@ -46,6 +46,7 @@ pub enum HirExprKind {
         key: Option<ExprId>,
         value: Option<ExprId>,
         unpack: bool,
+        by_ref: bool,
     },
     /// List/destructuring expression.
     List { elements: Vec<ExprId> },

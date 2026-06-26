@@ -60,6 +60,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_EVAL_DEPTH: usize = 16;
+const SORT_REGULAR: i64 = 0;
+const SORT_NUMERIC: i64 = 1;
+const SORT_STRING: i64 = 2;
+const SORT_DESC: i64 = 3;
+const SORT_ASC: i64 = 4;
+const SORT_LOCALE_STRING: i64 = 5;
+const SORT_NATURAL: i64 = 6;
+const SORT_FLAG_CASE: i64 = 8;
 #[cfg(feature = "jit-cranelift")]
 const JIT_BLACKLIST_SIDE_EXIT_THRESHOLD: u64 = 2;
 #[cfg(feature = "jit-cranelift")]
@@ -317,6 +325,11 @@ enum PendingControl {
 struct PreparedArg {
     value: Value,
     reference: Option<ReferenceCell>,
+}
+
+struct PreparedArguments {
+    args: Vec<PreparedArg>,
+    diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -890,6 +903,7 @@ impl InternalFunctionDispatchCache {
 struct ExecutionState {
     globals: GlobalSymbolTable,
     included_once: Vec<PathBuf>,
+    cwd: PathBuf,
     static_locals: HashMap<(u32, String), ReferenceCell>,
     static_properties: HashMap<(String, String), Value>,
     enum_cases: HashMap<(String, String), ObjectRef>,
@@ -1108,6 +1122,7 @@ struct PropertyHookCall {
 struct FunctionCall<'a> {
     args: Vec<CallArgument>,
     captures: Vec<ClosureCaptureValue>,
+    allow_by_ref_value_warnings: bool,
     this_value: Option<ObjectRef>,
     scope_class: Option<String>,
     called_class: Option<String>,
@@ -1126,6 +1141,7 @@ impl FunctionCall<'_> {
         Self {
             args,
             captures,
+            allow_by_ref_value_warnings: false,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -1138,6 +1154,11 @@ impl FunctionCall<'_> {
             resume_fiber_continuation: None,
             resume_fiber_input: None,
         }
+    }
+
+    fn with_by_ref_value_warnings(mut self) -> Self {
+        self.allow_by_ref_value_warnings = true;
+        self
     }
 
     fn running_generator(mut self, generator: GeneratorRef) -> Self {
@@ -1200,6 +1221,28 @@ struct CallArgument {
     name: Option<String>,
     value: Value,
     by_ref_local: Option<LocalId>,
+    by_ref_dim: Option<CallDimTarget>,
+    by_ref_property: Option<CallPropertyTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CallDimTarget {
+    local: LocalId,
+    dims: Vec<ArrayKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CallPropertyTarget {
+    object: ObjectRef,
+    property: String,
+}
+
+struct MultisortArraySpec {
+    cell: ReferenceCell,
+    entries: Vec<(ArrayKey, Value)>,
+    numeric_values: Option<Vec<f64>>,
+    descending: bool,
+    flags: i64,
 }
 
 enum ArrayCallbackError {
@@ -1217,6 +1260,8 @@ impl CallArgument {
             name: None,
             value,
             by_ref_local: None,
+            by_ref_dim: None,
+            by_ref_property: None,
         }
     }
 }
@@ -1371,6 +1416,7 @@ impl Vm {
 
         let mut stack = CallStack::new();
         let mut state = ExecutionState {
+            cwd: self.options.runtime_context.cwd.clone(),
             ini: self.options.runtime_context.ini_registry(),
             env: self.options.runtime_context.env.clone(),
             ..ExecutionState::default()
@@ -2789,6 +2835,23 @@ impl Vm {
             IrConstant::Float(value) => Value::float(*value),
             IrConstant::String(value) => Value::String(self.intern_str(value)),
             IrConstant::StringBytes(value) => Value::String(self.intern_bytes(value)),
+            IrConstant::Array(entries) => {
+                let mut array = PhpArray::new();
+                for entry in entries {
+                    let value = self.inline_constant_value(&entry.value);
+                    if let Some(key) = &entry.key {
+                        let key_value = self.inline_constant_value(key);
+                        if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                            array.insert(key, value);
+                        } else {
+                            array.append(value);
+                        }
+                    } else {
+                        array.append(value);
+                    }
+                }
+                Value::Array(array)
+            }
         }
     }
 
@@ -3444,12 +3507,42 @@ impl Vm {
                 && call.shared_top_level_locals.is_none()
                 && call.running_generator.is_none()
                 && call.running_fiber.is_none();
-            let args = match prepare_arguments(function, call.args, stack) {
+            let prepared = match prepare_arguments(
+                compiled,
+                function,
+                call.args,
+                stack,
+                call.allow_by_ref_value_warnings,
+            ) {
                 Ok(args) => args,
                 Err(message) => {
                     return self.runtime_error(output, compiled, stack, message);
                 }
             };
+            let args = prepared.args;
+            for diagnostic in prepared.diagnostics {
+                let handled = match self.dispatch_error_handler(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    php_runtime::PHP_E_WARNING,
+                    &diagnostic,
+                ) {
+                    Ok(handled) => handled,
+                    Err(result) => return result,
+                };
+                if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+                    emit_vm_diagnostic(
+                        output,
+                        state,
+                        &diagnostic,
+                        php_runtime::PhpDiagnosticChannel::Warning,
+                        php_runtime::PHP_E_WARNING,
+                    );
+                    diagnostics.push(diagnostic);
+                }
+            }
             if function.flags.is_generator && call.running_generator.is_none() {
                 if function.returns_by_ref {
                     return self.runtime_error(
@@ -3531,10 +3624,11 @@ impl Vm {
                 }
                 let locals = &mut stack.current_mut().expect("frame was pushed").locals;
                 let result = if param.by_ref {
-                    let Some(reference) = arg.reference else {
-                        unreachable!("prepare_arguments validates by-reference argument cells");
-                    };
-                    locals.bind_reference_cell(param.local, reference)
+                    if let Some(reference) = arg.reference {
+                        locals.bind_reference_cell(param.local, reference)
+                    } else {
+                        locals.set(param.local, arg.value)
+                    }
                 } else {
                     locals.set(param.local, arg.value)
                 };
@@ -4163,14 +4257,17 @@ impl Vm {
                     }
                     InstructionKind::EndFinally { after } => match pending_control.take() {
                         Some(PendingControl::Return(value)) => {
-                            if let Err(message) = check_return_type(
+                            let value = match coerce_return_value(
                                 compiled,
                                 function,
-                                value.as_ref(),
+                                value,
                                 self.typecheck_fast_path_context(),
                             ) {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                             if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
                                 export_shared_locals(function, stack, shared);
                             }
@@ -4331,7 +4428,10 @@ impl Vm {
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        let object = ObjectRef::new(&runtime_class);
+                        let object = ObjectRef::new_with_display_name(
+                            &runtime_class,
+                            class.display_name.clone(),
+                        );
                         if let Some(constructor) = class.constructor {
                             let class_owner = dynamic_class_owner_in_state(state, &class.name)
                                 .unwrap_or_else(|| compiled.clone());
@@ -4744,7 +4844,10 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let object = ObjectRef::new(&runtime_class);
+                        let object = ObjectRef::new_with_display_name(
+                            &runtime_class,
+                            class.display_name.clone(),
+                        );
                         if let Some(constructor) = class.constructor {
                             let class_owner = dynamic_class_owner_in_state(state, &class.name)
                                 .unwrap_or_else(|| compiled.clone());
@@ -6024,6 +6127,96 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }
+                    InstructionKind::IssetPropertyDim {
+                        dst,
+                        object,
+                        property,
+                        dims,
+                    } => {
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot test property {property} on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match read_dim_operands(unit, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let value = property_state_value(compiled, stack, &object, property)
+                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten());
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .registers
+                            .set(
+                                *dst,
+                                Value::Bool(!matches!(value, None | Some(Value::Null))),
+                            )
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
+                    InstructionKind::EmptyPropertyDim {
+                        dst,
+                        object,
+                        property,
+                        dims,
+                    } => {
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot test property {property} on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match read_dim_operands(unit, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let value = property_state_value(compiled, stack, &object, property)
+                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
+                            .unwrap_or(Value::Uninitialized);
+                        let result = match php_empty(&value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .registers
+                            .set(*dst, Value::Bool(result))
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
                     InstructionKind::UnsetProperty { object, property } => {
                         let object = match read_operand(unit, stack, *object) {
                             Ok(Value::Object(object)) => object,
@@ -6462,7 +6655,12 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }
-                    InstructionKind::ArrayInsert { array, key, value } => {
+                    InstructionKind::ArrayInsert {
+                        array,
+                        key,
+                        value,
+                        by_ref_local,
+                    } => {
                         let key = match key {
                             Some(key) => match read_operand(unit, stack, *key)
                                 .and_then(|value| array_key_from_value(&value))
@@ -6474,10 +6672,24 @@ impl Vm {
                             },
                             None => None,
                         };
-                        let value = match read_operand(unit, stack, *value) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
+                        let value = if let Some(local) = by_ref_local {
+                            match stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .locals
+                                .ensure_reference_cell(*local)
+                            {
+                                Ok(cell) => Value::Reference(cell),
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        } else {
+                            match read_operand(unit, stack, *value) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
                             }
                         };
                         let Some(Value::Array(array_value)) = stack
@@ -8579,14 +8791,17 @@ impl Vm {
                         block_id = finally;
                         continue 'dispatch;
                     }
-                    if let Err(message) = check_return_type(
+                    let value = match coerce_return_value(
                         compiled,
                         function,
-                        value.as_ref(),
+                        value,
                         self.typecheck_fast_path_context(),
                     ) {
-                        return self.runtime_error(output, compiled, stack, message);
-                    }
+                        Ok(value) => value,
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    };
                     let return_ref = if function.returns_by_ref {
                         let Some(local) = by_ref_local else {
                             return self.runtime_error(
@@ -8885,13 +9100,46 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        self.call_callable_inner(compiled, callee, args, output, stack, state, false)
+    }
+
+    fn call_callable_with_by_ref_value_warnings(
+        &self,
+        compiled: &CompiledUnit,
+        callee: Value,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        self.call_callable_inner(compiled, callee, args, output, stack, state, true)
+    }
+
+    fn call_callable_inner(
+        &self,
+        compiled: &CompiledUnit,
+        callee: Value,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        allow_by_ref_value_warnings: bool,
+    ) -> VmResult {
         match callee {
             Value::Callable(CallableValue::UserFunction { name }) => {
+                let make_call = |args, captures| {
+                    let call = FunctionCall::new(args, captures);
+                    if allow_by_ref_value_warnings {
+                        call.with_by_ref_value_warnings()
+                    } else {
+                        call
+                    }
+                };
                 if let Some(function) = compiled.lookup_function(&name) {
                     self.execute_function(
                         compiled,
                         function,
-                        FunctionCall::new(args, Vec::new()),
+                        make_call(args, Vec::new()),
                         output,
                         stack,
                         state,
@@ -8900,7 +9148,7 @@ impl Vm {
                     self.execute_function(
                         &owner,
                         function,
-                        FunctionCall::new(args, Vec::new()),
+                        make_call(args, Vec::new()),
                         output,
                         stack,
                         state,
@@ -8915,10 +9163,16 @@ impl Vm {
                 }
             }
             Value::Callable(CallableValue::Closure { function, captures }) => {
+                let call = FunctionCall::new(args, captures);
+                let call = if allow_by_ref_value_warnings {
+                    call.with_by_ref_value_warnings()
+                } else {
+                    call
+                };
                 self.execute_function(
                     compiled,
                     FunctionId::new(function),
-                    FunctionCall::new(args, captures),
+                    call,
                     output,
                     stack,
                     state,
@@ -8959,7 +9213,7 @@ impl Vm {
                 if is_process_builtin_name(&name) {
                     return self.call_process_builtin(compiled, &name, args, output, stack);
                 }
-                let values = match call_builtin_args_to_positional(&name, args, stack) {
+                let values = match call_builtin_args_to_positional(compiled, &name, args, stack) {
                     Ok(values) => values,
                     Err(message) => {
                         return self.runtime_error(output, compiled, stack, message);
@@ -10100,7 +10354,9 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> Result<Value, ArrayCallbackError> {
         let call_args = args.into_iter().map(CallArgument::positional).collect();
-        let result = self.call_callable(compiled, callback, call_args, output, stack, state);
+        let mut result = self.call_callable_with_by_ref_value_warnings(
+            compiled, callback, call_args, output, stack, state,
+        );
         if !result.status.is_success() {
             return Err(ArrayCallbackError::Runtime(Box::new(result)));
         }
@@ -10110,6 +10366,7 @@ impl Vm {
                     .to_owned(),
             ));
         }
+        state.diagnostics.append(&mut result.diagnostics);
         Ok(result.return_value.unwrap_or(Value::Null))
     }
 
@@ -10122,7 +10379,11 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        let result = self.call_array_sort_builtin_inner(compiled, name, args, output, stack, state);
+        let result = if name == "array_multisort" {
+            self.call_array_multisort_builtin_inner(compiled, name, args, output, stack, state)
+        } else {
+            self.call_array_sort_builtin_inner(compiled, name, args, output, stack, state)
+        };
         match result {
             Ok(value) => VmResult::success(output.clone(), Some(value)),
             Err(ArrayCallbackError::Runtime(result)) => *result,
@@ -10164,7 +10425,7 @@ impl Vm {
 
         let mut args = args.into_iter();
         let first = args.next().expect("checked non-empty");
-        let cell = sort_reference_cell(name, first, stack)?;
+        let cell = sort_reference_cell(compiled, name, first, stack)?;
         let Value::Array(array) = cell.get() else {
             return Err(ArrayCallbackError::Message(format!(
                 "E_PHP_VM_BUILTIN_TYPE: {name} expects array"
@@ -10174,22 +10435,39 @@ impl Vm {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let callback = args.next().map(|arg| arg.value);
+        let second = args.next().map(|arg| arg.value);
+        let callback = expects_callback.then(|| second.clone()).flatten();
+        let flags = if expects_callback {
+            SORT_REGULAR
+        } else {
+            second
+                .as_ref()
+                .map(to_int)
+                .transpose()
+                .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))?
+                .unwrap_or(SORT_REGULAR)
+        };
+        let descending = matches!(name, "rsort" | "arsort" | "krsort");
+        let mut bool_compare_deprecated = false;
         sort_entries_stable(&mut entries, |left, right| {
+            let (left, right) = if descending {
+                (right, left)
+            } else {
+                (left, right)
+            };
             self.compare_sort_entries(
                 compiled,
                 name,
                 callback.clone(),
+                flags,
                 left,
                 right,
                 output,
                 stack,
                 state,
+                &mut bool_compare_deprecated,
             )
         })?;
-        if matches!(name, "rsort" | "arsort" | "krsort") {
-            entries.reverse();
-        }
 
         let mut sorted = PhpArray::new();
         let reindex = matches!(name, "sort" | "rsort" | "usort");
@@ -10204,48 +10482,462 @@ impl Vm {
         Ok(Value::Bool(true))
     }
 
+    fn call_array_multisort_builtin_inner(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if args.is_empty() {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_BUILTIN_ARITY: {name} expects at least one argument"
+            )));
+        }
+        if args.iter().any(|arg| arg.name.is_some()) {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {name} has no builtin parameter"
+            )));
+        }
+
+        let mut args = args.into_iter().enumerate().peekable();
+        let mut specs = Vec::new();
+        while let Some((arg_index, arg)) = args.next() {
+            let position = arg_index + 1;
+            let cell = multisort_reference_cell_at(compiled, name, arg, stack, position)?;
+            let entries = multisort_array_entries(name, position, &cell.get())?;
+            let mut descending = false;
+            let mut flags = SORT_REGULAR;
+            let mut order_flag_seen = false;
+            let mut sort_flag_seen = false;
+            while let Some((_, next)) = args.peek() {
+                if sort_argument_is_array(compiled, next, stack)? {
+                    break;
+                }
+                let (flag_index, flag_arg) = args.next().expect("peeked argument");
+                let flag_position = flag_index + 1;
+                let Value::Int(flag) = flag_arg.value else {
+                    return Err(ArrayCallbackError::Message(format!(
+                        "E_PHP_RUNTIME_BUILTIN_TYPE: {name}(): Argument #{flag_position} must be an array or a sort flag"
+                    )));
+                };
+                match flag {
+                    SORT_ASC => {
+                        if order_flag_seen {
+                            return Err(multisort_duplicate_flag_error(name, flag_position));
+                        }
+                        order_flag_seen = true;
+                        descending = false;
+                    }
+                    SORT_DESC => {
+                        if order_flag_seen {
+                            return Err(multisort_duplicate_flag_error(name, flag_position));
+                        }
+                        order_flag_seen = true;
+                        descending = true;
+                    }
+                    SORT_REGULAR | SORT_NUMERIC | SORT_STRING | SORT_LOCALE_STRING
+                    | SORT_NATURAL => {
+                        if sort_flag_seen {
+                            return Err(multisort_duplicate_flag_error(name, flag_position));
+                        }
+                        sort_flag_seen = true;
+                        flags = flag;
+                    }
+                    value
+                        if value == (SORT_STRING | SORT_FLAG_CASE)
+                            || value == (SORT_NATURAL | SORT_FLAG_CASE) =>
+                    {
+                        if sort_flag_seen {
+                            return Err(multisort_duplicate_flag_error(name, flag_position));
+                        }
+                        sort_flag_seen = true;
+                        flags = value;
+                    }
+                    _ => {
+                        return Err(ArrayCallbackError::Message(format!(
+                            "E_PHP_RUNTIME_BUILTIN_VALUE: {name}(): Argument #{flag_position} must be a valid sort flag"
+                        )));
+                    }
+                }
+            }
+            let numeric_values = if flags == SORT_NUMERIC {
+                Some(multisort_numeric_values(
+                    &entries,
+                    output,
+                    state,
+                    builtin_source_span(compiled),
+                )?)
+            } else {
+                None
+            };
+            specs.push(MultisortArraySpec {
+                cell,
+                entries,
+                numeric_values,
+                descending,
+                flags,
+            });
+        }
+
+        let len = specs
+            .first()
+            .map(|spec| spec.entries.len())
+            .expect("checked non-empty");
+        if specs.iter().any(|spec| spec.entries.len() != len) {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_RUNTIME_BUILTIN_VALUE: Array sizes are inconsistent"
+            )));
+        }
+
+        let mut order = (0..len).collect::<Vec<_>>();
+        for index in 1..order.len() {
+            let mut current = index;
+            while current > 0
+                && self
+                    .multisort_compare_indices(
+                        compiled,
+                        &specs,
+                        order[current - 1],
+                        order[current],
+                        output,
+                        stack,
+                        state,
+                    )?
+                    .is_gt()
+            {
+                order.swap(current - 1, current);
+                current -= 1;
+            }
+        }
+
+        for spec in specs {
+            let sorted = multisort_reorder_entries(&spec.entries, &order);
+            spec.cell.set(Value::Array(sorted));
+        }
+
+        Ok(Value::Bool(true))
+    }
+
     fn compare_sort_entries(
         &self,
         compiled: &CompiledUnit,
         name: &str,
         callback: Option<Value>,
+        flags: i64,
         left: &(ArrayKey, Value),
         right: &(ArrayKey, Value),
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
+        bool_compare_deprecated: &mut bool,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
         if let Some(callback) = callback {
-            let args = if name == "uksort" {
-                vec![
-                    array_callback_key_value(&left.0),
-                    array_callback_key_value(&right.0),
-                ]
-            } else {
-                vec![left.1.clone(), right.1.clone()]
-            };
-            let result =
-                self.invoke_array_callback(compiled, callback, args, output, stack, state)?;
-            let int = to_int(&result)
-                .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))?;
-            return Ok(int.cmp(&0));
+            let result = self.invoke_array_callback(
+                compiled,
+                callback.clone(),
+                sort_callback_args(name, left, right),
+                output,
+                stack,
+                state,
+            )?;
+            if let Value::Bool(value) = result {
+                emit_sort_bool_compare_deprecation(
+                    compiled,
+                    name,
+                    output,
+                    stack,
+                    state,
+                    bool_compare_deprecated,
+                );
+                if value {
+                    return Ok(std::cmp::Ordering::Greater);
+                }
+                let reversed = self.invoke_array_callback(
+                    compiled,
+                    callback,
+                    sort_callback_args(name, right, left),
+                    output,
+                    stack,
+                    state,
+                )?;
+                return sort_callback_ordering(name, reversed, true);
+            }
+            return sort_callback_ordering(name, result, false);
         }
-        if matches!(name, "ksort" | "krsort") {
-            return compare(
-                &array_callback_key_value(&left.0),
-                &array_callback_key_value(&right.0),
-            )
-            .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")));
-        }
+        let left_value;
+        let right_value;
+        let (left_sort, right_sort) = if matches!(name, "ksort" | "krsort") {
+            left_value = array_callback_key_value(&left.0);
+            right_value = array_callback_key_value(&right.0);
+            (&left_value, &right_value)
+        } else {
+            (&left.1, &right.1)
+        };
         if matches!(name, "natsort" | "natcasesort") {
-            return Ok(natural_compare_values(
-                &left.1,
-                &right.1,
+            return self.compare_sort_natural_values(
+                compiled,
+                left_sort,
+                right_sort,
                 name == "natcasesort",
-            ));
+                output,
+                stack,
+                state,
+            );
         }
-        compare(&left.1, &right.1)
+        if flags == SORT_REGULAR {
+            return self.compare_sort_regular_values(
+                compiled, left_sort, right_sort, output, stack, state,
+            );
+        }
+        if flags == SORT_NUMERIC {
+            return self.compare_sort_numeric_values(
+                left_sort,
+                right_sort,
+                output,
+                state,
+                builtin_source_span(compiled),
+            );
+        }
+        if matches!(flags & !SORT_FLAG_CASE, SORT_STRING | SORT_LOCALE_STRING) {
+            return self.compare_sort_string_values(
+                compiled, left_sort, right_sort, flags, output, stack, state,
+            );
+        }
+        compare_sort_values(left_sort, right_sort, flags)
             .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))
+    }
+
+    fn multisort_compare_indices(
+        &self,
+        compiled: &CompiledUnit,
+        specs: &[MultisortArraySpec],
+        left: usize,
+        right: usize,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        for spec in specs {
+            let ordering = if spec.flags == SORT_REGULAR {
+                self.compare_sort_regular_values(
+                    compiled,
+                    &spec.entries[left].1,
+                    &spec.entries[right].1,
+                    output,
+                    stack,
+                    state,
+                )?
+            } else if let Some(values) = &spec.numeric_values {
+                values[left]
+                    .partial_cmp(&values[right])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else if matches!(
+                spec.flags & !SORT_FLAG_CASE,
+                SORT_STRING | SORT_LOCALE_STRING
+            ) {
+                self.compare_sort_string_values(
+                    compiled,
+                    &spec.entries[left].1,
+                    &spec.entries[right].1,
+                    spec.flags,
+                    output,
+                    stack,
+                    state,
+                )?
+            } else {
+                compare_sort_values(&spec.entries[left].1, &spec.entries[right].1, spec.flags)
+                    .map_err(|message| {
+                        ArrayCallbackError::Message(format!("array_multisort: {message}"))
+                    })?
+            };
+            let ordering = if spec.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            if !ordering.is_eq() {
+                return Ok(ordering);
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    }
+
+    fn compare_sort_numeric_values(
+        &self,
+        left: &Value,
+        right: &Value,
+        output: &mut OutputBuffer,
+        state: &mut ExecutionState,
+        source_span: RuntimeSourceSpan,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let left = sort_numeric_float(left, output, state, source_span.clone())?;
+        let right = sort_numeric_float(right, output, state, source_span)?;
+        Ok(left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn compare_sort_string_values(
+        &self,
+        compiled: &CompiledUnit,
+        left: &Value,
+        right: &Value,
+        flags: i64,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let case_insensitive = (flags & SORT_FLAG_CASE) != 0;
+        let left = self.sort_string_value_for_compare(
+            compiled,
+            left,
+            case_insensitive,
+            output,
+            stack,
+            state,
+        )?;
+        let right = self.sort_string_value_for_compare(
+            compiled,
+            right,
+            case_insensitive,
+            output,
+            stack,
+            state,
+        )?;
+        Ok(left.cmp(&right))
+    }
+
+    fn sort_string_value_for_compare(
+        &self,
+        compiled: &CompiledUnit,
+        value: &Value,
+        case_insensitive: bool,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<String, ArrayCallbackError> {
+        let mut text = self
+            .value_to_string(compiled, value, output, stack, state)
+            .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))?
+            .to_string_lossy();
+        if case_insensitive {
+            text = text.to_ascii_lowercase();
+        }
+        Ok(text)
+    }
+
+    fn compare_sort_natural_values(
+        &self,
+        compiled: &CompiledUnit,
+        left: &Value,
+        right: &Value,
+        case_insensitive: bool,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let left =
+            self.sort_natural_string_value(compiled, left, case_insensitive, output, stack, state)?;
+        let right = self.sort_natural_string_value(
+            compiled,
+            right,
+            case_insensitive,
+            output,
+            stack,
+            state,
+        )?;
+        Ok(natural_compare_bytes(left.as_bytes(), right.as_bytes()))
+    }
+
+    fn sort_natural_string_value(
+        &self,
+        compiled: &CompiledUnit,
+        value: &Value,
+        case_insensitive: bool,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<String, ArrayCallbackError> {
+        let text = match value {
+            Value::Reference(cell) => {
+                return self.sort_natural_string_value(
+                    compiled,
+                    &cell.get(),
+                    case_insensitive,
+                    output,
+                    stack,
+                    state,
+                );
+            }
+            Value::Object(_) => self
+                .value_to_string(compiled, value, output, stack, state)
+                .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))?
+                .to_string_lossy(),
+            other => sort_string_value(other, false),
+        };
+        Ok(if case_insensitive {
+            text.to_ascii_lowercase()
+        } else {
+            text
+        })
+    }
+
+    fn compare_sort_regular_values(
+        &self,
+        compiled: &CompiledUnit,
+        left: &Value,
+        right: &Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let left = self.sort_regular_comparable_value(compiled, left, output, stack, state)?;
+        let right = self.sort_regular_comparable_value(compiled, right, output, stack, state)?;
+        if matches!((&left, &right), (Value::Object(_), Value::Object(_))) {
+            return compare(&left, &right)
+                .map_err(|message| ArrayCallbackError::Message(format!("sort: {message}")));
+        }
+        let left = self.sort_regular_mixed_comparable_value(compiled, &left, output, stack, state)?;
+        let right =
+            self.sort_regular_mixed_comparable_value(compiled, &right, output, stack, state)?;
+        compare(&left, &right).map_err(|message| ArrayCallbackError::Message(format!("sort: {message}")))
+    }
+
+    fn sort_regular_comparable_value(
+        &self,
+        compiled: &CompiledUnit,
+        value: &Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        match value {
+            Value::Reference(cell) => {
+                self.sort_regular_comparable_value(compiled, &cell.get(), output, stack, state)
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn sort_regular_mixed_comparable_value(
+        &self,
+        compiled: &CompiledUnit,
+        value: &Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        match value {
+            Value::Object(object) if object_has_public_to_string(compiled, object) => {
+                self.object_to_string(compiled, object.clone(), output, stack, state)
+                    .map(Value::String)
+                    .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     fn call_fiber_callable(
@@ -10377,8 +11069,21 @@ impl Vm {
         if is_process_builtin_name(&normalized) {
             return self.call_process_builtin(compiled, &normalized, args, output, stack);
         }
+        if is_array_callback_builtin_name(&normalized) {
+            return self.call_array_callback_builtin(
+                compiled,
+                &normalized,
+                args,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_array_sort_builtin_name(&normalized) {
+            return self.call_array_sort_builtin(compiled, &normalized, args, output, stack, state);
+        }
         if BuiltinRegistry::new().contains(&normalized) {
-            let values = match call_builtin_args_to_positional(&normalized, args, stack) {
+            let values = match call_builtin_args_to_positional(compiled, &normalized, args, stack) {
                 Ok(values) => values,
                 Err(message) => {
                     return self.runtime_error(output, compiled, stack, message);
@@ -10546,7 +11251,8 @@ impl Vm {
                     self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
                 }
                 FunctionCallBuiltinKind::InternalRegistry => {
-                    let values = match call_builtin_args_to_positional(&name, args, stack) {
+                    let values = match call_builtin_args_to_positional(compiled, &name, args, stack)
+                    {
                         Ok(values) => values,
                         Err(message) => {
                             return self.runtime_error(output, compiled, stack, message);
@@ -10962,33 +11668,24 @@ impl Vm {
             );
         }
         if method_entry.flags.is_private || method_entry.flags.is_protected {
-            return match self.call_magic_instance_method(
-                compiled,
-                object.clone(),
-                "__call",
-                method,
-                args,
-                output,
-                stack,
-                state,
-            ) {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    if let Err(message) =
-                        validate_method_callable(compiled, stack, declaring_class, method_entry)
-                    {
-                        self.runtime_error(output, compiled, stack, message)
-                    } else {
-                        self.runtime_error(
-                            output,
-                            compiled,
-                            stack,
-                            "E_PHP_VM_METHOD_VISIBILITY: inaccessible method passed validation",
-                        )
-                    }
-                }
-                Err(result) => result,
-            };
+            if let Err(message) =
+                validate_method_callable(compiled, stack, declaring_class, method_entry)
+            {
+                return match self.call_magic_instance_method(
+                    compiled,
+                    object.clone(),
+                    "__call",
+                    method,
+                    args,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.runtime_error(output, compiled, stack, message),
+                    Err(result) => result,
+                };
+            }
         }
         if let Err(message) =
             validate_method_callable(compiled, stack, declaring_class, method_entry)
@@ -12237,7 +12934,7 @@ impl Vm {
                 self.object_to_string(compiled, object.clone(), output, stack, state)
             }
             Value::Array(_) => {
-                write_array_to_string_warning(output, state);
+                self.emit_array_to_string_warning(compiled, output, stack, state)?;
                 Ok(PhpString::from_bytes(b"Array".to_vec()))
             }
             Value::Reference(cell) => {
@@ -12246,6 +12943,42 @@ impl Vm {
             other => to_string(other)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message)),
         }
+    }
+
+    fn emit_array_to_string_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING",
+            RuntimeSeverity::Warning,
+            "Array to string conversion",
+            RuntimeSourceSpan::default(),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
     }
 
     fn object_to_string(
@@ -12544,7 +13277,13 @@ impl Vm {
                 .map_err(|message| self.runtime_error(output, compiled, stack, message)),
             CastKind::Int => match src {
                 Value::Object(object) => {
-                    write_object_numeric_cast_warning(output, state, object, "int");
+                    write_object_numeric_cast_warning(
+                        output,
+                        state,
+                        object,
+                        "int",
+                        RuntimeSourceSpan::default(),
+                    );
                     Ok(Value::Int(1))
                 }
                 _ => to_int(src)
@@ -12553,7 +13292,13 @@ impl Vm {
             },
             CastKind::Float => match src {
                 Value::Object(object) => {
-                    write_object_numeric_cast_warning(output, state, object, "float");
+                    write_object_numeric_cast_warning(
+                        output,
+                        state,
+                        object,
+                        "float",
+                        RuntimeSourceSpan::default(),
+                    );
                     Ok(Value::float(1.0))
                 }
                 _ => to_float(src)
@@ -12835,7 +13580,7 @@ impl Vm {
         };
         let including_file = current_source_path(compiled, stack);
         let include_path = state_include_path(state);
-        let cwd = self.options.runtime_context.cwd.clone();
+        let cwd = state.cwd.clone();
         let request = IncludePathCacheKey {
             path: path.clone(),
             include_path: include_path.clone(),
@@ -13006,6 +13751,7 @@ impl Vm {
         let call = FunctionCall {
             args: Vec::new(),
             captures: Vec::new(),
+            allow_by_ref_value_warnings: false,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -14054,6 +14800,7 @@ impl Vm {
         let call = FunctionCall {
             args: Vec::new(),
             captures: Vec::new(),
+            allow_by_ref_value_warnings: false,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -16417,7 +17164,7 @@ fn enum_case_object(
         return Ok(object.clone());
     }
     let runtime_class = runtime_class_entry(compiled, class, constant_value)?;
-    let object = ObjectRef::new(&runtime_class);
+    let object = ObjectRef::new_with_display_name(&runtime_class, class.display_name.clone());
     object.set_property("name", Value::String(PhpString::from_test_str(&case.name)));
     if runtime_class.enum_backing_type.is_some() {
         let value = case.value.map(constant_value).transpose()?.ok_or_else(|| {
@@ -17182,6 +17929,38 @@ fn property_state_value(
     object
         .get_property(&storage_name)
         .or_else(|| object.get_property(property))
+}
+
+fn ensure_property_reference_cell(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    object: &ObjectRef,
+    property: &str,
+) -> Result<ReferenceCell, String> {
+    let storage_name = if let Some(class) = compiled.lookup_class(&object.class_name()) {
+        let scope = current_scope_class(compiled, stack);
+        if let Some(resolved) =
+            lookup_property_in_hierarchy(compiled, class, property, scope.as_deref())?
+        {
+            validate_property_access(compiled, stack, resolved.class, resolved.property)?;
+            validate_property_set_access(compiled, stack, resolved.class, resolved.property)?;
+            property_storage_name(resolved.class, resolved.property)
+        } else {
+            property.to_owned()
+        }
+    } else {
+        property.to_owned()
+    };
+    let current = object
+        .get_property(&storage_name)
+        .or_else(|| object.get_property(property))
+        .unwrap_or(Value::Uninitialized);
+    if let Value::Reference(cell) = current {
+        return Ok(cell);
+    }
+    let cell = ReferenceCell::new(current);
+    object.set_property(storage_name, Value::Reference(cell.clone()));
+    Ok(cell)
 }
 
 fn validate_static_property_write(
@@ -19647,7 +20426,8 @@ fn ini_option_name(value: &Value) -> Result<String, String> {
 
 fn apply_float_string_precision(registry: &IniRegistry) {
     if let Some(precision) = registry
-        .get("precision")
+        .get("serialize_precision")
+        .or_else(|| registry.get("precision"))
         .and_then(|value| value.trim().parse::<i32>().ok())
     {
         set_float_string_precision(precision);
@@ -20739,7 +21519,7 @@ fn execute_builtin_entry(
     let diagnostic_display = diagnostic_display_options(state);
     let mut context = BuiltinContext::with_runtime(
         output,
-        runtime_context.cwd.clone(),
+        state.cwd.clone(),
         runtime_context.filesystem.clone(),
         Some(&mut state.resources),
     );
@@ -20749,6 +21529,7 @@ fn execute_builtin_entry(
     context.set_strtok_state(&mut state.strtok_state);
     let result = (entry.function())(&mut context, args, source_span.clone());
     let output = context.output().clone();
+    state.cwd = context.cwd().to_path_buf();
     let mut diagnostics = context.take_diagnostics();
     match result {
         Ok(value) => VmResult::success_with_diagnostics(output, Some(value), diagnostics),
@@ -20803,6 +21584,9 @@ fn validate_internal_builtin_args(
     compiled: &CompiledUnit,
     output: &OutputBuffer,
 ) -> Result<Vec<Value>, VmResult> {
+    if builtin_uses_custom_argument_validation(name) {
+        return Ok(values);
+    }
     let Some(metadata) = php_std::generated::arginfo::function_metadata(name) else {
         return Ok(values);
     };
@@ -20822,6 +21606,22 @@ fn validate_internal_builtin_args(
         Ok(validated) => Ok(validated.values().to_vec()),
         Err(error) => Err(arginfo_error_result(error, output)),
     }
+}
+
+fn builtin_uses_custom_argument_validation(name: &str) -> bool {
+    matches!(
+        name,
+        "range"
+            | "strip_tags"
+            | "stristr"
+            | "strpos"
+            | "strripos"
+            | "strrpos"
+            | "strstr"
+            | "strtr"
+            | "vfprintf"
+            | "vprintf"
+    )
 }
 
 fn arginfo_error_result(error: php_std::arginfo::ArginfoError, output: &OutputBuffer) -> VmResult {
@@ -20875,6 +21675,23 @@ fn constant_value(unit: &IrUnit, constant: ConstId) -> Result<Value, String> {
         IrConstant::Float(value) => Value::float(*value),
         IrConstant::String(value) => Value::String(PhpString::from_test_str(value)),
         IrConstant::StringBytes(value) => Value::String(PhpString::from_bytes(value.clone())),
+        IrConstant::Array(entries) => {
+            let mut array = PhpArray::new();
+            for entry in entries {
+                let value = inline_constant_value(&entry.value);
+                if let Some(key) = &entry.key {
+                    let key_value = inline_constant_value(key);
+                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                        array.insert(key, value);
+                    } else {
+                        array.append(value);
+                    }
+                } else {
+                    array.append(value);
+                }
+            }
+            Value::Array(array)
+        }
     })
 }
 
@@ -20886,14 +21703,33 @@ fn inline_constant_value(constant: &IrConstant) -> Value {
         IrConstant::Float(value) => Value::float(*value),
         IrConstant::String(value) => Value::String(PhpString::from_test_str(value)),
         IrConstant::StringBytes(value) => Value::String(PhpString::from_bytes(value.clone())),
+        IrConstant::Array(entries) => {
+            let mut array = PhpArray::new();
+            for entry in entries {
+                let value = inline_constant_value(&entry.value);
+                if let Some(key) = &entry.key {
+                    let key_value = inline_constant_value(key);
+                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                        array.insert(key, value);
+                    } else {
+                        array.append(value);
+                    }
+                } else {
+                    array.append(value);
+                }
+            }
+            Value::Array(array)
+        }
     }
 }
 
 fn prepare_arguments(
+    compiled: &CompiledUnit,
     function: &IrFunction,
     args: Vec<CallArgument>,
     stack: &mut CallStack,
-) -> Result<Vec<PreparedArg>, String> {
+    allow_by_ref_value_warnings: bool,
+) -> Result<PreparedArguments, String> {
     let min = function
         .params
         .iter()
@@ -20942,6 +21778,8 @@ fn prepare_arguments(
                 name: None,
                 value: arg.value,
                 by_ref_local: arg.by_ref_local,
+                by_ref_dim: arg.by_ref_dim,
+                by_ref_property: arg.by_ref_property,
             });
             supplied_count += 1;
             continue;
@@ -20980,6 +21818,8 @@ fn prepare_arguments(
             name: None,
             value: arg.value,
             by_ref_local: arg.by_ref_local,
+            by_ref_dim: arg.by_ref_dim,
+            by_ref_property: arg.by_ref_property,
         });
         positional_index += 1;
         supplied_count += 1;
@@ -20993,6 +21833,7 @@ fn prepare_arguments(
     }
 
     let mut prepared = Vec::with_capacity(function.params.len());
+    let mut diagnostics = Vec::new();
     for (index, param) in function.params.iter().enumerate() {
         if param.variadic {
             prepared.push(PreparedArg {
@@ -21003,14 +21844,23 @@ fn prepare_arguments(
         }
         if let Some(arg) = bound[index].take() {
             let reference = if param.by_ref {
-                let Some(local) = arg.by_ref_local else {
+                if let Some(reference) = call_argument_reference_cell(compiled, &arg, stack)? {
+                    Some(reference)
+                } else if allow_by_ref_value_warnings {
+                    diagnostics.push(by_ref_value_given_warning(
+                        compiled,
+                        function,
+                        stack,
+                        index + 1,
+                        &param.name,
+                    ));
+                    None
+                } else {
                     return Err(format!(
                         "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE: function {} argument ${} must be a variable",
                         function.name, param.name
                     ));
-                };
-                let frame = stack.current_mut().ok_or("no active frame")?;
-                Some(frame.locals.ensure_reference_cell(local)?)
+                }
             } else {
                 None
             };
@@ -21041,7 +21891,55 @@ fn prepare_arguments(
             ));
         }
     }
-    Ok(prepared)
+    Ok(PreparedArguments {
+        args: prepared,
+        diagnostics,
+    })
+}
+
+fn call_argument_reference_cell(
+    compiled: &CompiledUnit,
+    arg: &CallArgument,
+    stack: &mut CallStack,
+) -> Result<Option<ReferenceCell>, String> {
+    if let Some(local) = arg.by_ref_local {
+        let frame = stack.current_mut().ok_or("no active frame")?;
+        return frame.locals.ensure_reference_cell(local).map(Some);
+    }
+    if let Some(target) = &arg.by_ref_dim {
+        return ensure_dim_reference_cell(stack, target.local, &target.dims).map(Some);
+    }
+    if let Some(target) = &arg.by_ref_property {
+        return ensure_property_reference_cell(compiled, stack, &target.object, &target.property)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn by_ref_value_given_warning(
+    compiled: &CompiledUnit,
+    function: &IrFunction,
+    stack: &CallStack,
+    position: usize,
+    param_name: &str,
+) -> RuntimeDiagnostic {
+    let source_span = runtime_source_span(compiled, function.span);
+    let callable = if function.flags.is_closure {
+        let file = source_span.file.as_deref().unwrap_or("<unknown>");
+        format!("{{closure:{file}:{}}}", source_span.start)
+    } else {
+        function.name.clone()
+    };
+    RuntimeDiagnostic::new(
+        "E_PHP_VM_BY_REF_ARG_VALUE_GIVEN_WARNING",
+        RuntimeSeverity::Warning,
+        format!(
+            "{callable}(): Argument #{position} (${param_name}) must be passed by reference, value given"
+        ),
+        source_span,
+        stack_trace(compiled, stack),
+        Some(php_runtime::PhpReferenceClassification::Warning),
+    )
 }
 
 struct VariadicTailArg {
@@ -21239,33 +22137,40 @@ fn initialize_this(
         .set(LocalId::new(index as u32), Value::Object(this_value))
 }
 
-fn check_return_type(
+fn coerce_return_value(
     compiled: &CompiledUnit,
     function: &IrFunction,
-    value: Option<&Value>,
+    value: Option<Value>,
     typecheck: TypecheckFastPathContext<'_>,
-) -> Result<(), String> {
+) -> Result<Option<Value>, String> {
     let Some(return_type) = ir_runtime_type(function.return_type.as_ref()) else {
-        return Ok(());
+        return Ok(value);
     };
     if matches!(return_type, RuntimeType::Void) {
         return match value {
-            None => Ok(()),
+            None => Ok(None),
             Some(value) => Err(format!(
                 "E_PHP_VM_RETURN_TYPE_MISMATCH: function {} returned {}, expected void",
                 function.name,
-                value_type_name(value)
+                value_type_name(&value)
             )),
         };
     };
-    let value = value.unwrap_or(&Value::Null);
-    if vm_value_matches_runtime_type(compiled, value, &return_type, typecheck)? {
-        Ok(())
+
+    let mut value = value.unwrap_or(Value::Null);
+    if !compiled.unit().strict_types
+        && !function.returns_by_ref
+        && let Some(coerced) = coerce_value_to_runtime_type(&value, &return_type)
+    {
+        value = coerced;
+    }
+    if vm_value_matches_runtime_type(compiled, &value, &return_type, typecheck)? {
+        Ok(Some(value))
     } else {
         Err(format!(
             "E_PHP_VM_RETURN_TYPE_MISMATCH: function {} returned {}, expected {}",
             function.name,
-            value_type_name(value),
+            value_type_name(&value),
             runtime_type_name(&return_type)
         ))
     }
@@ -21683,14 +22588,43 @@ fn read_call_args(
                     name,
                     value: value.clone(),
                     by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
                 });
             }
             continue;
         }
+        let by_ref_dim = arg
+            .by_ref_dim
+            .as_ref()
+            .map(|target| {
+                read_dim_operands(unit, stack, &target.dims).map(|dims| CallDimTarget {
+                    local: target.local,
+                    dims,
+                })
+            })
+            .transpose()?;
+        let by_ref_property = arg
+            .by_ref_property
+            .as_ref()
+            .map(|target| match read_operand(unit, stack, target.object)? {
+                Value::Object(object) => Ok(CallPropertyTarget {
+                    object,
+                    property: target.property.clone(),
+                }),
+                other => Err(format!(
+                    "E_PHP_VM_BY_REF_PROPERTY_NON_OBJECT: cannot bind property ${} on {}",
+                    target.property,
+                    value_type_name(&other)
+                )),
+            })
+            .transpose()?;
         out.push(CallArgument {
             name: arg.name.clone(),
             value,
             by_ref_local: arg.by_ref_local,
+            by_ref_dim,
+            by_ref_property,
         });
     }
     Ok(out)
@@ -21727,7 +22661,8 @@ fn is_array_callback_builtin_name(name: &str) -> bool {
 fn is_array_sort_builtin_name(name: &str) -> bool {
     matches!(
         name,
-        "sort"
+        "array_multisort"
+            | "sort"
             | "rsort"
             | "asort"
             | "arsort"
@@ -21808,28 +22743,223 @@ fn array_callback_key_value(key: &ArrayKey) -> Value {
 }
 
 fn sort_reference_cell(
+    compiled: &CompiledUnit,
     function: &str,
     arg: CallArgument,
     stack: &mut CallStack,
 ) -> Result<ReferenceCell, ArrayCallbackError> {
-    if let Some(local) = arg.by_ref_local {
-        let frame = stack.current_mut().ok_or_else(|| {
-            ArrayCallbackError::Message(
-                "E_PHP_VM_NO_ACTIVE_FRAME: cannot bind sort reference argument".to_owned(),
-            )
-        })?;
-        return frame
-            .locals
-            .ensure_reference_cell(local)
-            .map_err(ArrayCallbackError::Message);
+    sort_reference_cell_at(compiled, function, arg, stack, 1)
+}
+
+fn sort_reference_cell_at(
+    compiled: &CompiledUnit,
+    function: &str,
+    arg: CallArgument,
+    stack: &mut CallStack,
+    position: usize,
+) -> Result<ReferenceCell, ArrayCallbackError> {
+    if let Some(cell) =
+        call_argument_reference_cell(compiled, &arg, stack).map_err(ArrayCallbackError::Message)?
+    {
+        return Ok(cell);
     }
     match arg.value {
         Value::Reference(cell) => Ok(cell),
         other => Err(ArrayCallbackError::Message(format!(
-            "E_PHP_VM_SORT_BY_REF_ARG: {function} argument #1 must be a mutable array variable, {} given",
+            "E_PHP_VM_SORT_BY_REF_ARG: {function} argument #{position} must be a mutable array variable, {} given",
             value_type_name(&other)
         ))),
     }
+}
+
+fn sort_callback_args(
+    name: &str,
+    left: &(ArrayKey, Value),
+    right: &(ArrayKey, Value),
+) -> Vec<Value> {
+    if name == "uksort" {
+        vec![
+            array_callback_key_value(&left.0),
+            array_callback_key_value(&right.0),
+        ]
+    } else {
+        vec![left.1.clone(), right.1.clone()]
+    }
+}
+
+fn sort_callback_ordering(
+    name: &str,
+    result: Value,
+    reverse: bool,
+) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+    let int = to_int(&result)
+        .map_err(|message| ArrayCallbackError::Message(format!("{name}: {message}")))?;
+    let ordering = int.cmp(&0);
+    Ok(if reverse {
+        ordering.reverse()
+    } else {
+        ordering
+    })
+}
+
+fn emit_sort_bool_compare_deprecation(
+    compiled: &CompiledUnit,
+    name: &str,
+    output: &mut OutputBuffer,
+    stack: &CallStack,
+    state: &mut ExecutionState,
+    emitted: &mut bool,
+) {
+    if *emitted {
+        return;
+    }
+    *emitted = true;
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_VM_SORT_BOOL_COMPARE_DEPRECATED",
+        RuntimeSeverity::Deprecation,
+        format!(
+            "{name}(): Returning bool from comparison function is deprecated, return an integer less than, equal to, or greater than zero"
+        ),
+        builtin_source_span(compiled),
+        stack_trace(compiled, stack),
+        None,
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Deprecated,
+        php_runtime::PHP_E_DEPRECATED,
+    );
+    state.diagnostics.push(diagnostic);
+}
+
+fn multisort_reference_cell_at(
+    compiled: &CompiledUnit,
+    _function: &str,
+    arg: CallArgument,
+    stack: &mut CallStack,
+    _position: usize,
+) -> Result<ReferenceCell, ArrayCallbackError> {
+    if let Some(cell) =
+        call_argument_reference_cell(compiled, &arg, stack).map_err(ArrayCallbackError::Message)?
+    {
+        return Ok(cell);
+    }
+    match arg.value {
+        Value::Reference(cell) => Ok(cell),
+        other => Ok(ReferenceCell::new(other)),
+    }
+}
+
+fn sort_argument_is_array(
+    compiled: &CompiledUnit,
+    arg: &CallArgument,
+    stack: &mut CallStack,
+) -> Result<bool, ArrayCallbackError> {
+    if let Some(cell) =
+        call_argument_reference_cell(compiled, arg, stack).map_err(ArrayCallbackError::Message)?
+    {
+        return Ok(matches!(cell.get(), Value::Array(_)));
+    }
+    Ok(match &arg.value {
+        Value::Array(_) => true,
+        Value::Reference(cell) => matches!(cell.get(), Value::Array(_)),
+        _ => false,
+    })
+}
+
+fn multisort_array_entries(
+    function: &str,
+    position: usize,
+    value: &Value,
+) -> Result<Vec<(ArrayKey, Value)>, ArrayCallbackError> {
+    match value {
+        Value::Array(array) => Ok(array
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()),
+        Value::Int(flag) if matches!(*flag, SORT_REGULAR | SORT_NUMERIC) => {
+            Err(ArrayCallbackError::Message(format!(
+                "E_PHP_RUNTIME_BUILTIN_VALUE: {function}(): Argument #{position} ($array) must be an array or a sort flag that has not already been specified"
+            )))
+        }
+        Value::Int(_) => Err(ArrayCallbackError::Message(format!(
+            "E_PHP_RUNTIME_BUILTIN_VALUE: {function}(): Argument #{position} ($array) must be a valid sort flag"
+        ))),
+        _ => Err(ArrayCallbackError::Message(format!(
+            "E_PHP_RUNTIME_BUILTIN_TYPE: {function}(): Argument #{position} ($array) must be an array or a sort flag"
+        ))),
+    }
+}
+
+fn multisort_duplicate_flag_error(function: &str, position: usize) -> ArrayCallbackError {
+    ArrayCallbackError::Message(format!(
+        "E_PHP_RUNTIME_BUILTIN_TYPE: {function}(): Argument #{position} must be an array or a sort flag that has not already been specified"
+    ))
+}
+
+fn sort_numeric_float(
+    value: &Value,
+    output: &mut OutputBuffer,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
+) -> Result<f64, ArrayCallbackError> {
+    match value {
+        Value::Reference(cell) => sort_numeric_float(&cell.get(), output, state, source_span),
+        Value::Object(object) => {
+            write_object_numeric_cast_warning(output, state, object, "float", source_span);
+            Ok(1.0)
+        }
+        other => to_float(other)
+            .map_err(|message| ArrayCallbackError::Message(format!("array_multisort: {message}"))),
+    }
+}
+
+fn multisort_numeric_values(
+    entries: &[(ArrayKey, Value)],
+    output: &mut OutputBuffer,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
+) -> Result<Vec<f64>, ArrayCallbackError> {
+    entries
+        .iter()
+        .map(|(_, value)| multisort_numeric_value(value, output, state, source_span.clone()))
+        .collect()
+}
+
+fn multisort_numeric_value(
+    value: &Value,
+    output: &mut OutputBuffer,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
+) -> Result<f64, ArrayCallbackError> {
+    match value {
+        Value::Reference(cell) => multisort_numeric_value(&cell.get(), output, state, source_span),
+        Value::Object(object) => {
+            write_object_numeric_cast_warning(output, state, object, "float", source_span.clone());
+            write_object_numeric_cast_warning(output, state, object, "float", source_span);
+            Ok(1.0)
+        }
+        other => to_float(other)
+            .map_err(|message| ArrayCallbackError::Message(format!("array_multisort: {message}"))),
+    }
+}
+
+fn multisort_reorder_entries(entries: &[(ArrayKey, Value)], order: &[usize]) -> PhpArray {
+    let mut sorted = PhpArray::new();
+    for index in order {
+        let (key, value) = &entries[*index];
+        match key {
+            ArrayKey::String(_) => {
+                sorted.insert(key.clone(), value.clone());
+            }
+            ArrayKey::Int(_) => {
+                sorted.append(value.clone());
+            }
+        }
+    }
+    sorted
 }
 
 fn sort_entries_stable<F>(
@@ -21842,14 +22972,338 @@ where
         &(ArrayKey, Value),
     ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
 {
-    for index in 1..entries.len() {
-        let mut current = index;
-        while current > 0 && compare_entries(&entries[current - 1], &entries[current])?.is_gt() {
-            entries.swap(current - 1, current);
-            current -= 1;
+    let mut sortable = entries
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(original_index, entry)| SortableArrayEntry {
+            original_index,
+            entry,
+        })
+        .collect::<Vec<_>>();
+    zend_sort_entries(&mut sortable, 0, entries.len(), &mut compare_entries)?;
+    for (target, sorted) in entries.iter_mut().zip(sortable) {
+        *target = sorted.entry;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SortableArrayEntry {
+    original_index: usize,
+    entry: (ArrayKey, Value),
+}
+
+fn compare_sortable_entries<F>(
+    entries: &[SortableArrayEntry],
+    left: usize,
+    right: usize,
+    compare_entries: &mut F,
+) -> Result<std::cmp::Ordering, ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    let ordering = compare_entries(&entries[left].entry, &entries[right].entry)?;
+    if ordering.is_eq() {
+        Ok(entries[left]
+            .original_index
+            .cmp(&entries[right].original_index))
+    } else {
+        Ok(ordering)
+    }
+}
+
+fn sortable_gt<F>(
+    entries: &[SortableArrayEntry],
+    left: usize,
+    right: usize,
+    compare_entries: &mut F,
+) -> Result<bool, ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    Ok(compare_sortable_entries(entries, left, right, compare_entries)?.is_gt())
+}
+
+fn zend_sort_2<F>(
+    entries: &mut [SortableArrayEntry],
+    a: usize,
+    b: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    if sortable_gt(entries, a, b, compare_entries)? {
+        entries.swap(a, b);
+    }
+    Ok(())
+}
+
+fn zend_sort_3<F>(
+    entries: &mut [SortableArrayEntry],
+    a: usize,
+    b: usize,
+    c: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    if !sortable_gt(entries, a, b, compare_entries)? {
+        if !sortable_gt(entries, b, c, compare_entries)? {
+            return Ok(());
+        }
+        entries.swap(b, c);
+        if sortable_gt(entries, a, b, compare_entries)? {
+            entries.swap(a, b);
+        }
+        return Ok(());
+    }
+    if !sortable_gt(entries, c, b, compare_entries)? {
+        entries.swap(a, c);
+        return Ok(());
+    }
+    entries.swap(a, b);
+    if sortable_gt(entries, b, c, compare_entries)? {
+        entries.swap(b, c);
+    }
+    Ok(())
+}
+
+fn zend_sort_4<F>(
+    entries: &mut [SortableArrayEntry],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    zend_sort_3(entries, a, b, c, compare_entries)?;
+    if sortable_gt(entries, c, d, compare_entries)? {
+        entries.swap(c, d);
+        if sortable_gt(entries, b, c, compare_entries)? {
+            entries.swap(b, c);
+            if sortable_gt(entries, a, b, compare_entries)? {
+                entries.swap(a, b);
+            }
         }
     }
     Ok(())
+}
+
+fn zend_sort_5<F>(
+    entries: &mut [SortableArrayEntry],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    zend_sort_4(entries, a, b, c, d, compare_entries)?;
+    if sortable_gt(entries, d, e, compare_entries)? {
+        entries.swap(d, e);
+        if sortable_gt(entries, c, d, compare_entries)? {
+            entries.swap(c, d);
+            if sortable_gt(entries, b, c, compare_entries)? {
+                entries.swap(b, c);
+                if sortable_gt(entries, a, b, compare_entries)? {
+                    entries.swap(a, b);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn zend_insert_sort_entries<F>(
+    entries: &mut [SortableArrayEntry],
+    start: usize,
+    count: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    match count {
+        0 | 1 => {}
+        2 => zend_sort_2(entries, start, start + 1, compare_entries)?,
+        3 => zend_sort_3(entries, start, start + 1, start + 2, compare_entries)?,
+        4 => zend_sort_4(
+            entries,
+            start,
+            start + 1,
+            start + 2,
+            start + 3,
+            compare_entries,
+        )?,
+        5 => zend_sort_5(
+            entries,
+            start,
+            start + 1,
+            start + 2,
+            start + 3,
+            start + 4,
+            compare_entries,
+        )?,
+        _ => {
+            let end = start + count;
+            let sentry = start + 6;
+            for i in start + 1..sentry {
+                let mut j = i - 1;
+                if !sortable_gt(entries, j, i, compare_entries)? {
+                    continue;
+                }
+                while j != start {
+                    j -= 1;
+                    if !sortable_gt(entries, j, i, compare_entries)? {
+                        j += 1;
+                        break;
+                    }
+                }
+                for k in (j + 1..=i).rev() {
+                    entries.swap(k, k - 1);
+                }
+            }
+            for i in sentry..end {
+                let mut j = i - 1;
+                if !sortable_gt(entries, j, i, compare_entries)? {
+                    continue;
+                }
+                loop {
+                    j -= 2;
+                    if !sortable_gt(entries, j, i, compare_entries)? {
+                        j += 1;
+                        if !sortable_gt(entries, j, i, compare_entries)? {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    if j == start {
+                        break;
+                    }
+                    if j == start + 1 {
+                        j -= 1;
+                        if sortable_gt(entries, i, j, compare_entries)? {
+                            j += 1;
+                        }
+                        break;
+                    }
+                }
+                for k in (j + 1..=i).rev() {
+                    entries.swap(k, k - 1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn zend_sort_entries<F>(
+    entries: &mut [SortableArrayEntry],
+    mut start: usize,
+    mut count: usize,
+    compare_entries: &mut F,
+) -> Result<(), ArrayCallbackError>
+where
+    F: FnMut(
+        &(ArrayKey, Value),
+        &(ArrayKey, Value),
+    ) -> Result<std::cmp::Ordering, ArrayCallbackError>,
+{
+    loop {
+        if count <= 16 {
+            zend_insert_sort_entries(entries, start, count, compare_entries)?;
+            return Ok(());
+        }
+        let end = start + count;
+        let offset = count >> 1;
+        let pivot = start + offset;
+        if (count >> 10) != 0 {
+            let delta = offset >> 1;
+            zend_sort_5(
+                entries,
+                start,
+                start + delta,
+                pivot,
+                pivot + delta,
+                end - 1,
+                compare_entries,
+            )?;
+        } else {
+            zend_sort_3(entries, start, pivot, end - 1, compare_entries)?;
+        }
+        entries.swap(start + 1, pivot);
+        let pivot = start + 1;
+        let mut i = pivot + 1;
+        let mut j = end - 1;
+        loop {
+            while sortable_gt(entries, pivot, i, compare_entries)? {
+                i += 1;
+                if i == j {
+                    break;
+                }
+            }
+            if i == j {
+                break;
+            }
+            j -= 1;
+            if j == i {
+                break;
+            }
+            while sortable_gt(entries, j, pivot, compare_entries)? {
+                j -= 1;
+                if j == i {
+                    break;
+                }
+            }
+            if j == i {
+                break;
+            }
+            entries.swap(i, j);
+            i += 1;
+            if i == j {
+                break;
+            }
+        }
+        entries.swap(pivot, i - 1);
+        if (i - 1) - start < end - i {
+            zend_sort_entries(entries, start, i - start - 1, compare_entries)?;
+            start = i;
+            count = end - i;
+        } else {
+            zend_sort_entries(entries, i, end - i, compare_entries)?;
+            count = i - start - 1;
+        }
+    }
 }
 
 fn natural_compare_values(
@@ -21860,6 +23314,28 @@ fn natural_compare_values(
     let left = sort_string_value(left, case_insensitive);
     let right = sort_string_value(right, case_insensitive);
     natural_compare_bytes(left.as_bytes(), right.as_bytes())
+}
+
+fn compare_sort_values(
+    left: &Value,
+    right: &Value,
+    flags: i64,
+) -> Result<std::cmp::Ordering, String> {
+    let normalized = flags & !SORT_FLAG_CASE;
+    let case_insensitive = (flags & SORT_FLAG_CASE) != 0;
+    match normalized {
+        SORT_REGULAR => compare(left, right),
+        SORT_NUMERIC => Ok(to_float(left)?
+            .partial_cmp(&to_float(right)?)
+            .unwrap_or(std::cmp::Ordering::Equal)),
+        SORT_STRING | SORT_LOCALE_STRING => {
+            let left = sort_string_value(left, case_insensitive);
+            let right = sort_string_value(right, case_insensitive);
+            Ok(left.cmp(&right))
+        }
+        SORT_NATURAL => Ok(natural_compare_values(left, right, case_insensitive)),
+        _ => compare(left, right),
+    }
 }
 
 fn sort_string_value(value: &Value, case_insensitive: bool) -> String {
@@ -21878,6 +23354,18 @@ fn natural_compare_bytes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
     let mut left_index = 0;
     let mut right_index = 0;
     while left_index < left.len() && right_index < right.len() {
+        while left_index < left.len() && left[left_index].is_ascii_whitespace() {
+            left_index += 1;
+        }
+        while right_index < right.len() && right[right_index].is_ascii_whitespace() {
+            right_index += 1;
+        }
+        match (left_index == left.len(), right_index == right.len()) {
+            (true, true) => return std::cmp::Ordering::Equal,
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => {}
+        }
         let left_byte = left[left_index];
         let right_byte = right[right_index];
         if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
@@ -21898,6 +23386,10 @@ fn natural_compare_bytes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
             let digit_order = left_digits.cmp(right_digits);
             if !digit_order.is_eq() {
                 return digit_order;
+            }
+            let original_len_order = (right_index - right_start).cmp(&(left_index - left_start));
+            if !original_len_order.is_eq() {
+                return original_len_order;
             }
             continue;
         }
@@ -21920,6 +23412,7 @@ fn trim_leading_ascii_zeroes(bytes: &[u8]) -> &[u8] {
 }
 
 fn call_builtin_args_to_positional(
+    compiled: &CompiledUnit,
     function: &str,
     args: Vec<CallArgument>,
     stack: &mut CallStack,
@@ -21935,14 +23428,22 @@ fn call_builtin_args_to_positional(
             || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
             || (matches!(
                 function,
-                "array_pop" | "array_push" | "array_shift" | "array_splice" | "array_unshift"
+                "array_pop"
+                    | "array_push"
+                    | "array_shift"
+                    | "array_splice"
+                    | "array_unshift"
+                    | "end"
+                    | "next"
+                    | "prev"
+                    | "reset"
+                    | "shuffle"
             ) && index == 0);
-        if bind_by_ref && let Some(local) = arg.by_ref_local {
-            let frame = stack.current_mut().ok_or_else(|| {
-                "E_PHP_VM_NO_ACTIVE_FRAME: cannot bind builtin reference argument".to_owned()
-            })?;
-            values.push(Value::Reference(frame.locals.ensure_reference_cell(local)?));
-            continue;
+        if bind_by_ref {
+            if let Some(cell) = call_argument_reference_cell(compiled, &arg, stack)? {
+                values.push(Value::Reference(cell));
+                continue;
+            }
         }
         values.push(arg.value);
     }
@@ -22499,15 +24000,16 @@ fn write_object_numeric_cast_warning(
     state: &mut ExecutionState,
     object: &ObjectRef,
     target: &str,
+    source_span: RuntimeSourceSpan,
 ) {
     let diagnostic = RuntimeDiagnostic::new(
         "E_PHP_RUNTIME_OBJECT_NUMERIC_CAST_WARNING",
         RuntimeSeverity::Warning,
         format!(
             "Object of class {} could not be converted to {target}",
-            object.class_name()
+            object.display_name()
         ),
-        RuntimeSourceSpan::default(),
+        source_span,
         Vec::new(),
         Some(php_runtime::PhpReferenceClassification::Warning),
     );
@@ -22540,23 +24042,16 @@ fn write_non_numeric_value_warning(output: &mut OutputBuffer, state: &mut Execut
     state.diagnostics.push(diagnostic);
 }
 
-fn write_array_to_string_warning(output: &mut OutputBuffer, state: &mut ExecutionState) {
-    let diagnostic = RuntimeDiagnostic::new(
-        "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING",
-        RuntimeSeverity::Warning,
-        "Array to string conversion",
-        RuntimeSourceSpan::default(),
-        Vec::new(),
-        Some(php_runtime::PhpReferenceClassification::Warning),
-    );
-    emit_vm_diagnostic(
-        output,
-        state,
-        &diagnostic,
-        php_runtime::PhpDiagnosticChannel::Warning,
-        php_runtime::PHP_E_WARNING,
-    );
-    state.diagnostics.push(diagnostic);
+fn object_has_public_to_string(compiled: &CompiledUnit, object: &ObjectRef) -> bool {
+    let Some(class) = compiled.lookup_class(&object.class_name()) else {
+        return false;
+    };
+    let Ok(Some(resolved)) = lookup_method_in_hierarchy(compiled, class, "__toString", None) else {
+        return false;
+    };
+    !resolved.method.flags.is_static
+        && !resolved.method.flags.is_private
+        && !resolved.method.flags.is_protected
 }
 
 fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
@@ -23345,6 +24840,36 @@ mod tests {
         assert_eq!(
             result.output.to_string_lossy(),
             "3|ABC|1|XYZ|strtr(): Argument #2 ($from) must be of type array, s given"
+        );
+    }
+
+    #[test]
+    fn custom_validated_builtins_bypass_generated_arginfo_coercions() {
+        let result = execute_source(
+            "<?php
+            class AllowTags {
+                public function __toString(): string {
+                    return 'ignored';
+                }
+            }
+            echo strip_tags('<b>x</b>', new AllowTags()), '|';
+            try {
+                strrpos('t', 't', PHP_INT_MAX + 1);
+            } catch (TypeError $e) {
+                echo $e->getMessage(), '|';
+            }
+            try {
+                vprintf('%s', true);
+            } catch (TypeError $e) {
+                echo $e->getMessage();
+            }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "x|strrpos(): Argument #3 ($offset) must be of type int, float given|vprintf(): Argument #2 ($values) must be of type array, true given"
         );
     }
 
@@ -24190,6 +25715,21 @@ mod tests {
             protected_scope.status
         );
         assert_eq!(protected_scope.output.as_bytes(), b"ok");
+    }
+
+    #[test]
+    fn isset_empty_property_dimensions_execute_in_class_scope() {
+        let result = execute_source(
+            "<?php class C { private $a = ['x' => [1], 'empty' => []]; public function run($k) { echo isset($this->a[$k]) ? 'yes' : 'no'; echo '|'; echo empty($this->a['empty']) ? 'empty' : 'filled'; } } (new C())->run('x');",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"yes|empty");
+
+        let missing = execute_source(
+            "<?php class C { private $a = ['x' => [1]]; public function run($k) { echo isset($this->a[$k]) ? 'yes' : 'no'; } } (new C())->run('missing');",
+        );
+        assert!(missing.status.is_success(), "{:?}", missing.status);
+        assert_eq!(missing.output.as_bytes(), b"no");
     }
 
     #[test]
@@ -27280,6 +28820,19 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn array_literal_reference_elements_bind_local_cells() {
+        let result = execute_source(
+            "<?php $value = 10; $array = [1 => &$value]; $value = 20; var_dump($array);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "array(1) {\n  [1]=>\n  &int(20)\n}\n"
+        );
+    }
+
+    #[test]
     fn lvalue_nested_dim_increment_and_auto_creation_execute() {
         let nested = execute_source(
             "<?php $a = [\"x\" => [\"y\" => 1]]; $a[\"x\"][\"y\"]++; echo $a[\"x\"][\"y\"];",
@@ -27647,6 +29200,16 @@ echo perf_jit_unstable_types_debug(4), "\n";
             message.contains("function bad returned string, expected int"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn return_type_weakly_coerces_scalar_values() {
+        let result = execute_source(
+            "<?php function safe_to_string(int|float $number): string { return $number; } echo safe_to_string(5.5);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"5.5");
     }
 
     #[test]
@@ -29025,12 +30588,295 @@ echo perf_jit_unstable_types_debug(4), "\n";
             $d = ['img10', 'img2', 'img1'];
             natsort($d);
             echo var_export($d, true), \"\\n\";
+            $e = ['B', 'a'];
+            sort($e, SORT_STRING | SORT_FLAG_CASE);
+            echo var_export($e, true), \"\\n\";
+            $f = ['B' => 1, 'a' => 2];
+            ksort($f, SORT_STRING | SORT_FLAG_CASE);
+            echo var_export($f, true), \"\\n\";
             ",
         );
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "array (\n  0 => 'a',\n  1 => 'b',\n  2 => 'c',\n)\narray (\n  'a' => 1,\n  'z' => 2,\n  'm' => 3,\n)\narray (\n  'z' => 2,\n  'm' => 3,\n  'a' => 1,\n)\narray (\n  0 => 3,\n  1 => 2,\n  2 => 1,\n)\narray (\n  2 => 'img1',\n  1 => 'img2',\n  0 => 'img10',\n)\n"
+            "array (\n  0 => 'a',\n  1 => 'b',\n  2 => 'c',\n)\narray (\n  'a' => 1,\n  'z' => 2,\n  'm' => 3,\n)\narray (\n  'z' => 2,\n  'm' => 3,\n  'a' => 1,\n)\narray (\n  0 => 3,\n  1 => 2,\n  2 => 1,\n)\narray (\n  2 => 'img1',\n  1 => 'img2',\n  0 => 'img10',\n)\narray (\n  0 => 'a',\n  1 => 'B',\n)\narray (\n  'a' => 2,\n  'B' => 1,\n)\n"
+        );
+    }
+
+    #[test]
+    fn array_sort_builtins_mutate_array_dimensions() {
+        let result = execute_source(
+            "<?php
+            function cmp($left, $right) { return $left <=> $right; }
+            $arrays = [[2, 10, -1], [100], [], [0], [-1], [-9, 34, 54, 0, 20]];
+            var_dump(usort($arrays[5], 'cmp'));
+            echo var_export($arrays[5], true);
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\narray (\n  0 => -9,\n  1 => 0,\n  2 => 20,\n  3 => 34,\n  4 => 54,\n)"
+        );
+    }
+
+    #[test]
+    fn by_ref_builtins_mutate_array_dimensions() {
+        let result = execute_source(
+            "<?php
+            $arrays = [[1, 2, 3]];
+            var_dump(shuffle($arrays[0]));
+            echo count($arrays[0]), '|', array_is_list($arrays[0]) ? 'list' : 'not-list';
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "bool(true)\n3|list");
+    }
+
+    #[test]
+    fn array_sort_builtins_mutate_private_properties() {
+        let result = execute_source(
+            "<?php
+            class Box {
+                private $values = [2, 1];
+                public function run() {
+                    sort($this->values);
+                    echo implode(',', $this->values);
+                }
+            }
+            (new Box())->run();
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1,2");
+    }
+
+    #[test]
+    fn array_sort_callbacks_can_call_private_methods_from_current_scope() {
+        let result = execute_source(
+            "<?php
+            class Box {
+                private $values = ['b' => [2], 'a' => [1]];
+                private function cmp($left, $right) {
+                    if (!isset($this->values[$left])) {
+                        throw new Exception('missing left');
+                    }
+                    if (!isset($this->values[$right])) {
+                        throw new Exception('missing right');
+                    }
+                    return $left <=> $right;
+                }
+                public function run() {
+                    uksort($this->values, [$this, 'cmp']);
+                    echo 'Done';
+                }
+            }
+            (new Box())->run();
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"Done");
+    }
+
+    #[test]
+    fn array_sort_bool_comparators_deprecate_and_use_reverse_compare() {
+        let result = execute_source(
+            "<?php
+            function bool_cmp($left, $right) { return $left > $right; }
+            $values = [2, 0, 1];
+            usort($values, 'bool_cmp');
+            echo '|', implode(',', $values);
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.contains(
+                "Deprecated: usort(): Returning bool from comparison function is deprecated"
+            ),
+            "{output}"
+        );
+        assert!(output.ends_with("|0,1,2"), "{output}");
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.id() == "E_PHP_VM_SORT_BOOL_COMPARE_DEPRECATED"
+                && diagnostic.severity() == RuntimeSeverity::Deprecation
+        }));
+    }
+
+    #[test]
+    fn dynamic_string_calls_dispatch_array_sort_builtins_in_vm() {
+        let result = execute_source(
+            "<?php
+            $sort = 'sort';
+            $values = [3, 1, 2];
+            $sort($values);
+            echo implode(',', $values);
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1,2,3");
+    }
+
+    #[test]
+    fn sort_string_warns_for_array_to_string_values() {
+        let result = execute_source(
+            "<?php
+            $values = [[1], 'b'];
+            sort($values, SORT_STRING);
+            echo '|done';
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.contains("Warning: Array to string conversion in "),
+            "{output}"
+        );
+        assert!(output.ends_with("|done"), "{output}");
+    }
+
+    #[test]
+    fn array_multisort_string_cast_warnings_respect_error_handler() {
+        let result = execute_source(
+            "<?php
+            function ignore_sort_warning($errno, $errstr) {}
+            set_error_handler('ignore_sort_warning');
+            $inputs = [
+                'int 0' => 0,
+                [],
+                'uppercase NULL' => NULL,
+                'empty string DQ' => '',
+                'string DQ' => 'string',
+            ];
+            var_dump(array_multisort($inputs, SORT_STRING));
+            foreach ($inputs as $key => $_) {
+                echo $key;
+                break;
+            }
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(!output.contains("Warning: Array to string conversion"), "{output}");
+        assert_eq!(output, "bool(true)\nuppercase NULL");
+    }
+
+    #[test]
+    fn array_multisort_regular_orders_mixed_values_like_php() {
+        let result = execute_source(
+            "<?php
+            class SortWithToString {
+                public function __toString(): string {
+                    return 'Class A object';
+                }
+            }
+            class SortWithoutToString {}
+            $inputs = [
+                'int 0' => 0,
+                'float -10.5' => -10.5,
+                [],
+                'uppercase NULL' => NULL,
+                'lowercase true' => true,
+                'empty string DQ' => '',
+                'string DQ' => 'string',
+                'with' => new SortWithToString(),
+                'without' => new SortWithoutToString(),
+                'undefined var' => @$undefined_var,
+            ];
+            var_dump(array_multisort($inputs));
+            foreach ($inputs as $key => $_) {
+                echo $key, \"\\n\";
+            }
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\nfloat -10.5\nint 0\n0\nuppercase NULL\nempty string DQ\nundefined var\nlowercase true\nwith\nstring DQ\nwithout\n"
+        );
+    }
+
+    #[test]
+    fn sort_regular_compares_objects_by_properties_before_to_string() {
+        let result = execute_source(
+            "<?php
+            class SortObjectValue {
+                public $class_value;
+                function __construct($value) {
+                    $this->class_value = $value;
+                }
+                function __toString() {
+                    return '';
+                }
+            }
+            $values = [
+                new SortObjectValue('axx'),
+                new SortObjectValue('t'),
+                new SortObjectValue('w'),
+                new SortObjectValue('py'),
+                new SortObjectValue('apple'),
+                new SortObjectValue('Orange'),
+                new SortObjectValue('Lemon'),
+                new SortObjectValue('aPPle'),
+            ];
+            var_dump(sort($values));
+            foreach ($values as $value) {
+                echo $value->class_value, \"\\n\";
+            }
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\nLemon\nOrange\naPPle\napple\naxx\npy\nt\nw\n"
+        );
+    }
+
+    #[test]
+    fn array_multisort_mutates_multiple_arrays_with_flags() {
+        let result = execute_source(
+            "<?php
+            $ar1 = ['row1' => 2, 'row2' => 1, 'row3' => 1];
+            $ar2 = ['row1' => 2, 'row2' => 'aa', 'row3' => '1'];
+            var_dump(array_multisort($ar1, SORT_ASC, SORT_REGULAR, $ar2, SORT_DESC, SORT_STRING));
+            echo var_export($ar1, true), \"\\n\", var_export($ar2, true), \"\\n\";
+            var_dump(array_multisort($ar2));
+            echo var_export($ar2, true), \"\\n\";
+            var_dump(array_multisort([1, 3, 2, 4]));
+            try {
+                array_multisort($ar2, SORT_ASC, SORT_ASC);
+            } catch (TypeError $e) {
+                echo $e->getMessage(), \"\\n\";
+            }
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\narray (\n  'row2' => 1,\n  'row3' => 1,\n  'row1' => 2,\n)\narray (\n  'row2' => 'aa',\n  'row3' => '1',\n  'row1' => 2,\n)\nbool(true)\narray (\n  'row3' => '1',\n  'row1' => 2,\n  'row2' => 'aa',\n)\nbool(true)\narray_multisort(): Argument #3 must be an array or a sort flag that has not already been specified\n"
+        );
+    }
+
+    #[test]
+    fn arsort_regular_orders_arrays_before_strings() {
+        let result = execute_source(
+            "<?php
+            $values = [
+                'array1' => [],
+                'array2' => [1],
+                'b' => 'b',
+                'ab' => 'ab',
+                4 => 4.01,
+                0 => 0.001,
+            ];
+            var_dump(arsort($values));
+            echo var_export(array_keys($values), true), \"\\n\";
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\narray (\n  0 => 'array2',\n  1 => 'array1',\n  2 => 'b',\n  3 => 'ab',\n  4 => 4,\n  5 => 0,\n)\n"
         );
     }
 
@@ -29081,6 +30927,29 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"by-ref");
+    }
+
+    #[test]
+    fn array_sort_callbacks_warn_for_by_ref_value_arguments() {
+        let result = execute_source(
+            "<?php
+            $values = ['b' => 'Banana', 'm' => 'Mango', 'a' => 'Apple'];
+            uasort($values, function (&$left, &$right) {
+                return $left <=> $right;
+            });
+            echo implode(',', array_keys($values));
+            ",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("Warning: {closure:"));
+        assert!(output.contains("Argument #1 ($left) must be passed by reference, value given"));
+        assert!(output.contains("Argument #2 ($right) must be passed by reference, value given"));
+        assert!(output.ends_with("a,b,m"));
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.id() == "E_PHP_VM_BY_REF_ARG_VALUE_GIVEN_WARNING"
+                && diagnostic.severity() == RuntimeSeverity::Warning
+        }));
     }
 
     #[test]

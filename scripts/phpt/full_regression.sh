@@ -20,6 +20,17 @@ run_dir="$work_root/full-runs/$timestamp"
 default_phpt_tool="${CARGO_TARGET_DIR:-target}/debug/php-phpt-tools"
 phpt_tool="${PHPT_TOOLS_BIN:-$default_phpt_tool}"
 
+if [[ "${PHPT_RUN_FULL:-0}" != "1" ]]; then
+  printf '%s\n' 'Refusing to start the full PHPT corpus without PHPT_RUN_FULL=1.' >&2
+  printf '%s\n' 'This gate can run 20k+ PHPTs. Use focused targets while iterating:' >&2
+  printf '%s\n' '  just phpt-fast MODULE=<module> [FILE=<path>|PATTERN=<text>]' >&2
+  printf '%s\n' '  just phpt-dev-module MODULE=<module>' >&2
+  printf '%s\n' '  just phpt-rerun-failures MODULE=<module>' >&2
+  printf '%s\n' 'For an intentional full gate, run:' >&2
+  printf '%s\n' '  PHPT_RUN_FULL=1 just phpt-full-regression' >&2
+  exit 2
+fi
+
 target_php="${TARGET_PHP:-target/debug/phrust-php}"
 target_mode="${PHPT_TARGET_MODE:-}"
 if [[ -z "$target_mode" ]]; then
@@ -103,17 +114,20 @@ if [[ -n "$previous_results" ]]; then
   reuse_args=(--reuse-results "$previous_results")
 fi
 
-job_args=()
-if [[ -n "${PHPT_JOBS:-}" ]]; then
-  job_args=(--jobs "$PHPT_JOBS")
+job_args=(--jobs "${PHPT_JOBS:-1}")
+
+dev_reuse_args=()
+if [[ -n "${PHPT_DEV_REUSE_PASS:-}" && "${PHPT_DEV_REUSE_PASS:-}" != "0" ]]; then
+  dev_reuse_args=(--dev-reuse-pass)
 fi
 
 printf 'TARGET_PHP=%s\n' "$target_php"
 printf 'PHPT_TARGET_MODE=%s\n' "$target_mode"
 printf 'PHPT_CORPUS_MANIFEST=%s\n' "$corpus"
 printf 'PHPT_RUN_DIR=%s\n' "$run_dir"
-printf 'PHPT_JOBS=%s\n' "${PHPT_JOBS:-auto}"
+printf 'PHPT_JOBS=%s\n' "${PHPT_JOBS:-1}"
 printf 'PHPT_REUSE_RESULTS=%s\n' "${reuse_args[*]:-disabled}"
+printf 'PHPT_DEV_REUSE_PASS=%s\n' "${PHPT_DEV_REUSE_PASS:-0}"
 
 set +e
 "$phpt_tool" run \
@@ -126,6 +140,7 @@ set +e
   --work-dir "$run_dir/work" \
   --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-30}" \
   "${reuse_args[@]}" \
+  "${dev_reuse_args[@]}" \
   "${job_args[@]}"
 run_status=$?
 set -e

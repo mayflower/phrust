@@ -471,6 +471,18 @@ fn verify_instruction(
             verify_register(*dst, function.register_count, errors);
             verify_operand(object, function, unit, errors);
         }
+        InstructionKind::IssetPropertyDim {
+            dst, object, dims, ..
+        }
+        | InstructionKind::EmptyPropertyDim {
+            dst, object, dims, ..
+        } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(object, function, unit, errors);
+            for dim in dims {
+                verify_operand(dim, function, unit, errors);
+            }
+        }
         InstructionKind::UnsetProperty { object, .. } => {
             verify_operand(object, function, unit, errors);
         }
@@ -492,12 +504,20 @@ fn verify_instruction(
         InstructionKind::NewArray { dst } => {
             verify_register(*dst, function.register_count, errors);
         }
-        InstructionKind::ArrayInsert { array, key, value } => {
+        InstructionKind::ArrayInsert {
+            array,
+            key,
+            value,
+            by_ref_local,
+        } => {
             verify_register(*array, function.register_count, errors);
             if let Some(key) = key {
                 verify_operand(key, function, unit, errors);
             }
             verify_operand(value, function, unit, errors);
+            if let Some(local) = by_ref_local {
+                verify_local(*local, function.local_count, errors);
+            }
         }
         InstructionKind::FetchDim {
             dst, array, key, ..
@@ -651,6 +671,28 @@ fn verify_call_args(
                         "unpacked call argument cannot carry by-reference local {}",
                         local.raw()
                     ),
+                ));
+            }
+        }
+        if let Some(dim) = &arg.by_ref_dim {
+            verify_local(dim.local, function.local_count, errors);
+            for operand in &dim.dims {
+                verify_operand(operand, function, unit, errors);
+            }
+            if arg.unpack {
+                errors.push(error(
+                    VerificationErrorCode::InvalidCallArgMetadata,
+                    "unpacked call argument cannot carry by-reference dimension metadata"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(property) = &arg.by_ref_property {
+            verify_operand(&property.object, function, unit, errors);
+            if arg.unpack {
+                errors.push(error(
+                    VerificationErrorCode::InvalidCallArgMetadata,
+                    "unpacked call argument cannot carry by-reference property metadata".to_owned(),
                 ));
             }
         }
@@ -933,6 +975,13 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
         | InstructionKind::EmptyProperty { object: src, .. }
         | InstructionKind::UnsetProperty { object: src, .. }
         | InstructionKind::ForeachInit { source: src, .. } => operand_register_uses(src, uses),
+        InstructionKind::IssetPropertyDim { object, dims, .. }
+        | InstructionKind::EmptyPropertyDim { object, dims, .. } => {
+            operand_register_uses(object, uses);
+            for dim in dims {
+                operand_register_uses(dim, uses);
+            }
+        }
         InstructionKind::BindReferenceDim { dims, .. }
         | InstructionKind::BindReferenceFromDim { dims, .. }
         | InstructionKind::IssetDim { dims, .. }
@@ -1006,7 +1055,9 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
             operand_register_uses(value, uses);
         }
         InstructionKind::AssignStaticProperty { value, .. } => operand_register_uses(value, uses),
-        InstructionKind::ArrayInsert { array, key, value } => {
+        InstructionKind::ArrayInsert {
+            array, key, value, ..
+        } => {
             uses.push(*array);
             if let Some(key) = key {
                 operand_register_uses(key, uses);
@@ -1071,6 +1122,8 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::FetchProperty { dst, .. }
         | InstructionKind::IssetProperty { dst, .. }
         | InstructionKind::EmptyProperty { dst, .. }
+        | InstructionKind::IssetPropertyDim { dst, .. }
+        | InstructionKind::EmptyPropertyDim { dst, .. }
         | InstructionKind::FetchStaticProperty { dst, .. }
         | InstructionKind::FetchClassConstant { dst, .. }
         | InstructionKind::AssignProperty { dst, .. }
@@ -1431,6 +1484,8 @@ mod tests {
                     value: Operand::Register(RegId::new(0)),
                     unpack: true,
                     by_ref_local: Some(LocalId::new(0)),
+                    by_ref_dim: None,
+                    by_ref_property: None,
                 }],
             },
         });

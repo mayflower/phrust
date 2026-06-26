@@ -16,6 +16,7 @@ use crate::{
     equal, identical, pcre, serialize as serialize_value, to_bool, to_float, to_int, to_number,
     to_string, unserialize as unserialize_value, value::FloatValue,
 };
+use crate::convert::float_to_php_string;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest, Md5};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -26,6 +27,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RANGE_MAX_ELEMENTS: usize = 1_000_000;
+const SORT_REGULAR: i64 = 0;
+const SORT_NUMERIC: i64 = 1;
+const SORT_STRING: i64 = 2;
+const SORT_LOCALE_STRING: i64 = 5;
+const SORT_NATURAL: i64 = 6;
+const SORT_FLAG_CASE: i64 = 8;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("boolval", builtin_boolval, BuiltinCompatibility::Php),
@@ -219,6 +226,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("serialize", builtin_serialize, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "setlocale",
+        builtin_setlocale,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "set_error_handler",
         builtin_error_handling_requires_vm,
@@ -493,6 +505,34 @@ pub(in crate::builtins::modules) fn builtin_array_values(
     ))
 }
 
+pub(in crate::builtins::modules) fn builtin_array_combine(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("array_combine", &args, 2)?;
+    let Value::Array(keys) = deref_value(&args[0]) else {
+        return Err(type_error("array_combine", "array", &args[0]));
+    };
+    let Value::Array(values) = deref_value(&args[1]) else {
+        return Err(type_error("array_combine", "array", &args[1]));
+    };
+    if keys.len() != values.len() {
+        return Err(value_error(
+            "array_combine",
+            "Argument #1 ($keys) and argument #2 ($values) must have the same number of elements",
+        ));
+    }
+    let mut output = PhpArray::new();
+    for ((_, key), (_, value)) in keys.iter().zip(values.iter()) {
+        let Some(key) = ArrayKey::from_value_mvp(key) else {
+            return Err(type_error("array_combine", "array key", key));
+        };
+        output.insert(key, value.clone());
+    }
+    Ok(Value::Array(output))
+}
+
 pub(in crate::builtins::modules) fn builtin_array_is_list(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -586,13 +626,15 @@ pub(in crate::builtins::modules) fn builtin_array_search(
 }
 
 pub(in crate::builtins::modules) fn builtin_range(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(2..=3).contains(&args.len()) {
         return Err(arity_error("range", "two or three argument(s)"));
     }
+    range_null_deprecation(context, &args[0], "#1 ($start)", span.clone());
+    range_null_deprecation(context, &args[1], "#2 ($end)", span.clone());
     let step = args
         .get(2)
         .map(range_step_arg)
@@ -600,9 +642,10 @@ pub(in crate::builtins::modules) fn builtin_range(
         .unwrap_or(RangeStep::Int(1));
     validate_range_step(step)?;
 
-    if let Some(values) = range_string_values(&args[0], &args[1], step)? {
+    if let Some(values) = range_string_values(context, &args[0], &args[1], step, span.clone())? {
         return Ok(Value::packed_array(values));
     }
+    warn_range_null_string_boundary(context, &args[0], &args[1], span.clone());
 
     let start = range_numeric_arg("range", "#1 ($start)", &args[0])?;
     let end = range_numeric_arg("range", "#2 ($end)", &args[1])?;
@@ -653,6 +696,32 @@ pub(in crate::builtins::modules) fn builtin_array_column(
     Ok(Value::Array(output))
 }
 
+pub(in crate::builtins::modules) fn builtin_array_diff(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 {
+        return Err(arity_error("array_diff", "at least two argument(s)"));
+    }
+    let first = array_value_arg("array_diff", &args[0])?;
+    let others = array_list_arg("array_diff", &args[1..])?;
+    Ok(Value::Array(array_diff_by_value(&first, &others)?))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_diff_assoc(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 {
+        return Err(arity_error("array_diff_assoc", "at least two argument(s)"));
+    }
+    let first = array_value_arg("array_diff_assoc", &args[0])?;
+    let others = array_list_arg("array_diff_assoc", &args[1..])?;
+    Ok(Value::Array(array_diff_by_key_and_value(&first, &others)?))
+}
+
 pub(in crate::builtins::modules) fn builtin_array_fill(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -694,6 +763,69 @@ pub(in crate::builtins::modules) fn builtin_array_fill(
         output.insert(ArrayKey::Int(key), args[2].clone());
     }
     Ok(Value::Array(output))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_intersect(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 {
+        return Err(arity_error("array_intersect", "at least two argument(s)"));
+    }
+    let first = array_value_arg("array_intersect", &args[0])?;
+    let others = array_list_arg("array_intersect", &args[1..])?;
+    Ok(Value::Array(array_intersect_by_value(&first, &others)?))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_intersect_assoc(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 {
+        return Err(arity_error(
+            "array_intersect_assoc",
+            "at least two argument(s)",
+        ));
+    }
+    let first = array_value_arg("array_intersect_assoc", &args[0])?;
+    let others = array_list_arg("array_intersect_assoc", &args[1..])?;
+    Ok(Value::Array(array_intersect_by_key_and_value(
+        &first, &others,
+    )?))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_intersect_ukey(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    array_callback_intersect_empty_shortcut("array_intersect_ukey", args, 1)
+}
+
+pub(in crate::builtins::modules) fn builtin_array_uintersect(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    array_callback_intersect_empty_shortcut("array_uintersect", args, 1)
+}
+
+pub(in crate::builtins::modules) fn builtin_array_intersect_uassoc(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    array_callback_intersect_empty_shortcut("array_intersect_uassoc", args, 1)
+}
+
+pub(in crate::builtins::modules) fn builtin_array_uintersect_uassoc(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    array_callback_intersect_empty_shortcut("array_uintersect_uassoc", args, 2)
 }
 
 pub(in crate::builtins::modules) fn builtin_array_push(
@@ -755,6 +887,100 @@ pub(in crate::builtins::modules) fn builtin_array_rand(
                 .collect(),
         ))
     }
+}
+
+pub(in crate::builtins::modules) fn builtin_shuffle(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("shuffle", &args, 1)?;
+    let cell = array_reference_cell("shuffle", &args[0])?;
+    let array = array_from_reference_cell("shuffle", &cell)?;
+    let mut values = array
+        .iter()
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    for index in 0..values.len() {
+        let offset = random_bounded_usize("shuffle", values.len() - index)?;
+        values.swap(index, index + offset);
+    }
+    cell.set(Value::packed_array(values));
+    Ok(Value::Bool(true))
+}
+
+pub(in crate::builtins::modules) fn builtin_current(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("current", &args, 1)?;
+    let array = array_value_arg("current", &args[0])?;
+    Ok(array.pointer_value().unwrap_or(Value::Bool(false)))
+}
+
+pub(in crate::builtins::modules) fn builtin_key(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("key", &args, 1)?;
+    let array = array_value_arg("key", &args[0])?;
+    Ok(array
+        .pointer_key()
+        .map_or(Value::Null, |key| array_key_to_value(&key)))
+}
+
+pub(in crate::builtins::modules) fn builtin_next(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("next", &args, 1)?;
+    let cell = array_reference_cell("next", &args[0])?;
+    let mut array = array_from_reference_cell("next", &cell)?;
+    let value = array.next_pointer().unwrap_or(Value::Bool(false));
+    cell.set(Value::Array(array));
+    Ok(value)
+}
+
+pub(in crate::builtins::modules) fn builtin_prev(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("prev", &args, 1)?;
+    let cell = array_reference_cell("prev", &args[0])?;
+    let mut array = array_from_reference_cell("prev", &cell)?;
+    let value = array.prev_pointer().unwrap_or(Value::Bool(false));
+    cell.set(Value::Array(array));
+    Ok(value)
+}
+
+pub(in crate::builtins::modules) fn builtin_end(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("end", &args, 1)?;
+    let cell = array_reference_cell("end", &args[0])?;
+    let mut array = array_from_reference_cell("end", &cell)?;
+    let value = array.end_pointer().unwrap_or(Value::Bool(false));
+    cell.set(Value::Array(array));
+    Ok(value)
+}
+
+pub(in crate::builtins::modules) fn builtin_reset(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("reset", &args, 1)?;
+    let cell = array_reference_cell("reset", &args[0])?;
+    let mut array = array_from_reference_cell("reset", &cell)?;
+    let value = array.reset_pointer().unwrap_or(Value::Bool(false));
+    cell.set(Value::Array(array));
+    Ok(value)
 }
 
 pub(in crate::builtins::modules) fn builtin_array_pop(
@@ -882,6 +1108,38 @@ pub(in crate::builtins::modules) fn builtin_array_splice(
     );
     cell.set(Value::packed_array(result_values));
     Ok(Value::Array(array_from_entries_reindex_ints(removed)))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_unique(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(1..=2).contains(&args.len()) {
+        return Err(arity_error("array_unique", "one or two argument(s)"));
+    }
+    let array = array_value_arg("array_unique", &args[0])?;
+    let flags = args
+        .get(1)
+        .map(|value| int_arg("array_unique", value))
+        .transpose()?
+        .unwrap_or(SORT_STRING);
+    let mut unique = Vec::new();
+    let mut output = crate::PhpArray::new();
+
+    for (key, value) in array.iter() {
+        let candidate = array_unique_key(value, flags)?;
+        if unique
+            .iter()
+            .any(|seen| array_unique_keys_match(seen, &candidate))
+        {
+            continue;
+        }
+        unique.push(candidate);
+        output.insert(key.clone(), value.clone());
+    }
+
+    Ok(Value::Array(output))
 }
 
 pub(in crate::builtins::modules) fn builtin_array_merge(
@@ -3277,19 +3535,30 @@ pub(in crate::builtins::modules) fn builtin_clearstatcache(
 pub(in crate::builtins::modules) fn builtin_fopen(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("fopen", &args, 2)?;
     let uri = string_arg("fopen", &args[0])?.to_string_lossy();
     let mode = string_arg("fopen", &args[1])?.to_string_lossy();
     let cwd = context.cwd().to_path_buf();
     let filesystem = context.filesystem_capabilities().clone();
-    let Some(resources) = context.resources() else {
-        return Ok(Value::Bool(false));
+    let open_result = {
+        let Some(resources) = context.resources() else {
+            return Ok(Value::Bool(false));
+        };
+        StreamWrapperRegistry::new().open(resources, &uri, &mode, &cwd, &filesystem)
     };
-    Ok(StreamWrapperRegistry::new()
-        .open(resources, &uri, &mode, &cwd, &filesystem)
-        .map_or(Value::Bool(false), Value::Resource))
+    match open_result {
+        Ok(resource) => Ok(Value::Resource(resource)),
+        Err(error) => {
+            context.php_warning(
+                error.diagnostic_id(),
+                format!("fopen({uri}): {}", error.message()),
+                span,
+            );
+            Ok(Value::Bool(false))
+        }
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_fclose(
@@ -3470,13 +3739,13 @@ pub(in crate::builtins::modules) fn builtin_rewind(
 pub(in crate::builtins::modules) fn builtin_file_get_contents(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_error("file_get_contents", "one or two argument(s)"));
     }
     let path = string_arg("file_get_contents", &args[0])?.to_string_lossy();
-    read_file_value(context, &path)
+    read_file_value(context, "file_get_contents", &path, span)
 }
 
 pub(in crate::builtins::modules) fn builtin_file_put_contents(
@@ -3504,11 +3773,11 @@ pub(in crate::builtins::modules) fn builtin_file_put_contents(
 pub(in crate::builtins::modules) fn builtin_readfile(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("readfile", &args, 1)?;
     let path = string_arg("readfile", &args[0])?.to_string_lossy();
-    let Value::String(bytes) = read_file_value(context, &path)? else {
+    let Value::String(bytes) = read_file_value(context, "readfile", &path, span)? else {
         return Ok(Value::Bool(false));
     };
     let len = bytes.len();
@@ -5006,6 +5275,30 @@ pub(in crate::builtins::modules) fn builtin_serialize(
         .map_err(|error| serialization_error("serialize", error.message()))
 }
 
+pub(in crate::builtins::modules) fn builtin_setlocale(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() {
+        return Err(arity_error("setlocale", "at least one argument"));
+    }
+    to_int(&args[0]).map_err(|message| conversion_error("setlocale", message))?;
+    if args.len() == 1 {
+        return Ok(Value::String(PhpString::from_test_str("C")));
+    }
+    for candidate in &args[1..] {
+        let locale = to_string(candidate)
+            .map_err(|message| conversion_error("setlocale", message))?
+            .to_string_lossy();
+        match locale.as_str() {
+            "" | "0" | "C" | "POSIX" => return Ok(Value::String(PhpString::from_test_str("C"))),
+            _ => {}
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
 pub(in crate::builtins::modules) fn builtin_unserialize(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -5758,12 +6051,44 @@ fn resource_arg(value: &Value) -> Option<crate::ResourceRef> {
     }
 }
 
-fn read_file_value(context: &BuiltinContext<'_>, path: &str) -> BuiltinResult {
+fn read_file_value(
+    context: &mut BuiltinContext<'_>,
+    function: &str,
+    path: &str,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
     let resolved = resolve_runtime_path(context, path);
     if !context.filesystem_capabilities().allows_path(&resolved) {
+        context.php_warning(
+            "E_PHP_RUNTIME_STREAM_CAPABILITY",
+            format!("{function}({path}): Failed to open stream: Operation not permitted"),
+            span,
+        );
         return Ok(Value::Bool(false));
     }
-    Ok(fs::read(resolved).map_or(Value::Bool(false), Value::string))
+    match fs::read(&resolved) {
+        Ok(bytes) => Ok(Value::string(bytes)),
+        Err(error) => {
+            context.php_warning(
+                "E_PHP_RUNTIME_STREAM_OPEN",
+                format!(
+                    "{function}({path}): Failed to open stream: {}",
+                    php_io_error_message(&error)
+                ),
+                span,
+            );
+            Ok(Value::Bool(false))
+        }
+    }
+}
+
+fn php_io_error_message(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
+        _ => error.to_string(),
+    }
 }
 
 fn directory_entries_with_dots(path: &Path) -> Option<Vec<String>> {
@@ -7578,6 +7903,13 @@ fn array_value_arg(name: &str, value: &Value) -> Result<crate::PhpArray, Builtin
     Ok(array)
 }
 
+fn array_list_arg(name: &str, values: &[Value]) -> Result<Vec<crate::PhpArray>, BuiltinError> {
+    values
+        .iter()
+        .map(|value| array_value_arg(name, value))
+        .collect()
+}
+
 fn array_reference_cell(name: &str, value: &Value) -> Result<crate::ReferenceCell, BuiltinError> {
     let Value::Reference(cell) = value else {
         return Err(type_error(name, "array reference", value));
@@ -7642,6 +7974,170 @@ fn array_value_matches(
         Ok(identical(left, right))
     } else {
         equal(left, right).map_err(|message| conversion_error(name, message))
+    }
+}
+
+fn array_diff_by_value(
+    first: &crate::PhpArray,
+    others: &[crate::PhpArray],
+) -> Result<crate::PhpArray, BuiltinError> {
+    let mut output = crate::PhpArray::new();
+    for (key, value) in first.iter() {
+        let needle = array_compare_value_key("array_diff", value)?;
+        if others.iter().all(|other| {
+            !other.iter().any(|(_, candidate)| {
+                array_compare_value_key("array_diff", candidate)
+                    .is_ok_and(|candidate| candidate == needle)
+            })
+        }) {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(output)
+}
+
+fn array_diff_by_key_and_value(
+    first: &crate::PhpArray,
+    others: &[crate::PhpArray],
+) -> Result<crate::PhpArray, BuiltinError> {
+    let mut output = crate::PhpArray::new();
+    for (key, value) in first.iter() {
+        let needle = array_compare_value_key("array_diff_assoc", value)?;
+        if others.iter().all(|other| {
+            !other.get(key).is_some_and(|candidate| {
+                array_compare_value_key("array_diff_assoc", candidate)
+                    .is_ok_and(|candidate| candidate == needle)
+            })
+        }) {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(output)
+}
+
+fn array_intersect_by_value(
+    first: &crate::PhpArray,
+    others: &[crate::PhpArray],
+) -> Result<crate::PhpArray, BuiltinError> {
+    let mut output = crate::PhpArray::new();
+    for (key, value) in first.iter() {
+        let needle = array_compare_value_key("array_intersect", value)?;
+        if others.iter().all(|other| {
+            other.iter().any(|(_, candidate)| {
+                array_compare_value_key("array_intersect", candidate)
+                    .is_ok_and(|candidate| candidate == needle)
+            })
+        }) {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(output)
+}
+
+fn array_intersect_by_key_and_value(
+    first: &crate::PhpArray,
+    others: &[crate::PhpArray],
+) -> Result<crate::PhpArray, BuiltinError> {
+    let mut output = crate::PhpArray::new();
+    for (key, value) in first.iter() {
+        let needle = array_compare_value_key("array_intersect_assoc", value)?;
+        if others.iter().all(|other| {
+            other.get(key).is_some_and(|candidate| {
+                array_compare_value_key("array_intersect_assoc", candidate)
+                    .is_ok_and(|candidate| candidate == needle)
+            })
+        }) {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(output)
+}
+
+fn array_compare_value_key(name: &str, value: &Value) -> Result<Vec<u8>, BuiltinError> {
+    Ok(to_string(&deref_value(value))
+        .map_err(|message| conversion_error(name, message))?
+        .as_bytes()
+        .to_vec())
+}
+
+fn array_callback_intersect_empty_shortcut(
+    name: &str,
+    args: Vec<Value>,
+    callback_count: usize,
+) -> BuiltinResult {
+    if args.len() < callback_count + 2 {
+        return Err(arity_error(
+            name,
+            if callback_count == 1 {
+                "at least three argument(s)"
+            } else {
+                "at least four argument(s)"
+            },
+        ));
+    }
+    let first = array_value_arg(name, &args[0])?;
+    let array_arg_end = args.len() - callback_count;
+    let others = array_list_arg(name, &args[1..array_arg_end])?;
+    if first.is_empty() || others.iter().any(crate::PhpArray::is_empty) {
+        return Ok(Value::Array(crate::PhpArray::new()));
+    }
+    Err(BuiltinError::new(
+        "E_PHP_RUNTIME_CALLABLE_CONTEXT_REQUIRED",
+        format!("{name}() requires VM callable dispatch for non-empty array comparisons"),
+    ))
+}
+
+#[derive(Clone, Debug)]
+enum ArrayUniqueKey {
+    Regular(Value),
+    Numeric(f64),
+    String(Vec<u8>),
+}
+
+fn array_unique_key(value: &Value, flags: i64) -> Result<ArrayUniqueKey, BuiltinError> {
+    let normalized_flags = flags & !SORT_FLAG_CASE;
+    let case_insensitive = (flags & SORT_FLAG_CASE) != 0;
+    match normalized_flags {
+        SORT_REGULAR => Ok(ArrayUniqueKey::Regular(deref_value(value))),
+        SORT_NUMERIC => {
+            let numeric = to_number(&deref_value(value))
+                .map_err(|message| conversion_error("array_unique", message))?;
+            Ok(ArrayUniqueKey::Numeric(match numeric {
+                NumericValue::Int(value) => value as f64,
+                NumericValue::Float(value) => value,
+            }))
+        }
+        SORT_STRING | SORT_LOCALE_STRING | SORT_NATURAL => {
+            let mut bytes = to_string(&deref_value(value))
+                .map_err(|message| conversion_error("array_unique", message))?
+                .as_bytes()
+                .to_vec();
+            if case_insensitive {
+                bytes.make_ascii_lowercase();
+            }
+            Ok(ArrayUniqueKey::String(bytes))
+        }
+        _ => {
+            let mut bytes = to_string(&deref_value(value))
+                .map_err(|message| conversion_error("array_unique", message))?
+                .as_bytes()
+                .to_vec();
+            if case_insensitive {
+                bytes.make_ascii_lowercase();
+            }
+            Ok(ArrayUniqueKey::String(bytes))
+        }
+    }
+}
+
+fn array_unique_keys_match(left: &ArrayUniqueKey, right: &ArrayUniqueKey) -> bool {
+    match (left, right) {
+        (ArrayUniqueKey::Regular(left), ArrayUniqueKey::Regular(right)) => {
+            equal(left, right).unwrap_or(false)
+        }
+        (ArrayUniqueKey::Numeric(left), ArrayUniqueKey::Numeric(right)) => left == right,
+        (ArrayUniqueKey::String(left), ArrayUniqueKey::String(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -7779,25 +8275,69 @@ fn php_non_finite_name(value: f64) -> &'static str {
 }
 
 fn range_string_values(
+    context: &mut BuiltinContext<'_>,
     start: &Value,
     end: &Value,
     step: RangeStep,
+    span: RuntimeSourceSpan,
 ) -> Result<Option<Vec<Value>>, BuiltinError> {
     let (Value::String(start), Value::String(end)) = (deref_value(start), deref_value(end)) else {
         return Ok(None);
     };
-    if start.len() != 1 || end.len() != 1 || !step.is_integral() {
+    let start = RangeStringOperand::new("#1 ($start)", &start);
+    let end = RangeStringOperand::new("#2 ($end)", &end);
+    warn_ignored_range_string_bytes(context, start, span.clone());
+    warn_ignored_range_string_bytes(context, end, span.clone());
+
+    if start.full_numeric
+        && end.full_numeric
+        && (start.value.len() != 1 || end.value.len() != 1 || !step.is_integral())
+    {
         return Ok(None);
+    }
+
+    if start.character_candidate && end.character_candidate && !step.is_integral() {
+        if !start.full_numeric || !end.full_numeric {
+            range_warning(
+                context,
+                "Argument #3 ($step) must be of type int when generating an array of characters, inputs converted to 0",
+                span,
+            );
+        }
+        return Ok(None);
+    }
+
+    if start.character_candidate && !end.character_candidate {
+        warn_range_empty_string(context, end, span.clone());
+        range_warning(
+            context,
+            "Argument #2 ($end) must be a single byte string if argument #1 ($start) is a single byte string, argument #1 ($start) converted to 0",
+            span,
+        );
+        return Ok(None);
+    }
+    if !start.character_candidate && end.character_candidate {
+        warn_range_empty_string(context, start, span.clone());
+        range_warning(
+            context,
+            "Argument #1 ($start) must be a single byte string if argument #2 ($end) is a single byte string, argument #2 ($end) converted to 0",
+            span,
+        );
+        return Ok(None);
+    }
+    if !start.character_candidate || !end.character_candidate {
+        return Ok(None);
+    }
+
+    let start = i32::from(start.first_byte.expect("character candidate has a byte"));
+    let end = i32::from(end.first_byte.expect("character candidate has a byte"));
+    if start < end && step.as_f64() < 0.0 {
+        return Err(range_increasing_step_error());
     }
     let Some(step) = step.abs_i64() else {
         return Ok(None);
     };
     let step = i32::try_from(step).map_err(|_| range_step_span_error())?;
-    let start = i32::from(start.as_bytes()[0]);
-    let end = i32::from(end.as_bytes()[0]);
-    if start < end && step <= 0 {
-        return Err(range_increasing_step_error());
-    }
     let distance = (start - end).abs();
     if step > distance && distance != 0 {
         return Err(range_step_span_error());
@@ -7821,6 +8361,128 @@ fn range_string_values(
     Ok(Some(out))
 }
 
+#[derive(Clone, Copy)]
+struct RangeStringOperand<'a> {
+    argument: &'static str,
+    value: &'a PhpString,
+    first_byte: Option<u8>,
+    character_candidate: bool,
+    full_numeric: bool,
+}
+
+impl<'a> RangeStringOperand<'a> {
+    fn new(argument: &'static str, value: &'a PhpString) -> Self {
+        let full_numeric = range_string_is_full_numeric(value);
+        let first_byte = value.as_bytes().first().copied();
+        let character_candidate = first_byte.is_some() && (value.len() == 1 || !full_numeric);
+        Self {
+            argument,
+            value,
+            first_byte,
+            character_candidate,
+            full_numeric,
+        }
+    }
+}
+
+fn range_string_is_full_numeric(value: &PhpString) -> bool {
+    let classified = classify_php_string(value);
+    matches!(
+        classified.kind,
+        NumericStringKind::IntString | NumericStringKind::FloatString
+    )
+}
+
+fn warn_ignored_range_string_bytes(
+    context: &mut BuiltinContext<'_>,
+    operand: RangeStringOperand<'_>,
+    span: RuntimeSourceSpan,
+) {
+    if operand.value.len() <= 1 || operand.full_numeric {
+        return;
+    }
+    range_warning(
+        context,
+        &format!(
+            "Argument {} must be a single byte, subsequent bytes are ignored",
+            operand.argument
+        ),
+        span,
+    );
+}
+
+fn warn_range_empty_string(
+    context: &mut BuiltinContext<'_>,
+    operand: RangeStringOperand<'_>,
+    span: RuntimeSourceSpan,
+) {
+    if !operand.value.is_empty() {
+        return;
+    }
+    range_warning(
+        context,
+        &format!("Argument {} must not be empty, casted to 0", operand.argument),
+        span,
+    );
+}
+
+fn range_warning(context: &mut BuiltinContext<'_>, message: &str, span: RuntimeSourceSpan) {
+    context.php_warning(
+        "E_PHP_RUNTIME_RANGE_WARNING",
+        format!("range(): {message}"),
+        span,
+    );
+}
+
+fn range_null_deprecation(
+    context: &mut BuiltinContext<'_>,
+    value: &Value,
+    argument: &str,
+    span: RuntimeSourceSpan,
+) {
+    if !matches!(deref_value(value), Value::Null) {
+        return;
+    }
+    context.php_deprecation(
+        "E_PHP_RUNTIME_RANGE_NULL_ARG",
+        format!(
+            "range(): Passing null to parameter {argument} of type string|int|float is deprecated"
+        ),
+        span,
+    );
+}
+
+fn warn_range_null_string_boundary(
+    context: &mut BuiltinContext<'_>,
+    start: &Value,
+    end: &Value,
+    span: RuntimeSourceSpan,
+) {
+    match (deref_value(start), deref_value(end)) {
+        (Value::Null, Value::String(end)) => {
+            let end = RangeStringOperand::new("#2 ($end)", &end);
+            if end.character_candidate {
+                range_warning(
+                    context,
+                    "Argument #1 ($start) must be a single byte string if argument #2 ($end) is a single byte string, argument #2 ($end) converted to 0",
+                    span,
+                );
+            }
+        }
+        (Value::String(start), Value::Null) => {
+            let start = RangeStringOperand::new("#1 ($start)", &start);
+            if start.character_candidate {
+                range_warning(
+                    context,
+                    "Argument #2 ($end) must be a single byte string if argument #1 ($start) is a single byte string, argument #1 ($start) converted to 0",
+                    span,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn range_numeric_values(
     start: RangeNumeric,
     end: RangeNumeric,
@@ -7834,8 +8496,6 @@ fn range_numeric_values(
     if distance != 0.0 && step_abs > distance {
         return Err(range_step_span_error());
     }
-    let count = range_numeric_count(distance, step_abs)?;
-    ensure_range_size(count)?;
     let use_int_values = start.is_int() && end.is_int() && step.is_integral();
     if use_int_values {
         let RangeNumeric::Int(start) = start else {
@@ -7845,8 +8505,10 @@ fn range_numeric_values(
             unreachable!("use_int_values requires integer end")
         };
         let step = step.abs_i64().ok_or_else(range_step_span_error)?;
+        let count = range_int_count(start, end, step)?;
         return range_int_values(start, end, step, count);
     }
+    let count = range_float_count(start.as_f64(), end.as_f64(), step_abs)?;
     Ok(range_float_values(
         start.as_f64(),
         end.as_f64(),
@@ -7855,21 +8517,47 @@ fn range_numeric_values(
     ))
 }
 
-fn range_numeric_count(distance: f64, step_abs: f64) -> Result<usize, BuiltinError> {
+fn range_float_count(start: f64, end: f64, step_abs: f64) -> Result<usize, BuiltinError> {
+    let distance = (end - start).abs();
     if !distance.is_finite() || !step_abs.is_finite() || step_abs <= 0.0 {
         return Err(value_error(
             "range",
             "The supplied range exceeds the maximum array size",
         ));
     }
-    let steps = (distance / step_abs).floor();
-    if !steps.is_finite() || steps >= RANGE_MAX_ELEMENTS as f64 {
-        return Err(value_error(
-            "range",
-            "The supplied range exceeds the maximum array size",
-        ));
+    let step_count = distance / step_abs;
+    let rounded_step_count = step_count.round();
+    let steps = if (step_count - rounded_step_count).abs()
+        <= f64::EPSILON * step_count.abs().max(1.0) * 16.0
+    {
+        rounded_step_count
+    } else {
+        step_count.floor()
+    };
+    if !steps.is_finite() {
+        return Err(range_float_size_error(start, end, step_abs, f64::INFINITY));
     }
-    Ok(steps as usize + 1)
+    let count = steps + 1.0;
+    if count > RANGE_MAX_ELEMENTS as f64 {
+        return Err(range_float_size_error(start, end, step_abs, count));
+    }
+    Ok(count as usize)
+}
+
+fn range_int_count(start: i64, end: i64, step: i64) -> Result<usize, BuiltinError> {
+    if step <= 0 {
+        return Err(argument_value_error("range", "#3 ($step)", "cannot be 0"));
+    }
+    let distance = if start <= end {
+        i128::from(end) - i128::from(start)
+    } else {
+        i128::from(start) - i128::from(end)
+    } as u128;
+    let count = distance / step as u128 + 1;
+    if count > RANGE_MAX_ELEMENTS as u128 {
+        return Err(range_int_size_error(start, end, step, count));
+    }
+    usize::try_from(count).map_err(|_| range_int_size_error(start, end, step, count))
 }
 
 fn range_int_values(
@@ -7912,6 +8600,47 @@ fn ensure_range_size(count: usize) -> Result<(), BuiltinError> {
         "range",
         "The supplied range exceeds the maximum array size",
     ))
+}
+
+fn range_float_size_error(start: f64, end: f64, step: f64, count: f64) -> BuiltinError {
+    let excess = count - RANGE_MAX_ELEMENTS as f64;
+    BuiltinError::new(
+        "E_PHP_RUNTIME_BUILTIN_VALUE",
+        format!(
+            "The supplied range exceeds the maximum array size by {} elements: start={}, end={}, step={}. Max size: {}",
+            range_float_size_component(excess),
+            range_float_endpoint_component(start),
+            range_float_endpoint_component(end),
+            float_to_php_string(step),
+            RANGE_MAX_ELEMENTS
+        ),
+    )
+}
+
+fn range_int_size_error(start: i64, end: i64, step: i64, count: u128) -> BuiltinError {
+    let excess = count.saturating_sub(RANGE_MAX_ELEMENTS as u128);
+    BuiltinError::new(
+        "E_PHP_RUNTIME_BUILTIN_VALUE",
+        format!(
+            "The supplied range exceeds the maximum array size by {excess} elements: start={start}, end={end}, step={step}. Calculated size: {count}. Maximum size: {RANGE_MAX_ELEMENTS}."
+        ),
+    )
+}
+
+fn range_float_size_component(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn range_float_endpoint_component(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        float_to_php_string(value)
+    }
 }
 
 fn ensure_array_fill_size(count: usize) -> Result<(), BuiltinError> {
@@ -8857,6 +9586,7 @@ fn runtime_type_name(value: &Value) -> &'static str {
 #[derive(Default)]
 struct DebugFormatter {
     active_references: BTreeSet<usize>,
+    active_arrays: BTreeSet<usize>,
 }
 
 impl DebugFormatter {
@@ -8875,6 +9605,11 @@ impl DebugFormatter {
                 output.write_test_str("\"\n");
             }
             Value::Array(array) => {
+                let id = array.gc_debug_id();
+                if !self.active_arrays.insert(id) {
+                    output.write_test_str("*RECURSION*\n");
+                    return;
+                }
                 output.write_test_str(&format!("array({}) {{\n", array.len()));
                 for (key, element) in array.iter() {
                     write_indent(output, indent + 2);
@@ -8884,18 +9619,20 @@ impl DebugFormatter {
                 }
                 write_indent(output, indent);
                 output.write_test_str("}\n");
+                self.active_arrays.remove(&id);
             }
             Value::Object(object) => {
                 let properties = object.properties_snapshot();
                 output.write_test_str(&format!(
                     "object({})#{} ({}) {{\n",
-                    object.class_name(),
+                    object.display_name(),
                     object.id(),
                     properties.len()
                 ));
                 for (name, property) in properties {
                     write_indent(output, indent + 2);
-                    output.write_test_str(&format!("[\"{name}\"]=>\n"));
+                    let label = object.property_debug_label(&name);
+                    output.write_test_str(&format!("[{label}]=>\n"));
                     write_indent(output, indent + 2);
                     self.write_var_dump_value(output, &property, indent + 2);
                 }
@@ -8915,6 +9652,13 @@ impl DebugFormatter {
                 if !self.active_references.insert(id) {
                     output.write_test_str("*RECURSION*\n");
                     return;
+                }
+                if let Value::Array(array) = cell.get() {
+                    if self.active_arrays.contains(&array.gc_debug_id()) {
+                        output.write_test_str("*RECURSION*\n");
+                        self.active_references.remove(&id);
+                        return;
+                    }
                 }
                 output.write_test_str("&");
                 self.write_var_dump_value(output, &cell.get(), indent);
@@ -8945,7 +9689,7 @@ impl DebugFormatter {
                 output.write_test_str(")\n");
             }
             Value::Object(object) => {
-                output.write_test_str(&format!("{} Object\n", object.class_name()));
+                output.write_test_str(&format!("{} Object\n", object.display_name()));
                 write_indent(output, indent);
                 output.write_test_str("(\n");
                 for (name, property) in object.properties_snapshot() {
@@ -9000,7 +9744,7 @@ impl DebugFormatter {
                 output.write_test_str(")");
             }
             Value::Object(object) => {
-                output.write_test_str(&format!("{}::__set_state(array(\n", object.class_name()));
+                output.write_test_str(&format!("{}::__set_state(array(\n", object.display_name()));
                 for (name, property) in object.properties_snapshot() {
                     write_indent(output, indent + 2);
                     write_export_string(output, &name);
@@ -9086,12 +9830,7 @@ fn php_float_debug_string(value: FloatValue) -> String {
         };
     }
 
-    let abs = value.abs();
-    if abs != 0.0 && !(1e-4..1e16).contains(&abs) {
-        return php_scientific_float_debug_string(value);
-    }
-
-    value.to_string()
+    float_to_php_string(value)
 }
 
 fn php_float_export_string(value: FloatValue) -> String {
@@ -9114,16 +9853,6 @@ fn php_float_export_string(value: FloatValue) -> String {
     formatted
 }
 
-fn php_scientific_float_debug_string(value: f64) -> String {
-    let formatted = format!("{value:E}");
-    if let Some((mantissa, exponent)) = formatted.split_once('E') {
-        let sign = if exponent.starts_with('-') { "" } else { "+" };
-        format!("{mantissa}E{sign}{exponent}")
-    } else {
-        formatted
-    }
-}
-
 fn write_indent(output: &mut OutputBuffer, spaces: usize) {
     output.write_bytes(vec![b' '; spaces]);
 }
@@ -9133,7 +9862,8 @@ mod tests {
     use super::{
         BuiltinCompatibility, BuiltinContext, BuiltinRegistry, JSON_ERROR_NONE, JSON_ERROR_SYNTAX,
         JSON_OBJECT_AS_ARRAY, JSON_PRESERVE_ZERO_FRACTION, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
-        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, RuntimeSourceSpan,
+        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, RuntimeSourceSpan, SORT_FLAG_CASE,
+        SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
     };
     use crate::{
         ArrayKey, ClassEntry, ClassFlags, FilesystemCapabilities, ObjectRef, OutputBuffer,
@@ -11152,6 +11882,7 @@ mod tests {
                 Value::Bool(true),
                 Value::Int(7),
                 Value::float(1.0),
+                Value::float(1.7000000000000002),
                 Value::float(f64::INFINITY),
                 Value::float(f64::NAN),
                 Value::float(9_223_372_036_854_776_000.0),
@@ -11164,7 +11895,24 @@ mod tests {
         assert_eq!(result, Value::Null);
         assert_eq!(
             output.to_string_lossy(),
-            "NULL\nbool(true)\nint(7)\nfloat(1)\nfloat(INF)\nfloat(NAN)\nfloat(9.223372036854776E+18)\nstring(2) \"hi\"\narray(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) \"x\"\n}\n"
+            "NULL\nbool(true)\nint(7)\nfloat(1)\nfloat(1.7)\nfloat(INF)\nfloat(NAN)\nfloat(9.2233720368548E+18)\nstring(2) \"hi\"\narray(2) {\n  [0]=>\n  int(1)\n  [1]=>\n  string(1) \"x\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn var_dump_marks_array_references_to_active_arrays_as_recursion() {
+        let cell = ReferenceCell::new(Value::Null);
+        let mut array = PhpArray::new();
+        array.append(Value::Reference(cell.clone()));
+        cell.set(Value::Array(array.clone()));
+
+        let mut output = OutputBuffer::new();
+        let result = call("var_dump", vec![Value::Array(array)], &mut output);
+
+        assert_eq!(result, Value::Null);
+        assert_eq!(
+            output.to_string_lossy(),
+            "array(1) {\n  [0]=>\n  *RECURSION*\n}\n"
         );
     }
 
@@ -12991,6 +13739,14 @@ mod tests {
             Value::Bool(true)
         );
         assert_eq!(
+            call(
+                "key_exists",
+                vec![Value::string("name"), Value::Array(mixed.clone())],
+                &mut output
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
             call("array_keys", vec![Value::Array(mixed.clone())], &mut output),
             Value::packed_array(vec![
                 Value::Int(1),
@@ -13041,6 +13797,25 @@ mod tests {
                 &mut output
             ),
             Value::string("name")
+        );
+        assert_eq!(
+            call(
+                "array_combine",
+                vec![
+                    Value::packed_array(vec![Value::string("x"), Value::Int(2)]),
+                    Value::packed_array(vec![Value::string("ex"), Value::string("two")])
+                ],
+                &mut output
+            ),
+            {
+                let mut combined = PhpArray::new();
+                combined.insert(
+                    ArrayKey::String(PhpString::from_test_str("x")),
+                    Value::string("ex"),
+                );
+                combined.insert(ArrayKey::Int(2), Value::string("two"));
+                Value::Array(combined)
+            }
         );
         assert_eq!(mixed, before);
     }
@@ -13117,6 +13892,282 @@ mod tests {
     }
 
     #[test]
+    fn array_unique_preserves_keys_and_honors_comparison_flags() {
+        let mut output = OutputBuffer::new();
+        let mut input = PhpArray::new();
+        input.insert(ArrayKey::Int(10), Value::string("01"));
+        input.insert(
+            ArrayKey::String(PhpString::from_test_str("one")),
+            Value::Int(1),
+        );
+        input.insert(ArrayKey::Int(11), Value::string("1"));
+        input.insert(
+            ArrayKey::String(PhpString::from_test_str("upper")),
+            Value::string("A"),
+        );
+        input.insert(
+            ArrayKey::String(PhpString::from_test_str("lower")),
+            Value::string("a"),
+        );
+
+        let mut expected_string = PhpArray::new();
+        expected_string.insert(ArrayKey::Int(10), Value::string("01"));
+        expected_string.insert(
+            ArrayKey::String(PhpString::from_test_str("one")),
+            Value::Int(1),
+        );
+        expected_string.insert(
+            ArrayKey::String(PhpString::from_test_str("upper")),
+            Value::string("A"),
+        );
+        expected_string.insert(
+            ArrayKey::String(PhpString::from_test_str("lower")),
+            Value::string("a"),
+        );
+        assert_eq!(
+            call(
+                "array_unique",
+                vec![Value::Array(input.clone())],
+                &mut output
+            ),
+            Value::Array(expected_string)
+        );
+
+        let mut numeric_input = PhpArray::new();
+        numeric_input.insert(ArrayKey::Int(10), Value::string("01"));
+        numeric_input.insert(
+            ArrayKey::String(PhpString::from_test_str("one")),
+            Value::Int(1),
+        );
+        numeric_input.insert(ArrayKey::Int(11), Value::string("1"));
+        let mut expected_numeric = PhpArray::new();
+        expected_numeric.insert(ArrayKey::Int(10), Value::string("01"));
+        assert_eq!(
+            call(
+                "array_unique",
+                vec![
+                    Value::Array(numeric_input.clone()),
+                    Value::Int(SORT_NUMERIC)
+                ],
+                &mut output
+            ),
+            Value::Array(expected_numeric.clone())
+        );
+        assert_eq!(
+            call(
+                "array_unique",
+                vec![Value::Array(numeric_input), Value::Int(SORT_REGULAR)],
+                &mut output
+            ),
+            Value::Array(expected_numeric)
+        );
+
+        let mut expected_case = PhpArray::new();
+        expected_case.insert(ArrayKey::Int(10), Value::string("01"));
+        expected_case.insert(
+            ArrayKey::String(PhpString::from_test_str("one")),
+            Value::Int(1),
+        );
+        expected_case.insert(
+            ArrayKey::String(PhpString::from_test_str("upper")),
+            Value::string("A"),
+        );
+        assert_eq!(
+            call(
+                "array_unique",
+                vec![
+                    Value::Array(input),
+                    Value::Int(SORT_STRING | SORT_FLAG_CASE)
+                ],
+                &mut output
+            ),
+            Value::Array(expected_case)
+        );
+    }
+
+    #[test]
+    fn array_intersect_builtins_cover_value_assoc_and_empty_callback_cases() {
+        let mut output = OutputBuffer::new();
+        let mut first = PhpArray::new();
+        first.insert(ArrayKey::Int(0), Value::Int(0));
+        first.insert(ArrayKey::Int(1), Value::Int(1));
+        first.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::string("2"),
+        );
+        let second = Value::packed_array(vec![Value::string("1"), Value::Int(2)]);
+
+        let mut expected = PhpArray::new();
+        expected.insert(ArrayKey::Int(1), Value::Int(1));
+        expected.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::string("2"),
+        );
+        assert_eq!(
+            call(
+                "array_intersect",
+                vec![Value::Array(first.clone()), second],
+                &mut output
+            ),
+            Value::Array(expected)
+        );
+
+        let mut assoc_second = PhpArray::new();
+        assoc_second.insert(ArrayKey::Int(1), Value::string("1"));
+        assoc_second.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::Int(2),
+        );
+        let mut expected_assoc = PhpArray::new();
+        expected_assoc.insert(ArrayKey::Int(1), Value::Int(1));
+        expected_assoc.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::string("2"),
+        );
+        assert_eq!(
+            call(
+                "array_intersect_assoc",
+                vec![Value::Array(first.clone()), Value::Array(assoc_second)],
+                &mut output
+            ),
+            Value::Array(expected_assoc)
+        );
+
+        let diff_second = Value::packed_array(vec![Value::string("1")]);
+        let mut expected_diff = PhpArray::new();
+        expected_diff.insert(ArrayKey::Int(0), Value::Int(0));
+        expected_diff.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::string("2"),
+        );
+        assert_eq!(
+            call(
+                "array_diff",
+                vec![Value::Array(first.clone()), diff_second],
+                &mut output
+            ),
+            Value::Array(expected_diff)
+        );
+
+        let mut assoc_diff_second = PhpArray::new();
+        assoc_diff_second.insert(ArrayKey::Int(1), Value::string("1"));
+        let mut expected_diff_assoc = PhpArray::new();
+        expected_diff_assoc.insert(ArrayKey::Int(0), Value::Int(0));
+        expected_diff_assoc.insert(
+            ArrayKey::String(PhpString::from_test_str("two")),
+            Value::string("2"),
+        );
+        assert_eq!(
+            call(
+                "array_diff_assoc",
+                vec![Value::Array(first.clone()), Value::Array(assoc_diff_second)],
+                &mut output
+            ),
+            Value::Array(expected_diff_assoc)
+        );
+
+        let empty = Value::packed_array(Vec::new());
+        for name in [
+            "array_intersect_ukey",
+            "array_uintersect",
+            "array_intersect_uassoc",
+        ] {
+            assert_eq!(
+                call(
+                    name,
+                    vec![Value::Array(first.clone()), empty.clone(), Value::Null],
+                    &mut output
+                ),
+                Value::packed_array(Vec::new())
+            );
+        }
+        assert_eq!(
+            call(
+                "array_uintersect_uassoc",
+                vec![Value::Array(first), empty, Value::Null, Value::Null],
+                &mut output
+            ),
+            Value::packed_array(Vec::new())
+        );
+    }
+
+    #[test]
+    fn shuffle_mutates_array_by_reference_and_reindexes_values() {
+        let mut output = OutputBuffer::new();
+        let cell = ReferenceCell::new(Value::Array({
+            let mut array = PhpArray::new();
+            array.insert(ArrayKey::Int(5), Value::string("a"));
+            array.insert(
+                ArrayKey::String(PhpString::from_test_str("name")),
+                Value::string("b"),
+            );
+            array.insert(ArrayKey::Int(9), Value::string("c"));
+            array
+        }));
+        assert_eq!(
+            call("shuffle", vec![Value::Reference(cell.clone())], &mut output),
+            Value::Bool(true)
+        );
+        let Value::Array(array) = cell.get() else {
+            panic!("shuffle should leave an array in the reference cell");
+        };
+        assert!(array.is_packed_fast());
+        assert_eq!(array.len(), 3);
+        let mut values = array
+            .iter()
+            .map(|(_, value)| match value {
+                Value::String(value) => value.to_string_lossy(),
+                other => panic!("unexpected shuffled value: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(values, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn array_pointer_builtins_track_current_key_and_mutating_moves() {
+        let mut output = OutputBuffer::new();
+        let cell = ReferenceCell::new(Value::Array({
+            let mut array = PhpArray::new();
+            array.append(Value::string("zero"));
+            array.append(Value::string("one"));
+            array.insert(ArrayKey::Int(200), Value::string("two"));
+            array
+        }));
+
+        assert_eq!(
+            call("current", vec![cell.get()], &mut output),
+            Value::string("zero")
+        );
+        assert_eq!(call("key", vec![cell.get()], &mut output), Value::Int(0));
+        assert_eq!(
+            call("next", vec![Value::Reference(cell.clone())], &mut output),
+            Value::string("one")
+        );
+        assert_eq!(call("key", vec![cell.get()], &mut output), Value::Int(1));
+        assert_eq!(
+            call("end", vec![Value::Reference(cell.clone())], &mut output),
+            Value::string("two")
+        );
+        assert_eq!(call("key", vec![cell.get()], &mut output), Value::Int(200));
+        assert_eq!(
+            call("prev", vec![Value::Reference(cell.clone())], &mut output),
+            Value::string("one")
+        );
+        assert_eq!(
+            call("reset", vec![Value::Reference(cell.clone())], &mut output),
+            Value::string("zero")
+        );
+
+        let empty = ReferenceCell::new(Value::packed_array(Vec::new()));
+        assert_eq!(
+            call("current", vec![empty.get()], &mut output),
+            Value::Bool(false)
+        );
+        assert_eq!(call("key", vec![empty.get()], &mut output), Value::Null);
+    }
+
+    #[test]
     fn array_range_builtin_covers_numeric_and_string_sequences() {
         let mut output = OutputBuffer::new();
 
@@ -13148,6 +14199,19 @@ mod tests {
                 Value::float(1.0),
                 Value::float(1.5),
                 Value::float(2.0)
+            ])
+        );
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::float(4.5), Value::float(4.2), Value::float(0.1)],
+                &mut output
+            ),
+            Value::packed_array(vec![
+                Value::float(4.5),
+                Value::float(4.4),
+                Value::float(4.3),
+                Value::float(4.2)
             ])
         );
         assert_eq!(
@@ -13229,6 +14293,118 @@ mod tests {
             ),
             "range(): Argument #3 ($step) must be greater than 0 for increasing ranges"
         );
+        assert_eq!(
+            call_error(
+                "range",
+                vec![Value::string("a"), Value::string("c"), Value::Int(-1)],
+                &mut output
+            ),
+            "range(): Argument #3 ($step) must be greater than 0 for increasing ranges"
+        );
+    }
+
+    #[test]
+    fn array_range_builtin_warns_for_invalid_string_inputs() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::string("AA"), Value::string("BB")],
+                &mut output
+            ),
+            Value::packed_array(vec![Value::string("A"), Value::string("B")])
+        );
+        let warnings = output.to_string_lossy();
+        assert!(warnings.contains(
+            "range(): Argument #1 ($start) must be a single byte, subsequent bytes are ignored"
+        ));
+        assert!(warnings.contains(
+            "range(): Argument #2 ($end) must be a single byte, subsequent bytes are ignored"
+        ));
+
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::string("Z"), Value::string("")],
+                &mut output
+            ),
+            Value::packed_array(vec![Value::Int(0)])
+        );
+        let warnings = output.to_string_lossy();
+        assert!(warnings.contains("range(): Argument #2 ($end) must not be empty, casted to 0"));
+        assert!(warnings.contains(
+            "range(): Argument #2 ($end) must be a single byte string if argument #1 ($start) is a single byte string, argument #1 ($start) converted to 0"
+        ));
+
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::string("A"), Value::string("H"), Value::float(2.6)],
+                &mut output
+            ),
+            Value::packed_array(vec![Value::float(0.0)])
+        );
+        assert!(output.to_string_lossy().contains(
+            "range(): Argument #3 ($step) must be of type int when generating an array of characters, inputs converted to 0"
+        ));
+
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::string("1"), Value::string("2"), Value::float(0.1)],
+                &mut output
+            ),
+            Value::packed_array(vec![
+                Value::float(1.0),
+                Value::float(1.1),
+                Value::float(1.2),
+                Value::float(1.3),
+                Value::float(1.4),
+                Value::float(1.5),
+                Value::float(1.6),
+                Value::float(1.7000000000000002),
+                Value::float(1.8),
+                Value::float(1.9),
+                Value::float(2.0)
+            ])
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn array_range_builtin_deprecates_null_boundaries() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call("range", vec![Value::Null, Value::Null], &mut output),
+            Value::packed_array(vec![Value::Int(0)])
+        );
+        let warnings = output.to_string_lossy();
+        assert!(warnings.contains(
+            "range(): Passing null to parameter #1 ($start) of type string|int|float is deprecated"
+        ));
+        assert!(warnings.contains(
+            "range(): Passing null to parameter #2 ($end) of type string|int|float is deprecated"
+        ));
+
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "range",
+                vec![Value::Null, Value::string("e")],
+                &mut output
+            ),
+            Value::packed_array(vec![Value::Int(0)])
+        );
+        let warnings = output.to_string_lossy();
+        assert!(warnings.contains(
+            "range(): Passing null to parameter #1 ($start) of type string|int|float is deprecated"
+        ));
+        assert!(warnings.contains(
+            "range(): Argument #1 ($start) must be a single byte string if argument #2 ($end) is a single byte string, argument #2 ($end) converted to 0"
+        ));
     }
 
     #[test]
@@ -13243,14 +14419,14 @@ mod tests {
             ),
             "range(): Argument #2 ($end) must be a finite number, INF provided"
         );
-        assert_eq!(
-            call_error(
-                "range",
-                vec![Value::Int(i64::MIN), Value::Int(i64::MAX), Value::Int(1)],
-                &mut output
-            ),
-            "builtin range: The supplied range exceeds the maximum array size"
+        let error = call_error(
+            "range",
+            vec![Value::Int(i64::MIN), Value::Int(i64::MAX), Value::Int(1)],
+            &mut output,
         );
+        assert!(error.contains("The supplied range exceeds the maximum array size by "));
+        assert!(error.contains("start=-9223372036854775808, end=9223372036854775807, step=1"));
+        assert!(error.contains("Maximum size: 1000000."));
         assert_eq!(
             call_error(
                 "range",
@@ -13622,6 +14798,36 @@ mod tests {
             call(
                 "unserialize",
                 vec![Value::string("bad payload")],
+                &mut output
+            ),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn setlocale_reports_supported_c_locale_and_rejects_missing_locales() {
+        let mut output = OutputBuffer::new();
+
+        assert_eq!(
+            call(
+                "setlocale",
+                vec![Value::Int(6), Value::string("C")],
+                &mut output
+            ),
+            Value::string("C")
+        );
+        assert_eq!(
+            call(
+                "setlocale",
+                vec![Value::Int(6), Value::string("invalid")],
+                &mut output
+            ),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call(
+                "setlocale",
+                vec![Value::Int(0), Value::string("fr_FR")],
                 &mut output
             ),
             Value::Bool(false)

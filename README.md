@@ -128,7 +128,8 @@ PHPT commands:
 ```bash
 nix develop -c just phpt-index
 nix develop -c just phpt-module MODULE=operators.conversions
-nix develop -c just phpt-full-regression
+nix develop -c just phpt-fast MODULE=operators.conversions FILE=path/to/test.phpt
+PHPT_RUN_FULL=1 nix develop -c just phpt-full-regression
 nix develop -c just phpt-verify-source-integrity
 ```
 

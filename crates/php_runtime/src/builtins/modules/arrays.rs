@@ -25,13 +25,48 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "array_diff",
+        core::builtin_array_diff,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_diff_assoc",
+        core::builtin_array_diff_assoc,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "array_filter",
         core::builtin_array_callback_requires_vm,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "array_combine",
+        core::builtin_array_combine,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "array_fill",
         core::builtin_array_fill,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_intersect",
+        core::builtin_array_intersect,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_intersect_assoc",
+        core::builtin_array_intersect_assoc,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_intersect_uassoc",
+        core::builtin_array_intersect_uassoc,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_intersect_ukey",
+        core::builtin_array_intersect_ukey,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -155,6 +190,21 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "array_uintersect",
+        core::builtin_array_uintersect,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_uintersect_uassoc",
+        core::builtin_array_uintersect_uassoc,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "array_unique",
+        core::builtin_array_unique,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "array_values",
         core::builtin_array_values,
         BuiltinCompatibility::Php,
@@ -170,6 +220,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "array_multisort",
+        core::builtin_array_sort_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "arsort",
         core::builtin_array_sort_requires_vm,
         BuiltinCompatibility::Php,
@@ -180,6 +235,8 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("count", core::builtin_count, BuiltinCompatibility::Php),
+    BuiltinEntry::new("current", core::builtin_current, BuiltinCompatibility::Php),
+    BuiltinEntry::new("end", core::builtin_end, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "in_array",
         core::builtin_in_array,
@@ -196,6 +253,12 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "key_exists",
+        core::builtin_array_key_exists,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new("key", core::builtin_key, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
         "natcasesort",
         core::builtin_array_sort_requires_vm,
         BuiltinCompatibility::Php,
@@ -205,12 +268,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         core::builtin_array_sort_requires_vm,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("next", core::builtin_next, BuiltinCompatibility::Php),
+    BuiltinEntry::new("prev", core::builtin_prev, BuiltinCompatibility::Php),
     BuiltinEntry::new("range", core::builtin_range, BuiltinCompatibility::Php),
+    BuiltinEntry::new("reset", core::builtin_reset, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "rsort",
         core::builtin_array_sort_requires_vm,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("shuffle", core::builtin_shuffle, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "sort",
         core::builtin_array_sort_requires_vm,

@@ -10,10 +10,39 @@ pub(crate) enum StringScan {
 /// Scans single-quoted strings and non-interpolated double-quoted strings.
 pub(crate) fn scan_constant_encapsed_string(source: &str, start: usize) -> Option<StringScan> {
     let bytes = source.as_bytes();
-    match bytes.get(start) {
-        Some(b'\'') => Some(scan_single_quoted(bytes, start)),
-        Some(b'"') => Some(scan_double_quoted(bytes, start)),
+    let (quote_start, prefix_len) = match (bytes.get(start), bytes.get(start + 1)) {
+        (Some(b'b' | b'B'), Some(b'\'' | b'"')) => (start + 1, 1),
+        _ => (start, 0),
+    };
+    match bytes.get(quote_start) {
+        Some(b'\'') => Some(add_string_prefix_len(
+            scan_single_quoted(bytes, quote_start),
+            prefix_len,
+        )),
+        Some(b'"') => match scan_double_quoted(bytes, quote_start) {
+            StringScan::Constant { len, terminated } => Some(StringScan::Constant {
+                len: len + prefix_len,
+                terminated,
+            }),
+            StringScan::Interpolated => {
+                if prefix_len == 0 {
+                    Some(StringScan::Interpolated)
+                } else {
+                    None
+                }
+            }
+        },
         _ => None,
+    }
+}
+
+fn add_string_prefix_len(scan: StringScan, prefix_len: usize) -> StringScan {
+    match scan {
+        StringScan::Constant { len, terminated } => StringScan::Constant {
+            len: len + prefix_len,
+            terminated,
+        },
+        StringScan::Interpolated => StringScan::Interpolated,
     }
 }
 
@@ -105,6 +134,24 @@ mod tests {
             scan_constant_encapsed_string("\"\\\\n\"", 0),
             Some(StringScan::Constant {
                 len: 5,
+                terminated: true
+            })
+        );
+    }
+
+    #[test]
+    fn binary_prefixed_strings_are_constant_string_tokens() {
+        assert_eq!(
+            scan_constant_encapsed_string("b\"binary\"", 0),
+            Some(StringScan::Constant {
+                len: 9,
+                terminated: true
+            })
+        );
+        assert_eq!(
+            scan_constant_encapsed_string("B'bin'", 0),
+            Some(StringScan::Constant {
+                len: 6,
                 terminated: true
             })
         );
