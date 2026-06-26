@@ -20450,8 +20450,7 @@ fn ini_option_name(value: &Value) -> Result<String, String> {
 
 fn apply_float_string_precision(registry: &IniRegistry) {
     if let Some(precision) = registry
-        .get("serialize_precision")
-        .or_else(|| registry.get("precision"))
+        .get("precision")
         .and_then(|value| value.trim().parse::<i32>().ok())
     {
         set_float_string_precision(precision);
@@ -24465,8 +24464,8 @@ mod tests {
 
         assert!(result.status.is_success(), "{:?}", result.status);
         let output = result.output.to_string_lossy();
-        assert!(output.contains("Warning: Object of class box could not be converted to int"));
-        assert!(output.contains("Warning: Object of class box could not be converted to float"));
+        assert!(output.contains("Warning: Object of class Box could not be converted to int"));
+        assert!(output.contains("Warning: Object of class Box could not be converted to float"));
         assert!(output.contains("int(1)"));
         assert!(output.contains("float(1)"));
     }

@@ -509,6 +509,32 @@ mod tests {
     }
 
     #[test]
+    fn successful_warning_output_does_not_emit_internal_stderr_diagnostics() {
+        let mut stdin = TestInput(Cursor::new(Vec::new()));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run(
+            [
+                "-r".to_string(),
+                "class Test {} $o = new Test; var_dump((int) $o);".to_string(),
+            ],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+        let stdout = String::from_utf8(stdout).expect("utf8");
+        assert!(
+            stdout.contains("Warning: Object of class Test could not be converted to int"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("int(1)"), "{stdout}");
+        assert_eq!(stderr, b"");
+    }
+
+    #[test]
     fn include_path_define_affects_include_resolution() {
         let root = temp_root("include-path");
         let lib = root.join("lib");

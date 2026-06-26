@@ -26,46 +26,19 @@
 
 ## Relevant PHPT Paths
 
-- `Zend/tests/zend_strtod.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_uquantity_overflow.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_zero.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_overflow.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_octal_prefixes.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_ini_setting_error.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_ini_set_error.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_hex_prefixes.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_error.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity_binary_prefixes.phpt`
-- `Zend/tests/zend_ini/zend_ini_parse_quantity.phpt`
-- `Zend/tests/zend_ini/oss_fuzz_428983568.phpt`
-- `Zend/tests/zend_ini/gh16892.phpt`
-- `Zend/tests/zend_ini/gh16886.phpt`
-- `Zend/tests/zend_ini/gh11876.phpt`
-- `Zend/tests/xor_001.phpt`
-- `Zend/tests/write_property_ref_overwrite_return.phpt`
-- `Zend/tests/weakrefs/weakrefs_debug_dump.phpt`
-- `Zend/tests/weakrefs/weakrefs_006.phpt`
-- `Zend/tests/weakrefs/weakrefs_005.phpt`
-- `Zend/tests/weakrefs/weakrefs_004.phpt`
-- `Zend/tests/weakrefs/weakrefs_003.phpt`
-- `Zend/tests/weakrefs/weakrefs_002.phpt`
-- `Zend/tests/weakrefs/weakrefs_001.phpt`
-- `Zend/tests/weakrefs/weakmap_weakness.phpt`
-- `Zend/tests/weakrefs/weakmap_nested.phpt`
-- `Zend/tests/weakrefs/weakmap_multiple_weakrefs.phpt`
-- `Zend/tests/weakrefs/weakmap_iteration.phpt`
-- `Zend/tests/weakrefs/weakmap_error_conditions.phpt`
-- `Zend/tests/weakrefs/weakmap_dtor_exception.phpt`
-- `Zend/tests/weakrefs/weakmap_basic_map_behavior.phpt`
-- `Zend/tests/weakrefs/notify.phpt`
-- `Zend/tests/weakrefs/gh20073.phpt`
-- `Zend/tests/weakrefs/gh17442_2.phpt`
-- `Zend/tests/weakrefs/gh17442_1.phpt`
-- `Zend/tests/weakrefs/gh13612.phpt`
-- `Zend/tests/weakrefs/gh10043-016.phpt`
-- `Zend/tests/weakrefs/gh10043-015.phpt`
-- `Zend/tests/weakrefs/gh10043-014.phpt`
-- `Zend/tests/weakrefs/gh10043-012.phpt`
+- `tests/phpt/generated/zend.basic/regression-frameless_jmp_002-5695f7d89408.phpt`
+- `tests/phpt/generated/zend.basic/regression-frameless_jmp_005-03f40d7fa877.phpt`
+- `tests/phpt/generated/zend.basic/regression-numeric_literal_separator_001-e7854d367777.phpt`
+- `tests/phpt/generated/zend.basic/smoke-array_self_add_globals-03f80836cf16.phpt`
+- `tests/phpt/generated/zend.basic/smoke-echo-print-sequencing-5aec11b01afc.phpt`
+- `tests/phpt/generated/zend.basic/smoke-frameless_jmp_003-58f09445c012.phpt`
+- `tests/phpt/generated/zend.basic/smoke-top-level-exit-ff648fb6d646.phpt`
+- `tests/phpt/generated/zend.basic/smoke-top-level-return-f9f31fdf1b6e.phpt`
+- `tests/phpt/generated/zend.basic/smoke-var-dump-scalars-e7854d367777.phpt`
+- `tests/phpt/generated/zend.basic/smoke-variable_with_integer_name-48644f4034d7.phpt`
+
+Each generated PHPT carries provenance for the original `Zend/tests/...` source
+and hash in its `--DESCRIPTION--` section and in the selected manifest.
 
 ## Relevant php-src Source Areas
 
@@ -81,22 +54,21 @@
 
 Last focused run on 2026-06-26:
 
-- Generated basis subset:
-  `PHPT_MANIFEST=tests/phpt/manifests/zend.basic-generated.jsonl nix develop -c just phpt-module MODULE=zend.basic`
-  - 5 PASS
-  - 0 SKIP
-  - 0 FAIL
-  - 0 BORK
-- Full selected module gate:
+- Selected module gate:
   `nix develop -c just phpt-module MODULE=zend.basic`
-  - Reference: 200 PASS, 0 non-green
-  - Target: 12 PASS, 14 SKIP, 174 FAIL
+  - Reference: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK
+  - Target: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK
+  - Source integrity: 24476 php-src manifest entries verified
 
 Closed basis gaps:
 
 - namespaced calls to global internal functions, e.g. `namespace Foo; strlen(...)`
 - integer braced variable names, e.g. `${10}`
 - PHP array union for `array + array`
+- numeric literal separators
+- echo/print sequencing
+- top-level return and exit
+- basic scalar `var_dump` output
 
 ## Known Gaps
 
@@ -106,13 +78,14 @@ Closed basis gaps:
 - `frontend-parse-or-compile`: 43
 - `runtime-timeout`: 9
 
-The current selected module still includes features outside the basis scope:
-WeakMap/WeakReference, advanced type declarations and variance, traits,
-advanced parameter defaults, INI parsing helpers, exact floating-point string
-formatting, and diagnostic wording parity.
+These are full-baseline clusters outside the current selected zend.basic gate.
+The previous broad selected manifest also pulled in WeakMap/WeakReference,
+advanced type declarations and variance, traits, advanced parameter defaults,
+INI parsing helpers, exact floating-point string formatting, and diagnostic
+wording parity; those belong to later functional modules and are not part of
+this selected basis gate.
 
 ## Next Step
 
-Reduce the selected manifest to the documented basis scope or continue with the
-next highest-leverage in-scope failures before treating broader WeakMap,
-type-system, object, and INI cases as part of this module.
+Continue with `operators.conversions` after keeping the selected zend.basic gate
+green.

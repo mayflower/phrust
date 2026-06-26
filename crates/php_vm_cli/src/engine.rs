@@ -51,13 +51,13 @@ where
     stdout
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
-    write_runtime_diagnostics(stderr, &input.source_path, &result.diagnostics)?;
     match result.status.exit_status() {
         ExitStatus::Success => Ok(EXIT_SUCCESS),
         ExitStatus::CompileError
         | ExitStatus::RuntimeError
         | ExitStatus::Fatal
         | ExitStatus::Unsupported => {
+            write_runtime_diagnostics(stderr, &input.source_path, &result.diagnostics)?;
             writeln!(stderr, "{}: {}", input.source_path, result.status)
                 .map_err(|error| error.to_string())?;
             Ok(EXIT_PHP_ERROR)
