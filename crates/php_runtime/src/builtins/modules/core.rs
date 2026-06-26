@@ -988,10 +988,9 @@ pub(in crate::builtins::modules) fn builtin_array_pop(
 ) -> BuiltinResult {
     expect_arity("array_pop", &args, 1)?;
     let cell = array_reference_cell("array_pop", &args[0])?;
-    let array = array_from_reference_cell("array_pop", &cell)?;
-    let mut entries = array_entries(&array);
-    let value = entries.pop().map_or(Value::Null, |(_, value)| value);
-    cell.set(Value::Array(array_from_entries_preserve(entries)));
+    let mut array = array_from_reference_cell("array_pop", &cell)?;
+    let value = array.pop().unwrap_or(Value::Null);
+    cell.set(Value::Array(array));
     Ok(value)
 }
 
@@ -6629,13 +6628,17 @@ fn min_max_builtin(name: &str, args: Vec<Value>, pick_max: bool) -> BuiltinResul
                 .iter()
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>(),
-            _ => return Err(type_error(name, "array", &args[0])),
+            _ => return Err(argument_type_error(name, "#1 ($value)", "array", &args[0])),
         }
     } else {
         args
     };
     if values.is_empty() {
-        return Err(value_error(name, "array must contain at least one element"));
+        return Err(argument_value_error(
+            name,
+            "#1 ($value)",
+            "must contain at least one element",
+        ));
     }
     let mut selected = values[0].clone();
     for value in values.into_iter().skip(1) {
@@ -10004,18 +10007,15 @@ fn php_float_debug_string(value: FloatValue) -> String {
 }
 
 fn php_float_debug_scientific_string(value: f64) -> String {
-    let mut output = format!("{value:.15E}");
+    // Rust's `{:E}` uses the shortest digit sequence that round-trips, matching
+    // PHP var_dump under serialize_precision=-1; we only reshape the exponent to
+    // PHP's `E+dd` form and ensure a `.0` mantissa fraction.
+    let output = format!("{value:E}");
     let Some(exponent_index) = output.find('E') else {
         return output;
     };
     let mut mantissa = output[..exponent_index].to_owned();
     let exponent = &output[exponent_index + 1..];
-    while mantissa.ends_with('0') {
-        mantissa.pop();
-    }
-    if mantissa.ends_with('.') {
-        mantissa.pop();
-    }
     if !mantissa.contains('.') {
         mantissa.push_str(".0");
     }
@@ -10025,13 +10025,12 @@ fn php_float_debug_scientific_string(value: f64) -> String {
         .or_else(|| exponent.strip_prefix('-').map(|digits| ("-", digits)))
         .unwrap_or(("+", exponent));
     let digits = sign.1.trim_start_matches('0');
-    output = format!(
+    format!(
         "{}E{}{}",
         mantissa,
         sign.0,
         if digits.is_empty() { "0" } else { digits }
-    );
-    output
+    )
 }
 
 fn php_float_export_string(value: FloatValue) -> String {

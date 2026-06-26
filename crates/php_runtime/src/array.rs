@@ -315,6 +315,23 @@ impl PhpArray {
             })
     }
 
+    /// Removes and returns the last element, mirroring PHP's `array_pop`
+    /// adjustment of the next auto-index: when the removed key is the most
+    /// recent auto-index (`next_append_key - 1`), the next index is decremented
+    /// so a following `[]=` reuses it (e.g. popping `-2` from `[-2 => x]` makes
+    /// the next append `-2` again).
+    pub fn pop(&mut self) -> Option<Value> {
+        let last_key = self.storage.entries.last()?.key.clone();
+        let previous_next = self.storage.next_append_key;
+        let value = self.remove(&last_key);
+        if let ArrayKey::Int(key) = last_key
+            && previous_next == Some(key.saturating_add(1))
+        {
+            self.storage_mut().next_append_key = Some(key);
+        }
+        value
+    }
+
     /// Returns the current internal-pointer value.
     #[must_use]
     pub fn pointer_value(&self) -> Option<Value> {
