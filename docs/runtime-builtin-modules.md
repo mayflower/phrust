@@ -1,7 +1,7 @@
 # Runtime Builtin Modules
 
-The runtime builtin layer is organized by responsibility instead of milestone
-or prompt history. Public consumers continue to use `php_runtime::builtins`;
+The runtime builtin layer is organized by runtime responsibility. Public
+consumers continue to use `php_runtime::builtins`;
 the internal layout separates request context, errors, signatures, registry
 assembly, and PHP module ownership.
 
@@ -47,7 +47,7 @@ module ownership, and their `BuiltinEntry` should be added to that file's
 across module boundaries; otherwise keep helpers private to the module that owns
 the builtin.
 
-Do not add phase-specific files, prompt-specific registries, or parallel
-registries. Unsupported behavior should remain explicit through stable runtime
+Do not add files or registries whose ownership is based on implementation
+history. Unsupported behavior should remain explicit through stable runtime
 diagnostics or VM-level placeholders rather than silently returning plausible
 values.

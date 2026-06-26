@@ -5302,7 +5302,7 @@ fn render_extension_policy_report(metadata: &BaselineMetadata, triage: &PhptTria
     out.push_str("- Extension PHPT counts come from `tests/phpt/manifests/phpt-corpus.jsonl` and the committed known-failure baseline.\n");
     out.push_str("- Extension failures are still present in `docs/phpt/reports/triage.md` and `docs/phpt/reports/full-baseline.md`.\n");
     out.push_str("- Out-of-scope means not required for strict core progress; it does not mean silently skipped or deleted.\n");
-    out.push_str("- Stub or implementation work must be added in the owning functional module, not as generated prompt or phase artifacts.\n");
+    out.push_str("- Stub or implementation work must be added in the owning functional module, not as generated implementation-history artifacts.\n");
     out
 }
 

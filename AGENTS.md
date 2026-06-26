@@ -45,7 +45,7 @@ Do not automatically update the target PHP version without a new ADR.
 - Do not commit extracted `php-src` corpus files or a vendored `php-src` copy.
 - Keep local reference checkouts under `third_party/`.
 
-## Future Work Boundaries
+## Layer Boundaries
 
 - Semantic work should consume `php_syntax` CST APIs and produce separate
   declaration tables, typed views, and semantic diagnostics.
@@ -56,9 +56,8 @@ Do not automatically update the target PHP version without a new ADR.
 - New tools should prefer existing source maps, token kinds, CST ranges, and
   fixture harnesses over adding parallel representations.
 
-## Phase 3 Semantic Frontend Boundaries
+### Semantic Frontend
 
-- Phase 3 work starts from `docs/phase-3/phase-3-definition-of-done.md`.
 - Add typed AST views in a dedicated `php_ast` layer, not in `php_syntax`.
 - Add HIR, declarations, scopes, name resolution, type lowering,
   constant-expression validation, attribute metadata, and semantic diagnostics
@@ -70,45 +69,49 @@ Do not automatically update the target PHP version without a new ADR.
   gaps, not executed.
 - Every semantic diagnostic ID needs a fixture or an explicit reserved/known-gap
   note before it is considered complete.
-- Phase 3 must preserve Phase 0, Phase 1, and Phase 2 validation commands.
 
-## Phase 4 Runtime and VM Boundaries
+### Runtime and VM
 
-- Phase 4 work starts from `docs/phase4-runtime-contract.md`.
-- Bytecode/IR, VM, and runtime work must consume Phase 3 HIR and semantic
-  metadata through `php_semantics`; do not add a second lexer, parser, or
-  semantic frontend.
+- Bytecode/IR, VM, and runtime work must consume HIR and semantic metadata
+  through `php_semantics`; do not add a second lexer, parser, or semantic
+  frontend.
 - Keep `php_syntax` and `php_semantics` responsible for syntax and compile-time
-  frontend diagnostics. Runtime diagnostics must live in the Phase 4 runtime/VM
-  layer.
+  frontend diagnostics. Runtime diagnostics must live in the runtime/VM layer.
 - Do not implement a full PHP standard library, Zend extension ABI, FPM/SAPI,
-  Opcache, quickening, inline caches, or JIT in Phase 4.
+  Opcache, quickening, inline caches, or JIT as part of core runtime work.
 - Unsupported runtime features must produce deterministic diagnostics or known
   gaps. Do not silently return plausible but incorrect results.
-- Phase 4 must preserve Phase 0, Phase 1, Phase 2, and Phase 3 validation
-  commands.
 
-## Phase 5 Runtime Semantics Boundaries
+### Runtime Semantics
 
-- Phase 5 work starts from `docs/phase5-runtime-contract.md`.
 - Keep the only input pipeline as `php_lexer` -> `php_syntax` -> `php_ast` ->
   `php_semantics`/HIR -> `php_ir` -> `php_runtime` -> `php_vm` ->
   `php_vm_cli`.
 - Do not add a second lexer, parser, AST, semantic frontend, or source
   string-matching execution path.
-- Phase 5 focuses on references, Copy-on-Write, arrays, calls, objects, traits,
+- Runtime semantics work focuses on references, Copy-on-Write, arrays, calls,
+  objects, traits,
   enums, magic methods, generators, fibers, reflection, include/require/eval,
   autoload, globals, destructors, GC, diagnostics, and differential runtime
   fixtures.
 - Every new runtime semantic behavior needs a focused fixture against
   `REFERENCE_PHP` when reference execution is available. Every unsupported
   language-semantics area needs a stable ID, fixture or concrete example, and
-  `docs/phase5-known-gaps.md` coverage.
-- Closing Phase 5 requires `docs/phase5-final-audit.md`,
-  `docs/phase5-coverage-matrix.md`, and `docs/phase6-handoff.md` to agree with
-  the fixture harness, known-gap catalog, README, and CI workflow.
-- Phase 5 still does not implement a complete standard library, SPL, Zend
+  known-gap documentation.
+- Runtime semantics work does not imply a complete standard library, SPL, Zend
   extension ABI, FPM/SAPI, Opcache, quickening, inline caches, or JIT.
+
+### Standard Library, Performance, and PHPT
+
+- Standard-library work belongs in `php_std`, runtime builtin modules, or the
+  owning VM integration point. Do not add generated registries or parallel
+  builtin surfaces for temporary implementation history.
+- Performance work may change caches, dispatch paths, optimizer passes, and
+  measurement tooling, but it must preserve PHP-visible output, diagnostics,
+  exit status, and side-effect order.
+- PHPT tooling must treat source `php-src` tests as read-only inputs. Generated
+  runnable PHPT fixtures belong under `tests/phpt/generated/`; run artifacts
+  belong under `target/`.
 
 ## Validation Commands
 
@@ -117,28 +120,22 @@ Do not automatically update the target PHP version without a new ADR.
 - Before finishing foundation, reference-tooling, lexer, parser, or CST work,
   run the strongest relevant verification target available in `just help`.
 - Parser fixture, diff, and roundtrip gates should be run when available.
-- Before finishing Phase 3 work, run `nix develop -c just verify-phase3` once
-  that target exists. Until then, run the strongest implemented gates for the
-  current slice and clearly report missing Phase 3 targets.
-- For Phase 3 semantic changes, also prefer the narrow relevant gate first:
+- For semantic frontend changes, prefer the narrow relevant gate first:
   `just semantic-fixtures`, `just semantic-diff`, or
   `just frontend-snapshots`.
-- Before finishing Phase 4 work, run `nix develop -c just verify-phase4` once
-  that target exists. Until then, run the strongest implemented gates for the
-  current slice and clearly report missing Phase 4 targets.
-- Before finishing Phase 5 work, run `nix develop -c just verify-phase5` once
-  that target exists. For final Phase 5 closure, also run the Phase 0 through
-  Phase 4 gates and `nix develop -c cargo test --workspace`.
-
-## Codex Operating Profile
-
-- Preferred launch command:
-
-```bash
-codex -p phrust-engine --cd /Volumes/CrucialMusic/src/phrust
-```
-
-- The matching profile is `~/.codex/phrust-engine.config.toml`.
+- For runtime and VM changes, prefer `just bytecode-snapshots`,
+  `just vm-smoke`, `just runtime-fixtures`, `just runtime-semantics-fixtures`,
+  or `just runtime-semantics-diff` before broader gates.
+- For standard-library changes, prefer `just stdlib-docs`,
+  `just stdlib-coverage`, or the relevant `diff-*` gate before
+  `just verify-stdlib`.
+- For performance changes, prefer the focused smoke target that owns the
+  optimization path before `just verify-performance`.
+- For PHPT tooling or baseline changes, run `just verify-phpt`; use
+  `just ci-phpt-smoke` for the CI runner-smoke contract.
+- Before finishing broad cross-layer changes, run the matching aggregate gate:
+  `just verify-frontend`, `just verify-runtime`, `just verify-stdlib`,
+  `just verify-performance`, `just verify-phpt`, or `just ci-local`.
 - Keep work vertical and auditable: requirement mapping, implementation,
   focused tests, then the relevant `nix develop -c just ...` gate.
 
@@ -147,5 +144,4 @@ codex -p phrust-engine --cd /Volumes/CrucialMusic/src/phrust
 - Use conventional commits: `type(scope): description`.
 - Keep the first line under 72 characters.
 - Use imperative mood.
-- Never mention Codex, Anthropic, assistants, or assisted development in commit
-  messages.
+- Do not mention development provenance in commit messages.

@@ -68,10 +68,10 @@ Closed selected-gate gaps:
 
 ## Known Gaps
 
-The full 129-candidate prompt-derived cluster still contains broad PHP feature
-areas that are outside this selected scalar conversion gate, including pipe
-operator, nullsafe operator, property hooks, fiber error suppression, broad
-unsupported operand diagnostics, and performance-only concat stress cases.
+The full 129-candidate source cluster still contains broad PHP feature areas
+that are outside this selected scalar conversion gate, including pipe operator,
+nullsafe operator, property hooks, fiber error suppression, broad unsupported
+operand diagnostics, and performance-only concat stress cases.
 
 ## Next Step
 
