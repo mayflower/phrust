@@ -22407,6 +22407,45 @@ fn clone_with_property_name(key: &ArrayKey) -> Result<String, String> {
     })
 }
 
+/// Parse the leading PHP integer of a non-canonical string array key, used to
+/// resolve string offsets like `$s["0foo"]`. Returns `None` for keys with no
+/// leading integer (e.g. `"foo"`), which the caller treats as a non-numeric
+/// offset.
+fn leading_int_offset(bytes: &[u8]) -> Option<i64> {
+    let mut index = 0;
+    let mut negative = false;
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        negative = bytes[0] == b'-';
+        index = 1;
+    }
+    let digits_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == digits_start {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[digits_start..index]).ok()?;
+    let magnitude = digits.parse::<i64>().ok()?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// Read a single-byte string offset following PHP semantics: integer keys may be
+/// negative (counted from the end), and string keys use their leading integer.
+/// Returns `None` for out-of-range or non-numeric offsets.
+fn string_offset_byte(string: &PhpString, key: &ArrayKey) -> Option<Value> {
+    let index = match key {
+        ArrayKey::Int(value) => *value,
+        ArrayKey::String(value) => leading_int_offset(value.as_bytes())?,
+    };
+    let length = string.len() as i64;
+    let resolved = if index < 0 { index + length } else { index };
+    if resolved < 0 || resolved >= length {
+        return None;
+    }
+    Some(Value::string(vec![string.as_bytes()[resolved as usize]]))
+}
+
 fn fetch_dim_value(array: &Value, key: &ArrayKey) -> Result<Option<Value>, String> {
     if let Value::Reference(cell) = array {
         return fetch_dim_value(&cell.get(), key);
@@ -22415,6 +22454,9 @@ fn fetch_dim_value(array: &Value, key: &ArrayKey) -> Result<Option<Value>, Strin
         && is_spl_container_runtime_class(&object.class_name())
     {
         return spl_container_offset_get(object, &array_key_to_value(key.clone())).map(Some);
+    }
+    if let Value::String(string) = array {
+        return Ok(string_offset_byte(string, key));
     }
     let Value::Array(array) = array else {
         return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
@@ -22458,13 +22500,21 @@ fn object_cast_property_name(key: &ArrayKey) -> String {
 fn fetch_dim_path_value(value: &Value, dims: &[ArrayKey]) -> Result<Option<Value>, String> {
     let mut current = effective_value(value);
     for key in dims {
-        let Value::Array(array) = &current else {
-            return Ok(None);
-        };
-        let Some(next) = array.get(key) else {
-            return Ok(None);
-        };
-        current = effective_value(next);
+        match &current {
+            Value::Array(array) => {
+                let Some(next) = array.get(key) else {
+                    return Ok(None);
+                };
+                current = effective_value(next);
+            }
+            Value::String(string) => {
+                let Some(next) = string_offset_byte(string, key) else {
+                    return Ok(None);
+                };
+                current = next;
+            }
+            _ => return Ok(None),
+        }
     }
     Ok(Some(current))
 }
