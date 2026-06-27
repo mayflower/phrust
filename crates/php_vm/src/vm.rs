@@ -934,6 +934,11 @@ struct ExecutionState {
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
     diagnostics: Vec<RuntimeDiagnostic>,
+    /// Throwable propagating up the call stack toward an enclosing handler.
+    ///
+    /// Set when a frame cannot handle a throw locally; each caller frame gets a
+    /// chance to catch it before the entry point renders it as uncaught.
+    pending_throw: Option<Value>,
 }
 
 impl ExecutionState {
@@ -1341,6 +1346,27 @@ impl VmResult {
             tiering_stats: None,
         }
     }
+
+    /// Non-success result marking that a throwable is unwinding the call stack.
+    ///
+    /// The throwable itself travels in `ExecutionState::pending_throw`; this
+    /// result only signals callers (via `!is_success()`) to consult it.
+    fn propagating_exception(output: OutputBuffer) -> Self {
+        Self {
+            status: ExecutionStatus::runtime_error(
+                "E_PHP_VM_PENDING_EXCEPTION: exception unwinding call stack",
+            ),
+            output,
+            diagnostics: Vec::new(),
+            return_value: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
 }
 
 /// Minimal interpreter VM.
@@ -1443,6 +1469,17 @@ impl Vm {
             &mut stack,
             &mut state,
         );
+        // A throwable that unwound past `main` without a handler is uncaught:
+        // render it as PHP's fatal error here, at the top of the call stack.
+        if let Some(throwable) = state.pending_throw.take() {
+            result = self.handle_uncaught_exception(
+                &unit,
+                &mut output,
+                &mut stack,
+                &mut state,
+                throwable,
+            );
+        }
         if result.status.is_success() {
             match self.run_shutdown_destructors(&unit, &mut output, &mut state) {
                 Ok(diagnostics) => {
@@ -3799,7 +3836,11 @@ impl Vm {
                             ) {
                                 Ok(value) => value,
                                 Err(result) => {
-                                    if let Some(throwable) = runtime_error_throwable(&result) {
+                                    if let Some(throwable) = state
+                                        .pending_throw
+                                        .take()
+                                        .or_else(|| runtime_error_throwable(&result))
+                                    {
                                         if let Some(target) = handle_throw(
                                             compiled,
                                             throwable.clone(),
@@ -3810,9 +3851,8 @@ impl Vm {
                                             block_id = target;
                                             continue 'dispatch;
                                         }
-                                        return self.handle_uncaught_exception(
-                                            compiled, output, stack, state, throwable,
-                                        );
+                                        return self
+                                            .propagate_exception(output, stack, state, throwable);
                                     }
                                     return result;
                                 }
@@ -4296,8 +4336,7 @@ impl Vm {
                                 block_id = target;
                                 continue 'dispatch;
                             }
-                            return self
-                                .handle_uncaught_exception(compiled, output, stack, state, value);
+                            return self.propagate_exception(output, stack, state, value);
                         }
                         None => {
                             block_id = *after;
@@ -4321,8 +4360,7 @@ impl Vm {
                             block_id = target;
                             continue 'dispatch;
                         }
-                        return self
-                            .handle_uncaught_exception(compiled, output, stack, state, value);
+                        return self.propagate_exception(output, stack, state, value);
                     }
                     InstructionKind::MakeException {
                         dst,
@@ -6862,8 +6900,10 @@ impl Vm {
                                                     "E_PHP_VM_STRING_OFFSET_TYPE: Cannot access offset of type string on string"
                                                         .to_owned(),
                                                 );
-                                                if let Some(throwable) =
-                                                    runtime_error_throwable(&result)
+                                                if let Some(throwable) = state
+                                                    .pending_throw
+                                                    .take()
+                                                    .or_else(|| runtime_error_throwable(&result))
                                                 {
                                                     if let Some(target) = handle_throw(
                                                         compiled,
@@ -6875,8 +6915,8 @@ impl Vm {
                                                         block_id = target;
                                                         continue 'dispatch;
                                                     }
-                                                    return self.handle_uncaught_exception(
-                                                        compiled, output, stack, state, throwable,
+                                                    return self.propagate_exception(
+                                                        output, stack, state, throwable,
                                                     );
                                                 }
                                                 return result;
@@ -7716,7 +7756,10 @@ impl Vm {
                             &running_fiber,
                         );
                         if !result.status.is_success()
-                            && let Some(throwable) = runtime_error_throwable(&result)
+                            && let Some(throwable) = state
+                                .pending_throw
+                                .take()
+                                .or_else(|| runtime_error_throwable(&result))
                         {
                             if let Some(target) = handle_throw(
                                 compiled,
@@ -7728,9 +7771,7 @@ impl Vm {
                                 block_id = target;
                                 continue 'dispatch;
                             }
-                            return self.handle_uncaught_exception(
-                                compiled, output, stack, state, throwable,
-                            );
+                            return self.propagate_exception(output, stack, state, throwable);
                         }
                         if !result.status.is_success() {
                             return result;
@@ -8209,8 +8250,8 @@ impl Vm {
                                                 block_id = target;
                                                 continue 'dispatch;
                                             }
-                                            return self.handle_uncaught_exception(
-                                                compiled, output, stack, state, throwable,
+                                            return self.propagate_exception(
+                                                output, stack, state, throwable,
                                             );
                                         }
                                         return result;
@@ -8245,9 +8286,7 @@ impl Vm {
                                     block_id = target;
                                     continue 'dispatch;
                                 }
-                                return self.handle_uncaught_exception(
-                                    compiled, output, stack, state, throwable,
-                                );
+                                return self.propagate_exception(output, stack, state, throwable);
                             }
                             return result;
                         }
@@ -13346,6 +13385,11 @@ impl Vm {
                     &mut stack,
                     state,
                 );
+                if let Some(throwable) = state.pending_throw.take() {
+                    return Err(self.handle_uncaught_exception(
+                        compiled, output, &mut stack, state, throwable,
+                    ));
+                }
                 if !result.status.is_success() {
                     return Err(result);
                 }
@@ -15045,6 +15089,21 @@ impl Vm {
         }
         let diagnostic = runtime_diagnostic_for_message(&diagnostic_message, compiled, stack);
         VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic)
+    }
+
+    /// Records `throwable` as unwinding past the current frame, pops that frame,
+    /// and returns a non-success result so the caller re-throws it through its
+    /// own handlers (or, at the entry point, renders it as uncaught).
+    fn propagate_exception(
+        &self,
+        output: &OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        throwable: Value,
+    ) -> VmResult {
+        state.pending_throw = Some(throwable);
+        stack.pop_recycle();
+        VmResult::propagating_exception(output.clone())
     }
 
     fn handle_uncaught_exception(
