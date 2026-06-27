@@ -22357,6 +22357,10 @@ fn prepare_arguments(
     let mut positional_index = 0usize;
     let mut saw_named = false;
     let mut supplied_count = 0usize;
+    // Extra positional arguments to a non-variadic function are not an error in
+    // PHP: they are ignored for parameter binding but remain visible to
+    // func_get_args(), so keep them in the prepared list.
+    let mut extra_positional: Vec<PreparedArg> = Vec::new();
 
     for arg in args {
         if let Some(name) = arg.name.clone() {
@@ -22417,12 +22421,13 @@ fn prepare_arguments(
             continue;
         }
         if positional_index >= max {
-            return Err(format!(
-                "E_PHP_VM_TOO_MANY_ARGS: function {} expects at most {} argument(s), got {}",
-                function.name,
-                max,
-                supplied_count + 1
-            ));
+            extra_positional.push(PreparedArg {
+                value: arg.value,
+                reference: None,
+            });
+            positional_index += 1;
+            supplied_count += 1;
+            continue;
         }
         if bound[positional_index].is_some() {
             return Err(format!(
@@ -22508,6 +22513,7 @@ fn prepare_arguments(
             ));
         }
     }
+    prepared.extend(extra_positional);
     Ok(PreparedArguments {
         args: prepared,
         diagnostics,
@@ -30221,14 +30227,13 @@ echo perf_jit_unstable_types_debug(4), "\n";
             )
         );
 
-        let extra = execute_source("<?php function one($a) { return $a; } one(1, 2);");
-        assert_eq!(extra.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(
-            extra.status.message(),
-            Some(
-                "E_PHP_VM_UNCAUGHT_EXCEPTION: Uncaught ArgumentCountError: function one expects at most 1 argument(s), got 2"
-            )
+        // PHP accepts extra positional arguments to a non-variadic function;
+        // they are ignored for binding but visible to func_get_args().
+        let extra = execute_source(
+            "<?php function one($a) { return $a . '|' . implode(',', func_get_args()); } echo one(1, 2);",
         );
+        assert!(extra.status.is_success(), "{:?}", extra.status);
+        assert_eq!(extra.output.as_bytes(), b"1|1,2");
     }
 
     #[test]
