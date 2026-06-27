@@ -11,7 +11,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCHMARK = ROOT / "target/performance/bench-performance-smoke.json"
+DEFAULT_BENCHMARK = ROOT / "target/performance/benchmark-smoke.json"
 DEFAULT_BASELINE = ROOT / "target/performance/baseline.json"
 DEFAULT_COMPARE = ROOT / "target/performance/perf-compare.md"
 DEFAULT_FRAMEWORK_SMOKE = ROOT / "target/performance/framework-smoke/summary.json"
@@ -51,16 +51,50 @@ INLINE_CACHE_COUNTERS = (
     "inline_cache_polymorphic",
     "function_call_ic_hits",
     "function_call_ic_misses",
+    "builtin_call_ic_hits",
+    "builtin_call_ic_misses",
+    "builtin_fast_stub_hits.count",
+    "builtin_fast_stub_hits.strlen",
+    "builtin_fast_stub_hits.is_int",
+    "builtin_fast_stub_hits.is_string",
+    "builtin_fast_stub_hits.is_array",
+    "builtin_fast_stub_misses.strlen",
+    "call_ic_megamorphic_fallbacks",
     "method_ic_hits",
     "method_ic_misses",
     "property_ic_hits",
     "property_ic_misses",
+    "property_ic_fallback_reasons.layout_epoch_mismatch",
+    "property_ic_fallback_reasons.receiver_class_mismatch",
+    "property_ic_fallback_reasons.uninitialized_typed_property",
     "class_static_ic_hits",
     "class_static_ic_misses",
     "include_path_ic_hits",
     "include_path_ic_misses",
     "autoload_class_lookup_ic_hits",
     "autoload_class_lookup_ic_misses",
+)
+
+FRAME_REUSE_COUNTERS = (
+    "frame_allocations",
+    "frame_reuses",
+    "frames_allocated",
+    "frames_reused",
+    "register_files_allocated",
+    "register_files_reused",
+)
+
+FRAMEWORK_COUNTER_COLUMNS = (
+    "instructions_executed",
+    "function_calls",
+    "method_calls",
+    "frames_allocated",
+    "frames_reused",
+    "array_dim_fetches",
+    "property_accesses",
+    "internal_function_dispatches",
+    "inline_cache_hits",
+    "output_bytes",
 )
 
 
@@ -126,6 +160,15 @@ def measurement_counters(measurement: dict[str, Any]) -> dict[str, int]:
     for key, value in counters.items():
         if isinstance(key, str) and isinstance(value, int):
             parsed[key] = value
+        elif key in {
+            "frame_reuse_blocked_by_reason",
+            "builtin_fast_stub_hits",
+            "builtin_fast_stub_misses",
+            "property_ic_fallback_reasons",
+        } and isinstance(value, dict):
+            for reason, count in value.items():
+                if isinstance(reason, str) and isinstance(count, int):
+                    parsed[f"{key}.{reason}"] = count
     return parsed
 
 
@@ -201,6 +244,18 @@ def summarize_report(
         "inline_cache_counters": {
             key: counter_totals.get(key, 0) for key in INLINE_CACHE_COUNTERS
         },
+        "frame_reuse_counters": {
+            key: counter_totals.get(key, 0) for key in FRAME_REUSE_COUNTERS
+        },
+        "frame_reuse_blocked_by_reason": dict(
+            sorted(
+                (
+                    (key.removeprefix("frame_reuse_blocked_by_reason."), value)
+                    for key, value in counter_totals.items()
+                    if key.startswith("frame_reuse_blocked_by_reason.")
+                )
+            )
+        ),
         "known_gaps": gap_rows(known_gaps_path),
         "measurements": measurements,
     }
@@ -262,7 +317,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 "## Missing Benchmarks",
                 "",
                 "No scenario table or counter summary can be rendered yet.",
-                "Run `nix develop -c just bench-performance-smoke` or "
+                "Run `nix develop -c just benchmark-smoke` or "
                 "`nix develop -c just perf-baseline`, then rerun "
                 "`nix develop -c just perf-report`.",
                 "",
@@ -340,6 +395,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.extend(
         render_counter_table("Inline Cache Hits and Misses", summary["inline_cache_counters"])
     )
+    lines.extend(render_counter_table("Frame and Register Reuse", summary["frame_reuse_counters"]))
+    lines.extend(
+        render_counter_table(
+            "Frame Reuse Blocked Reasons",
+            summary["frame_reuse_blocked_by_reason"],
+        )
+    )
 
     framework = summary.get("framework_smoke")
     lines.extend(["## Framework Micro-Smokes", ""])
@@ -357,11 +419,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 rows.append(
                     [
                         f"`{scenario.get('id', '<unknown>')}`",
-                        str(focus.get("instructions_executed", "-")),
-                        str(focus.get("function_calls", "-")),
-                        str(focus.get("method_calls", "-")),
-                        str(focus.get("inline_cache_hits", "-")),
-                        str(focus.get("output_bytes", "-")),
+                        *[str(focus.get(name, "-")) for name in FRAMEWORK_COUNTER_COLUMNS],
                     ]
                 )
         if rows:
@@ -372,6 +430,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
                         "Instructions",
                         "Function calls",
                         "Method calls",
+                        "Frames allocated",
+                        "Frames reused",
+                        "Array fetches",
+                        "Property access",
+                        "Builtin calls",
                         "IC hits",
                         "Output bytes",
                     ],
@@ -382,7 +445,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
             lines.append("Framework smoke summary exists but contains no scenarios.")
     elif isinstance(framework, dict):
         lines.append(
-            f"No framework smoke summary found. Run `nix develop -c just framework-smoke-performance` "
+            f"No framework smoke summary found. Run `nix develop -c just framework-smoke` "
             f"to create `{framework.get('path', DEFAULT_FRAMEWORK_SMOKE)}`."
         )
     else:
@@ -493,7 +556,7 @@ def run_self_test() -> int:
     )
     missing_markdown = render_markdown(missing)
     assert "Missing Benchmarks" in missing_markdown
-    assert "bench-performance-smoke" in missing_markdown
+    assert "benchmark-smoke" in missing_markdown
     print("[pass] perf_report self-test")
     return 0
 

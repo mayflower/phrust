@@ -3,6 +3,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::too_many_arguments)]
 
+use crate::bytecode::{
+    DenseBytecodeUnit, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
+    DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
+};
 use crate::compiled_unit::CompiledUnit;
 #[cfg(feature = "jit-cranelift")]
 use crate::counters::JitCompileDescriptor;
@@ -12,10 +16,11 @@ use crate::include::{IncludeLoader, include_path_file_fingerprint};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
     AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
-    ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallCacheTarget,
-    IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind, InlineCacheMode,
-    InlineCacheObservation, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
-    PropertyFetchCacheTarget,
+    ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallBuiltinMetadata,
+    FunctionCallCacheTarget, FunctionCallShape, IncludePathCacheKey, IncludePathCacheTarget,
+    InlineCacheKind, InlineCacheMode, InlineCacheObservation, InlineCacheTable, InvalidationEpoch,
+    MethodCallCacheTarget, PropertyFetchCacheTarget, PropertyFetchLayoutMetadata,
+    PropertyFetchResolvedTarget,
 };
 use crate::literal_pool::LiteralPool;
 use crate::quickening::{
@@ -24,12 +29,12 @@ use crate::quickening::{
 use crate::tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 use php_ir::constants::IrConstant;
 use php_ir::function::{IrFunction, IrParam, IrReturnType};
-use php_ir::ids::{BlockId, ConstId, FunctionId, InstrId, LocalId, RegId};
+use php_ir::ids::{BlockId, ConstId, FunctionId, InstrId, LocalId, RegId, UnitId};
 use php_ir::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, Instruction,
     InstructionKind, IrCallArg, IrCallArgValueKind, IrDiagnosticSeverity, TerminatorKind, UnaryOp,
 };
-use php_ir::module::IrUnit;
+use php_ir::module::{ClassEntry, ClassPropertyEntry, IrUnit};
 use php_ir::operand::Operand;
 use php_ir::verify::verify_unit;
 use php_runtime::IniRegistry;
@@ -44,12 +49,13 @@ use php_runtime::{
     ClassPropertyFlags as RuntimeClassPropertyFlags,
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ExecutionStatus,
     FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
-    OutputBuffer, PhpArray, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
-    RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Value,
-    compare, division_by_zero_mvp, emit_php_diagnostic, equal, error_reporting_allows_level,
-    identical, reset_float_string_precision, runtime_type_name, set_float_string_precision,
-    to_arithmetic_number, to_bool, to_float, to_int, to_number, to_string, undefined_function,
-    undefined_variable_warning, unsupported_feature, value_matches_runtime_type, value_type_name,
+    OutputBuffer, PhpArray, PhpArrayKind, PhpString, ProcessCapability, ReferenceCell,
+    RuntimeContext, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame,
+    RuntimeType, Slot, Value, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
+    error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
+    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
+    to_string, undefined_function, undefined_variable_warning, unsupported_feature,
+    value_matches_runtime_type, value_type_name,
 };
 #[cfg(test)]
 use php_runtime::{GcEntityId, GcEntityKind};
@@ -429,6 +435,11 @@ pub struct VmOptions {
     pub trace_runtime: bool,
     /// Collect performance VM/runtime counters in the execution result.
     pub collect_counters: bool,
+    /// Optional dense-bytecode execution mode. The default keeps the rich-IR
+    /// interpreter as the only execution path.
+    pub execution_format: ExecutionFormat,
+    /// Optional dense-bytecode superinstruction selection pass.
+    pub superinstructions: SuperinstructionMode,
     /// Maintain request-local quickening metadata without changing semantics.
     pub quickening: QuickeningMode,
     /// Allocate request-local inline-cache slots without changing semantics.
@@ -459,6 +470,8 @@ impl Default for VmOptions {
             trace: false,
             trace_runtime: false,
             collect_counters: false,
+            execution_format: ExecutionFormat::Ir,
+            superinstructions: SuperinstructionMode::Off,
             quickening: QuickeningMode::Off,
             inline_caches: InlineCacheMode::Off,
             jit: JitMode::Off,
@@ -469,6 +482,67 @@ impl Default for VmOptions {
             typecheck_fast_paths: true,
             internal_function_dispatch_cache: true,
         }
+    }
+}
+
+/// Optional VM execution-format switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionFormat {
+    /// Execute the current rich-IR interpreter only.
+    #[default]
+    Ir,
+    /// Try dense bytecode first and safely fall back to rich IR if unsupported.
+    Auto,
+    /// Require dense bytecode; unsupported lowering or verification is an
+    /// unsupported runtime result.
+    Bytecode,
+}
+
+impl ExecutionFormat {
+    /// Stable CLI/report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ir => "ir",
+            Self::Auto => "auto",
+            Self::Bytecode => "bytecode",
+        }
+    }
+
+    #[must_use]
+    const fn attempts_bytecode(self) -> bool {
+        matches!(self, Self::Auto | Self::Bytecode)
+    }
+
+    #[must_use]
+    const fn is_strict_bytecode(self) -> bool {
+        matches!(self, Self::Bytecode)
+    }
+}
+
+/// Optional dense-bytecode superinstruction selector.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SuperinstructionMode {
+    /// Keep lowered dense bytecode unchanged.
+    #[default]
+    Off,
+    /// Fuse supported adjacent dense bytecode patterns.
+    On,
+}
+
+impl SuperinstructionMode {
+    /// Stable CLI/report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    #[must_use]
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::On)
     }
 }
 
@@ -864,6 +938,11 @@ enum PropertyFetchCacheRead {
     Fallback,
 }
 
+enum BytecodeEntryAttempt {
+    Executed(Box<VmResult>),
+    Unsupported(String),
+}
+
 enum ClassStaticCacheRead {
     Value(Value),
     Fallback,
@@ -1232,6 +1311,85 @@ impl FunctionCall<'_> {
     }
 }
 
+fn frame_reuse_call_shape_blocked_reason(
+    function: &IrFunction,
+    call: &FunctionCall<'_>,
+) -> Option<&'static str> {
+    if function.flags.is_generator {
+        return Some("generator");
+    }
+    if call.running_generator.is_some() || call.resume_continuation.is_some() {
+        return Some("generator_continuation");
+    }
+    if call.running_fiber.is_some() || call.resume_fiber_continuation.is_some() {
+        return Some("fiber_continuation");
+    }
+    if function.returns_by_ref {
+        return Some("by_ref_return");
+    }
+    if function.params.iter().any(|param| param.by_ref) {
+        return Some("by_ref_param");
+    }
+    if function.flags.is_closure || !call.captures.is_empty() || !function.captures.is_empty() {
+        return Some(
+            if call.captures.is_empty() && function.captures.is_empty() {
+                "closure"
+            } else {
+                "closure_capture"
+            },
+        );
+    }
+    if call.this_value.is_some()
+        || call.scope_class.is_some()
+        || call.called_class.is_some()
+        || call.declaring_class.is_some()
+        || function.flags.is_method
+    {
+        return Some("class_context");
+    }
+    if call.shared_top_level_locals.is_some() {
+        return Some("shared_top_level_locals");
+    }
+    if function_has_try_or_finally(function) {
+        return Some("try_finally");
+    }
+    if function_may_hold_destructor_sensitive_value(function) {
+        return Some("destructor_sensitive_value");
+    }
+    None
+}
+
+fn frame_reuse_prepared_args_blocked_reason(prepared_args: &[PreparedArg]) -> Option<&'static str> {
+    prepared_args
+        .iter()
+        .any(|arg| arg.reference.is_some())
+        .then_some("by_ref_argument")
+}
+
+fn function_has_try_or_finally(function: &IrFunction) -> bool {
+    function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::EnterTry { .. }
+                    | InstructionKind::LeaveTry
+                    | InstructionKind::EndFinally { .. }
+            )
+        })
+    })
+}
+
+fn function_may_hold_destructor_sensitive_value(function: &IrFunction) -> bool {
+    function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::NewObject { .. } | InstructionKind::DynamicNewObject { .. }
+            )
+        })
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CallArgument {
     name: Option<String>,
@@ -1287,6 +1445,40 @@ impl CallArgument {
             by_ref_property: None,
         }
     }
+}
+
+fn function_call_shape(args: &[CallArgument]) -> FunctionCallShape {
+    FunctionCallShape {
+        arity: args.len().try_into().unwrap_or(u32::MAX),
+        named_arguments: args
+            .iter()
+            .filter_map(|arg| arg.name.clone())
+            .collect::<Vec<_>>(),
+        by_ref_arguments: args
+            .iter()
+            .map(|arg| {
+                arg.by_ref_local.is_some()
+                    || arg.by_ref_dim.is_some()
+                    || arg.by_ref_property.is_some()
+            })
+            .collect(),
+    }
+}
+
+fn function_call_builtin_metadata(
+    target: &FunctionCallCacheTarget,
+) -> Option<FunctionCallBuiltinMetadata> {
+    let FunctionCallCacheTarget::Builtin { kind, name } = target else {
+        return None;
+    };
+    Some(FunctionCallBuiltinMetadata {
+        implementation_id: format!("{kind:?}:{name}"),
+        version: 1,
+    })
+}
+
+fn function_call_target_is_builtin(target: &FunctionCallCacheTarget) -> bool {
+    matches!(target, FunctionCallCacheTarget::Builtin { .. })
 }
 
 impl VmResult {
@@ -1346,6 +1538,21 @@ impl VmResult {
     fn compile_error(output: OutputBuffer, message: impl Into<String>) -> Self {
         Self {
             status: ExecutionStatus::compile_error(message),
+            output,
+            diagnostics: Vec::new(),
+            return_value: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    fn unsupported(output: OutputBuffer, message: impl Into<String>) -> Self {
+        Self {
+            status: ExecutionStatus::unsupported(message),
             output,
             diagnostics: Vec::new(),
             return_value: None,
@@ -1472,14 +1679,46 @@ impl Vm {
         );
         apply_float_string_precision(&state.ini);
         seed_runtime_globals(&mut state.globals, &self.options.runtime_context);
-        let mut result = self.execute_function(
-            &unit,
-            entry,
-            FunctionCall::new(Vec::new(), Vec::new()),
-            &mut output,
-            &mut stack,
-            &mut state,
-        );
+        let mut result = if self.options.execution_format.attempts_bytecode() {
+            match self.try_execute_bytecode_entry(&unit, &mut output, &mut stack, &mut state) {
+                BytecodeEntryAttempt::Executed(result) => *result,
+                BytecodeEntryAttempt::Unsupported(message) => {
+                    if self.options.execution_format.is_strict_bytecode() {
+                        VmResult {
+                            status: ExecutionStatus::unsupported(message),
+                            output: output.clone(),
+                            diagnostics: Vec::new(),
+                            return_value: None,
+                            yielded: None,
+                            fiber_suspension: None,
+                            return_ref: None,
+                            trace: Vec::new(),
+                            counters: None,
+                            tiering_stats: None,
+                        }
+                    } else {
+                        self.record_counter_bytecode_unsupported_fallback();
+                        self.execute_function(
+                            &unit,
+                            entry,
+                            FunctionCall::new(Vec::new(), Vec::new()),
+                            &mut output,
+                            &mut stack,
+                            &mut state,
+                        )
+                    }
+                }
+            }
+        } else {
+            self.execute_function(
+                &unit,
+                entry,
+                FunctionCall::new(Vec::new(), Vec::new()),
+                &mut output,
+                &mut stack,
+                &mut state,
+            )
+        };
         // A throwable that unwound past `main` without a handler is uncaught:
         // render it as PHP's fatal error here, at the top of the call stack.
         if let Some(throwable) = state.pending_throw.take() {
@@ -1536,6 +1775,60 @@ impl Vm {
         }
     }
 
+    fn record_counter_bytecode_lower_attempt(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_lower_attempt();
+        }
+    }
+
+    fn record_counter_bytecode_lower_success(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_lower_success();
+        }
+    }
+
+    fn record_counter_bytecode_unsupported_fallback(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_unsupported_fallback();
+        }
+    }
+
+    fn record_counter_bytecode_instruction(&self, opcode: DenseOpcode) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_instruction(opcode.as_str());
+        }
+    }
+
+    fn record_counter_superinstruction_selection(&self, report: &SuperinstructionSelectionReport) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_superinstruction_selection(report.candidates, &report.emitted_by_kind);
+        }
+    }
+
+    fn record_counter_superinstruction_executed(&self, opcode: DenseOpcode) {
+        if !self.options.collect_counters || !opcode.is_superinstruction() {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_superinstruction_executed(opcode.as_str());
+        }
+    }
+
     fn record_counter_autoload(&self) {
         if !self.options.collect_counters {
             return;
@@ -1551,6 +1844,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_frame_activation(reused);
+        }
+    }
+
+    fn record_counter_frame_reuse_blocked(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_frame_reuse_blocked(reason);
         }
     }
 
@@ -1589,6 +1891,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_property_fetch_profile(observation);
+        }
+    }
+
+    fn record_counter_property_ic_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_ic_fallback(reason);
         }
     }
 
@@ -1838,7 +2149,7 @@ impl Vm {
         }
     }
 
-    #[cfg(feature = "jit-cranelift")]
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     fn record_counter_packed_fetch_fast_hit(&self) {
         if !self.options.collect_counters {
             return;
@@ -1848,7 +2159,7 @@ impl Vm {
         }
     }
 
-    #[cfg(feature = "jit-cranelift")]
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     fn record_counter_packed_fetch_bounds_exit(&self) {
         if !self.options.collect_counters {
             return;
@@ -1858,7 +2169,7 @@ impl Vm {
         }
     }
 
-    #[cfg(feature = "jit-cranelift")]
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     fn record_counter_packed_fetch_layout_exit(&self) {
         if !self.options.collect_counters {
             return;
@@ -2094,10 +2405,22 @@ impl Vm {
         instruction_id: php_ir::ids::InstrId,
         lowered_name: &str,
         epoch: InvalidationEpoch,
+        shape: &FunctionCallShape,
     ) -> Option<FunctionCallCacheTarget> {
         if !self.options.inline_caches.enabled() {
             return None;
         }
+        let expected_builtin_metadata = self
+            .inline_caches
+            .borrow()
+            .peek_function_call_target(
+                compiled_unit_cache_key(compiled),
+                function_id,
+                block_id,
+                instruction_id,
+            )
+            .as_ref()
+            .and_then(function_call_builtin_metadata);
         let (target, observation) = self.inline_caches.borrow_mut().lookup_function_call(
             compiled_unit_cache_key(compiled),
             function_id,
@@ -2105,8 +2428,21 @@ impl Vm {
             instruction_id,
             lowered_name,
             epoch,
+            shape,
+            expected_builtin_metadata.as_ref(),
         );
         self.record_inline_cache_event(observation);
+        if observation.hit {
+            self.record_counter_function_call_ic(true);
+            if target.as_ref().is_some_and(function_call_target_is_builtin) {
+                self.record_counter_builtin_call_ic(true);
+            }
+        } else if observation.miss {
+            self.record_counter_function_call_ic(false);
+            if observation.megamorphic {
+                self.record_counter_call_ic_megamorphic_fallback();
+            }
+        }
         target
     }
 
@@ -2118,11 +2454,13 @@ impl Vm {
         instruction_id: php_ir::ids::InstrId,
         lowered_name: &str,
         epoch: InvalidationEpoch,
+        shape: FunctionCallShape,
         target: FunctionCallCacheTarget,
     ) {
         if !self.options.inline_caches.enabled() {
             return;
         }
+        let builtin_metadata = function_call_builtin_metadata(&target);
         self.inline_caches.borrow_mut().install_function_call(
             compiled_unit_cache_key(compiled),
             function_id,
@@ -2130,6 +2468,8 @@ impl Vm {
             instruction_id,
             lowered_name,
             epoch,
+            shape,
+            builtin_metadata,
             target,
         );
     }
@@ -2249,6 +2589,84 @@ impl Vm {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "property IC installation needs the resolved property metadata and callsite guard context"
+    )]
+    fn maybe_install_property_fetch_inline_cache_target(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        receiver_entry: &ClassEntry,
+        declaring_class: &ClassEntry,
+        declaring_property: &ClassPropertyEntry,
+        storage_name: &str,
+        normalized_scope: Option<&str>,
+        lookup_epoch: InvalidationEpoch,
+        receiver_has_magic_get: bool,
+        state: &ExecutionState,
+        object: &ObjectRef,
+    ) {
+        if !self.options.inline_caches.enabled()
+            || declaring_property.flags.is_static
+            || declaring_property.flags.is_protected
+            || declaring_property.hooks.get.is_some()
+            || declaring_property.hooks.set.is_some()
+            || property_hook_is_active(state, object, declaring_class, declaring_property)
+        {
+            return;
+        }
+        let cache_scope = declaring_property
+            .flags
+            .is_private
+            .then(|| normalize_class_name(&declaring_class.name));
+        if declaring_property.flags.is_private && cache_scope.as_deref() != normalized_scope {
+            return;
+        }
+        let layout = property_fetch_layout_metadata(
+            receiver_entry,
+            declaring_class,
+            declaring_property,
+            cache_scope.as_deref(),
+            lookup_epoch,
+            receiver_has_magic_get,
+            false,
+            false,
+            true,
+        );
+        let target_payload = Box::new(PropertyFetchResolvedTarget {
+            receiver_class: receiver_class.to_owned(),
+            declaring_class: declaring_class.name.clone(),
+            property: declaring_property.name.clone(),
+            storage_name: storage_name.to_owned(),
+            layout,
+        });
+        let target = match dynamic_class_owner_index_in_state(state, &declaring_class.name) {
+            Some(unit_index) => PropertyFetchCacheTarget::DynamicUnit {
+                unit_index,
+                target: target_payload,
+            },
+            None => PropertyFetchCacheTarget::CurrentUnit {
+                target: target_payload,
+            },
+        };
+        self.install_property_fetch_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            cache_scope.as_deref(),
+            lookup_epoch,
+            target,
+        );
+    }
+
     fn lookup_class_constant_static_property_inline_cache(
         &self,
         compiled: &CompiledUnit,
@@ -2349,6 +2767,41 @@ impl Vm {
         self.record_counter_quickening(observation);
     }
 
+    fn observe_dense_quickening(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+    ) {
+        if !self.options.tiering.enabled || !self.options.quickening.enabled() {
+            return;
+        }
+        let observation =
+            self.quickening
+                .borrow_mut()
+                .observe_dense(unit_id, function_id, instruction_index);
+        self.record_counter_quickening(observation);
+    }
+
+    fn record_dense_quickening_guard(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+        hit: bool,
+    ) {
+        if !self.options.tiering.enabled || !self.options.quickening.enabled() {
+            return;
+        }
+        let observation = self.quickening.borrow_mut().record_dense_specialized_guard(
+            unit_id,
+            function_id,
+            instruction_index,
+            hit,
+        );
+        self.record_counter_quickening(observation);
+    }
+
     fn record_counter_string_concat_fast_path(&self, hit: bool) {
         if !self.options.collect_counters {
             return;
@@ -2366,6 +2819,17 @@ impl Vm {
         hit: bool,
     ) {
         self.record_quickening_guard(function_id, block_id, instruction_id, hit);
+        self.record_counter_string_concat_fast_path(hit);
+    }
+
+    fn record_quickened_dense_concat_guard(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+        hit: bool,
+    ) {
+        self.record_dense_quickening_guard(unit_id, function_id, instruction_index, hit);
         self.record_counter_string_concat_fast_path(hit);
     }
 
@@ -2402,6 +2866,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_array_sequential_foreach_fast_path_hit();
+        }
+    }
+
+    fn record_counter_cow_or_reference_fallback(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_cow_or_reference_fallback();
         }
     }
 
@@ -2468,6 +2941,42 @@ impl Vm {
         }
     }
 
+    fn record_counter_function_call_ic(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_function_call_ic(hit);
+        }
+    }
+
+    fn record_counter_builtin_call_ic(&self, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_builtin_call_ic(hit);
+        }
+    }
+
+    fn record_counter_builtin_fast_stub(&self, name: &str, hit: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_builtin_fast_stub(name, hit);
+        }
+    }
+
+    fn record_counter_call_ic_megamorphic_fallback(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_call_ic_megamorphic_fallback();
+        }
+    }
+
     fn lookup_internal_function_dispatch(&self, name: &str) -> Option<BuiltinEntry> {
         if !self.options.internal_function_dispatch_cache {
             return BuiltinRegistry::new().get(name);
@@ -2501,6 +3010,11 @@ impl Vm {
         let Some(entry) = self.lookup_internal_function_dispatch(name) else {
             return unknown_builtin_result(name, output);
         };
+        if self.options.inline_caches.enabled()
+            && let Some(result) = self.try_execute_fast_builtin_stub(name, &values, output)
+        {
+            return result;
+        }
         if let Some(result) = self.try_execute_direct_count_array(name, &values, output) {
             return result;
         }
@@ -2523,6 +3037,27 @@ impl Vm {
             state,
             builtin_source_span(compiled),
         )
+    }
+
+    fn try_execute_fast_builtin_stub(
+        &self,
+        name: &str,
+        values: &[Value],
+        output: &OutputBuffer,
+    ) -> Option<VmResult> {
+        if !fast_builtin_stub_supported(name) {
+            return None;
+        }
+        let Some(result) = fast_builtin_stub_result(name, values) else {
+            self.record_counter_builtin_fast_stub(name, false);
+            return None;
+        };
+        self.record_counter_builtin_fast_stub(name, true);
+        if name == "count" {
+            self.record_counter_array_count_fast_path_hit();
+            self.record_counter_internal_count_array_direct_fast_path_hit();
+        }
+        Some(VmResult::success(output.clone(), Some(result)))
     }
 
     fn try_execute_direct_count_array(
@@ -2594,17 +3129,19 @@ impl Vm {
         self.record_counter_packed_dim_fast_path(hit);
     }
 
-    fn try_quickened_add_int_int(
+    fn try_quickened_int_int_binary(
         &self,
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: php_ir::ids::InstrId,
+        op: BinaryOp,
         lhs: &Value,
         rhs: &Value,
     ) -> Option<Value> {
         if !self.options.quickening.enabled() {
             return None;
         }
+        let expected = int_int_specialization_for_binary_op(op)?;
 
         let specialization = {
             self.quickening
@@ -2613,11 +3150,11 @@ impl Vm {
         };
 
         match specialization {
-            Some(QuickeningSpecialization::AddIntInt) => match (lhs, rhs) {
+            Some(specialization) if specialization == expected => match (lhs, rhs) {
                 (Value::Int(lhs), Value::Int(rhs)) => {
-                    if let Some(sum) = lhs.checked_add(*rhs) {
+                    if let Some(value) = checked_int_binary(op, *lhs, *rhs) {
                         self.record_quickening_guard(function_id, block_id, instruction_id, true);
-                        Some(Value::Int(sum))
+                        Some(Value::Int(value))
                     } else {
                         self.record_quickening_guard(function_id, block_id, instruction_id, false);
                         None
@@ -2630,17 +3167,26 @@ impl Vm {
             },
             None => {
                 if matches!(lhs, Value::Int(_)) && matches!(rhs, Value::Int(_)) {
-                    let observation = self.quickening.borrow_mut().observe_add_int_int_candidate(
-                        function_id,
-                        block_id,
-                        instruction_id,
-                    );
+                    let observation = match op {
+                        BinaryOp::Add => self
+                            .quickening
+                            .borrow_mut()
+                            .observe_add_int_int_candidate(function_id, block_id, instruction_id),
+                        BinaryOp::Sub => self
+                            .quickening
+                            .borrow_mut()
+                            .observe_sub_int_int_candidate(function_id, block_id, instruction_id),
+                        BinaryOp::Mul => self
+                            .quickening
+                            .borrow_mut()
+                            .observe_mul_int_int_candidate(function_id, block_id, instruction_id),
+                        _ => return None,
+                    };
                     self.record_counter_quickening(observation);
                 }
                 None
             }
-            Some(QuickeningSpecialization::ConcatStringString) => None,
-            Some(QuickeningSpecialization::PackedArrayIntKey) => None,
+            Some(_) => None,
         }
     }
 
@@ -2705,7 +3251,11 @@ impl Vm {
                 None
             }
             Some(
-                QuickeningSpecialization::AddIntInt | QuickeningSpecialization::PackedArrayIntKey,
+                QuickeningSpecialization::AddIntInt
+                | QuickeningSpecialization::SubIntInt
+                | QuickeningSpecialization::MulIntInt
+                | QuickeningSpecialization::PackedArrayIntKey
+                | QuickeningSpecialization::BoolBranchCondition,
             ) => None,
         }
     }
@@ -2731,6 +3281,27 @@ impl Vm {
         match specialization {
             Some(QuickeningSpecialization::PackedArrayIntKey) => match (array, key) {
                 (Value::Array(array), Value::Int(index)) if *index >= 0 => {
+                    let metadata = array.packed_metadata();
+                    if metadata.contains_references {
+                        self.record_quickened_packed_dim_guard(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            false,
+                        );
+                        self.record_counter_cow_or_reference_fallback();
+                        return None;
+                    }
+                    if metadata.kind != PhpArrayKind::PackedList {
+                        self.record_quickened_packed_dim_guard(
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            false,
+                        );
+                        self.record_counter_packed_fetch_layout_exit();
+                        return None;
+                    }
                     if let Some(value) = array.packed_element_fast(*index as usize) {
                         self.record_quickened_packed_dim_guard(
                             function_id,
@@ -2738,6 +3309,7 @@ impl Vm {
                             instruction_id,
                             true,
                         );
+                        self.record_counter_packed_fetch_fast_hit();
                         self.record_counter_array_packed_read_fast_path_hit();
                         Some(effective_value(value))
                     } else {
@@ -2747,8 +3319,24 @@ impl Vm {
                             instruction_id,
                             false,
                         );
+                        self.record_counter_packed_fetch_bounds_exit();
                         None
                     }
+                }
+                (Value::Array(array), _) => {
+                    self.record_quickened_packed_dim_guard(
+                        function_id,
+                        block_id,
+                        instruction_id,
+                        false,
+                    );
+                    let metadata = array.packed_metadata();
+                    if metadata.contains_references {
+                        self.record_counter_cow_or_reference_fallback();
+                    } else {
+                        self.record_counter_packed_fetch_layout_exit();
+                    }
+                    None
                 }
                 _ => {
                     self.record_quickened_packed_dim_guard(
@@ -2757,12 +3345,14 @@ impl Vm {
                         instruction_id,
                         false,
                     );
+                    self.record_counter_packed_fetch_layout_exit();
                     None
                 }
             },
             None => {
                 if let (Value::Array(array), Value::Int(index)) = (array, key)
                     && *index >= 0
+                    && !array.contains_references_fast()
                     && array.packed_element_fast(*index as usize).is_some()
                 {
                     let observation = self
@@ -2778,8 +3368,204 @@ impl Vm {
                 None
             }
             Some(
-                QuickeningSpecialization::AddIntInt | QuickeningSpecialization::ConcatStringString,
+                QuickeningSpecialization::AddIntInt
+                | QuickeningSpecialization::SubIntInt
+                | QuickeningSpecialization::MulIntInt
+                | QuickeningSpecialization::ConcatStringString
+                | QuickeningSpecialization::BoolBranchCondition,
             ) => None,
+        }
+    }
+
+    fn try_quickened_dense_int_int_binary(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+        op: BinaryOp,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Option<Value> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+        let expected = int_int_specialization_for_binary_op(op)?;
+        let specialization = {
+            self.quickening
+                .borrow()
+                .dense_specialization(unit_id, function_id, instruction_index)
+        };
+
+        match specialization {
+            Some(specialization) if specialization == expected => match (lhs, rhs) {
+                (Value::Int(lhs), Value::Int(rhs)) => {
+                    if let Some(value) = checked_int_binary(op, *lhs, *rhs) {
+                        self.record_dense_quickening_guard(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                            true,
+                        );
+                        Some(Value::Int(value))
+                    } else {
+                        self.record_dense_quickening_guard(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                            false,
+                        );
+                        None
+                    }
+                }
+                _ => {
+                    self.record_dense_quickening_guard(
+                        unit_id,
+                        function_id,
+                        instruction_index,
+                        false,
+                    );
+                    None
+                }
+            },
+            None => {
+                if matches!(lhs, Value::Int(_)) && matches!(rhs, Value::Int(_)) {
+                    let observation = self
+                        .quickening
+                        .borrow_mut()
+                        .observe_dense_int_int_candidate(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                            expected,
+                        );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn try_quickened_dense_concat_string_string(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Option<Value> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+        let specialization = {
+            self.quickening
+                .borrow()
+                .dense_specialization(unit_id, function_id, instruction_index)
+        };
+
+        match specialization {
+            Some(QuickeningSpecialization::ConcatStringString) => match (lhs, rhs) {
+                (Value::String(lhs), Value::String(rhs)) => {
+                    let Some(capacity) = lhs.len().checked_add(rhs.len()) else {
+                        self.record_quickened_dense_concat_guard(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                            false,
+                        );
+                        return None;
+                    };
+                    let mut bytes = Vec::with_capacity(capacity);
+                    bytes.extend_from_slice(lhs.as_bytes());
+                    bytes.extend_from_slice(rhs.as_bytes());
+                    self.record_quickened_dense_concat_guard(
+                        unit_id,
+                        function_id,
+                        instruction_index,
+                        true,
+                    );
+                    Some(Value::String(PhpString::from_bytes(bytes)))
+                }
+                _ => {
+                    self.record_quickened_dense_concat_guard(
+                        unit_id,
+                        function_id,
+                        instruction_index,
+                        false,
+                    );
+                    None
+                }
+            },
+            None => {
+                if matches!(lhs, Value::String(_)) && matches!(rhs, Value::String(_)) {
+                    let observation = self
+                        .quickening
+                        .borrow_mut()
+                        .observe_dense_concat_string_string_candidate(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                        );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn try_quickened_dense_bool_branch(
+        &self,
+        unit_id: UnitId,
+        function_id: FunctionId,
+        instruction_index: u32,
+        value: &Value,
+    ) -> Option<bool> {
+        if !self.options.quickening.enabled() {
+            return None;
+        }
+        let specialization = {
+            self.quickening
+                .borrow()
+                .dense_specialization(unit_id, function_id, instruction_index)
+        };
+
+        match specialization {
+            Some(QuickeningSpecialization::BoolBranchCondition) => match value {
+                Value::Bool(value) => {
+                    self.record_dense_quickening_guard(
+                        unit_id,
+                        function_id,
+                        instruction_index,
+                        true,
+                    );
+                    Some(*value)
+                }
+                _ => {
+                    self.record_dense_quickening_guard(
+                        unit_id,
+                        function_id,
+                        instruction_index,
+                        false,
+                    );
+                    None
+                }
+            },
+            None => {
+                if matches!(value, Value::Bool(_)) {
+                    let observation = self
+                        .quickening
+                        .borrow_mut()
+                        .observe_dense_bool_branch_candidate(
+                            unit_id,
+                            function_id,
+                            instruction_index,
+                        );
+                    self.record_counter_quickening(observation);
+                }
+                None
+            }
+            Some(_) => None,
         }
     }
 
@@ -3447,6 +4233,933 @@ impl Vm {
         }
     }
 
+    fn try_execute_bytecode_entry(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> BytecodeEntryAttempt {
+        if self.options.trace || self.options.trace_runtime {
+            return BytecodeEntryAttempt::Unsupported(
+                "E_PHP_VM_DENSE_BYTECODE_TRACE_UNSUPPORTED: dense bytecode execution does not support tracing yet"
+                    .to_string(),
+            );
+        }
+        self.record_counter_bytecode_lower_attempt();
+        let mut dense = match DenseBytecodeUnit::lower_from_ir(compiled.unit()) {
+            Ok(dense) => dense,
+            Err(error) => {
+                return BytecodeEntryAttempt::Unsupported(format!(
+                    "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                    error.message
+                ));
+            }
+        };
+        if let Err(errors) = dense.verify() {
+            return BytecodeEntryAttempt::Unsupported(format!(
+                "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+                errors.len()
+            ));
+        }
+        if self.options.superinstructions.is_enabled() {
+            let report = dense.select_superinstructions();
+            self.record_counter_superinstruction_selection(&report);
+            if let Err(errors) = dense.verify() {
+                return BytecodeEntryAttempt::Unsupported(format!(
+                    "E_PHP_VM_DENSE_SUPERINSTRUCTION_VERIFY: selected dense bytecode failed verification with {} error(s)",
+                    errors.len()
+                ));
+            }
+        }
+        self.record_counter_bytecode_lower_success();
+        let entry = compiled.unit().entry;
+        let Some(dense_function) = dense.functions.get(entry.index()) else {
+            return BytecodeEntryAttempt::Unsupported(
+                "E_PHP_VM_DENSE_BYTECODE_ENTRY: dense bytecode entry function is missing"
+                    .to_string(),
+            );
+        };
+        let Some(ir_function) = compiled.unit().functions.get(entry.index()) else {
+            return BytecodeEntryAttempt::Unsupported(
+                "E_PHP_VM_DENSE_BYTECODE_ENTRY: IR entry function is missing".to_string(),
+            );
+        };
+        BytecodeEntryAttempt::Executed(Box::new(self.execute_bytecode_function(
+            compiled,
+            &dense,
+            dense_function,
+            ir_function,
+            entry,
+            output,
+            stack,
+            state,
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_bytecode_function(
+        &self,
+        compiled: &CompiledUnit,
+        dense: &DenseBytecodeUnit,
+        dense_function: &DenseFunction,
+        ir_function: &IrFunction,
+        function_id: FunctionId,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let reused_frame = stack.push_reusable_frame(
+            function_id,
+            dense_function.register_count,
+            dense_function.local_count,
+            None,
+            None,
+            None,
+        );
+        self.record_counter_frame_activation(reused_frame);
+        if ir_function.flags.is_top_level {
+            bind_top_level_global_locals(ir_function, stack, state);
+        }
+        let unit_id = compiled.unit().id;
+        let mut block_index = 0_u32;
+        let mut steps = 0_usize;
+        'dispatch: loop {
+            steps += 1;
+            if steps > self.options.max_steps {
+                let result = self.runtime_error(output, compiled, stack, "VM step limit exceeded");
+                stack.pop_recycle();
+                return result;
+            }
+            let Some(block) = dense_function.blocks.get(block_index as usize) else {
+                let result = self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!("invalid dense bytecode block block:{block_index}"),
+                );
+                stack.pop_recycle();
+                return result;
+            };
+            let start = block.first_instruction as usize;
+            let end = start + block.instruction_len as usize;
+            let Some(instructions) = dense_function.instructions.get(start..end) else {
+                let result = self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!("invalid dense bytecode instruction range for block:{block_index}"),
+                );
+                stack.pop_recycle();
+                return result;
+            };
+            let mut instruction_offset = 0_usize;
+            while instruction_offset < instructions.len() {
+                let instruction = &instructions[instruction_offset];
+                let dense_instruction_index = start + instruction_offset;
+                let dense_instruction_index = match u32::try_from(dense_instruction_index) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        let result = self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_VM_DENSE_BYTECODE_SITE_INDEX_OVERFLOW: dense instruction index exceeds u32",
+                        );
+                        stack.pop_recycle();
+                        return result;
+                    }
+                };
+                let next_instruction_offset = if instruction.opcode.is_superinstruction()
+                    && instruction_offset + 1 < instructions.len()
+                {
+                    instruction_offset + 2
+                } else {
+                    instruction_offset + 1
+                };
+                self.record_counter_bytecode_instruction(instruction.opcode);
+                self.record_counter_superinstruction_executed(instruction.opcode);
+                self.observe_dense_quickening(unit_id, function_id, dense_instruction_index);
+                match instruction.opcode {
+                    DenseOpcode::Nop => {}
+                    DenseOpcode::LoadConst => {
+                        let DenseOperands::RegConst { dst, constant } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self
+                            .constant_value(compiled.unit(), ConstId::new(constant))
+                        {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::LoadConstEcho => {
+                        let DenseOperands::RegConst { dst, constant } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self
+                            .constant_value(compiled.unit(), ConstId::new(constant))
+                        {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value.clone())
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
+                        {
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::Move | DenseOpcode::LoadLocal => {
+                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::LoadLocalEcho => {
+                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value.clone())
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
+                        {
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::StoreLocal => {
+                        let DenseOperands::LocalOperand { local, src } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .locals
+                            .set(LocalId::new(local), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::BinaryConcatEcho => {
+                        let DenseOperands::Binary { dst, lhs, rhs } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let lhs = match self.read_dense_operand(compiled, stack, lhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let rhs = match self.read_dense_operand(compiled, stack, rhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = self.try_quickened_dense_concat_string_string(
+                            unit_id,
+                            function_id,
+                            dense_instruction_index,
+                            &lhs,
+                            &rhs,
+                        );
+                        let value = match value {
+                            Some(value) => value,
+                            None => match self.execute_binary(
+                                compiled,
+                                BinaryOp::Concat,
+                                &lhs,
+                                &rhs,
+                                runtime_source_span(compiled, span),
+                                output,
+                                stack,
+                                state,
+                            ) {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value.clone())
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
+                        {
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::BinaryAdd
+                    | DenseOpcode::BinarySub
+                    | DenseOpcode::BinaryMul
+                    | DenseOpcode::BinaryDiv
+                    | DenseOpcode::BinaryMod
+                    | DenseOpcode::BinaryConcat
+                    | DenseOpcode::BinaryPow
+                    | DenseOpcode::BinaryBitAnd
+                    | DenseOpcode::BinaryBitOr
+                    | DenseOpcode::BinaryBitXor
+                    | DenseOpcode::BinaryShiftLeft
+                    | DenseOpcode::BinaryShiftRight => {
+                        let DenseOperands::Binary { dst, lhs, rhs } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let lhs = match self.read_dense_operand(compiled, stack, lhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let rhs = match self.read_dense_operand(compiled, stack, rhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let op = dense_binary_op(instruction.opcode)
+                            .expect("dense binary opcode matched");
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = match op {
+                            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => self
+                                .try_quickened_dense_int_int_binary(
+                                    unit_id,
+                                    function_id,
+                                    dense_instruction_index,
+                                    op,
+                                    &lhs,
+                                    &rhs,
+                                ),
+                            BinaryOp::Concat => self.try_quickened_dense_concat_string_string(
+                                unit_id,
+                                function_id,
+                                dense_instruction_index,
+                                &lhs,
+                                &rhs,
+                            ),
+                            _ => None,
+                        };
+                        let value = match value {
+                            Some(value) => value,
+                            None => match self.execute_binary(
+                                compiled,
+                                op,
+                                &lhs,
+                                &rhs,
+                                runtime_source_span(compiled, span),
+                                output,
+                                stack,
+                                state,
+                            ) {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::CompareEqual
+                    | DenseOpcode::CompareNotEqual
+                    | DenseOpcode::CompareIdentical
+                    | DenseOpcode::CompareNotIdentical
+                    | DenseOpcode::CompareLess
+                    | DenseOpcode::CompareLessEqual
+                    | DenseOpcode::CompareGreater
+                    | DenseOpcode::CompareGreaterEqual
+                    | DenseOpcode::CompareSpaceship => {
+                        let DenseOperands::Binary { dst, lhs, rhs } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let lhs = match self.read_dense_operand(compiled, stack, lhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let rhs = match self.read_dense_operand(compiled, stack, rhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let op = dense_compare_op(instruction.opcode)
+                            .expect("dense compare opcode matched");
+                        let value = match execute_compare(op, &lhs, &rhs) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::UnaryPlus
+                    | DenseOpcode::UnaryMinus
+                    | DenseOpcode::UnaryNot
+                    | DenseOpcode::UnaryBitNot => {
+                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let src = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let op =
+                            dense_unary_op(instruction.opcode).expect("dense unary opcode matched");
+                        let value = match execute_unary(op, &src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::CallFunction => {
+                        let DenseOperands::Call {
+                            dst,
+                            name,
+                            ref args,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(name) = dense.names.get(name as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode name n{name}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let mut values = Vec::with_capacity(args.len());
+                        for arg in args {
+                            match self.read_dense_operand(compiled, stack, *arg) {
+                                Ok(value) => values.push(CallArgument::positional(value)),
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            }
+                        }
+                        let lowered_name = normalize_function_name(name);
+                        let Some(target) =
+                            self.resolve_function_call_target(compiled, state, &lowered_name)
+                        else {
+                            let diagnostic = undefined_function(
+                                name,
+                                RuntimeSourceSpan::default(),
+                                stack_trace(compiled, stack),
+                            );
+                            let result = VmResult::runtime_error_with_diagnostic(
+                                output.clone(),
+                                diagnostic.message().to_owned(),
+                                diagnostic,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let result = self.execute_function_call_target(
+                            compiled, target, values, None, output, stack, state, &None,
+                        );
+                        if !result.status.is_success() {
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if result.fiber_suspension.is_some() {
+                            let result = VmResult::unsupported(
+                                output.clone(),
+                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode direct calls do not support fiber suspension yet",
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        let return_value = result.return_value.unwrap_or(Value::Null);
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode caller frame is active")
+                            .registers
+                            .set(RegId::new(dst), return_value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::Echo => {
+                        let DenseOperands::Operand { src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
+                        {
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::Discard => {
+                        let DenseOperands::Operand { src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        if let Err(message) = self.read_dense_operand(compiled, stack, src) {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::Jump => {
+                        let DenseOperands::Jump { target } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        block_index = target;
+                        continue 'dispatch;
+                    }
+                    DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue => {
+                        let DenseOperands::JumpIf { condition, target } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, condition) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let truthy = self.try_quickened_dense_bool_branch(
+                            unit_id,
+                            function_id,
+                            dense_instruction_index,
+                            &value,
+                        );
+                        let truthy = match truthy {
+                            Some(value) => value,
+                            None => match to_bool(&value) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                        };
+                        let jump = if instruction.opcode == DenseOpcode::JumpIfFalse {
+                            !truthy
+                        } else {
+                            truthy
+                        };
+                        block_index = if jump {
+                            target
+                        } else {
+                            match next_dense_block_index(dense_function, block_index) {
+                                Ok(next) => next,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            }
+                        };
+                        continue 'dispatch;
+                    }
+                    DenseOpcode::JumpIf => {
+                        let DenseOperands::JumpIfElse {
+                            condition,
+                            if_true,
+                            if_false,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, condition) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let truthy = self.try_quickened_dense_bool_branch(
+                            unit_id,
+                            function_id,
+                            dense_instruction_index,
+                            &value,
+                        );
+                        let truthy = match truthy {
+                            Some(value) => value,
+                            None => match to_bool(&value) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                        };
+                        block_index = if truthy { if_true } else { if_false };
+                        continue 'dispatch;
+                    }
+                    DenseOpcode::Return => {
+                        let DenseOperands::Return { value } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match value {
+                            Some(value) => match self.read_dense_operand(compiled, stack, value) {
+                                Ok(value) => Some(value),
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                            None => None,
+                        };
+                        let value = match coerce_return_value(
+                            compiled,
+                            ir_function,
+                            value,
+                            self.typecheck_fast_path_context(),
+                        ) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        stack.pop_recycle();
+                        return VmResult::success(output.clone(), value);
+                    }
+                }
+                instruction_offset = next_instruction_offset;
+            }
+            let result = self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("dense bytecode block block:{block_index} has no terminator"),
+            );
+            stack.pop_recycle();
+            return result;
+        }
+    }
+
+    fn read_dense_operand(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+        operand: DenseOperand,
+    ) -> Result<Value, String> {
+        match operand.kind {
+            DenseOperandKind::Register => {
+                let frame = stack.current().ok_or("no active frame")?;
+                let Some(value) = frame.registers.get(RegId::new(operand.index)) else {
+                    return Err(format!("invalid register r{}", operand.index));
+                };
+                if value.is_uninitialized() {
+                    return Err(format!("read uninitialized register r{}", operand.index));
+                }
+                Ok(value.clone())
+            }
+            DenseOperandKind::Local => {
+                let frame = stack.current().ok_or("no active frame")?;
+                let Some(value) = frame.locals.get(LocalId::new(operand.index)) else {
+                    return Err(format!("invalid local local:{}", operand.index));
+                };
+                Ok(if value.is_uninitialized() {
+                    Value::Null
+                } else {
+                    value
+                })
+            }
+            DenseOperandKind::Constant => {
+                self.constant_value(compiled.unit(), ConstId::new(operand.index))
+            }
+        }
+    }
+
+    fn invalid_bytecode_operand_shape(
+        &self,
+        output: &mut OutputBuffer,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+        instruction: &DenseInstruction,
+    ) -> VmResult {
+        self.runtime_error(
+            output,
+            compiled,
+            stack,
+            format!(
+                "E_PHP_VM_DENSE_BYTECODE_OPERAND_SHAPE: opcode {} has invalid operand payload",
+                instruction.opcode.as_str()
+            ),
+        )
+    }
+
     fn execute_function(
         &self,
         compiled: &CompiledUnit,
@@ -3482,6 +5195,11 @@ impl Vm {
             exception_handlers = continuation.exception_handlers;
             pending_control = continuation.pending_control;
             stack.push(continuation.frame);
+            self.record_counter_frame_reuse_blocked("fiber_continuation");
+            stack
+                .current_mut()
+                .expect("resumed fiber frame is active")
+                .reuse_eligible = false;
             match call
                 .resume_fiber_input
                 .take()
@@ -3521,6 +5239,11 @@ impl Vm {
             exception_handlers = continuation.exception_handlers;
             pending_control = continuation.pending_control;
             stack.push(continuation.frame);
+            self.record_counter_frame_reuse_blocked("generator_continuation");
+            stack
+                .current_mut()
+                .expect("resumed generator frame is active")
+                .reuse_eligible = false;
             match call
                 .resume_input
                 .take()
@@ -3562,6 +5285,8 @@ impl Vm {
                 && call.shared_top_level_locals.is_none()
                 && call.running_generator.is_none()
                 && call.running_fiber.is_none();
+            let frame_reuse_call_shape_reason =
+                frame_reuse_call_shape_blocked_reason(function, &call);
             let prepared = match prepare_arguments(
                 compiled,
                 function,
@@ -3574,6 +5299,8 @@ impl Vm {
                     return self.runtime_error(output, compiled, stack, message);
                 }
             };
+            let frame_reuse_blocked_reason = frame_reuse_call_shape_reason
+                .or_else(|| frame_reuse_prepared_args_blocked_reason(&prepared.args));
             let args = prepared.args;
             for diagnostic in prepared.diagnostics {
                 let handled = match self.dispatch_error_handler(
@@ -3599,6 +5326,7 @@ impl Vm {
                 }
             }
             if function.flags.is_generator && call.running_generator.is_none() {
+                self.record_counter_frame_reuse_blocked("generator");
                 if function.returns_by_ref {
                     return self.runtime_error(
                         output,
@@ -3635,14 +5363,27 @@ impl Vm {
             ) {
                 return VmResult::success(output.clone(), Some(value));
             }
-            let reused_frame = stack.push_reusable_frame(
-                function_id,
-                function.register_count,
-                function.local_count,
-                call.scope_class.take(),
-                call.called_class.take(),
-                call.declaring_class.take(),
-            );
+            let reused_frame = if let Some(reason) = frame_reuse_blocked_reason {
+                self.record_counter_frame_reuse_blocked(reason);
+                stack.push_fresh_frame(
+                    function_id,
+                    function.register_count,
+                    function.local_count,
+                    call.scope_class.take(),
+                    call.called_class.take(),
+                    call.declaring_class.take(),
+                );
+                false
+            } else {
+                stack.push_reusable_frame(
+                    function_id,
+                    function.register_count,
+                    function.local_count,
+                    call.scope_class.take(),
+                    call.called_class.take(),
+                    call.declaring_class.take(),
+                )
+            };
             self.record_counter_frame_activation(reused_frame);
             stack.current_mut().expect("frame was pushed").arguments =
                 args.iter().map(|arg| arg.value.clone()).collect();
@@ -3818,13 +5559,15 @@ impl Vm {
                             }
                         };
                         let value = match *op {
-                            BinaryOp::Add => self.try_quickened_add_int_int(
-                                function_id,
-                                block_id,
-                                instruction.id,
-                                &lhs,
-                                &rhs,
-                            ),
+                            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => self
+                                .try_quickened_int_int_binary(
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                    *op,
+                                    &lhs,
+                                    &rhs,
+                                ),
                             BinaryOp::Concat => self.try_quickened_concat_string_string(
                                 function_id,
                                 block_id,
@@ -5630,56 +7373,23 @@ impl Vm {
                                 Vec::new(),
                             ),
                         );
-                        if !resolved.property.flags.is_static
-                            && !resolved.property.flags.is_protected
-                            && resolved.property.hooks.get.is_none()
-                            && resolved.property.hooks.set.is_none()
-                            && !property_hook_is_active(
-                                state,
-                                &object,
-                                resolved.class,
-                                resolved.property,
-                            )
-                        {
-                            let cache_scope = resolved
-                                .property
-                                .flags
-                                .is_private
-                                .then(|| normalize_class_name(&resolved.class.name));
-                            if !resolved.property.flags.is_private
-                                || cache_scope.as_deref() == normalized_scope.as_deref()
-                            {
-                                let target = match dynamic_class_owner_index_in_state(
-                                    state,
-                                    &resolved.class.name,
-                                ) {
-                                    Some(unit_index) => PropertyFetchCacheTarget::DynamicUnit {
-                                        unit_index,
-                                        receiver_class: receiver_class.clone(),
-                                        declaring_class: resolved.class.name.clone(),
-                                        property: resolved.property.name.clone(),
-                                        storage_name: storage_name.clone(),
-                                    },
-                                    None => PropertyFetchCacheTarget::CurrentUnit {
-                                        receiver_class: receiver_class.clone(),
-                                        declaring_class: resolved.class.name.clone(),
-                                        property: resolved.property.name.clone(),
-                                        storage_name: storage_name.clone(),
-                                    },
-                                };
-                                self.install_property_fetch_inline_cache(
-                                    compiled,
-                                    function_id,
-                                    block_id,
-                                    instruction.id,
-                                    property,
-                                    &receiver_class,
-                                    cache_scope.as_deref(),
-                                    lookup_epoch,
-                                    target,
-                                );
-                            }
-                        }
+                        self.maybe_install_property_fetch_inline_cache_target(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            property,
+                            &receiver_class,
+                            &class,
+                            resolved.class,
+                            resolved.property,
+                            &storage_name,
+                            normalized_scope.as_deref(),
+                            lookup_epoch,
+                            receiver_has_magic_get,
+                            state,
+                            &object,
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -7046,8 +8756,13 @@ impl Vm {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), false)
                         } else {
                             let was_packed = local_array_is_packed_fast(stack, *local);
+                            let cow_or_reference =
+                                local_array_has_cow_or_reference_fallback(stack, *local);
                             let result =
                                 assign_dim_local(stack, *local, &dims, value.clone(), false);
+                            if result.is_ok() && cow_or_reference {
+                                self.record_counter_cow_or_reference_fallback();
+                            }
                             if result.is_ok()
                                 && was_packed
                                 && !local_array_is_packed_fast(stack, *local)
@@ -7091,11 +8806,17 @@ impl Vm {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), true)
                         } else {
                             let was_packed = local_array_is_packed_fast(stack, *local);
+                            let cow_or_reference =
+                                local_array_has_cow_or_reference_fallback(stack, *local);
                             let result =
                                 assign_dim_local(stack, *local, &dims, value.clone(), true);
+                            if result.is_ok() && cow_or_reference {
+                                self.record_counter_cow_or_reference_fallback();
+                            }
                             if result.is_ok()
                                 && dims.is_empty()
                                 && was_packed
+                                && !cow_or_reference
                                 && local_array_is_packed_fast(stack, *local)
                             {
                                 self.record_counter_array_packed_append_fast_path_hit();
@@ -7775,6 +9496,7 @@ impl Vm {
                         };
                         let lowered_name = normalize_function_name(name);
                         let epoch = state.lookup_epoch();
+                        let call_shape = function_call_shape(&values);
                         let target = self
                             .lookup_function_call_inline_cache(
                                 compiled,
@@ -7783,6 +9505,7 @@ impl Vm {
                                 instruction.id,
                                 &lowered_name,
                                 epoch,
+                                &call_shape,
                             )
                             .or_else(|| {
                                 let resolved = self.resolve_function_call_target(
@@ -7790,6 +9513,11 @@ impl Vm {
                                     state,
                                     &lowered_name,
                                 )?;
+                                if self.options.inline_caches.enabled()
+                                    && function_call_target_is_builtin(&resolved)
+                                {
+                                    self.record_counter_builtin_call_ic(false);
+                                }
                                 self.install_function_call_inline_cache(
                                     compiled,
                                     function_id,
@@ -7797,6 +9525,7 @@ impl Vm {
                                     instruction.id,
                                     &lowered_name,
                                     epoch,
+                                    call_shape.clone(),
                                     resolved.clone(),
                                 );
                                 Some(resolved)
@@ -11599,52 +13328,96 @@ impl Vm {
         stack: &CallStack,
         state: &ExecutionState,
     ) -> Result<PropertyFetchCacheRead, String> {
-        let (owner, declaring_class_name, property_name, storage_name) = match target {
-            PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: _,
-                declaring_class,
-                property,
-                storage_name,
-            } => (compiled.clone(), declaring_class, property, storage_name),
-            PropertyFetchCacheTarget::DynamicUnit {
-                unit_index,
-                receiver_class: _,
-                declaring_class,
-                property,
-                storage_name,
-            } => {
+        let (owner, target) = match target {
+            PropertyFetchCacheTarget::CurrentUnit { target } => (compiled.clone(), target),
+            PropertyFetchCacheTarget::DynamicUnit { unit_index, target } => {
                 let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    self.record_counter_property_ic_fallback("dynamic_unit_missing");
                     return Ok(PropertyFetchCacheRead::Fallback);
                 };
-                (owner, declaring_class, property, storage_name)
+                (owner, target)
             }
         };
-        let Some(declaring_class) = owner.lookup_class(&declaring_class_name) else {
+        let PropertyFetchResolvedTarget {
+            receiver_class,
+            declaring_class: declaring_class_name,
+            property: property_name,
+            storage_name,
+            layout,
+        } = *target;
+        if state.lookup_epoch().raw() != layout.layout_version {
+            self.record_counter_property_ic_fallback("layout_epoch_mismatch");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if normalize_class_name(&object.class_name()) != receiver_class {
+            self.record_counter_property_ic_fallback("receiver_class_mismatch");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        let Some(receiver_class_entry) =
+            lookup_class_in_state(compiled, state, &object.class_name())
+        else {
+            self.record_counter_property_ic_fallback("receiver_class_missing");
             return Ok(PropertyFetchCacheRead::Fallback);
         };
-        let Some(property) = declaring_class
+        if receiver_class_entry.id.raw() != layout.class_id {
+            self.record_counter_property_ic_fallback("class_id_mismatch");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if layout.dynamic_property_fallback {
+            self.record_counter_property_ic_fallback("dynamic_property_fallback");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if layout.has_property_hooks {
+            self.record_counter_property_ic_fallback("property_hook_metadata");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if !layout.typed_property_initialized {
+            self.record_counter_property_ic_fallback("uninitialized_metadata");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name) else {
+            self.record_counter_property_ic_fallback("declaring_class_missing");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        };
+        let Some((property_index, property)) = declaring_class
             .properties
             .iter()
-            .find(|entry| entry.name == property_name)
+            .enumerate()
+            .find(|(_, entry)| entry.name == property_name)
         else {
+            self.record_counter_property_ic_fallback("property_missing");
             return Ok(PropertyFetchCacheRead::Fallback);
         };
+        if layout.property_slot_index != Some(property_index as u32) {
+            self.record_counter_property_ic_fallback("property_slot_mismatch");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
+        if property_storage_name(declaring_class, property) != storage_name {
+            self.record_counter_property_ic_fallback("storage_name_mismatch");
+            return Ok(PropertyFetchCacheRead::Fallback);
+        }
         if property.flags.is_static || property.flags.is_protected {
+            self.record_counter_property_ic_fallback("static_or_protected_property");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
         if property.hooks.get.is_some() || property.hooks.set.is_some() {
+            self.record_counter_property_ic_fallback("property_hook_present");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
         if property_hook_is_active(state, object, declaring_class, property) {
+            self.record_counter_property_ic_fallback("property_hook_active");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
         if validate_property_access(&owner, stack, declaring_class, property).is_err() {
+            self.record_counter_property_ic_fallback("visibility_mismatch");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
         let Some(value) = object.get_property(&storage_name) else {
+            self.record_counter_property_ic_fallback("storage_missing");
             return Ok(PropertyFetchCacheRead::Fallback);
         };
         if matches!(value, Value::Uninitialized) {
+            self.record_counter_property_ic_fallback("uninitialized_typed_property");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
         Ok(PropertyFetchCacheRead::Value(value))
@@ -12051,7 +13824,9 @@ impl Vm {
     ) -> Result<ForeachIterator, VmResult> {
         match source {
             Value::Array(array) => {
-                if array.is_packed_fast() {
+                if array.is_packed_fast() && array.contains_references_fast() {
+                    self.record_counter_cow_or_reference_fallback();
+                } else if array.is_packed_fast() {
                     self.record_counter_array_sequential_foreach_fast_path_hit();
                 }
                 Ok(ForeachIterator::Snapshot {
@@ -18854,6 +20629,34 @@ fn property_has_hooks_or_active(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn property_fetch_layout_metadata(
+    receiver_class: &php_ir::module::ClassEntry,
+    declaring_class: &php_ir::module::ClassEntry,
+    property: &php_ir::module::ClassPropertyEntry,
+    visibility_context: Option<&str>,
+    layout_version: InvalidationEpoch,
+    has_magic_get: bool,
+    has_property_hooks: bool,
+    dynamic_property_fallback: bool,
+    typed_property_initialized: bool,
+) -> PropertyFetchLayoutMetadata {
+    PropertyFetchLayoutMetadata {
+        class_id: receiver_class.id.raw(),
+        layout_version: layout_version.raw(),
+        property_slot_index: declaring_class
+            .properties
+            .iter()
+            .position(|entry| entry.name == property.name)
+            .map(|index| index as u32),
+        visibility_context: visibility_context.map(str::to_owned),
+        typed_property_initialized,
+        has_property_hooks,
+        has_magic_get,
+        dynamic_property_fallback,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn property_fetch_profile_observation(
     callsite: &str,
     property: &str,
@@ -22121,6 +23924,28 @@ fn internal_function_dispatch_cacheable(name: &str) -> bool {
         )
 }
 
+fn fast_builtin_stub_supported(name: &str) -> bool {
+    matches!(
+        name,
+        "strlen" | "count" | "is_int" | "is_string" | "is_array"
+    )
+}
+
+fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
+    if values.len() != 1 || matches!(values.first(), Some(Value::Reference(_))) {
+        return None;
+    }
+    let value = values.first()?;
+    match (name, value) {
+        ("strlen", Value::String(string)) => Some(Value::Int(string.len() as i64)),
+        ("count", Value::Array(array)) => Some(Value::Int(array.len() as i64)),
+        ("is_int", value) => Some(Value::Bool(matches!(value, Value::Int(_)))),
+        ("is_string", value) => Some(Value::Bool(matches!(value, Value::String(_)))),
+        ("is_array", value) => Some(Value::Bool(matches!(value, Value::Array(_)))),
+        _ => None,
+    }
+}
+
 fn execute_builtin_entry(
     entry: BuiltinEntry,
     args: Vec<Value>,
@@ -23234,6 +25059,23 @@ fn local_array_is_packed_fast(stack: &CallStack, local: LocalId) -> bool {
         return false;
     };
     matches!(effective_value(&value), Value::Array(array) if array.is_packed_fast())
+}
+
+fn local_array_has_cow_or_reference_fallback(stack: &CallStack, local: LocalId) -> bool {
+    let Some(slot) = stack
+        .current()
+        .and_then(|frame| frame.locals.get_slot(local))
+    else {
+        return false;
+    };
+    match slot {
+        Slot::Value(Value::Array(array)) => array.is_shared() || array.contains_references_fast(),
+        Slot::Reference(cell) => match &*cell.borrow() {
+            Value::Array(array) => array.is_shared() || array.contains_references_fast(),
+            _ => true,
+        },
+        _ => false,
+    }
 }
 
 fn foreach_array_keys_from_local(
@@ -24786,6 +26628,93 @@ fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, Str
         ));
     }
     Ok(BlockId::new(next))
+}
+
+fn next_dense_block_index(function: &DenseFunction, current: u32) -> Result<u32, String> {
+    let next = current + 1;
+    if next as usize >= function.blocks.len() {
+        return Err(format!(
+            "fallthrough dense block after block:{current} is missing"
+        ));
+    }
+    Ok(next)
+}
+
+fn dense_binary_op(opcode: DenseOpcode) -> Option<BinaryOp> {
+    match opcode {
+        DenseOpcode::BinaryAdd => Some(BinaryOp::Add),
+        DenseOpcode::BinarySub => Some(BinaryOp::Sub),
+        DenseOpcode::BinaryMul => Some(BinaryOp::Mul),
+        DenseOpcode::BinaryDiv => Some(BinaryOp::Div),
+        DenseOpcode::BinaryMod => Some(BinaryOp::Mod),
+        DenseOpcode::BinaryConcat => Some(BinaryOp::Concat),
+        DenseOpcode::BinaryPow => Some(BinaryOp::Pow),
+        DenseOpcode::BinaryBitAnd => Some(BinaryOp::BitAnd),
+        DenseOpcode::BinaryBitOr => Some(BinaryOp::BitOr),
+        DenseOpcode::BinaryBitXor => Some(BinaryOp::BitXor),
+        DenseOpcode::BinaryShiftLeft => Some(BinaryOp::ShiftLeft),
+        DenseOpcode::BinaryShiftRight => Some(BinaryOp::ShiftRight),
+        _ => None,
+    }
+}
+
+fn int_int_specialization_for_binary_op(op: BinaryOp) -> Option<QuickeningSpecialization> {
+    match op {
+        BinaryOp::Add => Some(QuickeningSpecialization::AddIntInt),
+        BinaryOp::Sub => Some(QuickeningSpecialization::SubIntInt),
+        BinaryOp::Mul => Some(QuickeningSpecialization::MulIntInt),
+        BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::Concat
+        | BinaryOp::Pow
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => None,
+    }
+}
+
+fn checked_int_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Option<i64> {
+    match op {
+        BinaryOp::Add => lhs.checked_add(rhs),
+        BinaryOp::Sub => lhs.checked_sub(rhs),
+        BinaryOp::Mul => lhs.checked_mul(rhs),
+        BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::Concat
+        | BinaryOp::Pow
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => None,
+    }
+}
+
+fn dense_compare_op(opcode: DenseOpcode) -> Option<CompareOp> {
+    match opcode {
+        DenseOpcode::CompareEqual => Some(CompareOp::Equal),
+        DenseOpcode::CompareNotEqual => Some(CompareOp::NotEqual),
+        DenseOpcode::CompareIdentical => Some(CompareOp::Identical),
+        DenseOpcode::CompareNotIdentical => Some(CompareOp::NotIdentical),
+        DenseOpcode::CompareLess => Some(CompareOp::Less),
+        DenseOpcode::CompareLessEqual => Some(CompareOp::LessEqual),
+        DenseOpcode::CompareGreater => Some(CompareOp::Greater),
+        DenseOpcode::CompareGreaterEqual => Some(CompareOp::GreaterEqual),
+        DenseOpcode::CompareSpaceship => Some(CompareOp::Spaceship),
+        _ => None,
+    }
+}
+
+fn dense_unary_op(opcode: DenseOpcode) -> Option<UnaryOp> {
+    match opcode {
+        DenseOpcode::UnaryPlus => Some(UnaryOp::Plus),
+        DenseOpcode::UnaryMinus => Some(UnaryOp::Minus),
+        DenseOpcode::UnaryNot => Some(UnaryOp::Not),
+        DenseOpcode::UnaryBitNot => Some(UnaryOp::BitNot),
+        _ => None,
+    }
 }
 
 fn execute_arithmetic(op: BinaryOp, lhs: NumericValue, rhs: NumericValue) -> Result<Value, String> {
@@ -29369,19 +31298,105 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert_eq!(on.diagnostics, off.diagnostics);
         let counters = on.counters.expect("counters");
         assert!(
-            counters.array_packed_append_fast_path_hits >= 8,
+            counters.array_packed_append_fast_path_hits >= 7,
             "{counters:?}"
         );
+        assert!(counters.packed_append_fast_hits >= 7, "{counters:?}");
         assert!(
             counters.array_packed_read_fast_path_hits > 0,
             "{counters:?}"
         );
+        assert!(counters.packed_fetch_fast_hits > 0, "{counters:?}");
         assert!(
             counters.array_sequential_foreach_fast_path_hits > 0,
             "{counters:?}"
         );
+        assert!(counters.packed_foreach_fast_hits > 0, "{counters:?}");
         assert!(counters.array_count_fast_path_hits > 0, "{counters:?}");
         assert_eq!(counters.array_packed_to_mixed_transitions, 0);
+    }
+
+    #[test]
+    fn packed_array_fast_paths_record_guard_fallback_reasons() {
+        let bounds_source = "<?php
+            $items = [10, 20, 30];
+            $sum = 0;
+            for ($i = 0; $i < 16; $i++) {
+                if ($i === 12) {
+                    unset($items[2]);
+                }
+                $sum += $items[2];
+            }
+            echo $sum;
+        ";
+        let bounds = execute_source_with_options(
+            bounds_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(bounds.status.is_success(), "{:?}", bounds.status);
+        let bounds_counters = bounds.counters.expect("bounds counters");
+        assert!(
+            bounds_counters.packed_fetch_bounds_fallbacks > 0,
+            "{bounds_counters:?}"
+        );
+
+        let layout_source = "<?php
+            $items = [10, 20, 30];
+            $sum = 0;
+            for ($i = 0; $i < 16; $i++) {
+                if ($i === 12) {
+                    $items['x'] = 40;
+                }
+                $sum += $items[1];
+            }
+            echo $sum;
+        ";
+        let layout = execute_source_with_options(
+            layout_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(layout.status.is_success(), "{:?}", layout.status);
+        let layout_counters = layout.counters.expect("layout counters");
+        assert!(
+            layout_counters.packed_fetch_layout_fallbacks > 0,
+            "{layout_counters:?}"
+        );
+
+        let cow_reference_source = "<?php
+            $items = [1, 2, 3];
+            $copy = $items;
+            $copy[] = 4;
+            $ref =& $items[1];
+            foreach ($items as $value) {
+                echo $value;
+            }
+        ";
+        let cow_reference = execute_source_with_options(
+            cow_reference_source,
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(
+            cow_reference.status.is_success(),
+            "{:?}",
+            cow_reference.status
+        );
+        let cow_reference_counters = cow_reference.counters.expect("cow counters");
+        assert!(
+            cow_reference_counters.cow_or_reference_fallbacks > 0,
+            "{cow_reference_counters:?}"
+        );
     }
 
     #[test]
@@ -29451,10 +31466,8 @@ echo perf_jit_unstable_types_debug(4), "\n";
             counters.array_packed_append_fast_path_hits > 0,
             "{counters:?}"
         );
-        assert!(
-            counters.array_sequential_foreach_fast_path_hits > 0,
-            "{counters:?}"
-        );
+        assert!(counters.packed_append_fast_hits > 0, "{counters:?}");
+        assert!(counters.cow_or_reference_fallbacks > 0, "{counters:?}");
     }
 
     #[test]
@@ -29624,6 +31637,13 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let counters = result.counters.expect("counters");
         assert!(counters.frame_allocations > 0, "{counters:?}");
         assert!(counters.frame_reuses > 0, "{counters:?}");
+        assert_eq!(counters.frames_allocated, counters.frame_allocations);
+        assert_eq!(counters.frames_reused, counters.frame_reuses);
+        assert_eq!(
+            counters.register_files_allocated,
+            counters.frame_allocations
+        );
+        assert_eq!(counters.register_files_reused, counters.frame_reuses);
     }
 
     #[test]
@@ -29644,6 +31664,51 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn frame_reuse_blocks_closure_captures_conservatively() {
+        let source =
+            "<?php $base = 2; $f = function ($x) use ($base) { return $x + $base; }; echo $f(5);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"7");
+        let counters = result.counters.expect("counters");
+        assert_eq!(
+            counters
+                .frame_reuse_blocked_by_reason
+                .get("closure_capture"),
+            Some(&1),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn frame_reuse_blocks_by_ref_params_conservatively() {
+        let source = "<?php function bump_frame_ref(&$x) { $x = $x + 1; } $value = 1; bump_frame_ref($value); bump_frame_ref($value); echo $value;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"3");
+        let counters = result.counters.expect("counters");
+        assert_eq!(
+            counters.frame_reuse_blocked_by_reason.get("by_ref_param"),
+            Some(&2),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
     fn frame_reuse_preserves_exceptions_through_calls() {
         let source = "<?php function frame_reuse_finally($v) { try { return $v; } finally { echo 'finally|'; } } echo frame_reuse_finally('ok');";
         let result = execute_source_with_options(
@@ -29656,6 +31721,12 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"finally|ok");
+        let counters = result.counters.expect("counters");
+        assert_eq!(
+            counters.frame_reuse_blocked_by_reason.get("try_finally"),
+            Some(&1),
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -29671,6 +31742,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"m|after|d");
+        let counters = result.counters.expect("counters");
+        assert_eq!(
+            counters
+                .frame_reuse_blocked_by_reason
+                .get("destructor_sensitive_value"),
+            Some(&1),
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -29684,6 +31763,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
         assert!(generator.status.is_success(), "{:?}", generator.status);
         assert_eq!(generator.output.as_bytes(), b"v");
+        let generator_counters = generator.counters.expect("counters");
+        assert!(
+            generator_counters
+                .frame_reuse_blocked_by_reason
+                .get("generator")
+                .is_some_and(|count| *count >= 1),
+            "{generator_counters:?}"
+        );
 
         let fiber = execute_source_with_options(
             "<?php $fiber = new Fiber(function() { echo 'a'; Fiber::suspend('s'); echo 'b'; }); echo $fiber->start(); echo '|'; $fiber->resume('r');",

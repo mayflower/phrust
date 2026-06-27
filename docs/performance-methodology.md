@@ -312,9 +312,14 @@ Work item adds offline framework-like smokes in
 `tests/fixtures/performance/framework_smoke/`:
 
 - router dispatch;
+- Composer/autoload-like lookup;
 - DI-container lookup;
+- DTO hydration;
 - attribute/reflection warm path;
-- template-like string output.
+- template-like string output;
+- JSON/API-like response generation;
+- object property and method loops;
+- packed and mixed array traversal.
 
 Run them with:
 
@@ -324,6 +329,9 @@ nix develop -c just perf-report
 ```
 
 The smoke compares opt-off against opt-on (`--opt-level=2`, quickening on,
-inline caches on) and writes `target/performance/framework-smoke/summary.json`.
-`perf-report` includes that summary when present. The fixtures are local and do
-not use Packagist or vendored framework repositories.
+inline caches on), checks stdout/stderr/exit-status parity, writes
+`target/performance/framework-smoke/summary.json`, and regenerates
+`docs/performance-framework-corpus.md`. `perf-report` includes that summary when
+present. The fixtures are local and do not use Packagist or vendored framework
+repositories. They collect counters, not wall-clock timings; any timing derived
+from this corpus is local and advisory.

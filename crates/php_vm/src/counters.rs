@@ -102,17 +102,33 @@ pub struct VmCounters {
     pub jit_mode: String,
     pub jit_threshold: u64,
     pub instructions_executed: u64,
+    pub bytecode_lower_attempts: u64,
+    pub bytecode_lower_successes: u64,
+    pub bytecode_unsupported_fallbacks: u64,
+    pub bytecode_instructions_executed: u64,
+    pub superinstruction_candidates: u64,
+    pub superinstructions_emitted: u64,
+    pub superinstructions_executed: BTreeMap<String, u64>,
+    pub superinstruction_deopt_or_fallbacks: u64,
     pub opcodes: BTreeMap<String, u64>,
     pub function_calls: u64,
     pub method_calls: u64,
     pub frame_allocations: u64,
     pub frame_reuses: u64,
+    pub frames_allocated: u64,
+    pub frames_reused: u64,
+    pub register_files_allocated: u64,
+    pub register_files_reused: u64,
+    pub frame_reuse_blocked_by_reason: BTreeMap<String, u64>,
     pub array_dim_fetches: u64,
     pub packed_dim_fast_path_hits: u64,
     pub packed_dim_fast_path_misses: u64,
     pub array_packed_append_fast_path_hits: u64,
     pub array_packed_read_fast_path_hits: u64,
     pub array_sequential_foreach_fast_path_hits: u64,
+    pub packed_append_fast_hits: u64,
+    pub packed_foreach_fast_hits: u64,
+    pub cow_or_reference_fallbacks: u64,
     pub array_count_fast_path_hits: u64,
     pub array_packed_to_mixed_transitions: u64,
     pub numeric_string_cache_hits: u64,
@@ -127,6 +143,13 @@ pub struct VmCounters {
     pub internal_function_dispatch_cache_hits: u64,
     pub internal_function_dispatch_cache_misses: u64,
     pub internal_count_array_direct_fast_path_hits: u64,
+    pub function_call_ic_hits: u64,
+    pub function_call_ic_misses: u64,
+    pub builtin_call_ic_hits: u64,
+    pub builtin_call_ic_misses: u64,
+    pub builtin_fast_stub_hits: BTreeMap<String, u64>,
+    pub builtin_fast_stub_misses: BTreeMap<String, u64>,
+    pub call_ic_megamorphic_fallbacks: u64,
     pub local_slot_fast_path_hits: u64,
     pub local_slot_fast_path_misses: u64,
     pub property_fetches: u64,
@@ -172,6 +195,8 @@ pub struct VmCounters {
     pub packed_fetch_fast_hits: u64,
     pub packed_fetch_bounds_exits: u64,
     pub packed_fetch_layout_exits: u64,
+    pub packed_fetch_bounds_fallbacks: u64,
+    pub packed_fetch_layout_fallbacks: u64,
     pub packed_foreach_sum_fast_hits: u64,
     pub packed_foreach_sum_layout_exits: u64,
     pub packed_foreach_sum_overflow_exits: u64,
@@ -215,6 +240,7 @@ pub struct VmCounters {
     pub property_ic_hits: u64,
     pub property_ic_misses: u64,
     pub property_ic_guard_failures: u64,
+    pub property_ic_fallback_reasons: BTreeMap<String, u64>,
     pub class_static_ic_hits: u64,
     pub class_static_ic_misses: u64,
     pub class_static_ic_guard_failures: u64,
@@ -298,9 +324,62 @@ impl VmCounters {
     pub(crate) fn record_frame_activation(&mut self, reused: bool) {
         if reused {
             self.frame_reuses += 1;
+            self.frames_reused += 1;
+            self.register_files_reused += 1;
         } else {
             self.frame_allocations += 1;
+            self.frames_allocated += 1;
+            self.register_files_allocated += 1;
         }
+    }
+
+    pub(crate) fn record_frame_reuse_blocked(&mut self, reason: &str) {
+        *self
+            .frame_reuse_blocked_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_bytecode_lower_attempt(&mut self) {
+        self.bytecode_lower_attempts += 1;
+    }
+
+    pub(crate) fn record_bytecode_lower_success(&mut self) {
+        self.bytecode_lower_successes += 1;
+    }
+
+    pub(crate) fn record_bytecode_unsupported_fallback(&mut self) {
+        self.bytecode_unsupported_fallbacks += 1;
+    }
+
+    pub(crate) fn record_bytecode_instruction(&mut self, opcode: &str) {
+        self.bytecode_instructions_executed += 1;
+        *self
+            .opcodes
+            .entry(format!("bytecode_{opcode}"))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_superinstruction_selection(
+        &mut self,
+        candidates: u64,
+        emitted_by_kind: &BTreeMap<String, u64>,
+    ) {
+        self.superinstruction_candidates += candidates;
+        for (kind, count) in emitted_by_kind {
+            self.superinstructions_emitted += *count;
+            *self
+                .opcodes
+                .entry(format!("superinstruction_emitted_{kind}"))
+                .or_default() += *count;
+        }
+    }
+
+    pub(crate) fn record_superinstruction_executed(&mut self, kind: &str) {
+        *self
+            .superinstructions_executed
+            .entry(kind.to_string())
+            .or_default() += 1;
     }
 
     pub(crate) fn record_literal_intern(&mut self, hit: bool) {
@@ -329,6 +408,7 @@ impl VmCounters {
 
     pub(crate) fn record_array_packed_append_fast_path_hit(&mut self) {
         self.array_packed_append_fast_path_hits += 1;
+        self.packed_append_fast_hits += 1;
     }
 
     pub(crate) fn record_array_packed_read_fast_path_hit(&mut self) {
@@ -337,6 +417,11 @@ impl VmCounters {
 
     pub(crate) fn record_array_sequential_foreach_fast_path_hit(&mut self) {
         self.array_sequential_foreach_fast_path_hits += 1;
+        self.packed_foreach_fast_hits += 1;
+    }
+
+    pub(crate) fn record_cow_or_reference_fallback(&mut self) {
+        self.cow_or_reference_fallbacks += 1;
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -439,6 +524,42 @@ impl VmCounters {
 
     pub(crate) fn record_internal_count_array_direct_fast_path_hit(&mut self) {
         self.internal_count_array_direct_fast_path_hits += 1;
+    }
+
+    pub(crate) fn record_function_call_ic(&mut self, hit: bool) {
+        if hit {
+            self.function_call_ic_hits += 1;
+        } else {
+            self.function_call_ic_misses += 1;
+        }
+    }
+
+    pub(crate) fn record_builtin_call_ic(&mut self, hit: bool) {
+        if hit {
+            self.builtin_call_ic_hits += 1;
+        } else {
+            self.builtin_call_ic_misses += 1;
+        }
+    }
+
+    pub(crate) fn record_builtin_fast_stub(&mut self, name: &str, hit: bool) {
+        let map = if hit {
+            &mut self.builtin_fast_stub_hits
+        } else {
+            &mut self.builtin_fast_stub_misses
+        };
+        *map.entry(name.to_owned()).or_default() += 1;
+    }
+
+    pub(crate) fn record_call_ic_megamorphic_fallback(&mut self) {
+        self.call_ic_megamorphic_fallbacks += 1;
+    }
+
+    pub(crate) fn record_property_ic_fallback(&mut self, reason: &str) {
+        *self
+            .property_ic_fallback_reasons
+            .entry(reason.to_owned())
+            .or_default() += 1;
     }
 
     pub(crate) fn record_local_slot_fast_path(&mut self, hit: bool) {
@@ -575,11 +696,13 @@ impl VmCounters {
     #[allow(dead_code)]
     pub(crate) fn record_packed_fetch_bounds_exit(&mut self) {
         self.packed_fetch_bounds_exits += 1;
+        self.packed_fetch_bounds_fallbacks += 1;
     }
 
     #[allow(dead_code)]
     pub(crate) fn record_packed_fetch_layout_exit(&mut self) {
         self.packed_fetch_layout_exits += 1;
+        self.packed_fetch_layout_fallbacks += 1;
     }
 
     #[allow(dead_code)]
@@ -879,6 +1002,54 @@ impl VmCounters {
             self.instructions_executed,
             true,
         );
+        push_field(
+            &mut json,
+            "bytecode_lower_attempts",
+            self.bytecode_lower_attempts,
+            true,
+        );
+        push_field(
+            &mut json,
+            "bytecode_lower_successes",
+            self.bytecode_lower_successes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "bytecode_unsupported_fallbacks",
+            self.bytecode_unsupported_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "bytecode_instructions_executed",
+            self.bytecode_instructions_executed,
+            true,
+        );
+        push_field(
+            &mut json,
+            "superinstruction_candidates",
+            self.superinstruction_candidates,
+            true,
+        );
+        push_field(
+            &mut json,
+            "superinstructions_emitted",
+            self.superinstructions_emitted,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "superinstructions_executed",
+            &self.superinstructions_executed,
+            true,
+        );
+        push_field(
+            &mut json,
+            "superinstruction_deopt_or_fallbacks",
+            self.superinstruction_deopt_or_fallbacks,
+            true,
+        );
         json.push_str("  \"opcodes\": {");
         if self.opcodes.is_empty() {
             json.push('}');
@@ -902,6 +1073,26 @@ impl VmCounters {
         push_field(&mut json, "method_calls", self.method_calls, true);
         push_field(&mut json, "frame_allocations", self.frame_allocations, true);
         push_field(&mut json, "frame_reuses", self.frame_reuses, true);
+        push_field(&mut json, "frames_allocated", self.frames_allocated, true);
+        push_field(&mut json, "frames_reused", self.frames_reused, true);
+        push_field(
+            &mut json,
+            "register_files_allocated",
+            self.register_files_allocated,
+            true,
+        );
+        push_field(
+            &mut json,
+            "register_files_reused",
+            self.register_files_reused,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "frame_reuse_blocked_by_reason",
+            &self.frame_reuse_blocked_by_reason,
+            true,
+        );
         push_field(&mut json, "array_dim_fetches", self.array_dim_fetches, true);
         push_field(
             &mut json,
@@ -931,6 +1122,24 @@ impl VmCounters {
             &mut json,
             "array_sequential_foreach_fast_path_hits",
             self.array_sequential_foreach_fast_path_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_append_fast_hits",
+            self.packed_append_fast_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_foreach_fast_hits",
+            self.packed_foreach_fast_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "cow_or_reference_fallbacks",
+            self.cow_or_reference_fallbacks,
             true,
         );
         push_field(
@@ -1010,6 +1219,48 @@ impl VmCounters {
             &mut json,
             "internal_count_array_direct_fast_path_hits",
             self.internal_count_array_direct_fast_path_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "function_call_ic_hits",
+            self.function_call_ic_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "function_call_ic_misses",
+            self.function_call_ic_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "builtin_call_ic_hits",
+            self.builtin_call_ic_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "builtin_call_ic_misses",
+            self.builtin_call_ic_misses,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "builtin_fast_stub_hits",
+            &self.builtin_fast_stub_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "builtin_fast_stub_misses",
+            &self.builtin_fast_stub_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "call_ic_megamorphic_fallbacks",
+            self.call_ic_megamorphic_fallbacks,
             true,
         );
         push_field(
@@ -1215,6 +1466,18 @@ impl VmCounters {
             &mut json,
             "packed_fetch_layout_exits",
             self.packed_fetch_layout_exits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_fetch_bounds_fallbacks",
+            self.packed_fetch_bounds_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_fetch_layout_fallbacks",
+            self.packed_fetch_layout_fallbacks,
             true,
         );
         push_field(
@@ -1467,6 +1730,12 @@ impl VmCounters {
             &mut json,
             "property_ic_guard_failures",
             self.property_ic_guard_failures,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "property_ic_fallback_reasons",
+            &self.property_ic_fallback_reasons,
             true,
         );
         push_field(
@@ -1821,6 +2090,37 @@ fn push_field(json: &mut String, name: &str, value: u64, comma: bool) {
     json.push('\n');
 }
 
+fn push_string_u64_map_field(
+    json: &mut String,
+    name: &str,
+    values: &BTreeMap<String, u64>,
+    comma: bool,
+) {
+    json.push_str("  \"");
+    json.push_str(name);
+    json.push_str("\": {");
+    if values.is_empty() {
+        json.push('}');
+    } else {
+        json.push('\n');
+        for (index, (key, value)) in values.iter().enumerate() {
+            json.push_str("    \"");
+            json.push_str(&escape_json(key));
+            json.push_str("\": ");
+            json.push_str(&value.to_string());
+            if index + 1 != values.len() {
+                json.push(',');
+            }
+            json.push('\n');
+        }
+        json.push_str("  }");
+    }
+    if comma {
+        json.push(',');
+    }
+    json.push('\n');
+}
+
 fn push_nested_field(json: &mut String, name: &str, value: u64, comma: bool) {
     json.push_str("      \"");
     json.push_str(name);
@@ -2063,6 +2363,7 @@ mod tests {
     use crate::{InlineCacheKind, InlineCacheObservation, QuickeningObservation};
     use php_ir::ids::RegId;
     use php_ir::instruction::{BinaryOp, InstructionKind};
+    use std::collections::BTreeMap;
 
     use super::{
         JitCompileDescriptor, MethodCallProfileObservation, OutputStats,
@@ -2085,6 +2386,7 @@ mod tests {
         });
         counters.record_frame_activation(false);
         counters.record_frame_activation(true);
+        counters.record_frame_reuse_blocked("by_ref_param");
         counters.record_autoload();
         counters.record_literal_intern(false);
         counters.record_literal_intern(true);
@@ -2095,6 +2397,7 @@ mod tests {
         counters.record_array_packed_append_fast_path_hit();
         counters.record_array_packed_read_fast_path_hit();
         counters.record_array_sequential_foreach_fast_path_hit();
+        counters.record_cow_or_reference_fallback();
         counters.record_array_count_fast_path_hit();
         counters.record_array_packed_to_mixed_transition();
         counters.record_numeric_string_cache_stats(
@@ -2114,6 +2417,14 @@ mod tests {
         counters.record_internal_function_dispatch_cache(false);
         counters.record_internal_function_dispatch_cache(true);
         counters.record_internal_count_array_direct_fast_path_hit();
+        counters.record_function_call_ic(false);
+        counters.record_function_call_ic(true);
+        counters.record_builtin_call_ic(false);
+        counters.record_builtin_call_ic(true);
+        counters.record_builtin_fast_stub("strlen", false);
+        counters.record_builtin_fast_stub("strlen", true);
+        counters.record_call_ic_megamorphic_fallback();
+        counters.record_property_ic_fallback("layout_epoch_mismatch");
         counters.record_local_slot_fast_path(false);
         counters.record_local_slot_fast_path(true);
         counters.record_quickening(QuickeningObservation {
@@ -2208,12 +2519,23 @@ mod tests {
         assert_eq!(counters.function_calls, 1);
         assert_eq!(counters.frame_allocations, 1);
         assert_eq!(counters.frame_reuses, 1);
+        assert_eq!(counters.frames_allocated, 1);
+        assert_eq!(counters.frames_reused, 1);
+        assert_eq!(counters.register_files_allocated, 1);
+        assert_eq!(counters.register_files_reused, 1);
+        assert_eq!(
+            counters.frame_reuse_blocked_by_reason.get("by_ref_param"),
+            Some(&1)
+        );
         assert_eq!(counters.string_concats, 1);
         assert_eq!(counters.packed_dim_fast_path_hits, 1);
         assert_eq!(counters.packed_dim_fast_path_misses, 1);
         assert_eq!(counters.array_packed_append_fast_path_hits, 1);
         assert_eq!(counters.array_packed_read_fast_path_hits, 1);
         assert_eq!(counters.array_sequential_foreach_fast_path_hits, 1);
+        assert_eq!(counters.packed_append_fast_hits, 1);
+        assert_eq!(counters.packed_foreach_fast_hits, 1);
+        assert_eq!(counters.cow_or_reference_fallbacks, 1);
         assert_eq!(counters.array_count_fast_path_hits, 1);
         assert_eq!(counters.array_packed_to_mixed_transitions, 1);
         assert_eq!(counters.numeric_string_cache_hits, 2);
@@ -2228,6 +2550,19 @@ mod tests {
         assert_eq!(counters.internal_function_dispatch_cache_hits, 1);
         assert_eq!(counters.internal_function_dispatch_cache_misses, 1);
         assert_eq!(counters.internal_count_array_direct_fast_path_hits, 1);
+        assert_eq!(counters.function_call_ic_hits, 1);
+        assert_eq!(counters.function_call_ic_misses, 1);
+        assert_eq!(counters.builtin_call_ic_hits, 1);
+        assert_eq!(counters.builtin_call_ic_misses, 1);
+        assert_eq!(counters.builtin_fast_stub_hits.get("strlen"), Some(&1));
+        assert_eq!(counters.builtin_fast_stub_misses.get("strlen"), Some(&1));
+        assert_eq!(counters.call_ic_megamorphic_fallbacks, 1);
+        assert_eq!(
+            counters
+                .property_ic_fallback_reasons
+                .get("layout_epoch_mismatch"),
+            Some(&1)
+        );
         assert_eq!(counters.local_slot_fast_path_hits, 1);
         assert_eq!(counters.local_slot_fast_path_misses, 1);
         assert_eq!(counters.string_concat_fast_path_hits, 1);
@@ -2283,6 +2618,8 @@ mod tests {
         assert_eq!(counters.packed_fetch_fast_hits, 1);
         assert_eq!(counters.packed_fetch_bounds_exits, 1);
         assert_eq!(counters.packed_fetch_layout_exits, 1);
+        assert_eq!(counters.packed_fetch_bounds_fallbacks, 1);
+        assert_eq!(counters.packed_fetch_layout_fallbacks, 1);
         assert_eq!(counters.packed_foreach_sum_fast_hits, 1);
         assert_eq!(counters.packed_foreach_sum_layout_exits, 1);
         assert_eq!(counters.packed_foreach_sum_overflow_exits, 1);
@@ -2343,18 +2680,35 @@ mod tests {
         counters.record_instruction(&InstructionKind::Echo {
             src: php_ir::operand::Operand::Register(RegId::new(0)),
         });
+        let mut emitted = BTreeMap::new();
+        emitted.insert("load_const_echo".to_string(), 1);
+        counters.record_superinstruction_selection(1, &emitted);
+        counters.record_superinstruction_executed("load_const_echo");
 
         let json = counters.to_json();
 
         assert!(json.contains("\"instructions_executed\": 1"));
+        assert!(json.contains("\"superinstruction_candidates\": 1"));
+        assert!(json.contains("\"superinstructions_emitted\": 1"));
+        assert!(json.contains("\"superinstructions_executed\": {"));
+        assert!(json.contains("\"load_const_echo\": 1"));
+        assert!(json.contains("\"superinstruction_deopt_or_fallbacks\": 0"));
         assert!(json.contains("\"guard_failures\": 0"));
         assert!(json.contains("\"frame_allocations\": 0"));
         assert!(json.contains("\"frame_reuses\": 0"));
+        assert!(json.contains("\"frames_allocated\": 0"));
+        assert!(json.contains("\"frames_reused\": 0"));
+        assert!(json.contains("\"register_files_allocated\": 0"));
+        assert!(json.contains("\"register_files_reused\": 0"));
+        assert!(json.contains("\"frame_reuse_blocked_by_reason\": {}"));
         assert!(json.contains("\"packed_dim_fast_path_hits\": 0"));
         assert!(json.contains("\"packed_dim_fast_path_misses\": 0"));
         assert!(json.contains("\"array_packed_append_fast_path_hits\": 0"));
         assert!(json.contains("\"array_packed_read_fast_path_hits\": 0"));
         assert!(json.contains("\"array_sequential_foreach_fast_path_hits\": 0"));
+        assert!(json.contains("\"packed_append_fast_hits\": 0"));
+        assert!(json.contains("\"packed_foreach_fast_hits\": 0"));
+        assert!(json.contains("\"cow_or_reference_fallbacks\": 0"));
         assert!(json.contains("\"array_count_fast_path_hits\": 0"));
         assert!(json.contains("\"array_packed_to_mixed_transitions\": 0"));
         assert!(json.contains("\"numeric_string_cache_hits\": 0"));
@@ -2369,6 +2723,13 @@ mod tests {
         assert!(json.contains("\"internal_function_dispatch_cache_hits\": 0"));
         assert!(json.contains("\"internal_function_dispatch_cache_misses\": 0"));
         assert!(json.contains("\"internal_count_array_direct_fast_path_hits\": 0"));
+        assert!(json.contains("\"function_call_ic_hits\": 0"));
+        assert!(json.contains("\"function_call_ic_misses\": 0"));
+        assert!(json.contains("\"builtin_call_ic_hits\": 0"));
+        assert!(json.contains("\"builtin_call_ic_misses\": 0"));
+        assert!(json.contains("\"builtin_fast_stub_hits\": {}"));
+        assert!(json.contains("\"builtin_fast_stub_misses\": {}"));
+        assert!(json.contains("\"call_ic_megamorphic_fallbacks\": 0"));
         assert!(json.contains("\"local_slot_fast_path_hits\": 0"));
         assert!(json.contains("\"local_slot_fast_path_misses\": 0"));
         assert!(json.contains("\"literal_intern_hits\": 0"));
@@ -2405,6 +2766,8 @@ mod tests {
         assert!(json.contains("\"packed_fetch_fast_hits\": 0"));
         assert!(json.contains("\"packed_fetch_bounds_exits\": 0"));
         assert!(json.contains("\"packed_fetch_layout_exits\": 0"));
+        assert!(json.contains("\"packed_fetch_bounds_fallbacks\": 0"));
+        assert!(json.contains("\"packed_fetch_layout_fallbacks\": 0"));
         assert!(json.contains("\"packed_foreach_sum_fast_hits\": 0"));
         assert!(json.contains("\"packed_foreach_sum_layout_exits\": 0"));
         assert!(json.contains("\"packed_foreach_sum_overflow_exits\": 0"));
@@ -2448,6 +2811,7 @@ mod tests {
         assert!(json.contains("\"property_ic_hits\": 0"));
         assert!(json.contains("\"property_ic_misses\": 0"));
         assert!(json.contains("\"property_ic_guard_failures\": 0"));
+        assert!(json.contains("\"property_ic_fallback_reasons\": {}"));
         assert!(json.contains("\"class_static_ic_hits\": 0"));
         assert!(json.contains("\"class_static_ic_misses\": 0"));
         assert!(json.contains("\"class_static_ic_guard_failures\": 0"));

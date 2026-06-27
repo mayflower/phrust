@@ -563,6 +563,15 @@ format details may change when standard library adds broader standard-library,
 Composer, and performance work. User-visible PHP semantics must stay covered by
 fixtures and known-gap diagnostics before an API is treated as stable.
 
+The current frame/register reuse pool is an internal request-local optimization.
+Only reuse-eligible plain user-function activations enter the pool. Generator and
+fiber continuations keep owning their saved frames, and conservative fallback
+uses fresh frames for closure captures, by-reference calls/returns, class
+contexts, shared top-level locals, try/finally bodies, and object-allocation
+bodies that may retain destructor-sensitive values. These rules are observable
+only through VM counters; they must not alter PHP-visible output, diagnostics,
+side-effect order, references, or destructor timing.
+
 ## performance-critical Boundaries
 
 Runtime semantics intentionally favors determinism and explicit diagnostics over Zend

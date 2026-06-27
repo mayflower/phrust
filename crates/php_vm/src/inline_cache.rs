@@ -145,6 +145,21 @@ pub enum FunctionCallCacheTarget {
     },
 }
 
+/// Guarded argument metadata for a function-call IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCallShape {
+    pub arity: u32,
+    pub named_arguments: Vec<String>,
+    pub by_ref_arguments: Vec<bool>,
+}
+
+/// Guarded VM/runtime builtin implementation metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCallBuiltinMetadata {
+    pub implementation_id: String,
+    pub version: u32,
+}
+
 /// Resolution target cached by a method-call IC slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MethodCallCacheTarget {
@@ -193,22 +208,58 @@ impl MethodCallCacheTarget {
     }
 }
 
+/// Stable layout metadata guarded by a property-fetch IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyFetchLayoutMetadata {
+    pub class_id: u32,
+    pub layout_version: u64,
+    pub property_slot_index: Option<u32>,
+    pub visibility_context: Option<String>,
+    pub typed_property_initialized: bool,
+    pub has_property_hooks: bool,
+    pub has_magic_get: bool,
+    pub dynamic_property_fallback: bool,
+}
+
+/// Resolved property-fetch target payload kept out of interpreter stack frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyFetchResolvedTarget {
+    pub receiver_class: String,
+    pub declaring_class: String,
+    pub property: String,
+    pub storage_name: String,
+    pub layout: PropertyFetchLayoutMetadata,
+}
+
 /// Resolution target cached by a property-fetch IC slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PropertyFetchCacheTarget {
     CurrentUnit {
-        receiver_class: String,
-        declaring_class: String,
-        property: String,
-        storage_name: String,
+        target: Box<PropertyFetchResolvedTarget>,
     },
     DynamicUnit {
         unit_index: usize,
-        receiver_class: String,
-        declaring_class: String,
-        property: String,
-        storage_name: String,
+        target: Box<PropertyFetchResolvedTarget>,
     },
+}
+
+impl PropertyFetchCacheTarget {
+    #[must_use]
+    pub fn resolved_target(&self) -> &PropertyFetchResolvedTarget {
+        match self {
+            Self::CurrentUnit { target } | Self::DynamicUnit { target, .. } => target.as_ref(),
+        }
+    }
+
+    #[must_use]
+    pub fn layout(&self) -> &PropertyFetchLayoutMetadata {
+        &self.resolved_target().layout
+    }
+
+    #[must_use]
+    pub fn receiver_class(&self) -> &str {
+        &self.resolved_target().receiver_class
+    }
 }
 
 /// One guarded method-call target in a polymorphic IC slot.
@@ -323,6 +374,8 @@ pub struct InlineCacheSlot {
     pub epoch: InvalidationEpoch,
     pub stats: InlineCacheStats,
     pub function_call_name: Option<String>,
+    pub function_call_shape: Option<FunctionCallShape>,
+    pub function_call_builtin_metadata: Option<FunctionCallBuiltinMetadata>,
     pub function_call_target: Option<FunctionCallCacheTarget>,
     pub method_call_name: Option<String>,
     pub method_call_receiver_class: Option<String>,
@@ -540,6 +593,8 @@ fn mark_slot_megamorphic(slot: &mut InlineCacheSlot) {
 }
 
 fn clear_slot_targets(slot: &mut InlineCacheSlot) {
+    slot.function_call_shape = None;
+    slot.function_call_builtin_metadata = None;
     slot.function_call_target = None;
     slot.method_call_target = None;
     slot.method_call_polymorphic_entries.clear();
@@ -624,6 +679,8 @@ impl InlineCacheTable {
                 epoch: InvalidationEpoch::default(),
                 stats: InlineCacheStats::default(),
                 function_call_name: None,
+                function_call_shape: None,
+                function_call_builtin_metadata: None,
                 function_call_target: None,
                 method_call_name: None,
                 method_call_receiver_class: None,
@@ -660,6 +717,28 @@ impl InlineCacheTable {
         self.slots.len()
     }
 
+    #[must_use]
+    pub fn peek_function_call_target(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) -> Option<FunctionCallCacheTarget> {
+        let key = inline_cache_key(
+            unit_key,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::FunctionCall,
+        );
+        self.slots.get(&key)?.function_call_target.clone()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
+    )]
     pub fn lookup_function_call(
         &mut self,
         unit_key: u64,
@@ -668,6 +747,8 @@ impl InlineCacheTable {
         instruction: InstrId,
         lowered_name: &str,
         epoch: InvalidationEpoch,
+        shape: &FunctionCallShape,
+        builtin_metadata: Option<&FunctionCallBuiltinMetadata>,
     ) -> (Option<FunctionCallCacheTarget>, InlineCacheObservation) {
         let key = inline_cache_key(
             unit_key,
@@ -699,6 +780,14 @@ impl InlineCacheTable {
             let observation = record_slot_guard_failure(slot);
             return (None, with_kind(InlineCacheKind::FunctionCall, observation));
         }
+        if slot.function_call_shape.as_ref() != Some(shape) {
+            let observation = record_slot_guard_failure(slot);
+            return (None, with_kind(InlineCacheKind::FunctionCall, observation));
+        }
+        if slot.function_call_builtin_metadata.as_ref() != builtin_metadata {
+            let observation = record_slot_guard_failure(slot);
+            return (None, with_kind(InlineCacheKind::FunctionCall, observation));
+        }
         if slot.epoch != epoch {
             let observation = record_slot_invalidation(slot);
             return (None, with_kind(InlineCacheKind::FunctionCall, observation));
@@ -726,6 +815,8 @@ impl InlineCacheTable {
         instruction: InstrId,
         lowered_name: &str,
         epoch: InvalidationEpoch,
+        shape: FunctionCallShape,
+        builtin_metadata: Option<FunctionCallBuiltinMetadata>,
         target: FunctionCallCacheTarget,
     ) {
         let key = inline_cache_key(
@@ -742,6 +833,8 @@ impl InlineCacheTable {
             slot.state = InlineCacheState::Monomorphic;
             slot.epoch = epoch;
             slot.function_call_name = Some(lowered_name.to_owned());
+            slot.function_call_shape = Some(shape);
+            slot.function_call_builtin_metadata = builtin_metadata;
             slot.function_call_target = Some(target);
         }
     }
@@ -1620,13 +1713,57 @@ mod tests {
     use super::{
         AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
         AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
-        ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallCacheTarget,
+        ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind,
+        FunctionCallBuiltinMetadata, FunctionCallCacheTarget, FunctionCallShape,
         IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind, InlineCacheState,
         InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget, PropertyFetchCacheTarget,
+        PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
     };
     use crate::include::IncludePathFileFingerprint;
     use php_ir::ids::{BlockId, FunctionId, InstrId};
     use std::path::PathBuf;
+
+    fn positional_shape(arity: u32) -> FunctionCallShape {
+        FunctionCallShape {
+            arity,
+            named_arguments: Vec::new(),
+            by_ref_arguments: vec![false; arity as usize],
+        }
+    }
+
+    fn builtin_metadata(name: &str) -> FunctionCallBuiltinMetadata {
+        FunctionCallBuiltinMetadata {
+            implementation_id: format!("internal_registry:{name}"),
+            version: 1,
+        }
+    }
+
+    fn property_layout(class_id: u32) -> PropertyFetchLayoutMetadata {
+        PropertyFetchLayoutMetadata {
+            class_id,
+            layout_version: 6,
+            property_slot_index: Some(0),
+            visibility_context: None,
+            typed_property_initialized: true,
+            has_property_hooks: false,
+            has_magic_get: false,
+            dynamic_property_fallback: false,
+        }
+    }
+
+    fn property_target(
+        receiver_class: &str,
+        declaring_class: &str,
+        class_id: u32,
+    ) -> Box<PropertyFetchResolvedTarget> {
+        Box::new(PropertyFetchResolvedTarget {
+            receiver_class: receiver_class.to_owned(),
+            declaring_class: declaring_class.to_owned(),
+            property: "value".to_owned(),
+            storage_name: "value".to_owned(),
+            layout: property_layout(class_id),
+        })
+    }
 
     #[test]
     fn inline_cache_table_allocates_one_stable_slot_per_instruction_kind() {
@@ -1702,6 +1839,8 @@ mod tests {
             instruction,
             "strlen",
             InvalidationEpoch::new(3),
+            positional_shape(1),
+            Some(builtin_metadata("strlen")),
             FunctionCallCacheTarget::Builtin {
                 kind: FunctionCallBuiltinKind::InternalRegistry,
                 name: "strlen".to_owned(),
@@ -1714,6 +1853,8 @@ mod tests {
             instruction,
             "strlen",
             InvalidationEpoch::new(3),
+            &positional_shape(1),
+            Some(&builtin_metadata("strlen")),
         );
 
         assert!(target.is_some());
@@ -1742,6 +1883,8 @@ mod tests {
             instruction,
             "perf_fn",
             InvalidationEpoch::new(1),
+            positional_shape(0),
+            None,
             FunctionCallCacheTarget::CurrentUnit { function },
         );
         let (target, event) = table.lookup_function_call(
@@ -1751,11 +1894,93 @@ mod tests {
             instruction,
             "perf_fn",
             InvalidationEpoch::new(2),
+            &positional_shape(0),
+            None,
         );
 
         assert!(target.is_none());
         assert!(event.invalidation);
         assert!(event.miss);
+    }
+
+    #[test]
+    fn function_call_cache_guards_call_shape_and_builtin_metadata() {
+        let function = FunctionId::new(0);
+        let block = BlockId::new(0);
+        let instruction = InstrId::new(0);
+        let mut table = InlineCacheTable::default();
+        let shape = FunctionCallShape {
+            arity: 2,
+            named_arguments: vec!["left".to_owned(), "right".to_owned()],
+            by_ref_arguments: vec![false, false],
+        };
+
+        table.observe_slot(
+            7,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::FunctionCall,
+        );
+        table.install_function_call(
+            7,
+            function,
+            block,
+            instruction,
+            "strlen",
+            InvalidationEpoch::new(1),
+            shape.clone(),
+            Some(builtin_metadata("strlen")),
+            FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::InternalRegistry,
+                name: "strlen".to_owned(),
+            },
+        );
+
+        let wrong_shape = positional_shape(2);
+        let (target, event) = table.lookup_function_call(
+            7,
+            function,
+            block,
+            instruction,
+            "strlen",
+            InvalidationEpoch::new(1),
+            &wrong_shape,
+            Some(&builtin_metadata("strlen")),
+        );
+        assert!(target.is_none());
+        assert!(event.guard_failure);
+
+        table.install_function_call(
+            7,
+            function,
+            block,
+            instruction,
+            "strlen",
+            InvalidationEpoch::new(1),
+            shape.clone(),
+            Some(builtin_metadata("strlen")),
+            FunctionCallCacheTarget::Builtin {
+                kind: FunctionCallBuiltinKind::InternalRegistry,
+                name: "strlen".to_owned(),
+            },
+        );
+        let wrong_metadata = FunctionCallBuiltinMetadata {
+            implementation_id: "InternalRegistry:strlen".to_owned(),
+            version: 2,
+        };
+        let (target, event) = table.lookup_function_call(
+            7,
+            function,
+            block,
+            instruction,
+            "strlen",
+            InvalidationEpoch::new(1),
+            &shape,
+            Some(&wrong_metadata),
+        );
+        assert!(target.is_none());
+        assert!(event.guard_failure);
     }
 
     #[test]
@@ -1779,6 +2004,8 @@ mod tests {
             instruction,
             "perf_fn_a",
             InvalidationEpoch::new(1),
+            positional_shape(0),
+            None,
             FunctionCallCacheTarget::CurrentUnit { function },
         );
 
@@ -1792,6 +2019,8 @@ mod tests {
                 instruction,
                 name,
                 InvalidationEpoch::new(1),
+                &positional_shape(0),
+                None,
             );
             assert!(target.is_none());
             assert!(event.guard_failure);
@@ -1805,6 +2034,8 @@ mod tests {
                 instruction,
                 name,
                 InvalidationEpoch::new(1),
+                positional_shape(0),
+                None,
                 FunctionCallCacheTarget::CurrentUnit { function },
             );
         }
@@ -2069,10 +2300,7 @@ mod tests {
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "performancebox".to_owned(),
-                declaring_class: "PerfBox".to_owned(),
-                property: "value".to_owned(),
-                storage_name: "value".to_owned(),
+                target: property_target("performancebox", "PerfBox", 11),
             },
         );
         let (target, event) = table.lookup_property_fetch(
@@ -2116,10 +2344,7 @@ mod tests {
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "performanceboxa".to_owned(),
-                declaring_class: "PerfBoxA".to_owned(),
-                property: "value".to_owned(),
-                storage_name: "value".to_owned(),
+                target: property_target("performanceboxa", "PerfBoxA", 12),
             },
         );
         let (target, event) = table.lookup_property_fetch(
@@ -2163,10 +2388,7 @@ mod tests {
             None,
             InvalidationEpoch::new(6),
             PropertyFetchCacheTarget::CurrentUnit {
-                receiver_class: "performancebox".to_owned(),
-                declaring_class: "PerfBox".to_owned(),
-                property: "value".to_owned(),
-                storage_name: "value".to_owned(),
+                target: property_target("performancebox", "PerfBox", 13),
             },
         );
         let (target, event) = table.lookup_property_fetch(
@@ -2211,10 +2433,7 @@ mod tests {
                 None,
                 InvalidationEpoch::new(6),
                 PropertyFetchCacheTarget::CurrentUnit {
-                    receiver_class: receiver.to_owned(),
-                    declaring_class: receiver.to_owned(),
-                    property: "value".to_owned(),
-                    storage_name: "value".to_owned(),
+                    target: property_target(receiver, receiver, 14),
                 },
             );
         }
@@ -2270,10 +2489,7 @@ mod tests {
                 None,
                 InvalidationEpoch::new(6),
                 PropertyFetchCacheTarget::CurrentUnit {
-                    receiver_class: receiver.to_owned(),
-                    declaring_class: receiver.to_owned(),
-                    property: "value".to_owned(),
-                    storage_name: "value".to_owned(),
+                    target: property_target(receiver, receiver, 15),
                 },
             );
         }

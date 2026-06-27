@@ -37,6 +37,8 @@ help:
       '' \
       'Runtime and VM:' \
       '  just bytecode-snapshots   Run bytecode snapshot checks' \
+      '  just bytecode-exec-smoke  Run dense bytecode execution A/B smoke' \
+      '  just superinstruction-smoke Run dense bytecode superinstruction A/B smoke' \
       '  just vm-smoke             Run VM CLI smoke checks' \
       '  just vm-trace-smoke       Run VM trace/debug smoke checks' \
       '  just runtime-fixtures     Run runtime fixture checks' \
@@ -57,6 +59,10 @@ help:
       '  just quickening-smoke     Run quickening smoke gate' \
       '  just inline-cache-smoke   Run inline-cache smoke gate' \
       '  just jit-smoke            Run default-off JIT smoke gate' \
+      '  just framework-smoke      Run offline framework-like performance smoke' \
+      '  just release-benchmark-smoke Run production release performance smoke' \
+      '  just pgo-benchmark-smoke  Run optional PGO performance smoke' \
+      '  just bolt-benchmark-smoke Run optional Linux BOLT performance smoke' \
       '  just perf-report          Generate performance report' \
       '' \
       'PHPT:' \
@@ -96,7 +102,7 @@ runtime-hardening-lints:
     cargo clippy -p php_runtime -p php_vm --all-targets -- -D warnings -D unsafe-code
 
 test:
-    cargo test --workspace
+    RUST_MIN_STACK="${PHRUST_RUST_MIN_STACK:-8388608}" cargo test --workspace
 
 test-lexer:
     cargo test -p php_lexer
@@ -230,6 +236,7 @@ verify-frontend:
 
 verify-runtime:
     @just bytecode-snapshots
+    @just bytecode-exec-smoke
     @just vm-smoke
     @just vm-trace-smoke
     @just runtime-fixtures
@@ -251,8 +258,11 @@ verify-performance:
     @just performance-regression
     @just perf-flag-matrix
     @just benchmark-smoke
+    @just framework-smoke
+    @just release-benchmark-smoke
     @just cache-roundtrip
     @just optimizer-diff
+    @just superinstruction-smoke
     @just quickening-smoke
     @just inline-cache-smoke
     @just callgrind-smoke
@@ -532,6 +542,14 @@ bench-frontend:
 
 bytecode-snapshots:
     cargo test -p php_ir --test bytecode_snapshots -- --nocapture
+
+bytecode-exec-smoke:
+    cargo build -p php_vm_cli
+    scripts/performance/bytecode_exec_smoke.sh
+
+superinstruction-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/superinstruction_smoke.sh
 
 vm-smoke:
     cargo build -p php_vm_cli
@@ -1258,7 +1276,7 @@ compat-corpus-smoke:
     scripts/stdlib_diff.py --fixtures tests/fixtures/stdlib/corpus --area corpus --out target/stdlib/corpus
 
 performance-tests:
-    cargo test --workspace
+    RUST_MIN_STACK="${PHRUST_RUST_MIN_STACK:-8388608}" cargo test --workspace
     scripts/performance/compare_perf_json.py --self-test
     scripts/performance/hotpath_inventory.py --self-test
     scripts/performance/perf_report.py --self-test
@@ -1305,6 +1323,15 @@ profile-composer:
 
 release-profile-plan:
     scripts/performance/release_profile_plan.sh
+
+release-benchmark-smoke:
+    scripts/performance/release_profiles.py release
+
+pgo-benchmark-smoke:
+    scripts/performance/release_profiles.py pgo
+
+bolt-benchmark-smoke:
+    scripts/performance/release_profiles.py bolt
 
 framework-smoke:
     cargo build -p php_vm_cli --bin php-vm

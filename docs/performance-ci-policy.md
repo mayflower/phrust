@@ -12,8 +12,11 @@ nix develop -c just verify-performance
 and smoke coverage. It runs workspace tests, regression fixtures, the full
 performance-flag A/B matrix, bytecode-cache roundtrip checks, optimizer
 differential checks, quickening smoke, inline-cache smoke, skip-safe Callgrind
-smoke, default-off JIT smoke, safety audit smoke, benchmark smoke, hot-path
-inventory, and perf-report generation.
+smoke, default-off JIT smoke, safety audit smoke, benchmark smoke, framework
+smoke, release benchmark smoke, hot-path inventory, and perf-report generation.
+The workspace test step runs with `RUST_MIN_STACK` defaulting to `8388608`
+bytes, overridable with `PHRUST_RUST_MIN_STACK`, so recursive VM tests use the
+same deterministic stack budget in local and CI `just` gates.
 
 The focused commands remain available for local bisection and CI log triage:
 
@@ -23,7 +26,20 @@ nix develop -c just optimizer-diff
 nix develop -c just quickening-smoke
 nix develop -c just inline-cache-smoke
 nix develop -c just jit-smoke
+nix develop -c just release-benchmark-smoke
 ```
+
+Optional production-profile experiments are available but are not hard CI
+requirements:
+
+```bash
+nix develop -c just pgo-benchmark-smoke
+nix develop -c just bolt-benchmark-smoke
+```
+
+The optional recipes must write a machine-readable skip report when host tools,
+platform support, opt-in environment variables, or BOLT perf data are missing.
+They must not turn local host timings into pull-request speed budgets.
 
 The Cranelift addendum is feature-gated and runs as a separate optional CI job:
 

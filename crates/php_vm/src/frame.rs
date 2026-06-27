@@ -58,6 +58,12 @@ impl LocalFile {
         self.locals.get_mut(id.index())
     }
 
+    /// Reads a local slot by reference without dereferencing or cloning it.
+    #[must_use]
+    pub fn get_slot(&self, id: LocalId) -> Option<&Slot> {
+        self.locals.get(id.index())
+    }
+
     /// Writes a local without panicking.
     pub fn set(&mut self, id: LocalId, value: Value) -> Result<(), String> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
@@ -195,6 +201,9 @@ pub struct Frame {
     pub registers: RegisterFile,
     /// PHP local variable slots for the function.
     pub locals: LocalFile,
+    /// True when this activation may be returned to the request-local frame
+    /// pool after it completes.
+    pub reuse_eligible: bool,
 }
 
 impl Frame {
@@ -209,6 +218,7 @@ impl Frame {
             arguments: Vec::new(),
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
+            reuse_eligible: false,
         }
     }
 
@@ -230,6 +240,7 @@ impl Frame {
             arguments: Vec::new(),
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
+            reuse_eligible: false,
         }
     }
 
@@ -242,6 +253,7 @@ impl Frame {
         self.arguments.clear();
         self.registers.clear_for_reuse();
         self.locals.clear_for_reuse();
+        self.reuse_eligible = false;
     }
 
     /// Reinitializes a pooled frame for a new function activation.
@@ -261,6 +273,7 @@ impl Frame {
         self.arguments.clear();
         self.registers.reset_for_function(register_count);
         self.locals.reset_for_function(local_count);
+        self.reuse_eligible = false;
     }
 }
 
@@ -286,6 +299,28 @@ impl CallStack {
         self.frames.push(frame);
     }
 
+    /// Pushes a compiled function frame that must not enter the reuse pool.
+    pub fn push_fresh_frame(
+        &mut self,
+        function: FunctionId,
+        register_count: u32,
+        local_count: u32,
+        scope_class: Option<String>,
+        called_class: Option<String>,
+        declaring_class: Option<String>,
+    ) {
+        let mut frame = Frame::new_with_class_context(
+            function,
+            register_count,
+            local_count,
+            scope_class,
+            called_class,
+            declaring_class,
+        );
+        frame.reuse_eligible = false;
+        self.frames.push(frame);
+    }
+
     /// Pushes a compiled function frame, reusing request-local storage when a
     /// completed frame is available. Returns true when reuse happened.
     pub fn push_reusable_frame(
@@ -306,18 +341,21 @@ impl CallStack {
                 called_class,
                 declaring_class,
             );
+            frame.reuse_eligible = true;
             self.frames.push(frame);
             return true;
         }
 
-        self.frames.push(Frame::new_with_class_context(
+        let mut frame = Frame::new_with_class_context(
             function,
             register_count,
             local_count,
             scope_class,
             called_class,
             declaring_class,
-        ));
+        );
+        frame.reuse_eligible = true;
+        self.frames.push(frame);
         false
     }
 
@@ -331,6 +369,9 @@ impl CallStack {
         let Some(mut frame) = self.frames.pop() else {
             return false;
         };
+        if !frame.reuse_eligible {
+            return false;
+        }
         frame.clear_for_reuse();
         self.frame_pool.push(frame);
         true

@@ -27,6 +27,7 @@ DEFAULT_SELECTED_FIXTURES = (
     ROOT / "tests/fixtures/stdlib/_harness/stdlib/array_basics.php",
     ROOT / "tests/fixtures/stdlib/_harness/json-pcre-date/json_basics.php",
     ROOT / "tests/fixtures/stdlib/_harness/spl-reflection/reflection_function.php",
+    ROOT / "tests/fixtures/performance/inline_cache/property-shape-guards.php",
 )
 
 
@@ -115,6 +116,7 @@ def combos(cache_root: Path, include_jit: bool) -> tuple[Combo, list[Combo]]:
         "baseline",
         (
             "--opt-level=0",
+            "--superinstructions=off",
             "--quickening=off",
             "--inline-caches=off",
             "--bytecode-cache=off",
@@ -123,14 +125,17 @@ def combos(cache_root: Path, include_jit: bool) -> tuple[Combo, list[Combo]]:
         ),
     )
     variants = [
-        Combo("opt1", ("--opt-level=1", "--quickening=off", "--inline-caches=off", "--bytecode-cache=off", "--jit=off", "--tiering=off")),
-        Combo("opt2", ("--opt-level=2", "--quickening=off", "--inline-caches=off", "--bytecode-cache=off", "--jit=off", "--tiering=off")),
-        Combo("quickening-on", ("--opt-level=0", "--quickening=on", "--inline-caches=off", "--bytecode-cache=off", "--jit=off")),
-        Combo("inline-caches-on", ("--opt-level=0", "--quickening=off", "--inline-caches=on", "--bytecode-cache=off", "--jit=off")),
+        Combo("opt1", ("--opt-level=1", "--superinstructions=off", "--quickening=off", "--inline-caches=off", "--bytecode-cache=off", "--jit=off", "--tiering=off")),
+        Combo("opt2", ("--opt-level=2", "--superinstructions=off", "--quickening=off", "--inline-caches=off", "--bytecode-cache=off", "--jit=off", "--tiering=off")),
+        Combo("superinstructions-on-ir", ("--opt-level=0", "--superinstructions=on", "--quickening=off", "--inline-caches=off", "--bytecode-cache=off", "--jit=off", "--tiering=off")),
+        Combo("quickening-on", ("--opt-level=0", "--superinstructions=off", "--quickening=on", "--inline-caches=off", "--bytecode-cache=off", "--jit=off")),
+        Combo("quickening-on-bytecode-auto", ("--exec-format=auto", "--opt-level=0", "--superinstructions=off", "--quickening=on", "--inline-caches=off", "--bytecode-cache=off", "--jit=off")),
+        Combo("inline-caches-on", ("--opt-level=0", "--superinstructions=off", "--quickening=off", "--inline-caches=on", "--bytecode-cache=off", "--jit=off")),
         Combo(
             "bytecode-cache-read-write",
             (
                 "--opt-level=0",
+                "--superinstructions=off",
                 "--quickening=off",
                 "--inline-caches=off",
                 "--bytecode-cache=read-write",
@@ -144,6 +149,7 @@ def combos(cache_root: Path, include_jit: bool) -> tuple[Combo, list[Combo]]:
             "all-non-jit-cranelift",
             (
                 "--opt-level=2",
+                "--superinstructions=off",
                 "--quickening=on",
                 "--inline-caches=on",
                 "--bytecode-cache=read-write",
@@ -159,6 +165,7 @@ def combos(cache_root: Path, include_jit: bool) -> tuple[Combo, list[Combo]]:
                 "jit-cranelift",
                 (
                     "--opt-level=2",
+                    "--superinstructions=off",
                     "--quickening=on",
                     "--inline-caches=on",
                     "--bytecode-cache=off",

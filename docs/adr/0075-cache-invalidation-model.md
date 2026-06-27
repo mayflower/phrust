@@ -54,6 +54,20 @@ The first implementation should use the same side-table lifecycle as
 quickening. Later layers may add more compact slot layouts, but they must keep
 the invalidation semantics in this ADR.
 
+The current function-call IC implementation stores the normalized function name,
+function-table epoch, arity, named-argument sequence, by-reference argument
+shape, and, for VM/runtime builtins, a builtin implementation id plus version.
+The builtin version is request-local metadata today; future generated-arginfo or
+runtime builtin replacement work must bump or change it before reusing a slot.
+
+The current property-fetch IC implementation stores the normalized receiver
+class, declaring class/property storage target, receiver class id, layout epoch,
+declared property slot index, visibility context, typed-property initialized
+state, property-hook presence, magic `__get` presence, and dynamic-property
+fallback state. A cache hit revalidates that metadata against the request state
+before returning storage; mismatches record a property IC fallback reason and
+resume the baseline property path.
+
 ## Non-Goals
 
 This ADR does not introduce inline-cache fast paths, new VM opcodes, JIT code,

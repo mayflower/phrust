@@ -163,12 +163,16 @@ warnings, or by-reference/lvalue fetches.
 The implemented Performance side-table specialization is `PACKED_ARRAY_INT_KEY`.
 It only runs for read-only `FETCH_DIM` instructions whose runtime operands are
 direct `Value::Array` and direct non-negative `Value::Int`. The array must
-still be packed at execution time, with keys exactly `0..len`, and the key must
-be in bounds. The handler returns the element through the same effective-value
-path as the baseline fetch. Mixed arrays, out-of-bounds reads, numeric-string
-key normalization, string offset reads, SPL/ArrayAccess-like objects, quiet
-fetch behavior, warnings, and by-reference or write fetches record a packed dim
-miss and tail-call the generic `FETCH_DIM` implementation.
+still be packed at execution time according to `PhpArray::packed_metadata()`,
+with keys exactly `0..len`, and the key must be in bounds. The handler returns
+the element through the same effective-value path as the baseline fetch. Direct
+reference elements, mixed arrays, out-of-bounds reads, numeric-string key
+normalization, string offset reads, SPL/ArrayAccess-like objects, quiet fetch
+behavior, warnings, and by-reference or write fetches record the relevant
+packed fallback counter and tail-call the generic `FETCH_DIM` implementation.
+Shared read-only arrays remain eligible because operand reads clone array
+handles; mutation-sensitive append/assign paths record COW/reference fallback
+before generic separation.
 
 ### `CALL` Known Function
 
@@ -179,15 +183,24 @@ and argument binding logic. It must fall back for autoload/eval/include changes,
 disabled functions, dynamic callables, changed defaults, by-reference errors,
 or any exception-producing binding path.
 
-The implemented Work item function-call IC is monomorphic and
-resolution-only. It caches successful `CallFunction` resolution for current-unit
-user functions, include-defined dynamic functions, VM-managed builtins, and
-registered internal builtins. Each slot is keyed by compiled unit, function,
-block, instruction, and IC kind. The guard checks the normalized function name
-and request-local lookup epoch before tail-calling the same user-function or
-builtin execution path as the baseline resolver. Includes, eval attempts, and
-autoload registration changes conservatively bump the epoch; a stale slot records
-an invalidation and refreshes through generic resolution.
+The implemented Work item function-call IC is monomorphic and caches guarded
+`CallFunction` resolution for current-unit user functions, include-defined
+dynamic functions, VM-managed builtins, and registered internal builtins. Each
+slot is keyed by compiled unit, function, block, instruction, and IC kind. The
+guard checks the normalized function name, request-local lookup epoch, arity,
+named-argument sequence, by-reference argument shape, and builtin
+implementation id/version when the target is a VM/runtime builtin. A hit still
+tail-calls the same user-function or builtin execution path as the baseline
+resolver. Includes, eval attempts, and autoload registration changes
+conservatively bump the epoch; a stale slot records an invalidation and
+refreshes through generic resolution. Guard or metadata mismatches record a
+fallback and use the generic resolver.
+
+The initial builtin fast-stub set is deliberately small and runs only while
+`--inline-caches=on`: `strlen` for direct strings, `count` for direct arrays,
+and `is_int`, `is_string`, and `is_array` for direct non-reference values. Wrong
+arity, named-argument errors, by-reference paths, coercion-sensitive values, and
+unsupported builtin shapes fall back to the existing builtin registry path.
 
 ### `CALL_METHOD` Known Method
 
@@ -218,24 +231,31 @@ the object API. It must fall back for uninitialized typed properties, dynamic
 properties, readonly write-adjacent behavior, property hooks, `__get`, visibility
 errors, references, or class shape changes.
 
-The implemented Work item property-fetch IC is monomorphic and
-resolution-only for declared backed property reads. It caches successful
-`FetchProperty` metadata for current-unit classes and include-defined dynamic
-classes after the generic path has resolved the declared property, validated
-visibility, skipped hooks, read initialized storage, and proven the path is not
-dynamic or magic. Each slot is keyed by compiled unit, function, block,
-instruction, and IC kind. The guard checks the requested property name,
-normalized receiver class, request-local lookup epoch, and, for private
-properties, the exact normalized visibility scope. Public property entries use
-no scope guard because their visibility is scope-independent.
+The implemented property-fetch IC is monomorphic first, with a fixed-size
+polymorphic receiver list capped by the shared IC limit. It is resolution-only
+for declared backed property reads. It caches successful `FetchProperty`
+metadata for current-unit classes and include-defined dynamic classes after the
+generic path has resolved the declared property, validated visibility, skipped
+hooks, read initialized storage, and proven the path is not dynamic or magic.
+Each slot is keyed by compiled unit, function, block, instruction, and IC kind.
+The guard checks the requested property name, normalized receiver class,
+request-local lookup epoch, and, for private properties, the exact normalized
+visibility scope. Public property entries use no scope guard because their
+visibility is scope-independent.
 
-Cache hits rehydrate the declaring class and property from the owning compiled
-unit and still re-check visibility, hook metadata, active hook recursion, object
-storage, and uninitialized typed-property state before returning a value. If any
-of those checks become complex, the hit declines back to generic dispatch
-instead of producing a PHP-visible result. Dynamic properties, `__get` fallback,
-property hooks, protected properties, and first reads of uninitialized typed
-properties are intentionally not installed as property-cache targets.
+Phase 09.10 makes the cached target carry explicit object/class layout metadata:
+receiver class id, layout epoch, declared property slot index, visibility
+context, typed-property initialized state, property-hook presence, magic
+`__get` presence, and dynamic-property fallback state. Cache hits rehydrate the
+declaring class and property from the owning compiled unit and still re-check
+receiver class id, layout epoch, property slot, storage name, visibility, hook
+metadata, active hook recursion, object storage, and uninitialized
+typed-property state before returning a value. If any check fails, the hit
+declines back to generic dispatch and records `property_ic_fallback_reasons`.
+Dynamic properties, `__get` fallback, property hooks, protected properties, and
+first reads of uninitialized typed properties are intentionally not installed as
+property-cache targets. Property assignment ICs remain deferred until assignment
+semantics have the same focused fixture coverage.
 
 ### `FETCH_CLASS_CONST` And Static Property Metadata
 
@@ -352,6 +372,12 @@ only when counter collection is enabled. Current fields:
 | `string_concat_fast_path_misses` | `CONCAT_STRING_STRING` entries that fell back to generic concat. |
 | `packed_dim_fast_path_hits` | `PACKED_ARRAY_INT_KEY` handler executions whose guards passed. |
 | `packed_dim_fast_path_misses` | `PACKED_ARRAY_INT_KEY` entries that fell back to generic dim fetch. |
+| `packed_fetch_fast_hits` | Packed-array int-index fetches completed by the guarded interpreter/JIT path. |
+| `packed_fetch_bounds_fallbacks` | Installed packed-fetch guards that failed because the integer index was out of bounds. |
+| `packed_fetch_layout_fallbacks` | Installed packed-fetch guards that failed because the receiver/key was not an eligible packed-list int-index read. |
+| `packed_append_fast_hits` | Packed append writes that stayed on the guarded packed path without COW/reference fallback. |
+| `packed_foreach_fast_hits` | By-value packed-list foreach snapshots that were reference-free and used the packed fast path. |
+| `cow_or_reference_fallbacks` | Array fast paths that stayed generic because COW separation or direct reference elements were present. |
 | `inline_cache_observations` | Candidate IC instruction observations while inline caches are enabled. |
 | `inline_cache_slots` | Request-local IC slots allocated for candidate instructions. |
 | `inline_cache_function_slots` | Function-call IC slots allocated. |
@@ -368,12 +394,20 @@ only when counter collection is enabled. Current fields:
 | `inline_cache_fallback_calls` | Shared-protocol IC misses that used baseline lookup/dispatch. |
 | `inline_cache_megamorphic` | IC slots that transitioned to megamorphic state. |
 | `inline_cache_disabled` | IC slots disabled after repeated shape-changing guard failures. |
+| `function_call_ic_hits` | Function-call IC guard hits. |
+| `function_call_ic_misses` | Function-call IC misses, including cold slots and guard failures. |
+| `builtin_call_ic_hits` | Function-call IC hits whose cached target is a VM/runtime builtin. |
+| `builtin_call_ic_misses` | Function-call IC misses that resolve to a VM/runtime builtin through fallback. |
+| `builtin_fast_stub_hits` | Per-builtin hits for the small exact fast-stub set. |
+| `builtin_fast_stub_misses` | Per-builtin misses that fell back to the generic builtin path. |
+| `call_ic_megamorphic_fallbacks` | Function-call IC sites that reached megamorphic fallback state. |
 | `method_ic_hits` | Method-call IC guard hits. |
 | `method_ic_misses` | Method-call IC misses, including cold slots and guard failures. |
 | `method_ic_guard_failures` | Method-call IC misses caused by receiver, method, or scope guard failure. |
 | `property_ic_hits` | Property-fetch IC guard hits. |
 | `property_ic_misses` | Property-fetch IC misses, including cold slots and guard failures. |
 | `property_ic_guard_failures` | Property-fetch IC misses caused by receiver, property, or scope guard failure. |
+| `property_ic_fallback_reasons` | Per-reason slow-path exits when a cached property target fails layout/storage/visibility revalidation. |
 | `class_static_ic_hits` | Class-constant/static-property IC guard hits. |
 | `class_static_ic_misses` | Class-constant/static-property IC misses, including cold slots and guard failures. |
 | `class_static_ic_guard_failures` | Class-constant/static-property IC misses caused by class, member, kind, or scope guard failure. |

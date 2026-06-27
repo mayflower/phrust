@@ -54,7 +54,10 @@ generic interpreter instruction remains the semantic source of truth.
 Quickening is not an optimizer pass. Optimizer passes transform IR before
 execution, are controlled by opt levels, and must preserve verifier validity.
 Quickening observes runtime values during execution and must be discardable
-without changing the compiled unit.
+without changing the compiled unit. Request-local quickening keys may identify
+either a rich-IR site (`function`, `block`, `instruction`) or a dense-bytecode
+site (`unit`, `function`, absolute instruction index); both use the same guard
+and fallback protocol.
 
 Quickening is not a bytecode cache. Quickening state is request-local in Performance
 unless a later ADR defines a safe lifecycle for cross-request sharing. Cached
@@ -74,8 +77,9 @@ The initial quickening candidates are deliberately small and reversible.
 
 | Candidate | Baseline behavior | Guard | Fallback |
 | --- | --- | --- | --- |
-| `ADD` int/int | Generic binary addition and PHP numeric coercion behavior. | Both operands are unreferenced integer values; addition does not overflow the engine integer representation; no numeric-string coercion is needed. | Generic binary addition. |
+| `ADD`/`SUB`/`MUL` int/int | Generic binary arithmetic and PHP numeric coercion behavior. | Both operands are unreferenced integer values; the operation does not overflow the engine integer representation; no numeric-string coercion is needed. | Generic binary arithmetic. |
 | `CONCAT` string/string | Generic PHP concat conversion and allocation behavior. | Both operands are PHP strings; COW/reference state is respected; allocation succeeds. | Generic concat conversion path. |
+| Dense bool branch | Generic PHP truthiness conversion for branch conditions. | Condition value is already a PHP bool. | Generic `to_bool` branch conversion. |
 | `FETCH_DIM` packed-array/int-key | Generic array/string/object/null dimension fetch behavior. | Receiver is an array with packed layout; key is a non-negative integer in range; element read does not expose mutable storage unsafely. | Generic dimension fetch, including warnings/null behavior. |
 | `CALL` known function | Generic callable resolution and call binding. | Function table epoch and function id match; named/variadic/by-ref/default binding assumptions match the observed call shape. | Generic call resolution and binding. |
 | `FETCH_PROP` monomorphic class slot | Generic property visibility, dynamic property, hook, magic, and error behavior. | Object class id/epoch matches; property slot and visibility are stable; no property hooks, magic access, dynamic property creation, or uninitialized typed-property edge applies. | Generic property fetch path. |
@@ -156,13 +160,15 @@ continuation, exception classes, and timing-independent side effects.
 The VM counter surface should add quickening and inline-cache fields as the
 implementation lands:
 
-- `quickening_observations`
-- `quickening_installs`
-- `quickening_hits`
-- `quickening_misses`
+- `quickening_attempts`
+- `quickening_specialized`
+- `quickening_guard_hits`
+- `quickening_guard_misses`
 - `quickening_guard_failures`
-- `quickening_deopts`
-- `quickening_invalidations`
+- `quickening_fallback_calls`
+- `quickening_dequickens`
+- `quickening_megamorphic`
+- `quickening_disabled`
 - `inline_cache_hits`
 - `inline_cache_misses`
 - `inline_cache_invalidations`

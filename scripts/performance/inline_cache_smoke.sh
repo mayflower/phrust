@@ -88,6 +88,7 @@ required_fields = [
     "property_ic_hits",
     "property_ic_misses",
     "property_ic_guard_failures",
+    "property_ic_fallback_reasons",
     "class_static_ic_hits",
     "class_static_ic_misses",
     "class_static_ic_guard_failures",
@@ -99,6 +100,13 @@ required_fields = [
     "autoload_class_lookup_ic_misses",
     "autoload_class_lookup_ic_invalidations",
     "autoload_class_lookup_ic_guard_failures",
+    "function_call_ic_hits",
+    "function_call_ic_misses",
+    "builtin_call_ic_hits",
+    "builtin_call_ic_misses",
+    "builtin_fast_stub_hits",
+    "builtin_fast_stub_misses",
+    "call_ic_megamorphic_fallbacks",
 ]
 for sample in off + on:
     for field in required_fields:
@@ -108,8 +116,20 @@ for sample in off + on:
 def total(samples, field):
     return sum(sample.get(field, 0) for sample in samples)
 
+def total_map(samples, field, name):
+    total_value = 0
+    for sample in samples:
+        value = sample.get(field, {})
+        if isinstance(value, dict):
+            total_value += value.get(name, 0)
+    return total_value
+
 off_slots = total(off, "inline_cache_slots")
 off_observations = total(off, "inline_cache_observations")
+off_function_call_hits = total(off, "function_call_ic_hits")
+off_function_call_misses = total(off, "function_call_ic_misses")
+off_builtin_call_hits = total(off, "builtin_call_ic_hits")
+off_builtin_call_misses = total(off, "builtin_call_ic_misses")
 on_slots = total(on, "inline_cache_slots")
 on_observations = total(on, "inline_cache_observations")
 on_function_slots = total(on, "inline_cache_function_slots")
@@ -138,9 +158,19 @@ on_include_path_guard_failures = total(on, "include_path_ic_guard_failures")
 on_autoload_class_lookup_hits = total(on, "autoload_class_lookup_ic_hits")
 on_autoload_class_lookup_misses = total(on, "autoload_class_lookup_ic_misses")
 on_autoload_class_lookup_guard_failures = total(on, "autoload_class_lookup_ic_guard_failures")
+on_function_call_hits = total(on, "function_call_ic_hits")
+on_function_call_misses = total(on, "function_call_ic_misses")
+on_builtin_call_hits = total(on, "builtin_call_ic_hits")
+on_builtin_call_misses = total(on, "builtin_call_ic_misses")
+on_call_ic_megamorphic_fallbacks = total(on, "call_ic_megamorphic_fallbacks")
 
 if off_slots != 0 or off_observations != 0:
     raise SystemExit(f"[fail] inline-caches=off recorded slots={off_slots} observations={off_observations}")
+if off_function_call_hits or off_function_call_misses or off_builtin_call_hits or off_builtin_call_misses:
+    raise SystemExit("[fail] inline-caches=off recorded function/builtin IC counters")
+for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
+    if total_map(off, "builtin_fast_stub_hits", builtin) or total_map(off, "builtin_fast_stub_misses", builtin):
+        raise SystemExit(f"[fail] inline-caches=off recorded builtin fast-stub counters for {builtin}")
 if on_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no slots")
 if on_observations < on_slots:
@@ -157,6 +187,19 @@ if on_hits <= 0:
     raise SystemExit("[fail] function-call inline cache recorded no hits")
 if on_misses <= 0:
     raise SystemExit("[fail] function-call inline cache recorded no misses")
+if on_function_call_hits <= 0:
+    raise SystemExit("[fail] function-call IC counter recorded no hits")
+if on_function_call_misses <= 0:
+    raise SystemExit("[fail] function-call IC counter recorded no misses")
+if on_builtin_call_hits <= 0:
+    raise SystemExit("[fail] builtin-call IC counter recorded no hits")
+if on_builtin_call_misses <= 0:
+    raise SystemExit("[fail] builtin-call IC counter recorded no misses")
+for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
+    if total_map(on, "builtin_fast_stub_hits", builtin) <= 0:
+        raise SystemExit(f"[fail] builtin fast stub recorded no hits for {builtin}")
+if total_map(on, "builtin_fast_stub_misses", "strlen") <= 0:
+    raise SystemExit("[fail] builtin fast stub recorded no strlen misses")
 if on_method_hits <= 0:
     raise SystemExit("[fail] method-call inline cache recorded no hits")
 if on_method_misses <= 0:
@@ -179,24 +222,26 @@ if on_autoload_class_lookup_misses <= 0:
     raise SystemExit("[fail] autoload class lookup inline cache recorded no misses")
 if on_invalidations <= 0:
     raise SystemExit("[fail] inline-cache smoke recorded no IC invalidation")
-if on_guard_failures != 0:
-    raise SystemExit(f"[fail] function-call inline cache recorded unexpected guard failures: {on_guard_failures}")
+if on_property_guard_failures <= 0:
+    raise SystemExit("[fail] property-fetch inline cache recorded no guard failures for shape fallback fixture")
+if on_guard_failures != on_property_guard_failures:
+    raise SystemExit(
+        f"[fail] inline-cache guard failures {on_guard_failures} differ from expected property guard failures {on_property_guard_failures}"
+    )
 if on_fallback_calls < on_misses:
     raise SystemExit(f"[fail] inline-cache fallback calls {on_fallback_calls} below misses {on_misses}")
 if on_method_guard_failures != 0:
     raise SystemExit(f"[fail] method-call inline cache recorded unexpected guard failures: {on_method_guard_failures}")
-if on_property_guard_failures != 0:
-    raise SystemExit(f"[fail] property-fetch inline cache recorded unexpected guard failures: {on_property_guard_failures}")
 if on_class_static_guard_failures != 0:
     raise SystemExit(f"[fail] class-constant/static-property inline cache recorded unexpected guard failures: {on_class_static_guard_failures}")
 if on_include_path_guard_failures != 0:
     raise SystemExit(f"[fail] include-path inline cache recorded unexpected guard failures: {on_include_path_guard_failures}")
 if on_autoload_class_lookup_guard_failures != 0:
     raise SystemExit(f"[fail] autoload class lookup inline cache recorded unexpected guard failures: {on_autoload_class_lookup_guard_failures}")
-if on_megamorphic != 0:
-    raise SystemExit(f"[fail] function-call inline cache recorded unexpected megamorphic transitions: {on_megamorphic}")
 if on_disabled != 0:
     raise SystemExit(f"[fail] function-call inline cache recorded unexpected disabled transitions: {on_disabled}")
+if on_call_ic_megamorphic_fallbacks != 0:
+    raise SystemExit(f"[fail] function-call IC recorded unexpected megamorphic fallbacks: {on_call_ic_megamorphic_fallbacks}")
 PY
 
 printf '[pass] inline-cache smoke compared %s fixture(s)\n' "$fixture_count"

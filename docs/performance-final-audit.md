@@ -38,6 +38,7 @@ nix develop -c just callgrind-smoke
 nix develop -c just jit-smoke
 nix develop -c just safety-audit-smoke
 nix develop -c just benchmark-smoke
+nix develop -c just framework-smoke
 nix develop -c just hotpath-inventory
 nix develop -c just perf-report
 ```
@@ -82,7 +83,7 @@ nix develop -c just benchmark-suite
 | Optional profiling | Implemented maintainer-only recipes that skip by default and write profiler artifacts under `target/performance/profiles/`. | `docs/performance-profiling-workflow.md`, `scripts/performance/profile_smoke.sh` |
 | Optional release profiles | Documented LTO/PGO experiments without changing default build profiles. | `docs/performance-release-build-profile.md`, `scripts/performance/release_profile_plan.sh` |
 | Shared-cache research | Compared disk cache, mmap, process-local cache, and future shared memory with security/invalidation risks. | `docs/performance-research-shared-cache.md` |
-| Framework micro-smokes | Implemented offline router, DI-container, attribute/reflection, and template-output smokes with opt-off/on counter comparison and perf-report integration. | `tests/fixtures/performance/framework_smoke/`, `scripts/performance/framework_micro_smoke.py`, `just framework-smoke`, `just perf-report` |
+| Framework micro-smokes | Implemented offline router, Composer/autoload-like lookup, DI-container, DTO hydration, attribute/reflection, template-output, JSON/API-like output, object property/method loop, and packed/mixed array traversal smokes with opt-off/on counter comparison, generated corpus summary, `verify-performance`, and perf-report integration. | `tests/fixtures/performance/framework_smoke/`, `scripts/performance/framework_micro_smoke.py`, `docs/performance-framework-corpus.md`, `just framework-smoke`, `just verify-performance`, `just perf-report` |
 | Known gaps | Current and explicit; no performance claim depends on unstated gaps. | `docs/performance-known-gaps.md` |
 
 ## Current Known Gaps

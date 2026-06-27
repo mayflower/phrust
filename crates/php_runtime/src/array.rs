@@ -68,6 +68,25 @@ impl ArrayKey {
     }
 }
 
+/// Runtime array storage kind proven by array metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayKind {
+    /// Integer keys are exactly `0..len` in insertion order.
+    PackedList,
+    /// Any shape outside the packed-list invariant.
+    MixedHash,
+}
+
+/// Guard metadata for packed-array fast paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhpArrayPackedMetadata {
+    pub kind: PhpArrayKind,
+    pub is_shared: bool,
+    pub contains_references: bool,
+    pub mutation_epoch: u64,
+    pub packed_len: Option<usize>,
+}
+
 /// One ordered array slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayEntry {
@@ -94,12 +113,13 @@ impl ArrayEntry {
 /// The storage is intentionally opaque. Today it is a simple insertion-ordered
 /// vector, but callers interact through key/value APIs that can later route to
 /// packed or mixed representations without changing the VM boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct ArrayStorage {
     entries: Vec<ArrayEntry>,
     next_append_key: Option<i64>,
     packed_len: Option<usize>,
     internal_pointer: Option<usize>,
+    mutation_epoch: u64,
 }
 
 impl Default for ArrayStorage {
@@ -109,9 +129,21 @@ impl Default for ArrayStorage {
             next_append_key: None,
             packed_len: Some(0),
             internal_pointer: None,
+            mutation_epoch: 0,
         }
     }
 }
+
+impl PartialEq for ArrayStorage {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.next_append_key == other.next_append_key
+            && self.packed_len == other.packed_len
+            && self.internal_pointer == other.internal_pointer
+    }
+}
+
+impl Eq for ArrayStorage {}
 
 /// Copy-on-write ordered PHP array facade.
 ///
@@ -161,6 +193,7 @@ impl PhpArray {
                 next_append_key: None,
                 packed_len: Some(0),
                 internal_pointer: None,
+                mutation_epoch: 0,
             }),
         }
     }
@@ -206,6 +239,43 @@ impl PhpArray {
         self.is_packed_fast().then_some(self.storage.entries.len())
     }
 
+    /// Returns the array kind proven by tracked metadata.
+    #[must_use]
+    pub fn kind_fast(&self) -> PhpArrayKind {
+        if self.is_packed_fast() {
+            PhpArrayKind::PackedList
+        } else {
+            PhpArrayKind::MixedHash
+        }
+    }
+
+    /// Returns true when any direct array slot stores a PHP reference.
+    #[must_use]
+    pub fn contains_references_fast(&self) -> bool {
+        self.storage
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.value, Value::Reference(_)))
+    }
+
+    /// Returns the current structural/content mutation epoch.
+    #[must_use]
+    pub fn mutation_epoch(&self) -> u64 {
+        self.storage.mutation_epoch
+    }
+
+    /// Returns packed-array guard metadata for VM and JIT consumers.
+    #[must_use]
+    pub fn packed_metadata(&self) -> PhpArrayPackedMetadata {
+        PhpArrayPackedMetadata {
+            kind: self.kind_fast(),
+            is_shared: self.is_shared(),
+            contains_references: self.contains_references_fast(),
+            mutation_epoch: self.mutation_epoch(),
+            packed_len: self.packed_len_fast(),
+        }
+    }
+
     /// Returns a process-local storage identity for GC debug snapshots.
     ///
     /// This is not a PHP-visible handle and must only be used by runtime tests
@@ -240,8 +310,9 @@ impl PhpArray {
     pub fn insert(&mut self, key: ArrayKey, value: Value) -> Option<Value> {
         let storage = self.storage_mut();
         bump_append_key(storage, &key);
-        if let Some(entry) = storage.entries.iter_mut().find(|entry| entry.key == key) {
-            return Some(std::mem::replace(&mut entry.value, value));
+        if let Some(index) = storage.entries.iter().position(|entry| entry.key == key) {
+            bump_mutation_epoch(storage);
+            return Some(std::mem::replace(&mut storage.entries[index].value, value));
         }
         let old_len = storage.entries.len();
         let remains_packed = storage.packed_len == Some(old_len)
@@ -251,6 +322,7 @@ impl PhpArray {
         if storage.internal_pointer.is_none() {
             storage.internal_pointer = Some(0);
         }
+        bump_mutation_epoch(storage);
         None
     }
 
@@ -270,6 +342,7 @@ impl PhpArray {
         if storage.internal_pointer.is_none() {
             storage.internal_pointer = Some(0);
         }
+        bump_mutation_epoch(storage);
         key
     }
 
@@ -285,11 +358,12 @@ impl PhpArray {
 
     /// Returns a mutable value by normalized key without exposing storage.
     pub fn get_mut(&mut self, key: &ArrayKey) -> Option<&mut Value> {
-        self.storage_mut()
-            .entries
-            .iter_mut()
-            .find(|entry| &entry.key == key)
-            .map(|entry| &mut entry.value)
+        let storage = self.storage_mut();
+        if let Some(index) = storage.entries.iter().position(|entry| &entry.key == key) {
+            bump_mutation_epoch(storage);
+            return Some(&mut storage.entries[index].value);
+        }
+        None
     }
 
     /// Removes a value by normalized key.
@@ -311,6 +385,7 @@ impl PhpArray {
                         };
                 }
                 adjust_pointer_after_remove(storage, index);
+                bump_mutation_epoch(storage);
                 value
             })
     }
@@ -461,6 +536,10 @@ fn bump_append_key(storage: &mut ArrayStorage, key: &ArrayKey) {
     }
 }
 
+fn bump_mutation_epoch(storage: &mut ArrayStorage) {
+    storage.mutation_epoch = storage.mutation_epoch.wrapping_add(1);
+}
+
 fn adjust_pointer_after_remove(storage: &mut ArrayStorage, removed_index: usize) {
     let Some(pointer) = storage.internal_pointer else {
         return;
@@ -502,7 +581,7 @@ fn normalize_string_key(value: &PhpString) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArrayKey, PhpArray};
+    use super::{ArrayKey, PhpArray, PhpArrayKind};
     use crate::{PhpString, Value};
 
     #[test]
@@ -745,5 +824,64 @@ mod tests {
         assert_eq!(array.packed_len_fast(), Some(2));
         cell.set(Value::Int(7));
         assert_eq!(array.packed_element_fast(1), Some(&Value::Reference(cell)));
+    }
+
+    #[test]
+    fn packed_metadata_reports_kind_references_sharing_and_epoch() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        let metadata = array.packed_metadata();
+        assert_eq!(metadata.kind, PhpArrayKind::PackedList);
+        assert_eq!(metadata.packed_len, Some(2));
+        assert!(!metadata.is_shared);
+        assert!(!metadata.contains_references);
+        assert_eq!(metadata.mutation_epoch, 2);
+
+        let shared = array.clone();
+        assert!(array.packed_metadata().is_shared);
+        drop(shared);
+
+        let cell = crate::ReferenceCell::new(Value::Int(3));
+        array.append(Value::Reference(cell));
+        let metadata = array.packed_metadata();
+        assert_eq!(metadata.kind, PhpArrayKind::PackedList);
+        assert!(metadata.contains_references);
+        assert_eq!(metadata.packed_len, Some(3));
+        assert_eq!(metadata.mutation_epoch, 3);
+
+        array.insert(ArrayKey::String(PhpString::from("x")), Value::Int(4));
+        let metadata = array.packed_metadata();
+        assert_eq!(metadata.kind, PhpArrayKind::MixedHash);
+        assert_eq!(metadata.packed_len, None);
+        assert_eq!(metadata.mutation_epoch, 4);
+    }
+
+    #[test]
+    fn mutation_epoch_tracks_value_and_structural_writes() {
+        let mut array = PhpArray::new();
+        assert_eq!(array.mutation_epoch(), 0);
+
+        array.append(Value::Int(1));
+        assert_eq!(array.mutation_epoch(), 1);
+
+        array.insert(ArrayKey::Int(0), Value::Int(2));
+        assert_eq!(array.mutation_epoch(), 2);
+
+        *array.get_mut(&ArrayKey::Int(0)).expect("entry") = Value::Int(3);
+        assert_eq!(array.mutation_epoch(), 3);
+
+        assert_eq!(array.remove(&ArrayKey::Int(0)), Some(Value::Int(3)));
+        assert_eq!(array.mutation_epoch(), 4);
+        assert_eq!(array.remove(&ArrayKey::Int(99)), None);
+        assert_eq!(array.mutation_epoch(), 4);
+    }
+
+    #[test]
+    fn mutation_epoch_is_not_php_visible_equality() {
+        let mut first = PhpArray::from_packed(vec![Value::Int(1)]);
+        let second = PhpArray::from_packed(vec![Value::Int(1)]);
+        first.insert(ArrayKey::Int(0), Value::Int(1));
+
+        assert_ne!(first.mutation_epoch(), second.mutation_epoch());
+        assert_eq!(first, second);
     }
 }

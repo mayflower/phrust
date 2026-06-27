@@ -4,6 +4,7 @@
 //! control flow, exceptions, includes, tracing, and VM results. The current layer keeps
 //! it as a compile-tested skeleton only.
 
+pub mod bytecode;
 pub mod compiled_unit;
 pub mod counters;
 pub mod fallback;
@@ -17,6 +18,7 @@ pub mod tiering;
 pub mod todo_runtime;
 pub mod vm;
 
+pub use bytecode::{DenseBytecodeUnit, DenseOpcode};
 pub use compiled_unit::CompiledUnit;
 pub use counters::{JitCompileDescriptor, VmCounters};
 pub use fallback::{
@@ -38,7 +40,9 @@ pub use quickening::{
 };
 pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 pub use todo_runtime::{VmTodo, vm_skeleton_status};
-pub use vm::{JitBlacklistMode, JitMode, Vm, VmOptions, VmResult};
+pub use vm::{
+    ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm, VmOptions, VmResult,
+};
 
 #[cfg(test)]
 mod tests {

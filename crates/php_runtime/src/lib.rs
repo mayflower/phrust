@@ -33,7 +33,9 @@ pub mod tokenizer;
 pub mod types;
 pub mod value;
 
-pub use array::{ArrayEntry, ArrayKey, PhpArray, WeakArrayHandle};
+pub use array::{
+    ArrayEntry, ArrayKey, PhpArray, PhpArrayKind, PhpArrayPackedMetadata, WeakArrayHandle,
+};
 pub use autoload::AutoloadRegistry;
 pub use builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinRegistry,

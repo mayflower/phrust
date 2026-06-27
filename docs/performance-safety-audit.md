@@ -185,12 +185,19 @@ boundary and must stay covered by `docs/safety-audit-cranelift.md`,
 The VM now keeps a request-local frame pool inside `CallStack` for normal
 function activations. Completed normal calls recycle their frame after the VM
 has exported shared locals and captured any by-reference return cell.
+Each `Frame` carries an explicit reuse-eligibility flag, so shared
+`pop_recycle()` exits cannot accidentally pool an activation that was classified
+as unsafe at call entry.
 
 Safety constraints:
 
 - Pooled frames are cleared before reuse. Registers, locals, arguments, and
   class context fields are dropped so the pool does not keep PHP-visible values,
   references, objects, or destructor roots alive.
+- Fresh non-pooled frames are used for closure captures, by-reference params or
+  returns, generator/fiber continuations, class contexts, shared top-level
+  locals, try/finally bodies, and object-allocation bodies that may retain
+  destructor-sensitive values.
 - Generator and fiber suspension paths still use ownership-moving `pop()` and
   store the frame in their continuation. They do not recycle suspended frames.
 - Exception and fiber propagation paths keep ownership semantics unchanged.
@@ -202,13 +209,21 @@ Allocation counters:
 
 - `frame_allocations` counts fresh frame allocations for function activations.
 - `frame_reuses` counts activations served from the request-local frame pool.
+- `frames_allocated` and `frames_reused` are prompt-facing aliases for the same
+  activation counts.
+- `register_files_allocated` and `register_files_reused` track the register-file
+  allocation/reuse event coupled to each frame activation.
+- `frame_reuse_blocked_by_reason` records conservative fallback reasons.
 
 Coverage:
 
 - call-heavy loop shows frame reuse counters,
 - recursive calls preserve nested active frames,
+- closure captures and by-reference params execute with explicit non-reuse
+  counters,
 - supported finally-through-call control flow remains observable,
-- destructor output remains observable after the allocating call frame recycles,
+- destructor output remains observable while object-allocation frames stay
+  non-pooled,
 - generator and fiber suspension smoke tests preserve existing output.
 
 ## Work item: JIT ABI Boundary

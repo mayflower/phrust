@@ -48,6 +48,26 @@ classification, parameter prologues, internal functions, and output buffering.
 They must not bypass references, COW, destructors, generators, fibers,
 exceptions, visibility, magic methods, or diagnostics.
 
+Frame/register reuse is request-local and conservative. The VM reuses completed
+plain user-function frames and their register/local-file allocations, but pushes
+fresh non-pooled frames for closure captures, by-reference params or returns,
+generator/fiber continuations, class contexts, shared top-level locals,
+try/finally bodies, and object-allocation bodies that may retain
+destructor-sensitive values. Raw counters expose both legacy
+`frame_allocations`/`frame_reuses` and prompt-facing `frames_allocated`,
+`frames_reused`, `register_files_allocated`, `register_files_reused`, and
+`frame_reuse_blocked_by_reason`.
+
+Packed-array fast paths consume `PhpArray::packed_metadata()` rather than
+duplicating layout knowledge in the VM. The metadata records packed-vs-mixed
+kind, direct reference elements, COW sharing, mutation epoch, and packed length.
+Read-only packed int fetches may run on shared handles, because operand reads
+clone the array handle, but mutation-sensitive append/assign paths and
+reference-bearing arrays record `cow_or_reference_fallbacks` and use generic
+semantics. Cranelift remains default-off and may only consume this proven
+metadata through guarded helper paths; it is not the owner of packed-array
+semantics.
+
 ### Tiering Policy
 
 Tiering is request-local and advisory. The current policy tracks function entry
@@ -71,8 +91,9 @@ guard/deopt policy, code-cache lifecycle, platform limits, and abort criteria.
 ## Correctness Contract
 
 - `--opt-level=0` is the baseline when optimization flags exist.
-- `--quickening=off`, `--inline-caches=off`, `--bytecode-cache=off`, and
-  `--jit=off` are required once the respective layers exist.
+- `--quickening=off`, `--inline-caches=off`, `--bytecode-cache=off`,
+  `--exec-format=ir`, `--superinstructions=off`, and `--jit=off` are required
+  once the respective layers exist.
 - `--tiering=off` must keep adaptive quickening and JIT tier decisions inactive.
 - Optimized and baseline runs must match output, stderr, exit status,
   diagnostics, exception classes, warning text where modeled, and
@@ -83,6 +104,10 @@ guard/deopt policy, code-cache lifecycle, platform limits, and abort criteria.
 - Any known deviation is documented in `docs/performance-known-gaps.md`.
 
 ## Roadmap
+
+The current staged acceleration program is coordinated by
+`docs/performance-acceleration-plan.md` and its gap catalog
+`docs/performance-acceleration-known-gaps.md`.
 
 - `07.00`: preflight and initial known-gap catalog.
 - `07.01`: scope ADR and performance principles.
@@ -140,11 +165,17 @@ JIT, safety, matrix, and reporting gates.
 
 | Command | Current behavior |
 | --- | --- |
-| `verify-performance` | Runs `performance-tests`, `performance-regression`, cache/optimizer/quickening/inline-cache/JIT/safety gates, benchmark smoke, hot-path inventory, and `perf-report`. |
-| `performance-tests` | Runs `cargo test --workspace` plus Performance script self-tests. |
+| `verify-performance` | Runs `performance-tests`, `performance-regression`, cache/optimizer/superinstruction/quickening/inline-cache/JIT/safety gates, benchmark smoke, framework smoke, release benchmark smoke, hot-path inventory, and `perf-report`. |
+| `performance-tests` | Runs `cargo test --workspace` with deterministic `RUST_MIN_STACK` defaulting to `8388608`, plus Performance script self-tests. |
 | `performance-regression` | Runs `scripts/performance_regression_smoke.sh`, then `scripts/performance/regression_smoke.sh` across opt levels 0/1/2, quickening off/on, and inline caches off/on for the Work item stress fixtures, followed by `perf-flag-matrix`. |
-| `perf-flag-matrix` | Compares baseline output/exit/stderr against opt 1, opt 2, quickening, inline caches, bytecode-cache read/write, and all-non-JIT-on combinations across Performance regressions and selected Runtime semantics fixtures. JIT is opt-in with `PHRUST_PERF_MATRIX_JIT=1` when feature/platform support is available. |
+| `perf-flag-matrix` | Compares baseline output/exit/stderr against opt 1, opt 2, superinstructions-on-with-IR, quickening, quickening with `--exec-format=auto`, inline caches, bytecode-cache read/write, and all-non-JIT-on combinations across Performance regressions and selected Runtime semantics fixtures. JIT is opt-in with `PHRUST_PERF_MATRIX_JIT=1` when feature/platform support is available. |
 | `benchmark-smoke` | Builds the VM, runs deterministic Performance smoke fixtures, checks expected output, and writes `target/performance/benchmark-smoke.json`. |
+| `framework-smoke` | Builds the VM, compares opt-off and opt-on runs over deterministic framework-like fixtures, checks output parity, writes `target/performance/framework-smoke/summary.json`, and regenerates `docs/performance-framework-corpus.md`. |
+| `bytecode-exec-smoke` | Builds the VM, compares `--exec-format=ir` and strict `--exec-format=bytecode` for the supported dense-bytecode subset including scalar expressions, comparisons, and simple direct user-function calls, verifies `--exec-format=auto` fallback on an unsupported fixture, and writes `target/performance/bytecode-exec-smoke/summary.json`. |
+| `superinstruction-smoke` | Builds the VM, compares strict dense bytecode with `--superinstructions=off` and `--superinstructions=on` across supported fixtures, asserts fused opcode counters, and writes `target/performance/superinstruction-smoke/summary.json`. |
+| `release-benchmark-smoke` | Builds `php-vm` with Cargo `profile.release`, runs the deterministic performance and framework corpora against the release binary, and writes `target/performance/release/release-summary.{json,md}` plus corpus reports. Timings are advisory. |
+| `pgo-benchmark-smoke` | Optional PGO flow. Without `PHRUST_RUN_PGO=1` or `llvm-profdata`, writes a skip report under `target/performance/release/`; when enabled, builds profile-generate/profile-use release binaries and reruns the corpora. |
+| `bolt-benchmark-smoke` | Optional Linux-only BOLT flow. It writes a skip report outside Linux or without `PHRUST_RUN_BOLT=1`, `PHRUST_BOLT_PERF_DATA`, `perf2bolt`, and `llvm-bolt`; enabled runs consume perf data and benchmark the optimized binary. |
 | `callgrind-smoke` | Optional Callgrind smoke; skips cleanly outside Linux or without `valgrind`, otherwise writes `target/performance/callgrind/summary.json`. |
 | `rust-hotpath-bench` | Runs Criterion benchmarks from the benchmark-only, workspace-excluded `php_bench` package for Rust hot paths. |
 | `benchmark-suite` | Runs the deterministic CLI benchmark matrix and then `rust-hotpath-bench`. |
@@ -152,8 +183,8 @@ JIT, safety, matrix, and reporting gates.
 | `perf-compare` | Compares `target/performance/baseline.json` with a fresh benchmark smoke and writes `target/performance/perf-compare.md` plus JSON. |
 | `cache-roundtrip` | Runs fingerprint smoke coverage, bytecode-cache roundtrip/verifier/corrupt fallback tests, and CLI cache hit/miss/path-component tests. |
 | `optimizer-diff` | Verifies IR invariants and compares opt levels 0, 1, and 2 across optimizer fixtures with output, exit, and diagnostic diffs. |
-| `quickening-smoke` | Builds the VM, compares `--quickening=off` and `--quickening=on` across Performance smoke fixtures, and asserts quickening counters. |
-| `inline-cache-smoke` | Builds the VM, compares `--inline-caches=off` and `--inline-caches=on` across Performance smoke fixtures, and asserts IC slots, function-call hits/misses, method-call hits/misses, property-fetch hits/misses, class/static hits/misses, and include/eval/autoload epoch invalidation counters. |
+| `quickening-smoke` | Builds the VM, compares `--quickening=off` and `--quickening=on` across Performance smoke fixtures plus generated strict dense-bytecode fixtures for int arithmetic, string concat, and bool branches, and asserts quickening and bytecode counters. |
+| `inline-cache-smoke` | Builds the VM, compares `--inline-caches=off` and `--inline-caches=on` across Performance smoke fixtures, and asserts IC slots, guarded function-call and builtin-call hits/misses, builtin fast-stub hit/miss attribution, method-call hits/misses, property-fetch hits/misses and shape guard failures, class/static hits/misses, and include/eval/autoload epoch invalidation counters. |
 | `jit-smoke` | Runs default-off `php_jit` API, eligibility, ABI, optional Cranelift lowering tests, feature-on VM JIT tests, and a CLI A/B smoke comparing `--jit=off` and `--jit=on`; asserts compile/execution/fallback counters while keeping native machine-code execution disabled. |
 | `safety-audit-smoke` | Scans the Performance cache/JIT/adaptive runtime surface for Rust `unsafe`, runs bytecode-cache negative tests, and runs a small Miri cache test when the active toolchain supports it. |
 | `perf-report` | Renders `target/performance/perf-report.md` and JSON from benchmark measurements, VM counters, comparison artifact presence, and known gaps. |

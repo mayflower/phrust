@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use php_ir::ids::{BlockId, FunctionId, InstrId};
+use php_ir::ids::{BlockId, FunctionId, InstrId, UnitId};
 
 use crate::fallback::{DEQUICKEN_AFTER_GUARD_MISSES, FallbackProtocolStats};
 
@@ -28,19 +28,22 @@ impl QuickeningMode {
 /// Adaptive state for one instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuickeningState {
-    Cold,
-    Warming,
+    Uninitialized,
+    Observing,
     Specialized,
-    Megamorphic,
-    Disabled,
+    Dequickened,
+    Blacklisted,
 }
 
 /// Concrete quickening specialization installed for one instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuickeningSpecialization {
     AddIntInt,
+    SubIntInt,
+    MulIntInt,
     ConcatStringString,
     PackedArrayIntKey,
+    BoolBranchCondition,
 }
 
 /// Result of observing one instruction dispatch.
@@ -58,10 +61,17 @@ pub struct QuickeningObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct QuickeningKey {
-    function: u32,
-    block: u32,
-    instruction: u32,
+enum QuickeningKey {
+    Ir {
+        function: u32,
+        block: u32,
+        instruction: u32,
+    },
+    Dense {
+        unit: u32,
+        function: u32,
+        instruction: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +85,7 @@ struct QuickeningEntry {
 impl Default for QuickeningEntry {
     fn default() -> Self {
         Self {
-            state: QuickeningState::Cold,
+            state: QuickeningState::Uninitialized,
             executions: 0,
             specialization: None,
             stats: FallbackProtocolStats::default(),
@@ -97,18 +107,31 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> QuickeningObservation {
-        let key = quickening_key(function, block, instruction);
+        self.observe_key(ir_quickening_key(function, block, instruction))
+    }
+
+    /// Observes one dense bytecode instruction dispatch and updates metadata.
+    pub fn observe_dense(
+        &mut self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+    ) -> QuickeningObservation {
+        self.observe_key(dense_quickening_key(unit, function, instruction))
+    }
+
+    fn observe_key(&mut self, key: QuickeningKey) -> QuickeningObservation {
         let entry = self.entries.entry(key).or_default();
         entry.executions = entry.executions.saturating_add(1);
         match entry.state {
-            QuickeningState::Cold => {
-                entry.state = QuickeningState::Warming;
+            QuickeningState::Uninitialized => {
+                entry.state = QuickeningState::Observing;
                 QuickeningObservation {
                     attempt: true,
                     ..QuickeningObservation::default()
                 }
             }
-            QuickeningState::Warming => {
+            QuickeningState::Observing => {
                 if entry.executions >= SPECIALIZE_AFTER_EXECUTIONS {
                     entry.state = QuickeningState::Specialized;
                     QuickeningObservation {
@@ -123,11 +146,11 @@ impl QuickeningTable {
                     }
                 }
             }
-            QuickeningState::Specialized | QuickeningState::Megamorphic => QuickeningObservation {
+            QuickeningState::Specialized | QuickeningState::Dequickened => QuickeningObservation {
                 attempt: true,
                 ..QuickeningObservation::default()
             },
-            QuickeningState::Disabled => QuickeningObservation::default(),
+            QuickeningState::Blacklisted => QuickeningObservation::default(),
         }
     }
 
@@ -139,8 +162,23 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> Option<QuickeningSpecialization> {
+        self.specialization_key(ir_quickening_key(function, block, instruction))
+    }
+
+    /// Returns the specialization currently installed for one dense bytecode instruction.
+    #[must_use]
+    pub fn dense_specialization(
+        &self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+    ) -> Option<QuickeningSpecialization> {
+        self.specialization_key(dense_quickening_key(unit, function, instruction))
+    }
+
+    fn specialization_key(&self, key: QuickeningKey) -> Option<QuickeningSpecialization> {
         self.entries
-            .get(&quickening_key(function, block, instruction))
+            .get(&key)
             .and_then(|entry| entry.specialization)
     }
 
@@ -152,9 +190,22 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> Option<QuickeningState> {
-        self.entries
-            .get(&quickening_key(function, block, instruction))
-            .map(|entry| entry.state)
+        self.state_key(ir_quickening_key(function, block, instruction))
+    }
+
+    /// Returns the adaptive state for one dense bytecode instruction.
+    #[must_use]
+    pub fn dense_state(
+        &self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+    ) -> Option<QuickeningState> {
+        self.state_key(dense_quickening_key(unit, function, instruction))
+    }
+
+    fn state_key(&self, key: QuickeningKey) -> Option<QuickeningState> {
+        self.entries.get(&key).map(|entry| entry.state)
     }
 
     /// Applies the shared guard/fallback protocol for an installed
@@ -166,7 +217,25 @@ impl QuickeningTable {
         instruction: InstrId,
         hit: bool,
     ) -> QuickeningObservation {
-        let key = quickening_key(function, block, instruction);
+        self.record_specialized_guard_key(ir_quickening_key(function, block, instruction), hit)
+    }
+
+    /// Applies the guard/fallback protocol for one dense bytecode specialization.
+    pub fn record_dense_specialized_guard(
+        &mut self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+        hit: bool,
+    ) -> QuickeningObservation {
+        self.record_specialized_guard_key(dense_quickening_key(unit, function, instruction), hit)
+    }
+
+    fn record_specialized_guard_key(
+        &mut self,
+        key: QuickeningKey,
+        hit: bool,
+    ) -> QuickeningObservation {
         let Some(entry) = self.entries.get_mut(&key) else {
             return QuickeningObservation::default();
         };
@@ -185,7 +254,7 @@ impl QuickeningTable {
             && entry.stats.guard_failures >= DEQUICKEN_AFTER_GUARD_MISSES
         {
             let event = entry.stats.record_dequicken();
-            entry.state = QuickeningState::Megamorphic;
+            entry.state = QuickeningState::Dequickened;
             entry.specialization = None;
             dequickened = event.dequickened;
             megamorphic = event.megamorphic;
@@ -208,18 +277,50 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> QuickeningObservation {
-        let entry = self
-            .entries
-            .entry(quickening_key(function, block, instruction))
-            .or_default();
-        if entry.state == QuickeningState::Specialized && entry.specialization.is_none() {
-            entry.specialization = Some(QuickeningSpecialization::AddIntInt);
-            return QuickeningObservation {
-                specialized: true,
-                ..QuickeningObservation::default()
-            };
-        }
-        QuickeningObservation::default()
+        self.observe_candidate(
+            ir_quickening_key(function, block, instruction),
+            QuickeningSpecialization::AddIntInt,
+        )
+    }
+
+    /// Installs the SUB_INT_INT specialization after the generic instruction is hot.
+    pub fn observe_sub_int_int_candidate(
+        &mut self,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) -> QuickeningObservation {
+        self.observe_candidate(
+            ir_quickening_key(function, block, instruction),
+            QuickeningSpecialization::SubIntInt,
+        )
+    }
+
+    /// Installs the MUL_INT_INT specialization after the generic instruction is hot.
+    pub fn observe_mul_int_int_candidate(
+        &mut self,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+    ) -> QuickeningObservation {
+        self.observe_candidate(
+            ir_quickening_key(function, block, instruction),
+            QuickeningSpecialization::MulIntInt,
+        )
+    }
+
+    /// Installs an int/int dense arithmetic specialization after warmup.
+    pub fn observe_dense_int_int_candidate(
+        &mut self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+        specialization: QuickeningSpecialization,
+    ) -> QuickeningObservation {
+        self.observe_candidate(
+            dense_quickening_key(unit, function, instruction),
+            specialization,
+        )
     }
 
     /// Installs the CONCAT_STRING_STRING specialization after the instruction is hot.
@@ -229,18 +330,23 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> QuickeningObservation {
-        let entry = self
-            .entries
-            .entry(quickening_key(function, block, instruction))
-            .or_default();
-        if entry.state == QuickeningState::Specialized && entry.specialization.is_none() {
-            entry.specialization = Some(QuickeningSpecialization::ConcatStringString);
-            return QuickeningObservation {
-                specialized: true,
-                ..QuickeningObservation::default()
-            };
-        }
-        QuickeningObservation::default()
+        self.observe_candidate(
+            ir_quickening_key(function, block, instruction),
+            QuickeningSpecialization::ConcatStringString,
+        )
+    }
+
+    /// Installs the dense CONCAT_STRING_STRING specialization after warmup.
+    pub fn observe_dense_concat_string_string_candidate(
+        &mut self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+    ) -> QuickeningObservation {
+        self.observe_candidate(
+            dense_quickening_key(unit, function, instruction),
+            QuickeningSpecialization::ConcatStringString,
+        )
     }
 
     /// Installs the PACKED_ARRAY_INT_KEY specialization after the instruction is hot.
@@ -250,12 +356,33 @@ impl QuickeningTable {
         block: BlockId,
         instruction: InstrId,
     ) -> QuickeningObservation {
-        let entry = self
-            .entries
-            .entry(quickening_key(function, block, instruction))
-            .or_default();
+        self.observe_candidate(
+            ir_quickening_key(function, block, instruction),
+            QuickeningSpecialization::PackedArrayIntKey,
+        )
+    }
+
+    /// Installs the dense BOOL_BRANCH_CONDITION specialization after warmup.
+    pub fn observe_dense_bool_branch_candidate(
+        &mut self,
+        unit: UnitId,
+        function: FunctionId,
+        instruction: u32,
+    ) -> QuickeningObservation {
+        self.observe_candidate(
+            dense_quickening_key(unit, function, instruction),
+            QuickeningSpecialization::BoolBranchCondition,
+        )
+    }
+
+    fn observe_candidate(
+        &mut self,
+        key: QuickeningKey,
+        specialization: QuickeningSpecialization,
+    ) -> QuickeningObservation {
+        let entry = self.entries.entry(key).or_default();
         if entry.state == QuickeningState::Specialized && entry.specialization.is_none() {
-            entry.specialization = Some(QuickeningSpecialization::PackedArrayIntKey);
+            entry.specialization = Some(specialization);
             return QuickeningObservation {
                 specialized: true,
                 ..QuickeningObservation::default()
@@ -275,18 +402,26 @@ impl QuickeningTable {
     }
 }
 
-fn quickening_key(function: FunctionId, block: BlockId, instruction: InstrId) -> QuickeningKey {
-    QuickeningKey {
+fn ir_quickening_key(function: FunctionId, block: BlockId, instruction: InstrId) -> QuickeningKey {
+    QuickeningKey::Ir {
         function: function.raw(),
         block: block.raw(),
         instruction: instruction.raw(),
     }
 }
 
+fn dense_quickening_key(unit: UnitId, function: FunctionId, instruction: u32) -> QuickeningKey {
+    QuickeningKey::Dense {
+        unit: unit.raw(),
+        function: function.raw(),
+        instruction,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{QuickeningSpecialization, QuickeningState, QuickeningTable};
-    use php_ir::ids::{BlockId, FunctionId, InstrId};
+    use php_ir::ids::{BlockId, FunctionId, InstrId, UnitId};
 
     #[test]
     fn quickening_table_warms_then_marks_metadata_specialized() {
@@ -336,6 +471,35 @@ mod tests {
         assert_eq!(
             table.specialization(function, block, instruction),
             Some(QuickeningSpecialization::AddIntInt)
+        );
+    }
+
+    #[test]
+    fn quickening_table_installs_dense_arithmetic_after_warmup() {
+        let mut table = QuickeningTable::default();
+        let unit = UnitId::new(7);
+        let function = FunctionId::new(2);
+        let instruction = 11;
+
+        for _ in 0..8 {
+            table.observe_dense(unit, function, instruction);
+        }
+
+        let observation = table.observe_dense_int_int_candidate(
+            unit,
+            function,
+            instruction,
+            QuickeningSpecialization::MulIntInt,
+        );
+
+        assert!(observation.specialized);
+        assert_eq!(
+            table.dense_specialization(unit, function, instruction),
+            Some(QuickeningSpecialization::MulIntInt)
+        );
+        assert_eq!(
+            table.dense_state(unit, function, instruction),
+            Some(QuickeningState::Specialized)
         );
     }
 
@@ -407,8 +571,37 @@ mod tests {
         assert!(second.megamorphic);
         assert_eq!(
             table.state(function, block, instruction),
-            Some(QuickeningState::Megamorphic)
+            Some(QuickeningState::Dequickened)
         );
         assert_eq!(table.specialization(function, block, instruction), None);
+    }
+
+    #[test]
+    fn dense_quickening_guard_fallback_dequickens_site() {
+        let mut table = QuickeningTable::default();
+        let unit = UnitId::new(3);
+        let function = FunctionId::new(0);
+        let instruction = 4;
+
+        for _ in 0..8 {
+            table.observe_dense(unit, function, instruction);
+        }
+        table.observe_dense_bool_branch_candidate(unit, function, instruction);
+
+        let first = table.record_dense_specialized_guard(unit, function, instruction, false);
+        assert!(first.guard_failure);
+        assert!(!first.dequickened);
+
+        let second = table.record_dense_specialized_guard(unit, function, instruction, false);
+        assert!(second.guard_failure);
+        assert!(second.dequickened);
+        assert_eq!(
+            table.dense_state(unit, function, instruction),
+            Some(QuickeningState::Dequickened)
+        );
+        assert_eq!(
+            table.dense_specialization(unit, function, instruction),
+            None
+        );
     }
 }

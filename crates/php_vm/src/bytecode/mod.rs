@@ -1,0 +1,1644 @@
+//! Dense VM bytecode design skeleton.
+//!
+//! This module owns a compact execution-format representation for the VM. It
+//! lowers from verified rich IR, but it does not replace the existing
+//! interpreter path yet.
+
+use std::collections::BTreeMap;
+
+use php_ir::instruction::UnaryOp;
+use php_ir::instruction::{IrCallArg, IrCallArgValueKind, Terminator, TerminatorKind};
+use php_ir::source_map::{IrSourceMapTarget, IrSpan};
+use php_ir::{BinaryOp, CompareOp, Instruction, InstructionKind, IrFunction, IrUnit, Operand};
+
+/// Dense bytecode format version.
+pub const DENSE_BYTECODE_VERSION: u32 = 1;
+
+/// Numeric dense opcode discriminants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DenseOpcode {
+    /// No operation.
+    Nop = 0,
+    /// `rN = constants[N]`.
+    LoadConst = 1,
+    /// `rN = operand`.
+    Move = 2,
+    /// `rN = local[N]`.
+    LoadLocal = 3,
+    /// `local[N] = operand`.
+    StoreLocal = 4,
+    /// `rN = lhs + rhs`.
+    BinaryAdd = 5,
+    /// `rN = lhs - rhs`.
+    BinarySub = 14,
+    /// `rN = lhs * rhs`.
+    BinaryMul = 15,
+    /// `rN = lhs / rhs`.
+    BinaryDiv = 16,
+    /// `rN = lhs % rhs`.
+    BinaryMod = 17,
+    /// `rN = lhs . rhs`.
+    BinaryConcat = 6,
+    /// `rN = lhs ** rhs`.
+    BinaryPow = 18,
+    /// `rN = lhs & rhs`.
+    BinaryBitAnd = 19,
+    /// `rN = lhs | rhs`.
+    BinaryBitOr = 20,
+    /// `rN = lhs ^ rhs`.
+    BinaryBitXor = 21,
+    /// `rN = lhs << rhs`.
+    BinaryShiftLeft = 22,
+    /// `rN = lhs >> rhs`.
+    BinaryShiftRight = 23,
+    /// `rN = lhs == rhs`.
+    CompareEqual = 24,
+    /// `rN = lhs != rhs`.
+    CompareNotEqual = 25,
+    /// `rN = lhs === rhs`.
+    CompareIdentical = 26,
+    /// `rN = lhs !== rhs`.
+    CompareNotIdentical = 27,
+    /// `rN = lhs < rhs`.
+    CompareLess = 28,
+    /// `rN = lhs <= rhs`.
+    CompareLessEqual = 29,
+    /// `rN = lhs > rhs`.
+    CompareGreater = 30,
+    /// `rN = lhs >= rhs`.
+    CompareGreaterEqual = 31,
+    /// `rN = lhs <=> rhs`.
+    CompareSpaceship = 32,
+    /// `rN = +src`.
+    UnaryPlus = 33,
+    /// `rN = -src`.
+    UnaryMinus = 34,
+    /// `rN = !src`.
+    UnaryNot = 35,
+    /// `rN = ~src`.
+    UnaryBitNot = 36,
+    /// `rN = function(args...)`.
+    CallFunction = 37,
+    /// `rN = constants[N]; echo rN`.
+    LoadConstEcho = 38,
+    /// `rN = local[N]; echo rN`.
+    LoadLocalEcho = 39,
+    /// `rN = lhs . rhs; echo rN`.
+    BinaryConcatEcho = 40,
+    /// Emit one operand to output.
+    Echo = 7,
+    /// Jump to a dense block index.
+    Jump = 8,
+    /// Jump to a dense block index when the condition is false.
+    JumpIfFalse = 9,
+    /// Jump to a dense block index when the condition is true.
+    JumpIfTrue = 10,
+    /// Jump to one of two dense block indexes.
+    JumpIf = 11,
+    /// Return from the current function.
+    Return = 12,
+    /// Drop an unused operand value.
+    Discard = 13,
+}
+
+impl DenseOpcode {
+    #[must_use]
+    const fn is_terminator(self) -> bool {
+        matches!(
+            self,
+            Self::Jump | Self::JumpIfFalse | Self::JumpIfTrue | Self::JumpIf | Self::Return
+        )
+    }
+
+    /// Stable opcode spelling for reports and snapshots.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nop => "nop",
+            Self::LoadConst => "load_const",
+            Self::Move => "move",
+            Self::LoadLocal => "load_local",
+            Self::StoreLocal => "store_local",
+            Self::BinaryAdd => "binary_add",
+            Self::BinarySub => "binary_sub",
+            Self::BinaryMul => "binary_mul",
+            Self::BinaryDiv => "binary_div",
+            Self::BinaryMod => "binary_mod",
+            Self::BinaryConcat => "binary_concat",
+            Self::BinaryPow => "binary_pow",
+            Self::BinaryBitAnd => "binary_bit_and",
+            Self::BinaryBitOr => "binary_bit_or",
+            Self::BinaryBitXor => "binary_bit_xor",
+            Self::BinaryShiftLeft => "binary_shift_left",
+            Self::BinaryShiftRight => "binary_shift_right",
+            Self::CompareEqual => "compare_equal",
+            Self::CompareNotEqual => "compare_not_equal",
+            Self::CompareIdentical => "compare_identical",
+            Self::CompareNotIdentical => "compare_not_identical",
+            Self::CompareLess => "compare_less",
+            Self::CompareLessEqual => "compare_less_equal",
+            Self::CompareGreater => "compare_greater",
+            Self::CompareGreaterEqual => "compare_greater_equal",
+            Self::CompareSpaceship => "compare_spaceship",
+            Self::UnaryPlus => "unary_plus",
+            Self::UnaryMinus => "unary_minus",
+            Self::UnaryNot => "unary_not",
+            Self::UnaryBitNot => "unary_bit_not",
+            Self::CallFunction => "call_function",
+            Self::LoadConstEcho => "load_const_echo",
+            Self::LoadLocalEcho => "load_local_echo",
+            Self::BinaryConcatEcho => "binary_concat_echo",
+            Self::Echo => "echo",
+            Self::Jump => "jump",
+            Self::JumpIfFalse => "jump_if_false",
+            Self::JumpIfTrue => "jump_if_true",
+            Self::JumpIf => "jump_if",
+            Self::Return => "return",
+            Self::Discard => "discard",
+        }
+    }
+
+    /// Whether this opcode was emitted by the superinstruction selection pass.
+    #[must_use]
+    pub const fn is_superinstruction(self) -> bool {
+        matches!(
+            self,
+            Self::LoadConstEcho | Self::LoadLocalEcho | Self::BinaryConcatEcho
+        )
+    }
+}
+
+/// Dense side-table span ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseSpanId(u32);
+
+impl DenseSpanId {
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Dense name/string side-table ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseNameId(u32);
+
+impl DenseNameId {
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Dense inline-cache side-table ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseCacheSlotId(u32);
+
+impl DenseCacheSlotId {
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Predecoded operand kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenseOperandKind {
+    /// Register index.
+    Register,
+    /// Local slot index.
+    Local,
+    /// Constant-pool index.
+    Constant,
+}
+
+/// Predecoded operand index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseOperand {
+    /// Operand arena.
+    pub kind: DenseOperandKind,
+    /// Zero-based index inside the owning arena.
+    pub index: u32,
+}
+
+/// Dense instruction operands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DenseOperands {
+    /// No operands.
+    None,
+    /// Register and constant indexes.
+    RegConst { dst: u32, constant: u32 },
+    /// Register destination and generic operand.
+    RegOperand { dst: u32, src: DenseOperand },
+    /// Local destination/source and generic operand.
+    LocalOperand { local: u32, src: DenseOperand },
+    /// Binary operation over two predecoded operands.
+    Binary {
+        dst: u32,
+        lhs: DenseOperand,
+        rhs: DenseOperand,
+    },
+    /// Simple positional direct function call.
+    Call {
+        dst: u32,
+        name: u32,
+        args: Vec<DenseOperand>,
+    },
+    /// One generic operand.
+    Operand { src: DenseOperand },
+    /// One dense block target.
+    Jump { target: u32 },
+    /// Conditional dense block target.
+    JumpIf {
+        condition: DenseOperand,
+        target: u32,
+    },
+    /// Conditional dense true/false block targets.
+    JumpIfElse {
+        condition: DenseOperand,
+        if_true: u32,
+        if_false: u32,
+    },
+    /// Optional return operand.
+    Return { value: Option<DenseOperand> },
+}
+
+/// One dense instruction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseInstruction {
+    /// Numeric opcode.
+    pub opcode: DenseOpcode,
+    /// Predecoded operands.
+    pub operands: DenseOperands,
+    /// Source-span side-table ID.
+    pub span: DenseSpanId,
+    /// Optional cache slot for future IC/quickening sites.
+    pub cache_slot: Option<DenseCacheSlotId>,
+}
+
+/// Dense basic-block metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseBlock {
+    /// Dense block index within its function.
+    pub id: u32,
+    /// First instruction index in the function instruction array.
+    pub first_instruction: u32,
+    /// Number of instructions, including the terminator.
+    pub instruction_len: u32,
+    /// Dense instruction index of the block terminator.
+    pub terminator: u32,
+}
+
+/// One dense function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseFunction {
+    /// Function name for debug output.
+    pub name: String,
+    /// Register count from rich IR.
+    pub register_count: u32,
+    /// Local count from rich IR.
+    pub local_count: u32,
+    /// Dense blocks.
+    pub blocks: Vec<DenseBlock>,
+    /// Dense instruction array.
+    pub instructions: Vec<DenseInstruction>,
+}
+
+/// Dense source-map target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DenseSourceMapTarget {
+    /// Function table entry.
+    Function { function: u32 },
+    /// Dense block.
+    Block { function: u32, block: u32 },
+    /// Dense instruction inside a dense block.
+    Instruction {
+        function: u32,
+        block: u32,
+        instruction: u32,
+    },
+    /// Dense block terminator.
+    Terminator { function: u32, block: u32 },
+}
+
+/// Dense source-map entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseSourceMapEntry {
+    /// Dense target.
+    pub target: DenseSourceMapTarget,
+    /// Stable frontend origin label.
+    pub origin: String,
+    /// Span side-table ID.
+    pub span: DenseSpanId,
+}
+
+/// Dense VM bytecode unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseBytecodeUnit {
+    /// Dense bytecode format version.
+    pub version: u32,
+    /// Constant-pool length from rich IR.
+    pub constant_count: u32,
+    /// File-table length from rich IR.
+    pub file_count: u32,
+    /// Dense functions.
+    pub functions: Vec<DenseFunction>,
+    /// Source span side table.
+    pub spans: Vec<IrSpan>,
+    /// String/name side table reserved for future supported opcodes.
+    pub names: Vec<String>,
+    /// Cache slot side table reserved for future IC/quickening sites.
+    pub cache_slots: Vec<String>,
+    /// Dense source map.
+    pub source_map: Vec<DenseSourceMapEntry>,
+}
+
+/// Superinstruction selection summary for counters and smoke tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SuperinstructionSelectionReport {
+    /// Adjacent instruction pairs considered valid fusion candidates.
+    pub candidates: u64,
+    /// Superinstructions emitted into the dense instruction stream.
+    pub emitted: u64,
+    /// Emitted superinstructions grouped by stable opcode spelling.
+    pub emitted_by_kind: BTreeMap<String, u64>,
+}
+
+impl SuperinstructionSelectionReport {
+    fn record_emitted(&mut self, opcode: DenseOpcode) {
+        self.candidates += 1;
+        self.emitted += 1;
+        *self
+            .emitted_by_kind
+            .entry(opcode.as_str().to_string())
+            .or_default() += 1;
+    }
+}
+
+impl DenseBytecodeUnit {
+    /// Lower a rich IR unit into the dense design skeleton.
+    pub fn lower_from_ir(unit: &IrUnit) -> Result<Self, DenseLowerError> {
+        lower_unit(unit)
+    }
+
+    /// Verify dense bytecode invariants.
+    pub fn verify(&self) -> Result<(), Vec<DenseVerifyError>> {
+        verify_dense_unit(self)
+    }
+
+    /// Select conservative producer-plus-echo superinstructions in place.
+    pub fn select_superinstructions(&mut self) -> SuperinstructionSelectionReport {
+        let mut report = SuperinstructionSelectionReport::default();
+        for function in &mut self.functions {
+            select_function_superinstructions(function, &mut report);
+        }
+        report
+    }
+
+    /// Render a stable debug snapshot.
+    #[must_use]
+    pub fn to_snapshot_text(&self) -> String {
+        render_snapshot(self)
+    }
+}
+
+fn select_function_superinstructions(
+    function: &mut DenseFunction,
+    report: &mut SuperinstructionSelectionReport,
+) {
+    for block_index in 0..function.blocks.len() {
+        let (first, terminator) = {
+            let block = &function.blocks[block_index];
+            (block.first_instruction as usize, block.terminator as usize)
+        };
+        let mut index = first;
+        while index + 1 < terminator {
+            let next_operands = function.instructions[index + 1].operands.clone();
+            if function.instructions[index + 1].opcode != DenseOpcode::Echo {
+                index += 1;
+                continue;
+            }
+            let DenseOperands::Operand { src: echo_src } = next_operands else {
+                index += 1;
+                continue;
+            };
+            let opcode = function.instructions[index].opcode;
+            let operands = function.instructions[index].operands.clone();
+            let Some(fused) = select_echo_fusion(opcode, &operands, echo_src) else {
+                index += 1;
+                continue;
+            };
+            function.instructions[index].opcode = fused;
+            function.instructions[index + 1].opcode = DenseOpcode::Nop;
+            function.instructions[index + 1].operands = DenseOperands::None;
+            report.record_emitted(fused);
+            index += 2;
+        }
+    }
+}
+
+fn select_echo_fusion(
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    echo_src: DenseOperand,
+) -> Option<DenseOpcode> {
+    let echoed_register = match echo_src.kind {
+        DenseOperandKind::Register => echo_src.index,
+        DenseOperandKind::Local | DenseOperandKind::Constant => return None,
+    };
+    match (opcode, operands) {
+        (DenseOpcode::LoadConst, DenseOperands::RegConst { dst, .. })
+            if *dst == echoed_register =>
+        {
+            Some(DenseOpcode::LoadConstEcho)
+        }
+        (DenseOpcode::LoadLocal, DenseOperands::RegOperand { dst, src })
+            if *dst == echoed_register && src.kind == DenseOperandKind::Local =>
+        {
+            Some(DenseOpcode::LoadLocalEcho)
+        }
+        (DenseOpcode::BinaryConcat, DenseOperands::Binary { dst, .. })
+            if *dst == echoed_register =>
+        {
+            Some(DenseOpcode::BinaryConcatEcho)
+        }
+        _ => None,
+    }
+}
+
+/// Stable dense lowerer error code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenseLowerErrorCode {
+    /// Unsupported instruction family for the current dense subset.
+    UnsupportedInstruction,
+    /// Unsupported terminator shape for the current dense subset.
+    UnsupportedTerminator,
+}
+
+/// Dense lowerer error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseLowerError {
+    /// Stable error code.
+    pub code: DenseLowerErrorCode,
+    /// Human-readable context.
+    pub message: String,
+}
+
+/// Stable dense verifier error code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenseVerifyErrorCode {
+    /// Format version is not supported.
+    InvalidVersion,
+    /// Block index points outside the block table.
+    InvalidBlock,
+    /// Instruction index points outside the instruction table.
+    InvalidInstruction,
+    /// Register index points outside the function register file.
+    InvalidRegister,
+    /// Local index points outside the function local table.
+    InvalidLocal,
+    /// Constant index points outside the unit constant pool.
+    InvalidConstant,
+    /// Jump target points outside the function block table.
+    InvalidJumpTarget,
+    /// Span side-table ID or span range is invalid.
+    InvalidSpan,
+    /// Cache slot side-table ID is invalid.
+    InvalidCacheSlot,
+    /// Dense block does not end in exactly one terminator.
+    InvalidTerminator,
+    /// Opcode does not match its operand payload.
+    InvalidOperandShape,
+    /// Source-map target references missing dense data.
+    InvalidSourceMap,
+}
+
+/// Dense verifier error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseVerifyError {
+    /// Stable error code.
+    pub code: DenseVerifyErrorCode,
+    /// Human-readable context.
+    pub message: String,
+}
+
+fn lower_unit(unit: &IrUnit) -> Result<DenseBytecodeUnit, DenseLowerError> {
+    let mut dense = DenseBytecodeUnit {
+        version: DENSE_BYTECODE_VERSION,
+        constant_count: unit.constants.len() as u32,
+        file_count: unit.files.len() as u32,
+        functions: Vec::with_capacity(unit.functions.len()),
+        spans: Vec::new(),
+        names: Vec::new(),
+        cache_slots: Vec::new(),
+        source_map: Vec::new(),
+    };
+    for function in &unit.functions {
+        dense.functions.push(lower_function(
+            function,
+            &mut dense.spans,
+            &mut dense.names,
+        )?);
+    }
+    for entry in unit.source_map.entries() {
+        let span = push_span(&mut dense.spans, entry.span);
+        dense.source_map.push(DenseSourceMapEntry {
+            target: lower_source_map_target(&entry.target),
+            origin: entry.origin.clone(),
+            span,
+        });
+    }
+    dense.verify().map_err(|errors| DenseLowerError {
+        code: DenseLowerErrorCode::UnsupportedInstruction,
+        message: format!("lowered dense bytecode failed verification: {errors:?}"),
+    })?;
+    Ok(dense)
+}
+
+fn lower_function(
+    function: &IrFunction,
+    spans: &mut Vec<IrSpan>,
+    names: &mut Vec<String>,
+) -> Result<DenseFunction, DenseLowerError> {
+    let mut dense = DenseFunction {
+        name: function.name.clone(),
+        register_count: function.register_count,
+        local_count: function.local_count,
+        blocks: Vec::with_capacity(function.blocks.len()),
+        instructions: Vec::new(),
+    };
+    for block in &function.blocks {
+        let first_instruction = dense.instructions.len() as u32;
+        for instruction in &block.instructions {
+            dense
+                .instructions
+                .push(lower_instruction(instruction, spans, names)?);
+        }
+        let terminator = block.terminator.as_ref().ok_or_else(|| DenseLowerError {
+            code: DenseLowerErrorCode::UnsupportedTerminator,
+            message: format!("block {} has no terminator", block.id.raw()),
+        })?;
+        dense
+            .instructions
+            .push(lower_terminator(terminator, spans)?);
+        let instruction_len = dense.instructions.len() as u32 - first_instruction;
+        let terminator = dense.instructions.len() as u32 - 1;
+        dense.blocks.push(DenseBlock {
+            id: block.id.raw(),
+            first_instruction,
+            instruction_len,
+            terminator,
+        });
+    }
+    Ok(dense)
+}
+
+fn lower_instruction(
+    instruction: &Instruction,
+    spans: &mut Vec<IrSpan>,
+    names: &mut Vec<String>,
+) -> Result<DenseInstruction, DenseLowerError> {
+    let span = push_span(spans, instruction.span);
+    let (opcode, operands) = match &instruction.kind {
+        InstructionKind::Nop => (DenseOpcode::Nop, DenseOperands::None),
+        InstructionKind::LoadConst { dst, constant } => (
+            DenseOpcode::LoadConst,
+            DenseOperands::RegConst {
+                dst: dst.raw(),
+                constant: constant.raw(),
+            },
+        ),
+        InstructionKind::Move { dst, src } => (
+            DenseOpcode::Move,
+            DenseOperands::RegOperand {
+                dst: dst.raw(),
+                src: lower_operand(*src),
+            },
+        ),
+        InstructionKind::LoadLocal { dst, local } => (
+            DenseOpcode::LoadLocal,
+            DenseOperands::RegOperand {
+                dst: dst.raw(),
+                src: DenseOperand {
+                    kind: DenseOperandKind::Local,
+                    index: local.raw(),
+                },
+            },
+        ),
+        InstructionKind::StoreLocal { local, src } => (
+            DenseOpcode::StoreLocal,
+            DenseOperands::LocalOperand {
+                local: local.raw(),
+                src: lower_operand(*src),
+            },
+        ),
+        InstructionKind::Binary { dst, op, lhs, rhs } => (
+            dense_binary_opcode(*op),
+            DenseOperands::Binary {
+                dst: dst.raw(),
+                lhs: lower_operand(*lhs),
+                rhs: lower_operand(*rhs),
+            },
+        ),
+        InstructionKind::Compare { dst, op, lhs, rhs } => (
+            dense_compare_opcode(*op),
+            DenseOperands::Binary {
+                dst: dst.raw(),
+                lhs: lower_operand(*lhs),
+                rhs: lower_operand(*rhs),
+            },
+        ),
+        InstructionKind::Unary { dst, op, src } => (
+            dense_unary_opcode(*op),
+            DenseOperands::RegOperand {
+                dst: dst.raw(),
+                src: lower_operand(*src),
+            },
+        ),
+        InstructionKind::CallFunction { dst, name, args } => (
+            DenseOpcode::CallFunction,
+            DenseOperands::Call {
+                dst: dst.raw(),
+                name: push_name(names, name).index() as u32,
+                args: lower_simple_call_args(instruction, args)?,
+            },
+        ),
+        InstructionKind::Echo { src } => (
+            DenseOpcode::Echo,
+            DenseOperands::Operand {
+                src: lower_operand(*src),
+            },
+        ),
+        InstructionKind::Discard { src } => (
+            DenseOpcode::Discard,
+            DenseOperands::Operand {
+                src: lower_operand(*src),
+            },
+        ),
+        other => return unsupported_instruction(instruction, format!("{other:?}")),
+    };
+    Ok(DenseInstruction {
+        opcode,
+        operands,
+        span,
+        cache_slot: None,
+    })
+}
+
+fn lower_terminator(
+    terminator: &Terminator,
+    spans: &mut Vec<IrSpan>,
+) -> Result<DenseInstruction, DenseLowerError> {
+    let span = push_span(spans, terminator.span);
+    let (opcode, operands) = match &terminator.kind {
+        TerminatorKind::Jump { target } => (
+            DenseOpcode::Jump,
+            DenseOperands::Jump {
+                target: target.raw(),
+            },
+        ),
+        TerminatorKind::JumpIfFalse { condition, target } => (
+            DenseOpcode::JumpIfFalse,
+            DenseOperands::JumpIf {
+                condition: lower_operand(*condition),
+                target: target.raw(),
+            },
+        ),
+        TerminatorKind::JumpIfTrue { condition, target } => (
+            DenseOpcode::JumpIfTrue,
+            DenseOperands::JumpIf {
+                condition: lower_operand(*condition),
+                target: target.raw(),
+            },
+        ),
+        TerminatorKind::JumpIf {
+            condition,
+            if_true,
+            if_false,
+        } => (
+            DenseOpcode::JumpIf,
+            DenseOperands::JumpIfElse {
+                condition: lower_operand(*condition),
+                if_true: if_true.raw(),
+                if_false: if_false.raw(),
+            },
+        ),
+        TerminatorKind::Return {
+            value,
+            by_ref_local,
+        } => {
+            if by_ref_local.is_some() {
+                return Err(DenseLowerError {
+                    code: DenseLowerErrorCode::UnsupportedTerminator,
+                    message: "by-reference return is outside dense bytecode phase 09.03 subset"
+                        .to_string(),
+                });
+            }
+            (
+                DenseOpcode::Return,
+                DenseOperands::Return {
+                    value: value.map(lower_operand),
+                },
+            )
+        }
+    };
+    Ok(DenseInstruction {
+        opcode,
+        operands,
+        span,
+        cache_slot: None,
+    })
+}
+
+fn lower_operand(operand: Operand) -> DenseOperand {
+    match operand {
+        Operand::Register(id) => DenseOperand {
+            kind: DenseOperandKind::Register,
+            index: id.raw(),
+        },
+        Operand::Local(id) => DenseOperand {
+            kind: DenseOperandKind::Local,
+            index: id.raw(),
+        },
+        Operand::Constant(id) => DenseOperand {
+            kind: DenseOperandKind::Constant,
+            index: id.raw(),
+        },
+    }
+}
+
+fn lower_simple_call_args(
+    instruction: &Instruction,
+    args: &[IrCallArg],
+) -> Result<Vec<DenseOperand>, DenseLowerError> {
+    let mut lowered = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.name.is_some()
+            || arg.unpack
+            || arg.value_kind != IrCallArgValueKind::Direct
+            || arg.by_ref_local.is_some()
+            || arg.by_ref_dim.is_some()
+            || arg.by_ref_property.is_some()
+        {
+            return unsupported_instruction(
+                instruction,
+                "CallFunction with named, unpacked, or by-reference arguments".to_string(),
+            );
+        }
+        lowered.push(lower_operand(arg.value));
+    }
+    Ok(lowered)
+}
+
+fn dense_binary_opcode(op: BinaryOp) -> DenseOpcode {
+    match op {
+        BinaryOp::Add => DenseOpcode::BinaryAdd,
+        BinaryOp::Sub => DenseOpcode::BinarySub,
+        BinaryOp::Mul => DenseOpcode::BinaryMul,
+        BinaryOp::Div => DenseOpcode::BinaryDiv,
+        BinaryOp::Mod => DenseOpcode::BinaryMod,
+        BinaryOp::Concat => DenseOpcode::BinaryConcat,
+        BinaryOp::Pow => DenseOpcode::BinaryPow,
+        BinaryOp::BitAnd => DenseOpcode::BinaryBitAnd,
+        BinaryOp::BitOr => DenseOpcode::BinaryBitOr,
+        BinaryOp::BitXor => DenseOpcode::BinaryBitXor,
+        BinaryOp::ShiftLeft => DenseOpcode::BinaryShiftLeft,
+        BinaryOp::ShiftRight => DenseOpcode::BinaryShiftRight,
+    }
+}
+
+fn dense_compare_opcode(op: CompareOp) -> DenseOpcode {
+    match op {
+        CompareOp::Equal => DenseOpcode::CompareEqual,
+        CompareOp::NotEqual => DenseOpcode::CompareNotEqual,
+        CompareOp::Identical => DenseOpcode::CompareIdentical,
+        CompareOp::NotIdentical => DenseOpcode::CompareNotIdentical,
+        CompareOp::Less => DenseOpcode::CompareLess,
+        CompareOp::LessEqual => DenseOpcode::CompareLessEqual,
+        CompareOp::Greater => DenseOpcode::CompareGreater,
+        CompareOp::GreaterEqual => DenseOpcode::CompareGreaterEqual,
+        CompareOp::Spaceship => DenseOpcode::CompareSpaceship,
+    }
+}
+
+fn dense_unary_opcode(op: UnaryOp) -> DenseOpcode {
+    match op {
+        UnaryOp::Plus => DenseOpcode::UnaryPlus,
+        UnaryOp::Minus => DenseOpcode::UnaryMinus,
+        UnaryOp::Not => DenseOpcode::UnaryNot,
+        UnaryOp::BitNot => DenseOpcode::UnaryBitNot,
+    }
+}
+
+fn lower_source_map_target(target: &IrSourceMapTarget) -> DenseSourceMapTarget {
+    match target {
+        IrSourceMapTarget::Function { function } => DenseSourceMapTarget::Function {
+            function: function.raw(),
+        },
+        IrSourceMapTarget::Block { function, block } => DenseSourceMapTarget::Block {
+            function: function.raw(),
+            block: block.raw(),
+        },
+        IrSourceMapTarget::Instruction {
+            function,
+            block,
+            instruction,
+        } => DenseSourceMapTarget::Instruction {
+            function: function.raw(),
+            block: block.raw(),
+            instruction: instruction.raw(),
+        },
+        IrSourceMapTarget::Terminator { function, block } => DenseSourceMapTarget::Terminator {
+            function: function.raw(),
+            block: block.raw(),
+        },
+    }
+}
+
+fn unsupported_instruction<T>(
+    instruction: &Instruction,
+    detail: String,
+) -> Result<T, DenseLowerError> {
+    Err(DenseLowerError {
+        code: DenseLowerErrorCode::UnsupportedInstruction,
+        message: format!(
+            "instruction {} is outside the current dense bytecode subset: {detail}",
+            instruction.id.raw()
+        ),
+    })
+}
+
+fn push_span(spans: &mut Vec<IrSpan>, span: IrSpan) -> DenseSpanId {
+    let id = DenseSpanId::new(spans.len() as u32);
+    spans.push(span);
+    id
+}
+
+fn push_name(names: &mut Vec<String>, name: &str) -> DenseNameId {
+    let id = DenseNameId::new(names.len() as u32);
+    names.push(name.to_string());
+    id
+}
+
+fn verify_dense_unit(unit: &DenseBytecodeUnit) -> Result<(), Vec<DenseVerifyError>> {
+    let mut errors = Vec::new();
+    if unit.version != DENSE_BYTECODE_VERSION {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidVersion,
+            format!("unsupported dense bytecode version {}", unit.version),
+        ));
+    }
+    for (function_index, function) in unit.functions.iter().enumerate() {
+        verify_function(unit, function_index, function, &mut errors);
+    }
+    for entry in &unit.source_map {
+        verify_span_id(unit, entry.span, &mut errors);
+        verify_source_map_target(unit, &entry.target, &mut errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn verify_function(
+    unit: &DenseBytecodeUnit,
+    function_index: usize,
+    function: &DenseFunction,
+    errors: &mut Vec<DenseVerifyError>,
+) {
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        if block.id as usize != block_index {
+            errors.push(error(
+                DenseVerifyErrorCode::InvalidBlock,
+                format!(
+                    "function {function_index} block {block_index} has id {}",
+                    block.id
+                ),
+            ));
+        }
+        let first = block.first_instruction as usize;
+        let len = block.instruction_len as usize;
+        let end = first.saturating_add(len);
+        if len == 0 || end > function.instructions.len() {
+            errors.push(error(
+                DenseVerifyErrorCode::InvalidInstruction,
+                format!(
+                    "function {function_index} block {block_index} invalid instruction range {first}..{end}"
+                ),
+            ));
+            continue;
+        }
+        let expected_terminator = end - 1;
+        if block.terminator as usize != expected_terminator {
+            errors.push(error(
+                DenseVerifyErrorCode::InvalidTerminator,
+                format!(
+                    "function {function_index} block {block_index} terminator {} should be {expected_terminator}",
+                    block.terminator
+                ),
+            ));
+        }
+        for index in first..end {
+            let instruction = &function.instructions[index];
+            if index == expected_terminator {
+                if !instruction.opcode.is_terminator() {
+                    errors.push(error(
+                        DenseVerifyErrorCode::InvalidTerminator,
+                        format!(
+                            "function {function_index} block {block_index} final opcode {:?} is not a terminator",
+                            instruction.opcode
+                        ),
+                    ));
+                }
+            } else if instruction.opcode.is_terminator() {
+                errors.push(error(
+                    DenseVerifyErrorCode::InvalidTerminator,
+                    format!(
+                        "function {function_index} block {block_index} has terminator before block end at {index}"
+                    ),
+                ));
+            }
+            verify_instruction(unit, function, instruction, errors);
+        }
+    }
+}
+
+fn verify_instruction(
+    unit: &DenseBytecodeUnit,
+    function: &DenseFunction,
+    instruction: &DenseInstruction,
+    errors: &mut Vec<DenseVerifyError>,
+) {
+    verify_span_id(unit, instruction.span, errors);
+    if let Some(cache_slot) = instruction.cache_slot
+        && cache_slot.index() >= unit.cache_slots.len()
+    {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidCacheSlot,
+            format!("cache slot {} is outside side table", cache_slot.index()),
+        ));
+    }
+    match (instruction.opcode, &instruction.operands) {
+        (DenseOpcode::Nop, DenseOperands::None) => {}
+        (
+            DenseOpcode::LoadConst | DenseOpcode::LoadConstEcho,
+            DenseOperands::RegConst { dst, constant },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_constant(*constant, unit, errors);
+        }
+        (DenseOpcode::Move, DenseOperands::RegOperand { dst, src })
+        | (
+            DenseOpcode::LoadLocal | DenseOpcode::LoadLocalEcho,
+            DenseOperands::RegOperand { dst, src },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*src, unit, function, errors);
+            if matches!(
+                instruction.opcode,
+                DenseOpcode::LoadLocal | DenseOpcode::LoadLocalEcho
+            ) && src.kind != DenseOperandKind::Local
+            {
+                errors.push(error(
+                    DenseVerifyErrorCode::InvalidOperandShape,
+                    "load_local source must be a local operand".to_string(),
+                ));
+            }
+        }
+        (DenseOpcode::StoreLocal, DenseOperands::LocalOperand { local, src }) => {
+            verify_local(*local, function, errors);
+            verify_operand(*src, unit, function, errors);
+        }
+        (
+            DenseOpcode::BinaryAdd
+            | DenseOpcode::BinarySub
+            | DenseOpcode::BinaryMul
+            | DenseOpcode::BinaryDiv
+            | DenseOpcode::BinaryMod
+            | DenseOpcode::BinaryConcat
+            | DenseOpcode::BinaryPow
+            | DenseOpcode::BinaryBitAnd
+            | DenseOpcode::BinaryBitOr
+            | DenseOpcode::BinaryBitXor
+            | DenseOpcode::BinaryShiftLeft
+            | DenseOpcode::BinaryShiftRight
+            | DenseOpcode::BinaryConcatEcho
+            | DenseOpcode::CompareEqual
+            | DenseOpcode::CompareNotEqual
+            | DenseOpcode::CompareIdentical
+            | DenseOpcode::CompareNotIdentical
+            | DenseOpcode::CompareLess
+            | DenseOpcode::CompareLessEqual
+            | DenseOpcode::CompareGreater
+            | DenseOpcode::CompareGreaterEqual
+            | DenseOpcode::CompareSpaceship,
+            DenseOperands::Binary { dst, lhs, rhs },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*lhs, unit, function, errors);
+            verify_operand(*rhs, unit, function, errors);
+        }
+        (
+            DenseOpcode::UnaryPlus
+            | DenseOpcode::UnaryMinus
+            | DenseOpcode::UnaryNot
+            | DenseOpcode::UnaryBitNot,
+            DenseOperands::RegOperand { dst, src },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*src, unit, function, errors);
+        }
+        (DenseOpcode::CallFunction, DenseOperands::Call { dst, name, args }) => {
+            verify_register(*dst, function, errors);
+            verify_name(*name, unit, errors);
+            for arg in args {
+                verify_operand(*arg, unit, function, errors);
+            }
+        }
+        (DenseOpcode::Echo, DenseOperands::Operand { src }) => {
+            verify_operand(*src, unit, function, errors);
+        }
+        (DenseOpcode::Discard, DenseOperands::Operand { src }) => {
+            verify_operand(*src, unit, function, errors);
+        }
+        (DenseOpcode::Jump, DenseOperands::Jump { target }) => {
+            verify_jump_target(*target, function, errors);
+        }
+        (
+            DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue,
+            DenseOperands::JumpIf { condition, target },
+        ) => {
+            verify_operand(*condition, unit, function, errors);
+            verify_jump_target(*target, function, errors);
+        }
+        (
+            DenseOpcode::JumpIf,
+            DenseOperands::JumpIfElse {
+                condition,
+                if_true,
+                if_false,
+            },
+        ) => {
+            verify_operand(*condition, unit, function, errors);
+            verify_jump_target(*if_true, function, errors);
+            verify_jump_target(*if_false, function, errors);
+        }
+        (DenseOpcode::Return, DenseOperands::Return { value }) => {
+            if let Some(value) = value {
+                verify_operand(*value, unit, function, errors);
+            }
+        }
+        _ => errors.push(error(
+            DenseVerifyErrorCode::InvalidOperandShape,
+            format!(
+                "opcode {:?} does not match operands {:?}",
+                instruction.opcode, instruction.operands
+            ),
+        )),
+    }
+}
+
+fn verify_operand(
+    operand: DenseOperand,
+    unit: &DenseBytecodeUnit,
+    function: &DenseFunction,
+    errors: &mut Vec<DenseVerifyError>,
+) {
+    match operand.kind {
+        DenseOperandKind::Register => verify_register(operand.index, function, errors),
+        DenseOperandKind::Local => verify_local(operand.index, function, errors),
+        DenseOperandKind::Constant => verify_constant(operand.index, unit, errors),
+    }
+}
+
+fn verify_register(index: u32, function: &DenseFunction, errors: &mut Vec<DenseVerifyError>) {
+    if index >= function.register_count {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidRegister,
+            format!(
+                "register {index} is outside register_count {}",
+                function.register_count
+            ),
+        ));
+    }
+}
+
+fn verify_local(index: u32, function: &DenseFunction, errors: &mut Vec<DenseVerifyError>) {
+    if index >= function.local_count {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidLocal,
+            format!(
+                "local {index} is outside local_count {}",
+                function.local_count
+            ),
+        ));
+    }
+}
+
+fn verify_constant(index: u32, unit: &DenseBytecodeUnit, errors: &mut Vec<DenseVerifyError>) {
+    if index >= unit.constant_count {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidConstant,
+            format!(
+                "constant {index} is outside constant_count {}",
+                unit.constant_count
+            ),
+        ));
+    }
+}
+
+fn verify_name(index: u32, unit: &DenseBytecodeUnit, errors: &mut Vec<DenseVerifyError>) {
+    if index as usize >= unit.names.len() {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidOperandShape,
+            format!("name {index} is outside names side table"),
+        ));
+    }
+}
+
+fn verify_jump_target(index: u32, function: &DenseFunction, errors: &mut Vec<DenseVerifyError>) {
+    if index as usize >= function.blocks.len() {
+        errors.push(error(
+            DenseVerifyErrorCode::InvalidJumpTarget,
+            format!(
+                "jump target {index} is outside block count {}",
+                function.blocks.len()
+            ),
+        ));
+    }
+}
+
+fn verify_span_id(unit: &DenseBytecodeUnit, span: DenseSpanId, errors: &mut Vec<DenseVerifyError>) {
+    match unit.spans.get(span.index()) {
+        Some(value)
+            if value.file.index() < unit.file_count as usize && value.start <= value.end => {}
+        Some(value) => errors.push(error(
+            DenseVerifyErrorCode::InvalidSpan,
+            format!(
+                "span {} points at file {} range {}..{} with file_count {}",
+                span.raw(),
+                value.file.raw(),
+                value.start,
+                value.end,
+                unit.file_count
+            ),
+        )),
+        None => errors.push(error(
+            DenseVerifyErrorCode::InvalidSpan,
+            format!("span {} is outside side table", span.raw()),
+        )),
+    }
+}
+
+fn verify_source_map_target(
+    unit: &DenseBytecodeUnit,
+    target: &DenseSourceMapTarget,
+    errors: &mut Vec<DenseVerifyError>,
+) {
+    match target {
+        DenseSourceMapTarget::Function { function } => {
+            if *function as usize >= unit.functions.len() {
+                errors.push(error(
+                    DenseVerifyErrorCode::InvalidSourceMap,
+                    format!("source map function {function} is missing"),
+                ));
+            }
+        }
+        DenseSourceMapTarget::Block { function, block }
+        | DenseSourceMapTarget::Terminator { function, block } => {
+            if let Some(dense_function) = unit.functions.get(*function as usize) {
+                if *block as usize >= dense_function.blocks.len() {
+                    errors.push(error(
+                        DenseVerifyErrorCode::InvalidSourceMap,
+                        format!("source map block {block} is missing"),
+                    ));
+                }
+            } else {
+                errors.push(error(
+                    DenseVerifyErrorCode::InvalidSourceMap,
+                    format!("source map function {function} is missing"),
+                ));
+            }
+        }
+        DenseSourceMapTarget::Instruction {
+            function,
+            block,
+            instruction,
+        } => {
+            if let Some(dense_function) = unit.functions.get(*function as usize) {
+                if let Some(dense_block) = dense_function.blocks.get(*block as usize) {
+                    if *instruction >= dense_block.instruction_len.saturating_sub(1) {
+                        errors.push(error(
+                            DenseVerifyErrorCode::InvalidSourceMap,
+                            format!(
+                                "source map instruction {instruction} is outside block instruction count {}",
+                                dense_block.instruction_len.saturating_sub(1)
+                            ),
+                        ));
+                    }
+                } else {
+                    errors.push(error(
+                        DenseVerifyErrorCode::InvalidSourceMap,
+                        format!("source map block {block} is missing"),
+                    ));
+                }
+            } else {
+                errors.push(error(
+                    DenseVerifyErrorCode::InvalidSourceMap,
+                    format!("source map function {function} is missing"),
+                ));
+            }
+        }
+    }
+}
+
+fn error(code: DenseVerifyErrorCode, message: String) -> DenseVerifyError {
+    DenseVerifyError { code, message }
+}
+
+fn render_snapshot(unit: &DenseBytecodeUnit) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "dense_bytecode version={} constants={} files={} functions={} spans={} names={} cache_slots={}\n",
+        unit.version,
+        unit.constant_count,
+        unit.file_count,
+        unit.functions.len(),
+        unit.spans.len(),
+        unit.names.len(),
+        unit.cache_slots.len()
+    ));
+    for (function_index, function) in unit.functions.iter().enumerate() {
+        out.push_str(&format!(
+            "function {function_index} {} regs={} locals={} blocks={} instructions={}\n",
+            function.name,
+            function.register_count,
+            function.local_count,
+            function.blocks.len(),
+            function.instructions.len()
+        ));
+        for block in &function.blocks {
+            out.push_str(&format!(
+                "  block {} first={} len={} terminator={}\n",
+                block.id, block.first_instruction, block.instruction_len, block.terminator
+            ));
+            let first = block.first_instruction as usize;
+            let end = first + block.instruction_len as usize;
+            for index in first..end {
+                let instruction = &function.instructions[index];
+                out.push_str(&format!(
+                    "    {:04} {} {} span={}\n",
+                    index,
+                    instruction.opcode.as_str(),
+                    render_operands(&instruction.operands),
+                    instruction.span.raw()
+                ));
+            }
+        }
+    }
+    out.push_str("spans:\n");
+    for (index, span) in unit.spans.iter().enumerate() {
+        out.push_str(&format!(
+            "  span {index} file:{}@{}..{}\n",
+            span.file.raw(),
+            span.start,
+            span.end
+        ));
+    }
+    out
+}
+
+fn render_operands(operands: &DenseOperands) -> String {
+    match operands {
+        DenseOperands::None => "-".to_string(),
+        DenseOperands::RegConst { dst, constant } => format!("r{dst} c{constant}"),
+        DenseOperands::RegOperand { dst, src } => format!("r{dst} {}", render_operand(*src)),
+        DenseOperands::LocalOperand { local, src } => format!("l{local} {}", render_operand(*src)),
+        DenseOperands::Binary { dst, lhs, rhs } => {
+            format!("r{dst} {} {}", render_operand(*lhs), render_operand(*rhs))
+        }
+        DenseOperands::Call { dst, name, args } => {
+            let rendered_args: Vec<_> = args.iter().copied().map(render_operand).collect();
+            format!("r{dst} n{name} ({})", rendered_args.join(", "))
+        }
+        DenseOperands::Operand { src } => render_operand(*src),
+        DenseOperands::Jump { target } => format!("b{target}"),
+        DenseOperands::JumpIf { condition, target } => {
+            format!("{} b{target}", render_operand(*condition))
+        }
+        DenseOperands::JumpIfElse {
+            condition,
+            if_true,
+            if_false,
+        } => format!("{} b{if_true} b{if_false}", render_operand(*condition)),
+        DenseOperands::Return { value } => value.map_or_else(|| "-".to_string(), render_operand),
+    }
+}
+
+fn render_operand(operand: DenseOperand) -> String {
+    match operand.kind {
+        DenseOperandKind::Register => format!("r{}", operand.index),
+        DenseOperandKind::Local => format!("l{}", operand.index),
+        DenseOperandKind::Constant => format!("c{}", operand.index),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DenseBytecodeUnit, DenseInstruction, DenseOpcode, DenseOperands, DenseSpanId,
+        DenseVerifyErrorCode,
+    };
+    use php_ir::{
+        BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan, Operand, UnitId,
+        verify_unit,
+    };
+    use php_semantics::analyze_source;
+
+    #[test]
+    fn bytecode_lowering_snapshot_is_stable_for_manual_add() {
+        let unit = manual_basic_unit();
+        verify_unit(&unit).expect("manual IR verifies before dense lowering");
+        let dense = DenseBytecodeUnit::lower_from_ir(&unit).expect("manual IR lowers to dense");
+        dense.verify().expect("dense bytecode verifies");
+        assert_eq!(
+            dense.to_snapshot_text(),
+            concat!(
+                "dense_bytecode version=1 constants=2 files=1 functions=1 spans=4 names=0 cache_slots=0\n",
+                "function 0 main regs=3 locals=0 blocks=1 instructions=4\n",
+                "  block 0 first=0 len=4 terminator=3\n",
+                "    0000 load_const r0 c0 span=0\n",
+                "    0001 load_const r1 c1 span=1\n",
+                "    0002 binary_add r2 r0 r1 span=2\n",
+                "    0003 return r2 span=3\n",
+                "spans:\n",
+                "  span 0 file:0@6..7\n",
+                "  span 1 file:0@10..11\n",
+                "  span 2 file:0@6..11\n",
+                "  span 3 file:0@6..11\n",
+            )
+        );
+    }
+
+    #[test]
+    fn bytecode_lowering_covers_echo_literal_fixture_shape() {
+        let frontend = analyze_source("<?php echo 1;");
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "fixtures/bytecode/literals/valid/echo-int.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("fixture IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let dense = DenseBytecodeUnit::lower_from_ir(&result.unit)
+            .expect("literal echo fixture lowers to dense bytecode");
+        assert!(
+            dense.functions[0]
+                .instructions
+                .iter()
+                .any(|item| item.opcode == DenseOpcode::Echo)
+        );
+        assert_eq!(
+            dense.functions[0]
+                .instructions
+                .last()
+                .map(|item| item.opcode),
+            Some(DenseOpcode::Return)
+        );
+    }
+
+    #[test]
+    fn bytecode_lowering_covers_scalar_binary_unary_and_compare_shapes() {
+        let frontend = analyze_source("<?php echo 1 + 2 * 3, 2 ** 3, !false, 1 == \"1\", 2 <=> 3;");
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "fixtures/runtime/valid/scalars/expressions.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("scalar expression IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let dense = DenseBytecodeUnit::lower_from_ir(&result.unit)
+            .expect("scalar expression fixture lowers to dense bytecode");
+        let opcodes: Vec<_> = dense.functions[0]
+            .instructions
+            .iter()
+            .map(|item| item.opcode)
+            .collect();
+        assert!(opcodes.contains(&DenseOpcode::BinaryMul));
+        assert!(opcodes.contains(&DenseOpcode::BinaryAdd));
+        assert!(opcodes.contains(&DenseOpcode::BinaryPow));
+        assert!(opcodes.contains(&DenseOpcode::UnaryNot));
+        assert!(opcodes.contains(&DenseOpcode::CompareEqual));
+        assert!(opcodes.contains(&DenseOpcode::CompareSpaceship));
+    }
+
+    #[test]
+    fn bytecode_lowering_covers_simple_direct_function_calls() {
+        let frontend = analyze_source(
+            r#"<?php
+function add($a, $b) {
+    return $a + $b;
+}
+echo add(2, 3), "\n";
+"#,
+        );
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "fixtures/runtime/valid/functions/two-args.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("direct call IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let dense =
+            DenseBytecodeUnit::lower_from_ir(&result.unit).expect("direct call lowers to dense");
+        assert!(dense.names.iter().any(|name| name == "add"));
+        assert!(
+            dense.functions[0]
+                .instructions
+                .iter()
+                .any(|item| item.opcode == DenseOpcode::CallFunction)
+        );
+    }
+
+    #[test]
+    fn superinstruction_selection_fuses_low_risk_echo_pairs() {
+        let frontend = analyze_source(
+            r#"<?php
+$name = "world";
+echo "hello ";
+echo $name;
+echo "a" . "b";
+"#,
+        );
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "fixtures/performance/superinstructions/echo.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("superinstruction source IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let mut dense = DenseBytecodeUnit::lower_from_ir(&result.unit)
+            .expect("superinstruction source lowers to dense bytecode");
+
+        let report = dense.select_superinstructions();
+
+        dense.verify().expect("selected bytecode still verifies");
+        assert!(report.candidates >= 3, "{report:#?}");
+        assert_eq!(
+            report
+                .emitted_by_kind
+                .get(DenseOpcode::LoadConstEcho.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .emitted_by_kind
+                .get(DenseOpcode::LoadLocalEcho.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .emitted_by_kind
+                .get(DenseOpcode::BinaryConcatEcho.as_str()),
+            Some(&1)
+        );
+        assert!(
+            dense.functions[0]
+                .instructions
+                .iter()
+                .any(|item| item.opcode == DenseOpcode::Nop)
+        );
+    }
+
+    #[test]
+    fn bytecode_lowering_rejects_unsupported_instruction_family() {
+        let mut unit = manual_basic_unit();
+        unit.functions[0].blocks[0].instructions[2].kind = InstructionKind::FetchConst {
+            dst: php_ir::RegId::new(2),
+            name: "PHP_VERSION".to_string(),
+        };
+        let error = DenseBytecodeUnit::lower_from_ir(&unit).expect_err("fetch const unsupported");
+        assert_eq!(
+            error.code,
+            super::DenseLowerErrorCode::UnsupportedInstruction
+        );
+        assert!(error.message.contains("FetchConst"));
+    }
+
+    #[test]
+    fn bytecode_verifier_rejects_invalid_indexes_and_terminators() {
+        let unit = manual_basic_unit();
+        let mut dense = DenseBytecodeUnit::lower_from_ir(&unit).expect("manual IR lowers");
+        dense.constant_count = 1;
+        dense.functions[0].register_count = 1;
+        dense.functions[0].blocks[0].terminator = 2;
+        dense.functions[0].instructions[0].span = DenseSpanId::new(99);
+        let errors = dense
+            .verify()
+            .expect_err("mutated dense bytecode should fail");
+        let codes: Vec<_> = errors.iter().map(|error| error.code).collect();
+        assert!(codes.contains(&DenseVerifyErrorCode::InvalidConstant));
+        assert!(codes.contains(&DenseVerifyErrorCode::InvalidRegister));
+        assert!(codes.contains(&DenseVerifyErrorCode::InvalidTerminator));
+        assert!(codes.contains(&DenseVerifyErrorCode::InvalidSpan));
+    }
+
+    #[test]
+    fn bytecode_verifier_rejects_operand_shape_mismatch() {
+        let unit = manual_basic_unit();
+        let mut dense = DenseBytecodeUnit::lower_from_ir(&unit).expect("manual IR lowers");
+        dense.functions[0].instructions[0] = DenseInstruction {
+            opcode: DenseOpcode::LoadConst,
+            operands: DenseOperands::None,
+            span: DenseSpanId::new(0),
+            cache_slot: None,
+        };
+        let errors = dense
+            .verify()
+            .expect_err("operand shape mismatch should fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == DenseVerifyErrorCode::InvalidOperandShape)
+        );
+    }
+
+    fn manual_basic_unit() -> php_ir::IrUnit {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("fixtures/runtime/valid/scalars/echo.php");
+        let function = builder.start_function(
+            "main",
+            FunctionFlags {
+                is_top_level: true,
+                ..FunctionFlags::default()
+            },
+            IrSpan::new(file, 0, 5),
+        );
+        let block = builder.append_block(function);
+        let one = builder.add_constant(IrConstant::Int(1));
+        let two = builder.add_constant(IrConstant::Int(2));
+        let r0 = builder.alloc_register(function);
+        let r1 = builder.alloc_register(function);
+        let r2 = builder.alloc_register(function);
+        builder.emit_load_const(function, block, r0, one, IrSpan::new(file, 6, 7));
+        builder.emit_load_const(function, block, r1, two, IrSpan::new(file, 10, 11));
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Binary {
+                dst: r2,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(r0),
+                rhs: Operand::Register(r1),
+            },
+            IrSpan::new(file, 6, 11),
+        );
+        builder.terminate_return(
+            function,
+            block,
+            Some(Operand::Register(r2)),
+            IrSpan::new(file, 6, 11),
+        );
+        builder.set_entry(function);
+        builder.finish()
+    }
+}

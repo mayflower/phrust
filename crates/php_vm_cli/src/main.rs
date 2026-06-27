@@ -9,8 +9,8 @@ use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source};
 use php_source::TextRange;
 use php_vm::{
-    IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode, QuickeningMode, TieringOptions, Vm,
-    VmOptions,
+    ExecutionFormat, IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode, QuickeningMode,
+    SuperinstructionMode, TieringOptions, Vm, VmOptions,
 };
 use std::env;
 use std::fs;
@@ -265,6 +265,8 @@ where
         trace: run_options.trace,
         trace_runtime: run_options.trace_runtime,
         collect_counters: run_options.counters_json.is_some() || run_options.jit_stats.is_json(),
+        execution_format: run_options.execution_format,
+        superinstructions: run_options.superinstructions,
         quickening: run_options.quickening,
         inline_caches: run_options.inline_caches,
         jit: run_options.jit,
@@ -639,6 +641,8 @@ struct RunOptions<'a> {
     counters_json: Option<String>,
     bytecode_cache: BytecodeCacheOptions,
     opt_level: OptimizationLevel,
+    execution_format: ExecutionFormat,
+    superinstructions: SuperinstructionMode,
     quickening: QuickeningMode,
     inline_caches: InlineCacheMode,
     jit: JitMode,
@@ -783,6 +787,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let mut counters_json = None;
     let mut bytecode_cache = BytecodeCacheOptions::default();
     let mut opt_level = OptimizationLevel::O0;
+    let mut execution_format = ExecutionFormat::Ir;
+    let mut superinstructions = SuperinstructionMode::Off;
     let mut quickening = QuickeningMode::Off;
     let mut inline_caches = InlineCacheMode::Off;
     let mut jit = JitMode::Off;
@@ -831,6 +837,26 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
             }
             arg if let Some(value) = arg.strip_prefix("--opt-level=") => {
                 opt_level = parse_optimization_level(value)?;
+            }
+            "--exec-format" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --exec-format requires ir, auto, or bytecode".to_string());
+                };
+                execution_format = parse_execution_format(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--exec-format=") => {
+                execution_format = parse_execution_format(value)?;
+            }
+            "--superinstructions" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --superinstructions requires off or on".to_string());
+                };
+                superinstructions = parse_superinstruction_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--superinstructions=") => {
+                superinstructions = parse_superinstruction_mode(value)?;
             }
             "--quickening" => {
                 index += 1;
@@ -1042,6 +1068,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     counters_json,
                     bytecode_cache,
                     opt_level,
+                    execution_format,
+                    superinstructions,
                     quickening,
                     inline_caches,
                     jit,
@@ -1074,6 +1102,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         counters_json,
         bytecode_cache,
         opt_level,
+        execution_format,
+        superinstructions,
         quickening,
         inline_caches,
         jit,
@@ -1122,6 +1152,27 @@ fn parse_quickening_mode(value: &str) -> Result<QuickeningMode, String> {
         "on" => Ok(QuickeningMode::On),
         _ => Err(format!(
             "unsupported quickening mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_execution_format(value: &str) -> Result<ExecutionFormat, String> {
+    match value {
+        "ir" => Ok(ExecutionFormat::Ir),
+        "auto" => Ok(ExecutionFormat::Auto),
+        "bytecode" => Ok(ExecutionFormat::Bytecode),
+        _ => Err(format!(
+            "unsupported exec-format mode `{value}`; expected ir, auto, or bytecode"
+        )),
+    }
+}
+
+fn parse_superinstruction_mode(value: &str) -> Result<SuperinstructionMode, String> {
+    match value {
+        "off" => Ok(SuperinstructionMode::Off),
+        "on" => Ok(SuperinstructionMode::On),
+        _ => Err(format!(
+            "unsupported superinstructions mode `{value}`; expected off or on"
         )),
     }
 }
@@ -1617,7 +1668,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -1991,7 +2042,9 @@ mod tests {
         parse_run_args, run,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
-    use php_vm::{InlineCacheMode, JitBlacklistMode, JitMode};
+    use php_vm::{
+        ExecutionFormat, InlineCacheMode, JitBlacklistMode, JitMode, SuperinstructionMode,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -2494,6 +2547,8 @@ mod tests {
         assert_eq!(options.counters_json, None);
         assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
         assert_eq!(options.opt_level, OptimizationLevel::O0);
+        assert_eq!(options.execution_format, ExecutionFormat::Ir);
+        assert_eq!(options.superinstructions, SuperinstructionMode::Off);
         assert_eq!(options.quickening, QuickeningMode::Off);
         assert_eq!(options.inline_caches, InlineCacheMode::Off);
         assert_eq!(options.jit, JitMode::Off);
@@ -2519,6 +2574,8 @@ mod tests {
             "--bytecode-cache-stats".to_string(),
             "--clear-bytecode-cache".to_string(),
             "--opt-level=1".to_string(),
+            "--exec-format=bytecode".to_string(),
+            "--superinstructions=on".to_string(),
             "--quickening=on".to_string(),
             "--inline-caches=on".to_string(),
             "--jit=cranelift".to_string(),
@@ -2551,6 +2608,8 @@ mod tests {
         assert!(options.bytecode_cache.stats);
         assert!(options.bytecode_cache.clear);
         assert_eq!(options.opt_level, OptimizationLevel::O1);
+        assert_eq!(options.execution_format, ExecutionFormat::Bytecode);
+        assert_eq!(options.superinstructions, SuperinstructionMode::On);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
         assert_eq!(options.jit, JitMode::Cranelift);

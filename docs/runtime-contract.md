@@ -207,6 +207,40 @@ registers, locals, constants, blocks, missing terminators, uninitialized
 register reads, division by zero, and unsupported scalar type combinations
 produce controlled runtime errors instead of panics.
 
+`php_vm::bytecode` defines a separate dense bytecode representation for Tier 0
+execution work. Rich IR remains the verified frontend/optimizer boundary and
+the default interpreter continues to execute rich IR. The CLI exposes
+`php-vm run --exec-format=ir|auto|bytecode`; the default is `ir`. Dense
+bytecode lowers only `nop`, `load_const`, `move`, `load_local`, `store_local`,
+dense scalar binary operations, scalar unary operations, comparisons, simple
+direct positional user-function calls, `echo`, discard, jump terminators, and
+simple non-reference returns. Unsupported instruction families are rejected by the
+dense lowerer instead of being executed with alternate semantics. Strict
+`bytecode` mode returns unsupported for rejected units, while `auto` falls back
+to the rich-IR interpreter. The dense verifier checks register, local,
+constant, jump target, block terminator, source-span side table, cache slot,
+operand-shape, and source-map consistency before the executor consumes the
+format.
+
+Dense bytecode also exposes `php-vm run --superinstructions=off|on`; the
+default is `off`. When enabled with bytecode execution, the selector currently
+fuses adjacent `load_const` plus `echo`, `load_local` plus `echo`, and
+`binary_concat` plus `echo` pairs. Fused opcodes still use the same constant,
+operand, binary-concat, register-write, and echo helpers as the unfused path,
+and unsupported instruction families remain rejected or fall back through the
+normal execution-format policy.
+
+Normal VM calls use a request-local frame pool for reuse-eligible plain
+user-function activations. Each `Frame` records whether it may enter the pool,
+and `pop_recycle()` discards non-eligible frames instead of pooling them.
+Fresh-frame fallback is used for closure captures, by-reference params or
+returns, generator/fiber continuations, class contexts, shared top-level locals,
+try/finally bodies, and object-allocation bodies that may retain
+destructor-sensitive values. Frame/register counters include
+`frames_allocated`, `frames_reused`, `register_files_allocated`,
+`register_files_reused`, and `frame_reuse_blocked_by_reason`; the older
+`frame_allocations` and `frame_reuses` keys remain for compatibility.
+
 Local slots are indexed by `LocalId` in the IR function table. The VM stores
 `ValueSlot`s in the slot array so ordinary assignments stay by-value while the
 Work item `BindReference` instruction can bind two local slots to one
