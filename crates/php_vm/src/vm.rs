@@ -5421,7 +5421,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        if let Err(_message) = validate_property_access(
+                        if let Err(access_error) = validate_property_access(
                             compiled,
                             stack,
                             resolved.class,
@@ -5474,7 +5474,28 @@ impl Vm {
                                     continue;
                                 }
                                 Ok(None) => {
-                                    return self.runtime_error(output, compiled, stack, _message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, access_error);
+                                    if let Some(throwable) = runtime_error_throwable(&result) {
+                                        tag_throwable_location(
+                                            &throwable,
+                                            compiled,
+                                            instruction.span,
+                                        );
+                                        if let Some(target) = handle_throw(
+                                            compiled,
+                                            throwable.clone(),
+                                            &mut exception_handlers,
+                                            stack,
+                                            &mut pending_control,
+                                        ) {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        return self
+                                            .propagate_exception(output, stack, state, throwable);
+                                    }
+                                    return result;
                                 }
                                 Err(result) => return result,
                             }
@@ -18123,22 +18144,22 @@ fn validate_property_access(
         let scope = current_scope_class(compiled, stack);
         if scope.as_deref() != Some(normalize_class_name(&class.name).as_str()) {
             return Err(format!(
-                "E_PHP_VM_PRIVATE_PROPERTY_ACCESS: property {}::${} is private",
-                class.name, property.name
+                "E_PHP_VM_PRIVATE_PROPERTY_ACCESS: Cannot access private property {}::${}",
+                class.display_name, property.name
             ));
         }
     }
     if property.flags.is_protected {
         let Some(scope) = current_scope_class(compiled, stack) else {
             return Err(format!(
-                "E_PHP_VM_PROTECTED_PROPERTY_ACCESS: property {}::${} is protected",
-                class.name, property.name
+                "E_PHP_VM_PROTECTED_PROPERTY_ACCESS: Cannot access protected property {}::${}",
+                class.display_name, property.name
             ));
         };
         if !class_is_or_extends(compiled, &scope, &class.name)? {
             return Err(format!(
-                "E_PHP_VM_PROTECTED_PROPERTY_ACCESS: property {}::${} is protected",
-                class.name, property.name
+                "E_PHP_VM_PROTECTED_PROPERTY_ACCESS: Cannot access protected property {}::${}",
+                class.display_name, property.name
             ));
         }
     }
@@ -22038,7 +22059,9 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_VM_PARAM_TYPE_MISMATCH" => "TypeError",
         "E_PHP_VM_PRIVATE_METHOD_ACCESS"
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
-        | "E_PHP_VM_ABSTRACT_METHOD_CALL" => "Error",
+        | "E_PHP_VM_ABSTRACT_METHOD_CALL"
+        | "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
+        | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS" => "Error",
         _ => return None,
     };
     let message = diagnostic
@@ -26588,9 +26611,13 @@ mod tests {
             private_property.status.exit_status(),
             ExitStatus::RuntimeError
         );
-        assert_eq!(
-            private_property.diagnostics[0].id(),
-            "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
+        assert!(
+            private_property
+                .output
+                .to_string_lossy()
+                .contains("Uncaught Error: Cannot access private property Secret::$hidden"),
+            "{}",
+            private_property.output.to_string_lossy()
         );
 
         let protected_property = execute_source(
@@ -26600,9 +26627,13 @@ mod tests {
             protected_property.status.exit_status(),
             ExitStatus::RuntimeError
         );
-        assert_eq!(
-            protected_property.diagnostics[0].id(),
-            "E_PHP_VM_PROTECTED_PROPERTY_ACCESS"
+        assert!(
+            protected_property
+                .output
+                .to_string_lossy()
+                .contains("Uncaught Error: Cannot access protected property Secret::$hidden"),
+            "{}",
+            protected_property.output.to_string_lossy()
         );
     }
 
