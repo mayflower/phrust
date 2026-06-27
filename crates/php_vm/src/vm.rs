@@ -3,6 +3,8 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::too_many_arguments)]
 
+mod arguments;
+
 use crate::bytecode::{
     DenseBytecodeUnit, DenseCallArg, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
     DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
@@ -49,12 +51,12 @@ use php_runtime::{
     ClassMethodEntry as RuntimeClassMethodEntry, ClassMethodFlags as RuntimeClassMethodFlags,
     ClassPropertyEntry as RuntimeClassPropertyEntry,
     ClassPropertyFlags as RuntimeClassPropertyFlags,
-    ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureDebugInfo,
-    ExecutionStatus, FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable,
-    NumericValue, ObjectRef, OutputBuffer, PhpArray, PhpArrayKind, PhpString, ProcessCapability,
-    ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan,
-    RuntimeStackFrame, RuntimeType, Slot, Value, compare, division_by_zero_mvp,
-    emit_php_diagnostic, equal, error_reporting_allows_level, identical,
+    ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureContext,
+    ClosureDebugInfo, ClosurePayload, ExecutionStatus, FiberRef, FiberState, GeneratorRef,
+    GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef, OutputBuffer, PhpArray,
+    PhpArrayKind, PhpString, ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic,
+    RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, Value, compare,
+    division_by_zero_mvp, emit_php_diagnostic, equal, error_reporting_allows_level, identical,
     reset_float_string_precision, runtime_type_name, set_float_string_precision,
     to_arithmetic_number, to_bool, to_float, to_int, to_number, to_string, undefined_function,
     undefined_variable_warning, unsupported_feature, value_matches_runtime_type, value_type_name,
@@ -6039,7 +6041,7 @@ impl Vm {
                 && call.running_fiber.is_none();
             let frame_reuse_call_shape_reason =
                 frame_reuse_call_shape_blocked_reason(function, &call);
-            let prepared = match prepare_arguments(
+            let prepared = match arguments::prepare_arguments(
                 compiled,
                 function,
                 call.args,
@@ -11634,16 +11636,17 @@ impl Vm {
                             .get(function.index())
                             .filter(|closure| closure.flags.is_closure && !closure.flags.is_static)
                             .and_then(|_| current_this_object(compiled, stack));
-                        let value = Value::closure_with_debug_this_and_context(
-                            function.raw(),
-                            captured,
-                            closure_debug_info(compiled, *function),
-                            bound_this,
-                            current_scope_class(compiled, stack),
-                            current_called_class(compiled, stack),
-                            current_scope_class(compiled, stack),
-                        )
-                        .with_closure_owner_unit(dynamic_unit_index_for_compiled(state, compiled));
+                        let value = Value::closure(
+                            ClosurePayload::new(function.raw(), captured)
+                                .with_debug(closure_debug_info(compiled, *function))
+                                .with_bound_this(bound_this)
+                                .with_context(ClosureContext {
+                                    owner_unit: dynamic_unit_index_for_compiled(state, compiled),
+                                    scope_class: current_scope_class(compiled, stack),
+                                    called_class: current_called_class(compiled, stack),
+                                    declaring_class: current_scope_class(compiled, stack),
+                                }),
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -11660,17 +11663,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let Some((
-                            function,
-                            captures,
-                            bound_this,
-                            debug,
-                            owner_unit,
-                            scope_class,
-                            called_class,
-                            declaring_class,
-                        )) = callee.as_closure()
-                        else {
+                        let Some(payload) = callee.as_closure() else {
                             return self.runtime_error(
                                 output,
                                 compiled,
@@ -11684,26 +11677,40 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let mut call = FunctionCall::new(values, captures.clone())
+                        let mut call = FunctionCall::new(values, payload.captures.clone())
                             .inherit_fiber_context(&running_fiber)
                             .with_call_span(instruction.span)
                             .with_error_context(compiled.clone());
-                        if let Some(bound_this) = bound_this {
+                        if let Some(bound_this) = &payload.bound_this {
                             call = call.with_this(bound_this.clone());
                         }
-                        if let Some(scope_class) = scope_class {
+                        if let Some(scope_class) = &payload.context.scope_class {
                             call = call.with_class_context(
                                 scope_class.clone(),
-                                called_class.unwrap_or(scope_class).clone(),
-                                declaring_class.unwrap_or(scope_class).clone(),
+                                payload
+                                    .context
+                                    .called_class
+                                    .as_ref()
+                                    .unwrap_or(scope_class)
+                                    .clone(),
+                                payload
+                                    .context
+                                    .declaring_class
+                                    .as_ref()
+                                    .unwrap_or(scope_class)
+                                    .clone(),
                             );
                         }
                         let closure_owner = closure_owner_for_function(
-                            compiled, state, function, debug, owner_unit,
+                            compiled,
+                            state,
+                            payload.function,
+                            payload.debug.as_ref(),
+                            payload.context.owner_unit,
                         );
                         let result = self.execute_function(
                             &closure_owner,
-                            FunctionId::new(function),
+                            FunctionId::new(payload.function),
                             call,
                             output,
                             stack,
@@ -12466,37 +12473,33 @@ impl Vm {
                     )
                 }
             }
-            Value::Callable(CallableValue::Closure {
-                function,
-                captures,
-                bound_this,
-                debug,
-                owner_unit,
-                scope_class,
-                called_class,
-                declaring_class,
-                ..
-            }) => {
-                let mut call = FunctionCall::new(args, captures)
+            Value::Callable(CallableValue::Closure(payload)) => {
+                let mut call = FunctionCall::new(args, payload.captures)
                     .with_optional_call_span(call_span)
                     .with_error_context(compiled.clone());
                 let closure_owner = closure_owner_for_function(
                     compiled,
                     state,
-                    function,
-                    debug.as_ref(),
-                    owner_unit,
+                    payload.function,
+                    payload.debug.as_ref(),
+                    payload.context.owner_unit,
                 );
-                if let Some(bound_this) = bound_this
-                    && closure_function_has_this_local(&closure_owner, function)
+                if let Some(bound_this) = payload.bound_this
+                    && closure_function_has_this_local(&closure_owner, payload.function)
                 {
                     call = call.with_this(bound_this);
                 }
-                if let Some(scope_class) = scope_class {
+                if let Some(scope_class) = payload.context.scope_class {
                     call = call.with_class_context(
                         scope_class.clone(),
-                        called_class.unwrap_or_else(|| scope_class.clone()),
-                        declaring_class.unwrap_or_else(|| scope_class.clone()),
+                        payload
+                            .context
+                            .called_class
+                            .unwrap_or_else(|| scope_class.clone()),
+                        payload
+                            .context
+                            .declaring_class
+                            .unwrap_or_else(|| scope_class.clone()),
                     );
                 } else if let Some(this_value) = call.this_value.as_ref() {
                     let scope_class = this_value.class_name();
@@ -12513,7 +12516,7 @@ impl Vm {
                 );
                 self.execute_function(
                     &closure_owner,
-                    FunctionId::new(function),
+                    FunctionId::new(payload.function),
                     call,
                     output,
                     stack,
@@ -14518,37 +14521,33 @@ impl Vm {
                     )
                 }
             }
-            Value::Callable(CallableValue::Closure {
-                function,
-                captures,
-                bound_this,
-                debug,
-                owner_unit,
-                scope_class,
-                called_class,
-                declaring_class,
-                ..
-            }) => {
-                let mut call = FunctionCall::new(args, captures)
+            Value::Callable(CallableValue::Closure(payload)) => {
+                let mut call = FunctionCall::new(args, payload.captures)
                     .running_fiber(fiber)
                     .with_error_context(compiled.clone());
                 let closure_owner = closure_owner_for_function(
                     compiled,
                     state,
-                    function,
-                    debug.as_ref(),
-                    owner_unit,
+                    payload.function,
+                    payload.debug.as_ref(),
+                    payload.context.owner_unit,
                 );
-                if let Some(bound_this) = bound_this
-                    && closure_function_has_this_local(&closure_owner, function)
+                if let Some(bound_this) = payload.bound_this
+                    && closure_function_has_this_local(&closure_owner, payload.function)
                 {
                     call = call.with_this(bound_this);
                 }
-                if let Some(scope_class) = scope_class {
+                if let Some(scope_class) = payload.context.scope_class {
                     call = call.with_class_context(
                         scope_class.clone(),
-                        called_class.unwrap_or_else(|| scope_class.clone()),
-                        declaring_class.unwrap_or_else(|| scope_class.clone()),
+                        payload
+                            .context
+                            .called_class
+                            .unwrap_or_else(|| scope_class.clone()),
+                        payload
+                            .context
+                            .declaring_class
+                            .unwrap_or_else(|| scope_class.clone()),
                     );
                 } else if let Some(this_value) = call.this_value.as_ref() {
                     let scope_class = this_value.class_name();
@@ -14560,7 +14559,7 @@ impl Vm {
                 }
                 self.execute_function(
                     &closure_owner,
-                    FunctionId::new(function),
+                    FunctionId::new(payload.function),
                     call,
                     output,
                     stack,
@@ -15324,7 +15323,7 @@ impl Vm {
                     compiled, new_this, &method, scope, args, output, stack, state,
                 )
             }
-            callable @ CallableValue::Closure { .. } => {
+            callable @ CallableValue::Closure(_) => {
                 if is_std_class_object(&new_this) {
                     if let Err(result) = self.emit_closure_internal_scope_bind_warning(
                         compiled,
@@ -19502,10 +19501,12 @@ fn trace_value(value: &Value) -> String {
         Value::Callable(CallableValue::UserFunction { name }) => {
             format!("Callable(user_function={name})")
         }
-        Value::Callable(CallableValue::Closure {
-            function, captures, ..
-        }) => {
-            format!("Closure(function={function}, captures={})", captures.len())
+        Value::Callable(CallableValue::Closure(payload)) => {
+            format!(
+                "Closure(function={}, captures={})",
+                payload.function,
+                payload.captures.len()
+            )
         }
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             format!("Callable(internal_builtin={name})")
@@ -20579,13 +20580,8 @@ fn reflection_new_object(
                         reflection_internal_function_object(name)
                     }
                 }
-                Value::Callable(CallableValue::Closure {
-                    function,
-                    captures,
-                    bound_this,
-                    ..
-                }) => {
-                    let function = FunctionId::new(*function);
+                Value::Callable(CallableValue::Closure(payload)) => {
+                    let function = FunctionId::new(payload.function);
                     let function_entry = compiled.unit().functions.get(function.index()).ok_or_else(|| {
                         format!(
                             "E_PHP_VM_REFLECTION_UNKNOWN_FUNCTION: closure function {} is not defined",
@@ -20595,8 +20591,8 @@ fn reflection_new_object(
                     Ok(reflection_closure_object(
                         compiled,
                         function_entry,
-                        captures,
-                        bound_this.as_ref(),
+                        &payload.captures,
+                        payload.bound_this.as_ref(),
                     )?)
                 }
                 Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
@@ -23762,34 +23758,21 @@ fn closure_static_method_value(
 
 fn bind_closure_callable_value(callable: CallableValue, bound_this: Option<ObjectRef>) -> Value {
     match callable {
-        CallableValue::Closure {
-            function,
-            captures,
-            debug,
-            owner_unit,
-            scope_class,
-            called_class,
-            declaring_class,
-            ..
-        } => Value::closure_with_debug_this_and_context(
-            function,
-            captures,
-            debug,
-            bound_this.clone(),
-            bound_this
-                .as_ref()
-                .map(ObjectRef::class_name)
-                .or(scope_class),
-            bound_this
-                .as_ref()
-                .map(ObjectRef::class_name)
-                .or(called_class),
-            bound_this
-                .as_ref()
-                .map(ObjectRef::class_name)
-                .or(declaring_class),
-        )
-        .with_closure_owner_unit(owner_unit),
+        CallableValue::Closure(payload) => {
+            let rebound_class = bound_this.as_ref().map(ObjectRef::class_name);
+            let context = ClosureContext {
+                owner_unit: payload.context.owner_unit,
+                scope_class: rebound_class.clone().or(payload.context.scope_class),
+                called_class: rebound_class.clone().or(payload.context.called_class),
+                declaring_class: rebound_class.or(payload.context.declaring_class),
+            };
+            Value::closure(
+                ClosurePayload::new(payload.function, payload.captures)
+                    .with_debug(payload.debug)
+                    .with_bound_this(bound_this.clone())
+                    .with_context(context),
+            )
+        }
         CallableValue::BoundMethod {
             target,
             method,
@@ -23806,15 +23789,14 @@ fn bind_closure_callable_value(callable: CallableValue, bound_this: Option<Objec
 }
 
 fn callable_closure_should_warn_unbind_this(callable: &CallableValue) -> bool {
-    let CallableValue::Closure {
-        captures,
-        bound_this,
-        ..
-    } = callable
-    else {
+    let CallableValue::Closure(payload) = callable else {
         return false;
     };
-    bound_this.is_some() && captures.iter().any(|capture| capture.name == "this")
+    payload.bound_this.is_some()
+        && payload
+            .captures
+            .iter()
+            .any(|capture| capture.name == "this")
 }
 
 fn closure_from_acquired_callable(callable: Value) -> Value {
@@ -24090,16 +24072,17 @@ fn current_closure_value(
     let bound_this = (!function.flags.is_static)
         .then(|| current_this_object(compiled, stack))
         .flatten();
-    Ok(Value::closure_with_debug_this_and_context(
-        frame.function.raw(),
-        captures,
-        closure_debug_info(compiled, frame.function),
-        bound_this,
-        current_scope_class(compiled, stack),
-        current_called_class(compiled, stack),
-        current_scope_class(compiled, stack),
-    )
-    .with_closure_owner_unit(dynamic_unit_index_for_compiled(state, compiled)))
+    Ok(Value::closure(
+        ClosurePayload::new(frame.function.raw(), captures)
+            .with_debug(closure_debug_info(compiled, frame.function))
+            .with_bound_this(bound_this)
+            .with_context(ClosureContext {
+                owner_unit: dynamic_unit_index_for_compiled(state, compiled),
+                scope_class: current_scope_class(compiled, stack),
+                called_class: current_called_class(compiled, stack),
+                declaring_class: current_scope_class(compiled, stack),
+            }),
+    ))
 }
 
 fn is_std_class_runtime_class(class_name: &str) -> bool {
@@ -25700,27 +25683,7 @@ fn error_handler_callback_from_value(
                 ))
             }
         }
-        Value::Callable(CallableValue::Closure {
-            id,
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit,
-            scope_class,
-            called_class,
-            declaring_class,
-        }) => Ok(CallableValue::Closure {
-            id,
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit,
-            scope_class,
-            called_class,
-            declaring_class,
-        }),
+        Value::Callable(CallableValue::Closure(payload)) => Ok(CallableValue::Closure(payload)),
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             if BuiltinRegistry::new().contains(&name) {
                 Ok(CallableValue::InternalBuiltin { name })
@@ -25768,27 +25731,7 @@ fn autoload_callback_from_value(
                 ))
             }
         }
-        Value::Callable(CallableValue::Closure {
-            id,
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit,
-            scope_class,
-            called_class,
-            declaring_class,
-        }) => Ok(CallableValue::Closure {
-            id,
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit,
-            scope_class,
-            called_class,
-            declaring_class,
-        }),
+        Value::Callable(CallableValue::Closure(payload)) => Ok(CallableValue::Closure(payload)),
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             if BuiltinRegistry::new().contains(&name) {
                 Ok(CallableValue::InternalBuiltin { name })
@@ -26104,10 +26047,10 @@ fn error_handler_callback_max_args(
                     .map(user_function_max_positional_args)
             })
         }
-        CallableValue::Closure { function, .. } => compiled
+        CallableValue::Closure(payload) => compiled
             .unit()
             .functions
-            .get(FunctionId::new(*function).index())
+            .get(FunctionId::new(payload.function).index())
             .map(user_function_max_positional_args),
         CallableValue::InternalBuiltin { .. }
         | CallableValue::BoundMethod { .. }
@@ -27410,11 +27353,10 @@ fn callable_name_for_is_callable(
     match effective_value(value) {
         Value::Callable(CallableValue::UserFunction { name }) => Some(name),
         Value::Callable(CallableValue::InternalBuiltin { name }) => Some(name),
-        Value::Callable(CallableValue::Closure {
-            function, debug, ..
-        }) => {
-            let function = compiled.unit().functions.get(function as usize)?;
-            debug
+        Value::Callable(CallableValue::Closure(payload)) => {
+            let function = compiled.unit().functions.get(payload.function as usize)?;
+            payload
+                .debug
                 .map(|debug| debug.name)
                 .or_else(|| Some(function.name.clone()))
         }
@@ -28157,222 +28099,6 @@ fn inline_constant_value(constant: &IrConstant) -> Value {
     }
 }
 
-fn prepare_arguments(
-    compiled: &CompiledUnit,
-    function: &IrFunction,
-    args: Vec<CallArgument>,
-    stack: &mut CallStack,
-    state: &ExecutionState,
-    typecheck: TypecheckFastPathContext<'_>,
-    allow_by_ref_value_warnings: bool,
-    call_span: Option<php_ir::IrSpan>,
-    by_ref_warning_callable_name: Option<&str>,
-) -> Result<PreparedArguments, String> {
-    let min = function
-        .params
-        .iter()
-        .filter(|param| param.required)
-        .count();
-    let variadic_index = function.params.iter().position(|param| param.variadic);
-    let max = variadic_index.unwrap_or(function.params.len());
-    let mut bound: Vec<Option<CallArgument>> = (0..function.params.len()).map(|_| None).collect();
-    let mut variadic_tail = Vec::new();
-    let mut positional_index = 0usize;
-    let mut saw_named = false;
-    let mut supplied_count = 0usize;
-    // Extra positional arguments to a non-variadic function are not an error in
-    // PHP: they are ignored for parameter binding but remain visible to
-    // func_get_args(), so keep them in the prepared list.
-    let mut extra_positional: Vec<PreparedArg> = Vec::new();
-
-    for arg in args {
-        if let Some(name) = arg.name.clone() {
-            saw_named = true;
-            let Some(index) = function.params.iter().position(|param| param.name == name) else {
-                if variadic_index.is_some() {
-                    variadic_tail.push(VariadicTailArg {
-                        key: Some(name),
-                        value: arg.value,
-                    });
-                    supplied_count += 1;
-                    continue;
-                }
-                return Err(format!(
-                    "E_PHP_VM_UNKNOWN_NAMED_ARG: Unknown named parameter ${name}"
-                ));
-            };
-            if function.params[index].variadic {
-                variadic_tail.push(VariadicTailArg {
-                    key: Some(name),
-                    value: arg.value,
-                });
-                supplied_count += 1;
-                continue;
-            }
-            if bound[index].is_some() {
-                return Err(format!(
-                    "E_PHP_VM_DUPLICATE_NAMED_ARG: function {} argument ${name} was already provided",
-                    function.name
-                ));
-            }
-            bound[index] = Some(CallArgument {
-                name: None,
-                value: arg.value,
-                value_kind: arg.value_kind,
-                by_ref_local: arg.by_ref_local,
-                by_ref_dim: arg.by_ref_dim,
-                by_ref_property: arg.by_ref_property,
-            });
-            supplied_count += 1;
-            continue;
-        }
-
-        if saw_named {
-            return Err(format!(
-                "E_PHP_VM_POSITIONAL_AFTER_NAMED_ARG: function {} cannot use positional argument after named argument",
-                function.name
-            ));
-        }
-        if variadic_index.is_some_and(|index| positional_index >= index) {
-            variadic_tail.push(VariadicTailArg {
-                key: None,
-                value: arg.value,
-            });
-            positional_index += 1;
-            supplied_count += 1;
-            continue;
-        }
-        if positional_index >= max {
-            extra_positional.push(PreparedArg {
-                value: arg.value,
-                reference: None,
-            });
-            positional_index += 1;
-            supplied_count += 1;
-            continue;
-        }
-        if bound[positional_index].is_some() {
-            return Err(format!(
-                "E_PHP_VM_DUPLICATE_NAMED_ARG: function {} argument ${} was already provided",
-                function.name, function.params[positional_index].name
-            ));
-        }
-        bound[positional_index] = Some(CallArgument {
-            name: None,
-            value: arg.value,
-            value_kind: arg.value_kind,
-            by_ref_local: arg.by_ref_local,
-            by_ref_dim: arg.by_ref_dim,
-            by_ref_property: arg.by_ref_property,
-        });
-        positional_index += 1;
-        supplied_count += 1;
-    }
-
-    if supplied_count < min {
-        precheck_bound_argument_types(compiled, function, &mut bound, state, typecheck, call_span)?;
-        let requirement = if function.params.len() == min && variadic_index.is_none() {
-            format!("exactly {min} expected")
-        } else {
-            format!("at least {min} expected")
-        };
-        let call_site = call_span
-            .and_then(|span| source_span_file_line(compiled, span))
-            .map(|(file, line)| format!(" in {file} on line {line}"))
-            .unwrap_or_default();
-        return Err(format!(
-            "E_PHP_VM_TOO_FEW_ARGS: Too few arguments to function {}(), {} passed{} and {}",
-            function.name, supplied_count, call_site, requirement
-        ));
-    }
-
-    let mut prepared = Vec::with_capacity(function.params.len());
-    let mut trace_args = Vec::new();
-    let mut diagnostics = Vec::new();
-    for (index, param) in function.params.iter().enumerate() {
-        if param.variadic {
-            let sensitive = param_is_sensitive(param);
-            trace_args.extend(variadic_tail.iter().map(|arg| FrameTraceArgument {
-                name: arg.key.clone(),
-                value: trace_value_for_param(&arg.value, sensitive),
-            }));
-            prepared.push(PreparedArg {
-                value: variadic_array(variadic_tail),
-                reference: None,
-            });
-            break;
-        }
-        if let Some(arg) = bound[index].take() {
-            let reference = if param.by_ref {
-                if let Some(reference) = call_argument_reference_cell(compiled, &arg, stack)? {
-                    Some(reference)
-                } else if allow_by_ref_value_warnings {
-                    diagnostics.push(by_ref_value_given_warning(
-                        compiled,
-                        function,
-                        stack,
-                        index + 1,
-                        &param.name,
-                        by_ref_warning_callable_name,
-                    ));
-                    None
-                } else {
-                    return Err(format!(
-                        "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE: function {} argument ${} must be a variable",
-                        function.name, param.name
-                    ));
-                }
-            } else {
-                None
-            };
-            trace_args.push(FrameTraceArgument {
-                name: None,
-                value: trace_value_for_param(&arg.value, param_is_sensitive(param)),
-            });
-            prepared.push(PreparedArg {
-                value: arg.value,
-                reference,
-            });
-        } else if let Some(default) = &param.default {
-            if param.by_ref {
-                return Err(format!(
-                    "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE: function {} argument ${} must be a variable",
-                    function.name, param.name
-                ));
-            }
-            let value = inline_constant_value(default);
-            trace_args.push(FrameTraceArgument {
-                name: None,
-                value: trace_value_for_param(&value, param_is_sensitive(param)),
-            });
-            prepared.push(PreparedArg {
-                value,
-                reference: None,
-            });
-        } else if param.required {
-            return Err(format!(
-                "E_PHP_VM_TOO_FEW_ARGS: function {} is missing argument ${}",
-                function.name, param.name
-            ));
-        } else {
-            return Err(format!(
-                "E_PHP_VM_UNSUPPORTED_DEFAULT_ARG: function {} parameter ${} has no folded default",
-                function.name, param.name
-            ));
-        }
-    }
-    trace_args.extend(extra_positional.iter().map(|arg| FrameTraceArgument {
-        name: None,
-        value: arg.value.clone(),
-    }));
-    prepared.extend(extra_positional);
-    Ok(PreparedArguments {
-        args: prepared,
-        trace_args,
-        diagnostics,
-    })
-}
-
 fn precheck_bound_argument_types(
     compiled: &CompiledUnit,
     function: &IrFunction,
@@ -28452,11 +28178,6 @@ fn by_ref_value_given_warning(
     )
 }
 
-struct VariadicTailArg {
-    key: Option<String>,
-    value: Value,
-}
-
 #[derive(Clone, Copy)]
 struct TypecheckFastPathContext<'a> {
     enabled: bool,
@@ -28470,18 +28191,6 @@ impl TypecheckFastPathContext<'_> {
             counters: self.counters,
         }
     }
-}
-
-fn variadic_array(args: Vec<VariadicTailArg>) -> Value {
-    let mut array = PhpArray::new();
-    for arg in args {
-        if let Some(key) = arg.key {
-            array.insert(ArrayKey::String(PhpString::from(key.as_str())), arg.value);
-        } else {
-            array.append(arg.value);
-        }
-    }
-    Value::Array(array)
 }
 
 fn param_is_sensitive(param: &IrParam) -> bool {

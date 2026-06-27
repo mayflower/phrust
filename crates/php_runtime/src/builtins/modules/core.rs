@@ -17,7 +17,6 @@ use crate::{
     equal, identical, pcre, serialize as serialize_value, to_bool, to_float, to_int, to_number,
     to_string, unserialize as unserialize_value, value::FloatValue,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest, Md5};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sha1::Sha1;
@@ -26,13 +25,13 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RANGE_MAX_ELEMENTS: usize = 1_000_000;
-const SORT_REGULAR: i64 = 0;
-const SORT_NUMERIC: i64 = 1;
-const SORT_STRING: i64 = 2;
-const SORT_LOCALE_STRING: i64 = 5;
-const SORT_NATURAL: i64 = 6;
-const SORT_FLAG_CASE: i64 = 8;
+pub(in crate::builtins::modules) const RANGE_MAX_ELEMENTS: usize = 1_000_000;
+pub(in crate::builtins::modules) const SORT_REGULAR: i64 = 0;
+pub(in crate::builtins::modules) const SORT_NUMERIC: i64 = 1;
+pub(in crate::builtins::modules) const SORT_STRING: i64 = 2;
+pub(in crate::builtins::modules) const SORT_LOCALE_STRING: i64 = 5;
+pub(in crate::builtins::modules) const SORT_NATURAL: i64 = 6;
+pub(in crate::builtins::modules) const SORT_FLAG_CASE: i64 = 8;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("boolval", builtin_boolval, BuiltinCompatibility::Php),
@@ -249,8 +248,6 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_process_requires_vm,
         BuiltinCompatibility::Php,
     ),
-    BuiltinEntry::new("sizeof", builtin_count, BuiltinCompatibility::Php),
-    BuiltinEntry::new("substr", builtin_substr, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "system",
         builtin_process_requires_vm,
@@ -281,7 +278,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("var_export", builtin_var_export, BuiltinCompatibility::Php),
 ];
 
-fn expect_arity(name: &str, args: &[Value], expected: usize) -> Result<(), BuiltinError> {
+pub(in crate::builtins::modules) fn expect_arity(
+    name: &str,
+    args: &[Value],
+    expected: usize,
+) -> Result<(), BuiltinError> {
     if args.len() == expected {
         return Ok(());
     }
@@ -291,1059 +292,11 @@ fn expect_arity(name: &str, args: &[Value], expected: usize) -> Result<(), Built
     ))
 }
 
-fn arity_error(name: &str, expected: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn arity_error(name: &str, expected: &str) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_ARITY",
         format!("builtin {name} expects {expected}"),
     )
-}
-
-pub(in crate::builtins::modules) fn builtin_strlen(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strlen", &args, 1)?;
-    let value = string_arg("strlen", &args[0])?;
-    Ok(Value::Int(value.len() as i64))
-}
-
-pub(in crate::builtins::modules) fn builtin_strtoupper(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strtoupper", &args, 1)?;
-    Ok(Value::string(
-        string_arg("strtoupper", &args[0])?
-            .as_bytes()
-            .iter()
-            .map(u8::to_ascii_uppercase)
-            .collect::<Vec<_>>(),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_trim(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    trim_builtin(context, "trim", args, true, true, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_ltrim(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    trim_builtin(context, "ltrim", args, true, false, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_rtrim(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    trim_builtin(context, "rtrim", args, false, true, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_explode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin explode expects two or three argument(s)",
-        ));
-    }
-    let separator = string_arg("explode", &args[0])?;
-    if separator.is_empty() {
-        return Err(value_error("explode", "separator cannot be empty"));
-    }
-    let string = string_arg("explode", &args[1])?;
-    let limit = args
-        .get(2)
-        .map(|value| int_arg("explode", value))
-        .transpose()?;
-    let mut parts = split_bytes(string.as_bytes(), separator.as_bytes());
-    match limit {
-        Some(0) => parts.truncate(1),
-        Some(limit) if limit > 0 => {
-            parts = split_bytes_limited(string.as_bytes(), separator.as_bytes(), limit as usize)
-        }
-        Some(limit) if limit < 0 => {
-            let drop = limit.unsigned_abs() as usize;
-            if drop >= parts.len() {
-                parts.clear();
-            } else {
-                parts.truncate(parts.len() - drop);
-            }
-        }
-        _ => {}
-    }
-    Ok(Value::Array(crate::PhpArray::from_packed(
-        parts.into_iter().map(Value::string).collect(),
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_implode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin implode expects one or two argument(s)",
-        ));
-    }
-    let (separator, array) = if args.len() == 1 || matches!(deref_value(&args[0]), Value::Array(_))
-    {
-        (
-            crate::PhpString::from_bytes(Vec::new()),
-            array_arg("implode", &args[0])?,
-        )
-    } else {
-        (
-            string_arg("implode", &args[0])?,
-            array_arg("implode", &args[1])?,
-        )
-    };
-    let mut output = Vec::new();
-    for (index, value) in array.iter().enumerate() {
-        if index > 0 {
-            output.extend_from_slice(separator.as_bytes());
-        }
-        output.extend_from_slice(value.as_bytes());
-    }
-    Ok(Value::string(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_count(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(arity_error("count", "one or two argument(s)"));
-    }
-    let mode = args
-        .get(1)
-        .map(|value| int_arg("count", value))
-        .transpose()?
-        .unwrap_or(0);
-    let count = match deref_value(&args[0]) {
-        Value::Array(array) if mode == 1 => count_recursive(&array),
-        Value::Array(array) => array.len(),
-        Value::Object(object) => {
-            match (
-                object.get_property("__entries"),
-                object.get_property("__storage"),
-            ) {
-                (Some(Value::Array(entries)), _) => entries.len(),
-                (_, Some(Value::Array(entries))) => entries.len(),
-                _ => return Err(type_error("count", "array or Countable", &args[0])),
-            }
-        }
-        _ => return Err(type_error("count", "array or Countable", &args[0])),
-    };
-    Ok(Value::Int(count as i64))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_key_exists(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_key_exists", &args, 2)?;
-    let key = array_key_arg("array_key_exists", &args[0])?;
-    let Value::Array(array) = deref_value(&args[1]) else {
-        return Err(type_error("array_key_exists", "array", &args[1]));
-    };
-    Ok(Value::Bool(array.get(&key).is_some()))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_keys(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=3).contains(&args.len()) {
-        return Err(arity_error("array_keys", "one to three argument(s)"));
-    }
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("array_keys", "array", &args[0]));
-    };
-    let strict = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("array_keys", message))?
-        .unwrap_or(false);
-    let mut keys = Vec::new();
-    for (key, value) in array.iter() {
-        if let Some(filter) = args.get(1)
-            && !array_value_matches("array_keys", value, filter, strict)?
-        {
-            continue;
-        }
-        keys.push(array_key_to_value(key));
-    }
-    Ok(Value::packed_array(keys))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_values(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_values", &args, 1)?;
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("array_values", "array", &args[0]));
-    };
-    Ok(Value::packed_array(
-        array.iter().map(|(_, value)| value.clone()).collect(),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_combine(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_combine", &args, 2)?;
-    let Value::Array(keys) = deref_value(&args[0]) else {
-        return Err(type_error("array_combine", "array", &args[0]));
-    };
-    let Value::Array(values) = deref_value(&args[1]) else {
-        return Err(type_error("array_combine", "array", &args[1]));
-    };
-    if keys.len() != values.len() {
-        return Err(value_error(
-            "array_combine",
-            "Argument #1 ($keys) and argument #2 ($values) must have the same number of elements",
-        ));
-    }
-    let mut output = PhpArray::new();
-    for ((_, key), (_, value)) in keys.iter().zip(values.iter()) {
-        let Some(key) = ArrayKey::from_value_mvp(key) else {
-            return Err(type_error("array_combine", "array key", key));
-        };
-        output.insert(key, value.clone());
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_is_list(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_is_list", &args, 1)?;
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("array_is_list", "array", &args[0]));
-    };
-    Ok(Value::Bool(array.packed_elements().is_some()))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_key_first(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_key_first", &args, 1)?;
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("array_key_first", "array", &args[0]));
-    };
-    Ok(array
-        .iter()
-        .next()
-        .map_or(Value::Null, |(key, _)| array_key_to_value(key)))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_key_last(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_key_last", &args, 1)?;
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("array_key_last", "array", &args[0]));
-    };
-    Ok(array
-        .iter()
-        .last()
-        .map_or(Value::Null, |(key, _)| array_key_to_value(key)))
-}
-
-pub(in crate::builtins::modules) fn builtin_in_array(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("in_array", "two or three argument(s)"));
-    }
-    let Value::Array(array) = deref_value(&args[1]) else {
-        return Err(type_error("in_array", "array", &args[1]));
-    };
-    let strict = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("in_array", message))?
-        .unwrap_or(false);
-    for (_, value) in array.iter() {
-        if array_value_matches("in_array", &args[0], value, strict)? {
-            return Ok(Value::Bool(true));
-        }
-    }
-    Ok(Value::Bool(false))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_search(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("array_search", "two or three argument(s)"));
-    }
-    let Value::Array(array) = deref_value(&args[1]) else {
-        return Err(type_error("array_search", "array", &args[1]));
-    };
-    let strict = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("array_search", message))?
-        .unwrap_or(false);
-    for (key, value) in array.iter() {
-        if array_value_matches("array_search", &args[0], value, strict)? {
-            return Ok(array_key_to_value(key));
-        }
-    }
-    Ok(Value::Bool(false))
-}
-
-pub(in crate::builtins::modules) fn builtin_range(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("range", "two or three argument(s)"));
-    }
-    range_null_deprecation(context, &args[0], "#1 ($start)", span.clone());
-    range_null_deprecation(context, &args[1], "#2 ($end)", span.clone());
-    let step = args
-        .get(2)
-        .map(range_step_arg)
-        .transpose()?
-        .unwrap_or(RangeStep::Int(1));
-    validate_range_step(step)?;
-
-    if let Some(values) = range_string_values(context, &args[0], &args[1], step, span.clone())? {
-        return Ok(Value::packed_array(values));
-    }
-    warn_range_null_string_boundary(context, &args[0], &args[1], span.clone());
-
-    let start = range_numeric_arg("range", "#1 ($start)", &args[0])?;
-    let end = range_numeric_arg("range", "#2 ($end)", &args[1])?;
-    range_numeric_values(start, end, step).map(Value::packed_array)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_column(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("array_column", "two or three argument(s)"));
-    }
-    let Value::Array(rows) = deref_value(&args[0]) else {
-        return Err(type_error("array_column", "array", &args[0]));
-    };
-    let column_key = if matches!(deref_value(&args[1]), Value::Null) {
-        None
-    } else {
-        Some(array_key_arg("array_column", &args[1])?)
-    };
-    let index_key = args
-        .get(2)
-        .filter(|value| !matches!(deref_value(value), Value::Null))
-        .map(|value| array_key_arg("array_column", value))
-        .transpose()?;
-    let mut output = crate::PhpArray::new();
-    for (_, row) in rows.iter() {
-        let Value::Array(row) = deref_value(row) else {
-            continue;
-        };
-        let Some(value) = column_key
-            .as_ref()
-            .map_or(Some(Value::Array(row.clone())), |key| row.get(key).cloned())
-        else {
-            continue;
-        };
-        if let Some(index_key) = &index_key
-            && let Some(index_value) = row.get(index_key)
-            && let Some(output_key) = ArrayKey::from_value_mvp(index_value)
-        {
-            output.insert(output_key, value);
-            continue;
-        }
-        output.append(value);
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_diff(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err(arity_error("array_diff", "at least two argument(s)"));
-    }
-    let first = array_value_arg("array_diff", &args[0])?;
-    let others = array_list_arg("array_diff", &args[1..])?;
-    Ok(Value::Array(array_diff_by_value(&first, &others)?))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_diff_assoc(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err(arity_error("array_diff_assoc", "at least two argument(s)"));
-    }
-    let first = array_value_arg("array_diff_assoc", &args[0])?;
-    let others = array_list_arg("array_diff_assoc", &args[1..])?;
-    Ok(Value::Array(array_diff_by_key_and_value(&first, &others)?))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_fill(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_fill", &args, 3)?;
-    let start_index = int_arg("array_fill", &args[0])?;
-    let count = int_arg("array_fill", &args[1])?;
-    if count < 0 {
-        return Err(argument_value_error(
-            "array_fill",
-            "#2 ($count)",
-            "must be greater than or equal to 0",
-        ));
-    }
-    let count = usize::try_from(count).map_err(|_| {
-        argument_value_error(
-            "array_fill",
-            "#2 ($count)",
-            "must be less than or equal to PHP_INT_MAX",
-        )
-    })?;
-    ensure_array_fill_size(count)?;
-
-    let mut output = crate::PhpArray::new();
-    for offset in 0..count {
-        let offset = i64::try_from(offset).map_err(|_| {
-            value_error(
-                "array_fill",
-                "The supplied range exceeds the maximum array size",
-            )
-        })?;
-        let key = start_index.checked_add(offset).ok_or_else(|| {
-            value_error(
-                "array_fill",
-                "The supplied range exceeds the maximum array size",
-            )
-        })?;
-        output.insert(ArrayKey::Int(key), args[2].clone());
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_intersect(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err(arity_error("array_intersect", "at least two argument(s)"));
-    }
-    let first = array_value_arg("array_intersect", &args[0])?;
-    let others = array_list_arg("array_intersect", &args[1..])?;
-    Ok(Value::Array(array_intersect_by_value(&first, &others)?))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_intersect_assoc(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err(arity_error(
-            "array_intersect_assoc",
-            "at least two argument(s)",
-        ));
-    }
-    let first = array_value_arg("array_intersect_assoc", &args[0])?;
-    let others = array_list_arg("array_intersect_assoc", &args[1..])?;
-    Ok(Value::Array(array_intersect_by_key_and_value(
-        &first, &others,
-    )?))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_intersect_ukey(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    array_callback_intersect_empty_shortcut("array_intersect_ukey", args, 1)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_uintersect(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    array_callback_intersect_empty_shortcut("array_uintersect", args, 1)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_intersect_uassoc(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    array_callback_intersect_empty_shortcut("array_intersect_uassoc", args, 1)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_uintersect_uassoc(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    array_callback_intersect_empty_shortcut("array_uintersect_uassoc", args, 2)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_push(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("array_push", "one or more argument(s)"));
-    }
-    let cell = array_reference_cell("array_push", &args[0])?;
-    let mut array = array_from_reference_cell("array_push", &cell)?;
-    for value in args.iter().skip(1) {
-        array.append(value.clone());
-    }
-    let len = array.len() as i64;
-    cell.set(Value::Array(array));
-    Ok(Value::Int(len))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_rand(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(arity_error("array_rand", "one or two argument(s)"));
-    }
-    let array = array_value_arg("array_rand", &args[0])?;
-    if array.is_empty() {
-        return Err(value_error("array_rand", "Array is empty"));
-    }
-    let requested = args
-        .get(1)
-        .map(|value| int_arg("array_rand", value))
-        .transpose()?
-        .unwrap_or(1);
-    if requested < 1 || requested as usize > array.len() {
-        return Err(value_error(
-            "array_rand",
-            "Argument #2 ($num) must be between 1 and the number of elements in argument #1 ($array)",
-        ));
-    }
-
-    let mut keys = array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-    let requested = requested as usize;
-    for index in 0..requested {
-        let offset = random_bounded_usize("array_rand", keys.len() - index)?;
-        keys.swap(index, index + offset);
-    }
-
-    if requested == 1 {
-        Ok(array_key_to_value(&keys[0]))
-    } else {
-        Ok(Value::packed_array(
-            keys.into_iter()
-                .take(requested)
-                .map(|key| array_key_to_value(&key))
-                .collect(),
-        ))
-    }
-}
-
-pub(in crate::builtins::modules) fn builtin_shuffle(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("shuffle", &args, 1)?;
-    let cell = array_reference_cell("shuffle", &args[0])?;
-    let array = array_from_reference_cell("shuffle", &cell)?;
-    let mut values = array
-        .iter()
-        .map(|(_, value)| value.clone())
-        .collect::<Vec<_>>();
-    for index in 0..values.len() {
-        let offset = random_bounded_usize("shuffle", values.len() - index)?;
-        values.swap(index, index + offset);
-    }
-    cell.set(Value::packed_array(values));
-    Ok(Value::Bool(true))
-}
-
-pub(in crate::builtins::modules) fn builtin_current(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("current", &args, 1)?;
-    let array = array_value_arg("current", &args[0])?;
-    Ok(array.pointer_value().unwrap_or(Value::Bool(false)))
-}
-
-pub(in crate::builtins::modules) fn builtin_key(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("key", &args, 1)?;
-    let array = array_value_arg("key", &args[0])?;
-    Ok(array
-        .pointer_key()
-        .map_or(Value::Null, |key| array_key_to_value(&key)))
-}
-
-pub(in crate::builtins::modules) fn builtin_next(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("next", &args, 1)?;
-    let cell = array_reference_cell("next", &args[0])?;
-    let mut array = array_from_reference_cell("next", &cell)?;
-    let value = array.next_pointer().unwrap_or(Value::Bool(false));
-    cell.set(Value::Array(array));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_prev(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("prev", &args, 1)?;
-    let cell = array_reference_cell("prev", &args[0])?;
-    let mut array = array_from_reference_cell("prev", &cell)?;
-    let value = array.prev_pointer().unwrap_or(Value::Bool(false));
-    cell.set(Value::Array(array));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_end(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("end", &args, 1)?;
-    let cell = array_reference_cell("end", &args[0])?;
-    let mut array = array_from_reference_cell("end", &cell)?;
-    let value = array.end_pointer().unwrap_or(Value::Bool(false));
-    cell.set(Value::Array(array));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_reset(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("reset", &args, 1)?;
-    let cell = array_reference_cell("reset", &args[0])?;
-    let mut array = array_from_reference_cell("reset", &cell)?;
-    let value = array.reset_pointer().unwrap_or(Value::Bool(false));
-    cell.set(Value::Array(array));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_pop(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_pop", &args, 1)?;
-    let cell = array_reference_cell("array_pop", &args[0])?;
-    let mut array = array_from_reference_cell("array_pop", &cell)?;
-    let value = array.pop().unwrap_or(Value::Null);
-    cell.set(Value::Array(array));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_shift(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_shift", &args, 1)?;
-    let cell = array_reference_cell("array_shift", &args[0])?;
-    let array = array_from_reference_cell("array_shift", &cell)?;
-    let mut entries = array_entries(&array);
-    let value = if entries.is_empty() {
-        Value::Null
-    } else {
-        entries.remove(0).1
-    };
-    cell.set(Value::Array(array_from_entries_reindex_ints(entries)));
-    Ok(value)
-}
-
-pub(in crate::builtins::modules) fn builtin_array_unshift(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("array_unshift", "one or more argument(s)"));
-    }
-    let cell = array_reference_cell("array_unshift", &args[0])?;
-    let array = array_from_reference_cell("array_unshift", &cell)?;
-    let mut output = crate::PhpArray::new();
-    for value in args.iter().skip(1) {
-        output.append(value.clone());
-    }
-    for (key, value) in array.iter() {
-        match key {
-            ArrayKey::Int(_) => {
-                output.append(value.clone());
-            }
-            ArrayKey::String(key) => {
-                output.insert(ArrayKey::String(key.clone()), value.clone());
-            }
-        }
-    }
-    let len = output.len() as i64;
-    cell.set(Value::Array(output));
-    Ok(Value::Int(len))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_slice(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=4).contains(&args.len()) {
-        return Err(arity_error("array_slice", "two to four argument(s)"));
-    }
-    let array = array_value_arg("array_slice", &args[0])?;
-    let offset = int_arg("array_slice", &args[1])?;
-    let length = args
-        .get(2)
-        .filter(|value| !matches!(deref_value(value), Value::Null))
-        .map(|value| int_arg("array_slice", value))
-        .transpose()?;
-    let preserve_keys = args
-        .get(3)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("array_slice", message))?
-        .unwrap_or(false);
-    let entries = slice_entries(array_entries(&array), offset, length);
-    Ok(Value::Array(array_from_entries_for_slice(
-        entries,
-        preserve_keys,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_splice(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=4).contains(&args.len()) {
-        return Err(arity_error("array_splice", "two to four argument(s)"));
-    }
-    let cell = array_reference_cell("array_splice", &args[0])?;
-    let array = array_from_reference_cell("array_splice", &cell)?;
-    let entries = array_entries(&array);
-    let offset = int_arg("array_splice", &args[1])?;
-    let start = normalize_slice_start(entries.len(), offset);
-    let delete_len = args
-        .get(2)
-        .filter(|value| !matches!(deref_value(value), Value::Null))
-        .map(|value| splice_length(entries.len(), start, int_arg("array_splice", value)?))
-        .transpose()?
-        .unwrap_or(entries.len().saturating_sub(start));
-    let replacement = args
-        .get(3)
-        .map(|value| splice_replacement_values("array_splice", value))
-        .transpose()?
-        .unwrap_or_default();
-
-    let removed = entries[start..start + delete_len].to_vec();
-    let mut result_values = Vec::new();
-    result_values.extend(entries[..start].iter().map(|(_, value)| value.clone()));
-    result_values.extend(replacement);
-    result_values.extend(
-        entries[start + delete_len..]
-            .iter()
-            .map(|(_, value)| value.clone()),
-    );
-    cell.set(Value::packed_array(result_values));
-    Ok(Value::Array(array_from_entries_reindex_ints(removed)))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_unique(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(arity_error("array_unique", "one or two argument(s)"));
-    }
-    let array = array_value_arg("array_unique", &args[0])?;
-    let flags = args
-        .get(1)
-        .map(|value| int_arg("array_unique", value))
-        .transpose()?
-        .unwrap_or(SORT_STRING);
-    let mut unique = Vec::new();
-    let mut output = crate::PhpArray::new();
-
-    for (key, value) in array.iter() {
-        let candidate = array_unique_key(value, flags)?;
-        if unique
-            .iter()
-            .any(|seen| array_unique_keys_match(seen, &candidate))
-        {
-            continue;
-        }
-        unique.push(candidate);
-        output.insert(key.clone(), value.clone());
-    }
-
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_merge(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    let mut output = crate::PhpArray::new();
-    for arg in &args {
-        let array = array_value_arg("array_merge", arg)?;
-        for (key, value) in array.iter() {
-            match key {
-                ArrayKey::Int(_) => {
-                    output.append(value.clone());
-                }
-                ArrayKey::String(key) => {
-                    output.insert(ArrayKey::String(key.clone()), value.clone());
-                }
-            }
-        }
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_merge_recursive(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    let mut output = crate::PhpArray::new();
-    for arg in &args {
-        let array = array_value_arg("array_merge_recursive", arg)?;
-        merge_recursive_into(&mut output, &array);
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_replace(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("array_replace", "one or more argument(s)"));
-    }
-    let mut output = array_value_arg("array_replace", &args[0])?;
-    for arg in args.iter().skip(1) {
-        let array = array_value_arg("array_replace", arg)?;
-        for (key, value) in array.iter() {
-            output.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_replace_recursive(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error(
-            "array_replace_recursive",
-            "one or more argument(s)",
-        ));
-    }
-    let mut output = array_value_arg("array_replace_recursive", &args[0])?;
-    for arg in args.iter().skip(1) {
-        let array = array_value_arg("array_replace_recursive", arg)?;
-        replace_recursive_into(&mut output, &array);
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_reverse(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(arity_error("array_reverse", "one or two argument(s)"));
-    }
-    let array = array_value_arg("array_reverse", &args[0])?;
-    let preserve_keys = args
-        .get(1)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("array_reverse", message))?
-        .unwrap_or(false);
-    let mut entries = array_entries(&array);
-    entries.reverse();
-    Ok(Value::Array(array_from_entries_for_slice(
-        entries,
-        preserve_keys,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_pad(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_pad", &args, 3)?;
-    let array = array_value_arg("array_pad", &args[0])?;
-    let target = int_arg("array_pad", &args[1])?;
-    let pad_value = args[2].clone();
-    let mut values = array
-        .iter()
-        .map(|(_, value)| value.clone())
-        .collect::<Vec<_>>();
-    let target_len = target.unsigned_abs() as usize;
-    if target_len > values.len() {
-        let pad_count = target_len - values.len();
-        if target < 0 {
-            let mut padded = vec![pad_value; pad_count];
-            padded.extend(values);
-            values = padded;
-        } else {
-            values.extend(std::iter::repeat_n(pad_value, pad_count));
-        }
-    }
-    Ok(Value::packed_array(values))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_chunk(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("array_chunk", "two or three argument(s)"));
-    }
-    let array = array_value_arg("array_chunk", &args[0])?;
-    let length = int_arg("array_chunk", &args[1])?;
-    if length <= 0 {
-        return Err(value_error(
-            "array_chunk",
-            "length must be greater than or equal to 1",
-        ));
-    }
-    let preserve_keys = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("array_chunk", message))?
-        .unwrap_or(false);
-    let entries = array_entries(&array);
-    let mut chunks = Vec::new();
-    for chunk in entries.chunks(length as usize) {
-        let chunk_entries = chunk.to_vec();
-        let chunk_array = if preserve_keys {
-            array_from_entries_preserve(chunk_entries)
-        } else {
-            array_from_entries_for_slice(chunk_entries, false)
-        };
-        chunks.push(Value::Array(chunk_array));
-    }
-    Ok(Value::packed_array(chunks))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_flip(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("array_flip", &args, 1)?;
-    let array = array_value_arg("array_flip", &args[0])?;
-    let mut output = crate::PhpArray::new();
-    for (key, value) in array.iter() {
-        let Some(output_key) = ArrayKey::from_value_mvp(value) else {
-            context.php_warning(
-                "E_PHP_RUNTIME_ARRAY_FLIP_ENTRY_SKIPPED",
-                "array_flip(): Can only flip string and integer values, entry skipped",
-                span.clone(),
-            );
-            continue;
-        };
-        output.insert(output_key, array_key_to_value(key));
-    }
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_callback_requires_vm(
-    _context: &mut BuiltinContext<'_>,
-    _args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    Err(BuiltinError::new(
-        "E_PHP_RUNTIME_CALLABLE_CONTEXT_REQUIRED",
-        "array callback builtins require VM callable dispatch",
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_array_sort_requires_vm(
-    _context: &mut BuiltinContext<'_>,
-    _args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    Err(BuiltinError::new(
-        "E_PHP_RUNTIME_CALLABLE_CONTEXT_REQUIRED",
-        "array sort builtins require VM reference and callable dispatch",
-    ))
 }
 
 pub(in crate::builtins::modules) fn builtin_symbol_introspection_requires_vm(
@@ -1421,6 +374,58 @@ pub(in crate::builtins::modules) fn builtin_process_requires_vm(
         "E_PHP_RUNTIME_PROCESS_CONTEXT_REQUIRED",
         "process builtins require VM process capability policy",
     ))
+}
+
+pub(in crate::builtins::modules) fn builtin_random_bytes(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("random_bytes", &args, 1)?;
+    let length = int_arg("random_bytes", &args[0])?;
+    if length < 1 {
+        return Err(value_error("random_bytes", "length must be greater than 0"));
+    }
+    let mut bytes = vec![0; length as usize];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        BuiltinError::new(
+            "E_PHP_RUNTIME_RANDOM_FAILURE",
+            format!("random_bytes(): failed to read random bytes: {error}"),
+        )
+    })?;
+    Ok(Value::string(bytes))
+}
+
+pub(in crate::builtins::modules) fn builtin_random_int(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("random_int", &args, 2)?;
+    let min = int_arg("random_int", &args[0])?;
+    let max = int_arg("random_int", &args[1])?;
+    if max < min {
+        return Err(value_error(
+            "random_int",
+            "max must be greater than or equal to min",
+        ));
+    }
+    let range = (i128::from(max) - i128::from(min) + 1) as u128;
+    let zone = u128::MAX - (u128::MAX % range);
+    loop {
+        let mut bytes = [0; 16];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            BuiltinError::new(
+                "E_PHP_RUNTIME_RANDOM_FAILURE",
+                format!("random_int(): failed to read random bytes: {error}"),
+            )
+        })?;
+        let sample = u128::from_le_bytes(bytes);
+        if sample < zone {
+            let offset = (sample % range) as i128;
+            return Ok(Value::Int((i128::from(min) + offset) as i64));
+        }
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_gc_collect_cycles(
@@ -1651,302 +656,6 @@ pub(in crate::builtins::modules) fn builtin_number_format(
     Ok(Value::string(grouped))
 }
 
-pub(in crate::builtins::modules) fn builtin_str_replace(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(3..=4).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin str_replace expects three or four argument(s)",
-        ));
-    }
-    let search = string_list_arg("str_replace", &args[0])?;
-    let replace = string_list_arg("str_replace", &args[1])?;
-    let mut count = 0_i64;
-    let result = replace_subject(&args[2], &search, &replace, &mut count)?;
-    if let Some(Value::Reference(cell)) = args.get(3) {
-        cell.set(Value::Int(count));
-    }
-    Ok(result)
-}
-
-pub(in crate::builtins::modules) fn builtin_strtr(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.len() == 2 {
-        let mut subject = string_arg("strtr", &args[0])?.into_bytes();
-        let Value::Array(map) = deref_value(&args[1]) else {
-            return Err(strtr_argument_type_error("#2 ($from)", "array", &args[1]));
-        };
-        let mut replacements = Vec::new();
-        for (key, value) in map.iter() {
-            let key = match key {
-                ArrayKey::Int(index) => index.to_string().into_bytes(),
-                ArrayKey::String(key) => key.as_bytes().to_vec(),
-            };
-            if key.is_empty() {
-                if !subject.is_empty() {
-                    context.php_warning(
-                        "E_PHP_RUNTIME_STRTR_EMPTY_SEARCH",
-                        "strtr(): Ignoring replacement of empty string",
-                        span.clone(),
-                    );
-                }
-                continue;
-            }
-            replacements.push((key, string_arg("strtr", value)?.into_bytes()));
-        }
-        replacements.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
-        subject = replace_map(&subject, &replacements);
-        return Ok(Value::string(subject));
-    }
-    expect_arity("strtr", &args, 3)?;
-    let mut subject = string_arg("strtr", &args[0])?.into_bytes();
-    let from = strtr_string_arg(
-        context,
-        &args[1],
-        "#2 ($from)",
-        "array|string",
-        span.clone(),
-    )?;
-    let to = strtr_string_arg(context, &args[2], "#3 ($to)", "string", span)?;
-    let to_bytes = to.as_bytes();
-    for byte in &mut subject {
-        if let Some(index) = from
-            .as_bytes()
-            .iter()
-            .take(to_bytes.len())
-            .rposition(|from| from == byte)
-            && let Some(replacement) = to_bytes.get(index)
-        {
-            *byte = *replacement;
-        }
-    }
-    Ok(Value::string(subject))
-}
-
-pub(in crate::builtins::modules) fn builtin_strip_tags(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(arity_error("strip_tags", "one or two argument(s)"));
-    }
-    let input = string_arg("strip_tags", &args[0])?;
-    let allowed = args.get(1).map(allowed_strip_tags_arg).transpose()?;
-    Ok(Value::string(strip_tags_bytes(
-        input.as_bytes(),
-        allowed.as_deref(),
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_strtok(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() || args.len() > 2 {
-        return Err(arity_error("strtok", "one or two argument(s)"));
-    }
-    if args.len() == 1 {
-        let Some(state) = context.strtok_state() else {
-            return Ok(Value::Bool(false));
-        };
-        if state.requires_input() {
-            context.php_warning(
-                "E_PHP_RUNTIME_STRTOK_MISSING_INPUT",
-                "strtok(): Both arguments must be provided when starting tokenization",
-                span,
-            );
-            return Ok(Value::Bool(false));
-        }
-    }
-    let Some(state) = context.strtok_state() else {
-        return Ok(Value::Bool(false));
-    };
-    let delimiters = if args.len() == 2 {
-        let input = string_arg("strtok", &args[0])?;
-        state.reset(input.into_bytes());
-        string_arg("strtok", &args[1])?
-    } else {
-        string_arg("strtok", &args[0])?
-    };
-    Ok(state
-        .next_token(delimiters.as_bytes())
-        .map_or(Value::Bool(false), Value::string))
-}
-
-pub(in crate::builtins::modules) fn builtin_strtolower(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strtolower", &args, 1)?;
-    Ok(Value::string(
-        string_arg("strtolower", &args[0])?
-            .as_bytes()
-            .iter()
-            .map(u8::to_ascii_lowercase)
-            .collect::<Vec<_>>(),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_ucfirst(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("ucfirst", &args, 1)?;
-    Ok(Value::string(change_first_ascii(
-        string_arg("ucfirst", &args[0])?,
-        true,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_lcfirst(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("lcfirst", &args, 1)?;
-    Ok(Value::string(change_first_ascii(
-        string_arg("lcfirst", &args[0])?,
-        false,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_ucwords(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin ucwords expects one or two argument(s)",
-        ));
-    }
-    let mut bytes = string_arg("ucwords", &args[0])?.into_bytes();
-    let delimiters = args
-        .get(1)
-        .map(|value| string_arg("ucwords", value))
-        .transpose()?;
-    let delimiters = delimiters
-        .as_ref()
-        .map_or(b" \t\r\n\x0c\x0b".as_slice(), crate::PhpString::as_bytes);
-    let mut at_word_start = true;
-    for byte in &mut bytes {
-        if delimiters.contains(byte) {
-            at_word_start = true;
-        } else if at_word_start {
-            *byte = byte.to_ascii_uppercase();
-            at_word_start = false;
-        }
-    }
-    Ok(Value::string(bytes))
-}
-
-pub(in crate::builtins::modules) fn builtin_str_repeat(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("str_repeat", &args, 2)?;
-    let string = string_arg("str_repeat", &args[0])?;
-    let count = int_arg("str_repeat", &args[1])?;
-    if count < 0 {
-        return Err(value_error(
-            "str_repeat",
-            "count must be greater than or equal to 0",
-        ));
-    }
-    Ok(Value::string(string.as_bytes().repeat(count as usize)))
-}
-
-pub(in crate::builtins::modules) fn builtin_str_pad(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=4).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin str_pad expects two to four argument(s)",
-        ));
-    }
-    let input = string_arg("str_pad", &args[0])?;
-    let length = int_arg("str_pad", &args[1])?;
-    if length < 0 {
-        return Err(value_error(
-            "str_pad",
-            "length must be greater than or equal to 0",
-        ));
-    }
-    let pad = args
-        .get(2)
-        .map(|value| string_arg("str_pad", value))
-        .transpose()?
-        .unwrap_or_else(|| crate::PhpString::from_test_str(" "));
-    if pad.is_empty() {
-        return Err(value_error("str_pad", "pad string cannot be empty"));
-    }
-    let pad_type = args
-        .get(3)
-        .map(|value| int_arg("str_pad", value))
-        .transpose()?
-        .unwrap_or(1);
-    let target = length as usize;
-    if input.len() >= target {
-        return Ok(Value::String(input));
-    }
-    let needed = target - input.len();
-    let (left, right) = match pad_type {
-        0 => (needed, 0),
-        2 => (needed / 2, needed - (needed / 2)),
-        _ => (0, needed),
-    };
-    let mut output = repeat_pad(pad.as_bytes(), left);
-    output.extend_from_slice(input.as_bytes());
-    output.extend_from_slice(&repeat_pad(pad.as_bytes(), right));
-    Ok(Value::string(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_strrev(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strrev", &args, 1)?;
-    let mut bytes = string_arg("strrev", &args[0])?.into_bytes();
-    bytes.reverse();
-    Ok(Value::string(bytes))
-}
-
-pub(in crate::builtins::modules) fn builtin_quotemeta(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("quotemeta", &args, 1)?;
-    let input = string_arg("quotemeta", &args[0])?.into_bytes();
-    let mut out = Vec::with_capacity(input.len());
-    for &byte in &input {
-        if matches!(
-            byte,
-            b'.' | b'\\' | b'+' | b'*' | b'?' | b'[' | b'^' | b']' | b'$' | b'(' | b')'
-        ) {
-            out.push(b'\\');
-        }
-        out.push(byte);
-    }
-    Ok(Value::string(out))
-}
-
 pub(in crate::builtins::modules) fn builtin_usleep(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -2005,1242 +714,6 @@ pub(in crate::builtins::modules) fn builtin_uniqid(
     Ok(Value::string(out))
 }
 
-pub(in crate::builtins::modules) fn builtin_bin2hex(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("bin2hex", &args, 1)?;
-    Ok(Value::string(hex_encode(
-        string_arg("bin2hex", &args[0])?.as_bytes(),
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_hex2bin(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("hex2bin", &args, 1)?;
-    let input = string_arg("hex2bin", &args[0])?;
-    if !input.as_bytes().len().is_multiple_of(2) {
-        context.php_warning(
-            "E_PHP_RUNTIME_HEX2BIN_ODD_LENGTH",
-            "hex2bin(): Hexadecimal input string must have an even length",
-            span,
-        );
-        return Ok(Value::Bool(false));
-    }
-    if input
-        .as_bytes()
-        .iter()
-        .any(|byte| hex_nibble(*byte).is_none())
-    {
-        context.php_warning(
-            "E_PHP_RUNTIME_HEX2BIN_INVALID_HEX",
-            "hex2bin(): Input string must be hexadecimal string",
-            span,
-        );
-        return Ok(Value::Bool(false));
-    }
-    hex_decode(input.as_bytes()).map_or(Ok(Value::Bool(false)), |bytes| Ok(Value::string(bytes)))
-}
-
-pub(in crate::builtins::modules) fn builtin_ord(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("ord", &args, 1)?;
-    let input = string_arg("ord", &args[0])?;
-    input
-        .as_bytes()
-        .first()
-        .copied()
-        .map(|byte| Value::Int(i64::from(byte)))
-        .ok_or_else(|| value_error("ord", "string must not be empty"))
-}
-
-pub(in crate::builtins::modules) fn builtin_chr(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("chr", &args, 1)?;
-    let value = int_arg("chr", &args[0])?.rem_euclid(256) as u8;
-    Ok(Value::string(vec![value]))
-}
-
-pub(in crate::builtins::modules) fn builtin_pack(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("pack", "at least one argument"));
-    }
-    let format = string_arg("pack", &args[0])?;
-    let specs = parse_pack_format(format.as_bytes(), false)?;
-    let mut values = args.iter().skip(1);
-    let mut output = Vec::new();
-
-    for spec in specs {
-        match spec.code {
-            b'l' | b'I' | b'V' => {
-                let count = spec.count.unwrap_or(1);
-                for _ in 0..count {
-                    let value = values
-                        .next()
-                        .ok_or_else(|| value_error("pack", "not enough arguments"))?;
-                    let number = int_arg("pack", value)?;
-                    output.extend_from_slice(&pack_u32_bytes(spec.code, number));
-                }
-            }
-            code => return Err(invalid_pack_format("pack", code)),
-        }
-    }
-
-    Ok(Value::string(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_unpack(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("unpack", "two or three argument(s)"));
-    }
-    let format = string_arg("unpack", &args[0])?;
-    let data = string_arg("unpack", &args[1])?;
-    let offset = args
-        .get(2)
-        .map(|value| int_arg("unpack", value))
-        .transpose()?
-        .unwrap_or(0);
-    if offset < 0 || offset as usize > data.len() {
-        return Err(unpack_offset_error());
-    }
-
-    let specs = parse_pack_format(format.as_bytes(), true)?;
-    let base = offset as usize;
-    let mut cursor = base;
-    let mut next_numeric_key = 1_i64;
-    let mut output = PhpArray::new();
-
-    for spec in specs {
-        match spec.code {
-            b'l' | b'I' | b'V' => {
-                let count = spec.count.unwrap_or(1);
-                for index in 0..count {
-                    let end = cursor.checked_add(4).ok_or_else(|| {
-                        value_error("unpack", "Type value overflows internal cursor")
-                    })?;
-                    if end > data.len() {
-                        return Err(BuiltinError::new(
-                            "E_PHP_RUNTIME_BUILTIN_VALUE",
-                            "Type value overflows input data string",
-                        ));
-                    }
-                    let value = unpack_u32_value(spec.code, &data.as_bytes()[cursor..end]);
-                    cursor = end;
-                    let key = unpack_result_key(&spec, index, &mut next_numeric_key);
-                    output.insert(key, Value::Int(value));
-                }
-            }
-            b'@' => {
-                cursor = base
-                    .checked_add(spec.count.unwrap_or(0))
-                    .ok_or_else(|| value_error("unpack", "cursor is out of range"))?;
-                if cursor > data.len() {
-                    return Err(value_error("unpack", "cursor is out of range"));
-                }
-            }
-            b'X' => {
-                let count = spec.count.unwrap_or(1);
-                cursor = cursor
-                    .checked_sub(count)
-                    .ok_or_else(|| value_error("unpack", "cursor is out of range"))?;
-            }
-            code => return Err(invalid_pack_format("unpack", code)),
-        }
-    }
-
-    Ok(Value::Array(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_md5(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin md5 expects one or two argument(s)",
-        ));
-    }
-    let input = string_arg("md5", &args[0])?;
-    let raw = args
-        .get(1)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("md5", message))?
-        .unwrap_or(false);
-    let digest = Md5::digest(input.as_bytes());
-    Ok(if raw {
-        Value::string(digest.to_vec())
-    } else {
-        Value::string(hex_encode(&digest))
-    })
-}
-
-pub(in crate::builtins::modules) fn builtin_sha1(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin sha1 expects one or two argument(s)",
-        ));
-    }
-    let input = string_arg("sha1", &args[0])?;
-    let raw = args
-        .get(1)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("sha1", message))?
-        .unwrap_or(false);
-    let digest = Sha1::digest(input.as_bytes());
-    Ok(if raw {
-        Value::string(digest.to_vec())
-    } else {
-        Value::string(hex_encode(&digest))
-    })
-}
-
-pub(in crate::builtins::modules) fn builtin_crc32(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("crc32", &args, 1)?;
-    let input = string_arg("crc32", &args[0])?;
-    Ok(Value::Int(i64::from(crc32fast::hash(input.as_bytes()))))
-}
-
-pub(in crate::builtins::modules) fn builtin_hash(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("hash", "two or three argument(s)"));
-    }
-    let algorithm = string_arg("hash", &args[0])?.to_string_lossy();
-    let input = string_arg("hash", &args[1])?;
-    let binary = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("hash", message))?
-        .unwrap_or(false);
-    let digest = hash_digest_bytes("hash", &algorithm, input.as_bytes())?;
-    Ok(if binary {
-        Value::string(digest)
-    } else {
-        Value::string(hex_encode(&digest))
-    })
-}
-
-pub(in crate::builtins::modules) fn builtin_hash_hmac(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(3..=4).contains(&args.len()) {
-        return Err(arity_error("hash_hmac", "three or four argument(s)"));
-    }
-    let algorithm = string_arg("hash_hmac", &args[0])?.to_string_lossy();
-    let input = string_arg("hash_hmac", &args[1])?;
-    let key = string_arg("hash_hmac", &args[2])?;
-    let binary = args
-        .get(3)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("hash_hmac", message))?
-        .unwrap_or(false);
-    let digest = hmac_digest_bytes("hash_hmac", &algorithm, key.as_bytes(), input.as_bytes())?;
-    Ok(if binary {
-        Value::string(digest)
-    } else {
-        Value::string(hex_encode(&digest))
-    })
-}
-
-pub(in crate::builtins::modules) fn builtin_random_bytes(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("random_bytes", &args, 1)?;
-    let length = int_arg("random_bytes", &args[0])?;
-    if length < 1 {
-        return Err(value_error("random_bytes", "length must be greater than 0"));
-    }
-    let mut bytes = vec![0; length as usize];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        BuiltinError::new(
-            "E_PHP_RUNTIME_RANDOM_FAILURE",
-            format!("random_bytes(): failed to read random bytes: {error}"),
-        )
-    })?;
-    Ok(Value::string(bytes))
-}
-
-pub(in crate::builtins::modules) fn builtin_random_int(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("random_int", &args, 2)?;
-    let min = int_arg("random_int", &args[0])?;
-    let max = int_arg("random_int", &args[1])?;
-    if max < min {
-        return Err(value_error(
-            "random_int",
-            "max must be greater than or equal to min",
-        ));
-    }
-    let range = (i128::from(max) - i128::from(min) + 1) as u128;
-    let zone = u128::MAX - (u128::MAX % range);
-    loop {
-        let mut bytes = [0; 16];
-        getrandom::fill(&mut bytes).map_err(|error| {
-            BuiltinError::new(
-                "E_PHP_RUNTIME_RANDOM_FAILURE",
-                format!("random_int(): failed to read random bytes: {error}"),
-            )
-        })?;
-        let sample = u128::from_le_bytes(bytes);
-        if sample < zone {
-            let offset = (sample % range) as i128;
-            return Ok(Value::Int((i128::from(min) + offset) as i64));
-        }
-    }
-}
-
-pub(in crate::builtins::modules) fn builtin_base64_encode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("base64_encode", &args, 1)?;
-    Ok(Value::string(
-        BASE64_STANDARD
-            .encode(string_arg("base64_encode", &args[0])?.as_bytes())
-            .into_bytes(),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_base64_decode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin base64_decode expects one or two argument(s)",
-        ));
-    }
-    let input = string_arg("base64_decode", &args[0])?;
-    let strict = args
-        .get(1)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("base64_decode", message))?
-        .unwrap_or(false);
-    let source = if strict {
-        input.as_bytes().to_vec()
-    } else {
-        input
-            .as_bytes()
-            .iter()
-            .copied()
-            .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-            .collect()
-    };
-    match BASE64_STANDARD.decode(source) {
-        Ok(bytes) => Ok(Value::string(bytes)),
-        Err(_) => Ok(Value::Bool(false)),
-    }
-}
-
-pub(in crate::builtins::modules) fn builtin_htmlspecialchars(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=4).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin htmlspecialchars expects one to four argument(s)",
-        ));
-    }
-    Ok(Value::string(html_escape(
-        string_arg("htmlspecialchars", &args[0])?.as_bytes(),
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_htmlentities(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    builtin_htmlspecialchars(context, args, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_htmlspecialchars_decode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin htmlspecialchars_decode expects one or two argument(s)",
-        ));
-    }
-    Ok(Value::string(html_decode(
-        &string_arg("htmlspecialchars_decode", &args[0])?.to_string_lossy(),
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_urlencode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("urlencode", &args, 1)?;
-    Ok(Value::string(url_encode(
-        string_arg("urlencode", &args[0])?.as_bytes(),
-        false,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_rawurlencode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("rawurlencode", &args, 1)?;
-    Ok(Value::string(url_encode(
-        string_arg("rawurlencode", &args[0])?.as_bytes(),
-        true,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_urldecode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("urldecode", &args, 1)?;
-    Ok(Value::string(url_decode(
-        string_arg("urldecode", &args[0])?.as_bytes(),
-        false,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_rawurldecode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("rawurldecode", &args, 1)?;
-    Ok(Value::string(url_decode(
-        string_arg("rawurldecode", &args[0])?.as_bytes(),
-        true,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_parse_url(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=2).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin parse_url expects one or two argument(s)",
-        ));
-    }
-    let url = string_arg("parse_url", &args[0])?;
-    let Some(parsed) = parse_php_url(url.as_bytes()) else {
-        return Ok(Value::Bool(false));
-    };
-
-    if let Some(component) = args.get(1) {
-        return parse_url_component(&parsed, int_arg("parse_url", component)?);
-    }
-
-    let mut array = PhpArray::new();
-    insert_url_component(&mut array, "scheme", parsed.scheme);
-    insert_url_component(&mut array, "host", parsed.host);
-    if let Some(port) = parsed.port {
-        array.insert(string_array_key("port"), Value::Int(port));
-    }
-    insert_url_component(&mut array, "user", parsed.user);
-    insert_url_component(&mut array, "pass", parsed.pass);
-    insert_url_component(&mut array, "path", parsed.path);
-    insert_url_component(&mut array, "query", parsed.query);
-    insert_url_component(&mut array, "fragment", parsed.fragment);
-    Ok(Value::Array(array))
-}
-
-pub(in crate::builtins::modules) fn builtin_http_build_query(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=4).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin http_build_query expects one to four argument(s)",
-        ));
-    }
-    let Value::Array(array) = deref_value(&args[0]) else {
-        return Err(type_error("http_build_query", "array", &args[0]));
-    };
-    let mut pairs = Vec::new();
-    build_query_pairs(None, &Value::Array(array), &mut pairs)?;
-    Ok(Value::string(pairs.join("&").into_bytes()))
-}
-
-pub(in crate::builtins::modules) fn builtin_substr(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin substr expects two or three argument(s)",
-        ));
-    }
-    let string = string_arg("substr", &args[0])?;
-    let offset = int_arg("substr", &args[1])?;
-    let length = match args.get(2).map(deref_value) {
-        Some(Value::Null) | None => None,
-        Some(value) => Some(int_arg("substr", &value)?),
-    };
-    let bytes = string.as_bytes();
-    let start = normalize_offset(bytes.len(), offset);
-    let end = match length {
-        None => bytes.len(),
-        Some(length) if length >= 0 => start.saturating_add(length as usize).min(bytes.len()),
-        Some(length) => bytes.len().saturating_sub(length.unsigned_abs() as usize),
-    };
-    if start >= bytes.len() || end < start {
-        return Ok(Value::string(Vec::new()));
-    }
-    Ok(Value::string(bytes[start..end].to_vec()))
-}
-
-pub(in crate::builtins::modules) fn builtin_strpos(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_position(context, "strpos", args, false, false, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_stripos(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_position(context, "stripos", args, true, false, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_strrpos(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_position(context, "strrpos", args, false, true, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_strripos(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_position(context, "strripos", args, true, true, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_strrchr(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("strrchr", "two or three argument(s)"));
-    }
-    let haystack = string_arg("strrchr", &args[0])?;
-    let needle = string_arg("strrchr", &args[1])?;
-    let before_needle = args
-        .get(2)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("strrchr", message))?
-        .unwrap_or(false);
-    let needle = needle.as_bytes().first().copied().unwrap_or(0);
-    Ok(haystack
-        .as_bytes()
-        .iter()
-        .rposition(|byte| *byte == needle)
-        .map_or(Value::Bool(false), |index| {
-            if before_needle {
-                Value::string(haystack.as_bytes()[..index].to_vec())
-            } else {
-                Value::string(haystack.as_bytes()[index..].to_vec())
-            }
-        }))
-}
-
-pub(in crate::builtins::modules) fn builtin_strstr(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_search_slice(context, "strstr", args, false, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_stristr(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_search_slice(context, "stristr", args, true, span)
-}
-
-pub(in crate::builtins::modules) fn builtin_strpbrk(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strpbrk", &args, 2)?;
-    let haystack = string_arg("strpbrk", &args[0])?;
-    let chars = string_arg("strpbrk", &args[1])?;
-    if chars.is_empty() {
-        return Err(argument_value_error(
-            "strpbrk",
-            "#2 ($characters)",
-            "must be a non-empty string",
-        ));
-    }
-    Ok(haystack
-        .as_bytes()
-        .iter()
-        .position(|byte| chars.as_bytes().contains(byte))
-        .map_or(Value::Bool(false), |index| {
-            Value::string(haystack.as_bytes()[index..].to_vec())
-        }))
-}
-
-pub(in crate::builtins::modules) fn builtin_strspn(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_span("strspn", args, true)
-}
-
-pub(in crate::builtins::modules) fn builtin_strcspn(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    string_span("strcspn", args, false)
-}
-
-pub(in crate::builtins::modules) fn builtin_substr_count(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=4).contains(&args.len()) {
-        return Err(arity_error("substr_count", "two to four argument(s)"));
-    }
-    let haystack = string_arg("substr_count", &args[0])?;
-    let needle = string_arg("substr_count", &args[1])?;
-    if needle.is_empty() {
-        return Err(substr_count_argument_error(
-            "#2 ($needle) must not be empty",
-        ));
-    }
-    let offset = args
-        .get(2)
-        .map(|value| int_arg("substr_count", value))
-        .transpose()?
-        .unwrap_or(0);
-    let start = checked_search_offset("substr_count", haystack.len(), offset).map_err(|_| {
-        substr_count_argument_error("#3 ($offset) must be contained in argument #1 ($haystack)")
-    })?;
-    let length = match args.get(3) {
-        Some(Value::Null) | None => None,
-        Some(value) => Some(int_arg("substr_count", value)?),
-    };
-    let count_len = substr_count_length(haystack.len(), start, length)?;
-    let end = start + count_len;
-    let bytes = &haystack.as_bytes()[start..end];
-    let mut count = 0i64;
-    let mut search = 0usize;
-    while let Some(index) = find_bytes_from(bytes, needle.as_bytes(), search, false) {
-        count += 1;
-        search = index + needle.len();
-    }
-    Ok(Value::Int(count))
-}
-
-fn substr_count_argument_error(message: &str) -> BuiltinError {
-    BuiltinError::new(
-        "E_PHP_RUNTIME_BUILTIN_VALUE",
-        format!("substr_count(): Argument {message}"),
-    )
-}
-
-fn substr_count_length(
-    total: usize,
-    start: usize,
-    length: Option<i64>,
-) -> Result<usize, BuiltinError> {
-    let remaining = total.saturating_sub(start);
-    match length {
-        None => Ok(remaining),
-        Some(length) if length >= 0 && length as usize <= remaining => Ok(length as usize),
-        Some(length) if length < 0 && length.unsigned_abs() as usize <= remaining => {
-            Ok(remaining - length.unsigned_abs() as usize)
-        }
-        Some(_) => Err(substr_count_argument_error(
-            "#4 ($length) must be contained in argument #1 ($haystack)",
-        )),
-    }
-}
-
-pub(in crate::builtins::modules) fn builtin_substr_compare(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(3..=5).contains(&args.len()) {
-        return Err(arity_error("substr_compare", "three to five argument(s)"));
-    }
-    let main = string_arg("substr_compare", &args[0])?;
-    let other = string_arg("substr_compare", &args[1])?;
-    let offset = int_arg("substr_compare", &args[2])?;
-    let start = substr_compare_offset(main.len(), offset)?;
-    let length = match args.get(3) {
-        Some(Value::Null) | None => None,
-        Some(value) => {
-            let length = int_arg("substr_compare", value)?;
-            if length < 0 {
-                return Err(argument_value_error(
-                    "substr_compare",
-                    "#4 ($length)",
-                    "must be greater than or equal to 0",
-                ));
-            }
-            Some(length)
-        }
-    };
-    let case_insensitive = args
-        .get(4)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("substr_compare", message))?
-        .unwrap_or(false);
-    let compare_len = byte_substring_length("substr_compare", main.len(), start, length)?;
-    let mut left = main.as_bytes()[start..start + compare_len].to_vec();
-    let mut right = other.as_bytes().to_vec();
-    if let Some(length) = length
-        && length >= 0
-    {
-        right.truncate(length as usize);
-    }
-    if case_insensitive {
-        left.iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
-        right
-            .iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
-    }
-    Ok(Value::Int(match left.cmp(&right) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }))
-}
-
-fn substr_compare_offset(len: usize, offset: i64) -> Result<usize, BuiltinError> {
-    if offset > len as i64 {
-        return Err(value_error("substr_compare", "offset is out of range"));
-    }
-    Ok(normalize_offset(len, offset))
-}
-
-pub(in crate::builtins::modules) fn builtin_str_contains(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("str_contains", &args, 2)?;
-    let haystack = string_arg("str_contains", &args[0])?;
-    let needle = string_arg("str_contains", &args[1])?;
-    Ok(Value::Bool(
-        find_bytes(haystack.as_bytes(), needle.as_bytes()).is_some(),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_str_starts_with(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("str_starts_with", &args, 2)?;
-    let haystack = string_arg("str_starts_with", &args[0])?;
-    let needle = string_arg("str_starts_with", &args[1])?;
-    Ok(Value::Bool(
-        haystack.as_bytes().starts_with(needle.as_bytes()),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_str_ends_with(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("str_ends_with", &args, 2)?;
-    let haystack = string_arg("str_ends_with", &args[0])?;
-    let needle = string_arg("str_ends_with", &args[1])?;
-    Ok(Value::Bool(
-        haystack.as_bytes().ends_with(needle.as_bytes()),
-    ))
-}
-
-pub(in crate::builtins::modules) fn builtin_strcmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strcmp", &args, 2)?;
-    compare_strings("strcmp", &args, false, None)
-}
-
-pub(in crate::builtins::modules) fn builtin_strncmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strncmp", &args, 3)?;
-    let length = int_arg("strncmp", &args[2])?;
-    if length < 0 {
-        return Err(argument_value_error(
-            "strncmp",
-            "#3 ($length)",
-            "must be greater than or equal to 0",
-        ));
-    }
-    compare_strings("strncmp", &args, false, Some(length as usize))
-}
-
-pub(in crate::builtins::modules) fn builtin_strcasecmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strcasecmp", &args, 2)?;
-    compare_strings("strcasecmp", &args, true, None)
-}
-
-pub(in crate::builtins::modules) fn builtin_strncasecmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strncasecmp", &args, 3)?;
-    let length = int_arg("strncasecmp", &args[2])?;
-    if length < 0 {
-        return Err(argument_value_error(
-            "strncasecmp",
-            "#3 ($length)",
-            "must be greater than or equal to 0",
-        ));
-    }
-    compare_strings("strncasecmp", &args, true, Some(length as usize))
-}
-
-pub(in crate::builtins::modules) fn builtin_version_compare(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(2..=3).contains(&args.len()) {
-        return Err(arity_error("version_compare", "2 or 3 argument(s)"));
-    }
-
-    let left = string_arg("version_compare", &args[0])?.to_string_lossy();
-    let right = string_arg("version_compare", &args[1])?.to_string_lossy();
-    let comparison = compare_versions(&left, &right);
-    if let Some(operator) = args.get(2) {
-        let operator = string_arg("version_compare", operator)?.to_string_lossy();
-        return Ok(Value::Bool(version_operator_matches(
-            &operator, comparison,
-        )?));
-    }
-    Ok(Value::Int(comparison))
-}
-
-pub(in crate::builtins::modules) fn builtin_addslashes(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("addslashes", &args, 1)?;
-    let input = string_arg("addslashes", &args[0])?;
-    let mut output = Vec::with_capacity(input.len());
-    for byte in input.as_bytes() {
-        match *byte {
-            b'\0' => output.extend_from_slice(b"\\0"),
-            b'\'' | b'"' | b'\\' => {
-                output.push(b'\\');
-                output.push(*byte);
-            }
-            byte => output.push(byte),
-        }
-    }
-    Ok(Value::string(output))
-}
-
-pub(in crate::builtins::modules) fn builtin_stripslashes(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("stripslashes", &args, 1)?;
-    let input = string_arg("stripslashes", &args[0])?;
-    Ok(Value::string(stripslashes_bytes(input.as_bytes())))
-}
-
-pub(in crate::builtins::modules) fn builtin_stripcslashes(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("stripcslashes", &args, 1)?;
-    let input = string_arg("stripcslashes", &args[0])?;
-    Ok(Value::string(stripcslashes_bytes(input.as_bytes())))
-}
-
-pub(in crate::builtins::modules) fn builtin_strnatcmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strnatcmp", &args, 2)?;
-    natural_compare_builtin("strnatcmp", &args, false)
-}
-
-pub(in crate::builtins::modules) fn builtin_strnatcasecmp(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strnatcasecmp", &args, 2)?;
-    natural_compare_builtin("strnatcasecmp", &args, true)
-}
-
-pub(in crate::builtins::modules) fn builtin_wordwrap(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(1..=4).contains(&args.len()) {
-        return Err(arity_error("wordwrap", "one to four argument(s)"));
-    }
-    let input = string_arg("wordwrap", &args[0])?;
-    let width = args
-        .get(1)
-        .map(|value| int_arg("wordwrap", value))
-        .transpose()?
-        .unwrap_or(75);
-    let break_string = args
-        .get(2)
-        .map(|value| string_arg("wordwrap", value))
-        .transpose()?
-        .unwrap_or_else(|| PhpString::from("\n"));
-    let cut = args
-        .get(3)
-        .map(to_bool)
-        .transpose()
-        .map_err(|message| conversion_error("wordwrap", message))?
-        .unwrap_or(false);
-    if break_string.is_empty() {
-        return Err(argument_value_error(
-            "wordwrap",
-            "#3 ($break)",
-            "must not be empty",
-        ));
-    }
-    if width == 0 && cut {
-        return Err(argument_value_error(
-            "wordwrap",
-            "#4 ($cut_long_words)",
-            "cannot be true when argument #2 ($width) is 0",
-        ));
-    }
-    if width < 0 && cut {
-        return Ok(Value::string(wordwrap_negative_cut_bytes(
-            input.as_bytes(),
-            break_string.as_bytes(),
-        )));
-    }
-    if width == 0 {
-        return Ok(Value::string(wordwrap_zero_width_bytes(
-            input.as_bytes(),
-            break_string.as_bytes(),
-        )));
-    }
-    let width = if width <= 0 { 1 } else { width as usize };
-    wordwrap_check_memory_limit(
-        context,
-        input.as_bytes(),
-        width,
-        break_string.as_bytes(),
-        &span,
-    )?;
-    Ok(Value::string(wordwrap_bytes(
-        input.as_bytes(),
-        width,
-        break_string.as_bytes(),
-        cut,
-    )))
-}
-
-pub(in crate::builtins::modules) fn builtin_substr_replace(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if !(3..=4).contains(&args.len()) {
-        return Err(arity_error("substr_replace", "three or four argument(s)"));
-    }
-    match deref_value(&args[0]) {
-        Value::Array(array) => {
-            let mut result = PhpArray::new();
-            for (index, (key, value)) in array.iter().enumerate() {
-                let replacement = substr_replace_indexed_string_arg(&args[1], index)?;
-                let offset = substr_replace_indexed_int_arg(&args[2], index)?.unwrap_or(0);
-                let length = args
-                    .get(3)
-                    .map(|value| substr_replace_indexed_int_arg(value, index))
-                    .transpose()?
-                    .flatten();
-                let replaced =
-                    substr_replace_one("substr_replace", value, &replacement, offset, length)?;
-                result.insert(key.clone(), replaced);
-            }
-            Ok(Value::Array(result))
-        }
-        subject => {
-            if matches!(deref_value(&args[2]), Value::Array(_)) {
-                return Err(BuiltinError::new(
-                    "E_PHP_RUNTIME_BUILTIN_TYPE",
-                    "substr_replace(): Argument #3 ($offset) cannot be an array when working on a single string",
-                ));
-            }
-            if args
-                .get(3)
-                .is_some_and(|value| matches!(deref_value(value), Value::Array(_)))
-            {
-                return Err(BuiltinError::new(
-                    "E_PHP_RUNTIME_BUILTIN_TYPE",
-                    "substr_replace(): Argument #4 ($length) cannot be an array when working on a single string",
-                ));
-            }
-            let replacement = substr_replace_indexed_string_arg(&args[1], 0)?;
-            let offset = int_arg("substr_replace", &args[2])?;
-            let length = args
-                .get(3)
-                .map(|value| int_arg("substr_replace", value))
-                .transpose()?;
-            substr_replace_one("substr_replace", &subject, &replacement, offset, length)
-        }
-    }
-}
-
-pub(in crate::builtins::modules) fn builtin_convert_uuencode(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("convert_uuencode", &args, 1)?;
-    let input = string_arg("convert_uuencode", &args[0])?;
-    Ok(Value::string(uuencode_bytes(input.as_bytes())))
-}
-
-pub(in crate::builtins::modules) fn builtin_convert_uudecode(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("convert_uudecode", &args, 1)?;
-    let input = string_arg("convert_uudecode", &args[0])?;
-    Ok(uudecode_bytes(input.as_bytes()).map_or_else(
-        || {
-            context.php_warning(
-                "E_PHP_RUNTIME_INVALID_UUENCODED_STRING",
-                "convert_uudecode(): Argument #1 ($data) is not a valid uuencoded string",
-                span,
-            );
-            Value::Bool(false)
-        },
-        Value::string,
-    ))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VersionPart {
-    Number(i64),
-    Label(i8),
-}
-
-fn compare_versions(left: &str, right: &str) -> i64 {
-    let left = version_parts(left);
-    let right = version_parts(right);
-    let len = left.len().max(right.len());
-    for index in 0..len {
-        let ordering = compare_version_part(left.get(index), right.get(index));
-        if ordering != 0 {
-            return ordering;
-        }
-    }
-    0
-}
-
-fn version_parts(version: &str) -> Vec<VersionPart> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digit: Option<bool> = None;
-
-    for ch in version.chars() {
-        if ch.is_ascii_alphanumeric() {
-            let is_digit = ch.is_ascii_digit();
-            if current_is_digit.is_some_and(|was_digit| was_digit != is_digit) {
-                push_version_part(&mut parts, &current);
-                current.clear();
-            }
-            current.push(ch);
-            current_is_digit = Some(is_digit);
-        } else if matches!(ch, '.' | '-' | '_' | '+') {
-            if !current.is_empty() {
-                push_version_part(&mut parts, &current);
-                current.clear();
-            }
-            current_is_digit = None;
-        } else if !current.is_empty() {
-            push_version_part(&mut parts, &current);
-            current.clear();
-            current_is_digit = None;
-        }
-    }
-
-    if !current.is_empty() {
-        push_version_part(&mut parts, &current);
-    }
-
-    while matches!(parts.last(), Some(VersionPart::Number(0))) {
-        parts.pop();
-    }
-    parts
-}
-
-fn push_version_part(parts: &mut Vec<VersionPart>, part: &str) {
-    if part.as_bytes().iter().all(u8::is_ascii_digit) {
-        parts.push(VersionPart::Number(part.parse::<i64>().unwrap_or(i64::MAX)));
-    } else {
-        parts.push(VersionPart::Label(version_label_rank(part)));
-    }
-}
-
-fn version_label_rank(label: &str) -> i8 {
-    match label.to_ascii_lowercase().as_str() {
-        "dev" => -6,
-        "alpha" | "a" => -5,
-        "beta" | "b" => -4,
-        "rc" => -3,
-        "pl" | "p" => 1,
-        _ => -2,
-    }
-}
-
-fn compare_version_part(left: Option<&VersionPart>, right: Option<&VersionPart>) -> i64 {
-    match (left, right) {
-        (None, None) => 0,
-        (Some(part), None) => compare_part_to_release(*part),
-        (None, Some(part)) => -compare_part_to_release(*part),
-        (Some(VersionPart::Number(left)), Some(VersionPart::Number(right))) => {
-            ordering_to_i64(left.cmp(right))
-        }
-        (Some(left), Some(right)) => {
-            ordering_to_i64(version_part_rank(*left).cmp(&version_part_rank(*right)))
-        }
-    }
-}
-
-fn ordering_to_i64(ordering: std::cmp::Ordering) -> i64 {
-    match ordering {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }
-}
-
-fn compare_part_to_release(part: VersionPart) -> i64 {
-    match part {
-        VersionPart::Number(0) => 0,
-        VersionPart::Number(_) => 1,
-        VersionPart::Label(rank) => ordering_to_i64(rank.cmp(&0)),
-    }
-}
-
-fn version_part_rank(part: VersionPart) -> i16 {
-    match part {
-        VersionPart::Number(0) => 0,
-        VersionPart::Number(value) => 10 + value.min(1_000) as i16,
-        VersionPart::Label(rank) => i16::from(rank),
-    }
-}
-
-fn version_operator_matches(operator: &str, comparison: i64) -> Result<bool, BuiltinError> {
-    match operator.to_ascii_lowercase().as_str() {
-        "<" | "lt" => Ok(comparison < 0),
-        "<=" | "le" => Ok(comparison <= 0),
-        ">" | "gt" => Ok(comparison > 0),
-        ">=" | "ge" => Ok(comparison >= 0),
-        "==" | "=" | "eq" => Ok(comparison == 0),
-        "!=" | "<>" | "ne" => Ok(comparison != 0),
-        _ => Err(BuiltinError::new(
-            "E_PHP_RUNTIME_BUILTIN_VALUE",
-            format!("builtin version_compare received unsupported operator {operator}"),
-        )),
-    }
-}
-
 pub(in crate::builtins::modules) fn builtin_print(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -3256,70 +729,6 @@ pub(in crate::builtins::modules) fn builtin_print(
     })?;
     context.output().write_php_string(&string);
     Ok(Value::Int(1))
-}
-
-pub(in crate::builtins::modules) fn builtin_printf(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("printf", "one or more argument(s)"));
-    }
-    let format = string_arg("printf", &args[0])?;
-    let rendered = php_format("printf", format.as_bytes(), &args[1..], context, span)?;
-    let length = rendered.len() as i64;
-    context.output().write_bytes(rendered);
-    Ok(Value::Int(length))
-}
-
-pub(in crate::builtins::modules) fn builtin_sprintf(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    if args.is_empty() {
-        return Err(arity_error("sprintf", "one or more argument(s)"));
-    }
-    let format = string_arg("sprintf", &args[0])?;
-    Ok(Value::string(php_format(
-        "sprintf",
-        format.as_bytes(),
-        &args[1..],
-        context,
-        span,
-    )?))
-}
-
-pub(in crate::builtins::modules) fn builtin_vprintf(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("vprintf", &args, 2)?;
-    let format = string_needle_arg("vprintf", "#1 ($format)", &args[0])?;
-    let values = format_array_values("vprintf", "#2 ($values)", &args[1])?;
-    let rendered = php_format("vprintf", format.as_bytes(), &values, context, span)?;
-    let length = rendered.len() as i64;
-    context.output().write_bytes(rendered);
-    Ok(Value::Int(length))
-}
-
-pub(in crate::builtins::modules) fn builtin_vsprintf(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("vsprintf", &args, 2)?;
-    let format = string_needle_arg("vsprintf", "#1 ($format)", &args[0])?;
-    let values = format_array_values("vsprintf", "#2 ($values)", &args[1])?;
-    Ok(Value::string(php_format(
-        "vsprintf",
-        format.as_bytes(),
-        &values,
-        context,
-        span,
-    )?))
 }
 
 pub(in crate::builtins::modules) fn builtin_fprintf(
@@ -5302,18 +2711,6 @@ pub(in crate::builtins::modules) fn builtin_floatval(
         .map_err(|message| conversion_error("floatval", message))
 }
 
-pub(in crate::builtins::modules) fn builtin_strval(
-    context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("strval", &args, 1)?;
-    let value = args.into_iter().next().expect("checked arity");
-    string_cast_value(context, &value, span)
-        .map(Value::String)
-        .map_err(|message| conversion_error("strval", message))
-}
-
 pub(in crate::builtins::modules) fn builtin_var_dump(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -5452,7 +2849,7 @@ pub(in crate::builtins::modules) fn builtin_var_export(
     }
 }
 
-fn serialization_error(name: &str, message: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn serialization_error(name: &str, message: &str) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_SERIALIZATION_ERROR",
         format!("builtin {name} failed: {message}"),
@@ -5460,13 +2857,13 @@ fn serialization_error(name: &str, message: &str) -> BuiltinError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct PackFormatSpec {
-    code: u8,
-    count: Option<usize>,
-    label: Option<Vec<u8>>,
+pub(in crate::builtins::modules) struct PackFormatSpec {
+    pub(in crate::builtins::modules) code: u8,
+    pub(in crate::builtins::modules) count: Option<usize>,
+    pub(in crate::builtins::modules) label: Option<Vec<u8>>,
 }
 
-fn parse_pack_format(
+pub(in crate::builtins::modules) fn parse_pack_format(
     format: &[u8],
     allow_labels: bool,
 ) -> Result<Vec<PackFormatSpec>, BuiltinError> {
@@ -5509,21 +2906,21 @@ fn parse_pack_format(
     Ok(specs)
 }
 
-fn invalid_pack_format(_name: &str, code: u8) -> BuiltinError {
+pub(in crate::builtins::modules) fn invalid_pack_format(_name: &str, code: u8) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
         format!("Invalid format type {}", code as char),
     )
 }
 
-fn unpack_offset_error() -> BuiltinError {
+pub(in crate::builtins::modules) fn unpack_offset_error() -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
         "unpack(): Argument #3 ($offset) must be contained in argument #2 ($data)",
     )
 }
 
-fn pack_u32_bytes(code: u8, value: i64) -> [u8; 4] {
+pub(in crate::builtins::modules) fn pack_u32_bytes(code: u8, value: i64) -> [u8; 4] {
     match code {
         b'l' => (value as i32).to_le_bytes(),
         b'I' | b'V' => (value as u32).to_le_bytes(),
@@ -5531,7 +2928,7 @@ fn pack_u32_bytes(code: u8, value: i64) -> [u8; 4] {
     }
 }
 
-fn unpack_u32_value(code: u8, bytes: &[u8]) -> i64 {
+pub(in crate::builtins::modules) fn unpack_u32_value(code: u8, bytes: &[u8]) -> i64 {
     let bytes: [u8; 4] = bytes.try_into().expect("checked unpack width");
     match code {
         b'l' => i64::from(i32::from_le_bytes(bytes)),
@@ -5540,7 +2937,11 @@ fn unpack_u32_value(code: u8, bytes: &[u8]) -> i64 {
     }
 }
 
-fn unpack_result_key(spec: &PackFormatSpec, index: usize, next_numeric_key: &mut i64) -> ArrayKey {
+pub(in crate::builtins::modules) fn unpack_result_key(
+    spec: &PackFormatSpec,
+    index: usize,
+    next_numeric_key: &mut i64,
+) -> ArrayKey {
     match &spec.label {
         Some(label) if !label.is_empty() && spec.count.unwrap_or(1) == 1 => {
             ArrayKey::String(PhpString::from_bytes(label.clone()))
@@ -5558,7 +2959,11 @@ fn unpack_result_key(spec: &PackFormatSpec, index: usize, next_numeric_key: &mut
     }
 }
 
-fn type_error(name: &str, expected: &str, actual: &Value) -> BuiltinError {
+pub(in crate::builtins::modules) fn type_error(
+    name: &str,
+    expected: &str,
+    actual: &Value,
+) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_TYPE",
         format!(
@@ -5568,21 +2973,30 @@ fn type_error(name: &str, expected: &str, actual: &Value) -> BuiltinError {
     )
 }
 
-fn value_error(name: &str, message: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn value_error(name: &str, message: &str) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
         format!("builtin {name}: {message}"),
     )
 }
 
-fn argument_value_error(name: &str, argument: &str, message: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn argument_value_error(
+    name: &str,
+    argument: &str,
+    message: &str,
+) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
         format!("{name}(): Argument {argument} {message}"),
     )
 }
 
-fn argument_type_error(name: &str, argument: &str, expected: &str, actual: &Value) -> BuiltinError {
+pub(in crate::builtins::modules) fn argument_type_error(
+    name: &str,
+    argument: &str,
+    expected: &str,
+    actual: &Value,
+) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_TYPE",
         format!(
@@ -5592,14 +3006,17 @@ fn argument_type_error(name: &str, argument: &str, expected: &str, actual: &Valu
     )
 }
 
-fn conversion_error(name: &str, message: String) -> BuiltinError {
+pub(in crate::builtins::modules) fn conversion_error(name: &str, message: String) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_TYPE",
         format!("builtin {name} could not convert value: {message}"),
     )
 }
 
-fn string_arg(name: &str, value: &Value) -> Result<crate::PhpString, BuiltinError> {
+pub(in crate::builtins::modules) fn string_arg(
+    name: &str,
+    value: &Value,
+) -> Result<crate::PhpString, BuiltinError> {
     to_string(value).map_err(|message| {
         BuiltinError::new(
             "E_PHP_RUNTIME_BUILTIN_TYPE",
@@ -5608,7 +3025,7 @@ fn string_arg(name: &str, value: &Value) -> Result<crate::PhpString, BuiltinErro
     })
 }
 
-fn string_needle_arg(
+pub(in crate::builtins::modules) fn string_needle_arg(
     name: &str,
     argument: &str,
     value: &Value,
@@ -5622,7 +3039,7 @@ fn string_needle_arg(
     }
 }
 
-fn strtr_string_arg(
+pub(in crate::builtins::modules) fn strtr_string_arg(
     context: &mut BuiltinContext<'_>,
     value: &Value,
     argument: &str,
@@ -5648,7 +3065,7 @@ fn strtr_string_arg(
     }
 }
 
-fn nullable_string_arg(
+pub(in crate::builtins::modules) fn nullable_string_arg(
     context: &mut BuiltinContext<'_>,
     name: &str,
     value: &Value,
@@ -5678,7 +3095,11 @@ fn nullable_string_arg(
     }
 }
 
-fn strtr_argument_type_error(argument: &str, expected: &str, actual: &Value) -> BuiltinError {
+pub(in crate::builtins::modules) fn strtr_argument_type_error(
+    argument: &str,
+    expected: &str,
+    actual: &Value,
+) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_TYPE",
         format!(
@@ -5688,7 +3109,7 @@ fn strtr_argument_type_error(argument: &str, expected: &str, actual: &Value) -> 
     )
 }
 
-fn php_argument_type_name(value: &Value) -> String {
+pub(in crate::builtins::modules) fn php_argument_type_name(value: &Value) -> String {
     match deref_value(value) {
         Value::Null | Value::Uninitialized => "null".to_owned(),
         Value::Bool(true) => "true".to_owned(),
@@ -5705,7 +3126,7 @@ fn php_argument_type_name(value: &Value) -> String {
     }
 }
 
-fn string_cast_value(
+pub(in crate::builtins::modules) fn string_cast_value(
     context: &mut BuiltinContext<'_>,
     value: &Value,
     span: RuntimeSourceSpan,
@@ -5724,7 +3145,10 @@ fn string_cast_value(
     }
 }
 
-fn int_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
+pub(in crate::builtins::modules) fn int_arg(
+    name: &str,
+    value: &Value,
+) -> Result<i64, BuiltinError> {
     to_int(value).map_err(|message| {
         BuiltinError::new(
             "E_PHP_RUNTIME_BUILTIN_TYPE",
@@ -5733,7 +3157,7 @@ fn int_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
     })
 }
 
-fn printf_int_arg(
+pub(in crate::builtins::modules) fn printf_int_arg(
     name: &str,
     value: &Value,
     context: &mut BuiltinContext<'_>,
@@ -5759,7 +3183,7 @@ fn printf_int_arg(
     }
 }
 
-fn wrapping_float_to_i64(value: f64) -> i64 {
+pub(in crate::builtins::modules) fn wrapping_float_to_i64(value: f64) -> i64 {
     let modulus = 18_446_744_073_709_551_616.0_f64;
     let remainder = value.abs().rem_euclid(modulus);
     let unsigned = remainder as u64;
@@ -5771,7 +3195,7 @@ fn wrapping_float_to_i64(value: f64) -> i64 {
     }
 }
 
-fn php_float_warning_literal(value: f64) -> String {
+pub(in crate::builtins::modules) fn php_float_warning_literal(value: f64) -> String {
     let formatted = format!("{value:.1E}");
     let Some((mantissa, exponent)) = formatted.split_once('E') else {
         return formatted;
@@ -5780,7 +3204,10 @@ fn php_float_warning_literal(value: f64) -> String {
     format!("{mantissa}E{exponent:+}")
 }
 
-fn float_arg(name: &str, value: &Value) -> Result<f64, BuiltinError> {
+pub(in crate::builtins::modules) fn float_arg(
+    name: &str,
+    value: &Value,
+) -> Result<f64, BuiltinError> {
     to_float(value).map_err(|message| {
         BuiltinError::new(
             "E_PHP_RUNTIME_BUILTIN_TYPE",
@@ -5789,23 +3216,26 @@ fn float_arg(name: &str, value: &Value) -> Result<f64, BuiltinError> {
     })
 }
 
-fn string_array_key(value: &str) -> ArrayKey {
+pub(in crate::builtins::modules) fn string_array_key(value: &str) -> ArrayKey {
     ArrayKey::String(crate::PhpString::from_test_str(value))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ParsedUrl {
-    scheme: Option<Vec<u8>>,
-    host: Option<Vec<u8>>,
-    port: Option<i64>,
-    user: Option<Vec<u8>>,
-    pass: Option<Vec<u8>>,
-    path: Option<Vec<u8>>,
-    query: Option<Vec<u8>>,
-    fragment: Option<Vec<u8>>,
+pub(in crate::builtins::modules) struct ParsedUrl {
+    pub(in crate::builtins::modules) scheme: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) host: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) port: Option<i64>,
+    pub(in crate::builtins::modules) user: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) pass: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) path: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) query: Option<Vec<u8>>,
+    pub(in crate::builtins::modules) fragment: Option<Vec<u8>>,
 }
 
-fn parse_url_component(parsed: &ParsedUrl, component: i64) -> BuiltinResult {
+pub(in crate::builtins::modules) fn parse_url_component(
+    parsed: &ParsedUrl,
+    component: i64,
+) -> BuiltinResult {
     let value = match component {
         0 => parsed.scheme.clone().map(Value::string),
         1 => parsed.host.clone().map(Value::string),
@@ -5825,13 +3255,17 @@ fn parse_url_component(parsed: &ParsedUrl, component: i64) -> BuiltinResult {
     Ok(value.unwrap_or(Value::Null))
 }
 
-fn insert_url_component(array: &mut PhpArray, key: &str, value: Option<Vec<u8>>) {
+pub(in crate::builtins::modules) fn insert_url_component(
+    array: &mut PhpArray,
+    key: &str,
+    value: Option<Vec<u8>>,
+) {
     if let Some(value) = value {
         array.insert(string_array_key(key), Value::string(value));
     }
 }
 
-fn parse_php_url(bytes: &[u8]) -> Option<ParsedUrl> {
+pub(in crate::builtins::modules) fn parse_php_url(bytes: &[u8]) -> Option<ParsedUrl> {
     let mut parsed = ParsedUrl::default();
     let mut s = 0usize;
     let len = bytes.len();
@@ -5899,7 +3333,7 @@ fn parse_php_url(bytes: &[u8]) -> Option<ParsedUrl> {
     parse_php_url_host(bytes, s, parsed)
 }
 
-fn parse_php_url_port(
+pub(in crate::builtins::modules) fn parse_php_url_port(
     bytes: &[u8],
     mut s: usize,
     colon: usize,
@@ -5929,7 +3363,11 @@ fn parse_php_url_port(
     parse_php_url_host(bytes, s, parsed)
 }
 
-fn parse_php_url_host(bytes: &[u8], mut s: usize, mut parsed: ParsedUrl) -> Option<ParsedUrl> {
+pub(in crate::builtins::modules) fn parse_php_url_host(
+    bytes: &[u8],
+    mut s: usize,
+    mut parsed: ParsedUrl,
+) -> Option<ParsedUrl> {
     let len = bytes.len();
     let e = find_first_of(bytes, s, b"/?#");
 
@@ -5975,7 +3413,11 @@ fn parse_php_url_host(bytes: &[u8], mut s: usize, mut parsed: ParsedUrl) -> Opti
     }
 }
 
-fn parse_php_url_path(bytes: &[u8], s: usize, mut parsed: ParsedUrl) -> ParsedUrl {
+pub(in crate::builtins::modules) fn parse_php_url_path(
+    bytes: &[u8],
+    s: usize,
+    mut parsed: ParsedUrl,
+) -> ParsedUrl {
     let len = bytes.len();
     let mut e = len;
     if let Some(fragment_start) = find_byte(bytes, s, b'#') {
@@ -5992,7 +3434,7 @@ fn parse_php_url_path(bytes: &[u8], s: usize, mut parsed: ParsedUrl) -> ParsedUr
     parsed
 }
 
-fn parse_url_port(bytes: &[u8]) -> Option<i64> {
+pub(in crate::builtins::modules) fn parse_url_port(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -6000,49 +3442,70 @@ fn parse_url_port(bytes: &[u8]) -> Option<i64> {
     (0..=65535).contains(&value).then_some(value)
 }
 
-fn url_component(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+pub(in crate::builtins::modules) fn url_component(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Vec<u8> {
     bytes[start..end]
         .iter()
         .map(|byte| if byte.is_ascii_control() { b'_' } else { *byte })
         .collect()
 }
 
-fn find_byte(bytes: &[u8], start: usize, needle: u8) -> Option<usize> {
+pub(in crate::builtins::modules) fn find_byte(
+    bytes: &[u8],
+    start: usize,
+    needle: u8,
+) -> Option<usize> {
     bytes[start..]
         .iter()
         .position(|byte| *byte == needle)
         .map(|offset| start + offset)
 }
 
-fn find_byte_before(bytes: &[u8], start: usize, end: usize, needle: u8) -> Option<usize> {
+pub(in crate::builtins::modules) fn find_byte_before(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    needle: u8,
+) -> Option<usize> {
     bytes[start..end]
         .iter()
         .position(|byte| *byte == needle)
         .map(|offset| start + offset)
 }
 
-fn find_first_of(bytes: &[u8], start: usize, needles: &[u8]) -> usize {
+pub(in crate::builtins::modules) fn find_first_of(
+    bytes: &[u8],
+    start: usize,
+    needles: &[u8],
+) -> usize {
     bytes[start..]
         .iter()
         .position(|byte| needles.contains(byte))
         .map_or(bytes.len(), |offset| start + offset)
 }
 
-fn find_last_byte(bytes: &[u8], needle: u8) -> Option<usize> {
+pub(in crate::builtins::modules) fn find_last_byte(bytes: &[u8], needle: u8) -> Option<usize> {
     bytes.iter().rposition(|byte| *byte == needle)
 }
 
-fn starts_with_at(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
+pub(in crate::builtins::modules) fn starts_with_at(
+    bytes: &[u8],
+    start: usize,
+    needle: &[u8],
+) -> bool {
     bytes
         .get(start..start.saturating_add(needle.len()))
         .is_some_and(|candidate| candidate == needle)
 }
 
-fn php_path_separators() -> &'static [char] {
+pub(in crate::builtins::modules) fn php_path_separators() -> &'static [char] {
     if cfg!(windows) { &['/', '\\'] } else { &['/'] }
 }
 
-fn trim_trailing_path_separators(path: &str) -> &str {
+pub(in crate::builtins::modules) fn trim_trailing_path_separators(path: &str) -> &str {
     let trimmed = path.trim_end_matches(php_path_separators());
     if trimmed.is_empty() && path.starts_with(php_path_separators()) {
         &path[..1]
@@ -6051,7 +3514,7 @@ fn trim_trailing_path_separators(path: &str) -> &str {
     }
 }
 
-fn php_basename(path: &str) -> String {
+pub(in crate::builtins::modules) fn php_basename(path: &str) -> String {
     let trimmed = trim_trailing_path_separators(path);
     if trimmed.is_empty() {
         return String::new();
@@ -6063,7 +3526,7 @@ fn php_basename(path: &str) -> String {
         .to_owned()
 }
 
-fn php_dirname_once(path: &str) -> String {
+pub(in crate::builtins::modules) fn php_dirname_once(path: &str) -> String {
     let trimmed = trim_trailing_path_separators(path);
     if trimmed.is_empty() {
         return ".".to_owned();
@@ -6082,7 +3545,7 @@ fn php_dirname_once(path: &str) -> String {
     }
 }
 
-fn split_extension(basename: &str) -> (String, Option<String>) {
+pub(in crate::builtins::modules) fn split_extension(basename: &str) -> (String, Option<String>) {
     let Some(index) = basename.rfind('.') else {
         return (basename.to_owned(), None);
     };
@@ -6095,7 +3558,10 @@ fn split_extension(basename: &str) -> (String, Option<String>) {
     )
 }
 
-fn resolve_runtime_path(context: &BuiltinContext<'_>, path: &str) -> PathBuf {
+pub(in crate::builtins::modules) fn resolve_runtime_path(
+    context: &BuiltinContext<'_>,
+    path: &str,
+) -> PathBuf {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
@@ -6105,7 +3571,7 @@ fn resolve_runtime_path(context: &BuiltinContext<'_>, path: &str) -> PathBuf {
     normalize_runtime_path(&joined)
 }
 
-fn normalize_runtime_path(path: &Path) -> PathBuf {
+pub(in crate::builtins::modules) fn normalize_runtime_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -6121,7 +3587,7 @@ fn normalize_runtime_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn metadata_for_arg(
+pub(in crate::builtins::modules) fn metadata_for_arg(
     context: &BuiltinContext<'_>,
     name: &str,
     value: &Value,
@@ -6140,14 +3606,14 @@ fn metadata_for_arg(
     Ok(metadata.ok())
 }
 
-fn resource_arg(value: &Value) -> Option<crate::ResourceRef> {
+pub(in crate::builtins::modules) fn resource_arg(value: &Value) -> Option<crate::ResourceRef> {
     match deref_value(value) {
         Value::Resource(resource) => Some(resource),
         _ => None,
     }
 }
 
-fn read_file_value(
+pub(in crate::builtins::modules) fn read_file_value(
     context: &mut BuiltinContext<'_>,
     function: &str,
     path: &str,
@@ -6178,7 +3644,7 @@ fn read_file_value(
     }
 }
 
-fn php_io_error_message(error: &std::io::Error) -> String {
+pub(in crate::builtins::modules) fn php_io_error_message(error: &std::io::Error) -> String {
     match error.kind() {
         std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
         std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
@@ -6187,7 +3653,9 @@ fn php_io_error_message(error: &std::io::Error) -> String {
     }
 }
 
-fn directory_entries_with_dots(path: &Path) -> Option<Vec<String>> {
+pub(in crate::builtins::modules) fn directory_entries_with_dots(
+    path: &Path,
+) -> Option<Vec<String>> {
     let mut entries = vec![".".to_string(), "..".to_string()];
     let read_dir = fs::read_dir(path).ok()?;
     let mut names = read_dir
@@ -6199,7 +3667,10 @@ fn directory_entries_with_dots(path: &Path) -> Option<Vec<String>> {
     Some(entries)
 }
 
-fn glob_directory_and_pattern(context: &BuiltinContext<'_>, pattern: &str) -> (PathBuf, String) {
+pub(in crate::builtins::modules) fn glob_directory_and_pattern(
+    context: &BuiltinContext<'_>,
+    pattern: &str,
+) -> (PathBuf, String) {
     let wildcard_index = pattern.find(['*', '?']).unwrap_or(pattern.len());
     let parent_end = pattern[..wildcard_index]
         .rfind(php_path_separators())
@@ -6213,7 +3684,7 @@ fn glob_directory_and_pattern(context: &BuiltinContext<'_>, pattern: &str) -> (P
     (directory, file_pattern.to_string())
 }
 
-fn glob_pattern_matches(pattern: &str, name: &str) -> bool {
+pub(in crate::builtins::modules) fn glob_pattern_matches(pattern: &str, name: &str) -> bool {
     fn matches_bytes(pattern: &[u8], name: &[u8]) -> bool {
         match pattern.split_first() {
             None => name.is_empty(),
@@ -6230,14 +3701,17 @@ fn glob_pattern_matches(pattern: &str, name: &str) -> bool {
     matches_bytes(pattern.as_bytes(), name.as_bytes())
 }
 
-fn is_remote_stream_uri(uri: &str) -> bool {
+pub(in crate::builtins::modules) fn is_remote_stream_uri(uri: &str) -> bool {
     matches!(
         uri.split_once("://").map(|(scheme, _)| scheme),
         Some("http" | "https" | "ftp" | "ftps")
     )
 }
 
-fn php_value_to_json(value: &Value, flags: i64) -> Result<JsonValue, i64> {
+pub(in crate::builtins::modules) fn php_value_to_json(
+    value: &Value,
+    flags: i64,
+) -> Result<JsonValue, i64> {
     match deref_value(value) {
         Value::Null | Value::Uninitialized => Ok(JsonValue::Null),
         Value::Bool(value) => Ok(JsonValue::Bool(value)),
@@ -6294,7 +3768,10 @@ fn php_value_to_json(value: &Value, flags: i64) -> Result<JsonValue, i64> {
     }
 }
 
-fn json_to_php_value(value: JsonValue, associative: bool) -> Value {
+pub(in crate::builtins::modules) fn json_to_php_value(
+    value: JsonValue,
+    associative: bool,
+) -> Value {
     match value {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(value) => Value::Bool(value),
@@ -6330,7 +3807,10 @@ fn json_to_php_value(value: JsonValue, associative: bool) -> Value {
     }
 }
 
-fn normalize_json_encoded(mut encoded: String, flags: i64) -> String {
+pub(in crate::builtins::modules) fn normalize_json_encoded(
+    mut encoded: String,
+    flags: i64,
+) -> String {
     if flags & JSON_UNESCAPED_SLASHES != 0 {
         encoded = encoded.replace("\\/", "/");
     }
@@ -6341,7 +3821,7 @@ fn normalize_json_encoded(mut encoded: String, flags: i64) -> String {
     encoded
 }
 
-fn compile_preg_pattern(
+pub(in crate::builtins::modules) fn compile_preg_pattern(
     context: &mut BuiltinContext<'_>,
     pattern: PhpString,
 ) -> Option<std::sync::Arc<pcre::CompiledPattern>> {
@@ -6354,18 +3834,21 @@ fn compile_preg_pattern(
     }
 }
 
-fn preg_failure(context: &mut BuiltinContext<'_>, error: pcre::PcreFailure) -> BuiltinResult {
+pub(in crate::builtins::modules) fn preg_failure(
+    context: &mut BuiltinContext<'_>,
+    error: pcre::PcreFailure,
+) -> BuiltinResult {
     context.set_preg_last_error(error.code(), error.message().to_string());
     Ok(Value::Bool(false))
 }
 
-fn assign_reference_arg(argument: Option<&Value>, value: Value) {
+pub(in crate::builtins::modules) fn assign_reference_arg(argument: Option<&Value>, value: Value) {
     if let Some(Value::Reference(reference)) = argument {
         reference.set(value);
     }
 }
 
-fn pattern_order_matches(matches: Vec<Value>) -> Value {
+pub(in crate::builtins::modules) fn pattern_order_matches(matches: Vec<Value>) -> Value {
     let mut grouped: Vec<PhpArray> = Vec::new();
     for match_value in matches {
         let Value::Array(captures) = match_value else {
@@ -6385,7 +3868,7 @@ fn pattern_order_matches(matches: Vec<Value>) -> Value {
     Value::packed_array(grouped.into_iter().map(Value::Array).collect())
 }
 
-fn preg_replace_subject(
+pub(in crate::builtins::modules) fn preg_replace_subject(
     compiled: &pcre::CompiledPattern,
     replacement: &[u8],
     subject: &Value,
@@ -6414,7 +3897,7 @@ fn preg_replace_subject(
     }
 }
 
-fn preg_replace_bytes(
+pub(in crate::builtins::modules) fn preg_replace_bytes(
     compiled: &pcre::CompiledPattern,
     replacement: &[u8],
     subject: &[u8],
@@ -6440,7 +3923,7 @@ fn preg_replace_bytes(
     Ok(output)
 }
 
-fn preg_replace_callback_subject(
+pub(in crate::builtins::modules) fn preg_replace_callback_subject(
     context: &mut BuiltinContext<'_>,
     compiled: &pcre::CompiledPattern,
     callback: BuiltinEntry,
@@ -6485,7 +3968,7 @@ fn preg_replace_callback_subject(
     }
 }
 
-fn preg_replace_callback_bytes(
+pub(in crate::builtins::modules) fn preg_replace_callback_bytes(
     context: &mut BuiltinContext<'_>,
     compiled: &pcre::CompiledPattern,
     callback: BuiltinEntry,
@@ -6523,7 +4006,10 @@ fn preg_replace_callback_bytes(
     Ok(output)
 }
 
-fn expand_preg_replacement(replacement: &[u8], captures: &pcre2::bytes::Captures<'_>) -> Vec<u8> {
+pub(in crate::builtins::modules) fn expand_preg_replacement(
+    replacement: &[u8],
+    captures: &pcre2::bytes::Captures<'_>,
+) -> Vec<u8> {
     let mut output = Vec::new();
     let mut index = 0usize;
     while index < replacement.len() {
@@ -6545,7 +4031,12 @@ fn expand_preg_replacement(replacement: &[u8], captures: &pcre2::bytes::Captures
     output
 }
 
-fn append_split_piece(array: &mut PhpArray, bytes: &[u8], offset: usize, flags: i64) {
+pub(in crate::builtins::modules) fn append_split_piece(
+    array: &mut PhpArray,
+    bytes: &[u8],
+    offset: usize,
+    flags: i64,
+) {
     if flags & pcre::PREG_SPLIT_NO_EMPTY != 0 && bytes.is_empty() {
         return;
     }
@@ -6560,7 +4051,11 @@ fn append_split_piece(array: &mut PhpArray, bytes: &[u8], offset: usize, flags: 
     array.append(value);
 }
 
-fn json_failure(context: &mut BuiltinContext<'_>, flags: i64, code: i64) -> BuiltinResult {
+pub(in crate::builtins::modules) fn json_failure(
+    context: &mut BuiltinContext<'_>,
+    flags: i64,
+    code: i64,
+) -> BuiltinResult {
     context.set_json_last_error(code);
     if flags & JSON_THROW_ON_ERROR != 0 {
         Err(BuiltinError::new(
@@ -6572,7 +4067,7 @@ fn json_failure(context: &mut BuiltinContext<'_>, flags: i64, code: i64) -> Buil
     }
 }
 
-fn json_std_class() -> ClassEntry {
+pub(in crate::builtins::modules) fn json_std_class() -> ClassEntry {
     ClassEntry {
         name: "stdClass".to_string(),
         parent: None,
@@ -6588,7 +4083,7 @@ fn json_std_class() -> ClassEntry {
     }
 }
 
-fn metadata_mtime(metadata: &Metadata) -> i64 {
+pub(in crate::builtins::modules) fn metadata_mtime(metadata: &Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -6596,7 +4091,7 @@ fn metadata_mtime(metadata: &Metadata) -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
-fn file_type_name(metadata: &Metadata) -> &'static str {
+pub(in crate::builtins::modules) fn file_type_name(metadata: &Metadata) -> &'static str {
     let file_type = metadata.file_type();
     if file_type.is_file() {
         "file"
@@ -6609,7 +4104,7 @@ fn file_type_name(metadata: &Metadata) -> &'static str {
     }
 }
 
-fn stat_array(metadata: Metadata) -> Value {
+pub(in crate::builtins::modules) fn stat_array(metadata: Metadata) -> Value {
     let size = metadata.len() as i64;
     let mtime = metadata_mtime(&metadata);
     let mode = if metadata.is_dir() {
@@ -6633,13 +4128,20 @@ fn stat_array(metadata: Metadata) -> Value {
     Value::Array(array)
 }
 
-fn numeric_f64_arg(name: &str, value: &Value) -> Result<f64, BuiltinError> {
+pub(in crate::builtins::modules) fn numeric_f64_arg(
+    name: &str,
+    value: &Value,
+) -> Result<f64, BuiltinError> {
     to_number(value)
         .map(|number| number.as_f64())
         .map_err(|message| conversion_error(name, message))
 }
 
-fn min_max_builtin(name: &str, args: Vec<Value>, pick_max: bool) -> BuiltinResult {
+pub(in crate::builtins::modules) fn min_max_builtin(
+    name: &str,
+    args: Vec<Value>,
+    pick_max: bool,
+) -> BuiltinResult {
     if args.is_empty() {
         return Err(arity_error(name, "at least one argument"));
     }
@@ -6672,7 +4174,10 @@ fn min_max_builtin(name: &str, args: Vec<Value>, pick_max: bool) -> BuiltinResul
     Ok(selected)
 }
 
-fn group_decimal_integer(integer: &str, separator: &str) -> String {
+pub(in crate::builtins::modules) fn group_decimal_integer(
+    integer: &str,
+    separator: &str,
+) -> String {
     if separator.is_empty() || integer.len() <= 3 {
         return integer.to_owned();
     }
@@ -6690,7 +4195,7 @@ fn group_decimal_integer(integer: &str, separator: &str) -> String {
     grouped
 }
 
-fn normalize_offset(len: usize, offset: i64) -> usize {
+pub(in crate::builtins::modules) fn normalize_offset(len: usize, offset: i64) -> usize {
     if offset >= 0 {
         (offset as usize).min(len)
     } else {
@@ -6698,7 +4203,11 @@ fn normalize_offset(len: usize, offset: i64) -> usize {
     }
 }
 
-fn checked_search_offset(name: &str, len: usize, offset: i64) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn checked_search_offset(
+    name: &str,
+    len: usize,
+    offset: i64,
+) -> Result<usize, BuiltinError> {
     let abs = offset.unsigned_abs() as usize;
     if offset > len as i64 || (offset < 0 && abs > len) {
         return Err(value_error(name, "offset is out of range"));
@@ -6706,7 +4215,7 @@ fn checked_search_offset(name: &str, len: usize, offset: i64) -> Result<usize, B
     Ok(normalize_offset(len, offset))
 }
 
-fn byte_substring_length(
+pub(in crate::builtins::modules) fn byte_substring_length(
     name: &str,
     total: usize,
     start: usize,
@@ -6725,7 +4234,7 @@ fn byte_substring_length(
     }
 }
 
-fn string_search_slice(
+pub(in crate::builtins::modules) fn string_search_slice(
     context: &mut BuiltinContext<'_>,
     name: &str,
     args: Vec<Value>,
@@ -6778,7 +4287,11 @@ fn string_search_slice(
     )
 }
 
-fn string_span(name: &str, args: Vec<Value>, accepted: bool) -> BuiltinResult {
+pub(in crate::builtins::modules) fn string_span(
+    name: &str,
+    args: Vec<Value>,
+    accepted: bool,
+) -> BuiltinResult {
     if !(2..=4).contains(&args.len()) {
         return Err(arity_error(name, "two to four argument(s)"));
     }
@@ -6800,7 +4313,7 @@ fn string_span(name: &str, args: Vec<Value>, accepted: bool) -> BuiltinResult {
     Ok(Value::Int(count as i64))
 }
 
-fn string_span_offset(len: usize, offset: i64) -> usize {
+pub(in crate::builtins::modules) fn string_span_offset(len: usize, offset: i64) -> usize {
     if offset >= 0 {
         (offset as usize).min(len)
     } else {
@@ -6808,7 +4321,11 @@ fn string_span_offset(len: usize, offset: i64) -> usize {
     }
 }
 
-fn string_span_length(total: usize, start: usize, length: Option<i64>) -> usize {
+pub(in crate::builtins::modules) fn string_span_length(
+    total: usize,
+    start: usize,
+    length: Option<i64>,
+) -> usize {
     let remaining = total.saturating_sub(start);
     match length {
         None => remaining,
@@ -6817,7 +4334,7 @@ fn string_span_length(total: usize, start: usize, length: Option<i64>) -> usize 
     }
 }
 
-fn string_position(
+pub(in crate::builtins::modules) fn string_position(
     context: &mut BuiltinContext<'_>,
     name: &str,
     args: Vec<Value>,
@@ -6873,11 +4390,11 @@ fn string_position(
     Ok(result.map_or(Value::Bool(false), |index| Value::Int(index as i64)))
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(in crate::builtins::modules) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     find_bytes_from(haystack, needle, 0, false)
 }
 
-fn find_bytes_from(
+pub(in crate::builtins::modules) fn find_bytes_from(
     haystack: &[u8],
     needle: &[u8],
     start: usize,
@@ -6895,7 +4412,7 @@ fn find_bytes_from(
         .map(|index| index + start)
 }
 
-fn rfind_bytes(
+pub(in crate::builtins::modules) fn rfind_bytes(
     haystack: &[u8],
     needle: &[u8],
     start: usize,
@@ -6930,7 +4447,7 @@ fn rfind_bytes(
     })
 }
 
-fn position_offset_error(name: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn position_offset_error(name: &str) -> BuiltinError {
     argument_value_error(
         name,
         "#3 ($offset)",
@@ -6938,7 +4455,10 @@ fn position_offset_error(name: &str) -> BuiltinError {
     )
 }
 
-fn position_offset_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
+pub(in crate::builtins::modules) fn position_offset_arg(
+    name: &str,
+    value: &Value,
+) -> Result<i64, BuiltinError> {
     if let Value::String(value) = deref_value(value) {
         let classified = classify_php_string(&value);
         return match (classified.kind, classified.value) {
@@ -6963,7 +4483,11 @@ fn position_offset_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
     int_arg(name, value)
 }
 
-fn bytes_equal(left: &[u8], right: &[u8], case_insensitive: bool) -> bool {
+pub(in crate::builtins::modules) fn bytes_equal(
+    left: &[u8],
+    right: &[u8],
+    case_insensitive: bool,
+) -> bool {
     if case_insensitive {
         left.eq_ignore_ascii_case(right)
     } else {
@@ -6971,7 +4495,7 @@ fn bytes_equal(left: &[u8], right: &[u8], case_insensitive: bool) -> bool {
     }
 }
 
-fn compare_strings(
+pub(in crate::builtins::modules) fn compare_strings(
     name: &str,
     args: &[Value],
     case_insensitive: bool,
@@ -6995,7 +4519,7 @@ fn compare_strings(
     Ok(Value::Int(binary_string_compare(&left, &right)))
 }
 
-fn binary_string_compare(left: &[u8], right: &[u8]) -> i64 {
+pub(in crate::builtins::modules) fn binary_string_compare(left: &[u8], right: &[u8]) -> i64 {
     let limit = left.len().min(right.len());
     for index in 0..limit {
         let diff = i64::from(left[index]) - i64::from(right[index]);
@@ -7010,7 +4534,7 @@ fn binary_string_compare(left: &[u8], right: &[u8]) -> i64 {
     }
 }
 
-fn substr_replace_one(
+pub(in crate::builtins::modules) fn substr_replace_one(
     name: &str,
     subject: &Value,
     replacement: &PhpString,
@@ -7033,7 +4557,7 @@ fn substr_replace_one(
     Ok(Value::string(output))
 }
 
-fn substr_replace_indexed_string_arg(
+pub(in crate::builtins::modules) fn substr_replace_indexed_string_arg(
     value: &Value,
     index: usize,
 ) -> Result<PhpString, BuiltinError> {
@@ -7048,7 +4572,7 @@ fn substr_replace_indexed_string_arg(
     }
 }
 
-fn substr_replace_indexed_int_arg(
+pub(in crate::builtins::modules) fn substr_replace_indexed_int_arg(
     value: &Value,
     index: usize,
 ) -> Result<Option<i64>, BuiltinError> {
@@ -7060,7 +4584,7 @@ fn substr_replace_indexed_int_arg(
     }
 }
 
-fn stripslashes_bytes(input: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn stripslashes_bytes(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
@@ -7077,7 +4601,7 @@ fn stripslashes_bytes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-fn stripcslashes_bytes(input: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn stripcslashes_bytes(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
@@ -7121,7 +4645,9 @@ fn stripcslashes_bytes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-fn allowed_strip_tags_arg(value: &Value) -> Result<Vec<u8>, BuiltinError> {
+pub(in crate::builtins::modules) fn allowed_strip_tags_arg(
+    value: &Value,
+) -> Result<Vec<u8>, BuiltinError> {
     match deref_value(value) {
         Value::Null | Value::Uninitialized => Ok(Vec::new()),
         Value::Array(array) => {
@@ -7143,7 +4669,9 @@ fn allowed_strip_tags_arg(value: &Value) -> Result<Vec<u8>, BuiltinError> {
     }
 }
 
-fn strip_tags_allowed_string(value: &Value) -> Result<Vec<u8>, BuiltinError> {
+pub(in crate::builtins::modules) fn strip_tags_allowed_string(
+    value: &Value,
+) -> Result<Vec<u8>, BuiltinError> {
     match string_arg("strip_tags", value) {
         Ok(value) => Ok(value.into_bytes()),
         Err(error) if matches!(deref_value(value), Value::Object(_)) => {
@@ -7154,7 +4682,7 @@ fn strip_tags_allowed_string(value: &Value) -> Result<Vec<u8>, BuiltinError> {
     }
 }
 
-fn lower_ascii_bytes(input: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn lower_ascii_bytes(input: &[u8]) -> Vec<u8> {
     input.iter().map(u8::to_ascii_lowercase).collect()
 }
 
@@ -7167,7 +4695,10 @@ enum StripTagsState {
     Comment,
 }
 
-fn strip_tags_bytes(input: &[u8], allowed: Option<&[u8]>) -> Vec<u8> {
+pub(in crate::builtins::modules) fn strip_tags_bytes(
+    input: &[u8],
+    allowed: Option<&[u8]>,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0usize;
     let mut state = StripTagsState::Output;
@@ -7360,18 +4891,22 @@ fn strip_tags_bytes(input: &[u8], allowed: Option<&[u8]>) -> Vec<u8> {
     output
 }
 
-fn push_strip_tag_byte(buffer: &mut Vec<u8>, allowed: Option<&[u8]>, byte: u8) {
+pub(in crate::builtins::modules) fn push_strip_tag_byte(
+    buffer: &mut Vec<u8>,
+    allowed: Option<&[u8]>,
+    byte: u8,
+) {
     if allowed.is_some() {
         buffer.push(byte);
     }
 }
 
-fn strip_tag_is_allowed(tag: &[u8], allowed: &[u8]) -> bool {
+pub(in crate::builtins::modules) fn strip_tag_is_allowed(tag: &[u8], allowed: &[u8]) -> bool {
     let normalized = normalize_strip_tag(tag);
     !normalized.is_empty() && find_bytes_from(allowed, &normalized, 0, false).is_some()
 }
 
-fn normalize_strip_tag(tag: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn normalize_strip_tag(tag: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(tag.len().min(32));
     let mut state = 0u8;
     let mut index = 0usize;
@@ -7402,7 +4937,7 @@ fn normalize_strip_tag(tag: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn decode_c_hex_escape(input: &[u8]) -> (u8, usize) {
+pub(in crate::builtins::modules) fn decode_c_hex_escape(input: &[u8]) -> (u8, usize) {
     let mut value = 0u8;
     let mut consumed = 0usize;
     for byte in input.iter().copied().take(2) {
@@ -7415,7 +4950,7 @@ fn decode_c_hex_escape(input: &[u8]) -> (u8, usize) {
     (value, consumed)
 }
 
-fn decode_c_octal_escape(input: &[u8]) -> (u8, usize) {
+pub(in crate::builtins::modules) fn decode_c_octal_escape(input: &[u8]) -> (u8, usize) {
     let mut value = 0u16;
     let mut consumed = 0usize;
     for byte in input.iter().copied().take(3) {
@@ -7428,7 +4963,11 @@ fn decode_c_octal_escape(input: &[u8]) -> (u8, usize) {
     (value as u8, consumed)
 }
 
-fn natural_compare_builtin(name: &str, args: &[Value], case_insensitive: bool) -> BuiltinResult {
+pub(in crate::builtins::modules) fn natural_compare_builtin(
+    name: &str,
+    args: &[Value],
+    case_insensitive: bool,
+) -> BuiltinResult {
     let left = string_arg(name, &args[0])?;
     let right = string_arg(name, &args[1])?;
     Ok(Value::Int(ordering_to_i64(natural_compare_bytes(
@@ -7438,7 +4977,19 @@ fn natural_compare_builtin(name: &str, args: &[Value], case_insensitive: bool) -
     ))))
 }
 
-fn natural_compare_bytes(left: &[u8], right: &[u8], case_insensitive: bool) -> std::cmp::Ordering {
+pub(in crate::builtins::modules) fn ordering_to_i64(ordering: std::cmp::Ordering) -> i64 {
+    match ordering {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+pub(in crate::builtins::modules) fn natural_compare_bytes(
+    left: &[u8],
+    right: &[u8],
+    case_insensitive: bool,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     let mut left_index = 0usize;
@@ -7521,7 +5072,7 @@ fn natural_compare_bytes(left: &[u8], right: &[u8], case_insensitive: bool) -> s
     }
 }
 
-fn natural_compare_left(
+pub(in crate::builtins::modules) fn natural_compare_left(
     left: &[u8],
     left_index: &mut usize,
     right: &[u8],
@@ -7554,7 +5105,7 @@ fn natural_compare_left(
     }
 }
 
-fn natural_compare_right(
+pub(in crate::builtins::modules) fn natural_compare_right(
     left: &[u8],
     left_index: &mut usize,
     right: &[u8],
@@ -7587,7 +5138,12 @@ fn natural_compare_right(
     }
 }
 
-fn wordwrap_bytes(input: &[u8], width: usize, break_string: &[u8], cut: bool) -> Vec<u8> {
+pub(in crate::builtins::modules) fn wordwrap_bytes(
+    input: &[u8],
+    width: usize,
+    break_string: &[u8],
+    cut: bool,
+) -> Vec<u8> {
     if input.is_empty() {
         return Vec::new();
     }
@@ -7601,7 +5157,10 @@ fn wordwrap_bytes(input: &[u8], width: usize, break_string: &[u8], cut: bool) ->
     output
 }
 
-fn wordwrap_zero_width_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn wordwrap_zero_width_bytes(
+    input: &[u8],
+    break_string: &[u8],
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     for byte in input {
         if byte.is_ascii_whitespace() {
@@ -7613,7 +5172,7 @@ fn wordwrap_zero_width_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
     output
 }
 
-fn wordwrap_check_memory_limit(
+pub(in crate::builtins::modules) fn wordwrap_check_memory_limit(
     context: &mut BuiltinContext<'_>,
     input: &[u8],
     width: usize,
@@ -7636,7 +5195,7 @@ fn wordwrap_check_memory_limit(
     wordwrap_memory_limit_error(context, limit, estimated.saturating_sub(input.len()), span)
 }
 
-fn wordwrap_worst_case_output_len(
+pub(in crate::builtins::modules) fn wordwrap_worst_case_output_len(
     input_len: usize,
     width: usize,
     break_len: usize,
@@ -7648,7 +5207,7 @@ fn wordwrap_worst_case_output_len(
     input_len.checked_add(breaks.checked_mul(break_len)?)
 }
 
-fn wordwrap_memory_limit_error(
+pub(in crate::builtins::modules) fn wordwrap_memory_limit_error(
     context: &mut BuiltinContext<'_>,
     limit: usize,
     allocation: usize,
@@ -7665,7 +5224,7 @@ fn wordwrap_memory_limit_error(
     Err(BuiltinError::new("E_PHP_RUNTIME_MEMORY_LIMIT", message))
 }
 
-fn parse_php_memory_limit_bytes(value: &str) -> Option<usize> {
+pub(in crate::builtins::modules) fn parse_php_memory_limit_bytes(value: &str) -> Option<usize> {
     let value = value.trim();
     if value.is_empty() || value == "-1" {
         return None;
@@ -7680,7 +5239,10 @@ fn parse_php_memory_limit_bytes(value: &str) -> Option<usize> {
     bytes.checked_mul(multiplier)
 }
 
-fn wordwrap_negative_cut_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn wordwrap_negative_cut_bytes(
+    input: &[u8],
+    break_string: &[u8],
+) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in input {
         if *byte == b'\n' {
@@ -7695,7 +5257,13 @@ fn wordwrap_negative_cut_bytes(input: &[u8], break_string: &[u8]) -> Vec<u8> {
     output
 }
 
-fn wordwrap_line(line: &[u8], width: usize, break_string: &[u8], cut: bool, output: &mut Vec<u8>) {
+pub(in crate::builtins::modules) fn wordwrap_line(
+    line: &[u8],
+    width: usize,
+    break_string: &[u8],
+    cut: bool,
+    output: &mut Vec<u8>,
+) {
     let mut start = 0usize;
     while line.len().saturating_sub(start) > width {
         let search_end = start + (width + 1).min(line.len() - start);
@@ -7743,11 +5311,11 @@ fn wordwrap_line(line: &[u8], width: usize, break_string: &[u8], cut: bool, outp
     output.extend_from_slice(&line[start..]);
 }
 
-fn break_string_is_whitespace(break_string: &[u8]) -> bool {
+pub(in crate::builtins::modules) fn break_string_is_whitespace(break_string: &[u8]) -> bool {
     break_string.iter().all(u8::is_ascii_whitespace)
 }
 
-fn uuencode_bytes(input: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn uuencode_bytes(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     for chunk in input.chunks(45) {
         output.push(uuencode_sixbit(chunk.len() as u8));
@@ -7766,12 +5334,12 @@ fn uuencode_bytes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-fn uuencode_sixbit(value: u8) -> u8 {
+pub(in crate::builtins::modules) fn uuencode_sixbit(value: u8) -> u8 {
     let encoded = (value & 0x3f) + 0x20;
     if encoded == 0x20 { b'`' } else { encoded }
 }
 
-fn uudecode_bytes(input: &[u8]) -> Option<Vec<u8>> {
+pub(in crate::builtins::modules) fn uudecode_bytes(input: &[u8]) -> Option<Vec<u8>> {
     if input.is_empty() {
         return None;
     }
@@ -7814,7 +5382,7 @@ fn uudecode_bytes(input: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn uudecode_sixbit(value: u8) -> u8 {
+pub(in crate::builtins::modules) fn uudecode_sixbit(value: u8) -> u8 {
     if value == b'`' {
         0
     } else {
@@ -7822,7 +5390,7 @@ fn uudecode_sixbit(value: u8) -> u8 {
     }
 }
 
-fn trim_builtin(
+pub(in crate::builtins::modules) fn trim_builtin(
     context: &mut BuiltinContext<'_>,
     name: &str,
     args: Vec<Value>,
@@ -7864,7 +5432,7 @@ fn trim_builtin(
     Ok(Value::string(bytes[start..end].to_vec()))
 }
 
-fn default_trim_mask() -> [bool; 256] {
+pub(in crate::builtins::modules) fn default_trim_mask() -> [bool; 256] {
     let mut mask = [false; 256];
     for byte in b" \t\n\r\0\x0b" {
         mask[usize::from(*byte)] = true;
@@ -7872,7 +5440,7 @@ fn default_trim_mask() -> [bool; 256] {
     mask
 }
 
-fn trim_mask_from_charlist(
+pub(in crate::builtins::modules) fn trim_mask_from_charlist(
     context: &mut BuiltinContext<'_>,
     name: &str,
     charlist: &[u8],
@@ -7949,7 +5517,7 @@ fn trim_mask_from_charlist(
     mask
 }
 
-fn trim_range_warning(
+pub(in crate::builtins::modules) fn trim_range_warning(
     context: &mut BuiltinContext<'_>,
     name: &str,
     message: &str,
@@ -7962,11 +5530,15 @@ fn trim_range_warning(
     );
 }
 
-fn split_bytes(bytes: &[u8], separator: &[u8]) -> Vec<Vec<u8>> {
+pub(in crate::builtins::modules) fn split_bytes(bytes: &[u8], separator: &[u8]) -> Vec<Vec<u8>> {
     split_bytes_limited(bytes, separator, usize::MAX)
 }
 
-fn split_bytes_limited(bytes: &[u8], separator: &[u8], limit: usize) -> Vec<Vec<u8>> {
+pub(in crate::builtins::modules) fn split_bytes_limited(
+    bytes: &[u8],
+    separator: &[u8],
+    limit: usize,
+) -> Vec<Vec<u8>> {
     if limit == 0 {
         return Vec::new();
     }
@@ -7983,7 +5555,10 @@ fn split_bytes_limited(bytes: &[u8], separator: &[u8], limit: usize) -> Vec<Vec<
     parts
 }
 
-fn array_arg(name: &str, value: &Value) -> Result<Vec<crate::PhpString>, BuiltinError> {
+pub(in crate::builtins::modules) fn array_arg(
+    name: &str,
+    value: &Value,
+) -> Result<Vec<crate::PhpString>, BuiltinError> {
     let Value::Array(array) = deref_value(value) else {
         return Err(type_error(name, "array", value));
     };
@@ -7993,33 +5568,45 @@ fn array_arg(name: &str, value: &Value) -> Result<Vec<crate::PhpString>, Builtin
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn array_key_arg(name: &str, value: &Value) -> Result<ArrayKey, BuiltinError> {
+pub(in crate::builtins::modules) fn array_key_arg(
+    name: &str,
+    value: &Value,
+) -> Result<ArrayKey, BuiltinError> {
     ArrayKey::from_value_mvp(&deref_value(value))
         .ok_or_else(|| type_error(name, "int|string key-compatible value", value))
 }
 
-fn array_value_arg(name: &str, value: &Value) -> Result<crate::PhpArray, BuiltinError> {
+pub(in crate::builtins::modules) fn array_value_arg(
+    name: &str,
+    value: &Value,
+) -> Result<crate::PhpArray, BuiltinError> {
     let Value::Array(array) = deref_value(value) else {
         return Err(type_error(name, "array", value));
     };
     Ok(array)
 }
 
-fn array_list_arg(name: &str, values: &[Value]) -> Result<Vec<crate::PhpArray>, BuiltinError> {
+pub(in crate::builtins::modules) fn array_list_arg(
+    name: &str,
+    values: &[Value],
+) -> Result<Vec<crate::PhpArray>, BuiltinError> {
     values
         .iter()
         .map(|value| array_value_arg(name, value))
         .collect()
 }
 
-fn array_reference_cell(name: &str, value: &Value) -> Result<crate::ReferenceCell, BuiltinError> {
+pub(in crate::builtins::modules) fn array_reference_cell(
+    name: &str,
+    value: &Value,
+) -> Result<crate::ReferenceCell, BuiltinError> {
     let Value::Reference(cell) = value else {
         return Err(type_error(name, "array reference", value));
     };
     Ok(cell.clone())
 }
 
-fn array_from_reference_cell(
+pub(in crate::builtins::modules) fn array_from_reference_cell(
     name: &str,
     cell: &crate::ReferenceCell,
 ) -> Result<crate::PhpArray, BuiltinError> {
@@ -8030,14 +5617,17 @@ fn array_from_reference_cell(
     Ok(array)
 }
 
-fn array_key_to_value(key: &ArrayKey) -> Value {
+pub(in crate::builtins::modules) fn array_key_to_value(key: &ArrayKey) -> Value {
     match key {
         ArrayKey::Int(value) => Value::Int(*value),
         ArrayKey::String(value) => Value::String(value.clone()),
     }
 }
 
-fn random_bounded_usize(name: &str, upper: usize) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn random_bounded_usize(
+    name: &str,
+    upper: usize,
+) -> Result<usize, BuiltinError> {
     debug_assert!(upper > 0);
     let range = upper as u128;
     let zone = u128::MAX - (u128::MAX % range);
@@ -8056,7 +5646,7 @@ fn random_bounded_usize(name: &str, upper: usize) -> Result<usize, BuiltinError>
     }
 }
 
-fn same_filesystem_path(left: &Path, right: &Path) -> bool {
+pub(in crate::builtins::modules) fn same_filesystem_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
@@ -8066,7 +5656,7 @@ fn same_filesystem_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn array_value_matches(
+pub(in crate::builtins::modules) fn array_value_matches(
     name: &str,
     left: &Value,
     right: &Value,
@@ -8079,7 +5669,7 @@ fn array_value_matches(
     }
 }
 
-fn array_diff_by_value(
+pub(in crate::builtins::modules) fn array_diff_by_value(
     first: &crate::PhpArray,
     others: &[crate::PhpArray],
 ) -> Result<crate::PhpArray, BuiltinError> {
@@ -8098,7 +5688,7 @@ fn array_diff_by_value(
     Ok(output)
 }
 
-fn array_diff_by_key_and_value(
+pub(in crate::builtins::modules) fn array_diff_by_key_and_value(
     first: &crate::PhpArray,
     others: &[crate::PhpArray],
 ) -> Result<crate::PhpArray, BuiltinError> {
@@ -8117,7 +5707,7 @@ fn array_diff_by_key_and_value(
     Ok(output)
 }
 
-fn array_intersect_by_value(
+pub(in crate::builtins::modules) fn array_intersect_by_value(
     first: &crate::PhpArray,
     others: &[crate::PhpArray],
 ) -> Result<crate::PhpArray, BuiltinError> {
@@ -8136,7 +5726,7 @@ fn array_intersect_by_value(
     Ok(output)
 }
 
-fn array_intersect_by_key_and_value(
+pub(in crate::builtins::modules) fn array_intersect_by_key_and_value(
     first: &crate::PhpArray,
     others: &[crate::PhpArray],
 ) -> Result<crate::PhpArray, BuiltinError> {
@@ -8155,14 +5745,17 @@ fn array_intersect_by_key_and_value(
     Ok(output)
 }
 
-fn array_compare_value_key(name: &str, value: &Value) -> Result<Vec<u8>, BuiltinError> {
+pub(in crate::builtins::modules) fn array_compare_value_key(
+    name: &str,
+    value: &Value,
+) -> Result<Vec<u8>, BuiltinError> {
     Ok(to_string(&deref_value(value))
         .map_err(|message| conversion_error(name, message))?
         .as_bytes()
         .to_vec())
 }
 
-fn array_callback_intersect_empty_shortcut(
+pub(in crate::builtins::modules) fn array_callback_intersect_empty_shortcut(
     name: &str,
     args: Vec<Value>,
     callback_count: usize,
@@ -8190,13 +5783,16 @@ fn array_callback_intersect_empty_shortcut(
 }
 
 #[derive(Clone, Debug)]
-enum ArrayUniqueKey {
+pub(in crate::builtins::modules) enum ArrayUniqueKey {
     Regular(Value),
     Numeric(f64),
     String(Vec<u8>),
 }
 
-fn array_unique_key(value: &Value, flags: i64) -> Result<ArrayUniqueKey, BuiltinError> {
+pub(in crate::builtins::modules) fn array_unique_key(
+    value: &Value,
+    flags: i64,
+) -> Result<ArrayUniqueKey, BuiltinError> {
     let normalized_flags = flags & !SORT_FLAG_CASE;
     let case_insensitive = (flags & SORT_FLAG_CASE) != 0;
     match normalized_flags {
@@ -8232,7 +5828,10 @@ fn array_unique_key(value: &Value, flags: i64) -> Result<ArrayUniqueKey, Builtin
     }
 }
 
-fn array_unique_keys_match(left: &ArrayUniqueKey, right: &ArrayUniqueKey) -> bool {
+pub(in crate::builtins::modules) fn array_unique_keys_match(
+    left: &ArrayUniqueKey,
+    right: &ArrayUniqueKey,
+) -> bool {
     match (left, right) {
         (ArrayUniqueKey::Regular(left), ArrayUniqueKey::Regular(right)) => {
             equal(left, right).unwrap_or(false)
@@ -8244,7 +5843,7 @@ fn array_unique_keys_match(left: &ArrayUniqueKey, right: &ArrayUniqueKey) -> boo
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RangeStep {
+pub(in crate::builtins::modules) enum RangeStep {
     Int(i64),
     Float(f64),
 }
@@ -8280,7 +5879,7 @@ impl RangeStep {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RangeNumeric {
+pub(in crate::builtins::modules) enum RangeNumeric {
     Int(i64),
     Float(f64),
 }
@@ -8298,14 +5897,16 @@ impl RangeNumeric {
     }
 }
 
-fn range_step_arg(value: &Value) -> Result<RangeStep, BuiltinError> {
+pub(in crate::builtins::modules) fn range_step_arg(
+    value: &Value,
+) -> Result<RangeStep, BuiltinError> {
     match range_numeric_arg("range", "#3 ($step)", value)? {
         RangeNumeric::Int(value) => Ok(RangeStep::Int(value)),
         RangeNumeric::Float(value) => Ok(RangeStep::Float(value)),
     }
 }
 
-fn range_numeric_arg(
+pub(in crate::builtins::modules) fn range_numeric_arg(
     name: &str,
     argument: &str,
     value: &Value,
@@ -8339,7 +5940,9 @@ fn range_numeric_arg(
     Ok(numeric)
 }
 
-fn validate_range_step(step: RangeStep) -> Result<(), BuiltinError> {
+pub(in crate::builtins::modules) fn validate_range_step(
+    step: RangeStep,
+) -> Result<(), BuiltinError> {
     let value = step.as_f64();
     if value == 0.0 {
         return Err(argument_value_error("range", "#3 ($step)", "cannot be 0"));
@@ -8357,7 +5960,10 @@ fn validate_range_step(step: RangeStep) -> Result<(), BuiltinError> {
     Ok(())
 }
 
-fn validate_finite_range_number(argument: &str, value: RangeNumeric) -> Result<(), BuiltinError> {
+pub(in crate::builtins::modules) fn validate_finite_range_number(
+    argument: &str,
+    value: RangeNumeric,
+) -> Result<(), BuiltinError> {
     let value = value.as_f64();
     if value.is_finite() {
         return Ok(());
@@ -8372,11 +5978,11 @@ fn validate_finite_range_number(argument: &str, value: RangeNumeric) -> Result<(
     ))
 }
 
-fn php_non_finite_name(value: f64) -> &'static str {
+pub(in crate::builtins::modules) fn php_non_finite_name(value: f64) -> &'static str {
     if value.is_nan() { "NAN" } else { "INF" }
 }
 
-fn range_string_values(
+pub(in crate::builtins::modules) fn range_string_values(
     context: &mut BuiltinContext<'_>,
     start: &Value,
     end: &Value,
@@ -8487,7 +6093,7 @@ impl<'a> RangeStringOperand<'a> {
     }
 }
 
-fn range_string_is_full_numeric(value: &PhpString) -> bool {
+pub(in crate::builtins::modules) fn range_string_is_full_numeric(value: &PhpString) -> bool {
     let classified = classify_php_string(value);
     matches!(
         classified.kind,
@@ -8531,7 +6137,11 @@ fn warn_range_empty_string(
     );
 }
 
-fn range_warning(context: &mut BuiltinContext<'_>, message: &str, span: RuntimeSourceSpan) {
+pub(in crate::builtins::modules) fn range_warning(
+    context: &mut BuiltinContext<'_>,
+    message: &str,
+    span: RuntimeSourceSpan,
+) {
     context.php_warning(
         "E_PHP_RUNTIME_RANGE_WARNING",
         format!("range(): {message}"),
@@ -8539,7 +6149,7 @@ fn range_warning(context: &mut BuiltinContext<'_>, message: &str, span: RuntimeS
     );
 }
 
-fn range_null_deprecation(
+pub(in crate::builtins::modules) fn range_null_deprecation(
     context: &mut BuiltinContext<'_>,
     value: &Value,
     argument: &str,
@@ -8557,7 +6167,7 @@ fn range_null_deprecation(
     );
 }
 
-fn warn_range_null_string_boundary(
+pub(in crate::builtins::modules) fn warn_range_null_string_boundary(
     context: &mut BuiltinContext<'_>,
     start: &Value,
     end: &Value,
@@ -8588,7 +6198,7 @@ fn warn_range_null_string_boundary(
     }
 }
 
-fn range_numeric_values(
+pub(in crate::builtins::modules) fn range_numeric_values(
     start: RangeNumeric,
     end: RangeNumeric,
     step: RangeStep,
@@ -8623,7 +6233,11 @@ fn range_numeric_values(
     ))
 }
 
-fn range_float_count(start: f64, end: f64, step_abs: f64) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn range_float_count(
+    start: f64,
+    end: f64,
+    step_abs: f64,
+) -> Result<usize, BuiltinError> {
     let distance = (end - start).abs();
     if !distance.is_finite() || !step_abs.is_finite() || step_abs <= 0.0 {
         return Err(value_error(
@@ -8650,7 +6264,11 @@ fn range_float_count(start: f64, end: f64, step_abs: f64) -> Result<usize, Built
     Ok(count as usize)
 }
 
-fn range_int_count(start: i64, end: i64, step: i64) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn range_int_count(
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<usize, BuiltinError> {
     if step <= 0 {
         return Err(argument_value_error("range", "#3 ($step)", "cannot be 0"));
     }
@@ -8666,7 +6284,7 @@ fn range_int_count(start: i64, end: i64, step: i64) -> Result<usize, BuiltinErro
     usize::try_from(count).map_err(|_| range_int_size_error(start, end, step, count))
 }
 
-fn range_int_values(
+pub(in crate::builtins::modules) fn range_int_values(
     start: i64,
     end: i64,
     step: i64,
@@ -8691,7 +6309,7 @@ fn range_int_values(
     Ok(out)
 }
 
-fn range_float_values(
+pub(in crate::builtins::modules) fn range_float_values(
     start: f64,
     end: f64,
     step: f64,
@@ -8714,7 +6332,7 @@ fn range_float_values(
         .collect()
 }
 
-fn ensure_range_size(count: usize) -> Result<(), BuiltinError> {
+pub(in crate::builtins::modules) fn ensure_range_size(count: usize) -> Result<(), BuiltinError> {
     if count <= RANGE_MAX_ELEMENTS {
         return Ok(());
     }
@@ -8724,7 +6342,12 @@ fn ensure_range_size(count: usize) -> Result<(), BuiltinError> {
     ))
 }
 
-fn range_float_size_error(start: f64, end: f64, step: f64, count: f64) -> BuiltinError {
+pub(in crate::builtins::modules) fn range_float_size_error(
+    start: f64,
+    end: f64,
+    step: f64,
+    count: f64,
+) -> BuiltinError {
     let excess = count - RANGE_MAX_ELEMENTS as f64;
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
@@ -8739,7 +6362,12 @@ fn range_float_size_error(start: f64, end: f64, step: f64, count: f64) -> Builti
     )
 }
 
-fn range_int_size_error(start: i64, end: i64, step: i64, count: u128) -> BuiltinError {
+pub(in crate::builtins::modules) fn range_int_size_error(
+    start: i64,
+    end: i64,
+    step: i64,
+    count: u128,
+) -> BuiltinError {
     let excess = count.saturating_sub(RANGE_MAX_ELEMENTS as u128);
     BuiltinError::new(
         "E_PHP_RUNTIME_BUILTIN_VALUE",
@@ -8749,7 +6377,7 @@ fn range_int_size_error(start: i64, end: i64, step: i64, count: u128) -> Builtin
     )
 }
 
-fn range_float_size_component(value: f64) -> String {
+pub(in crate::builtins::modules) fn range_float_size_component(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.1}")
     } else {
@@ -8757,7 +6385,7 @@ fn range_float_size_component(value: f64) -> String {
     }
 }
 
-fn range_float_endpoint_component(value: f64) -> String {
+pub(in crate::builtins::modules) fn range_float_endpoint_component(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")
     } else {
@@ -8765,7 +6393,9 @@ fn range_float_endpoint_component(value: f64) -> String {
     }
 }
 
-fn ensure_array_fill_size(count: usize) -> Result<(), BuiltinError> {
+pub(in crate::builtins::modules) fn ensure_array_fill_size(
+    count: usize,
+) -> Result<(), BuiltinError> {
     if count <= RANGE_MAX_ELEMENTS {
         return Ok(());
     }
@@ -8775,7 +6405,7 @@ fn ensure_array_fill_size(count: usize) -> Result<(), BuiltinError> {
     ))
 }
 
-fn range_step_span_error() -> BuiltinError {
+pub(in crate::builtins::modules) fn range_step_span_error() -> BuiltinError {
     argument_value_error(
         "range",
         "#3 ($step)",
@@ -8783,7 +6413,7 @@ fn range_step_span_error() -> BuiltinError {
     )
 }
 
-fn range_increasing_step_error() -> BuiltinError {
+pub(in crate::builtins::modules) fn range_increasing_step_error() -> BuiltinError {
     argument_value_error(
         "range",
         "#3 ($step)",
@@ -8791,7 +6421,7 @@ fn range_increasing_step_error() -> BuiltinError {
     )
 }
 
-fn count_recursive(array: &crate::PhpArray) -> usize {
+pub(in crate::builtins::modules) fn count_recursive(array: &crate::PhpArray) -> usize {
     let mut count = array.len();
     for (_, value) in array.iter() {
         if let Value::Array(child) = deref_value(value) {
@@ -8801,14 +6431,18 @@ fn count_recursive(array: &crate::PhpArray) -> usize {
     count
 }
 
-fn array_entries(array: &crate::PhpArray) -> Vec<(ArrayKey, Value)> {
+pub(in crate::builtins::modules) fn array_entries(
+    array: &crate::PhpArray,
+) -> Vec<(ArrayKey, Value)> {
     array
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
 
-fn array_from_entries_preserve(entries: Vec<(ArrayKey, Value)>) -> crate::PhpArray {
+pub(in crate::builtins::modules) fn array_from_entries_preserve(
+    entries: Vec<(ArrayKey, Value)>,
+) -> crate::PhpArray {
     let mut array = crate::PhpArray::new();
     for (key, value) in entries {
         array.insert(key, value);
@@ -8816,7 +6450,9 @@ fn array_from_entries_preserve(entries: Vec<(ArrayKey, Value)>) -> crate::PhpArr
     array
 }
 
-fn array_from_entries_reindex_ints(entries: Vec<(ArrayKey, Value)>) -> crate::PhpArray {
+pub(in crate::builtins::modules) fn array_from_entries_reindex_ints(
+    entries: Vec<(ArrayKey, Value)>,
+) -> crate::PhpArray {
     let mut array = crate::PhpArray::new();
     for (key, value) in entries {
         match key {
@@ -8831,7 +6467,7 @@ fn array_from_entries_reindex_ints(entries: Vec<(ArrayKey, Value)>) -> crate::Ph
     array
 }
 
-fn array_from_entries_for_slice(
+pub(in crate::builtins::modules) fn array_from_entries_for_slice(
     entries: Vec<(ArrayKey, Value)>,
     preserve_keys: bool,
 ) -> crate::PhpArray {
@@ -8841,7 +6477,7 @@ fn array_from_entries_for_slice(
     array_from_entries_reindex_ints(entries)
 }
 
-fn normalize_slice_start(len: usize, offset: i64) -> usize {
+pub(in crate::builtins::modules) fn normalize_slice_start(len: usize, offset: i64) -> usize {
     if offset >= 0 {
         (offset as usize).min(len)
     } else {
@@ -8849,7 +6485,7 @@ fn normalize_slice_start(len: usize, offset: i64) -> usize {
     }
 }
 
-fn slice_entries(
+pub(in crate::builtins::modules) fn slice_entries(
     entries: Vec<(ArrayKey, Value)>,
     offset: i64,
     length: Option<i64>,
@@ -8867,7 +6503,11 @@ fn slice_entries(
     }
 }
 
-fn splice_length(total: usize, start: usize, length: i64) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn splice_length(
+    total: usize,
+    start: usize,
+    length: i64,
+) -> Result<usize, BuiltinError> {
     Ok(if length >= 0 {
         (length as usize).min(total.saturating_sub(start))
     } else {
@@ -8877,14 +6517,20 @@ fn splice_length(total: usize, start: usize, length: i64) -> Result<usize, Built
     })
 }
 
-fn splice_replacement_values(name: &str, value: &Value) -> Result<Vec<Value>, BuiltinError> {
+pub(in crate::builtins::modules) fn splice_replacement_values(
+    name: &str,
+    value: &Value,
+) -> Result<Vec<Value>, BuiltinError> {
     match deref_value(value) {
         Value::Array(array) => Ok(array.iter().map(|(_, value)| value.clone()).collect()),
         value => Ok(vec![string_arg(name, &value).map(Value::String)?]),
     }
 }
 
-fn merge_recursive_into(output: &mut crate::PhpArray, input: &crate::PhpArray) {
+pub(in crate::builtins::modules) fn merge_recursive_into(
+    output: &mut crate::PhpArray,
+    input: &crate::PhpArray,
+) {
     for (key, value) in input.iter() {
         match key {
             ArrayKey::Int(_) => {
@@ -8903,7 +6549,7 @@ fn merge_recursive_into(output: &mut crate::PhpArray, input: &crate::PhpArray) {
     }
 }
 
-fn merge_recursive_values(left: Value, right: Value) -> Value {
+pub(in crate::builtins::modules) fn merge_recursive_values(left: Value, right: Value) -> Value {
     match (deref_value(&left), deref_value(&right)) {
         (Value::Array(mut left), Value::Array(right)) => {
             merge_recursive_into(&mut left, &right);
@@ -8913,7 +6559,10 @@ fn merge_recursive_values(left: Value, right: Value) -> Value {
     }
 }
 
-fn replace_recursive_into(output: &mut crate::PhpArray, input: &crate::PhpArray) {
+pub(in crate::builtins::modules) fn replace_recursive_into(
+    output: &mut crate::PhpArray,
+    input: &crate::PhpArray,
+) {
     for (key, value) in input.iter() {
         let replacement = if let Some(existing) = output.get(key).cloned() {
             replace_recursive_values(existing, value.clone())
@@ -8924,7 +6573,7 @@ fn replace_recursive_into(output: &mut crate::PhpArray, input: &crate::PhpArray)
     }
 }
 
-fn replace_recursive_values(left: Value, right: Value) -> Value {
+pub(in crate::builtins::modules) fn replace_recursive_values(left: Value, right: Value) -> Value {
     match (deref_value(&left), deref_value(&right)) {
         (Value::Array(mut left), Value::Array(right)) => {
             replace_recursive_into(&mut left, &right);
@@ -8934,7 +6583,10 @@ fn replace_recursive_values(left: Value, right: Value) -> Value {
     }
 }
 
-fn string_list_arg(name: &str, value: &Value) -> Result<Vec<crate::PhpString>, BuiltinError> {
+pub(in crate::builtins::modules) fn string_list_arg(
+    name: &str,
+    value: &Value,
+) -> Result<Vec<crate::PhpString>, BuiltinError> {
     match deref_value(value) {
         Value::Array(array) => array
             .iter()
@@ -8944,7 +6596,7 @@ fn string_list_arg(name: &str, value: &Value) -> Result<Vec<crate::PhpString>, B
     }
 }
 
-fn replace_subject(
+pub(in crate::builtins::modules) fn replace_subject(
     subject: &Value,
     search: &[crate::PhpString],
     replace: &[crate::PhpString],
@@ -8973,7 +6625,12 @@ fn replace_subject(
     }
 }
 
-fn replace_all(bytes: &[u8], needle: &[u8], replacement: &[u8], count: &mut i64) -> Vec<u8> {
+pub(in crate::builtins::modules) fn replace_all(
+    bytes: &[u8],
+    needle: &[u8],
+    replacement: &[u8],
+    count: &mut i64,
+) -> Vec<u8> {
     let mut output = Vec::new();
     let mut start = 0;
     while let Some(index) = find_bytes_from(bytes, needle, start, false) {
@@ -8986,7 +6643,10 @@ fn replace_all(bytes: &[u8], needle: &[u8], replacement: &[u8], count: &mut i64)
     output
 }
 
-fn replace_map(bytes: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn replace_map(
+    bytes: &[u8],
+    replacements: &[(Vec<u8>, Vec<u8>)],
+) -> Vec<u8> {
     let mut output = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
@@ -9004,7 +6664,10 @@ fn replace_map(bytes: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     output
 }
 
-fn change_first_ascii(string: crate::PhpString, uppercase: bool) -> Vec<u8> {
+pub(in crate::builtins::modules) fn change_first_ascii(
+    string: crate::PhpString,
+    uppercase: bool,
+) -> Vec<u8> {
     let mut bytes = string.into_bytes();
     if let Some(first) = bytes.first_mut() {
         *first = if uppercase {
@@ -9016,7 +6679,7 @@ fn change_first_ascii(string: crate::PhpString, uppercase: bool) -> Vec<u8> {
     bytes
 }
 
-fn repeat_pad(pad: &[u8], length: usize) -> Vec<u8> {
+pub(in crate::builtins::modules) fn repeat_pad(pad: &[u8], length: usize) -> Vec<u8> {
     let mut output = Vec::with_capacity(length);
     while output.len() < length {
         let remaining = length - output.len();
@@ -9038,7 +6701,7 @@ struct PrintfSpec {
     specifier: u8,
 }
 
-fn php_format(
+pub(in crate::builtins::modules) fn php_format(
     name: &str,
     format: &[u8],
     args: &[Value],
@@ -9218,11 +6881,15 @@ fn parse_printf_spec(
     Ok((spec, index + 1))
 }
 
-fn printf_value_error(message: &str) -> BuiltinError {
+pub(in crate::builtins::modules) fn printf_value_error(message: &str) -> BuiltinError {
     BuiltinError::new("E_PHP_RUNTIME_BUILTIN_VALUE", message)
 }
 
-fn parse_ascii_usize(name: &str, digits: &[u8], field: &str) -> Result<usize, BuiltinError> {
+pub(in crate::builtins::modules) fn parse_ascii_usize(
+    name: &str,
+    digits: &[u8],
+    field: &str,
+) -> Result<usize, BuiltinError> {
     std::str::from_utf8(digits)
         .ok()
         .and_then(|text| text.parse::<usize>().ok())
@@ -9308,7 +6975,7 @@ fn format_signed_decimal(
 }
 
 /// PHP renders non-finite floats as bare `INF`, `-INF`, or `NaN`.
-fn non_finite_float_text(value: f64) -> Option<&'static str> {
+pub(in crate::builtins::modules) fn non_finite_float_text(value: f64) -> Option<&'static str> {
     if value.is_finite() {
         None
     } else if value.is_nan() {
@@ -9371,7 +7038,7 @@ fn format_float_general(name: &str, spec: &PrintfSpec, value: f64) -> Result<Str
     Ok(format_numeric_sign(name, spec, negative, digits))
 }
 
-fn format_scientific_abs(
+pub(in crate::builtins::modules) fn format_scientific_abs(
     value: f64,
     precision: usize,
     uppercase: bool,
@@ -9405,7 +7072,7 @@ fn format_scientific_abs(
     mantissa
 }
 
-fn trim_float_fraction(mut text: String) -> String {
+pub(in crate::builtins::modules) fn trim_float_fraction(mut text: String) -> String {
     if text.contains('.') {
         while text.ends_with('0') {
             text.pop();
@@ -9455,7 +7122,7 @@ fn apply_printf_padding(spec: &PrintfSpec, mut bytes: Vec<u8>) -> Vec<u8> {
     output
 }
 
-fn format_array_values(
+pub(in crate::builtins::modules) fn format_array_values(
     name: &str,
     argument: &str,
     value: &Value,
@@ -9466,7 +7133,7 @@ fn format_array_values(
     Ok(array.iter().map(|(_, value)| value.clone()).collect())
 }
 
-fn hex_encode(bytes: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn hex_encode(bytes: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -9476,7 +7143,11 @@ fn hex_encode(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
-fn hash_digest_bytes(name: &str, algorithm: &str, input: &[u8]) -> Result<Vec<u8>, BuiltinError> {
+pub(in crate::builtins::modules) fn hash_digest_bytes(
+    name: &str,
+    algorithm: &str,
+    input: &[u8],
+) -> Result<Vec<u8>, BuiltinError> {
     match normalized_hash_algorithm(algorithm).as_deref() {
         Some("md5") => Ok(Md5::digest(input).to_vec()),
         Some("sha1") => Ok(Sha1::digest(input).to_vec()),
@@ -9485,7 +7156,7 @@ fn hash_digest_bytes(name: &str, algorithm: &str, input: &[u8]) -> Result<Vec<u8
     }
 }
 
-fn hmac_digest_bytes(
+pub(in crate::builtins::modules) fn hmac_digest_bytes(
     name: &str,
     algorithm: &str,
     key: &[u8],
@@ -9514,7 +7185,7 @@ fn hmac_digest_bytes(
     }
 }
 
-fn hmac_with_block_64(
+pub(in crate::builtins::modules) fn hmac_with_block_64(
     mut key: Vec<u8>,
     input: &[u8],
     digest: impl Fn(&[u8]) -> Vec<u8>,
@@ -9529,7 +7200,7 @@ fn hmac_with_block_64(
     digest(&outer)
 }
 
-fn normalized_hash_algorithm(algorithm: &str) -> Option<String> {
+pub(in crate::builtins::modules) fn normalized_hash_algorithm(algorithm: &str) -> Option<String> {
     let normalized = algorithm.to_ascii_lowercase().replace('-', "");
     match normalized.as_str() {
         "md5" | "sha1" | "crc32" | "crc32b" => Some(normalized),
@@ -9537,7 +7208,7 @@ fn normalized_hash_algorithm(algorithm: &str) -> Option<String> {
     }
 }
 
-fn hex_decode(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(in crate::builtins::modules) fn hex_decode(bytes: &[u8]) -> Option<Vec<u8>> {
     if !bytes.len().is_multiple_of(2) {
         return None;
     }
@@ -9548,7 +7219,7 @@ fn hex_decode(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+pub(in crate::builtins::modules) fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -9557,7 +7228,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn html_escape(bytes: &[u8]) -> Vec<u8> {
+pub(in crate::builtins::modules) fn html_escape(bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in bytes {
         match byte {
@@ -9572,7 +7243,7 @@ fn html_escape(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
-fn html_decode(text: &str) -> Vec<u8> {
+pub(in crate::builtins::modules) fn html_decode(text: &str) -> Vec<u8> {
     text.replace("&quot;", "\"")
         .replace("&#039;", "'")
         .replace("&#x27;", "'")
@@ -9582,7 +7253,7 @@ fn html_decode(text: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-fn url_encode(bytes: &[u8], raw: bool) -> Vec<u8> {
+pub(in crate::builtins::modules) fn url_encode(bytes: &[u8], raw: bool) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in bytes {
         if byte.is_ascii_alphanumeric()
@@ -9600,7 +7271,7 @@ fn url_encode(bytes: &[u8], raw: bool) -> Vec<u8> {
     output
 }
 
-fn url_decode(bytes: &[u8], raw: bool) -> Vec<u8> {
+pub(in crate::builtins::modules) fn url_decode(bytes: &[u8], raw: bool) -> Vec<u8> {
     let mut output = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
@@ -9623,7 +7294,7 @@ fn url_decode(bytes: &[u8], raw: bool) -> Vec<u8> {
     output
 }
 
-fn build_query_pairs(
+pub(in crate::builtins::modules) fn build_query_pairs(
     prefix: Option<String>,
     value: &Value,
     pairs: &mut Vec<String>,
@@ -9661,14 +7332,14 @@ fn build_query_pairs(
     Ok(())
 }
 
-fn deref_value(value: &Value) -> Value {
+pub(in crate::builtins::modules) fn deref_value(value: &Value) -> Value {
     match value {
         Value::Reference(cell) => cell.get(),
         value => value.clone(),
     }
 }
 
-fn php_gettype(value: &Value) -> &'static str {
+pub(in crate::builtins::modules) fn php_gettype(value: &Value) -> &'static str {
     match deref_value(value) {
         Value::Null => "NULL",
         Value::Bool(_) => "boolean",
@@ -9684,7 +7355,7 @@ fn php_gettype(value: &Value) -> &'static str {
     }
 }
 
-fn php_debug_type(value: &Value) -> String {
+pub(in crate::builtins::modules) fn php_debug_type(value: &Value) -> String {
     match deref_value(value) {
         Value::Null | Value::Uninitialized => "null".to_owned(),
         Value::Bool(_) => "bool".to_owned(),
@@ -9701,7 +7372,7 @@ fn php_debug_type(value: &Value) -> String {
     }
 }
 
-fn runtime_type_name(value: &Value) -> &'static str {
+pub(in crate::builtins::modules) fn runtime_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "bool",
@@ -9830,18 +7501,15 @@ impl DebugFormatter {
         indent: usize,
     ) {
         match callable {
-            CallableValue::Closure {
-                id,
-                function,
-                captures,
-                bound_this,
-                debug: Some(debug),
-                ..
-            } => {
-                let has_static = !captures.is_empty();
-                let has_this = bound_this.is_some();
+            CallableValue::Closure(payload) if payload.debug.is_some() => {
+                let debug = payload.debug.as_ref().expect("checked above");
+                let has_static = !payload.captures.is_empty();
+                let has_this = payload.bound_this.is_some();
                 let property_count = 3 + usize::from(has_static) + usize::from(has_this);
-                output.write_test_str(&format!("object(Closure)#{id} ({property_count}) {{\n"));
+                output.write_test_str(&format!(
+                    "object(Closure)#{} ({property_count}) {{\n",
+                    payload.id
+                ));
                 self.write_var_dump_property(
                     output,
                     "name",
@@ -9856,9 +7524,14 @@ impl DebugFormatter {
                 );
                 self.write_var_dump_property(output, "line", Value::Int(debug.line), indent);
                 if has_static {
-                    self.write_closure_static_var_dump(output, *function, captures, indent);
+                    self.write_closure_static_var_dump(
+                        output,
+                        payload.function,
+                        &payload.captures,
+                        indent,
+                    );
                 }
-                if let Some(bound_this) = bound_this {
+                if let Some(bound_this) = &payload.bound_this {
                     self.write_var_dump_property(
                         output,
                         "this",
@@ -9906,8 +7579,8 @@ impl DebugFormatter {
                 write_indent(output, indent);
                 output.write_test_str("}\n");
             }
-            CallableValue::Closure { id, .. } => {
-                output.write_test_str(&format!("object(Closure)#{id} (0) {{\n"));
+            CallableValue::Closure(payload) => {
+                output.write_test_str(&format!("object(Closure)#{} (0) {{\n", payload.id));
                 write_indent(output, indent);
                 output.write_test_str("}\n");
             }
@@ -9960,10 +7633,7 @@ impl DebugFormatter {
             .or_else(|| capture.reference().map(|reference| reference.get()));
         matches!(
             value,
-            Some(Value::Callable(CallableValue::Closure {
-                function: captured,
-                ..
-            })) if captured == function
+            Some(Value::Callable(CallableValue::Closure(payload))) if payload.function == function
         )
     }
 
@@ -10125,7 +7795,10 @@ impl DebugFormatter {
     }
 }
 
-fn write_array_key_dump(output: &mut OutputBuffer, key: &ArrayKey) {
+pub(in crate::builtins::modules) fn write_array_key_dump(
+    output: &mut OutputBuffer,
+    key: &ArrayKey,
+) {
     match key {
         ArrayKey::Int(index) => output.write_test_str(&format!("[{index}]=>\n")),
         ArrayKey::String(key) => {
@@ -10134,7 +7807,7 @@ fn write_array_key_dump(output: &mut OutputBuffer, key: &ArrayKey) {
     }
 }
 
-fn var_export_value_starts_multiline(value: &Value) -> bool {
+pub(in crate::builtins::modules) fn var_export_value_starts_multiline(value: &Value) -> bool {
     match value {
         Value::Array(_) | Value::Object(_) => true,
         Value::Reference(cell) => var_export_value_starts_multiline(&cell.get()),
@@ -10142,7 +7815,7 @@ fn var_export_value_starts_multiline(value: &Value) -> bool {
     }
 }
 
-fn print_r_value_starts_multiline(value: &Value) -> bool {
+pub(in crate::builtins::modules) fn print_r_value_starts_multiline(value: &Value) -> bool {
     match value {
         Value::Array(_) | Value::Object(_) => true,
         Value::Reference(cell) => print_r_value_starts_multiline(&cell.get()),
@@ -10150,21 +7823,21 @@ fn print_r_value_starts_multiline(value: &Value) -> bool {
     }
 }
 
-fn write_print_r_key(output: &mut OutputBuffer, key: &ArrayKey) {
+pub(in crate::builtins::modules) fn write_print_r_key(output: &mut OutputBuffer, key: &ArrayKey) {
     match key {
         ArrayKey::Int(index) => output.write_test_str(&format!("[{index}]")),
         ArrayKey::String(key) => output.write_test_str(&format!("[{}]", key.to_string_lossy())),
     }
 }
 
-fn write_export_key(output: &mut OutputBuffer, key: &ArrayKey) {
+pub(in crate::builtins::modules) fn write_export_key(output: &mut OutputBuffer, key: &ArrayKey) {
     match key {
         ArrayKey::Int(index) => output.write_test_str(&index.to_string()),
         ArrayKey::String(key) => write_export_string(output, &key.to_string_lossy()),
     }
 }
 
-fn write_export_string(output: &mut OutputBuffer, text: &str) {
+pub(in crate::builtins::modules) fn write_export_string(output: &mut OutputBuffer, text: &str) {
     if text.contains('\0') {
         let mut segments = text.split('\0');
         write_export_single_quoted_string(output, segments.next().unwrap_or_default());
@@ -10177,7 +7850,10 @@ fn write_export_string(output: &mut OutputBuffer, text: &str) {
     write_export_single_quoted_string(output, text);
 }
 
-fn write_export_single_quoted_string(output: &mut OutputBuffer, text: &str) {
+pub(in crate::builtins::modules) fn write_export_single_quoted_string(
+    output: &mut OutputBuffer,
+    text: &str,
+) {
     output.write_test_str("'");
     for character in text.chars() {
         match character {
@@ -10189,7 +7865,10 @@ fn write_export_single_quoted_string(output: &mut OutputBuffer, text: &str) {
     output.write_test_str("'");
 }
 
-fn php_float_debug_string(value: FloatValue, serialize_precision: i32) -> String {
+pub(in crate::builtins::modules) fn php_float_debug_string(
+    value: FloatValue,
+    serialize_precision: i32,
+) -> String {
     let value = value.to_f64();
     if value.is_nan() {
         return "NAN".to_owned();
@@ -10221,7 +7900,7 @@ fn php_float_debug_string(value: FloatValue, serialize_precision: i32) -> String
 /// and serialize when `serialize_precision` is a positive number of significant
 /// digits: trailing zeros are stripped, and scientific notation is chosen when
 /// the decimal point falls before -4 or after `ndigit` significant digits.
-fn php_gcvt(value: f64, ndigit: usize) -> String {
+pub(in crate::builtins::modules) fn php_gcvt(value: f64, ndigit: usize) -> String {
     let ndigit = ndigit.max(1);
     if value == 0.0 {
         return "0".to_owned();
@@ -10267,7 +7946,7 @@ fn php_gcvt(value: f64, ndigit: usize) -> String {
     out
 }
 
-fn php_float_debug_scientific_string(value: f64) -> String {
+pub(in crate::builtins::modules) fn php_float_debug_scientific_string(value: f64) -> String {
     // Rust's `{:E}` uses the shortest digit sequence that round-trips, matching
     // PHP var_dump under serialize_precision=-1; we only reshape the exponent to
     // PHP's `E+dd` form and ensure a `.0` mantissa fraction.
@@ -10294,7 +7973,7 @@ fn php_float_debug_scientific_string(value: f64) -> String {
     )
 }
 
-fn php_float_export_string(value: FloatValue) -> String {
+pub(in crate::builtins::modules) fn php_float_export_string(value: FloatValue) -> String {
     let value = value.to_f64();
     if value.is_nan() {
         return "NAN".to_owned();
@@ -10314,7 +7993,7 @@ fn php_float_export_string(value: FloatValue) -> String {
     formatted
 }
 
-fn write_indent(output: &mut OutputBuffer, spaces: usize) {
+pub(in crate::builtins::modules) fn write_indent(output: &mut OutputBuffer, spaces: usize) {
     output.write_bytes(vec![b' '; spaces]);
 }
 
@@ -12471,26 +10150,26 @@ mod tests {
             "var_dump",
             vec![
                 Value::user_function_callable("test1"),
-                Value::closure_with_debug(
-                    3,
-                    Vec::new(),
-                    Some(crate::ClosureDebugInfo {
+                Value::closure(crate::ClosurePayload::new(3, Vec::new()).with_debug(Some(
+                    crate::ClosureDebugInfo {
                         name: "{closure:/tmp/source.php:7}".to_owned(),
                         file: "/tmp/source.php".to_owned(),
                         line: 7,
-                    }),
-                ),
-                Value::closure_with_debug(
-                    4,
-                    vec![crate::ClosureCaptureValue::by_value(
-                        "x".to_owned(),
-                        Value::Int(2),
-                    )],
-                    Some(crate::ClosureDebugInfo {
+                    },
+                ))),
+                Value::closure(
+                    crate::ClosurePayload::new(
+                        4,
+                        vec![crate::ClosureCaptureValue::by_value(
+                            "x".to_owned(),
+                            Value::Int(2),
+                        )],
+                    )
+                    .with_debug(Some(crate::ClosureDebugInfo {
                         name: "{closure:/tmp/source.php:9}".to_owned(),
                         file: "/tmp/source.php".to_owned(),
                         line: 9,
-                    }),
+                    })),
                 ),
             ],
             &mut output,

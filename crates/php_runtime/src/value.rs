@@ -17,17 +17,78 @@ pub struct ClosureDebugInfo {
     pub line: i64,
 }
 
-/// Borrowed runtime closure payload.
-pub type ClosurePayloadRef<'a> = (
-    u32,
-    &'a Vec<ClosureCaptureValue>,
-    Option<&'a ObjectRef>,
-    Option<&'a ClosureDebugInfo>,
-    Option<usize>,
-    Option<&'a String>,
-    Option<&'a String>,
-    Option<&'a String>,
-);
+/// Lexical and dynamic class context carried by a runtime closure.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClosureContext {
+    /// Optional owning dynamic VM unit for closures created by include/eval.
+    pub owner_unit: Option<usize>,
+    /// Lexical class scope captured when the closure was created.
+    pub scope_class: Option<String>,
+    /// Late-bound class captured when the closure was created.
+    pub called_class: Option<String>,
+    /// Declaring class captured when the closure was created.
+    pub declaring_class: Option<String>,
+}
+
+/// Runtime closure payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosurePayload {
+    /// PHP-visible object handle for the Closure instance.
+    pub id: u64,
+    /// Raw `php_ir::FunctionId`.
+    pub function: u32,
+    /// Captured values in deterministic capture order.
+    pub captures: Vec<ClosureCaptureValue>,
+    /// Object bound as `$this` when the closure was created.
+    pub bound_this: Option<ObjectRef>,
+    /// Optional source metadata used by debug output.
+    pub debug: Option<ClosureDebugInfo>,
+    /// Lexical and dynamic class context.
+    pub context: ClosureContext,
+}
+
+impl ClosurePayload {
+    /// Creates a closure payload with a fresh PHP-visible Closure object handle.
+    #[must_use]
+    pub fn new(function: u32, captures: Vec<ClosureCaptureValue>) -> Self {
+        Self {
+            id: next_object_id(),
+            function,
+            captures,
+            bound_this: None,
+            debug: None,
+            context: ClosureContext::default(),
+        }
+    }
+
+    /// Attaches PHP debug metadata.
+    #[must_use]
+    pub fn with_debug(mut self, debug: Option<ClosureDebugInfo>) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// Attaches an object bound as `$this`.
+    #[must_use]
+    pub fn with_bound_this(mut self, bound_this: Option<ObjectRef>) -> Self {
+        self.bound_this = bound_this;
+        self
+    }
+
+    /// Attaches lexical class context.
+    #[must_use]
+    pub fn with_context(mut self, context: ClosureContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Stamps the owning dynamic VM unit that created this closure.
+    #[must_use]
+    pub fn with_owner_unit(mut self, owner_unit: Option<usize>) -> Self {
+        self.context.owner_unit = owner_unit;
+        self
+    }
+}
 
 /// Runtime callable values.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,26 +100,7 @@ pub enum CallableValue {
     },
     /// runtime closure value. The function ID is stored as its stable raw IR ID
     /// to keep `php_runtime` independent from `php_ir`.
-    Closure {
-        /// PHP-visible object handle for the Closure instance.
-        id: u64,
-        /// Raw `php_ir::FunctionId`.
-        function: u32,
-        /// Captured values in deterministic capture order.
-        captures: Vec<ClosureCaptureValue>,
-        /// Object bound as `$this` when the closure was created.
-        bound_this: Option<ObjectRef>,
-        /// Optional source metadata used by debug output.
-        debug: Option<ClosureDebugInfo>,
-        /// Optional owning dynamic VM unit for closures created by include/eval.
-        owner_unit: Option<usize>,
-        /// Lexical class scope captured when the closure was created.
-        scope_class: Option<String>,
-        /// Late-bound class captured when the closure was created.
-        called_class: Option<String>,
-        /// Declaring class captured when the closure was created.
-        declaring_class: Option<String>,
-    },
+    Closure(ClosurePayload),
     /// Internal builtin resolved by deterministic builtin name.
     InternalBuiltin {
         /// Normalized builtin name.
@@ -241,97 +283,8 @@ impl Value {
 
     /// Creates a runtime closure callable value.
     #[must_use]
-    pub fn closure(function: u32, captures: Vec<ClosureCaptureValue>) -> Self {
-        Self::Callable(CallableValue::Closure {
-            id: next_object_id(),
-            function,
-            captures,
-            bound_this: None,
-            debug: None,
-            owner_unit: None,
-            scope_class: None,
-            called_class: None,
-            declaring_class: None,
-        })
-    }
-
-    /// Creates a runtime closure callable value with PHP debug metadata.
-    #[must_use]
-    pub fn closure_with_debug(
-        function: u32,
-        captures: Vec<ClosureCaptureValue>,
-        debug: Option<ClosureDebugInfo>,
-    ) -> Self {
-        Self::Callable(CallableValue::Closure {
-            id: next_object_id(),
-            function,
-            captures,
-            bound_this: None,
-            debug,
-            owner_unit: None,
-            scope_class: None,
-            called_class: None,
-            declaring_class: None,
-        })
-    }
-
-    /// Creates a runtime closure callable value with PHP debug metadata and an
-    /// object bound as `$this`.
-    #[must_use]
-    pub fn closure_with_debug_and_this(
-        function: u32,
-        captures: Vec<ClosureCaptureValue>,
-        debug: Option<ClosureDebugInfo>,
-        bound_this: Option<ObjectRef>,
-    ) -> Self {
-        Self::Callable(CallableValue::Closure {
-            id: next_object_id(),
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit: None,
-            scope_class: None,
-            called_class: None,
-            declaring_class: None,
-        })
-    }
-
-    /// Creates a runtime closure callable value with PHP debug metadata, an
-    /// optional bound `$this`, and lexical class context.
-    #[must_use]
-    pub fn closure_with_debug_this_and_context(
-        function: u32,
-        captures: Vec<ClosureCaptureValue>,
-        debug: Option<ClosureDebugInfo>,
-        bound_this: Option<ObjectRef>,
-        scope_class: Option<String>,
-        called_class: Option<String>,
-        declaring_class: Option<String>,
-    ) -> Self {
-        Self::Callable(CallableValue::Closure {
-            id: next_object_id(),
-            function,
-            captures,
-            bound_this,
-            debug,
-            owner_unit: None,
-            scope_class,
-            called_class,
-            declaring_class,
-        })
-    }
-
-    /// Stamps a closure with the owning dynamic VM unit that created it.
-    #[must_use]
-    pub fn with_closure_owner_unit(mut self, owner_unit: Option<usize>) -> Self {
-        if let Self::Callable(CallableValue::Closure {
-            owner_unit: stored, ..
-        }) = &mut self
-        {
-            *stored = owner_unit;
-        }
-        self
+    pub fn closure(payload: ClosurePayload) -> Self {
+        Self::Callable(CallableValue::Closure(payload))
     }
 
     /// Creates a resolved user-function callable value.
@@ -378,28 +331,9 @@ impl Value {
 
     /// Returns closure payload when this value is a runtime closure.
     #[must_use]
-    pub fn as_closure(&self) -> Option<ClosurePayloadRef<'_>> {
+    pub fn as_closure(&self) -> Option<&ClosurePayload> {
         match self {
-            Self::Callable(CallableValue::Closure {
-                function,
-                captures,
-                bound_this,
-                debug,
-                owner_unit,
-                scope_class,
-                called_class,
-                declaring_class,
-                ..
-            }) => Some((
-                *function,
-                captures,
-                bound_this.as_ref(),
-                debug.as_ref(),
-                *owner_unit,
-                scope_class.as_ref(),
-                called_class.as_ref(),
-                declaring_class.as_ref(),
-            )),
+            Self::Callable(CallableValue::Closure(payload)) => Some(payload),
             _ => None,
         }
     }
@@ -453,14 +387,13 @@ impl fmt::Debug for Value {
                 .field("kind", &"user_function")
                 .field("name", name)
                 .finish(),
-            Self::Callable(CallableValue::Closure {
-                function, captures, ..
-            }) => f
+            Self::Callable(CallableValue::Closure(payload)) => f
                 .debug_struct("Closure")
-                .field("function", function)
+                .field("function", &payload.function)
                 .field(
                     "captures",
-                    &captures
+                    &payload
+                        .captures
                         .iter()
                         .map(|capture| capture.name.as_str())
                         .collect::<Vec<_>>(),

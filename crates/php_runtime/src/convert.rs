@@ -702,9 +702,9 @@ mod tests {
 
     #[test]
     fn closure_callables_are_identical_by_handle() {
-        let closure = Value::closure(1, Vec::new());
+        let closure = Value::closure(crate::ClosurePayload::new(1, Vec::new()));
         let same_handle = closure.clone();
-        let other = Value::closure(1, Vec::new());
+        let other = Value::closure(crate::ClosurePayload::new(1, Vec::new()));
 
         assert!(identical(&closure, &same_handle));
         assert!(!identical(&closure, &other));

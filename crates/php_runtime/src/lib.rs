@@ -99,7 +99,8 @@ pub use string::PhpString;
 pub use todo_runtime::{RuntimeTodo, runtime_skeleton_status};
 pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
 pub use value::{
-    CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureDebugInfo, FloatValue, Value,
+    CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
+    ClosurePayload, FloatValue, Value,
 };
 
 #[cfg(test)]
@@ -211,13 +212,13 @@ mod tests {
         let builtin = Value::internal_builtin_callable("trim");
         let method = Value::method_callable_placeholder("C::m");
         let unresolved = Value::unresolved_callable("$dynamic");
-        let closure = Value::closure(
+        let closure = Value::closure(crate::ClosurePayload::new(
             7,
             vec![crate::ClosureCaptureValue::by_value(
                 "x".to_owned(),
                 Value::Int(3),
             )],
-        );
+        ));
 
         assert!(matches!(
             user,
@@ -228,7 +229,7 @@ mod tests {
         assert!(format!("{unresolved:?}").contains("unresolved_dynamic"));
         assert!(matches!(
             closure.as_closure(),
-            Some((7, captures, None, None, None, None, None, None)) if captures.len() == 1
+            Some(payload) if payload.function == 7 && payload.captures.len() == 1
         ));
     }
 }

@@ -905,21 +905,19 @@ mod tests {
             Some(Value::String(crate::PhpString::from_test_str("ready")))
         );
 
-        let closure = Value::closure(
+        let closure = Value::closure(crate::ClosurePayload::new(
             29,
             vec![crate::ClosureCaptureValue::by_value(
                 "captured".to_owned(),
                 Value::String(crate::PhpString::from_test_str("cap")),
             )],
-        );
+        ));
         match closure {
-            Value::Callable(crate::CallableValue::Closure {
-                function, captures, ..
-            }) => {
-                assert_eq!(function, 29);
-                assert_eq!(captures[0].name, "captured");
+            Value::Callable(crate::CallableValue::Closure(payload)) => {
+                assert_eq!(payload.function, 29);
+                assert_eq!(payload.captures[0].name, "captured");
                 assert_eq!(
-                    captures[0].value(),
+                    payload.captures[0].value(),
                     Some(&Value::String(crate::PhpString::from_test_str("cap")))
                 );
             }

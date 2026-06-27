@@ -326,15 +326,11 @@ impl GcTrackedHeap {
                 let value = cell.borrow();
                 self.track_value_inner(&value, seen);
             }
-            Value::Callable(CallableValue::Closure {
-                captures,
-                bound_this,
-                ..
-            }) => {
-                if let Some(bound_this) = bound_this {
+            Value::Callable(CallableValue::Closure(payload)) => {
+                if let Some(bound_this) = &payload.bound_this {
                     self.track_value_inner(&Value::Object(bound_this.clone()), seen);
                 }
-                for capture in captures {
+                for capture in &payload.captures {
                     if let Some(value) = capture.value() {
                         self.track_value_inner(value, seen);
                     }
@@ -438,20 +434,17 @@ impl GcScanner {
                 }
                 vec![id]
             }
-            Value::Callable(CallableValue::Closure {
-                captures,
-                bound_this,
-                ..
-            }) => {
+            Value::Callable(CallableValue::Closure(payload)) => {
                 self.next_closure_id = self.next_closure_id.saturating_add(1);
                 let id = GcEntityId::new(GcEntityKind::Closure, self.next_closure_id);
                 self.ensure_node(id, None);
-                let edges = bound_this
+                let edges = payload
+                    .bound_this
                     .as_ref()
                     .map(|object| self.scan_value(&Value::Object(object.clone())))
                     .unwrap_or_default()
                     .into_iter()
-                    .chain(captures.iter().flat_map(|capture| {
+                    .chain(payload.captures.iter().flat_map(|capture| {
                         capture
                             .value()
                             .map_or_else(Vec::new, |value| self.scan_value(value))
@@ -608,13 +601,13 @@ mod tests {
         let class = empty_class("Captured");
         let object = ObjectRef::new(&class);
         let cell = ReferenceCell::new(Value::Object(object.clone()));
-        let closure = Value::closure(
+        let closure = Value::closure(crate::ClosurePayload::new(
             7,
             vec![ClosureCaptureValue::by_reference(
                 "x".to_owned(),
                 cell.clone(),
             )],
-        );
+        ));
 
         let snapshot = scan_roots([
             GcRoot::slot(
