@@ -141,9 +141,9 @@ set +e
   --php-src "$php_src" \
   --work-dir "$run_dir/work" \
   --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-30}" \
-  "${reuse_args[@]}" \
-  "${dev_reuse_args[@]}" \
-  "${job_args[@]}"
+  ${reuse_args[@]+"${reuse_args[@]}"} \
+  ${dev_reuse_args[@]+"${dev_reuse_args[@]}"} \
+  ${job_args[@]+"${job_args[@]}"}
 run_status=$?
 set -e
 
@@ -160,7 +160,7 @@ fi
   --module-counts "$module_counts" \
   --report "$report" \
   --timestamp "$timestamp" \
-  "${previous_args[@]}"
+  ${previous_args[@]+"${previous_args[@]}"}
 
 "$phpt_tool" triage \
   --corpus "$corpus" \
