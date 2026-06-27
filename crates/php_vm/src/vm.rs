@@ -8220,35 +8220,10 @@ impl Vm {
                             method_entry.function,
                         );
                         let has_magic_call = class_has_public_magic_call(&class_owner, &class);
-                        if method_entry.flags.is_static {
-                            self.record_counter_method_call_profile(
-                                method_call_profile_observation(
-                                    &method_callsite,
-                                    &lowered_method,
-                                    &receiver_class,
-                                    &class,
-                                    Some((&class_owner, declaring_class, method_entry)),
-                                    scope.as_deref(),
-                                    epoch,
-                                    has_magic_call,
-                                    false,
-                                    simple_positional_arguments,
-                                    has_by_ref_argument,
-                                    callee_jit_eligible,
-                                    false,
-                                    vec!["static_method"],
-                                ),
-                            );
-                            return self.runtime_error(
-                                output,
-                                compiled,
-                                stack,
-                                format!(
-                                    "E_PHP_VM_STATIC_METHOD_AS_INSTANCE: method {}::{} is static",
-                                    declaring_class.name, method_entry.name
-                                ),
-                            );
-                        }
+                        // PHP permits calling a static method through an instance
+                        // (`$obj->staticMethod()`); it runs as a static call. Fall
+                        // through to the normal dispatch — a static body never uses
+                        // `$this`, so the bound receiver is inert.
                         self.record_counter_method_call_profile(method_call_profile_observation(
                             &method_callsite,
                             &lowered_method,
@@ -8638,15 +8613,26 @@ impl Vm {
                         let method_entry = resolved.method;
                         let declaring_class = resolved.class;
                         if !method_entry.flags.is_static {
-                            return self.runtime_error(
-                                output,
-                                compiled,
-                                stack,
-                                format!(
-                                    "E_PHP_VM_NON_STATIC_METHOD_CALL: method {}::{} is not static",
-                                    declaring_class.name, method_entry.name
-                                ),
+                            let message = format!(
+                                "E_PHP_VM_NON_STATIC_METHOD_CALL: Non-static method {}::{}() cannot be called statically",
+                                declaring_class.display_name, method_entry.name
                             );
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
                         }
                         // A private/protected static method that is inaccessible
                         // from the current scope routes to __callStatic (or fails);
@@ -11755,17 +11741,8 @@ impl Vm {
                 ),
             );
         };
-        if method_entry.flags.is_static {
-            return self.runtime_error(
-                output,
-                compiled,
-                stack,
-                format!(
-                    "E_PHP_VM_STATIC_METHOD_AS_INSTANCE: method {}::{} is static",
-                    declaring_class.name, method_entry.name
-                ),
-            );
-        }
+        // A static method reached through an instance/callable runs as a static
+        // call; PHP allows this, so do not reject it here.
         if let Err(message) =
             validate_method_callable(&owner, stack, &declaring_class, &method_entry)
         {
@@ -11929,17 +11906,7 @@ impl Vm {
         };
         let method_entry = resolved.method;
         let declaring_class = resolved.class;
-        if method_entry.flags.is_static {
-            return self.runtime_error(
-                output,
-                compiled,
-                stack,
-                format!(
-                    "E_PHP_VM_STATIC_METHOD_AS_INSTANCE: method {}::{} is static",
-                    declaring_class.name, method_entry.name
-                ),
-            );
-        }
+        // PHP allows reaching a static method through an instance; run it.
         if (method_entry.flags.is_private || method_entry.flags.is_protected)
             && let Err(message) =
                 validate_method_callable(compiled, stack, declaring_class, method_entry)
@@ -22126,7 +22093,8 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         | "E_PHP_VM_ABSTRACT_METHOD_CALL"
         | "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
         | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS"
-        | "E_PHP_VM_UNKNOWN_STATIC_PROPERTY" => "Error",
+        | "E_PHP_VM_UNKNOWN_STATIC_PROPERTY"
+        | "E_PHP_VM_NON_STATIC_METHOD_CALL" => "Error",
         _ => return None,
     };
     let message = diagnostic
