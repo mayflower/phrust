@@ -6011,7 +6011,22 @@ impl Vm {
                                 resolved.class,
                                 resolved.constant,
                             ) {
-                                return self.runtime_error(output, compiled, stack, message);
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
                             }
                             let cache_scope = if resolved.constant.flags.is_private
                                 || resolved.constant.flags.is_protected
@@ -18239,22 +18254,22 @@ fn validate_constant_access(
         let scope = current_scope_class(compiled, stack);
         if scope.as_deref() != Some(normalize_class_name(&class.name).as_str()) {
             return Err(format!(
-                "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS: constant {}::{} is private",
-                class.name, constant.name
+                "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS: Cannot access private constant {}::{}",
+                class.display_name, constant.name
             ));
         }
     }
     if constant.flags.is_protected {
         let Some(scope) = current_scope_class(compiled, stack) else {
             return Err(format!(
-                "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS: constant {}::{} is protected",
-                class.name, constant.name
+                "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS: Cannot access protected constant {}::{}",
+                class.display_name, constant.name
             ));
         };
         if !class_is_or_extends(compiled, &scope, &class.name)? {
             return Err(format!(
-                "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS: constant {}::{} is protected",
-                class.name, constant.name
+                "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS: Cannot access protected constant {}::{}",
+                class.display_name, constant.name
             ));
         }
     }
@@ -22094,7 +22109,9 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         | "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
         | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS"
         | "E_PHP_VM_UNKNOWN_STATIC_PROPERTY"
-        | "E_PHP_VM_NON_STATIC_METHOD_CALL" => "Error",
+        | "E_PHP_VM_NON_STATIC_METHOD_CALL"
+        | "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS"
+        | "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS" => "Error",
         _ => return None,
     };
     let message = diagnostic
