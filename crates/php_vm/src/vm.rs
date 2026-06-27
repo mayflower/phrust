@@ -8196,7 +8196,8 @@ impl Vm {
                                         if let Some(throwable) = runtime_error_throwable(&result) {
                                             tag_throwable_location(
                                                 &throwable,
-                                                runtime_source_span(compiled, instruction.span),
+                                                compiled,
+                                                instruction.span,
                                             );
                                             if let Some(target) = handle_throw(
                                                 compiled,
@@ -8233,10 +8234,7 @@ impl Vm {
                             }
                             let result = self.runtime_error(output, compiled, stack, message);
                             if let Some(throwable) = runtime_error_throwable(&result) {
-                                tag_throwable_location(
-                                    &throwable,
-                                    runtime_source_span(compiled, instruction.span),
-                                );
+                                tag_throwable_location(&throwable, compiled, instruction.span);
                                 if let Some(target) = handle_throw(
                                     compiled,
                                     throwable.clone(),
@@ -15435,12 +15433,14 @@ fn catch_matches(
 
 /// Stamps a synthesized throwable with the file/line of the failing operation so
 /// its `Fatal error: …` rendering and getFile/getLine report a real location.
-fn tag_throwable_location(throwable: &Value, span: RuntimeSourceSpan) {
+fn tag_throwable_location(throwable: &Value, compiled: &CompiledUnit, span: php_ir::IrSpan) {
     if let Value::Object(object) = throwable {
-        if let Some(file) = span.file {
-            object.set_property("file", Value::string(file.into_bytes()));
+        if let Some(file) = compiled.unit().files.get(span.file.index()) {
+            object.set_property("file", Value::string(file.path.clone().into_bytes()));
         }
-        object.set_property("line", Value::Int(i64::from(span.start)));
+        let line = source_span_display_line(compiled, span, false)
+            .unwrap_or_else(|| i64::from(span.start));
+        object.set_property("line", Value::Int(line));
     }
 }
 
