@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use php_ir::ids::{LocalId, RegId};
 use php_ir::instruction::UnaryOp;
 use php_ir::instruction::{IrCallArg, IrCallArgValueKind, Terminator, TerminatorKind};
 use php_ir::source_map::{IrSourceMapTarget, IrSpan};
@@ -86,6 +87,20 @@ pub enum DenseOpcode {
     LoadLocalEcho = 39,
     /// `rN = lhs . rhs; echo rN`.
     BinaryConcatEcho = 40,
+    /// `rN = []`.
+    NewArray = 41,
+    /// Insert or append one value into an array register.
+    ArrayInsert = 42,
+    /// `rN = array[key]`.
+    FetchDim = 43,
+    /// `local[dims...] = value`.
+    AssignDim = 44,
+    /// `local[dims...][] = value`.
+    AppendDim = 45,
+    /// Initialize a by-value foreach iterator.
+    ForeachInit = 46,
+    /// Advance a by-value foreach iterator.
+    ForeachNext = 47,
     /// Emit one operand to output.
     Echo = 7,
     /// Jump to a dense block index.
@@ -149,6 +164,13 @@ impl DenseOpcode {
             Self::LoadConstEcho => "load_const_echo",
             Self::LoadLocalEcho => "load_local_echo",
             Self::BinaryConcatEcho => "binary_concat_echo",
+            Self::NewArray => "new_array",
+            Self::ArrayInsert => "array_insert",
+            Self::FetchDim => "fetch_dim",
+            Self::AssignDim => "assign_dim",
+            Self::AppendDim => "append_dim",
+            Self::ForeachInit => "foreach_init",
+            Self::ForeachNext => "foreach_next",
             Self::Echo => "echo",
             Self::Jump => "jump",
             Self::JumpIfFalse => "jump_if_false",
@@ -263,7 +285,39 @@ pub enum DenseOperands {
     Call {
         dst: u32,
         name: u32,
-        args: Vec<DenseOperand>,
+        args: Vec<DenseCallArg>,
+    },
+    /// Register destination only.
+    Dst { dst: u32 },
+    /// Array insert/append operands.
+    ArrayInsert {
+        array: u32,
+        key: Option<DenseOperand>,
+        value: DenseOperand,
+        by_ref_local: Option<u32>,
+    },
+    /// Array dimension fetch operands.
+    FetchDim {
+        dst: u32,
+        array: DenseOperand,
+        key: DenseOperand,
+        quiet: bool,
+    },
+    /// Local array dimension assignment/append operands.
+    AssignDim {
+        dst: u32,
+        local: u32,
+        dims: Vec<DenseOperand>,
+        value: DenseOperand,
+    },
+    /// Foreach iterator initialization.
+    ForeachInit { iterator: u32, source: DenseOperand },
+    /// Foreach iterator advance.
+    ForeachNext {
+        has_value: u32,
+        iterator: u32,
+        key: Option<u32>,
+        value: u32,
     },
     /// One generic operand.
     Operand { src: DenseOperand },
@@ -282,6 +336,41 @@ pub enum DenseOperands {
     },
     /// Optional return operand.
     Return { value: Option<DenseOperand> },
+}
+
+/// One dense function-call argument with call-shape metadata preserved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseCallArg {
+    /// Optional named-argument name side-table index.
+    pub name: Option<u32>,
+    /// Evaluated value operand.
+    pub value: DenseOperand,
+    /// Source value class for by-reference send compatibility.
+    pub value_kind: IrCallArgValueKind,
+    /// Caller local when this argument can satisfy a by-reference parameter.
+    pub by_ref_local: Option<u32>,
+    /// Caller array dimension when this argument can satisfy a by-reference parameter.
+    pub by_ref_dim: Option<DenseCallDimTarget>,
+    /// Caller property when this argument can satisfy a by-reference parameter.
+    pub by_ref_property: Option<DenseCallPropertyTarget>,
+}
+
+/// Dense by-reference array-dimension call target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseCallDimTarget {
+    /// Root caller local.
+    pub local: u32,
+    /// Evaluated dimension operands.
+    pub dims: Vec<DenseOperand>,
+}
+
+/// Dense by-reference property call target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseCallPropertyTarget {
+    /// Evaluated object operand.
+    pub object: DenseOperand,
+    /// Static property name side-table index.
+    pub property: u32,
 }
 
 /// One dense instruction.
@@ -681,7 +770,87 @@ fn lower_instruction(
             DenseOperands::Call {
                 dst: dst.raw(),
                 name: push_name(names, name).index() as u32,
-                args: lower_simple_call_args(instruction, args)?,
+                args: lower_call_args(instruction, names, args)?,
+            },
+        ),
+        InstructionKind::NewArray { dst } => {
+            (DenseOpcode::NewArray, DenseOperands::Dst { dst: dst.raw() })
+        }
+        InstructionKind::ArrayInsert {
+            array,
+            key,
+            value,
+            by_ref_local,
+        } => (
+            DenseOpcode::ArrayInsert,
+            DenseOperands::ArrayInsert {
+                array: array.raw(),
+                key: key.map(lower_operand),
+                value: lower_operand(*value),
+                by_ref_local: by_ref_local.map(LocalId::raw),
+            },
+        ),
+        InstructionKind::FetchDim {
+            dst,
+            array,
+            key,
+            quiet,
+        } => (
+            DenseOpcode::FetchDim,
+            DenseOperands::FetchDim {
+                dst: dst.raw(),
+                array: lower_operand(*array),
+                key: lower_operand(*key),
+                quiet: *quiet,
+            },
+        ),
+        InstructionKind::AssignDim {
+            dst,
+            local,
+            dims,
+            value,
+        } => (
+            DenseOpcode::AssignDim,
+            DenseOperands::AssignDim {
+                dst: dst.raw(),
+                local: local.raw(),
+                dims: dims.iter().copied().map(lower_operand).collect(),
+                value: lower_operand(*value),
+            },
+        ),
+        InstructionKind::AppendDim {
+            dst,
+            local,
+            dims,
+            value,
+        } => (
+            DenseOpcode::AppendDim,
+            DenseOperands::AssignDim {
+                dst: dst.raw(),
+                local: local.raw(),
+                dims: dims.iter().copied().map(lower_operand).collect(),
+                value: lower_operand(*value),
+            },
+        ),
+        InstructionKind::ForeachInit { iterator, source } => (
+            DenseOpcode::ForeachInit,
+            DenseOperands::ForeachInit {
+                iterator: iterator.raw(),
+                source: lower_operand(*source),
+            },
+        ),
+        InstructionKind::ForeachNext {
+            has_value,
+            iterator,
+            key,
+            value,
+        } => (
+            DenseOpcode::ForeachNext,
+            DenseOperands::ForeachNext {
+                has_value: has_value.raw(),
+                iterator: iterator.raw(),
+                key: key.map(RegId::raw),
+                value: value.raw(),
             },
         ),
         InstructionKind::Echo { src } => (
@@ -788,25 +957,39 @@ fn lower_operand(operand: Operand) -> DenseOperand {
     }
 }
 
-fn lower_simple_call_args(
+fn lower_call_args(
     instruction: &Instruction,
+    names: &mut Vec<String>,
     args: &[IrCallArg],
-) -> Result<Vec<DenseOperand>, DenseLowerError> {
+) -> Result<Vec<DenseCallArg>, DenseLowerError> {
     let mut lowered = Vec::with_capacity(args.len());
     for arg in args {
-        if arg.name.is_some()
-            || arg.unpack
-            || arg.value_kind != IrCallArgValueKind::Direct
-            || arg.by_ref_local.is_some()
-            || arg.by_ref_dim.is_some()
-            || arg.by_ref_property.is_some()
-        {
+        if arg.unpack {
             return unsupported_instruction(
                 instruction,
-                "CallFunction with named, unpacked, or by-reference arguments".to_string(),
+                "CallFunction with unpacked arguments".to_string(),
             );
         }
-        lowered.push(lower_operand(arg.value));
+        lowered.push(DenseCallArg {
+            name: arg
+                .name
+                .as_ref()
+                .map(|name| push_name(names, name).index() as u32),
+            value: lower_operand(arg.value),
+            value_kind: arg.value_kind,
+            by_ref_local: arg.by_ref_local.map(LocalId::raw),
+            by_ref_dim: arg.by_ref_dim.as_ref().map(|target| DenseCallDimTarget {
+                local: target.local.raw(),
+                dims: target.dims.iter().copied().map(lower_operand).collect(),
+            }),
+            by_ref_property: arg
+                .by_ref_property
+                .as_ref()
+                .map(|target| DenseCallPropertyTarget {
+                    object: lower_operand(target.object),
+                    property: push_name(names, &target.property).index() as u32,
+                }),
+        });
     }
     Ok(lowered)
 }
@@ -1075,8 +1258,75 @@ fn verify_instruction(
             verify_register(*dst, function, errors);
             verify_name(*name, unit, errors);
             for arg in args {
-                verify_operand(*arg, unit, function, errors);
+                verify_call_arg(arg, unit, function, errors);
             }
+        }
+        (DenseOpcode::NewArray, DenseOperands::Dst { dst }) => {
+            verify_register(*dst, function, errors);
+        }
+        (
+            DenseOpcode::ArrayInsert,
+            DenseOperands::ArrayInsert {
+                array,
+                key,
+                value,
+                by_ref_local,
+            },
+        ) => {
+            verify_register(*array, function, errors);
+            if let Some(key) = key {
+                verify_operand(*key, unit, function, errors);
+            }
+            verify_operand(*value, unit, function, errors);
+            if let Some(local) = by_ref_local {
+                verify_local(*local, function, errors);
+            }
+        }
+        (
+            DenseOpcode::FetchDim,
+            DenseOperands::FetchDim {
+                dst, array, key, ..
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*array, unit, function, errors);
+            verify_operand(*key, unit, function, errors);
+        }
+        (
+            DenseOpcode::AssignDim | DenseOpcode::AppendDim,
+            DenseOperands::AssignDim {
+                dst,
+                local,
+                dims,
+                value,
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_local(*local, function, errors);
+            for dim in dims {
+                verify_operand(*dim, unit, function, errors);
+            }
+            verify_operand(*value, unit, function, errors);
+        }
+        (DenseOpcode::ForeachInit, DenseOperands::ForeachInit { iterator, source }) => {
+            verify_register(*iterator, function, errors);
+            verify_operand(*source, unit, function, errors);
+        }
+        (
+            DenseOpcode::ForeachNext,
+            DenseOperands::ForeachNext {
+                has_value,
+                iterator,
+                key,
+                value,
+            },
+        ) => {
+            verify_register(*has_value, function, errors);
+            verify_register(*iterator, function, errors);
+            if let Some(key) = key {
+                verify_register(*key, function, errors);
+            }
+            verify_register(*value, function, errors);
         }
         (DenseOpcode::Echo, DenseOperands::Operand { src }) => {
             verify_operand(*src, unit, function, errors);
@@ -1131,6 +1381,31 @@ fn verify_operand(
         DenseOperandKind::Register => verify_register(operand.index, function, errors),
         DenseOperandKind::Local => verify_local(operand.index, function, errors),
         DenseOperandKind::Constant => verify_constant(operand.index, unit, errors),
+    }
+}
+
+fn verify_call_arg(
+    arg: &DenseCallArg,
+    unit: &DenseBytecodeUnit,
+    function: &DenseFunction,
+    errors: &mut Vec<DenseVerifyError>,
+) {
+    if let Some(name) = arg.name {
+        verify_name(name, unit, errors);
+    }
+    verify_operand(arg.value, unit, function, errors);
+    if let Some(local) = arg.by_ref_local {
+        verify_local(local, function, errors);
+    }
+    if let Some(target) = &arg.by_ref_dim {
+        verify_local(target.local, function, errors);
+        for dim in &target.dims {
+            verify_operand(*dim, unit, function, errors);
+        }
+    }
+    if let Some(target) = &arg.by_ref_property {
+        verify_operand(target.object, unit, function, errors);
+        verify_name(target.property, unit, errors);
     }
 }
 
@@ -1341,8 +1616,54 @@ fn render_operands(operands: &DenseOperands) -> String {
             format!("r{dst} {} {}", render_operand(*lhs), render_operand(*rhs))
         }
         DenseOperands::Call { dst, name, args } => {
-            let rendered_args: Vec<_> = args.iter().copied().map(render_operand).collect();
+            let rendered_args: Vec<_> = args.iter().map(render_call_arg).collect();
             format!("r{dst} n{name} ({})", rendered_args.join(", "))
+        }
+        DenseOperands::Dst { dst } => format!("r{dst}"),
+        DenseOperands::ArrayInsert {
+            array,
+            key,
+            value,
+            by_ref_local,
+        } => {
+            let key = key.map_or_else(|| "[]".to_string(), render_operand);
+            let suffix = by_ref_local.map_or_else(String::new, |local| format!(" by_ref=l{local}"));
+            format!("r{array} {key} {}{suffix}", render_operand(*value))
+        }
+        DenseOperands::FetchDim {
+            dst,
+            array,
+            key,
+            quiet,
+        } => format!(
+            "r{dst} {} {} quiet={quiet}",
+            render_operand(*array),
+            render_operand(*key)
+        ),
+        DenseOperands::AssignDim {
+            dst,
+            local,
+            dims,
+            value,
+        } => {
+            let dims: Vec<_> = dims.iter().copied().map(render_operand).collect();
+            format!(
+                "r{dst} l{local} [{}] {}",
+                dims.join(", "),
+                render_operand(*value)
+            )
+        }
+        DenseOperands::ForeachInit { iterator, source } => {
+            format!("r{iterator} {}", render_operand(*source))
+        }
+        DenseOperands::ForeachNext {
+            has_value,
+            iterator,
+            key,
+            value,
+        } => {
+            let key = key.map_or_else(|| "-".to_string(), |key| format!("r{key}"));
+            format!("r{has_value} r{iterator} key={key} value=r{value}")
         }
         DenseOperands::Operand { src } => render_operand(*src),
         DenseOperands::Jump { target } => format!("b{target}"),
@@ -1364,6 +1685,23 @@ fn render_operand(operand: DenseOperand) -> String {
         DenseOperandKind::Local => format!("l{}", operand.index),
         DenseOperandKind::Constant => format!("c{}", operand.index),
     }
+}
+
+fn render_call_arg(arg: &DenseCallArg) -> String {
+    let mut out = render_operand(arg.value);
+    if let Some(name) = arg.name {
+        out.push_str(&format!(" name=n{name}"));
+    }
+    if let Some(local) = arg.by_ref_local {
+        out.push_str(&format!(" by_ref=l{local}"));
+    }
+    if let Some(target) = &arg.by_ref_dim {
+        out.push_str(&format!(" by_ref_dim=l{}", target.local));
+    }
+    if let Some(target) = &arg.by_ref_property {
+        out.push_str(&format!(" by_ref_prop=n{}", target.property));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1493,6 +1831,48 @@ echo add(2, 3), "\n";
                 .iter()
                 .any(|item| item.opcode == DenseOpcode::CallFunction)
         );
+    }
+
+    #[test]
+    fn bytecode_lowering_covers_arrays_dims_and_foreach() {
+        let frontend = analyze_source(
+            r#"<?php
+$items = [];
+for ($i = 0; $i < 3; $i++) {
+    $items[] = $i + 1;
+}
+$sum = $items[1];
+foreach ($items as $value) {
+    $sum += $value;
+}
+echo count($items), ":", $sum, "\n";
+"#,
+        );
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "tests/fixtures/performance/perf_smoke/arrays_packed.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("array/foreach IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let dense =
+            DenseBytecodeUnit::lower_from_ir(&result.unit).expect("array/foreach lowers to dense");
+        let opcodes: Vec<_> = dense.functions[0]
+            .instructions
+            .iter()
+            .map(|item| item.opcode)
+            .collect();
+        assert!(opcodes.contains(&DenseOpcode::NewArray));
+        assert!(opcodes.contains(&DenseOpcode::AppendDim));
+        assert!(opcodes.contains(&DenseOpcode::FetchDim));
+        assert!(opcodes.contains(&DenseOpcode::ForeachInit));
+        assert!(opcodes.contains(&DenseOpcode::ForeachNext));
+        assert!(opcodes.contains(&DenseOpcode::CallFunction));
+        assert!(dense.names.iter().any(|name| name == "count"));
     }
 
     #[test]

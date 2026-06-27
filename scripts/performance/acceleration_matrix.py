@@ -30,11 +30,14 @@ DEFAULT_FIXTURES = (
     ROOT / "tests/fixtures/performance/perf_smoke/strings_concat.php",
     ROOT / "tests/fixtures/performance/framework_smoke/router_dispatch.php",
     ROOT / "tests/fixtures/performance/framework_smoke/template_output.php",
+    ROOT / "tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php",
 )
 BYTECODE_STRICT_FIXTURES = {
     "fixtures/runtime/valid/hello.php",
     "fixtures/runtime/valid/scalars/echo.php",
     "fixtures/runtime/valid/functions/simple.php",
+    "tests/fixtures/performance/perf_smoke/arrays_packed.php",
+    "tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php",
 }
 
 

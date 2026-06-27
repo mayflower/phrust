@@ -4,7 +4,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::bytecode::{
-    DenseBytecodeUnit, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
+    DenseBytecodeUnit, DenseCallArg, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
     DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
 };
 use crate::compiled_unit::CompiledUnit;
@@ -36,6 +36,7 @@ use php_ir::instruction::{
 };
 use php_ir::module::{ClassEntry, ClassPropertyEntry, IrUnit};
 use php_ir::operand::Operand;
+use php_ir::source_map::IrSpan;
 use php_ir::verify::verify_unit;
 use php_runtime::IniRegistry;
 use php_runtime::{
@@ -3700,7 +3701,7 @@ impl Vm {
         &self,
         function_id: FunctionId,
         function: &IrFunction,
-        stack: &CallStack,
+        stack: &mut CallStack,
         block_id: BlockId,
         instruction: &Instruction,
         output_len: usize,
@@ -4322,6 +4323,7 @@ impl Vm {
             bind_top_level_global_locals(ir_function, stack, state);
         }
         let unit_id = compiled.unit().id;
+        let mut foreach_iterators: HashMap<RegId, ForeachIterator> = HashMap::new();
         let mut block_index = 0_u32;
         let mut steps = 0_usize;
         'dispatch: loop {
@@ -4840,18 +4842,14 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let mut values = Vec::with_capacity(args.len());
-                        for arg in args {
-                            match self.read_dense_operand(compiled, stack, *arg) {
-                                Ok(value) => values.push(CallArgument::positional(value)),
-                                Err(message) => {
-                                    let result =
-                                        self.runtime_error(output, compiled, stack, message);
-                                    stack.pop_recycle();
-                                    return result;
-                                }
+                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
+                            Ok(values) => values,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
                             }
-                        }
+                        };
                         let lowered_name = normalize_function_name(name);
                         let Some(target) =
                             self.resolve_function_call_target(compiled, state, &lowered_name)
@@ -4891,6 +4889,380 @@ impl Vm {
                             .registers
                             .set(RegId::new(dst), return_value)
                         {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::NewArray => {
+                        let DenseOperands::Dst { dst } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), Value::Array(PhpArray::new()))
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::ArrayInsert => {
+                        let DenseOperands::ArrayInsert {
+                            array,
+                            key,
+                            value,
+                            by_ref_local,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let key = match key {
+                            Some(key) => match self
+                                .read_dense_operand(compiled, stack, key)
+                                .and_then(|value| array_key_from_value(&value))
+                            {
+                                Ok(key) => Some(key),
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                            None => None,
+                        };
+                        let value = if let Some(local) = by_ref_local {
+                            match stack
+                                .current_mut()
+                                .expect("bytecode frame was pushed")
+                                .locals
+                                .ensure_reference_cell(LocalId::new(local))
+                            {
+                                Ok(cell) => Value::Reference(cell),
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            }
+                        } else {
+                            match self.read_dense_operand(compiled, stack, value) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            }
+                        };
+                        let Some(Value::Array(array_value)) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .get_mut(RegId::new(array))
+                        else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                "E_PHP_VM_ARRAY_INSERT_TARGET: target is not an array register",
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let was_packed = array_value.is_packed_fast();
+                        if let Some(key) = key {
+                            array_value.insert(key, value);
+                        } else {
+                            array_value.append(value);
+                            if was_packed && array_value.is_packed_fast() {
+                                self.record_counter_array_packed_append_fast_path_hit();
+                            }
+                        }
+                        if was_packed && !array_value.is_packed_fast() {
+                            self.record_counter_array_packed_to_mixed_transition();
+                        }
+                    }
+                    DenseOpcode::FetchDim => {
+                        let DenseOperands::FetchDim {
+                            dst,
+                            array,
+                            key,
+                            quiet,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let array = match self.read_dense_operand(compiled, stack, array) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let key_value = match self.read_dense_operand(compiled, stack, key) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = self.try_quickened_packed_array_int_key(
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            &array,
+                            &key_value,
+                        );
+                        let value = match value {
+                            Some(value) => value,
+                            None => match self.fetch_dim_value(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &array,
+                                &key_value,
+                                quiet,
+                                dense
+                                    .spans
+                                    .get(instruction.span.index())
+                                    .copied()
+                                    .unwrap_or_default(),
+                            ) {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::AssignDim | DenseOpcode::AppendDim => {
+                        let DenseOperands::AssignDim {
+                            dst,
+                            local,
+                            ref dims,
+                            value,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let local = LocalId::new(local);
+                        let append = instruction.opcode == DenseOpcode::AppendDim;
+                        let result = if is_globals_local(ir_function, local) {
+                            assign_globals_dim(&mut state.globals, &dims, value.clone(), append)
+                        } else {
+                            let was_packed = local_array_is_packed_fast(stack, local);
+                            let cow_or_reference =
+                                local_array_has_cow_or_reference_fallback(stack, local);
+                            let result =
+                                assign_dim_local(stack, local, &dims, value.clone(), append);
+                            if result.is_ok() && cow_or_reference {
+                                self.record_counter_cow_or_reference_fallback();
+                            }
+                            if result.is_ok()
+                                && append
+                                && dims.is_empty()
+                                && was_packed
+                                && !cow_or_reference
+                                && local_array_is_packed_fast(stack, local)
+                            {
+                                self.record_counter_array_packed_append_fast_path_hit();
+                            }
+                            if result.is_ok()
+                                && was_packed
+                                && !local_array_is_packed_fast(stack, local)
+                            {
+                                self.record_counter_array_packed_to_mixed_transition();
+                            }
+                            result
+                        };
+                        if let Err(message) = result {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        self.record_lvalue_trace_event(
+                            if append {
+                                "array-append-dim"
+                            } else {
+                                "array-write-dim"
+                            },
+                            local,
+                            &dims,
+                        );
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::ForeachInit => {
+                        let DenseOperands::ForeachInit { iterator, source } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let source = match self.read_dense_operand(compiled, stack, source) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let foreach_iterator = match self
+                            .foreach_iterator_from_value(compiled, source, output, stack, state)
+                        {
+                            Ok(iterator) => iterator,
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        self.record_runtime_trace_event(format!(
+                            "foreach init iterator=r{} kind={}",
+                            iterator,
+                            format_foreach_iterator_kind(&foreach_iterator)
+                        ));
+                        foreach_iterators.insert(RegId::new(iterator), foreach_iterator);
+                    }
+                    DenseOpcode::ForeachNext => {
+                        let DenseOperands::ForeachNext {
+                            has_value,
+                            iterator,
+                            key,
+                            value,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let next_value = match self.next_foreach_value(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            &mut foreach_iterators,
+                            RegId::new(iterator),
+                            key.is_some(),
+                        ) {
+                            Ok(next) => next,
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let frame = stack.current_mut().expect("bytecode frame was pushed");
+                        let Some((entry_key, entry_value)) = next_value else {
+                            if let Err(message) = frame
+                                .registers
+                                .set(RegId::new(has_value), Value::Bool(false))
+                            {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            instruction_offset = next_instruction_offset;
+                            continue;
+                        };
+                        if let Err(message) = frame
+                            .registers
+                            .set(RegId::new(has_value), Value::Bool(true))
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if let Some(key) = key
+                            && let Err(message) = frame
+                                .registers
+                                .set(RegId::new(key), entry_key.unwrap_or(Value::Int(0)))
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if let Err(message) = frame.registers.set(RegId::new(value), entry_value) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
                             return result;
@@ -5140,6 +5512,359 @@ impl Vm {
                 self.constant_value(compiled.unit(), ConstId::new(operand.index))
             }
         }
+    }
+
+    fn read_dense_dim_operands(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+        dims: &[DenseOperand],
+    ) -> Result<Vec<ArrayKey>, String> {
+        dims.iter()
+            .map(|operand| {
+                self.read_dense_operand(compiled, stack, *operand)
+                    .and_then(|value| array_key_from_value(&value))
+            })
+            .collect()
+    }
+
+    fn read_dense_call_args(
+        &self,
+        dense: &DenseBytecodeUnit,
+        compiled: &CompiledUnit,
+        stack: &mut CallStack,
+        args: &[DenseCallArg],
+    ) -> Result<Vec<CallArgument>, String> {
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.read_dense_operand(compiled, stack, arg.value)?;
+            let by_ref_dim = arg
+                .by_ref_dim
+                .as_ref()
+                .map(|target| {
+                    self.read_dense_dim_operands(compiled, stack, &target.dims)
+                        .map(|dims| CallDimTarget {
+                            local: LocalId::new(target.local),
+                            dims,
+                        })
+                })
+                .transpose()?;
+            let by_ref_property = arg
+                .by_ref_property
+                .as_ref()
+                .map(
+                    |target| match self.read_dense_operand(compiled, stack, target.object)? {
+                        Value::Object(object) => Ok(CallPropertyTarget {
+                            object,
+                            property: dense
+                                .names
+                                .get(target.property as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "invalid dense bytecode property name n{}",
+                                        target.property
+                                    )
+                                })?
+                                .clone(),
+                        }),
+                        other => Err(format!(
+                            "E_PHP_VM_BY_REF_PROPERTY_NON_OBJECT: cannot bind property n{} on {}",
+                            target.property,
+                            value_type_name(&other)
+                        )),
+                    },
+                )
+                .transpose()?;
+            out.push(CallArgument {
+                name: arg
+                    .name
+                    .map(|name| {
+                        dense
+                            .names
+                            .get(name as usize)
+                            .cloned()
+                            .ok_or_else(|| format!("invalid dense bytecode argument name n{name}"))
+                    })
+                    .transpose()?,
+                value,
+                value_kind: arg.value_kind,
+                by_ref_local: arg.by_ref_local.map(LocalId::new),
+                by_ref_dim,
+                by_ref_property,
+            });
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_dim_value(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        array: &Value,
+        key_value: &Value,
+        quiet: bool,
+        span: IrSpan,
+    ) -> Result<Value, VmResult> {
+        let key = array_key_from_value(key_value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        let base = effective_value(array);
+        if let Value::String(string) = &base {
+            return match string_offset_for_read(string, &key) {
+                StringOffsetRead::Byte(value) => Ok(value),
+                StringOffsetRead::Illegal { value, key_bytes } => {
+                    if !quiet {
+                        let diagnostic = illegal_string_offset_warning(
+                            &key_bytes,
+                            runtime_source_span(compiled, span),
+                            stack_trace(compiled, stack),
+                        );
+                        match self.dispatch_error_handler(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            php_runtime::PHP_E_WARNING,
+                            &diagnostic,
+                        ) {
+                            Ok(false)
+                                if error_reporting_allows(state, php_runtime::PHP_E_WARNING) =>
+                            {
+                                emit_vm_diagnostic(
+                                    output,
+                                    state,
+                                    &diagnostic,
+                                    php_runtime::PhpDiagnosticChannel::Warning,
+                                    php_runtime::PHP_E_WARNING,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(result) => return Err(result),
+                        }
+                    }
+                    Ok(value)
+                }
+                StringOffsetRead::OutOfRange(index) => {
+                    if quiet {
+                        Ok(Value::Null)
+                    } else {
+                        let diagnostic = uninitialized_string_offset_warning(
+                            index,
+                            runtime_source_span(compiled, span),
+                            stack_trace(compiled, stack),
+                        );
+                        match self.dispatch_error_handler(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            php_runtime::PHP_E_WARNING,
+                            &diagnostic,
+                        ) {
+                            Ok(false)
+                                if error_reporting_allows(state, php_runtime::PHP_E_WARNING) =>
+                            {
+                                emit_vm_diagnostic(
+                                    output,
+                                    state,
+                                    &diagnostic,
+                                    php_runtime::PhpDiagnosticChannel::Warning,
+                                    php_runtime::PHP_E_WARNING,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(result) => return Err(result),
+                        }
+                        Ok(Value::string(Vec::new()))
+                    }
+                }
+                StringOffsetRead::NonNumeric => {
+                    if quiet {
+                        Ok(Value::Null)
+                    } else {
+                        Err(self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_VM_STRING_OFFSET_TYPE: Cannot access offset of type string on string"
+                                .to_owned(),
+                        ))
+                    }
+                }
+            };
+        }
+
+        match fetch_dim_value(array, &key) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) if quiet => Ok(Value::Null),
+            Ok(None) => {
+                let diagnostic = undefined_array_key_warning(&key, stack_trace(compiled, stack));
+                if error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+                    emit_vm_diagnostic(
+                        output,
+                        state,
+                        &diagnostic,
+                        php_runtime::PhpDiagnosticChannel::Warning,
+                        php_runtime::PHP_E_WARNING,
+                    );
+                }
+                Ok(Value::Null)
+            }
+            Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
+        }
+    }
+
+    fn next_foreach_value(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        foreach_iterators: &mut HashMap<RegId, ForeachIterator>,
+        iterator: RegId,
+        needs_key: bool,
+    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+        let next_value = match foreach_iterators.get(&iterator).cloned() {
+            Some(ForeachIterator::Snapshot { entries, position }) => {
+                let next = entries
+                    .get(position)
+                    .cloned()
+                    .map(|(key, value)| (Some(array_key_to_value(key)), value));
+                if next.is_some()
+                    && let Some(ForeachIterator::Snapshot { position, .. }) =
+                        foreach_iterators.get_mut(&iterator)
+                {
+                    *position += 1;
+                }
+                next
+            }
+            Some(ForeachIterator::ObjectProperties { object, position }) => {
+                let keys = object_property_iteration_keys(compiled, &object)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+                let next = keys.get(position).and_then(|name| {
+                    object.get_property(name).map(|value| {
+                        (
+                            Some(Value::string(name.as_bytes().to_vec())),
+                            effective_value(&value),
+                        )
+                    })
+                });
+                if next.is_some()
+                    && let Some(ForeachIterator::ObjectProperties { position, .. }) =
+                        foreach_iterators.get_mut(&iterator)
+                {
+                    *position += 1;
+                }
+                next
+            }
+            Some(ForeachIterator::IteratorObject { object, needs_next }) => {
+                if needs_next {
+                    self.call_object_method_value(
+                        compiled,
+                        object.clone(),
+                        "next",
+                        output,
+                        stack,
+                        state,
+                    )?;
+                }
+                let valid = self.call_object_method_value(
+                    compiled,
+                    object.clone(),
+                    "valid",
+                    output,
+                    stack,
+                    state,
+                )?;
+                if !to_bool(&valid)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?
+                {
+                    None
+                } else {
+                    let entry_value = self.call_object_method_value(
+                        compiled,
+                        object.clone(),
+                        "current",
+                        output,
+                        stack,
+                        state,
+                    )?;
+                    let entry_key = if needs_key {
+                        Some(self.call_object_method_value(
+                            compiled,
+                            object.clone(),
+                            "key",
+                            output,
+                            stack,
+                            state,
+                        )?)
+                    } else {
+                        None
+                    };
+                    if let Some(ForeachIterator::IteratorObject { needs_next, .. }) =
+                        foreach_iterators.get_mut(&iterator)
+                    {
+                        *needs_next = true;
+                    }
+                    Some((entry_key, entry_value))
+                }
+            }
+            Some(ForeachIterator::Generator {
+                generator,
+                consumed,
+            }) => {
+                if consumed {
+                    self.resume_generator_to_next_yield(
+                        compiled,
+                        generator,
+                        GeneratorResumeInput::Value(Value::Null),
+                        output,
+                        stack,
+                        state,
+                    )?
+                } else {
+                    if let Some(ForeachIterator::Generator { consumed, .. }) =
+                        foreach_iterators.get_mut(&iterator)
+                    {
+                        *consumed = true;
+                    }
+                    self.advance_generator_to_first_yield(
+                        compiled, generator, output, stack, state,
+                    )?
+                }
+            }
+            Some(ForeachIterator::ByReference { .. }) | None => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_FOREACH_ITERATOR_MISSING: iterator r{} is not initialized",
+                        iterator.raw()
+                    ),
+                ));
+            }
+        };
+
+        if let Some((entry_key, entry_value)) = &next_value {
+            self.record_runtime_trace_event(format!(
+                "foreach next iterator=r{} status=value key={} value={}",
+                iterator.raw(),
+                entry_key
+                    .as_ref()
+                    .map(trace_value)
+                    .unwrap_or_else(|| "None".to_owned()),
+                trace_value(entry_value)
+            ));
+        } else {
+            self.record_runtime_trace_event(format!(
+                "foreach next iterator=r{} status=done",
+                iterator.raw()
+            ));
+        }
+        Ok(next_value)
     }
 
     fn invalid_bytecode_operand_shape(

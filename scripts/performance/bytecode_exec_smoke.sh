@@ -25,6 +25,8 @@ supported_fixtures=(
   "fixtures/bytecode/lower/valid/echo.php"
   "fixtures/bytecode/literals/valid/echo-int.php"
   "fixtures/bytecode/literals/valid/echo-multiple.php"
+  "tests/fixtures/performance/perf_smoke/arrays_packed.php"
+  "tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php"
 )
 
 json_escape() {

@@ -117,14 +117,16 @@ but falls back to the rich-IR interpreter when dense bytecode is unsupported.
 The `bytecode-exec-smoke` gate compares strict bytecode against IR for
 supported fixtures and verifies `auto` fallback plus strict unsupported status.
 
-Phase 09.05 starts coverage expansion without adding semantic shortcuts. Dense
-bytecode now lowers and executes scalar binary operations, unary operations, and
-comparisons by delegating to the existing rich-IR VM semantic helpers. It also
-lowers simple direct positional user-function calls and delegates execution to
-the existing VM function-call target path. The A/B smoke covers scalar
-expression, comparison, and simple direct-call fixtures in strict bytecode mode.
-Builtin dispatch, named/unpacked/by-reference call metadata, property access,
-array dimensions, and foreach remain on the unsupported/fallback path until
+Phase 09.05 expands coverage without adding semantic shortcuts. Dense bytecode
+now lowers and executes scalar binary operations, unary operations, comparisons,
+full direct-call shape metadata for named and by-reference compatibility,
+builtin calls through the existing VM function-call target path, dense array
+construction/insert/fetch/assign/append opcodes, and by-value foreach init/next.
+The A/B smoke covers scalar expression, comparison, direct-call, packed-array,
+and framework-like mixed-array traversal fixtures in strict bytecode mode.
+Property fetch/assign, method/static calls, unpacked calls, by-reference
+foreach, exceptions/try/finally, generators/fibers, include/eval, and
+object-heavy framework bytecode coverage remain unsupported/fallback paths until
 their instruction-family fixtures and counters land.
 
 Phase 09.06 adds the first default-off dense-bytecode superinstruction pass.
