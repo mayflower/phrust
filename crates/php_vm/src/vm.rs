@@ -947,6 +947,9 @@ struct ExecutionState {
     /// Set when a frame cannot handle a throw locally; each caller frame gets a
     /// chance to catch it before the entry point renders it as uncaught.
     pending_throw: Option<Value>,
+    /// Stack trace captured at the throw origin (before unwinding), rendered as
+    /// PHP's `Stack trace:` body for the uncaught-error message.
+    pending_trace: Option<String>,
 }
 
 impl ExecutionState {
@@ -4359,6 +4362,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
                         if let Some(target) = handle_throw(
                             compiled,
                             value.clone(),
@@ -5490,6 +5494,8 @@ impl Vm {
                                             compiled,
                                             instruction.span,
                                         );
+                                        state.pending_trace =
+                                            Some(capture_backtrace_string(compiled, stack));
                                         if let Some(target) = handle_throw(
                                             compiled,
                                             throwable.clone(),
@@ -8293,6 +8299,8 @@ impl Vm {
                                                 compiled,
                                                 instruction.span,
                                             );
+                                            state.pending_trace =
+                                                Some(capture_backtrace_string(compiled, stack));
                                             if let Some(target) = handle_throw(
                                                 compiled,
                                                 throwable.clone(),
@@ -8329,6 +8337,8 @@ impl Vm {
                             let result = self.runtime_error(output, compiled, stack, message);
                             if let Some(throwable) = runtime_error_throwable(&result) {
                                 tag_throwable_location(&throwable, compiled, instruction.span);
+                                state.pending_trace =
+                                    Some(capture_backtrace_string(compiled, stack));
                                 if let Some(target) = handle_throw(
                                     compiled,
                                     throwable.clone(),
@@ -8687,12 +8697,22 @@ impl Vm {
                             ) {
                                 Ok(Some(result)) => result,
                                 Ok(None) => {
-                                    return self.runtime_error(
-                                        output,
+                                    match self.raise_runtime_error(
                                         compiled,
+                                        output,
                                         stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
                                         inaccessible,
-                                    );
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                                 Err(result) => return result,
                             };
@@ -8714,7 +8734,22 @@ impl Vm {
                         if let Err(message) =
                             validate_method_callable(compiled, stack, declaring_class, method_entry)
                         {
-                            return self.runtime_error(output, compiled, stack, message);
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
                         }
                         let called_class =
                             called_class_for_static_call(compiled, stack, class_name, class);
@@ -15169,6 +15204,7 @@ impl Vm {
         let result = self.runtime_error(output, compiled, stack, message);
         if let Some(throwable) = runtime_error_throwable(&result) {
             tag_throwable_location(&throwable, compiled, span);
+            state.pending_trace = Some(capture_backtrace_string(compiled, stack));
             if let Some(target) = handle_throw(
                 compiled,
                 throwable.clone(),
@@ -15193,8 +15229,9 @@ impl Vm {
         state: &mut ExecutionState,
         value: Value,
     ) -> VmResult {
+        let trace = state.pending_trace.take();
         let Some(callback) = state.exception_handlers.last().cloned() else {
-            return uncaught_exception(output, compiled, stack, value);
+            return uncaught_exception(output, compiled, stack, value, trace);
         };
         let result = self.call_callable(
             compiled,
@@ -15587,6 +15624,7 @@ fn uncaught_exception(
     compiled: &CompiledUnit,
     stack: &CallStack,
     value: Value,
+    trace: Option<String>,
 ) -> VmResult {
     let class_name = throwable_class_name(&value);
     let (message, file, line) = match &value {
@@ -15619,8 +15657,9 @@ fn uncaught_exception(
         format!("Uncaught {class_name}: {message}")
     };
     // PHP renders an uncaught throwable as a fatal error on the output stream.
+    let trace = trace.unwrap_or_else(|| "#0 {main}".to_owned());
     output.write_test_str(&format!(
-        "\nFatal error: {heading} in {file}:{line}\nStack trace:\n#0 {{main}}\n  thrown in {file} on line {line}\n"
+        "\nFatal error: {heading} in {file}:{line}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
     ));
     let full = format!("E_PHP_VM_UNCAUGHT_EXCEPTION: {heading}");
     VmResult::runtime_error_with_diagnostic(
@@ -21796,6 +21835,104 @@ fn stack_trace(compiled: &CompiledUnit, stack: &CallStack) -> Vec<RuntimeStackFr
             RuntimeStackFrame::new(name)
         })
         .collect()
+}
+
+/// Renders one argument as it appears in a PHP stack trace.
+fn format_trace_arg(value: &Value) -> String {
+    match value {
+        Value::Reference(cell) => format_trace_arg(&cell.get()),
+        Value::Null | Value::Uninitialized => "NULL".to_owned(),
+        Value::Bool(true) => "true".to_owned(),
+        Value::Bool(false) => "false".to_owned(),
+        Value::Int(value) => value.to_string(),
+        Value::Float(value) => {
+            let value = value.to_f64();
+            if value.fract() == 0.0 && value.is_finite() {
+                format!("{value:.1}")
+            } else {
+                format!("{value}")
+            }
+        }
+        Value::String(value) => {
+            let text = value.to_string_lossy();
+            if text.len() > 15 {
+                format!("'{}...'", &text[..15])
+            } else {
+                format!("'{text}'")
+            }
+        }
+        Value::Array(_) => "Array".to_owned(),
+        Value::Object(object) => format!("Object({})", object.display_name()),
+        Value::Fiber(_) => "Object(Fiber)".to_owned(),
+        Value::Generator(_) => "Object(Generator)".to_owned(),
+        Value::Resource(_) => "Resource".to_owned(),
+        Value::Callable(_) => "Object(Closure)".to_owned(),
+    }
+}
+
+/// Renders a frame's `Class->method(args)` / `func(args)` call descriptor.
+fn format_trace_call(compiled: &CompiledUnit, frame: &Frame) -> String {
+    let Some(function) = compiled.unit().functions.get(frame.function.index()) else {
+        return "{closure}()".to_owned();
+    };
+    let args = frame
+        .arguments
+        .iter()
+        .map(format_trace_arg)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let name = if function.flags.is_closure {
+        "{closure}".to_owned()
+    } else if function.flags.is_method && function.name.contains("::") {
+        // PHP renders instance calls with `->` and static calls with `::`; a
+        // bound `$this` local distinguishes them.
+        let has_this = function
+            .locals
+            .iter()
+            .position(|local| local == "this")
+            .and_then(|index| frame.locals.get(LocalId::new(index as u32)))
+            .is_some_and(|value| matches!(value, Value::Object(_)));
+        if has_this {
+            function.name.replacen("::", "->", 1)
+        } else {
+            function.name.clone()
+        }
+    } else {
+        function.name.clone()
+    };
+    format!("{name}({args})")
+}
+
+/// Captures the current call stack as PHP's `Stack trace:` body, newest frame
+/// first, ending with `#N {main}`. Call-site lines are not tracked, so a
+/// deterministic placeholder line is emitted (EXPECTF tolerates it via `%d`).
+fn capture_backtrace_string(compiled: &CompiledUnit, stack: &CallStack) -> String {
+    let mut lines = Vec::new();
+    let mut index = 0usize;
+    for frame in stack.frames().iter().rev() {
+        let function = compiled.unit().functions.get(frame.function.index());
+        if function.is_some_and(|function| function.flags.is_top_level) {
+            lines.push(format!("#{index} {{main}}"));
+            index += 1;
+            continue;
+        }
+        let file = function
+            .and_then(|function| compiled.unit().files.get(function.span.file.index()))
+            .map(|file| file.path.clone())
+            .unwrap_or_default();
+        let line = function
+            .and_then(|function| source_span_display_line(compiled, function.span, false))
+            .unwrap_or(0);
+        lines.push(format!(
+            "#{index} {file}({line}): {}",
+            format_trace_call(compiled, frame)
+        ));
+        index += 1;
+    }
+    if lines.is_empty() {
+        lines.push("#0 {main}".to_owned());
+    }
+    lines.join("\n")
 }
 
 /// Determines whether a value is callable, matching PHP's `is_callable`. When
@@ -32188,7 +32325,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             )),
             "{output}"
         );
-        assert!(output.contains("Stack trace:\n#0 {main}\n"), "{output}");
+        assert!(output.contains("Stack trace:\n#0 "), "{output}");
         assert!(output.contains("  thrown in "), "{output}");
     }
 
