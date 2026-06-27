@@ -84,6 +84,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_environment_requires_vm,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "gc_collect_cycles",
+        builtin_gc_collect_cycles,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("gettype", builtin_gettype, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "ini_get",
@@ -1416,6 +1421,15 @@ pub(in crate::builtins::modules) fn builtin_process_requires_vm(
         "E_PHP_RUNTIME_PROCESS_CONTEXT_REQUIRED",
         "process builtins require VM process capability policy",
     ))
+}
+
+pub(in crate::builtins::modules) fn builtin_gc_collect_cycles(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("gc_collect_cycles", &args, 0)?;
+    Ok(Value::Int(0))
 }
 
 pub(in crate::builtins::modules) fn builtin_abs(
@@ -9706,6 +9720,7 @@ fn runtime_type_name(value: &Value) -> &'static str {
 struct DebugFormatter {
     active_references: BTreeSet<usize>,
     active_arrays: BTreeSet<usize>,
+    active_objects: BTreeSet<u64>,
     /// `serialize_precision` ini value applied to var_dump floats (`-1` selects
     /// the shortest round-trippable representation).
     serialize_precision: i32,
@@ -9716,6 +9731,7 @@ impl Default for DebugFormatter {
         Self {
             active_references: BTreeSet::new(),
             active_arrays: BTreeSet::new(),
+            active_objects: BTreeSet::new(),
             serialize_precision: -1,
         }
     }
@@ -9757,6 +9773,10 @@ impl DebugFormatter {
                 self.active_arrays.remove(&id);
             }
             Value::Object(object) => {
+                if !self.active_objects.insert(object.id()) {
+                    output.write_test_str("*RECURSION*\n");
+                    return;
+                }
                 let properties = object.properties_snapshot();
                 output.write_test_str(&format!(
                     "object({})#{} ({}) {{\n",
@@ -9773,6 +9793,7 @@ impl DebugFormatter {
                 }
                 write_indent(output, indent);
                 output.write_test_str("}\n");
+                self.active_objects.remove(&object.id());
             }
             Value::Resource(resource) => output.write_test_str(&format!(
                 "resource({}) of type ({})\n",
@@ -9781,7 +9802,7 @@ impl DebugFormatter {
             )),
             Value::Fiber(_) => output.write_test_str("object(Fiber)#0 (0) {\n}\n"),
             Value::Generator(_) => output.write_test_str("object(Generator)#0 (0) {\n}\n"),
-            Value::Callable(_) => output.write_test_str("object(Closure)#0 (0) {\n}\n"),
+            Value::Callable(callable) => self.write_callable_var_dump(output, callable, indent),
             Value::Reference(cell) => {
                 let id = cell.gc_debug_id();
                 if !self.active_references.insert(id) {
@@ -9800,6 +9821,162 @@ impl DebugFormatter {
                 self.active_references.remove(&id);
             }
         }
+    }
+
+    fn write_callable_var_dump(
+        &mut self,
+        output: &mut OutputBuffer,
+        callable: &CallableValue,
+        indent: usize,
+    ) {
+        match callable {
+            CallableValue::Closure {
+                id,
+                function,
+                captures,
+                bound_this,
+                debug: Some(debug),
+            } => {
+                let has_static = !captures.is_empty();
+                let has_this = bound_this.is_some();
+                let property_count = 3 + usize::from(has_static) + usize::from(has_this);
+                output.write_test_str(&format!("object(Closure)#{id} ({property_count}) {{\n"));
+                self.write_var_dump_property(
+                    output,
+                    "name",
+                    Value::string(debug.name.clone()),
+                    indent,
+                );
+                self.write_var_dump_property(
+                    output,
+                    "file",
+                    Value::string(debug.file.clone()),
+                    indent,
+                );
+                self.write_var_dump_property(output, "line", Value::Int(debug.line), indent);
+                if has_static {
+                    self.write_closure_static_var_dump(output, *function, captures, indent);
+                }
+                if let Some(bound_this) = bound_this {
+                    self.write_var_dump_property(
+                        output,
+                        "this",
+                        Value::Object(bound_this.clone()),
+                        indent,
+                    );
+                }
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+            CallableValue::UserFunction { name } | CallableValue::InternalBuiltin { name } => {
+                output.write_test_str("object(Closure)#1 (1) {\n");
+                self.write_var_dump_property(
+                    output,
+                    "function",
+                    Value::string(name.clone()),
+                    indent,
+                );
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+            CallableValue::MethodPlaceholder { target } => {
+                output.write_test_str("object(Closure)#1 (1) {\n");
+                self.write_var_dump_property(
+                    output,
+                    "function",
+                    Value::string(target.clone()),
+                    indent,
+                );
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+            CallableValue::BoundMethod { target, method, .. } => {
+                let class_name = match target {
+                    crate::CallableMethodTarget::Object(object) => object.display_name(),
+                    crate::CallableMethodTarget::Class(class_name) => class_name.clone(),
+                };
+                output.write_test_str("object(Closure)#1 (1) {\n");
+                self.write_var_dump_property(
+                    output,
+                    "function",
+                    Value::string(format!("{class_name}::{method}")),
+                    indent,
+                );
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+            CallableValue::Closure { id, .. } => {
+                output.write_test_str(&format!("object(Closure)#{id} (0) {{\n"));
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+            CallableValue::UnresolvedDynamic { .. } => {
+                output.write_test_str("object(Closure)#1 (0) {\n");
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+            }
+        }
+    }
+
+    fn write_closure_static_var_dump(
+        &mut self,
+        output: &mut OutputBuffer,
+        function: u32,
+        captures: &[crate::ClosureCaptureValue],
+        indent: usize,
+    ) {
+        write_indent(output, indent + 2);
+        output.write_test_str("[\"static\"]=>\n");
+        write_indent(output, indent + 2);
+        output.write_test_str(&format!("array({}) {{\n", captures.len()));
+        for capture in captures {
+            write_indent(output, indent + 4);
+            output.write_test_str(&format!("[\"{}\"]=>\n", capture.name));
+            write_indent(output, indent + 4);
+            if self.capture_is_self_recursive(function, capture) {
+                output.write_test_str("*RECURSION*\n");
+                continue;
+            }
+            let value = capture
+                .value()
+                .cloned()
+                .or_else(|| capture.reference().map(|reference| reference.get()))
+                .unwrap_or(Value::Null);
+            self.write_var_dump_value(output, &value, indent + 4);
+        }
+        write_indent(output, indent + 2);
+        output.write_test_str("}\n");
+    }
+
+    fn capture_is_self_recursive(
+        &self,
+        function: u32,
+        capture: &crate::ClosureCaptureValue,
+    ) -> bool {
+        let value = capture
+            .value()
+            .cloned()
+            .or_else(|| capture.reference().map(|reference| reference.get()));
+        matches!(
+            value,
+            Some(Value::Callable(CallableValue::Closure {
+                function: captured,
+                ..
+            })) if captured == function
+        )
+    }
+
+    fn write_var_dump_property(
+        &mut self,
+        output: &mut OutputBuffer,
+        name: &str,
+        value: Value,
+        indent: usize,
+    ) {
+        write_indent(output, indent + 2);
+        output.write_test_str(&format!("[\"{name}\"]=>\n"));
+        write_indent(output, indent + 2);
+        self.write_var_dump_value(output, &value, indent + 2);
     }
 
     fn write_print_r_value(&mut self, output: &mut OutputBuffer, value: &Value, indent: usize) {
@@ -12271,6 +12448,78 @@ mod tests {
             output.to_string_lossy(),
             "array(1) {\n  [0]=>\n  *RECURSION*\n}\n"
         );
+    }
+
+    #[test]
+    fn var_dump_marks_object_references_to_active_objects_as_recursion() {
+        let object = ObjectRef::new(&empty_class("DebugBox"));
+        let cell = ReferenceCell::new(Value::Object(object.clone()));
+        object.set_property("self", Value::Reference(cell));
+
+        let mut output = OutputBuffer::new();
+        let result = call("var_dump", vec![Value::Object(object)], &mut output);
+
+        assert_eq!(result, Value::Null);
+        assert!(output.to_string_lossy().contains("*RECURSION*\n"));
+    }
+
+    #[test]
+    fn var_dump_prints_callable_closure_metadata() {
+        let mut output = OutputBuffer::new();
+        let result = call(
+            "var_dump",
+            vec![
+                Value::user_function_callable("test1"),
+                Value::closure_with_debug(
+                    3,
+                    Vec::new(),
+                    Some(crate::ClosureDebugInfo {
+                        name: "{closure:/tmp/source.php:7}".to_owned(),
+                        file: "/tmp/source.php".to_owned(),
+                        line: 7,
+                    }),
+                ),
+                Value::closure_with_debug(
+                    4,
+                    vec![crate::ClosureCaptureValue::by_value(
+                        "x".to_owned(),
+                        Value::Int(2),
+                    )],
+                    Some(crate::ClosureDebugInfo {
+                        name: "{closure:/tmp/source.php:9}".to_owned(),
+                        file: "/tmp/source.php".to_owned(),
+                        line: 9,
+                    }),
+                ),
+            ],
+            &mut output,
+        );
+
+        assert_eq!(result, Value::Null);
+        let dumped = output.to_string_lossy();
+        let closure_headers = dumped
+            .lines()
+            .filter(|line| line.starts_with("object(Closure)#"))
+            .collect::<Vec<_>>();
+        assert_eq!(closure_headers.len(), 3);
+        assert_eq!(closure_headers[0], "object(Closure)#1 (1) {");
+        assert!(closure_headers[1].ends_with(" (3) {"));
+        assert!(closure_headers[2].ends_with(" (4) {"));
+        assert_ne!(
+            closure_debug_id(closure_headers[1]),
+            closure_debug_id(closure_headers[2])
+        );
+        assert!(dumped.contains("string(27) \"{closure:/tmp/source.php:7}\""));
+        assert!(dumped.contains("string(27) \"{closure:/tmp/source.php:9}\""));
+        assert!(dumped.contains("[\"static\"]=>\n  array(1) {"));
+    }
+
+    fn closure_debug_id(header: &str) -> &str {
+        header
+            .split_once('#')
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .map(|(id, _)| id)
+            .expect("closure var_dump header should include an object handle")
     }
 
     #[test]

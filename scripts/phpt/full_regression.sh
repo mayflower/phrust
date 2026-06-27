@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh"
+
 php_src="${PHP_SRC_DIR:-}"
 if [[ -z "$php_src" ]]; then
   if [[ -d third_party/php-src-8.5.7 ]]; then
@@ -116,7 +119,8 @@ if [[ -n "$previous_results" ]]; then
   reuse_args=(--reuse-results "$previous_results")
 fi
 
-job_args=(--jobs "${PHPT_JOBS:-1}")
+phpt_jobs="$(phpt_default_jobs)"
+job_args=(--jobs "$phpt_jobs")
 
 dev_reuse_args=()
 if [[ -n "${PHPT_DEV_REUSE_PASS:-}" && "${PHPT_DEV_REUSE_PASS:-}" != "0" ]]; then
@@ -127,7 +131,7 @@ printf 'TARGET_PHP=%s\n' "$target_php"
 printf 'PHPT_TARGET_MODE=%s\n' "$target_mode"
 printf 'PHPT_CORPUS_MANIFEST=%s\n' "$corpus"
 printf 'PHPT_RUN_DIR=%s\n' "$run_dir"
-printf 'PHPT_JOBS=%s\n' "${PHPT_JOBS:-1}"
+printf 'PHPT_JOBS=%s\n' "$phpt_jobs"
 printf 'PHPT_REUSE_RESULTS=%s\n' "${reuse_args[*]:-disabled}"
 printf 'PHPT_DEV_REUSE_PASS=%s\n' "${PHPT_DEV_REUSE_PASS:-0}"
 

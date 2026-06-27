@@ -45,13 +45,15 @@ MODULE=<module>` for target-only feedback. Use `PATTERN=<text>` or
 `FILE=<path>` with `phpt-fast` to run one failure cluster or one PHPT while
 debugging. Focused runs write separate results and do not overwrite the module
 cache. Use `just phpt-rerun-failures MODULE=<module>` to rerun only the latest
-non-green module outcomes, or `just phpt-dev-fast ...` for the explicit local
-`PHPT_DEV_REUSE_PASS=1` path that can reuse unchanged previous PASS results
-across binary changes. The fast targets use an external work directory by
-default, enable strict previous-result reuse, and skip rebuilds so small runtime
-changes can be checked without paying full-corpus or repeated shell startup
-cost. PHPT runs are serial by default; set `PHPT_JOBS=<n>` only for an
-intentional parallel batch. `just phpt-build` remains the normal deterministic
+non-green module outcomes. `just phpt-dev-module` also sets
+`PHPT_DEV_REUSE_TARGET_PASS=1` by default, so unchanged target-side PASS results
+can be reused across binary changes while the Reference PHP comparison remains
+strict. The fast targets use an external work directory by default, enable
+strict previous-result reuse, and skip rebuilds so small runtime changes can be
+checked without paying full-corpus or repeated shell startup cost. PHPT runs
+default to bounded host parallelism (`min(host CPUs, 8)`);
+set `PHPT_JOBS=<n>` or `php-phpt-tools run --jobs <n>` to pin a specific
+worker count. `just phpt-build` remains the normal deterministic
 build command, and `php-phpt-tools run --reuse-results <results.jsonl>` also
 reuses unchanged test outcomes by strict fingerprint. The full regression script
 uses the latest previous run automatically unless `PHPT_DISABLE_REUSE=1`

@@ -6189,7 +6189,10 @@ fn parse_bool_flag(value: &str, name: &str) -> Result<bool, String> {
 }
 
 fn default_phpt_jobs() -> usize {
-    1
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 8)
 }
 
 fn parse_usize(value: &str, name: &str) -> Result<usize, String> {
@@ -6944,8 +6947,9 @@ mod tests {
     }
 
     #[test]
-    fn default_run_jobs_is_serial() {
-        assert_eq!(default_phpt_jobs(), 1);
+    fn default_run_jobs_uses_bounded_parallelism() {
+        let jobs = default_phpt_jobs();
+        assert!((1..=8).contains(&jobs));
     }
 
     #[test]

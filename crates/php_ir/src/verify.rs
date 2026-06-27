@@ -427,6 +427,10 @@ fn verify_instruction(
         InstructionKind::ResolveCallable { dst, .. } => {
             verify_register(*dst, function.register_count, errors);
         }
+        InstructionKind::AcquireCallable { dst, value } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(value, function, unit, errors);
+        }
         InstructionKind::CallCallable { dst, callee, args } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(callee, function, unit, errors);
@@ -1043,6 +1047,7 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
             operand_register_uses(callee, uses);
             call_args_register_uses(args, uses);
         }
+        InstructionKind::AcquireCallable { value, .. } => operand_register_uses(value, uses),
         InstructionKind::ResolveCallable { .. } => {}
         InstructionKind::Pipe {
             input, callable, ..
@@ -1113,6 +1118,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::MakeClosure { dst, .. }
         | InstructionKind::CallClosure { dst, .. }
         | InstructionKind::ResolveCallable { dst, .. }
+        | InstructionKind::AcquireCallable { dst, .. }
         | InstructionKind::CallCallable { dst, .. }
         | InstructionKind::Pipe { dst, .. }
         | InstructionKind::Include { dst, .. }

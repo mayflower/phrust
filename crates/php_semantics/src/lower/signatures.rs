@@ -231,7 +231,7 @@ impl SignatureLowerer<'_> {
     }
 
     fn collect_raw_method(&mut self, method: MethodDecl<'_>) {
-        let tokens = descendant_significant_tokens(method.syntax());
+        let tokens = method_signature_significant_tokens(method.syntax());
         let name = raw_method_name(&tokens);
         let is_constructor = name
             .as_deref()
@@ -277,6 +277,8 @@ impl SignatureLowerer<'_> {
         )
         .with_flags(flags);
         self.push_signature(signature);
+
+        self.collect_children(method.syntax());
     }
 
     fn lower_raw_param(&mut self, tokens: &[TypeToken]) -> Option<Parameter> {
@@ -524,14 +526,30 @@ fn parameter_type_tokens(param: &SyntaxNode) -> Option<Vec<TypeToken>> {
 
 fn default_value_ref(param: &SyntaxNode, const_expr_candidate: bool) -> Option<DefaultValueRef> {
     let equals = syntax_child_tokens(param).find(|token| token.text() == "=")?;
-    let expr = syntax_child_nodes(param).find(|node| node.kind().name() == "EXPR")?;
+    let expr = widest_expr_after(param, equals.text_range().end())?;
     Some(DefaultValueRef::new(
-        TextRange::new(
-            equals.text_range().end().to_usize(),
-            expr.text_range().end().to_usize(),
-        ),
+        TextRange::new(equals.text_range().end().to_usize(), expr.end().to_usize()),
         const_expr_candidate,
     ))
+}
+
+fn widest_expr_after(node: &SyntaxNode, start: php_source::BytePos) -> Option<TextRange> {
+    let mut best: Option<TextRange> = None;
+    for child in syntax_child_nodes(node) {
+        if child.kind().name() == "EXPR" && child.text_range().start() >= start {
+            best = Some(match best {
+                Some(current) if current.len() >= child.text_range().len() => current,
+                _ => child.text_range(),
+            });
+        }
+        if let Some(candidate) = widest_expr_after(child, start) {
+            best = Some(match best {
+                Some(current) if current.len() >= candidate.len() => current,
+                _ => candidate,
+            });
+        }
+    }
+    best
 }
 
 fn direct_significant_tokens(node: &SyntaxNode) -> Vec<TypeToken> {
@@ -550,6 +568,26 @@ fn descendant_significant_tokens(node: &SyntaxNode) -> Vec<TypeToken> {
             range: token.text_range(),
         })
         .collect()
+}
+
+fn method_signature_significant_tokens(method: &SyntaxNode) -> Vec<TypeToken> {
+    let mut tokens = Vec::new();
+    for child in method.children() {
+        match child {
+            php_syntax::SyntaxElement::Token(token) => {
+                if !token.kind().is_trivia() {
+                    tokens.push(type_token_from_syntax_token(token));
+                }
+            }
+            php_syntax::SyntaxElement::Node(node) => {
+                if BlockStmt::cast(node).is_some() {
+                    break;
+                }
+                tokens.extend(descendant_significant_tokens(node));
+            }
+        }
+    }
+    tokens
 }
 
 fn raw_method_name(tokens: &[TypeToken]) -> Option<String> {
@@ -925,6 +963,37 @@ mod tests {
             signature.name() == Some("m")
                 && signature.flags().is_static()
                 && signature.flags().has_return_type_void()
+                && !signature.flags().this_available()
+        }));
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn records_nested_static_closure_without_static_method_leakage() {
+        let parse = parse_source_file(
+            "<?php class C { public function m() { $f = static function () { return $this; }; } }",
+        );
+        let root = source_file(parse.root()).expect("source");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", 0));
+        let mut reporter = DiagnosticReporter::new();
+        collect_signatures_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        assert!(module.signatures().iter().any(|signature| {
+            signature.name() == Some("m")
+                && !signature.flags().is_static()
+                && signature.flags().this_available()
+        }));
+        assert!(module.signatures().iter().any(|signature| {
+            signature.kind() == crate::hir::SignatureKind::Closure
+                && signature.flags().is_static()
                 && !signature.flags().this_available()
         }));
         assert!(reporter.into_diagnostics().is_empty());

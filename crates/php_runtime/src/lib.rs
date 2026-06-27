@@ -98,7 +98,9 @@ pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
 pub use todo_runtime::{RuntimeTodo, runtime_skeleton_status};
 pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
-pub use value::{CallableValue, ClosureCaptureValue, FloatValue, Value};
+pub use value::{
+    CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureDebugInfo, FloatValue, Value,
+};
 
 #[cfg(test)]
 mod tests {
@@ -226,7 +228,7 @@ mod tests {
         assert!(format!("{unresolved:?}").contains("unresolved_dynamic"));
         assert!(matches!(
             closure.as_closure(),
-            Some((7, captures)) if captures.len() == 1
+            Some((7, captures, None, None)) if captures.len() == 1
         ));
     }
 }

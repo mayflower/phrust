@@ -120,6 +120,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "is_a",
+        core::builtin_symbol_introspection_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "is_subclass_of",
         core::builtin_symbol_introspection_requires_vm,
         BuiltinCompatibility::Php,

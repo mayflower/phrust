@@ -93,6 +93,8 @@ pub struct FunctionFlags {
     pub is_closure: bool,
     /// True for methods.
     pub is_method: bool,
+    /// True for static closures.
+    pub is_static: bool,
     /// True when the function body contains `yield` or `yield from`.
     pub is_generator: bool,
 }

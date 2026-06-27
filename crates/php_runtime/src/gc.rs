@@ -5,7 +5,10 @@
 //! can use it to prove root tracking and cycle-candidate discovery while full
 //! PHP refcount/GC behavior remains a documented later step.
 
-use crate::{CallableValue, Slot, Value, WeakArrayHandle, WeakObjectHandle, WeakReferenceHandle};
+use crate::{
+    CallableMethodTarget, CallableValue, Slot, Value, WeakArrayHandle, WeakObjectHandle,
+    WeakReferenceHandle,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Refcounted runtime entity kind known to the runtime-semantics GC skeleton.
@@ -323,7 +326,14 @@ impl GcTrackedHeap {
                 let value = cell.borrow();
                 self.track_value_inner(&value, seen);
             }
-            Value::Callable(CallableValue::Closure { captures, .. }) => {
+            Value::Callable(CallableValue::Closure {
+                captures,
+                bound_this,
+                ..
+            }) => {
+                if let Some(bound_this) = bound_this {
+                    self.track_value_inner(&Value::Object(bound_this.clone()), seen);
+                }
                 for capture in captures {
                     if let Some(value) = capture.value() {
                         self.track_value_inner(value, seen);
@@ -333,6 +343,10 @@ impl GcTrackedHeap {
                     }
                 }
             }
+            Value::Callable(CallableValue::BoundMethod {
+                target: CallableMethodTarget::Object(object),
+                ..
+            }) => self.track_value_inner(&Value::Object(object.clone()), seen),
             Value::Null
             | Value::Bool(_)
             | Value::Int(_)
@@ -343,6 +357,10 @@ impl GcTrackedHeap {
             | Value::Callable(
                 CallableValue::UserFunction { .. }
                 | CallableValue::InternalBuiltin { .. }
+                | CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Class(_),
+                    ..
+                }
                 | CallableValue::MethodPlaceholder { .. }
                 | CallableValue::UnresolvedDynamic { .. },
             ) => {}
@@ -420,13 +438,20 @@ impl GcScanner {
                 }
                 vec![id]
             }
-            Value::Callable(CallableValue::Closure { captures, .. }) => {
+            Value::Callable(CallableValue::Closure {
+                captures,
+                bound_this,
+                ..
+            }) => {
                 self.next_closure_id = self.next_closure_id.saturating_add(1);
                 let id = GcEntityId::new(GcEntityKind::Closure, self.next_closure_id);
                 self.ensure_node(id, None);
-                let edges = captures
-                    .iter()
-                    .flat_map(|capture| {
+                let edges = bound_this
+                    .as_ref()
+                    .map(|object| self.scan_value(&Value::Object(object.clone())))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(captures.iter().flat_map(|capture| {
                         capture
                             .value()
                             .map_or_else(Vec::new, |value| self.scan_value(value))
@@ -437,11 +462,15 @@ impl GcScanner {
                                     .map(|cell| self.scan_value(&Value::Reference(cell)))
                                     .unwrap_or_default(),
                             )
-                    })
+                    }))
                     .collect::<Vec<_>>();
                 self.extend_edges(id, edges);
                 vec![id]
             }
+            Value::Callable(CallableValue::BoundMethod {
+                target: CallableMethodTarget::Object(object),
+                ..
+            }) => self.scan_value(&Value::Object(object.clone())),
             Value::Null
             | Value::Bool(_)
             | Value::Int(_)
@@ -452,6 +481,10 @@ impl GcScanner {
             | Value::Callable(
                 CallableValue::UserFunction { .. }
                 | CallableValue::InternalBuiltin { .. }
+                | CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Class(_),
+                    ..
+                }
                 | CallableValue::MethodPlaceholder { .. }
                 | CallableValue::UnresolvedDynamic { .. },
             ) => Vec::new(),

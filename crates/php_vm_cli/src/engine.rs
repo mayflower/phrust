@@ -1,7 +1,7 @@
 use php_ir::{LoweringOptions, lower_frontend_result, verify_unit};
 use php_runtime::{ErrorReporting, ExitStatus, FilesystemCapabilities, RuntimeContext};
-use php_semantics::{FrontendResult, Severity, analyze_source};
-use php_source::TextRange;
+use php_semantics::{FrontendResult, Severity, analyze_source, diagnostics::DiagnosticId};
+use php_source::{SourceText, TextRange};
 use php_vm::{IncludeLoader, Vm, VmOptions};
 use std::fs;
 use std::io::Write;
@@ -78,6 +78,7 @@ where
 
 struct Pipeline {
     path: String,
+    source: SourceText,
     frontend: FrontendResult,
     lowering: php_ir::LoweringResult,
 }
@@ -111,6 +112,7 @@ fn compile_source(source: &str, source_path: &str) -> Result<Pipeline, String> {
     }
     Ok(Pipeline {
         path: source_path.to_string(),
+        source: SourceText::new(source),
         frontend,
         lowering,
     })
@@ -188,6 +190,16 @@ fn write_frontend_diagnostics<W: Write>(stderr: &mut W, pipeline: &Pipeline) -> 
     for diagnostic in pipeline.frontend.semantic_diagnostics() {
         if diagnostic.severity() == Severity::Error {
             if let Some(span) = diagnostic.span() {
+                if diagnostic.id() == DiagnosticId::InvalidTypeCallableContext {
+                    write_php_fatal_line(
+                        stderr,
+                        &pipeline.path,
+                        &pipeline.source,
+                        span,
+                        diagnostic.message(),
+                    )?;
+                    continue;
+                }
                 write_span_line(
                     stderr,
                     &pipeline.path,
@@ -231,6 +243,22 @@ fn write_frontend_diagnostics<W: Write>(stderr: &mut W, pipeline: &Pipeline) -> 
     Ok(())
 }
 
+fn write_php_fatal_line<W: Write>(
+    stderr: &mut W,
+    path: &str,
+    source: &SourceText,
+    span: TextRange,
+    message: &str,
+) -> Result<(), String> {
+    let line = line_number_for_span(source, span);
+    writeln!(stderr, "Fatal error: {message} in {path} on line {line}")
+        .map_err(|error| error.to_string())
+}
+
+fn line_number_for_span(source: &SourceText, span: TextRange) -> usize {
+    source.line_col(span.start()).line
+}
+
 fn write_runtime_diagnostics<W: Write>(
     stderr: &mut W,
     path: &str,
@@ -272,4 +300,35 @@ pub fn read_script(path: &Path) -> Result<(String, PathBuf, String), String> {
     let real_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let source_path = real_path.to_string_lossy().into_owned();
     Ok((source, real_path, source_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_number_for_span_uses_one_based_source_lines() {
+        let source = SourceText::new("<?php\nfunction f(callable&Traversable $x) {}\n");
+        assert_eq!(line_number_for_span(&source, TextRange::new(6, 14)), 2);
+    }
+
+    #[test]
+    fn php_fatal_line_matches_php_compile_error_shape() {
+        let source = SourceText::new("<?php\nfunction f(callable&Traversable $x) {}\n");
+        let mut stderr = Vec::new();
+
+        write_php_fatal_line(
+            &mut stderr,
+            "fixture.php",
+            &source,
+            TextRange::new(6, 14),
+            "Type callable cannot be part of an intersection type",
+        )
+        .expect("fatal line should render");
+
+        assert_eq!(
+            String::from_utf8(stderr).expect("stderr should be UTF-8"),
+            "Fatal error: Type callable cannot be part of an intersection type in fixture.php on line 2\n"
+        );
+    }
 }

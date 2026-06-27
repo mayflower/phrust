@@ -670,6 +670,9 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 format_callable_kind(callable)
             )
         }
+        InstructionKind::AcquireCallable { dst, value } => {
+            format!("acquire_callable r{} {}", dst.raw(), format_operand(value))
+        }
         InstructionKind::CallCallable { dst, callee, args } => {
             let args = format_call_args(args);
             format!(

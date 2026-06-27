@@ -270,6 +270,7 @@ pub fn identical(left: &Value, right: &Value) -> bool {
         (Value::Array(left), Value::Array(right)) => arrays_identical(left, right),
         (Value::Object(left), Value::Object(right)) => left.id() == right.id(),
         (Value::Resource(left), Value::Resource(right)) => left.id() == right.id(),
+        (Value::Callable(left), Value::Callable(right)) => left == right,
         (Value::Reference(left), Value::Reference(right)) if left.ptr_eq(right) => true,
         (Value::Reference(left), right) => identical(&left.get(), right),
         (left, Value::Reference(right)) => identical(left, &right.get()),
@@ -697,6 +698,16 @@ mod tests {
             compare(&Value::string(b"2".to_vec()), &Value::Int(10)).unwrap(),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn closure_callables_are_identical_by_handle() {
+        let closure = Value::closure(1, Vec::new());
+        let same_handle = closure.clone();
+        let other = Value::closure(1, Vec::new());
+
+        assert!(identical(&closure, &same_handle));
+        assert!(!identical(&closure, &other));
     }
 
     #[test]

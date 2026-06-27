@@ -360,6 +360,8 @@ pub enum InstructionKind {
     },
     /// Resolve a callable descriptor into a runtime callable value.
     ResolveCallable { dst: RegId, callable: CallableKind },
+    /// Validate/acquire a runtime value as a first-class callable.
+    AcquireCallable { dst: RegId, value: Operand },
     /// Call a runtime callable value through the unified callable path.
     CallCallable {
         dst: RegId,

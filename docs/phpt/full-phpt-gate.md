@@ -64,9 +64,9 @@ corpus contains stress tests where a 10 second local timeout is load-sensitive.
 Override with `PHPT_TIMEOUT_SECONDS=<seconds>` when deliberately tightening or
 debugging timeout behavior.
 
-The runner executes PHPT cases serially by default. Opt into parallel execution
-with `PHPT_JOBS=<n>` or `php-phpt-tools run --jobs <n>` only for an intentional
-batch run. Results are written in manifest order so the JSONL output remains
+The runner defaults to bounded host parallelism (`min(host CPUs, 8)`). Override
+with `PHPT_JOBS=<n>` or `php-phpt-tools run --jobs <n>` to pin a specific
+worker count. Results are written in manifest order so the JSONL output remains
 deterministic across job counts.
 
 ## Fast Iteration
@@ -92,11 +92,13 @@ link setup are paid once.
 
 `phpt-dev-module` runs the selected module against already-built binaries with
 `PHPT_SKIP_BUILD=1`, strict previous-result reuse for both Reference PHP and
-Target PHP, `PHPT_TIMEOUT_SECONDS=10`, and
-`PHPT_WORK_DIR=/private/tmp/phrust-phpt-work` by default. Strict reuse remains
-fingerprint based, so a changed runner binary, target binary, timeout, target
-mode, PHPT source, external file body, or expectation text invalidates the
-cached entry.
+Target PHP, target-side `PHPT_DEV_REUSE_TARGET_PASS=1`,
+`PHPT_TIMEOUT_SECONDS=10`, and `PHPT_WORK_DIR=/private/tmp/phrust-phpt-work` by
+default. Strict reuse remains fingerprint based, so a changed runner binary,
+target binary, timeout, target mode, PHPT source, external file body, or
+expectation text invalidates the cached entry. Target-side dev pass reuse can
+reuse unchanged previous PASS results across binary changes; it does not apply
+to the Reference PHP comparison.
 
 `phpt-fast` runs the target-only loop with `PHPT_SKIP_BUILD=1`, strict
 previous-result reuse, `PHPT_TIMEOUT_SECONDS=3`, and

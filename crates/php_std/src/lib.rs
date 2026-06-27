@@ -327,6 +327,7 @@ impl ExtensionRegistry {
     pub fn standard_library() -> Self {
         Self::from_extensions([
             ExtensionDescriptor::new("core")
+                .with_class(ClassDescriptor::new("Closure", "core", ClassKind::Class))
                 .with_constant(ConstantDescriptor::with_value(
                     "PHP_VERSION",
                     "core",
@@ -719,6 +720,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("ini_set", "standard"))
                 .with_function(FunctionDescriptor::php("intdiv", "standard"))
                 .with_function(FunctionDescriptor::php("interface_exists", "standard"))
+                .with_function(FunctionDescriptor::php("is_a", "core"))
                 .with_function(FunctionDescriptor::php("intval", "standard"))
                 .with_function(FunctionDescriptor::php("is_array", "standard"))
                 .with_function(FunctionDescriptor::php("is_bool", "standard"))
@@ -1708,6 +1710,7 @@ mod tests {
             "enum_exists",
             "method_exists",
             "property_exists",
+            "is_a",
             "is_subclass_of",
             "get_class",
             "get_class_methods",

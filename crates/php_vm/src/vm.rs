@@ -11,7 +11,7 @@ use crate::compiled_unit::CompiledUnit;
 #[cfg(feature = "jit-cranelift")]
 use crate::counters::JitCompileDescriptor;
 use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservation, VmCounters};
-use crate::frame::{CallStack, Frame};
+use crate::frame::{CallStack, Frame, FrameActivationContext};
 use crate::include::{IncludeLoader, include_path_file_fingerprint};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
@@ -41,22 +41,23 @@ use php_ir::verify::verify_unit;
 use php_runtime::IniRegistry;
 use php_runtime::{
     ArrayKey, AttributeEntry as RuntimeAttributeEntry, AutoloadRegistry, BuiltinContext,
-    BuiltinEntry, BuiltinRegistry, CallableValue, ClassConstantEntry as RuntimeClassConstantEntry,
+    BuiltinEntry, BuiltinRegistry, CallableMethodTarget, CallableValue,
+    ClassConstantEntry as RuntimeClassConstantEntry,
     ClassConstantFlags as RuntimeClassConstantFlags, ClassEntry as RuntimeClassEntry,
     ClassEnumBackingType as RuntimeClassEnumBackingType,
     ClassEnumCaseEntry as RuntimeClassEnumCaseEntry, ClassFlags as RuntimeClassFlags,
     ClassMethodEntry as RuntimeClassMethodEntry, ClassMethodFlags as RuntimeClassMethodFlags,
     ClassPropertyEntry as RuntimeClassPropertyEntry,
     ClassPropertyFlags as RuntimeClassPropertyFlags,
-    ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ExecutionStatus,
-    FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
-    OutputBuffer, PhpArray, PhpArrayKind, PhpString, ProcessCapability, ReferenceCell,
-    RuntimeContext, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame,
-    RuntimeType, Slot, Value, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
-    error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
-    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
-    to_string, undefined_function, undefined_variable_warning, unsupported_feature,
-    value_matches_runtime_type, value_type_name,
+    ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureDebugInfo,
+    ExecutionStatus, FiberRef, FiberState, GeneratorRef, GeneratorState, GlobalSymbolTable,
+    NumericValue, ObjectRef, OutputBuffer, PhpArray, PhpArrayKind, PhpString, ProcessCapability,
+    ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeSeverity, RuntimeSourceSpan,
+    RuntimeStackFrame, RuntimeType, Slot, Value, compare, division_by_zero_mvp,
+    emit_php_diagnostic, equal, error_reporting_allows_level, identical,
+    reset_float_string_precision, runtime_type_name, set_float_string_precision,
+    to_arithmetic_number, to_bool, to_float, to_int, to_number, to_string, undefined_function,
+    undefined_variable_warning, unsupported_feature, value_matches_runtime_type, value_type_name,
 };
 #[cfg(test)]
 use php_runtime::{GcEntityId, GcEntityKind};
@@ -1218,7 +1219,9 @@ struct PropertyHookCall {
 struct FunctionCall<'a> {
     args: Vec<CallArgument>,
     captures: Vec<ClosureCaptureValue>,
+    call_span: Option<php_ir::IrSpan>,
     allow_by_ref_value_warnings: bool,
+    by_ref_warning_callable_name: Option<String>,
     this_value: Option<ObjectRef>,
     scope_class: Option<String>,
     called_class: Option<String>,
@@ -1237,7 +1240,9 @@ impl FunctionCall<'_> {
         Self {
             args,
             captures,
+            call_span: None,
             allow_by_ref_value_warnings: false,
+            by_ref_warning_callable_name: None,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -1252,8 +1257,23 @@ impl FunctionCall<'_> {
         }
     }
 
+    fn with_call_span(mut self, span: php_ir::IrSpan) -> Self {
+        self.call_span = Some(span);
+        self
+    }
+
+    fn with_optional_call_span(mut self, span: Option<php_ir::IrSpan>) -> Self {
+        self.call_span = span;
+        self
+    }
+
     fn with_by_ref_value_warnings(mut self) -> Self {
         self.allow_by_ref_value_warnings = true;
+        self
+    }
+
+    fn with_optional_by_ref_warning_callable_name(mut self, name: Option<String>) -> Self {
+        self.by_ref_warning_callable_name = name;
         self
     }
 
@@ -4314,9 +4334,7 @@ impl Vm {
             function_id,
             dense_function.register_count,
             dense_function.local_count,
-            None,
-            None,
-            None,
+            FrameActivationContext::default(),
         );
         self.record_counter_frame_activation(reused_frame);
         if ir_function.flags.is_top_level {
@@ -4868,7 +4886,7 @@ impl Vm {
                             return result;
                         };
                         let result = self.execute_function_call_target(
-                            compiled, target, values, None, output, stack, state, &None,
+                            compiled, target, values, None, None, output, stack, state, &None,
                         );
                         if !result.status.is_success() {
                             stack.pop_recycle();
@@ -5452,6 +5470,7 @@ impl Vm {
                         };
                         let value = match coerce_return_value(
                             compiled,
+                            state,
                             ir_function,
                             value,
                             self.typecheck_fast_path_context(),
@@ -6017,11 +6036,22 @@ impl Vm {
                 function,
                 call.args,
                 stack,
+                state,
+                self.typecheck_fast_path_context(),
                 call.allow_by_ref_value_warnings,
+                call.call_span,
+                call.by_ref_warning_callable_name.as_deref(),
             ) {
                 Ok(args) => args,
                 Err(message) => {
-                    return self.runtime_error(output, compiled, stack, message);
+                    let result = self.runtime_error(output, compiled, stack, message);
+                    if let Some(throwable) = runtime_error_throwable(&result) {
+                        tag_throwable_location(&throwable, compiled, function.span);
+                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                        state.pending_throw = Some(throwable);
+                        return VmResult::propagating_exception(output.clone());
+                    }
+                    return result;
                 }
             };
             let frame_reuse_blocked_reason = frame_reuse_call_shape_reason
@@ -6088,15 +6118,19 @@ impl Vm {
             ) {
                 return VmResult::success(output.clone(), Some(value));
             }
+            let activation_context = FrameActivationContext {
+                scope_class: call.scope_class.take(),
+                called_class: call.called_class.take(),
+                declaring_class: call.declaring_class.take(),
+                call_span: call.call_span,
+            };
             let reused_frame = if let Some(reason) = frame_reuse_blocked_reason {
                 self.record_counter_frame_reuse_blocked(reason);
                 stack.push_fresh_frame(
                     function_id,
                     function.register_count,
                     function.local_count,
-                    call.scope_class.take(),
-                    call.called_class.take(),
-                    call.declaring_class.take(),
+                    activation_context,
                 );
                 false
             } else {
@@ -6104,9 +6138,7 @@ impl Vm {
                     function_id,
                     function.register_count,
                     function.local_count,
-                    call.scope_class.take(),
-                    call.called_class.take(),
-                    call.declaring_class.take(),
+                    activation_context,
                 )
             };
             self.record_counter_frame_activation(reused_frame);
@@ -6133,14 +6165,21 @@ impl Vm {
                 if let Err(message) = coerce_or_check_param_type(
                     compiled,
                     compiled.unit(),
+                    state,
                     function,
                     param,
                     arg_index,
                     &mut arg.value,
                     arg.reference.is_some(),
                     self.typecheck_fast_path_context(),
+                    call.call_span,
                 ) {
                     let result = self.runtime_error(output, compiled, stack, message);
+                    if let Some(throwable) = runtime_error_throwable(&result) {
+                        tag_throwable_location(&throwable, compiled, function.span);
+                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                        return self.propagate_exception(output, stack, state, throwable);
+                    }
                     stack.pop_recycle();
                     return result;
                 }
@@ -6786,6 +6825,7 @@ impl Vm {
                         Some(PendingControl::Return(value)) => {
                             let value = match coerce_return_value(
                                 compiled,
+                                state,
                                 function,
                                 value,
                                 self.typecheck_fast_path_context(),
@@ -6952,14 +6992,15 @@ impl Vm {
                                 ),
                             );
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
-                            self.constant_value(compiled.unit(), value)
-                        }) {
-                            Ok(class) => class,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
+                        let runtime_class =
+                            match runtime_class_entry(compiled, state, &class, &|value| {
+                                self.constant_value(compiled.unit(), value)
+                            }) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -7028,6 +7069,25 @@ impl Vm {
                         class_name,
                         args,
                     } => {
+                        if is_closure_runtime_class(class_name) {
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                "E_PHP_VM_CLOSURE_INSTANTIATION: Instantiation of class Closure is not allowed"
+                                    .to_owned(),
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
                         if is_fiber_runtime_class(class_name) {
                             let values = match read_call_args(unit, stack, args) {
                                 Ok(values) => values,
@@ -7362,14 +7422,15 @@ impl Vm {
                                 }
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
-                            self.constant_value(compiled.unit(), value)
-                        }) {
-                            Ok(class) => class,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
+                        let runtime_class =
+                            match runtime_class_entry(compiled, state, &class, &|value| {
+                                self.constant_value(compiled.unit(), value)
+                            }) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -7471,14 +7532,15 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
-                            self.constant_value(compiled.unit(), value)
-                        }) {
-                            Ok(class) => class,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
+                        let runtime_class =
+                            match runtime_class_entry(compiled, state, &class, &|value| {
+                                self.constant_value(compiled.unit(), value)
+                            }) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -7551,14 +7613,15 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class = match runtime_class_entry(compiled, &class, &|value| {
-                            self.constant_value(compiled.unit(), value)
-                        }) {
-                            Ok(class) => class,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
+                        let runtime_class =
+                            match runtime_class_entry(compiled, state, &class, &|value| {
+                                self.constant_value(compiled.unit(), value)
+                            }) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -10277,6 +10340,7 @@ impl Vm {
                                 block_id,
                                 instruction.id,
                             )),
+                            Some(instruction.span),
                             output,
                             stack,
                             state,
@@ -10381,6 +10445,122 @@ impl Vm {
                                 }
                                 continue;
                             }
+                            Value::Callable(callable)
+                                if method.eq_ignore_ascii_case("__invoke") =>
+                            {
+                                let value = match self
+                                    .call_callable_inner(
+                                        compiled,
+                                        Value::Callable(callable),
+                                        values,
+                                        Some(instruction.span),
+                                        output,
+                                        stack,
+                                        state,
+                                        false,
+                                        None,
+                                    )
+                                    .return_value
+                                {
+                                    Some(value) => value,
+                                    None => Value::Null,
+                                };
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Value::Callable(callable) if method.eq_ignore_ascii_case("call") => {
+                                let result = self.call_closure_call_method(
+                                    compiled,
+                                    callable,
+                                    values,
+                                    output,
+                                    stack,
+                                    state,
+                                    instruction.span,
+                                );
+                                if !result.status.is_success()
+                                    && let Some(throwable) = state
+                                        .pending_throw
+                                        .take()
+                                        .or_else(|| runtime_error_throwable(&result))
+                                {
+                                    if let Some(target) = handle_throw(
+                                        compiled,
+                                        throwable.clone(),
+                                        &mut exception_handlers,
+                                        stack,
+                                        &mut pending_control,
+                                    ) {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
+                                if !result.status.is_success() {
+                                    return result;
+                                }
+                                let return_value = result.return_value.unwrap_or(Value::Null);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, return_value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Value::Callable(callable) if method.eq_ignore_ascii_case("bindto") => {
+                                let result = self.call_closure_bind_to_method(
+                                    compiled,
+                                    callable,
+                                    values,
+                                    output,
+                                    stack,
+                                    state,
+                                    instruction.span,
+                                );
+                                if !result.status.is_success()
+                                    && let Some(throwable) = state
+                                        .pending_throw
+                                        .take()
+                                        .or_else(|| runtime_error_throwable(&result))
+                                {
+                                    if let Some(target) = handle_throw(
+                                        compiled,
+                                        throwable.clone(),
+                                        &mut exception_handlers,
+                                        stack,
+                                        &mut pending_control,
+                                    ) {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
+                                if !result.status.is_success() {
+                                    return result;
+                                }
+                                let return_value = result.return_value.unwrap_or(Value::Null);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, return_value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
                             Value::Object(object) => object,
                             other => {
                                 let message = format!(
@@ -10431,14 +10611,21 @@ impl Vm {
                         if is_reflection_runtime_class(&object.class_name()) {
                             let values =
                                 values.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
-                            let value =
-                                match reflection_method_value(compiled, &object, method, values) {
-                                    Ok(value) => value,
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                };
+                            let value = match reflection_method_value(
+                                compiled,
+                                &object,
+                                method,
+                                values,
+                                output,
+                                stack,
+                                state,
+                                runtime_source_span(compiled, instruction.span),
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
                             if let Err(message) = stack
                                 .current_mut()
                                 .expect("caller frame is active")
@@ -10524,8 +10711,6 @@ impl Vm {
                             }
                             continue;
                         }
-                        let dynamic_owner_index =
-                            dynamic_class_owner_index_in_state(state, &object.class_name());
                         let receiver_class = normalize_class_name(&object.class_name());
                         let lowered_method = normalize_method_name(method);
                         let scope = current_scope_class(compiled, stack);
@@ -10582,6 +10767,25 @@ impl Vm {
                                     state,
                                     &running_fiber,
                                 );
+                                if !result.status.is_success()
+                                    && let Some(throwable) = state
+                                        .pending_throw
+                                        .take()
+                                        .or_else(|| runtime_error_throwable(&result))
+                                {
+                                    if let Some(target) = handle_throw(
+                                        compiled,
+                                        throwable.clone(),
+                                        &mut exception_handlers,
+                                        stack,
+                                        &mut pending_control,
+                                    ) {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
                                 if !result.status.is_success() {
                                     return result;
                                 }
@@ -10619,12 +10823,12 @@ impl Vm {
                         {
                             self.record_counter_direct_call_fallback();
                         }
-                        let dynamic_owner = dynamic_owner_index
-                            .and_then(|unit_index| state.dynamic_units.get(unit_index).cloned());
-                        let class_owner = dynamic_owner.unwrap_or_else(|| compiled.clone());
-                        let resolved = match lookup_method_in_hierarchy(
-                            &class_owner,
-                            &class,
+                        let receiver_class_owner =
+                            class_owner_in_state(compiled, state, &class.name);
+                        let resolved = match lookup_resolved_method_in_state(
+                            compiled,
+                            state,
+                            &class.name,
                             method,
                             scope.as_deref(),
                         ) {
@@ -10639,7 +10843,7 @@ impl Vm {
                                         None,
                                         scope.as_deref(),
                                         epoch,
-                                        class_has_public_magic_call(&class_owner, &class),
+                                        class_has_public_magic_call(&receiver_class_owner, &class),
                                         true,
                                         method_call_args_are_simple_positional(args),
                                         method_call_has_by_ref_argument(args, None, None),
@@ -10692,8 +10896,10 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let method_entry = resolved.method;
-                        let declaring_class = resolved.class;
+                        let method_entry = &resolved.method;
+                        let declaring_class = &resolved.class;
+                        let class_owner =
+                            class_owner_in_state(compiled, state, &declaring_class.name);
                         let simple_positional_arguments =
                             method_call_args_are_simple_positional(args);
                         let has_by_ref_argument = method_call_has_by_ref_argument(
@@ -10705,7 +10911,8 @@ impl Vm {
                             &class_owner,
                             method_entry.function,
                         );
-                        let has_magic_call = class_has_public_magic_call(&class_owner, &class);
+                        let has_magic_call =
+                            class_has_public_magic_call(&receiver_class_owner, &class);
                         // PHP permits calling a static method through an instance
                         // (`$obj->staticMethod()`); it runs as a static call. Fall
                         // through to the normal dispatch — a static body never uses
@@ -10726,9 +10933,10 @@ impl Vm {
                             false,
                             Vec::new(),
                         ));
-                        if let Err(message) = validate_method_callable(
-                            &class_owner,
-                            stack,
+                        if let Err(message) = validate_method_callable_in_state_scope(
+                            compiled,
+                            state,
+                            scope.as_deref(),
                             declaring_class,
                             method_entry,
                         ) {
@@ -10807,7 +11015,9 @@ impl Vm {
                             }
                             return result;
                         }
-                        let target = dynamic_owner_index.map_or_else(
+                        let declaring_dynamic_owner_index =
+                            dynamic_class_owner_index_in_state(state, &declaring_class.name);
+                        let target = declaring_dynamic_owner_index.map_or_else(
                             || MethodCallCacheTarget::CurrentUnit {
                                 receiver_class: receiver_class.clone(),
                                 receiver_class_id: class.id.raw(),
@@ -10857,6 +11067,24 @@ impl Vm {
                             stack,
                             state,
                         );
+                        if !result.status.is_success()
+                            && let Some(throwable) = state
+                                .pending_throw
+                                .take()
+                                .or_else(|| runtime_error_throwable(&result))
+                        {
+                            if let Some(target) = handle_throw(
+                                compiled,
+                                throwable.clone(),
+                                &mut exception_handlers,
+                                stack,
+                                &mut pending_control,
+                            ) {
+                                block_id = target;
+                                continue 'dispatch;
+                            }
+                            return self.propagate_exception(output, stack, state, throwable);
+                        }
                         if !result.status.is_success() {
                             return result;
                         }
@@ -10891,6 +11119,52 @@ impl Vm {
                         method,
                         args,
                     } => {
+                        if is_closure_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let value = match closure_static_method_value(
+                                compiled,
+                                state,
+                                stack,
+                                method,
+                                values,
+                                output,
+                                runtime_source_span(compiled, instruction.span),
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if is_fiber_runtime_class(class_name)
                             && normalize_method_name(method) == "suspend"
                         {
@@ -11260,7 +11534,18 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = Value::closure(function.raw(), captured);
+                        let bound_this = compiled
+                            .unit()
+                            .functions
+                            .get(function.index())
+                            .filter(|closure| closure.flags.is_closure && !closure.flags.is_static)
+                            .and_then(|_| current_this_object(compiled, stack));
+                        let value = Value::closure_with_debug_and_this(
+                            function.raw(),
+                            captured,
+                            closure_debug_info(compiled, *function),
+                            bound_this,
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -11277,7 +11562,8 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let Some((function, captures)) = callee.as_closure() else {
+                        let Some((function, captures, bound_this, debug)) = callee.as_closure()
+                        else {
                             return self.runtime_error(
                                 output,
                                 compiled,
@@ -11291,15 +11577,40 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        let mut call = FunctionCall::new(values, captures.clone())
+                            .inherit_fiber_context(&running_fiber)
+                            .with_call_span(instruction.span);
+                        if let Some(bound_this) = bound_this {
+                            call = call.with_this(bound_this.clone());
+                        }
+                        let closure_owner =
+                            closure_owner_for_function(compiled, state, function, debug);
                         let result = self.execute_function(
-                            compiled,
+                            &closure_owner,
                             FunctionId::new(function),
-                            FunctionCall::new(values, captures.clone())
-                                .inherit_fiber_context(&running_fiber),
+                            call,
                             output,
                             stack,
                             state,
                         );
+                        if !result.status.is_success()
+                            && let Some(throwable) = state
+                                .pending_throw
+                                .take()
+                                .or_else(|| runtime_error_throwable(&result))
+                        {
+                            if let Some(target) = handle_throw(
+                                compiled,
+                                throwable.clone(),
+                                &mut exception_handlers,
+                                stack,
+                                &mut pending_control,
+                            ) {
+                                block_id = target;
+                                continue 'dispatch;
+                            }
+                            return self.propagate_exception(output, stack, state, throwable);
+                        }
                         if !result.status.is_success() {
                             return result;
                         }
@@ -11329,7 +11640,64 @@ impl Vm {
                         }
                     }
                     InstructionKind::ResolveCallable { dst, callable } => {
-                        let value = resolve_callable(compiled, callable);
+                        let value = match resolve_callable(compiled, state, callable) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .registers
+                            .set(*dst, value)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
+                    InstructionKind::AcquireCallable { dst, value } => {
+                        let value = match read_operand(unit, stack, *value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let value = match acquire_callable_value(compiled, state, stack, value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                        };
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -11352,8 +11720,33 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result =
-                            self.call_callable(compiled, callee, values, output, stack, state);
+                        let result = self.call_callable_with_call_span(
+                            compiled,
+                            callee,
+                            values,
+                            Some(instruction.span),
+                            output,
+                            stack,
+                            state,
+                        );
+                        if !result.status.is_success()
+                            && let Some(throwable) = state
+                                .pending_throw
+                                .take()
+                                .or_else(|| runtime_error_throwable(&result))
+                        {
+                            if let Some(target) = handle_throw(
+                                compiled,
+                                throwable.clone(),
+                                &mut exception_handlers,
+                                stack,
+                                &mut pending_control,
+                            ) {
+                                block_id = target;
+                                continue 'dispatch;
+                            }
+                            return self.propagate_exception(output, stack, state, throwable);
+                        }
                         if !result.status.is_success() {
                             return result;
                         }
@@ -11562,6 +11955,7 @@ impl Vm {
                     }
                     let value = match coerce_return_value(
                         compiled,
+                        state,
                         function,
                         value,
                         self.typecheck_fast_path_context(),
@@ -11869,7 +12263,24 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        self.call_callable_inner(compiled, callee, args, output, stack, state, false)
+        self.call_callable_inner(
+            compiled, callee, args, None, output, stack, state, false, None,
+        )
+    }
+
+    fn call_callable_with_call_span(
+        &self,
+        compiled: &CompiledUnit,
+        callee: Value,
+        args: Vec<CallArgument>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        self.call_callable_inner(
+            compiled, callee, args, call_span, output, stack, state, false, None,
+        )
     }
 
     fn call_callable_with_by_ref_value_warnings(
@@ -11881,7 +12292,9 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        self.call_callable_inner(compiled, callee, args, output, stack, state, true)
+        self.call_callable_inner(
+            compiled, callee, args, None, output, stack, state, true, None,
+        )
     }
 
     fn call_callable_inner(
@@ -11889,20 +12302,26 @@ impl Vm {
         compiled: &CompiledUnit,
         callee: Value,
         args: Vec<CallArgument>,
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
         allow_by_ref_value_warnings: bool,
+        by_ref_warning_callable_name: Option<String>,
     ) -> VmResult {
         match callee {
             Value::Callable(CallableValue::UserFunction { name }) => {
                 let make_call = |args, captures| {
-                    let call = FunctionCall::new(args, captures);
+                    let call =
+                        FunctionCall::new(args, captures).with_optional_call_span(call_span);
                     if allow_by_ref_value_warnings {
                         call.with_by_ref_value_warnings()
                     } else {
                         call
                     }
+                    .with_optional_by_ref_warning_callable_name(
+                        by_ref_warning_callable_name.clone(),
+                    )
                 };
                 if let Some(function) = compiled.lookup_function(&name) {
                     self.execute_function(
@@ -11931,15 +12350,34 @@ impl Vm {
                     )
                 }
             }
-            Value::Callable(CallableValue::Closure { function, captures }) => {
-                let call = FunctionCall::new(args, captures);
+            Value::Callable(CallableValue::Closure {
+                function,
+                captures,
+                bound_this,
+                debug,
+                ..
+            }) => {
+                let mut call = FunctionCall::new(args, captures).with_optional_call_span(call_span);
+                let closure_owner =
+                    closure_owner_for_function(compiled, state, function, debug.as_ref());
+                if let Some(bound_this) = bound_this {
+                    let scope_class = bound_this.class_name();
+                    if closure_function_has_this_local(&closure_owner, function) {
+                        call = call.with_this(bound_this);
+                    }
+                    call =
+                        call.with_class_context(scope_class.clone(), scope_class.clone(), scope_class);
+                }
                 let call = if allow_by_ref_value_warnings {
                     call.with_by_ref_value_warnings()
                 } else {
                     call
-                };
+                }
+                .with_optional_by_ref_warning_callable_name(
+                    by_ref_warning_callable_name.clone(),
+                );
                 self.execute_function(
-                    compiled,
+                    &closure_owner,
                     FunctionId::new(function),
                     call,
                     output,
@@ -12005,6 +12443,13 @@ impl Vm {
                     compiled,
                 )
             }
+            Value::Callable(CallableValue::BoundMethod {
+                target,
+                method,
+                scope,
+            }) => self.call_bound_method_callable(
+                compiled, target, &method, scope, args, output, stack, state,
+            ),
             Value::Callable(CallableValue::MethodPlaceholder { target }) => self.runtime_error(
                 output,
                 compiled,
@@ -12028,7 +12473,15 @@ impl Vm {
                 state,
             ),
             Value::Array(array) => {
-                self.call_array_callable(compiled, &array, args, output, stack, state)
+                self.call_array_callable(
+                    compiled,
+                    &array,
+                    args,
+                    output,
+                    stack,
+                    state,
+                    allow_by_ref_value_warnings,
+                )
             }
             Value::Object(object) => {
                 self.call_object_callable(compiled, object, args, output, stack, state)
@@ -12851,6 +13304,7 @@ impl Vm {
             ));
         }
         let callback = args[0].clone();
+        validate_array_callback_arg(compiled, state, "array_map", 1, "callback", true, &callback)?;
         let arrays = args[1..]
             .iter()
             .map(|arg| array_callback_entries("array_map", arg))
@@ -13743,15 +14197,36 @@ impl Vm {
                     )
                 }
             }
-            Value::Callable(CallableValue::Closure { function, captures }) => self
-                .execute_function(
-                    compiled,
+            Value::Callable(CallableValue::Closure {
+                function,
+                captures,
+                bound_this,
+                debug,
+                ..
+            }) => {
+                let mut call = FunctionCall::new(args, captures).running_fiber(fiber);
+                let closure_owner =
+                    closure_owner_for_function(compiled, state, function, debug.as_ref());
+                if let Some(bound_this) = bound_this {
+                    let scope_class = bound_this.class_name();
+                    if closure_function_has_this_local(&closure_owner, function) {
+                        call = call.with_this(bound_this);
+                    }
+                    call = call.with_class_context(
+                        scope_class.clone(),
+                        scope_class.clone(),
+                        scope_class,
+                    );
+                }
+                self.execute_function(
+                    &closure_owner,
                     FunctionId::new(function),
-                    FunctionCall::new(args, captures).running_fiber(fiber),
+                    call,
                     output,
                     stack,
                     state,
-                ),
+                )
+            }
             other => self.call_callable(compiled, other, args, output, stack, state),
         }
     }
@@ -13961,6 +14436,7 @@ impl Vm {
         target: FunctionCallCacheTarget,
         args: Vec<CallArgument>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -13970,7 +14446,9 @@ impl Vm {
             FunctionCallCacheTarget::CurrentUnit { function } => self.execute_function(
                 compiled,
                 function,
-                FunctionCall::new(args, Vec::new()).inherit_fiber_context(running_fiber),
+                FunctionCall::new(args, Vec::new())
+                    .inherit_fiber_context(running_fiber)
+                    .with_optional_call_span(call_span),
                 output,
                 stack,
                 state,
@@ -13992,7 +14470,9 @@ impl Vm {
                 self.execute_function(
                     &owner,
                     function,
-                    FunctionCall::new(args, Vec::new()).inherit_fiber_context(running_fiber),
+                    FunctionCall::new(args, Vec::new())
+                        .inherit_fiber_context(running_fiber)
+                        .with_optional_call_span(call_span),
                     output,
                     stack,
                     state,
@@ -14332,6 +14812,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
+        allow_by_ref_value_warnings: bool,
     ) -> VmResult {
         let elements = array
             .iter()
@@ -14360,6 +14841,19 @@ impl Vm {
             Value::Object(object) => {
                 self.call_object_method_callable(compiled, object, &method, args, output, stack, state)
             }
+            Value::Callable(callable) if method.eq_ignore_ascii_case("__invoke") => {
+                self.call_callable_inner(
+                    compiled,
+                    Value::Callable(callable),
+                    args,
+                    None,
+                    output,
+                    stack,
+                    state,
+                    allow_by_ref_value_warnings,
+                    Some("Closure::__invoke".to_owned()),
+                )
+            }
             Value::String(class_name) => self.call_static_method_callable(
                 compiled,
                 &class_name.to_string_lossy(),
@@ -14379,6 +14873,511 @@ impl Vm {
                 ),
             ),
         }
+    }
+
+    fn call_bound_method_callable(
+        &self,
+        compiled: &CompiledUnit,
+        target: CallableMethodTarget,
+        method: &str,
+        scope: Option<String>,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        match target {
+            CallableMethodTarget::Object(object) => self.call_bound_object_method_callable(
+                compiled, object, method, scope, args, output, stack, state,
+            ),
+            CallableMethodTarget::Class(class_name) => self.call_bound_static_method_callable(
+                compiled,
+                &class_name,
+                method,
+                scope,
+                args,
+                output,
+                stack,
+                state,
+            ),
+        }
+    }
+
+    fn call_closure_call_method(
+        &self,
+        compiled: &CompiledUnit,
+        callable: CallableValue,
+        mut args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> VmResult {
+        if args.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_TOO_FEW_ARGS: Closure::call expects at least 1 argument, 0 given",
+            );
+        }
+        let new_this = callable_resolve_reference(args.remove(0).value);
+        let Value::Object(new_this) = new_this else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::call(): Argument #1 ($newThis) must be of type object, {} given",
+                    value_type_name(&new_this)
+                ),
+            );
+        };
+        match callable {
+            CallableValue::BoundMethod {
+                target: CallableMethodTarget::Object(object),
+                method,
+                scope,
+            } => {
+                let compatible = class_is_a_in_state(
+                    compiled,
+                    state,
+                    &new_this.class_name(),
+                    &object.class_name(),
+                )
+                .unwrap_or(false);
+                if !compatible {
+                    if let Err(result) = self.emit_closure_call_bind_warning(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        &object.class_name(),
+                        &method,
+                        &new_this.class_name(),
+                        span,
+                    ) {
+                        return result;
+                    }
+                    return VmResult::success(output.clone(), Some(Value::Null));
+                }
+                self.call_bound_object_method_callable(
+                    compiled, new_this, &method, scope, args, output, stack, state,
+                )
+            }
+            callable @ CallableValue::Closure { .. } => {
+                if is_std_class_object(&new_this) {
+                    if let Err(result) = self.emit_closure_internal_scope_bind_warning(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        &new_this.class_name(),
+                        span,
+                    ) {
+                        return result;
+                    }
+                    return VmResult::success(output.clone(), Some(Value::Null));
+                }
+                self.call_callable_inner(
+                    compiled,
+                    bind_closure_callable_value(callable, Some(new_this)),
+                    args,
+                    Some(span),
+                    output,
+                    stack,
+                    state,
+                    false,
+                    Some("Closure::call".to_owned()),
+                )
+            }
+            other => self.call_callable_inner(
+                compiled,
+                Value::Callable(other),
+                args,
+                Some(span),
+                output,
+                stack,
+                state,
+                false,
+                Some("Closure::call".to_owned()),
+            ),
+        }
+    }
+
+    fn call_closure_bind_to_method(
+        &self,
+        compiled: &CompiledUnit,
+        callable: CallableValue,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> VmResult {
+        let mut values = match call_args_to_positional("Closure::bindTo", args) {
+            Ok(values) => values,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if values.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_TOO_FEW_ARGS: Closure::bindTo expects at least 1 argument, 0 given",
+            );
+        }
+        if values.len() > 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: Closure::bindTo expects at most 2 arguments, {} given",
+                    values.len()
+                ),
+            );
+        }
+        if let Some(scope) = values.get(1) {
+            match callable_resolve_reference(scope.clone()) {
+                Value::Null | Value::String(_) | Value::Object(_) => {}
+                other => {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bindTo(): Argument #2 ($newScope) must be of type object|string|null, {} given",
+                            value_type_name(&other)
+                        ),
+                    );
+                }
+            }
+        }
+        let new_this = callable_resolve_reference(values.remove(0));
+        let bound_this = match new_this {
+            Value::Null => {
+                if callable_closure_should_warn_unbind_this(&callable) {
+                    if let Err(result) =
+                        self.emit_closure_unbind_this_warning(compiled, output, stack, state, span)
+                    {
+                        return result;
+                    }
+                    return VmResult::success(output.clone(), Some(Value::Null));
+                }
+                None
+            }
+            Value::Object(object) => Some(object),
+            other => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bindTo(): Argument #1 ($newThis) must be of type ?object, {} given",
+                        value_type_name(&other)
+                    ),
+                );
+            }
+        };
+        let value = bind_closure_callable_value(callable, bound_this);
+        VmResult::success(output.clone(), Some(value))
+    }
+
+    fn emit_closure_internal_scope_bind_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        class_name: &str,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_INTERNAL_SCOPE_BIND_WARNING",
+            RuntimeSeverity::Warning,
+            format!(
+                "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
+                callable_class_display_name(compiled, state, class_name)
+            ),
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    fn emit_closure_unbind_this_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_UNBIND_THIS_WARNING",
+            RuntimeSeverity::Warning,
+            "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    fn emit_closure_call_bind_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        declaring_class: &str,
+        method: &str,
+        target_class: &str,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_CALL_BIND_WARNING",
+            RuntimeSeverity::Warning,
+            format!(
+                "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                callable_class_display_name(compiled, state, declaring_class),
+                method,
+                callable_class_display_name(compiled, state, target_class)
+            ),
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    fn call_bound_object_method_callable(
+        &self,
+        compiled: &CompiledUnit,
+        object: ObjectRef,
+        method: &str,
+        scope: Option<String>,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                    object.class_name()
+                ),
+            );
+        };
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            method,
+            scope.as_deref(),
+        ) {
+            Ok(Some(method)) => method,
+            Ok(None) => {
+                return match self.call_magic_instance_method(
+                    compiled,
+                    object.clone(),
+                    "__call",
+                    method,
+                    args,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                            object.class_name(),
+                            method
+                        ),
+                    ),
+                    Err(result) => result,
+                };
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            scope.as_deref(),
+            &resolved.class,
+            &resolved.method,
+        ) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        self.execute_function(
+            &class_owner,
+            resolved.method.function,
+            FunctionCall::new(args, Vec::new())
+                .with_this(object.clone())
+                .with_class_context(
+                    resolved.class.name.clone(),
+                    object.class_name(),
+                    resolved.class.name.clone(),
+                ),
+            output,
+            stack,
+            state,
+        )
+    }
+
+    fn call_bound_static_method_callable(
+        &self,
+        compiled: &CompiledUnit,
+        class_name: &str,
+        method: &str,
+        scope: Option<String>,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"),
+            );
+        };
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            class_name,
+            method,
+            scope.as_deref(),
+        ) {
+            Ok(Some(method)) => method,
+            Ok(None) => {
+                let called_class = normalize_class_name(class_name);
+                return match self.call_magic_static_method(
+                    compiled,
+                    &class,
+                    "__callStatic",
+                    method,
+                    args,
+                    called_class,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                            class.display_name, method
+                        ),
+                    ),
+                    Err(result) => result,
+                };
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if !resolved.method.flags.is_static {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_NON_STATIC_METHOD_CALL: Non-static method {}::{}() cannot be called statically",
+                    resolved.class.display_name, method
+                ),
+            );
+        }
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            scope.as_deref(),
+            &resolved.class,
+            &resolved.method,
+        ) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        self.execute_function(
+            &class_owner,
+            resolved.method.function,
+            FunctionCall::new(args, Vec::new()).with_class_context(
+                resolved.class.name.clone(),
+                normalize_class_name(class_name),
+                resolved.class.name.clone(),
+            ),
+            output,
+            stack,
+            state,
+        )
     }
 
     fn call_object_callable(
@@ -14422,7 +15421,7 @@ impl Vm {
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
-        let Some(class) = compiled.lookup_class(&object.class_name()) else {
+        let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
             return self.runtime_error(
                 output,
                 compiled,
@@ -14434,7 +15433,13 @@ impl Vm {
             );
         };
         let scope = current_scope_class(compiled, stack);
-        let resolved = match lookup_method_in_hierarchy(compiled, class, method, scope.as_deref()) {
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            method,
+            scope.as_deref(),
+        ) {
             Ok(Some(method)) => method,
             Ok(None) => {
                 return match self.call_magic_instance_method(
@@ -14463,12 +15468,17 @@ impl Vm {
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
-        let method_entry = resolved.method;
-        let declaring_class = resolved.class;
+        let method_entry = &resolved.method;
+        let declaring_class = &resolved.class;
         // PHP allows reaching a static method through an instance; run it.
         if (method_entry.flags.is_private || method_entry.flags.is_protected)
-            && let Err(message) =
-                validate_method_callable(compiled, stack, declaring_class, method_entry)
+            && let Err(message) = validate_method_callable_in_state_scope(
+                compiled,
+                state,
+                scope.as_deref(),
+                declaring_class,
+                method_entry,
+            )
         {
             return match self.call_magic_instance_method(
                 compiled,
@@ -14485,9 +15495,13 @@ impl Vm {
                 Err(result) => result,
             };
         }
-        if let Err(message) =
-            validate_method_callable(compiled, stack, declaring_class, method_entry)
-        {
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            scope.as_deref(),
+            declaring_class,
+            method_entry,
+        ) {
             return self.runtime_error(output, compiled, stack, message);
         }
         self.record_runtime_trace_event(format!(
@@ -14496,8 +15510,9 @@ impl Vm {
             method_entry.name,
             declaring_class.name
         ));
+        let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
         self.execute_function(
-            compiled,
+            &class_owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
                 .with_this(object.clone())
@@ -14686,10 +15701,16 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<Option<VmResult>, VmResult> {
-        let Some(class) = compiled.lookup_class(&object.class_name()) else {
+        let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
             return Ok(None);
         };
-        let resolved = match lookup_method_in_hierarchy(compiled, class, magic_method, None) {
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            magic_method,
+            None,
+        ) {
             Ok(Some(method)) => method,
             Ok(None) => return Ok(None),
             Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
@@ -14725,8 +15746,9 @@ impl Vm {
             CallArgument::positional(magic_args_array(args)),
         ];
         state.magic_method_stack.push(guard);
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
         let result = self.execute_function(
-            compiled,
+            &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new())
                 .with_this(object.clone())
@@ -14756,11 +15778,13 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<Option<VmResult>, VmResult> {
-        let resolved = match lookup_method_in_hierarchy(compiled, class, magic_method, None) {
-            Ok(Some(method)) => method,
-            Ok(None) => return Ok(None),
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
-        };
+        let resolved =
+            match lookup_resolved_method_in_state(compiled, state, &class.name, magic_method, None)
+            {
+                Ok(Some(method)) => method,
+                Ok(None) => return Ok(None),
+                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            };
         if !resolved.method.flags.is_static
             || resolved.method.flags.is_private
             || resolved.method.flags.is_protected
@@ -14792,8 +15816,9 @@ impl Vm {
             CallArgument::positional(magic_args_array(args)),
         ];
         state.magic_method_stack.push(guard);
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
         let result = self.execute_function(
-            compiled,
+            &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new()).with_class_context(
                 resolved.class.name.clone(),
@@ -15789,6 +16814,11 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<PhpString, VmResult> {
+        if is_reflection_runtime_class(&object.class_name()) {
+            return reflection_object_to_string(&object)
+                .map(|value| PhpString::from(value.into_bytes()))
+                .map_err(|message| self.runtime_error(output, compiled, stack, message));
+        }
         let Some(class) = compiled.lookup_class(&object.class_name()) else {
             return Err(self.runtime_error(
                 output,
@@ -16277,6 +17307,21 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        if is_closure_runtime_class(class_name) {
+            let value = match closure_static_method_value(
+                compiled,
+                state,
+                stack,
+                method,
+                args,
+                output,
+                RuntimeSourceSpan::default(),
+            ) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            };
+            return VmResult::success(output.clone(), Some(value));
+        }
         if is_php_token_runtime_class(class_name) {
             let value = match php_token_static_method_value(class_name, method, args) {
                 Ok(value) => value,
@@ -16581,7 +17626,9 @@ impl Vm {
         let call = FunctionCall {
             args: Vec::new(),
             captures: Vec::new(),
+            call_span: None,
             allow_by_ref_value_warnings: false,
+            by_ref_warning_callable_name: None,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -16612,6 +17659,9 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        if name == "is_callable" {
+            return self.call_is_callable_builtin(compiled, args, output, stack, state);
+        }
         let values = match call_args_to_positional(name, args) {
             Ok(values) => values,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -16832,14 +17882,6 @@ impl Vm {
             "method_exists" => {
                 self.call_method_exists_builtin(compiled, values, output, stack, state)
             }
-            "is_callable" => {
-                let value = values.first().cloned().unwrap_or(Value::Null);
-                let syntax_only = values
-                    .get(1)
-                    .is_some_and(|value| to_bool(value).unwrap_or(false));
-                let callable = value_is_callable(compiled, state, &value, syntax_only);
-                VmResult::success(output.clone(), Some(Value::Bool(callable)))
-            }
             "property_exists" => {
                 self.call_property_exists_builtin(compiled, values, output, stack, state)
             }
@@ -16866,6 +17908,7 @@ impl Vm {
             "is_subclass_of" => {
                 self.call_is_subclass_of_builtin(compiled, values, output, stack, state)
             }
+            "is_a" => self.call_is_a_builtin(compiled, values, output, stack, state),
             "get_class" => self.call_get_class_builtin(compiled, values, output, stack, state),
             "get_parent_class" => {
                 self.call_get_parent_class_builtin(compiled, values, output, stack, state)
@@ -16889,6 +17932,97 @@ impl Vm {
                 format!("E_PHP_VM_UNKNOWN_AUTOLOAD_BUILTIN: {name}"),
             ),
         }
+    }
+
+    fn call_is_callable_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let mut bound: Vec<Option<CallArgument>> = vec![None, None, None];
+        let mut positional_index = 0usize;
+        let mut saw_named = false;
+        for arg in args {
+            let index = if let Some(name) = arg.name.clone() {
+                saw_named = true;
+                match name.as_str() {
+                    "value" => 0,
+                    "syntax_only" => 1,
+                    "callable_name" => 2,
+                    _ => {
+                        return self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            format!(
+                                "E_PHP_VM_UNKNOWN_NAMED_ARG: function is_callable has no builtin parameter ${name}"
+                            ),
+                        );
+                    }
+                }
+            } else {
+                if saw_named {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_POSITIONAL_AFTER_NAMED_ARG: function is_callable cannot use positional argument after named argument",
+                    );
+                }
+                let index = positional_index;
+                positional_index += 1;
+                index
+            };
+            if index >= bound.len() {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_TOO_MANY_ARGS: is_callable() expects at most 3 arguments",
+                );
+            }
+            if bound[index].is_some() {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_DUPLICATE_NAMED_ARG: is_callable() argument was already provided",
+                );
+            }
+            bound[index] = Some(arg);
+        }
+        let Some(value_arg) = bound[0].as_ref() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: is_callable expects value",
+            );
+        };
+        let value = value_arg.value.clone();
+        let syntax_only = bound[1]
+            .as_ref()
+            .is_some_and(|arg| to_bool(&arg.value).unwrap_or(false));
+        let callable = value_is_callable(compiled, state, &value, syntax_only);
+        if let Some(name_arg) = bound[2].as_ref() {
+            match call_argument_reference_cell(compiled, name_arg, stack) {
+                Ok(Some(cell)) => {
+                    let name = if callable {
+                        callable_name_for_is_callable(compiled, state, &value)
+                            .unwrap_or_else(|| String::from("Array"))
+                    } else {
+                        String::new()
+                    };
+                    cell.set(Value::string(name));
+                }
+                Ok(None) => {}
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            }
+        }
+        VmResult::success(output.clone(), Some(Value::Bool(callable)))
     }
 
     fn call_method_exists_builtin(
@@ -17127,7 +18261,9 @@ impl Vm {
             .skip(1)
             .map(CallArgument::positional)
             .collect();
-        self.call_callable(compiled, callback, args, output, stack, state)
+        self.call_callable_with_by_ref_value_warnings(
+            compiled, callback, args, output, stack, state,
+        )
     }
 
     fn call_user_func_array_builtin(
@@ -17156,7 +18292,9 @@ impl Vm {
             );
         };
         let args = call_args_from_php_array(array);
-        self.call_callable(compiled, callback, args, output, stack, state)
+        self.call_callable_with_by_ref_value_warnings(
+            compiled, callback, args, output, stack, state,
+        )
     }
 
     fn call_forward_static_call_builtin(
@@ -17332,6 +18470,49 @@ impl Vm {
         }
         let exists = class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
             .unwrap_or(false);
+        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+    }
+
+    fn call_is_a_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if !(2..=3).contains(&values.len()) {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: is_a expects two or three arguments",
+            );
+        }
+        let allow_string = values
+            .get(2)
+            .is_some_and(|value| to_bool(value).unwrap_or(false));
+        let class_name = match class_name_for_is_a_subject(&values[0], allow_string) {
+            Ok(Some(name)) => name,
+            Ok(None) => return VmResult::success(output.clone(), Some(Value::Bool(false))),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let target_name = match to_string(&values[1]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        for candidate in [&class_name, &target_name] {
+            if builtin_class_exists(candidate) {
+                continue;
+            }
+            if lookup_class_in_state(compiled, state, candidate).is_none()
+                && let Err(result) = self.autoload_class(compiled, candidate, output, stack, state)
+            {
+                return result;
+            }
+        }
+        let exists =
+            class_is_a_in_state(compiled, state, &class_name, &target_name).unwrap_or(false);
         VmResult::success(output.clone(), Some(Value::Bool(exists)))
     }
 
@@ -17638,7 +18819,9 @@ impl Vm {
         let call = FunctionCall {
             args: Vec::new(),
             captures: Vec::new(),
+            call_span: None,
             allow_by_ref_value_warnings: false,
+            by_ref_warning_callable_name: None,
             this_value: None,
             scope_class: None,
             called_class: None,
@@ -17850,11 +19033,20 @@ fn trace_value(value: &Value) -> String {
         Value::Callable(CallableValue::UserFunction { name }) => {
             format!("Callable(user_function={name})")
         }
-        Value::Callable(CallableValue::Closure { function, captures }) => {
+        Value::Callable(CallableValue::Closure {
+            function, captures, ..
+        }) => {
             format!("Closure(function={function}, captures={})", captures.len())
         }
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             format!("Callable(internal_builtin={name})")
+        }
+        Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
+            let target = match target {
+                CallableMethodTarget::Object(object) => object.class_name(),
+                CallableMethodTarget::Class(class_name) => class_name.clone(),
+            };
+            format!("Callable(bound_method={target}::{method})")
         }
         Value::Callable(CallableValue::MethodPlaceholder { target }) => {
             format!("Callable(method_placeholder={target})")
@@ -18184,16 +19376,26 @@ fn uncaught_exception(
             0,
         ),
     };
+    let has_definition_location =
+        class_name == "TypeError" && message.contains("called in ") && !file.is_empty() && line > 0;
     let heading = if message.is_empty() {
         format!("Uncaught {class_name}")
+    } else if has_definition_location {
+        format!("Uncaught {class_name}: {message} and defined in {file}:{line}")
     } else {
         format!("Uncaught {class_name}: {message}")
     };
     // PHP renders an uncaught throwable as a fatal error on the output stream.
     let trace = trace.unwrap_or_else(|| "#0 {main}".to_owned());
-    output.write_test_str(&format!(
-        "\nFatal error: {heading} in {file}:{line}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
-    ));
+    if has_definition_location {
+        output.write_test_str(&format!(
+            "\nFatal error: {heading}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
+        ));
+    } else {
+        output.write_test_str(&format!(
+            "\nFatal error: {heading} in {file}:{line}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
+        ));
+    }
     let full = format!("E_PHP_VM_UNCAUGHT_EXCEPTION: {heading}");
     VmResult::runtime_error_with_diagnostic(
         output.clone(),
@@ -18211,14 +19413,15 @@ fn uncaught_exception(
 
 fn runtime_class_entry(
     compiled: &CompiledUnit,
+    state: &ExecutionState,
     class: &php_ir::module::ClassEntry,
     constant_value: &impl Fn(ConstId) -> Result<Value, String>,
 ) -> Result<RuntimeClassEntry, String> {
     let mut lineage = Vec::new();
-    collect_class_lineage(compiled, class, &mut lineage)?;
+    collect_class_lineage(compiled, state, class, &mut lineage)?;
     let mut properties = Vec::new();
     let mut constants = Vec::new();
-    for class in lineage {
+    for class in &lineage {
         push_runtime_properties(class, &mut properties, constant_value)?;
         push_runtime_constants(class, &mut constants, constant_value)?;
     }
@@ -18264,15 +19467,53 @@ fn runtime_class_entry(
     })
 }
 
-fn collect_class_lineage<'a>(
+fn collect_class_lineage(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    lineage: &mut Vec<php_ir::module::ClassEntry>,
+) -> Result<(), String> {
+    collect_class_lineage_inner(compiled, state, class, lineage, &mut Vec::new())
+}
+
+fn collect_class_lineage_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    lineage: &mut Vec<php_ir::module::ClassEntry>,
+    seen: &mut Vec<String>,
+) -> Result<(), String> {
+    let normalized = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &normalized) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(normalized);
+    if let Some(parent_name) = class.parent.as_deref() {
+        let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
+            return Err(format!(
+                "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
+                class.name, parent_name
+            ));
+        };
+        collect_class_lineage_inner(compiled, state, &parent, lineage, seen)?;
+    }
+    lineage.push(class.clone());
+    seen.pop();
+    Ok(())
+}
+
+fn collect_class_lineage_compiled<'a>(
     compiled: &'a CompiledUnit,
     class: &'a php_ir::module::ClassEntry,
     lineage: &mut Vec<&'a php_ir::module::ClassEntry>,
 ) -> Result<(), String> {
-    collect_class_lineage_inner(compiled, class, lineage, &mut Vec::new())
+    collect_class_lineage_compiled_inner(compiled, class, lineage, &mut Vec::new())
 }
 
-fn collect_class_lineage_inner<'a>(
+fn collect_class_lineage_compiled_inner<'a>(
     compiled: &'a CompiledUnit,
     class: &'a php_ir::module::ClassEntry,
     lineage: &mut Vec<&'a php_ir::module::ClassEntry>,
@@ -18293,7 +19534,7 @@ fn collect_class_lineage_inner<'a>(
                 class.name, parent_name
             ));
         };
-        collect_class_lineage_inner(compiled, parent, lineage, seen)?;
+        collect_class_lineage_compiled_inner(compiled, parent, lineage, seen)?;
     }
     lineage.push(class);
     seen.pop();
@@ -18669,6 +19910,30 @@ fn source_span_display_line(
     Some(line as i64)
 }
 
+fn source_span_file_line(
+    compiled: &CompiledUnit,
+    span: php_ir::source_map::IrSpan,
+) -> Option<(String, i64)> {
+    let file = compiled.unit().files.get(span.file.index())?;
+    let line =
+        source_span_display_line(compiled, span, false).unwrap_or_else(|| i64::from(span.start));
+    Some((file.path.clone(), line))
+}
+
+fn closure_debug_info(compiled: &CompiledUnit, function: FunctionId) -> Option<ClosureDebugInfo> {
+    let function = compiled.unit().functions.get(function.index())?;
+    if !function.flags.is_closure {
+        return None;
+    }
+    let file = compiled.unit().files.get(function.span.file.index())?;
+    let line = source_span_display_line(compiled, function.span, false)?;
+    Some(ClosureDebugInfo {
+        name: format!("{{closure:{}:{line}}}", file.path),
+        file: file.path.clone(),
+        line,
+    })
+}
+
 fn reflection_bool_property(object: &ObjectRef, property: &str) -> Value {
     object.get_property(property).unwrap_or(Value::Bool(false))
 }
@@ -18743,12 +20008,19 @@ fn reflection_new_object(
                     if let Some(function_id) = compiled.lookup_function(&normalize_function_name(name))
                     {
                         let function_entry = &compiled.unit().functions[function_id.index()];
-                        Ok(reflection_function_object(compiled, function_entry)?)
+                        let object = reflection_function_object(compiled, function_entry)?;
+                        object.set_property("is_closure", Value::Bool(true));
+                        Ok(object)
                     } else {
                         reflection_internal_function_object(name)
                     }
                 }
-                Value::Callable(CallableValue::Closure { function, captures }) => {
+                Value::Callable(CallableValue::Closure {
+                    function,
+                    captures,
+                    bound_this,
+                    ..
+                }) => {
                     let function = FunctionId::new(*function);
                     let function_entry = compiled.unit().functions.get(function.index()).ok_or_else(|| {
                         format!(
@@ -18756,7 +20028,19 @@ fn reflection_new_object(
                             function.raw()
                         )
                     })?;
-                    Ok(reflection_closure_object(compiled, function_entry, captures)?)
+                    Ok(reflection_closure_object(
+                        compiled,
+                        function_entry,
+                        captures,
+                        bound_this.as_ref(),
+                    )?)
+                }
+                Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
+                    let class_name = match target {
+                        CallableMethodTarget::Object(object) => object.class_name(),
+                        CallableMethodTarget::Class(class_name) => class_name.clone(),
+                    };
+                    reflection_method_object(compiled, &class_name, method)
                 }
                 Value::Callable(_) => Err(
                     "E_PHP_VM_REFLECTION_UNSUPPORTED_CALLABLE: callable reflection supports user functions and closures in the reflection-clone MVP"
@@ -18837,6 +20121,10 @@ fn reflection_method_value(
     object: &ObjectRef,
     method: &str,
     args: Vec<Value>,
+    output: &mut OutputBuffer,
+    stack: &CallStack,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
 ) -> Result<Value, String> {
     let method = normalize_method_name(method);
     match normalize_class_name(&object.class_name()).as_str() {
@@ -19088,6 +20376,16 @@ fn reflection_method_value(
                 Some(Value::Bool(true))
             ))),
             "allowsnull" => Ok(reflection_bool_property(object, "allows_null")),
+            "iscallable" => {
+                emit_reflection_parameter_is_callable_deprecation(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    source_span,
+                );
+                Ok(Value::Bool(reflection_parameter_type_is(object, "callable")))
+            }
             _ => Err(format!(
                 "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
                 object.class_name(),
@@ -19150,6 +20448,44 @@ fn internal_function_signature(name: &str) -> InternalReflectionSignature {
         return_allows_null: true,
         params: Vec::new(),
     }
+}
+
+fn emit_reflection_parameter_is_callable_deprecation(
+    compiled: &CompiledUnit,
+    output: &mut OutputBuffer,
+    stack: &CallStack,
+    state: &mut ExecutionState,
+    source_span: RuntimeSourceSpan,
+) {
+    if !error_reporting_allows(state, php_runtime::PHP_E_DEPRECATED) {
+        return;
+    }
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_VM_REFLECTION_PARAMETER_IS_CALLABLE_DEPRECATED",
+        RuntimeSeverity::Deprecation,
+        "Method ReflectionParameter::isCallable() is deprecated since 8.0, use ReflectionParameter::getType() instead",
+        source_span,
+        stack_trace(compiled, stack),
+        None,
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Deprecated,
+        php_runtime::PHP_E_DEPRECATED,
+    );
+    state.diagnostics.push(diagnostic);
+}
+
+fn reflection_parameter_type_is(object: &ObjectRef, expected: &str) -> bool {
+    let Some(Value::Object(type_object)) = object.get_property("type") else {
+        return false;
+    };
+    let Some(Value::String(name)) = type_object.get_property("name") else {
+        return false;
+    };
+    name.to_string_lossy().eq_ignore_ascii_case(expected)
 }
 
 fn internal_method_signature(class_name: &str, method_name: &str) -> InternalReflectionSignature {
@@ -19731,6 +21067,7 @@ fn reflection_closure_object(
     compiled: &CompiledUnit,
     function: &IrFunction,
     captures: &[ClosureCaptureValue],
+    bound_this: Option<&ObjectRef>,
 ) -> Result<ObjectRef, String> {
     let object = reflection_function_object(compiled, function)?;
     object.set_property("name", reflection_string("{closure}"));
@@ -19739,7 +21076,12 @@ fn reflection_closure_object(
         "static_variables",
         reflection_static_variables_value(captures),
     );
-    object.set_property("closure_scope_class", Value::Null);
+    let scope_class = bound_this
+        .filter(|object| is_std_class_object(object))
+        .map(|_| reflection_class_object(compiled, "Closure").map(Value::Object))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    object.set_property("closure_scope_class", scope_class);
     Ok(object)
 }
 
@@ -20067,6 +21409,8 @@ fn reflection_parameters_value(
                 ("has_default", Value::Bool(default.is_some())),
                 ("default", default.unwrap_or(Value::Null)),
                 ("optional", Value::Bool(!param.required)),
+                ("by_ref", Value::Bool(param.by_ref)),
+                ("variadic", Value::Bool(param.variadic)),
                 (
                     "allows_null",
                     Value::Bool(param.type_.as_ref().is_none_or(ir_type_allows_null)),
@@ -20116,6 +21460,80 @@ fn reflection_object_string_property(object: &ObjectRef, property: &str) -> Resu
     Ok(to_string(&value)?.to_string_lossy())
 }
 
+fn reflection_object_to_string(object: &ObjectRef) -> Result<String, String> {
+    match normalize_class_name(&object.class_name()).as_str() {
+        "reflectionfunction" | "reflectionmethod" => reflection_function_to_string(object),
+        "reflectionnamedtype" => reflection_object_string_property(object, "name"),
+        _ => Err(format!(
+            "E_PHP_VM_REFLECTION_TOSTRING_UNSUPPORTED: object of class {} cannot be converted to string",
+            object.class_name()
+        )),
+    }
+}
+
+fn reflection_function_to_string(object: &ObjectRef) -> Result<String, String> {
+    let name = reflection_object_string_property(object, "name")?;
+    let is_closure = matches!(object.get_property("is_closure"), Some(Value::Bool(true)));
+    let header_name = &name;
+    let function_kind = if is_closure { "Closure" } else { "Function" };
+    let file = reflection_to_string_scalar(object.get_property("file").as_ref())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let start_line = reflection_to_string_scalar(object.get_property("start_line").as_ref())
+        .unwrap_or_else(|| "0".to_owned());
+    let end_line = reflection_to_string_scalar(object.get_property("end_line").as_ref())
+        .unwrap_or_else(|| start_line.clone());
+    let params = match object.get_property("parameters") {
+        Some(Value::Array(params)) => params,
+        _ => PhpArray::new(),
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{function_kind} [ <user> function {header_name} ] {{\n"
+    ));
+    out.push_str(&format!("  @@ {file} {start_line} - {end_line}\n\n"));
+    out.push_str(&format!("  - Parameters [{}] {{\n", params.len()));
+    for (index, (_, value)) in params.iter().enumerate() {
+        let Value::Object(param) = value else {
+            continue;
+        };
+        out.push_str("    ");
+        out.push_str(&reflection_parameter_to_string(index, param)?);
+        out.push('\n');
+    }
+    out.push_str("  }\n}");
+    Ok(out)
+}
+
+fn reflection_parameter_to_string(index: usize, param: &ObjectRef) -> Result<String, String> {
+    let name = reflection_object_string_property(param, "name")?;
+    let optional = matches!(param.get_property("optional"), Some(Value::Bool(true)));
+    let by_ref = matches!(param.get_property("by_ref"), Some(Value::Bool(true)));
+    let variadic = matches!(param.get_property("variadic"), Some(Value::Bool(true)));
+    let required_label = if optional { "<optional>" } else { "<required>" };
+    let type_prefix = match param.get_property("type") {
+        Some(Value::Object(type_object)) => {
+            let type_name = reflection_object_string_property(&type_object, "name")?;
+            format!("{type_name} ")
+        }
+        _ => String::new(),
+    };
+    let by_ref_prefix = if by_ref { "&" } else { "" };
+    let variadic_prefix = if variadic { "..." } else { "" };
+    Ok(format!(
+        "Parameter #{index} [ {required_label} {type_prefix}{by_ref_prefix}{variadic_prefix}${name} ]"
+    ))
+}
+
+fn reflection_to_string_scalar(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(value)) => Some(value.to_string_lossy()),
+        Some(Value::Int(value)) => Some(value.to_string()),
+        Some(Value::Bool(false)) | Some(Value::Null) | None => None,
+        Some(Value::Bool(true)) => Some("1".to_owned()),
+        _ => None,
+    }
+}
+
 fn empty_array_value() -> Value {
     Value::Array(PhpArray::new())
 }
@@ -20134,7 +21552,7 @@ fn enum_case_object(
     if let Some(object) = state.enum_cases.get(&key) {
         return Ok(object.clone());
     }
-    let runtime_class = runtime_class_entry(compiled, class, constant_value)?;
+    let runtime_class = runtime_class_entry(compiled, state, class, constant_value)?;
     let object = ObjectRef::new_with_display_name(&runtime_class, class.display_name.clone());
     object.set_property("name", Value::String(PhpString::from_test_str(&case.name)));
     if runtime_class.enum_backing_type.is_some() {
@@ -20382,7 +21800,7 @@ fn validate_no_unimplemented_abstract_methods(
     class: &php_ir::module::ClassEntry,
 ) -> Result<(), String> {
     let mut lineage = Vec::new();
-    collect_class_lineage(compiled, class, &mut lineage)?;
+    collect_class_lineage_compiled(compiled, class, &mut lineage)?;
     for declaring in lineage {
         for method in &declaring.methods {
             if !method.flags.is_abstract {
@@ -20517,6 +21935,12 @@ struct ResolvedMethod<'a> {
     method: &'a php_ir::module::ClassMethodEntry,
 }
 
+#[derive(Clone)]
+struct ResolvedMethodOwned {
+    class: php_ir::module::ClassEntry,
+    method: php_ir::module::ClassMethodEntry,
+}
+
 #[derive(Clone, Copy)]
 struct ResolvedProperty<'a> {
     class: &'a php_ir::module::ClassEntry,
@@ -20535,26 +21959,36 @@ fn validate_method_callable(
     class: &php_ir::module::ClassEntry,
     method: &php_ir::module::ClassMethodEntry,
 ) -> Result<(), String> {
+    validate_method_callable_in_scope(
+        compiled,
+        current_scope_class(compiled, stack).as_deref(),
+        class,
+        method,
+    )
+}
+
+fn validate_method_callable_in_scope(
+    compiled: &CompiledUnit,
+    scope: Option<&str>,
+    class: &php_ir::module::ClassEntry,
+    method: &php_ir::module::ClassMethodEntry,
+) -> Result<(), String> {
     if method.flags.is_abstract {
         return Err(format!(
             "E_PHP_VM_ABSTRACT_METHOD_CALL: Cannot call abstract method {}::{}()",
             class.display_name, method.name
         ));
     }
-    if method.flags.is_private {
-        let scope = current_scope_class(compiled, stack);
-        if scope.as_deref() != Some(normalize_class_name(&class.name).as_str()) {
-            return Err(format!(
-                "E_PHP_VM_PRIVATE_METHOD_ACCESS: Call to private method {}::{}() from {}",
-                class.display_name,
-                method.name,
-                scope_description(scope.as_deref())
-            ));
-        }
+    if method.flags.is_private && scope != Some(normalize_class_name(&class.name).as_str()) {
+        return Err(format!(
+            "E_PHP_VM_PRIVATE_METHOD_ACCESS: Call to private method {}::{}() from {}",
+            class.display_name,
+            method.name,
+            scope_description(scope)
+        ));
     }
     if method.flags.is_protected {
-        let scope = current_scope_class(compiled, stack);
-        let allowed = scope.as_deref().is_some_and(|scope| {
+        let allowed = scope.is_some_and(|scope| {
             class_is_or_extends(compiled, scope, &class.name).unwrap_or(false)
         });
         if !allowed {
@@ -20562,7 +21996,44 @@ fn validate_method_callable(
                 "E_PHP_VM_PROTECTED_METHOD_ACCESS: Call to protected method {}::{}() from {}",
                 class.display_name,
                 method.name,
-                scope_description(scope.as_deref())
+                scope_description(scope)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_method_callable_in_state_scope(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    scope: Option<&str>,
+    class: &php_ir::module::ClassEntry,
+    method: &php_ir::module::ClassMethodEntry,
+) -> Result<(), String> {
+    if method.flags.is_abstract {
+        return Err(format!(
+            "E_PHP_VM_ABSTRACT_METHOD_CALL: Cannot call abstract method {}::{}()",
+            class.display_name, method.name
+        ));
+    }
+    if method.flags.is_private && scope != Some(normalize_class_name(&class.name).as_str()) {
+        return Err(format!(
+            "E_PHP_VM_PRIVATE_METHOD_ACCESS: Call to private method {}::{}() from {}",
+            class.display_name,
+            method.name,
+            scope_description(scope)
+        ));
+    }
+    if method.flags.is_protected {
+        let allowed = scope.is_some_and(|scope| {
+            class_is_a_in_state(compiled, state, scope, &class.name).unwrap_or(false)
+        });
+        if !allowed {
+            return Err(format!(
+                "E_PHP_VM_PROTECTED_METHOD_ACCESS: Call to protected method {}::{}() from {}",
+                class.display_name,
+                method.name,
+                scope_description(scope)
             ));
         }
     }
@@ -21227,6 +22698,7 @@ fn object_instanceof(
     match value {
         Value::Reference(cell) => object_instanceof(compiled, &cell.get(), class_name),
         Value::Fiber(_) => Ok(normalize_class_name(class_name) == "fiber"),
+        Value::Callable(_) => Ok(is_closure_runtime_class(class_name)),
         Value::Object(object) => {
             if let Some(result) = internal_throwable_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
@@ -21618,6 +23090,403 @@ fn normalize_method_name(method: &str) -> String {
 
 fn is_fiber_runtime_class(class_name: &str) -> bool {
     normalize_class_name(class_name) == "fiber"
+}
+
+fn is_closure_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "closure"
+}
+
+fn is_std_class_object(object: &ObjectRef) -> bool {
+    normalize_class_name(&object.class_name()) == "stdclass"
+}
+
+fn closure_static_method_value(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    method: &str,
+    args: Vec<CallArgument>,
+    output: &mut OutputBuffer,
+    source_span: RuntimeSourceSpan,
+) -> Result<Value, String> {
+    match normalize_method_name(method).as_str() {
+        "getcurrent" => {
+            let values = call_args_to_positional("Closure::getCurrent", args)?;
+            if !values.is_empty() {
+                return Err(format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: Closure::getCurrent expects 0 argument(s), {} given",
+                    values.len()
+                ));
+            }
+            current_closure_value(compiled, stack)
+        }
+        "fromcallable" => {
+            let mut values = call_args_to_positional("Closure::fromCallable", args)?;
+            if values.len() != 1 {
+                let id = if values.is_empty() {
+                    "E_PHP_VM_TOO_FEW_ARGS"
+                } else {
+                    "E_PHP_VM_TOO_MANY_ARGS"
+                };
+                return Err(format!(
+                    "{id}: Closure::fromCallable expects exactly 1 argument, {} given",
+                    values.len()
+                ));
+            }
+            let callable = resolve_closure_from_callable_relative_value(
+                compiled,
+                state,
+                stack,
+                values.remove(0),
+                output,
+                source_span,
+            )?;
+            let callable = acquire_callable_value(compiled, state, stack, callable)?;
+            Ok(closure_from_acquired_callable(callable))
+        }
+        "bind" => {
+            let mut values = call_args_to_positional("Closure::bind", args)?;
+            if values.len() < 2 {
+                return Err(format!(
+                    "E_PHP_VM_TOO_FEW_ARGS: Closure::bind expects at least 2 arguments, {} given",
+                    values.len()
+                ));
+            }
+            if values.len() > 3 {
+                return Err(format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: Closure::bind expects at most 3 arguments, {} given",
+                    values.len()
+                ));
+            }
+            if let Some(scope) = values.get(2) {
+                match callable_resolve_reference(scope.clone()) {
+                    Value::Null | Value::String(_) | Value::Object(_) => {}
+                    other => {
+                        return Err(format!(
+                            "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bind(): Argument #3 ($newScope) must be of type object|string|null, {} given",
+                            value_type_name(&other)
+                        ));
+                    }
+                }
+            }
+            let closure = callable_resolve_reference(values.remove(0));
+            let Value::Callable(callable) = closure else {
+                return Err(format!(
+                    "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bind(): Argument #1 ($closure) must be of type Closure, {} given",
+                    value_type_name(&closure)
+                ));
+            };
+            let new_this = callable_resolve_reference(values.remove(0));
+            let bound_this = match new_this {
+                Value::Null => None,
+                Value::Object(object) => Some(object),
+                other => {
+                    return Err(format!(
+                        "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bind(): Argument #2 ($newThis) must be of type ?object, {} given",
+                        value_type_name(&other)
+                    ));
+                }
+            };
+            Ok(bind_closure_callable_value(callable, bound_this))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method Closure::{method} is not defined"
+        )),
+    }
+}
+
+fn bind_closure_callable_value(callable: CallableValue, bound_this: Option<ObjectRef>) -> Value {
+    match callable {
+        CallableValue::Closure {
+            function,
+            captures,
+            debug,
+            ..
+        } => Value::closure_with_debug_and_this(function, captures, debug, bound_this),
+        CallableValue::BoundMethod {
+            target,
+            method,
+            scope,
+        } => {
+            let rebound_target = match bound_this {
+                Some(object) => CallableMethodTarget::Object(object),
+                None => target,
+            };
+            Value::bound_method_callable(rebound_target, method, scope)
+        }
+        other => Value::Callable(other),
+    }
+}
+
+fn callable_closure_should_warn_unbind_this(callable: &CallableValue) -> bool {
+    let CallableValue::Closure {
+        captures,
+        bound_this,
+        ..
+    } = callable
+    else {
+        return false;
+    };
+    bound_this.is_some() && captures.iter().any(|capture| capture.name == "this")
+}
+
+fn closure_from_acquired_callable(callable: Value) -> Value {
+    match callable {
+        Value::String(name) => {
+            let name = name.to_string_lossy();
+            if let Some((class_name, method)) = name.split_once("::") {
+                Value::bound_method_callable(
+                    CallableMethodTarget::Class(class_name.to_owned()),
+                    method.to_owned(),
+                    None,
+                )
+            } else if is_callable_builtin_name(&normalize_function_name(&name)) {
+                Value::internal_builtin_callable(normalize_function_name(&name))
+            } else {
+                Value::user_function_callable(normalize_function_name(&name))
+            }
+        }
+        other => other,
+    }
+}
+
+fn resolve_closure_from_callable_relative_value(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    value: Value,
+    output: &mut OutputBuffer,
+    source_span: RuntimeSourceSpan,
+) -> Result<Value, String> {
+    match value {
+        Value::String(name) => {
+            let name_text = name.to_string_lossy();
+            let Some(resolved) = resolve_relative_callable_value(
+                compiled,
+                state,
+                stack,
+                &name_text,
+                output,
+                source_span,
+            )?
+            else {
+                return Ok(Value::String(name));
+            };
+            Ok(resolved)
+        }
+        Value::Array(array) => {
+            let mut resolved = PhpArray::new();
+            for (key, value) in array.iter() {
+                let value = if key == &ArrayKey::Int(0) {
+                    match effective_value(value) {
+                        Value::String(class_name) => resolve_relative_callable_class_name(
+                            compiled,
+                            state,
+                            stack,
+                            &class_name.to_string_lossy(),
+                            output,
+                            source_span.clone(),
+                        )?
+                        .map(Value::string)
+                        .unwrap_or_else(|| value.clone()),
+                        _ => value.clone(),
+                    }
+                } else {
+                    value.clone()
+                };
+                resolved.insert(key.clone(), value);
+            }
+            Ok(Value::Array(resolved))
+        }
+        other => Ok(other),
+    }
+}
+
+fn resolve_relative_callable_value(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    name: &str,
+    output: &mut OutputBuffer,
+    source_span: RuntimeSourceSpan,
+) -> Result<Option<Value>, String> {
+    let Some((class_name, method)) = name.split_once("::") else {
+        return Ok(None);
+    };
+    let Some(resolved_class) = resolve_relative_callable_class_name(
+        compiled,
+        state,
+        stack,
+        class_name,
+        output,
+        source_span,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(object) = current_this_object(compiled, stack)
+        && lookup_resolved_method_in_state(compiled, state, &resolved_class, method, None)?
+            .is_some_and(|resolved| !resolved.method.flags.is_static)
+    {
+        validate_object_method_callable_acquisition(
+            compiled,
+            state,
+            stack,
+            &object.class_name(),
+            method,
+            true,
+        )?;
+        return Ok(Some(Value::bound_method_callable(
+            CallableMethodTarget::Object(object),
+            method.to_owned(),
+            current_scope_class(compiled, stack),
+        )));
+    }
+    Ok(Some(Value::string(format!("{resolved_class}::{method}"))))
+}
+
+fn resolve_relative_callable_class_name(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    class_name: &str,
+    output: &mut OutputBuffer,
+    source_span: RuntimeSourceSpan,
+) -> Result<Option<String>, String> {
+    match normalize_class_name(class_name).as_str() {
+        "self" => {
+            emit_relative_callable_deprecation(compiled, output, stack, state, "self", source_span);
+            current_scope_class(compiled, stack)
+                .ok_or_else(|| {
+                    "E_PHP_VM_INVALID_STATIC_SCOPE: self:: is not available outside class scope"
+                        .to_owned()
+                })
+                .map(Some)
+        }
+        "static" => {
+            emit_relative_callable_deprecation(
+                compiled,
+                output,
+                stack,
+                state,
+                "static",
+                source_span,
+            );
+            current_called_class(compiled, stack)
+                .ok_or_else(|| {
+                    "E_PHP_VM_INVALID_STATIC_SCOPE: static:: is not available outside class scope"
+                        .to_owned()
+                })
+                .map(Some)
+        }
+        "parent" => {
+            emit_relative_callable_deprecation(
+                compiled,
+                output,
+                stack,
+                state,
+                "parent",
+                source_span,
+            );
+            let scope = current_scope_class(compiled, stack).ok_or_else(|| {
+                "E_PHP_VM_INVALID_STATIC_SCOPE: parent:: is not available outside class scope"
+                    .to_owned()
+            })?;
+            let class = lookup_class_in_state(compiled, state, &scope)
+                .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {scope} is not defined"))?;
+            class
+                .parent
+                .clone()
+                .ok_or_else(|| {
+                    format!(
+                        "E_PHP_VM_NO_PARENT_CLASS: class {} has no parent",
+                        class.name
+                    )
+                })
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn emit_relative_callable_deprecation(
+    compiled: &CompiledUnit,
+    output: &mut OutputBuffer,
+    stack: &CallStack,
+    state: &mut ExecutionState,
+    keyword: &str,
+    source_span: RuntimeSourceSpan,
+) {
+    if !error_reporting_allows(state, php_runtime::PHP_E_DEPRECATED) {
+        return;
+    }
+    let diagnostic = RuntimeDiagnostic::new(
+        "E_PHP_VM_RELATIVE_CALLABLE_DEPRECATED",
+        RuntimeSeverity::Deprecation,
+        format!("Use of \"{keyword}\" in callables is deprecated"),
+        source_span,
+        stack_trace(compiled, stack),
+        None,
+    );
+    emit_vm_diagnostic(
+        output,
+        state,
+        &diagnostic,
+        php_runtime::PhpDiagnosticChannel::Deprecated,
+        php_runtime::PHP_E_DEPRECATED,
+    );
+    state.diagnostics.push(diagnostic);
+}
+
+fn current_closure_value(compiled: &CompiledUnit, stack: &CallStack) -> Result<Value, String> {
+    let frame = stack
+        .current()
+        .ok_or_else(|| "E_PHP_VM_CURRENT_CLOSURE: Current function is not a closure".to_owned())?;
+    let function = compiled
+        .unit()
+        .functions
+        .get(frame.function.index())
+        .ok_or_else(|| "E_PHP_VM_CURRENT_CLOSURE: Current function is not a closure".to_owned())?;
+    if !function.flags.is_closure {
+        return Err("E_PHP_VM_CURRENT_CLOSURE: Current function is not a closure".to_owned());
+    }
+
+    let mut captures = Vec::with_capacity(function.captures.len());
+    for metadata in &function.captures {
+        let slot = frame
+            .locals
+            .iter()
+            .find(|(index, _)| *index == metadata.local.index())
+            .map(|(_, slot)| slot)
+            .ok_or_else(|| format!("invalid local local:{}", metadata.local.raw()))?;
+        if metadata.by_ref {
+            let Slot::Reference(cell) = slot else {
+                return Err(format!(
+                    "E_PHP_VM_BY_REF_CAPTURE_MISSING_CELL: closure capture ${} has no reference cell",
+                    metadata.name
+                ));
+            };
+            captures.push(ClosureCaptureValue::by_reference(
+                metadata.name.clone(),
+                cell.clone(),
+            ));
+        } else {
+            captures.push(ClosureCaptureValue::by_value(
+                metadata.name.clone(),
+                slot.read(),
+            ));
+        }
+    }
+
+    let bound_this = (!function.flags.is_static)
+        .then(|| current_this_object(compiled, stack))
+        .flatten();
+    Ok(Value::closure_with_debug_and_this(
+        frame.function.raw(),
+        captures,
+        closure_debug_info(compiled, frame.function),
+        bound_this,
+    ))
 }
 
 fn is_std_class_runtime_class(class_name: &str) -> bool {
@@ -23130,6 +24999,7 @@ fn is_symbol_introspection_builtin_name(name: &str) -> bool {
             | "method_exists"
             | "property_exists"
             | "is_callable"
+            | "is_a"
             | "is_subclass_of"
             | "get_class"
             | "get_class_methods"
@@ -23214,9 +25084,19 @@ fn error_handler_callback_from_value(
                 ))
             }
         }
-        Value::Callable(CallableValue::Closure { function, captures }) => {
-            Ok(CallableValue::Closure { function, captures })
-        }
+        Value::Callable(CallableValue::Closure {
+            id,
+            function,
+            captures,
+            bound_this,
+            debug,
+        }) => Ok(CallableValue::Closure {
+            id,
+            function,
+            captures,
+            bound_this,
+            debug,
+        }),
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             if BuiltinRegistry::new().contains(&name) {
                 Ok(CallableValue::InternalBuiltin { name })
@@ -23264,9 +25144,19 @@ fn autoload_callback_from_value(
                 ))
             }
         }
-        Value::Callable(CallableValue::Closure { function, captures }) => {
-            Ok(CallableValue::Closure { function, captures })
-        }
+        Value::Callable(CallableValue::Closure {
+            id,
+            function,
+            captures,
+            bound_this,
+            debug,
+        }) => Ok(CallableValue::Closure {
+            id,
+            function,
+            captures,
+            bound_this,
+            debug,
+        }),
         Value::Callable(CallableValue::InternalBuiltin { name }) => {
             if BuiltinRegistry::new().contains(&name) {
                 Ok(CallableValue::InternalBuiltin { name })
@@ -23358,6 +25248,53 @@ fn dynamic_function_target_in_state(
     Some((entry.unit_index, entry.function))
 }
 
+fn closure_owner_for_function(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    function: u32,
+    debug: Option<&ClosureDebugInfo>,
+) -> CompiledUnit {
+    let function_id = FunctionId::new(function);
+    if compiled_unit_contains_closure(compiled, function_id, debug) {
+        return compiled.clone();
+    }
+    state
+        .dynamic_units
+        .iter()
+        .find(|unit| compiled_unit_contains_closure(unit, function_id, debug))
+        .cloned()
+        .unwrap_or_else(|| compiled.clone())
+}
+
+fn closure_function_has_this_local(compiled: &CompiledUnit, function: u32) -> bool {
+    compiled
+        .unit()
+        .functions
+        .get(FunctionId::new(function).index())
+        .is_some_and(|entry| entry.locals.iter().any(|local| local == "this"))
+}
+
+fn compiled_unit_contains_closure(
+    compiled: &CompiledUnit,
+    function: FunctionId,
+    debug: Option<&ClosureDebugInfo>,
+) -> bool {
+    let Some(entry) = compiled.unit().functions.get(function.index()) else {
+        return false;
+    };
+    if !entry.flags.is_closure {
+        return false;
+    }
+    let Some(debug) = debug else {
+        return true;
+    };
+    compiled
+        .unit()
+        .files
+        .get(entry.span.file.index())
+        .is_some_and(|file| file.path == debug.file)
+}
+
 fn lookup_class_in_state(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -23399,6 +25336,14 @@ fn class_like_exists_direct(
 fn dynamic_class_owner_in_state(state: &ExecutionState, class_name: &str) -> Option<CompiledUnit> {
     let unit_index = dynamic_class_owner_index_in_state(state, class_name)?;
     state.dynamic_units.get(unit_index).cloned()
+}
+
+fn class_owner_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+) -> CompiledUnit {
+    dynamic_class_owner_in_state(state, class_name).unwrap_or_else(|| compiled.clone())
 }
 
 fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) -> Option<usize> {
@@ -23506,6 +25451,7 @@ fn error_handler_callback_max_args(
             .get(FunctionId::new(*function).index())
             .map(user_function_max_positional_args),
         CallableValue::InternalBuiltin { .. }
+        | CallableValue::BoundMethod { .. }
         | CallableValue::MethodPlaceholder { .. }
         | CallableValue::UnresolvedDynamic { .. } => None,
     }
@@ -23638,6 +25584,18 @@ fn object_from_value(value: &Value) -> Option<ObjectRef> {
         Value::Object(object) => Some(object.clone()),
         Value::Reference(cell) => object_from_value(&cell.get()),
         _ => None,
+    }
+}
+
+fn class_name_for_is_a_subject(
+    value: &Value,
+    allow_string: bool,
+) -> Result<Option<String>, String> {
+    match effective_value(value) {
+        Value::Object(object) => Ok(Some(object.class_name())),
+        Value::Callable(_) => Ok(Some("Closure".to_owned())),
+        value if allow_string => to_string(&value).map(|name| Some(name.to_string_lossy())),
+        _ => Ok(None),
     }
 }
 
@@ -23874,19 +25832,38 @@ fn lookup_method_in_state(
     class_name: &str,
     method: &str,
 ) -> Result<Option<php_ir::module::ClassMethodEntry>, String> {
+    lookup_resolved_method_in_state(compiled, state, class_name, method, None)
+        .map(|resolved| resolved.map(|resolved| resolved.method))
+}
+
+fn lookup_resolved_method_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    method: &str,
+    caller_scope: Option<&str>,
+) -> Result<Option<ResolvedMethodOwned>, String> {
     let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
         return Ok(None);
     };
-    lookup_method_in_state_inner(compiled, state, &class, method, &mut Vec::new())
+    lookup_resolved_method_in_state_inner(
+        compiled,
+        state,
+        &class,
+        method,
+        caller_scope,
+        &mut Vec::new(),
+    )
 }
 
-fn lookup_method_in_state_inner(
+fn lookup_resolved_method_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     class: &php_ir::module::ClassEntry,
     method: &str,
+    caller_scope: Option<&str>,
     seen: &mut Vec<String>,
-) -> Result<Option<php_ir::module::ClassMethodEntry>, String> {
+) -> Result<Option<ResolvedMethodOwned>, String> {
     let class_name = normalize_class_name(&class.name);
     if seen.iter().any(|name| name == &class_name) {
         return Err(format!(
@@ -23894,22 +25871,51 @@ fn lookup_method_in_state_inner(
             class.name
         ));
     }
-    seen.push(class_name);
+    seen.push(class_name.clone());
     let normalized = normalize_method_name(method);
     if let Some(method) = class
         .methods
         .iter()
         .find(|entry| normalize_method_name(&entry.name) == normalized)
     {
+        if method.flags.is_private
+            && caller_scope.is_some_and(|scope| normalize_class_name(scope) != class_name)
+            && class.parent.is_some()
+            && let Some(parent) = class
+                .parent
+                .as_deref()
+                .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+            && let Some(parent_method) = lookup_resolved_method_in_state_inner(
+                compiled,
+                state,
+                &parent,
+                method.name.as_str(),
+                caller_scope,
+                seen,
+            )?
+        {
+            seen.pop();
+            return Ok(Some(parent_method));
+        }
         seen.pop();
-        return Ok(Some(method.clone()));
+        return Ok(Some(ResolvedMethodOwned {
+            class: class.clone(),
+            method: method.clone(),
+        }));
     }
     if let Some(parent) = class
         .parent
         .as_deref()
         .and_then(|parent| lookup_class_in_state(compiled, state, parent))
     {
-        let resolved = lookup_method_in_state_inner(compiled, state, &parent, method, seen)?;
+        let resolved = lookup_resolved_method_in_state_inner(
+            compiled,
+            state,
+            &parent,
+            method,
+            caller_scope,
+            seen,
+        )?;
         seen.pop();
         return Ok(resolved);
     }
@@ -23978,6 +25984,34 @@ fn class_is_subclass_of_in_state(
         .unwrap_or_else(|| {
             class_implements_in_state(compiled, state, &class_name, &target_name, &mut Vec::new())
         })
+}
+
+fn class_is_a_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    target_name: &str,
+) -> Result<bool, String> {
+    let class_name = normalize_class_name(class_name);
+    let target_name = normalize_class_name(target_name);
+    if class_name == target_name {
+        return Ok(class_exists_for_is_a(compiled, state, &class_name));
+    }
+    class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
+}
+
+fn class_exists_for_is_a(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+) -> bool {
+    lookup_class_in_state(compiled, state, class_name).is_some() || builtin_class_exists(class_name)
+}
+
+fn builtin_class_exists(class_name: &str) -> bool {
+    php_std::ExtensionRegistry::standard_library()
+        .enabled_class(class_name)
+        .is_some()
 }
 
 fn class_extends_in_state(
@@ -24465,8 +26499,7 @@ fn format_trace_call(compiled: &CompiledUnit, frame: &Frame) -> String {
 }
 
 /// Captures the current call stack as PHP's `Stack trace:` body, newest frame
-/// first, ending with `#N {main}`. Call-site lines are not tracked, so a
-/// deterministic placeholder line is emitted (EXPECTF tolerates it via `%d`).
+/// first, ending with `#N {main}`.
 fn capture_backtrace_string(compiled: &CompiledUnit, stack: &CallStack) -> String {
     let mut lines = Vec::new();
     let mut index = 0usize;
@@ -24477,12 +26510,16 @@ fn capture_backtrace_string(compiled: &CompiledUnit, stack: &CallStack) -> Strin
             index += 1;
             continue;
         }
-        let file = function
-            .and_then(|function| compiled.unit().files.get(function.span.file.index()))
+        let display_span = frame
+            .call_span
+            .or_else(|| function.map(|function| function.span));
+        let file = display_span
+            .and_then(|span| compiled.unit().files.get(span.file.index()))
             .map(|file| file.path.clone())
             .unwrap_or_default();
-        let line = function
-            .and_then(|function| source_span_display_line(compiled, function.span, false))
+        let line = display_span
+            .and_then(|span| source_span_display_line(compiled, span, false))
+            .or_else(|| display_span.map(|span| i64::from(span.start)))
             .unwrap_or(0);
         lines.push(format!(
             "#{index} {file}({line}): {}",
@@ -24520,7 +26557,7 @@ fn value_is_callable(
             }
             if let Some((class, method)) = name.split_once("::") {
                 lookup_method_in_state(compiled, state, class, method)
-                    .map(|method| method.is_some())
+                    .map(|method| method.is_some_and(|method| method.flags.is_static))
                     .unwrap_or(false)
             } else {
                 let normalized = normalize_function_name(&name);
@@ -24544,29 +26581,411 @@ fn value_is_callable(
             if syntax_only {
                 return true;
             }
-            lookup_method_in_state(compiled, state, &class, &method.to_string_lossy())
-                .map(|method| method.is_some())
-                .unwrap_or(false)
+            let method = method.to_string_lossy();
+            match effective_value(target) {
+                Value::Object(_) => lookup_method_in_state(compiled, state, &class, &method)
+                    .map(|method| method.is_some())
+                    .unwrap_or(false),
+                _ => lookup_method_in_state(compiled, state, &class, &method)
+                    .map(|method| method.is_some_and(|method| method.flags.is_static))
+                    .unwrap_or(false),
+            }
         }
         _ => false,
     }
 }
 
-fn resolve_callable(compiled: &CompiledUnit, callable: &CallableKind) -> Value {
+fn callable_name_for_is_callable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+) -> Option<String> {
+    match effective_value(value) {
+        Value::Callable(CallableValue::UserFunction { name }) => Some(name),
+        Value::Callable(CallableValue::InternalBuiltin { name }) => Some(name),
+        Value::Callable(CallableValue::Closure {
+            function, debug, ..
+        }) => {
+            let function = compiled.unit().functions.get(function as usize)?;
+            debug
+                .map(|debug| debug.name)
+                .or_else(|| Some(function.name.clone()))
+        }
+        Value::Callable(CallableValue::MethodPlaceholder { target })
+        | Value::Callable(CallableValue::UnresolvedDynamic { target }) => Some(target),
+        Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
+            let class_name = match target {
+                CallableMethodTarget::Object(object) => {
+                    callable_class_display_name(compiled, state, &object.class_name())
+                }
+                CallableMethodTarget::Class(class_name) => {
+                    callable_class_display_name(compiled, state, &class_name)
+                }
+            };
+            Some(format!("{class_name}::{method}"))
+        }
+        Value::Object(object) => Some(format!(
+            "{}::__invoke",
+            callable_class_display_name(compiled, state, &object.class_name())
+        )),
+        Value::String(name) => Some(name.to_string_lossy()),
+        Value::Array(array) => callable_array_name_for_is_callable(compiled, state, &array),
+        _ => None,
+    }
+}
+
+fn callable_array_name_for_is_callable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    array: &PhpArray,
+) -> Option<String> {
+    let target = array.get(&ArrayKey::Int(0))?;
+    let method = array.get(&ArrayKey::Int(1))?;
+    let method = to_string(method).ok()?.to_string_lossy();
+    match effective_value(target) {
+        Value::Object(object) => Some(format!(
+            "{}::{method}",
+            callable_class_display_name(compiled, state, &object.class_name())
+        )),
+        Value::String(class_name) => {
+            let class_name = class_name.to_string_lossy();
+            Some(format!(
+                "{}::{method}",
+                callable_class_display_name(compiled, state, &class_name)
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn callable_class_display_name(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+) -> String {
+    lookup_class_in_state(compiled, state, class_name)
+        .map(|class| class.display_name)
+        .unwrap_or_else(|| class_name.to_owned())
+}
+
+fn acquire_callable_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    value: Value,
+) -> Result<Value, String> {
+    let value = effective_value(&value);
+    match value {
+        Value::Callable(_) => Ok(value),
+        Value::String(name) => {
+            let name_text = name.to_string_lossy();
+            validate_string_callable_acquisition(compiled, state, stack, &name_text)?;
+            Ok(Value::String(name))
+        }
+        Value::Array(array) => acquire_array_callable(compiled, state, stack, &array),
+        Value::Object(object) => {
+            validate_object_method_callable_acquisition(
+                compiled,
+                state,
+                stack,
+                &object.class_name(),
+                "__invoke",
+                false,
+            )?;
+            Ok(Value::Object(object))
+        }
+        other => Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE: Value of type {} is not callable",
+            value_type_name(&other)
+        )),
+    }
+}
+
+fn validate_string_callable_acquisition(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    name: &str,
+) -> Result<(), String> {
+    if let Some((class_name, method)) = name.split_once("::") {
+        return validate_static_method_callable_acquisition(
+            compiled, state, stack, class_name, method, true,
+        );
+    }
+    let normalized = normalize_function_name(name);
+    if function_callable_exists(compiled, state, &normalized) {
+        Ok(())
+    } else {
+        Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_FUNCTION: Call to undefined function {name}()"
+        ))
+    }
+}
+
+fn acquire_array_callable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    array: &PhpArray,
+) -> Result<Value, String> {
+    let (Some(target), Some(method)) = (array.get(&ArrayKey::Int(0)), array.get(&ArrayKey::Int(1)))
+    else {
+        return Err(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE: Value of type array is not callable"
+                .to_owned(),
+        );
+    };
+    if array.len() != 2 {
+        return Err(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE: Value of type array is not callable"
+                .to_owned(),
+        );
+    }
+    let method = to_string(method)
+        .map_err(|_| {
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE: Value of type array is not callable"
+                .to_owned()
+        })?
+        .to_string_lossy();
+    match effective_value(target) {
+        Value::Object(object) => {
+            validate_object_method_callable_acquisition(
+                compiled,
+                state,
+                stack,
+                &object.class_name(),
+                &method,
+                true,
+            )?;
+            Ok(Value::bound_method_callable(
+                CallableMethodTarget::Object(object),
+                method,
+                current_scope_class(compiled, stack),
+            ))
+        }
+        Value::Callable(callable) if method.eq_ignore_ascii_case("__invoke") => {
+            Ok(Value::Callable(callable))
+        }
+        Value::String(class_name) => {
+            let class_name = class_name.to_string_lossy();
+            validate_static_method_callable_acquisition(
+                compiled,
+                state,
+                stack,
+                &class_name,
+                &method,
+                true,
+            )?;
+            Ok(Value::bound_method_callable(
+                CallableMethodTarget::Class(class_name),
+                method,
+                current_scope_class(compiled, stack),
+            ))
+        }
+        other => Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE: Value of type {} is not callable",
+            value_type_name(&other)
+        )),
+    }
+}
+
+fn validate_object_method_callable_acquisition(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    class_name: &str,
+    method: &str,
+    allow_magic_call: bool,
+) -> Result<(), String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to undefined method {class_name}::{method}()"
+        ));
+    };
+    let scope = current_scope_class(compiled, stack);
+    let resolved =
+        lookup_resolved_method_in_state(compiled, state, class_name, method, scope.as_deref())?;
+    let Some(resolved) = resolved else {
+        if allow_magic_call && class_has_public_magic_call_in_state(compiled, state, class_name)? {
+            return Ok(());
+        }
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to undefined method {}::{method}()",
+            class.display_name
+        ));
+    };
+    validate_method_callable_for_acquisition_in_state(
+        compiled,
+        state,
+        stack,
+        &resolved.class,
+        &resolved.method,
+        method,
+    )
+}
+
+fn validate_static_method_callable_acquisition(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    class_name: &str,
+    method: &str,
+    allow_magic_call_static: bool,
+) -> Result<(), String> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to undefined method {class_name}::{method}()"
+        ));
+    };
+    let scope = current_scope_class(compiled, stack);
+    let resolved =
+        lookup_resolved_method_in_state(compiled, state, class_name, method, scope.as_deref())?;
+    let Some(resolved) = resolved else {
+        if allow_magic_call_static
+            && class_has_public_magic_call_static_in_state(compiled, state, class_name)?
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to undefined method {}::{method}()",
+            class.display_name
+        ));
+    };
+    if !resolved.method.flags.is_static {
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_NON_STATIC_METHOD: Failed to create closure from callable: non-static method {}::{}() cannot be called statically",
+            resolved.class.display_name, method
+        ));
+    }
+    validate_method_callable_for_acquisition_in_state(
+        compiled,
+        state,
+        stack,
+        &resolved.class,
+        &resolved.method,
+        method,
+    )
+}
+
+fn class_has_public_magic_call_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+) -> Result<bool, String> {
+    Ok(
+        lookup_resolved_method_in_state(compiled, state, class_name, "__call", None)?.is_some_and(
+            |resolved| {
+                !resolved.method.flags.is_static
+                    && !resolved.method.flags.is_private
+                    && !resolved.method.flags.is_protected
+            },
+        ),
+    )
+}
+
+fn class_has_public_magic_call_static_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+) -> Result<bool, String> {
+    Ok(
+        lookup_resolved_method_in_state(compiled, state, class_name, "__callStatic", None)?
+            .is_some_and(|resolved| {
+                resolved.method.flags.is_static
+                    && !resolved.method.flags.is_private
+                    && !resolved.method.flags.is_protected
+            }),
+    )
+}
+
+fn validate_method_callable_for_acquisition_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    class: &php_ir::module::ClassEntry,
+    method: &php_ir::module::ClassMethodEntry,
+    display_method: &str,
+) -> Result<(), String> {
+    if method.flags.is_abstract {
+        return Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Cannot call abstract method {}::{display_method}()",
+            class.display_name
+        ));
+    }
+    if method.flags.is_private {
+        let scope = current_scope_class(compiled, stack);
+        if scope.as_deref() != Some(normalize_class_name(&class.name).as_str()) {
+            return Err(format!(
+                "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to private method {}::{display_method}() from {}",
+                class.display_name,
+                scope_description(scope.as_deref())
+            ));
+        }
+    }
+    if method.flags.is_protected {
+        let scope = current_scope_class(compiled, stack);
+        let allowed = scope.as_deref().is_some_and(|scope| {
+            class_is_a_in_state(compiled, state, scope, &class.name).unwrap_or(false)
+        });
+        if !allowed {
+            return Err(format!(
+                "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD: Call to protected method {}::{display_method}() from {}",
+                class.display_name,
+                scope_description(scope.as_deref())
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn function_callable_exists(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    normalized_name: &str,
+) -> bool {
+    compiled.lookup_function(normalized_name).is_some()
+        || dynamic_function_in_state(state, normalized_name).is_some()
+        || is_callable_builtin_name(normalized_name)
+}
+
+fn is_callable_builtin_name(name: &str) -> bool {
+    is_supported_builtin(name)
+        || is_autoload_builtin_name(name)
+        || is_symbol_introspection_builtin_name(name)
+        || is_config_builtin_name(name)
+        || is_error_handling_builtin_name(name)
+        || is_output_buffering_builtin_name(name)
+        || is_environment_builtin_name(name)
+        || is_process_builtin_name(name)
+        || is_array_callback_builtin_name(name)
+        || is_array_sort_builtin_name(name)
+}
+
+fn resolve_callable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    callable: &CallableKind,
+) -> Result<Value, String> {
     match callable {
         CallableKind::FunctionName { name } => {
-            if compiled.lookup_function(name).is_some() {
-                Value::user_function_callable(name.clone())
-            } else if is_supported_builtin(name) {
-                Value::internal_builtin_callable(name.clone())
+            if compiled.lookup_function(name).is_some()
+                || dynamic_function_in_state(state, name).is_some()
+            {
+                Ok(Value::user_function_callable(name.clone()))
+            } else if is_callable_builtin_name(name) {
+                Ok(Value::internal_builtin_callable(name.clone()))
             } else {
-                Value::unresolved_callable(format!("function {name}"))
+                Err(format!(
+                    "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_FUNCTION: Call to undefined function {name}()"
+                ))
             }
         }
         CallableKind::MethodPlaceholder { target } => {
-            Value::method_callable_placeholder(target.clone())
+            Ok(Value::method_callable_placeholder(target.clone()))
         }
-        CallableKind::UnresolvedDynamic { target } => Value::unresolved_callable(target.clone()),
+        CallableKind::UnresolvedDynamic { target } => Err(format!(
+            "E_PHP_VM_FIRST_CLASS_CALLABLE_UNRESOLVED_DYNAMIC: callable {target} could not be resolved"
+        )),
     }
 }
 
@@ -24837,13 +27256,20 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_VM_PRIVATE_METHOD_ACCESS"
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
         | "E_PHP_VM_ABSTRACT_METHOD_CALL"
+        | "E_PHP_VM_CLOSURE_INSTANTIATION"
         | "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
         | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS"
         | "E_PHP_VM_UNKNOWN_STATIC_PROPERTY"
         | "E_PHP_VM_NON_STATIC_METHOD_CALL"
+        | "E_PHP_VM_CURRENT_CLOSURE"
         | "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS"
         | "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS"
         | "E_PHP_VM_METHOD_CALL_NON_OBJECT" => "Error",
+        "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE"
+        | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_FUNCTION"
+        | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD"
+        | "E_PHP_VM_FIRST_CLASS_CALLABLE_NON_STATIC_METHOD"
+        | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNRESOLVED_DYNAMIC" => "TypeError",
         _ => return None,
     };
     let message = diagnostic
@@ -24926,7 +27352,11 @@ fn prepare_arguments(
     function: &IrFunction,
     args: Vec<CallArgument>,
     stack: &mut CallStack,
+    state: &ExecutionState,
+    typecheck: TypecheckFastPathContext<'_>,
     allow_by_ref_value_warnings: bool,
+    call_span: Option<php_ir::IrSpan>,
+    by_ref_warning_callable_name: Option<&str>,
 ) -> Result<PreparedArguments, String> {
     let min = function
         .params
@@ -25031,9 +27461,19 @@ fn prepare_arguments(
     }
 
     if supplied_count < min {
+        precheck_bound_argument_types(compiled, function, &mut bound, state, typecheck, call_span)?;
+        let requirement = if function.params.len() == min && variadic_index.is_none() {
+            format!("exactly {min} expected")
+        } else {
+            format!("at least {min} expected")
+        };
+        let call_site = call_span
+            .and_then(|span| source_span_file_line(compiled, span))
+            .map(|(file, line)| format!(" in {file} on line {line}"))
+            .unwrap_or_default();
         return Err(format!(
-            "E_PHP_VM_TOO_FEW_ARGS: function {} expects at least {} argument(s), got {}",
-            function.name, min, supplied_count
+            "E_PHP_VM_TOO_FEW_ARGS: Too few arguments to function {}(), {} passed{} and {}",
+            function.name, supplied_count, call_site, requirement
         ));
     }
 
@@ -25058,6 +27498,7 @@ fn prepare_arguments(
                         stack,
                         index + 1,
                         &param.name,
+                        by_ref_warning_callable_name,
                     ));
                     None
                 } else {
@@ -25103,6 +27544,37 @@ fn prepare_arguments(
     })
 }
 
+fn precheck_bound_argument_types(
+    compiled: &CompiledUnit,
+    function: &IrFunction,
+    bound: &mut [Option<CallArgument>],
+    state: &ExecutionState,
+    typecheck: TypecheckFastPathContext<'_>,
+    call_span: Option<php_ir::IrSpan>,
+) -> Result<(), String> {
+    for (index, (param, arg)) in function.params.iter().zip(bound.iter_mut()).enumerate() {
+        if param.by_ref || param.variadic {
+            continue;
+        }
+        let Some(arg) = arg.as_mut() else {
+            continue;
+        };
+        coerce_or_check_param_type(
+            compiled,
+            compiled.unit(),
+            state,
+            function,
+            param,
+            index,
+            &mut arg.value,
+            false,
+            typecheck,
+            call_span,
+        )?;
+    }
+    Ok(())
+}
+
 fn call_argument_reference_cell(
     compiled: &CompiledUnit,
     arg: &CallArgument,
@@ -25128,9 +27600,12 @@ fn by_ref_value_given_warning(
     stack: &CallStack,
     position: usize,
     param_name: &str,
+    callable_name: Option<&str>,
 ) -> RuntimeDiagnostic {
     let source_span = runtime_source_span(compiled, function.span);
-    let callable = if function.flags.is_closure {
+    let callable = if let Some(callable_name) = callable_name {
+        callable_name.to_owned()
+    } else if function.flags.is_closure {
         let file = source_span.file.as_deref().unwrap_or("<unknown>");
         format!("{{closure:{file}:{}}}", source_span.start)
     } else {
@@ -25193,31 +27668,45 @@ fn type_error_value_name(value: &Value) -> String {
 /// Builds PHP's argument `TypeError` message, e.g.
 /// `Foo::bar(): Argument #1 ($baz) must be of type int, string given`.
 fn param_type_mismatch_message(
+    compiled: &CompiledUnit,
     function: &IrFunction,
     param: &IrParam,
     arg_index: usize,
     value: &Value,
     runtime_type: &RuntimeType,
+    call_span: Option<php_ir::IrSpan>,
+    include_parameter_name: bool,
 ) -> String {
-    format!(
-        "E_PHP_VM_PARAM_TYPE_MISMATCH: {}(): Argument #{} (${}) must be of type {}, {} given",
+    let parameter_name = if include_parameter_name {
+        format!(" (${})", param.name)
+    } else {
+        String::new()
+    };
+    let mut message = format!(
+        "E_PHP_VM_PARAM_TYPE_MISMATCH: {}(): Argument #{}{} must be of type {}, {} given",
         function.name,
         arg_index + 1,
-        param.name,
+        parameter_name,
         runtime_type_name(runtime_type),
         type_error_value_name(value),
-    )
+    );
+    if let Some((file, line)) = call_span.and_then(|span| source_span_file_line(compiled, span)) {
+        message.push_str(&format!(", called in {file} on line {line}"));
+    }
+    message
 }
 
 fn coerce_or_check_param_type(
     compiled: &CompiledUnit,
     unit: &IrUnit,
+    state: &ExecutionState,
     function: &IrFunction,
     param: &IrParam,
     arg_index: usize,
     value: &mut Value,
     by_ref_arg: bool,
     typecheck: TypecheckFastPathContext<'_>,
+    call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
     let Some(runtime_type) = ir_runtime_type(param.type_.as_ref()) else {
         return Ok(());
@@ -25226,12 +27715,14 @@ fn coerce_or_check_param_type(
         return coerce_or_check_variadic_param_type(
             compiled,
             unit,
+            state,
             function,
             param,
             arg_index,
             value,
             &runtime_type,
             typecheck,
+            call_span,
         );
     }
     if !unit.strict_types
@@ -25241,15 +27732,18 @@ fn coerce_or_check_param_type(
         *value = coerced;
         return Ok(());
     }
-    if vm_value_matches_runtime_type(compiled, value, &runtime_type, typecheck)? {
+    if vm_value_matches_runtime_type(compiled, Some(state), value, &runtime_type, typecheck)? {
         Ok(())
     } else {
         Err(param_type_mismatch_message(
+            compiled,
             function,
             param,
             arg_index,
             value,
             &runtime_type,
+            call_span,
+            true,
         ))
     }
 }
@@ -25257,12 +27751,14 @@ fn coerce_or_check_param_type(
 fn coerce_or_check_variadic_param_type(
     compiled: &CompiledUnit,
     unit: &IrUnit,
+    state: &ExecutionState,
     function: &IrFunction,
     param: &IrParam,
     arg_index: usize,
     value: &mut Value,
     runtime_type: &RuntimeType,
     typecheck: TypecheckFastPathContext<'_>,
+    call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
     let Value::Array(array) = value else {
         return Ok(());
@@ -25276,13 +27772,22 @@ fn coerce_or_check_variadic_param_type(
             && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
         {
             element = coerced;
-        } else if !vm_value_matches_runtime_type(compiled, &element, runtime_type, typecheck)? {
+        } else if !vm_value_matches_runtime_type(
+            compiled,
+            Some(state),
+            &element,
+            runtime_type,
+            typecheck,
+        )? {
             return Err(param_type_mismatch_message(
+                compiled,
                 function,
                 param,
                 arg_index + offset,
                 &element,
                 runtime_type,
+                call_span,
+                false,
             ));
         }
         if let Some(slot) = array.get_mut(&key) {
@@ -25377,6 +27882,7 @@ fn initialize_this(
 
 fn coerce_return_value(
     compiled: &CompiledUnit,
+    state: &ExecutionState,
     function: &IrFunction,
     value: Option<Value>,
     typecheck: TypecheckFastPathContext<'_>,
@@ -25402,7 +27908,7 @@ fn coerce_return_value(
     {
         value = coerced;
     }
-    if vm_value_matches_runtime_type(compiled, &value, &return_type, typecheck)? {
+    if vm_value_matches_runtime_type(compiled, Some(state), &value, &return_type, typecheck)? {
         Ok(Some(value))
     } else {
         Err(format!(
@@ -25425,7 +27931,7 @@ fn check_property_type(
     let Some(runtime_type) = runtime_type else {
         return Ok(());
     };
-    if vm_value_matches_runtime_type(compiled, value, runtime_type, typecheck)? {
+    if vm_value_matches_runtime_type(compiled, None, value, runtime_type, typecheck)? {
         Ok(())
     } else {
         Err(format!(
@@ -25438,12 +27944,19 @@ fn check_property_type(
 
 fn vm_value_matches_runtime_type(
     compiled: &CompiledUnit,
+    state: Option<&ExecutionState>,
     value: &Value,
     runtime_type: &RuntimeType,
     typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<bool, String> {
     if let Value::Reference(cell) = value {
-        return vm_value_matches_runtime_type(compiled, &cell.get(), runtime_type, typecheck);
+        return vm_value_matches_runtime_type(
+            compiled,
+            state,
+            &cell.get(),
+            runtime_type,
+            typecheck,
+        );
     }
     if typecheck.enabled {
         if typecheck_fast_path_match(value, runtime_type) {
@@ -25454,14 +27967,24 @@ fn vm_value_matches_runtime_type(
     }
     let fallback_typecheck = typecheck.disabled();
     Ok(match runtime_type {
+        RuntimeType::Callable => state.map_or_else(
+            || value_matches_runtime_type(value, runtime_type),
+            |state| value_is_callable(compiled, state, value, false),
+        ),
         RuntimeType::Class { name } => object_instanceof(compiled, value, name)?,
         RuntimeType::Nullable { inner } => {
             matches!(value, Value::Null)
-                || vm_value_matches_runtime_type(compiled, value, inner, fallback_typecheck)?
+                || vm_value_matches_runtime_type(compiled, state, value, inner, fallback_typecheck)?
         }
         RuntimeType::Union { members } => {
             for member in members {
-                if vm_value_matches_runtime_type(compiled, value, member, fallback_typecheck)? {
+                if vm_value_matches_runtime_type(
+                    compiled,
+                    state,
+                    value,
+                    member,
+                    fallback_typecheck,
+                )? {
                     return Ok(true);
                 }
             }
@@ -25469,7 +27992,13 @@ fn vm_value_matches_runtime_type(
         }
         RuntimeType::Intersection { members } => {
             for member in members {
-                if !vm_value_matches_runtime_type(compiled, value, member, fallback_typecheck)? {
+                if !vm_value_matches_runtime_type(
+                    compiled,
+                    state,
+                    value,
+                    member,
+                    fallback_typecheck,
+                )? {
                     return Ok(false);
                 }
             }
@@ -25477,7 +28006,13 @@ fn vm_value_matches_runtime_type(
         }
         RuntimeType::Dnf { clauses } => {
             for clause in clauses {
-                if vm_value_matches_runtime_type(compiled, value, clause, fallback_typecheck)? {
+                if vm_value_matches_runtime_type(
+                    compiled,
+                    state,
+                    value,
+                    clause,
+                    fallback_typecheck,
+                )? {
                     return Ok(true);
                 }
             }
@@ -25498,7 +28033,7 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
         RuntimeType::Object => {
             matches!(
                 value,
-                Value::Object(_) | Value::Fiber(_) | Value::Generator(_)
+                Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_)
             )
         }
         RuntimeType::Class { name } => {
@@ -25511,6 +28046,9 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
             ) || matches!(
                 value,
                 Value::Generator(_) if name.eq_ignore_ascii_case("Generator")
+            ) || matches!(
+                value,
+                Value::Callable(_) if name.eq_ignore_ascii_case("Closure")
             )
         }
         RuntimeType::Nullable { inner } => {
@@ -26103,6 +28641,96 @@ fn array_callback_type_error(
         Some(php_runtime::PhpReferenceClassification::TypeError),
     );
     VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic)
+}
+
+fn validate_array_callback_arg(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    function: &str,
+    position: usize,
+    param_name: &str,
+    nullable: bool,
+    callback: &Value,
+) -> Result<(), ArrayCallbackError> {
+    if nullable && matches!(effective_value(callback), Value::Null) {
+        return Ok(());
+    }
+    if value_is_callable(compiled, state, callback, false) {
+        return Ok(());
+    }
+    let nullable_suffix = if nullable { " or null" } else { "" };
+    Err(ArrayCallbackError::Message(format!(
+        "E_PHP_RUNTIME_BUILTIN_TYPE: {function}(): Argument #{position} (${param_name}) must be a valid callback{nullable_suffix}, {}",
+        invalid_array_callback_reason(compiled, state, callback)
+    )))
+}
+
+fn invalid_array_callback_reason(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    callback: &Value,
+) -> String {
+    match effective_value(callback) {
+        Value::String(name) => format!(
+            "function \"{}\" not found or invalid function name",
+            name.to_string_lossy()
+        ),
+        Value::Array(array) => invalid_array_callback_array_reason(compiled, state, &array),
+        _ => "no array or string given".to_owned(),
+    }
+}
+
+fn invalid_array_callback_array_reason(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    array: &PhpArray,
+) -> String {
+    let Some(target) = array.get(&ArrayKey::Int(0)) else {
+        return "array callback must have exactly two members".to_owned();
+    };
+    let Some(method) = array.get(&ArrayKey::Int(1)) else {
+        return "array callback must have exactly two members".to_owned();
+    };
+    let method = match effective_value(method) {
+        Value::String(method) => method,
+        _ => return "second array member is not a valid method".to_owned(),
+    };
+    match effective_value(target) {
+        Value::Object(object) => invalid_array_callback_method_reason(
+            compiled,
+            state,
+            &object.class_name(),
+            &method.to_string_lossy(),
+            false,
+        ),
+        Value::String(class) => invalid_array_callback_method_reason(
+            compiled,
+            state,
+            &class.to_string_lossy(),
+            &method.to_string_lossy(),
+            true,
+        ),
+        _ => "first array member is not a valid class name or object".to_owned(),
+    }
+}
+
+fn invalid_array_callback_method_reason(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    method: &str,
+    static_target: bool,
+) -> String {
+    if !class_like_exists_direct(compiled, state, class_name, AutoloadClassLookupKind::Class) {
+        return format!("class \"{class_name}\" not found");
+    }
+    match lookup_method_in_state(compiled, state, class_name, method) {
+        Ok(Some(method_entry)) if static_target && !method_entry.flags.is_static => {
+            format!("non-static method {class_name}::{method}() cannot be called statically")
+        }
+        Ok(Some(_)) => format!("class {class_name} does not have a method \"{method}\""),
+        _ => format!("class {class_name} does not have a method \"{method}\""),
+    }
 }
 
 fn array_callback_key_value(key: &ArrayKey) -> Value {
@@ -33089,11 +35717,34 @@ echo perf_jit_unstable_types_debug(4), "\n";
     fn function_params_argument_count_errors_are_stable() {
         let missing = execute_source("<?php function one($a) { return $a; } one();");
         assert_eq!(missing.status.exit_status(), ExitStatus::RuntimeError);
+        let missing_message = missing.status.message().unwrap_or_default();
+        assert!(
+            missing_message.contains(
+                "Uncaught ArgumentCountError: Too few arguments to function one(), 0 passed in /tmp/phrust-test.php on line "
+            ),
+            "{missing_message}"
+        );
+        assert!(
+            missing_message.ends_with(" and exactly 1 expected"),
+            "{missing_message}"
+        );
+
+        let strict_type_before_missing = execute_source(
+            "<?php declare(strict_types=1); function pair(int $a, string $b) {} pair('1');",
+        );
         assert_eq!(
-            missing.status.message(),
-            Some(
-                "E_PHP_VM_UNCAUGHT_EXCEPTION: Uncaught ArgumentCountError: function one expects at least 1 argument(s), got 0"
-            )
+            strict_type_before_missing.status.exit_status(),
+            ExitStatus::RuntimeError
+        );
+        let strict_message = strict_type_before_missing
+            .status
+            .message()
+            .unwrap_or_default();
+        assert!(
+            strict_message.contains(
+                "Uncaught TypeError: pair(): Argument #1 ($a) must be of type int, string given"
+            ),
+            "{strict_message}"
         );
 
         // PHP accepts extra positional arguments to a non-variadic function;
@@ -33152,11 +35803,21 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert_eq!(failure.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
         assert!(
             failure.output.to_string_lossy().contains(
-                "Uncaught TypeError: add_one(): Argument #1 ($value) must be of type int, array given"
+                "Uncaught TypeError: add_one(): Argument #1 ($value) must be of type int, array given, called in "
             ),
             "{}",
             failure.output.to_string_lossy()
         );
+        let failure_output = failure.output.to_string_lossy();
+        assert!(
+            failure_output.contains(" and defined in "),
+            "{failure_output}"
+        );
+        assert!(
+            failure_output.contains("add_one(Array)"),
+            "{failure_output}"
+        );
+        assert!(failure_output.contains("  thrown in "), "{failure_output}");
     }
 
     #[test]
@@ -33314,7 +35975,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             variadic_result
                 .output
                 .to_string_lossy()
-                .contains("Uncaught TypeError: ints(): Argument #1 ($xs) must be of type int"),
+                .contains("Uncaught TypeError: ints(): Argument #1 must be of type int"),
             "{}",
             variadic_result.output.to_string_lossy()
         );

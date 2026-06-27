@@ -423,7 +423,7 @@ phpt-module *args:
     scripts/phpt/module_run.sh {{args}}
 
 phpt-dev-module *args:
-    @PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-10}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_run.sh {{args}}
+    @PHPT_SKIP_BUILD=1 PHPT_REUSE_LAST="${PHPT_REUSE_LAST:-1}" PHPT_DEV_REUSE_TARGET_PASS="${PHPT_DEV_REUSE_TARGET_PASS:-1}" PHPT_TIMEOUT_SECONDS="${PHPT_TIMEOUT_SECONDS:-10}" PHPT_WORK_DIR="${PHPT_WORK_DIR:-/private/tmp/phrust-phpt-work}" scripts/phpt/module_run.sh {{args}}
 
 phpt-module-target *args:
     scripts/phpt/module_target.sh {{args}}
@@ -1042,7 +1042,8 @@ runtime-fixtures:
     code=$?; \
     set -e; \
     test "$code" -eq 3; \
-    grep -q 'ArgumentCountError: function one expects at least 1 argument(s), got 0' "$tmp_dir/functions-missing-arg.err"; \
+    grep -q 'ArgumentCountError: Too few arguments to function one(), 0 passed in ' "$tmp_dir/functions-missing-arg.err"; \
+    grep -q ' and exactly 1 expected' "$tmp_dir/functions-missing-arg.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/functions/extra-arg.php > "$tmp_dir/functions-extra-arg.out"; \
     printf '1|1,2' > "$tmp_dir/functions-extra-arg.expected"; \
     cmp "$tmp_dir/functions-extra-arg.expected" "$tmp_dir/functions-extra-arg.out"; \

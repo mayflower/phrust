@@ -792,6 +792,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::MakeClosure { dst, .. }
         | InstructionKind::CallClosure { dst, .. }
         | InstructionKind::ResolveCallable { dst, .. }
+        | InstructionKind::AcquireCallable { dst, .. }
         | InstructionKind::CallCallable { dst, .. }
         | InstructionKind::Pipe { dst, .. }
         | InstructionKind::Include { dst, .. }
@@ -982,6 +983,7 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
             class_name: src, ..
         }
         | InstructionKind::UnsetProperty { object: src, .. }
+        | InstructionKind::AcquireCallable { value: src, .. }
         | InstructionKind::ForeachInit { source: src, .. } => remap_operand_constants(src, remap),
         InstructionKind::Binary { lhs, rhs, .. } | InstructionKind::Compare { lhs, rhs, .. } => {
             remap_operand_constants(lhs, remap);
@@ -1185,6 +1187,7 @@ fn rewrite_instruction_register_operands(
             class_name: src, ..
         }
         | InstructionKind::UnsetProperty { object: src, .. }
+        | InstructionKind::AcquireCallable { value: src, .. }
         | InstructionKind::ForeachInit { source: src, .. } => {
             rewrite_operand_registers(src, aliases)
         }

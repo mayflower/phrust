@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh"
+
 module="${MODULE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -106,7 +109,8 @@ work_root="${PHPT_WORK_DIR:-target/phpt-work}"
 reference_dir="$work_root/module-runs/${safe_module}/reference"
 target_dir="$work_root/module-runs/${safe_module}/target"
 
-job_args=(--jobs "${PHPT_JOBS:-1}")
+phpt_jobs="$(phpt_default_jobs)"
+job_args=(--jobs "$phpt_jobs")
 
 reference_reuse_args=()
 if [[ "${PHPT_DISABLE_REFERENCE_REUSE:-0}" != "1" && -s "$reference_dir/results.jsonl" ]]; then
@@ -116,6 +120,11 @@ fi
 target_reuse_args=()
 if [[ "${PHPT_REUSE_LAST:-1}" != "0" && -s "$target_dir/results.jsonl" ]]; then
   target_reuse_args=(--reuse-results "$target_dir/results.jsonl")
+fi
+
+target_dev_reuse_args=()
+if [[ "${PHPT_DEV_REUSE_TARGET_PASS:-0}" != "0" ]]; then
+  target_dev_reuse_args=(--dev-reuse-pass)
 fi
 
 "$phpt_tool" run \
@@ -141,6 +150,7 @@ set +e
   --work-dir "$target_dir/work" \
   --timeout-seconds "${PHPT_TIMEOUT_SECONDS:-10}" \
   ${target_reuse_args[@]+"${target_reuse_args[@]}"} \
+  ${target_dev_reuse_args[@]+"${target_dev_reuse_args[@]}"} \
   ${job_args[@]+"${job_args[@]}"}
 target_status=$?
 set -e

@@ -1529,6 +1529,7 @@ fn check_instruction(
         | InstructionKind::CallCallable { .. }
         | InstructionKind::Pipe { .. }
         | InstructionKind::ResolveCallable { .. }
+        | InstructionKind::AcquireCallable { .. }
         | InstructionKind::MakeClosure { .. } => rejected.push(JitEligibilityReason::instruction(
             "JIT_ELIGIBILITY_REJECT_CALL_OPCODE",
             "calls and callable resolution are outside the default JIT subset",

@@ -227,6 +227,27 @@ impl<'a> LoweringContext<'a> {
             });
     }
 
+    fn record_early_diagnostic_origin(
+        &mut self,
+        function: FunctionId,
+        origin: impl Into<String>,
+        span: IrSpan,
+        severity: IrDiagnosticSeverity,
+        diagnostic_id: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.early_diagnostics
+            .entry(function)
+            .or_default()
+            .push(EarlyDiagnostic {
+                origin: origin.into(),
+                span,
+                severity,
+                diagnostic_id: diagnostic_id.into(),
+                message: message.into(),
+            });
+    }
+
     fn emit_early_diagnostics(
         &mut self,
         builder: &mut IrBuilder,
@@ -381,6 +402,12 @@ struct StaticMethodCallTarget {
 }
 
 #[derive(Clone, Debug)]
+enum CallableComponent {
+    Expr(ExprId),
+    String(String),
+}
+
+#[derive(Clone, Debug)]
 struct TraitMethodCandidate {
     trait_name: String,
     display_trait_name: String,
@@ -484,7 +511,7 @@ pub fn lower_frontend_result(
     let mut context = LoweringContext::new(frontend, options, file);
     context.function_names.insert(function, String::new());
     context.lower_global_constant_declarations(&mut builder);
-    context.lower_function_declarations(&mut builder);
+    context.lower_function_declarations(&mut builder, function);
     context.lower_class_declarations(&mut builder);
     let current_block = context.lower_top_level(&mut builder, function, block);
     if context.options.emit_unsupported_instructions
@@ -1429,7 +1456,35 @@ impl LoweringContext<'_> {
             .collect()
     }
 
-    fn lower_function_declarations(&mut self, builder: &mut IrBuilder) {
+    fn global_constant_initializer_map(&self) -> HashMap<String, IrConstant> {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return HashMap::new();
+        };
+        let mut values = self.global_const_initializers().into_iter();
+        module
+            .declaration_table()
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() == DeclarationKind::Constant)
+            .filter_map(|entry| {
+                values
+                    .next()
+                    .and_then(|value| value.map(|value| (entry, value)))
+            })
+            .flat_map(|(entry, value)| {
+                [
+                    (entry.name().to_owned(), value.clone()),
+                    (entry.fqn().canonical(NameKind::Constant), value),
+                ]
+            })
+            .collect()
+    }
+
+    fn lower_function_declarations(&mut self, builder: &mut IrBuilder, main_function: FunctionId) {
         let Some(module) = self
             .frontend
             .database()
@@ -1481,6 +1536,23 @@ impl LoweringContext<'_> {
                         "parameter default is not a folded Semantic frontend constant expression",
                     );
                 }
+                if default == Some(IrConstant::Null)
+                    && self.param_type_triggers_implicit_nullable_deprecation(param)
+                {
+                    let span = span_from_range(self.file, param.span());
+                    self.record_early_diagnostic_origin(
+                        main_function,
+                        format!("hir:function:{name}:parameter:{}", param.name()),
+                        span,
+                        IrDiagnosticSeverity::Deprecation,
+                        "E_PHP_RUNTIME_IMPLICIT_NULLABLE_PARAMETER",
+                        format!(
+                            "{}(): Implicitly marking parameter {} as nullable is deprecated, the explicit nullable type must be used instead",
+                            name,
+                            param.name()
+                        ),
+                    );
+                }
                 let attributes = self.lower_parameter_attributes(builder, param.attributes());
                 builder.push_param(
                     function,
@@ -1518,6 +1590,7 @@ impl LoweringContext<'_> {
             .frontend
             .database()
             .module(self.frontend.module().module_id())?;
+        let named_constants = self.global_constant_initializer_map();
         module
             .const_exprs()
             .iter()
@@ -1534,11 +1607,7 @@ impl LoweringContext<'_> {
                 if let Some(value) = const_expr.folded_value() {
                     return ir_constant_from_const_value(value);
                 }
-                let expr = module.expressions().get(const_expr.expr_id())?;
-                match expr.kind() {
-                    HirExprKind::Literal { text } => literal_constant(text),
-                    _ => None,
-                }
+                constant_from_expr_with_names(module, const_expr.expr_id(), &named_constants)
             })
             .or_else(|| {
                 self.source_text
@@ -1546,6 +1615,36 @@ impl LoweringContext<'_> {
                     .get(default.span().start().to_usize()..default.span().end().to_usize())
                     .and_then(literal_constant)
             })
+    }
+
+    fn param_type_triggers_implicit_nullable_deprecation(&self, param: &Parameter) -> bool {
+        let Some(type_id) = param.type_id() else {
+            return false;
+        };
+        !self.type_accepts_null(type_id)
+    }
+
+    fn type_accepts_null(&self, type_id: TypeId) -> bool {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        let Some(ty) = module.types().get(type_id) else {
+            return false;
+        };
+        match ty.kind() {
+            HirTypeKind::Nullable { .. } | HirTypeKind::Null | HirTypeKind::Mixed => true,
+            HirTypeKind::Union { members, .. } => {
+                members.iter().any(|member| self.type_accepts_null(*member))
+            }
+            HirTypeKind::Dnf { members } => {
+                members.iter().any(|member| self.type_accepts_null(*member))
+            }
+            _ => false,
+        }
     }
 
     fn lower_property_default(&self, default: Option<ConstExprId>) -> Option<IrConstant> {
@@ -1866,6 +1965,9 @@ impl LoweringContext<'_> {
             }
             HirStmtKind::Expr { expr } => {
                 if let Some(expr) = expr {
+                    if expr_stmt_is_side_effect_free_bare_variable(module, expr) {
+                        return block;
+                    }
                     if self.lower_top_level_exit_stmt(builder, function, block, expr, module) {
                         return block;
                     }
@@ -2764,14 +2866,23 @@ impl LoweringContext<'_> {
         let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
         let after_block = builder.append_block(function);
         let body_block = builder.append_block(function);
-        let catch_block = (!parts.catches.is_empty()).then(|| builder.append_block(function));
+        let catch_blocks = parts
+            .catches
+            .iter()
+            .map(|_| builder.append_block(function))
+            .collect::<Vec<_>>();
         let finally_block =
             (!parts.finally_body.is_empty()).then(|| builder.append_block(function));
-        let catch_local = parts
+        let catch_locals = parts
             .catches
-            .first()
-            .and_then(|catch| catch.variable.as_deref())
-            .map(|name| builder.intern_local(function, name));
+            .iter()
+            .map(|catch| {
+                catch
+                    .variable
+                    .as_deref()
+                    .map(|name| builder.intern_local(function, name))
+            })
+            .collect::<Vec<_>>();
 
         for catch in &parts.catches {
             if !catch_types_supported(catch) {
@@ -2785,35 +2896,50 @@ impl LoweringContext<'_> {
                 );
             }
         }
-        let catch_types = parts
-            .catches
-            .first()
-            .map(|catch| {
-                catch
-                    .types
-                    .iter()
-                    .map(|ty| normalize_class_name(ty))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
 
-        builder.emit(
-            function,
-            block,
-            InstructionKind::EnterTry {
-                catch: catch_block,
-                catch_types,
-                finally: finally_block,
-                after: after_block,
-                exception_local: catch_local,
-            },
-            span,
-        );
+        if let Some(finally) = finally_block {
+            builder.emit(
+                function,
+                block,
+                InstructionKind::EnterTry {
+                    catch: None,
+                    catch_types: Vec::new(),
+                    finally: Some(finally),
+                    after: after_block,
+                    exception_local: None,
+                },
+                span,
+            );
+        }
+        for (index, catch) in parts.catches.iter().enumerate().rev() {
+            let catch_types = catch
+                .types
+                .iter()
+                .map(|ty| normalize_class_name(ty))
+                .collect::<Vec<_>>();
+            builder.emit(
+                function,
+                block,
+                InstructionKind::EnterTry {
+                    catch: Some(catch_blocks[index]),
+                    catch_types,
+                    finally: None,
+                    after: after_block,
+                    exception_local: catch_locals[index],
+                },
+                span,
+            );
+        }
         self.jump_if_open(builder, function, block, body_block, span);
 
         let body_end = self.lower_stmt_list(builder, function, body_block, parts.body);
         if !builder.is_terminated(function, body_end) {
-            builder.emit(function, body_end, InstructionKind::LeaveTry, span);
+            for _ in 0..parts.catches.len() {
+                builder.emit(function, body_end, InstructionKind::LeaveTry, span);
+            }
+            if finally_block.is_some() {
+                builder.emit(function, body_end, InstructionKind::LeaveTry, span);
+            }
             self.jump_if_open(
                 builder,
                 function,
@@ -2823,15 +2949,18 @@ impl LoweringContext<'_> {
             );
         }
 
-        if let Some(catch_block) = catch_block {
-            let catch_body = parts
-                .catches
-                .into_iter()
-                .next()
-                .map(|catch| catch.body)
-                .unwrap_or_default();
+        let catch_count = parts.catches.len();
+        for (index, (catch_block, catch)) in catch_blocks.into_iter().zip(parts.catches).enumerate()
+        {
+            for _ in 0..catch_count.saturating_sub(index + 1) {
+                builder.emit(function, catch_block, InstructionKind::LeaveTry, span);
+            }
+            let catch_body = catch.body;
             let catch_end = self.lower_stmt_list(builder, function, catch_block, catch_body);
             if !builder.is_terminated(function, catch_end) {
+                if finally_block.is_some() {
+                    builder.emit(function, catch_end, InstructionKind::LeaveTry, span);
+                }
                 self.jump_if_open(
                     builder,
                     function,
@@ -4763,7 +4892,14 @@ impl LoweringContext<'_> {
             if let Some(callee) = callee
                 && let Some(lowered) = self.lower_method_first_class_callable(builder, site, callee)
             {
-                return Some(lowered);
+                return Some(self.lower_acquire_callable_value(builder, site, lowered));
+            }
+            if let Some(callee) = callee
+                && self.first_class_callable_runtime_value(callee)
+            {
+                let lowered =
+                    self.lower_expr_to_register(builder, site.function, site.block, callee)?;
+                return Some(self.lower_acquire_callable_value(builder, site, lowered));
             }
             CallableKind::UnresolvedDynamic {
                 target: "first-class callable target is not a simple function name".to_owned(),
@@ -4790,6 +4926,36 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_acquire_callable_value(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        value: LoweredExpr,
+    ) -> LoweredExpr {
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            value.block,
+            InstructionKind::AcquireCallable {
+                dst,
+                value: Operand::Register(value.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            value.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        LoweredExpr {
+            register: dst,
+            block: value.block,
+        }
+    }
+
     /// Lowers a method or static-method first-class callable (`$obj->m(...)`,
     /// `Cls::m(...)`) to a `[receiver, 'm']` array callable value.
     fn lower_method_first_class_callable(
@@ -4803,28 +4969,31 @@ impl LoweringContext<'_> {
             .database()
             .module(self.frontend.module().module_id())?;
         let expr = module.expressions().get(callee)?;
-        enum Receiver {
-            Instance(ExprId),
-            Static(String),
-        }
         let (receiver, method) = match expr.kind() {
             HirExprKind::MethodCall {
                 receiver, method, ..
             } => {
                 let target = self.method_call_target(*receiver, *method)?;
-                (Receiver::Instance(target.receiver), target.method)
+                (
+                    CallableComponent::Expr(target.receiver),
+                    CallableComponent::String(target.method),
+                )
             }
             HirExprKind::PropertyFetch {
                 receiver: Some(receiver),
                 property: Some(property),
                 nullsafe: false,
             } => (
-                Receiver::Instance(*receiver),
-                self.static_property_name(*property)?,
+                CallableComponent::Expr(*receiver),
+                self.callable_member_component(*property)?,
             ),
             HirExprKind::StaticAccess { .. } => {
-                let target = self.static_method_call_target(callee)?;
-                (Receiver::Static(target.class_name), target.method)
+                let HirExprKind::StaticAccess { target, member } = expr.kind() else {
+                    return None;
+                };
+                let target = self.callable_static_target_component((*target)?)?;
+                let method = self.callable_member_component((*member)?)?;
+                (target, method)
             }
             _ => return None,
         };
@@ -4844,41 +5013,18 @@ impl LoweringContext<'_> {
             site.span,
         );
         let mut current = site.block;
-        let receiver_register = match receiver {
-            Receiver::Instance(receiver_expr) => {
-                let lowered =
-                    self.lower_expr_to_register(builder, site.function, current, receiver_expr)?;
-                current = lowered.block;
-                lowered.register
-            }
-            Receiver::Static(class_name) => {
-                let lowered = self.emit_constant_to_register(
-                    builder,
-                    LowerSite {
-                        block: current,
-                        ..site
-                    },
-                    IrConstant::String(class_name),
-                );
-                current = lowered.block;
-                lowered.register
-            }
-        };
+        let receiver_register =
+            self.lower_callable_component_to_register(builder, site, current, receiver)?;
+        current = receiver_register.block;
         self.emit_callable_array_insert(
             builder,
             site,
             current,
             dst,
-            Operand::Register(receiver_register),
+            Operand::Register(receiver_register.register),
         );
-        let method_value = self.emit_constant_to_register(
-            builder,
-            LowerSite {
-                block: current,
-                ..site
-            },
-            IrConstant::String(method),
-        );
+        let method_value =
+            self.lower_callable_component_to_register(builder, site, current, method)?;
         current = method_value.block;
         self.emit_callable_array_insert(
             builder,
@@ -4891,6 +5037,76 @@ impl LoweringContext<'_> {
             register: dst,
             block: current,
         })
+    }
+
+    fn first_class_callable_runtime_value(&self, expr: ExprId) -> bool {
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        matches!(
+            expression.kind(),
+            HirExprKind::Array { .. } | HirExprKind::New { .. } | HirExprKind::Variable { .. }
+        ) || matches!(
+            expression.kind(),
+            HirExprKind::Unary {
+                operator,
+                expr: Some(inner),
+            } if operator == "parenthesized" && self.first_class_callable_runtime_value(*inner)
+        )
+    }
+
+    fn callable_static_target_component(&self, expr: ExprId) -> Option<CallableComponent> {
+        if let Some(class_name) = self.static_class_name(expr) {
+            return Some(CallableComponent::String(class_name));
+        }
+        Some(CallableComponent::Expr(expr))
+    }
+
+    fn callable_member_component(&self, expr: ExprId) -> Option<CallableComponent> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        match expression.kind() {
+            HirExprKind::Literal { text } if text.starts_with('$') => {
+                Some(CallableComponent::Expr(expr))
+            }
+            HirExprKind::Name { resolution } if resolution.source().starts_with('$') => {
+                Some(CallableComponent::Expr(expr))
+            }
+            HirExprKind::Variable { .. } => Some(CallableComponent::Expr(expr)),
+            _ => self
+                .static_property_display_name(expr)
+                .map(CallableComponent::String)
+                .or(Some(CallableComponent::Expr(expr))),
+        }
+    }
+
+    fn lower_callable_component_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        block: BlockId,
+        component: CallableComponent,
+    ) -> Option<LoweredExpr> {
+        match component {
+            CallableComponent::Expr(expr) => {
+                self.lower_expr_to_register(builder, site.function, block, expr)
+            }
+            CallableComponent::String(value) => Some(self.emit_constant_to_register(
+                builder,
+                LowerSite { block, ..site },
+                IrConstant::String(value),
+            )),
+        }
     }
 
     fn emit_callable_array_insert(
@@ -4956,6 +5172,9 @@ impl LoweringContext<'_> {
         }
         let closure_function =
             self.lower_closure_function(builder, site.expr, &signature, arrow_body, &captures);
+        if !signature.flags().is_static() && builder.local_id(site.function, "this").is_some() {
+            builder.intern_local(closure_function, "this");
+        }
         let dst = builder.alloc_register(site.function);
         let capture_args = captures
             .iter()
@@ -5009,6 +5228,9 @@ impl LoweringContext<'_> {
         }
         let closure_function =
             self.lower_signatureless_closure_function(builder, site.expr, site.range, &captures);
+        if builder.local_id(site.function, "this").is_some() {
+            builder.intern_local(closure_function, "this");
+        }
         let dst = builder.alloc_register(site.function);
         let capture_args = captures
             .iter()
@@ -5117,6 +5339,7 @@ impl LoweringContext<'_> {
             name,
             FunctionFlags {
                 is_closure: true,
+                is_static: signature.flags().is_static(),
                 ..FunctionFlags::default()
             },
             span,
@@ -6976,6 +7199,22 @@ impl LoweringContext<'_> {
         }
     }
 
+    fn static_property_display_name(&self, expr: ExprId) -> Option<String> {
+        let range = self.span_for(SourceMappedId::from(expr));
+        if let Some(source) = self.source_text.slice(range) {
+            let source = source.trim();
+            if !source.is_empty()
+                && !source.starts_with('$')
+                && source
+                    .bytes()
+                    .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            {
+                return Some(local_name(source).to_owned());
+            }
+        }
+        self.static_property_name(expr)
+    }
+
     fn static_property_target(&self, expr: ExprId) -> Option<StaticPropertyTarget> {
         let module = self
             .frontend
@@ -7807,6 +8046,13 @@ fn span_from_range(file: FileId, range: TextRange) -> IrSpan {
     IrSpan::from_text_range(file, range)
 }
 
+fn expr_stmt_is_side_effect_free_bare_variable(module: &HirModule, expr: ExprId) -> bool {
+    let Some(expression) = module.expressions().get(expr) else {
+        return false;
+    };
+    matches!(expression.kind(), HirExprKind::Variable { .. })
+}
+
 fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start().to_usize() <= inner.start().to_usize()
         && outer.end().to_usize() >= inner.end().to_usize()
@@ -7817,10 +8063,36 @@ fn ranges_overlap(lhs: TextRange, rhs: TextRange) -> bool {
 }
 
 fn constant_from_expr(module: &HirModule, expr_id: ExprId) -> Option<IrConstant> {
+    constant_from_expr_with_names(module, expr_id, &HashMap::new())
+}
+
+fn constant_from_expr_with_names(
+    module: &HirModule,
+    expr_id: ExprId,
+    named_constants: &HashMap<String, IrConstant>,
+) -> Option<IrConstant> {
     let expr = module.expressions().get(expr_id)?;
     match expr.kind() {
         HirExprKind::Literal { text } => literal_constant(text),
-        HirExprKind::Name { resolution } => language_constant(resolution.source()),
+        HirExprKind::Name { resolution } => language_constant(resolution.source())
+            .or_else(|| named_constant_value(named_constants, resolution)),
+        HirExprKind::Unary { operator, expr } => {
+            let value = constant_from_expr_with_names(module, (*expr)?, named_constants)?;
+            match operator.as_str() {
+                "parenthesized" | "+" => Some(value),
+                "-" => negate_ir_constant(value),
+                _ => None,
+            }
+        }
+        HirExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = constant_from_expr_with_names(module, (*left)?, named_constants)?;
+            let right = constant_from_expr_with_names(module, (*right)?, named_constants)?;
+            binary_ir_constant(operator, left, right)
+        }
         HirExprKind::Array { elements } => {
             let mut entries = Vec::with_capacity(elements.len());
             for element_id in elements {
@@ -7836,17 +8108,73 @@ fn constant_from_expr(module: &HirModule, expr_id: ExprId) -> Option<IrConstant>
                             return None;
                         }
                         entries.push(IrConstantArrayEntry {
-                            key: key.and_then(|key| constant_from_expr(module, key)),
-                            value: constant_from_expr(module, (*value)?)?,
+                            key: key.and_then(|key| {
+                                constant_from_expr_with_names(module, key, named_constants)
+                            }),
+                            value: constant_from_expr_with_names(
+                                module,
+                                (*value)?,
+                                named_constants,
+                            )?,
                         });
                     }
                     _ => entries.push(IrConstantArrayEntry {
                         key: None,
-                        value: constant_from_expr(module, *element_id)?,
+                        value: constant_from_expr_with_names(module, *element_id, named_constants)?,
                     }),
                 }
             }
             Some(IrConstant::Array(entries))
+        }
+        _ => None,
+    }
+}
+
+fn named_constant_value(
+    named_constants: &HashMap<String, IrConstant>,
+    resolution: &HirNameResolution,
+) -> Option<IrConstant> {
+    let candidates = [
+        resolution.resolved(),
+        resolution.fallback(),
+        Some(resolution.source()),
+        resolution.source().strip_prefix('\\'),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|name| named_constants.get(name).cloned())
+}
+
+fn negate_ir_constant(value: IrConstant) -> Option<IrConstant> {
+    match value {
+        IrConstant::Int(value) => value.checked_neg().map(IrConstant::Int),
+        IrConstant::Float(value) => Some(IrConstant::Float(-value)),
+        _ => None,
+    }
+}
+
+fn binary_ir_constant(operator: &str, left: IrConstant, right: IrConstant) -> Option<IrConstant> {
+    match (operator, left, right) {
+        ("+", IrConstant::Int(left), IrConstant::Int(right)) => {
+            left.checked_add(right).map(IrConstant::Int)
+        }
+        ("-", IrConstant::Int(left), IrConstant::Int(right)) => {
+            left.checked_sub(right).map(IrConstant::Int)
+        }
+        ("*", IrConstant::Int(left), IrConstant::Int(right)) => {
+            left.checked_mul(right).map(IrConstant::Int)
+        }
+        ("<<", IrConstant::Int(left), IrConstant::Int(right)) => u32::try_from(right)
+            .ok()
+            .and_then(|shift| left.checked_shl(shift))
+            .map(IrConstant::Int),
+        (".", IrConstant::String(left), IrConstant::String(right)) => {
+            Some(IrConstant::String(format!("{left}{right}")))
+        }
+        (".", IrConstant::StringBytes(mut left), IrConstant::StringBytes(right)) => {
+            left.extend(right);
+            Some(IrConstant::StringBytes(left))
         }
         _ => None,
     }

@@ -288,6 +288,7 @@ impl VmCounters {
             InstructionKind::BindReferenceFromCall { .. }
             | InstructionKind::CallFunction { .. }
             | InstructionKind::CallClosure { .. }
+            | InstructionKind::AcquireCallable { .. }
             | InstructionKind::CallCallable { .. }
             | InstructionKind::Pipe { .. } => self.function_calls += 1,
             InstructionKind::CallMethod { .. } | InstructionKind::CallStaticMethod { .. } => {
@@ -2303,6 +2304,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::MakeClosure { .. } => "make_closure",
         InstructionKind::CallClosure { .. } => "call_closure",
         InstructionKind::ResolveCallable { .. } => "resolve_callable",
+        InstructionKind::AcquireCallable { .. } => "acquire_callable",
         InstructionKind::CallCallable { .. } => "call_callable",
         InstructionKind::Pipe { .. } => "pipe",
         InstructionKind::Include { .. } => "include",

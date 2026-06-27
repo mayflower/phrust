@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh"
+
 module="${MODULE:-}"
 focus_file="${FILE:-}"
 focus_pattern="${PATTERN:-}"
@@ -167,7 +170,8 @@ if [[ -n "${PHPT_DEV_REUSE_PASS:-}" && "${PHPT_DEV_REUSE_PASS:-}" != "0" ]]; the
   dev_reuse_args=(--dev-reuse-pass)
 fi
 
-job_args=(--jobs "${PHPT_JOBS:-1}")
+phpt_jobs="$(phpt_default_jobs)"
+job_args=(--jobs "$phpt_jobs")
 
 set +e
 if [[ -n "$reuse_results" ]]; then

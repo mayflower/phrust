@@ -1,5 +1,6 @@
 //! Stack frame and register storage for the first VM core.
 
+use php_ir::IrSpan;
 use php_ir::ids::{FunctionId, LocalId, RegId};
 use php_runtime::{ReferenceCell, Slot, TempValue, Value};
 
@@ -197,6 +198,8 @@ pub struct Frame {
     /// PHP-visible arguments supplied to this call after default/variadic
     /// normalization.
     pub arguments: Vec<Value>,
+    /// Source span of the call site that activated this frame, when known.
+    pub call_span: Option<IrSpan>,
     /// Registers for the function.
     pub registers: RegisterFile,
     /// PHP local variable slots for the function.
@@ -204,6 +207,19 @@ pub struct Frame {
     /// True when this activation may be returned to the request-local frame
     /// pool after it completes.
     pub reuse_eligible: bool,
+}
+
+/// Metadata attached to a function activation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FrameActivationContext {
+    /// Class scope used for `self::`, visibility, and private member lookup.
+    pub scope_class: Option<String>,
+    /// Late-static-binding called class used for `static::`.
+    pub called_class: Option<String>,
+    /// Class that declares the selected method body.
+    pub declaring_class: Option<String>,
+    /// Source span of the call site that activated this frame, when known.
+    pub call_span: Option<IrSpan>,
 }
 
 impl Frame {
@@ -216,6 +232,7 @@ impl Frame {
             called_class: None,
             declaring_class: None,
             arguments: Vec::new(),
+            call_span: None,
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
             reuse_eligible: false,
@@ -224,20 +241,19 @@ impl Frame {
 
     /// Creates a frame for a class method with explicit class metadata.
     #[must_use]
-    pub fn new_with_class_context(
+    pub fn new_with_activation_context(
         function: FunctionId,
         register_count: u32,
         local_count: u32,
-        scope_class: Option<String>,
-        called_class: Option<String>,
-        declaring_class: Option<String>,
+        context: FrameActivationContext,
     ) -> Self {
         Self {
             function,
-            scope_class,
-            called_class,
-            declaring_class,
+            scope_class: context.scope_class,
+            called_class: context.called_class,
+            declaring_class: context.declaring_class,
             arguments: Vec::new(),
+            call_span: context.call_span,
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
             reuse_eligible: false,
@@ -250,6 +266,7 @@ impl Frame {
         self.scope_class = None;
         self.called_class = None;
         self.declaring_class = None;
+        self.call_span = None;
         self.arguments.clear();
         self.registers.clear_for_reuse();
         self.locals.clear_for_reuse();
@@ -257,19 +274,18 @@ impl Frame {
     }
 
     /// Reinitializes a pooled frame for a new function activation.
-    pub fn reset_with_class_context(
+    pub fn reset_with_activation_context(
         &mut self,
         function: FunctionId,
         register_count: u32,
         local_count: u32,
-        scope_class: Option<String>,
-        called_class: Option<String>,
-        declaring_class: Option<String>,
+        context: FrameActivationContext,
     ) {
         self.function = function;
-        self.scope_class = scope_class;
-        self.called_class = called_class;
-        self.declaring_class = declaring_class;
+        self.scope_class = context.scope_class;
+        self.called_class = context.called_class;
+        self.declaring_class = context.declaring_class;
+        self.call_span = context.call_span;
         self.arguments.clear();
         self.registers.reset_for_function(register_count);
         self.locals.reset_for_function(local_count);
@@ -305,18 +321,10 @@ impl CallStack {
         function: FunctionId,
         register_count: u32,
         local_count: u32,
-        scope_class: Option<String>,
-        called_class: Option<String>,
-        declaring_class: Option<String>,
+        context: FrameActivationContext,
     ) {
-        let mut frame = Frame::new_with_class_context(
-            function,
-            register_count,
-            local_count,
-            scope_class,
-            called_class,
-            declaring_class,
-        );
+        let mut frame =
+            Frame::new_with_activation_context(function, register_count, local_count, context);
         frame.reuse_eligible = false;
         self.frames.push(frame);
     }
@@ -328,32 +336,17 @@ impl CallStack {
         function: FunctionId,
         register_count: u32,
         local_count: u32,
-        scope_class: Option<String>,
-        called_class: Option<String>,
-        declaring_class: Option<String>,
+        context: FrameActivationContext,
     ) -> bool {
         if let Some(mut frame) = self.frame_pool.pop() {
-            frame.reset_with_class_context(
-                function,
-                register_count,
-                local_count,
-                scope_class,
-                called_class,
-                declaring_class,
-            );
+            frame.reset_with_activation_context(function, register_count, local_count, context);
             frame.reuse_eligible = true;
             self.frames.push(frame);
             return true;
         }
 
-        let mut frame = Frame::new_with_class_context(
-            function,
-            register_count,
-            local_count,
-            scope_class,
-            called_class,
-            declaring_class,
-        );
+        let mut frame =
+            Frame::new_with_activation_context(function, register_count, local_count, context);
         frame.reuse_eligible = true;
         self.frames.push(frame);
         false

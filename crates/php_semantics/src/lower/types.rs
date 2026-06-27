@@ -253,8 +253,24 @@ impl TypeLowerer<'_> {
                     span,
                 );
             }
+            HirTypeKind::Intersection { members }
+                if members.iter().any(|member| self.type_is_callable(*member)) =>
+            {
+                self.error(
+                    DiagnosticId::InvalidTypeCallableContext,
+                    "Type callable cannot be part of an intersection type",
+                    span,
+                );
+            }
             _ => {}
         }
+    }
+
+    fn type_is_callable(&self, ty: TypeId) -> bool {
+        matches!(
+            self.module().types()[ty].kind(),
+            HirTypeKind::Builtin(BuiltinType::Callable)
+        )
     }
 
     fn check_duplicate_members(&mut self, members: &[TypeId]) {

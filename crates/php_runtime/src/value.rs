@@ -1,9 +1,29 @@
 //! Minimal runtime value model for early VM execution.
 
 use crate::{
-    FiberRef, GeneratorRef, ObjectRef, PhpArray, ReferenceCell, ResourceRef, string::PhpString,
+    FiberRef, GeneratorRef, ObjectRef, PhpArray, ReferenceCell, ResourceRef,
+    object::next_object_id, string::PhpString,
 };
 use std::fmt;
+
+/// Debug metadata PHP exposes when dumping a runtime `Closure` value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosureDebugInfo {
+    /// Synthetic closure name, for example `{closure:/path/file.php:12}`.
+    pub name: String,
+    /// Source file where the closure was declared.
+    pub file: String,
+    /// Source line where the closure was declared.
+    pub line: i64,
+}
+
+/// Borrowed runtime closure payload.
+pub type ClosurePayloadRef<'a> = (
+    u32,
+    &'a Vec<ClosureCaptureValue>,
+    Option<&'a ObjectRef>,
+    Option<&'a ClosureDebugInfo>,
+);
 
 /// Runtime callable values.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,15 +36,30 @@ pub enum CallableValue {
     /// runtime closure value. The function ID is stored as its stable raw IR ID
     /// to keep `php_runtime` independent from `php_ir`.
     Closure {
+        /// PHP-visible object handle for the Closure instance.
+        id: u64,
         /// Raw `php_ir::FunctionId`.
         function: u32,
         /// Captured values in deterministic capture order.
         captures: Vec<ClosureCaptureValue>,
+        /// Object bound as `$this` when the closure was created.
+        bound_this: Option<ObjectRef>,
+        /// Optional source metadata used by debug output.
+        debug: Option<ClosureDebugInfo>,
     },
     /// Internal builtin resolved by deterministic builtin name.
     InternalBuiltin {
         /// Normalized builtin name.
         name: String,
+    },
+    /// Method callable acquired through first-class callable syntax.
+    BoundMethod {
+        /// Bound object or class target.
+        target: CallableMethodTarget,
+        /// Method name using PHP-visible spelling from the acquisition site.
+        method: String,
+        /// Class scope active when the callable was acquired.
+        scope: Option<String>,
     },
     /// Placeholder for method callables until object/method runtime exists.
     MethodPlaceholder {
@@ -36,6 +71,15 @@ pub enum CallableValue {
         /// Stable human-readable target description.
         target: String,
     },
+}
+
+/// Runtime target for an acquired method callable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallableMethodTarget {
+    /// Instance method target.
+    Object(ObjectRef),
+    /// Static method target class name.
+    Class(String),
 }
 
 /// One value captured into a closure.
@@ -186,7 +230,47 @@ impl Value {
     /// Creates a runtime closure callable value.
     #[must_use]
     pub fn closure(function: u32, captures: Vec<ClosureCaptureValue>) -> Self {
-        Self::Callable(CallableValue::Closure { function, captures })
+        Self::Callable(CallableValue::Closure {
+            id: next_object_id(),
+            function,
+            captures,
+            bound_this: None,
+            debug: None,
+        })
+    }
+
+    /// Creates a runtime closure callable value with PHP debug metadata.
+    #[must_use]
+    pub fn closure_with_debug(
+        function: u32,
+        captures: Vec<ClosureCaptureValue>,
+        debug: Option<ClosureDebugInfo>,
+    ) -> Self {
+        Self::Callable(CallableValue::Closure {
+            id: next_object_id(),
+            function,
+            captures,
+            bound_this: None,
+            debug,
+        })
+    }
+
+    /// Creates a runtime closure callable value with PHP debug metadata and an
+    /// object bound as `$this`.
+    #[must_use]
+    pub fn closure_with_debug_and_this(
+        function: u32,
+        captures: Vec<ClosureCaptureValue>,
+        debug: Option<ClosureDebugInfo>,
+        bound_this: Option<ObjectRef>,
+    ) -> Self {
+        Self::Callable(CallableValue::Closure {
+            id: next_object_id(),
+            function,
+            captures,
+            bound_this,
+            debug,
+        })
     }
 
     /// Creates a resolved user-function callable value.
@@ -199,6 +283,20 @@ impl Value {
     #[must_use]
     pub fn internal_builtin_callable(name: impl Into<String>) -> Self {
         Self::Callable(CallableValue::InternalBuiltin { name: name.into() })
+    }
+
+    /// Creates a bound method callable value.
+    #[must_use]
+    pub fn bound_method_callable(
+        target: CallableMethodTarget,
+        method: impl Into<String>,
+        scope: Option<String>,
+    ) -> Self {
+        Self::Callable(CallableValue::BoundMethod {
+            target,
+            method: method.into(),
+            scope,
+        })
     }
 
     /// Creates a method-callable placeholder value.
@@ -219,11 +317,15 @@ impl Value {
 
     /// Returns closure payload when this value is a runtime closure.
     #[must_use]
-    pub const fn as_closure(&self) -> Option<(u32, &Vec<ClosureCaptureValue>)> {
+    pub fn as_closure(&self) -> Option<ClosurePayloadRef<'_>> {
         match self {
-            Self::Callable(CallableValue::Closure { function, captures }) => {
-                Some((*function, captures))
-            }
+            Self::Callable(CallableValue::Closure {
+                function,
+                captures,
+                bound_this,
+                debug,
+                ..
+            }) => Some((*function, captures, bound_this.as_ref(), debug.as_ref())),
             _ => None,
         }
     }
@@ -277,7 +379,9 @@ impl fmt::Debug for Value {
                 .field("kind", &"user_function")
                 .field("name", name)
                 .finish(),
-            Self::Callable(CallableValue::Closure { function, captures }) => f
+            Self::Callable(CallableValue::Closure {
+                function, captures, ..
+            }) => f
                 .debug_struct("Closure")
                 .field("function", function)
                 .field(
@@ -292,6 +396,17 @@ impl fmt::Debug for Value {
                 .debug_struct("Callable")
                 .field("kind", &"internal_builtin")
                 .field("name", name)
+                .finish(),
+            Self::Callable(CallableValue::BoundMethod {
+                target,
+                method,
+                scope,
+            }) => f
+                .debug_struct("Callable")
+                .field("kind", &"bound_method")
+                .field("target", target)
+                .field("method", method)
+                .field("scope", scope)
                 .finish(),
             Self::Callable(CallableValue::MethodPlaceholder { target }) => f
                 .debug_struct("Callable")

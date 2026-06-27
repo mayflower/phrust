@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) fn next_object_id() -> u64 {
+    NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Minimal runtime type adapter used by the VM for Semantic frontend annotations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeType {
@@ -314,7 +318,7 @@ impl ObjectRef {
             .collect();
         let properties = property_entries.into_iter().collect();
         Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: class.name.clone(),
                 display_name,
@@ -363,7 +367,7 @@ impl ObjectRef {
     pub fn clone_shallow(&self) -> Self {
         let storage = self.storage.borrow();
         Self {
-            id: NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_object_id(),
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: storage.class_name.clone(),
                 display_name: storage.display_name.clone(),
@@ -909,7 +913,9 @@ mod tests {
             )],
         );
         match closure {
-            Value::Callable(crate::CallableValue::Closure { function, captures }) => {
+            Value::Callable(crate::CallableValue::Closure {
+                function, captures, ..
+            }) => {
                 assert_eq!(function, 29);
                 assert_eq!(captures[0].name, "captured");
                 assert_eq!(
