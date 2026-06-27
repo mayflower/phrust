@@ -321,6 +321,14 @@ enum PendingControl {
     Throw(Value),
 }
 
+/// Outcome of routing a runtime error through the active exception handlers.
+enum RaiseOutcome {
+    /// A handler in the current frame caught the throwable; resume at this block.
+    Caught(BlockId),
+    /// Nothing caught it in this frame; return this result to the caller.
+    Done(Box<VmResult>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedArg {
     value: Value,
@@ -5732,15 +5740,26 @@ impl Vm {
                         ) {
                             Ok(Some(resolved)) => resolved,
                             Ok(None) => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: property {}::${property} is not declared",
-                                        class.name
-                                    ),
+                                let message = format!(
+                                    "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
+                                    class.display_name
                                 );
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
                             }
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -6651,15 +6670,26 @@ impl Vm {
                         ) {
                             Ok(Some(resolved)) => resolved,
                             Ok(None) => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: property {}::${property} is not declared",
-                                        class.name
-                                    ),
+                                let message = format!(
+                                    "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
+                                    class.display_name
                                 );
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
                             }
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -15128,6 +15158,40 @@ impl Vm {
         VmResult::propagating_exception(output.clone())
     }
 
+    /// Builds a runtime error for `message` and, when it maps to a PHP throwable,
+    /// stamps the operation location and routes it through the current frame's
+    /// handlers: `Caught` jumps to a catch block, `Done` returns a result that
+    /// either propagates the throwable or carries a non-catchable failure.
+    fn raise_runtime_error(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        handlers: &mut Vec<ExceptionHandler>,
+        pending_control: &mut Option<PendingControl>,
+        span: php_ir::IrSpan,
+        message: String,
+    ) -> RaiseOutcome {
+        let result = self.runtime_error(output, compiled, stack, message);
+        if let Some(throwable) = runtime_error_throwable(&result) {
+            tag_throwable_location(&throwable, compiled, span);
+            if let Some(target) = handle_throw(
+                compiled,
+                throwable.clone(),
+                handlers,
+                stack,
+                pending_control,
+            ) {
+                return RaiseOutcome::Caught(target);
+            }
+            return RaiseOutcome::Done(Box::new(
+                self.propagate_exception(output, stack, state, throwable),
+            ));
+        }
+        RaiseOutcome::Done(Box::new(result))
+    }
+
     fn handle_uncaught_exception(
         &self,
         compiled: &CompiledUnit,
@@ -22061,7 +22125,8 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
         | "E_PHP_VM_ABSTRACT_METHOD_CALL"
         | "E_PHP_VM_PRIVATE_PROPERTY_ACCESS"
-        | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS" => "Error",
+        | "E_PHP_VM_PROTECTED_PROPERTY_ACCESS"
+        | "E_PHP_VM_UNKNOWN_STATIC_PROPERTY" => "Error",
         _ => return None,
     };
     let message = diagnostic
