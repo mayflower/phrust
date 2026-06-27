@@ -923,7 +923,7 @@ runtime-fixtures:
     code=$?; \
     set -e; \
     test "$code" -eq 3; \
-    grep -q 'E_PHP_VM_PARAM_TYPE_MISMATCH' "$tmp_dir/runtime-types-param-int-fail.err"; \
+    grep -q 'Uncaught TypeError: add_one(): Argument #1 ($value) must be of type int, array given' "$tmp_dir/runtime-types-param-int-fail.out"; \
     set +e; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/invalid/runtime_types/return-string-fail.php > "$tmp_dir/runtime-types-return-string-fail.out" 2> "$tmp_dir/runtime-types-return-string-fail.err"; \
     code=$?; \

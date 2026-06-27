@@ -3652,12 +3652,13 @@ impl Vm {
             } else if function.flags.is_top_level {
                 bind_top_level_global_locals(function, stack, state);
             }
-            for (param, mut arg) in function.params.iter().zip(args) {
+            for (arg_index, (param, mut arg)) in function.params.iter().zip(args).enumerate() {
                 if let Err(message) = coerce_or_check_param_type(
                     compiled,
                     compiled.unit(),
                     function,
                     param,
+                    arg_index,
                     &mut arg.value,
                     arg.reference.is_some(),
                     self.typecheck_fast_path_context(),
@@ -22034,6 +22035,7 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP" => "Error",
         "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES" => "TypeError",
         "E_PHP_VM_STRING_OFFSET_TYPE" => "TypeError",
+        "E_PHP_VM_PARAM_TYPE_MISMATCH" => "TypeError",
         "E_PHP_VM_PRIVATE_METHOD_ACCESS"
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
         | "E_PHP_VM_ABSTRACT_METHOD_CALL" => "Error",
@@ -22367,11 +22369,41 @@ fn variadic_array(args: Vec<VariadicTailArg>) -> Value {
     Value::Array(array)
 }
 
+/// PHP's `zend_zval_type_name`-style name used in `TypeError` messages: the
+/// class name for objects, otherwise the scalar type name.
+fn type_error_value_name(value: &Value) -> String {
+    match value {
+        Value::Reference(cell) => type_error_value_name(&cell.get()),
+        Value::Object(object) => object.display_name(),
+        other => value_type_name(other).to_owned(),
+    }
+}
+
+/// Builds PHP's argument `TypeError` message, e.g.
+/// `Foo::bar(): Argument #1 ($baz) must be of type int, string given`.
+fn param_type_mismatch_message(
+    function: &IrFunction,
+    param: &IrParam,
+    arg_index: usize,
+    value: &Value,
+    runtime_type: &RuntimeType,
+) -> String {
+    format!(
+        "E_PHP_VM_PARAM_TYPE_MISMATCH: {}(): Argument #{} (${}) must be of type {}, {} given",
+        function.name,
+        arg_index + 1,
+        param.name,
+        runtime_type_name(runtime_type),
+        type_error_value_name(value),
+    )
+}
+
 fn coerce_or_check_param_type(
     compiled: &CompiledUnit,
     unit: &IrUnit,
     function: &IrFunction,
     param: &IrParam,
+    arg_index: usize,
     value: &mut Value,
     by_ref_arg: bool,
     typecheck: TypecheckFastPathContext<'_>,
@@ -22385,6 +22417,7 @@ fn coerce_or_check_param_type(
             unit,
             function,
             param,
+            arg_index,
             value,
             &runtime_type,
             typecheck,
@@ -22400,12 +22433,12 @@ fn coerce_or_check_param_type(
     if vm_value_matches_runtime_type(compiled, value, &runtime_type, typecheck)? {
         Ok(())
     } else {
-        Err(format!(
-            "E_PHP_VM_PARAM_TYPE_MISMATCH: function {} argument ${} got {}, expected {}",
-            function.name,
-            param.name,
-            value_type_name(value),
-            runtime_type_name(&runtime_type)
+        Err(param_type_mismatch_message(
+            function,
+            param,
+            arg_index,
+            value,
+            &runtime_type,
         ))
     }
 }
@@ -22415,6 +22448,7 @@ fn coerce_or_check_variadic_param_type(
     unit: &IrUnit,
     function: &IrFunction,
     param: &IrParam,
+    arg_index: usize,
     value: &mut Value,
     runtime_type: &RuntimeType,
     typecheck: TypecheckFastPathContext<'_>,
@@ -22426,18 +22460,18 @@ fn coerce_or_check_variadic_param_type(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
-    for (key, mut element) in entries {
+    for (offset, (key, mut element)) in entries.into_iter().enumerate() {
         if !unit.strict_types
             && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
         {
             element = coerced;
         } else if !vm_value_matches_runtime_type(compiled, &element, runtime_type, typecheck)? {
-            return Err(format!(
-                "E_PHP_VM_PARAM_TYPE_MISMATCH: function {} argument ${} got {}, expected {}",
-                function.name,
-                param.name,
-                value_type_name(&element),
-                runtime_type_name(runtime_type)
+            return Err(param_type_mismatch_message(
+                function,
+                param,
+                arg_index + offset,
+                &element,
+                runtime_type,
             ));
         }
         if let Some(slot) = array.get_mut(&key) {
@@ -30009,12 +30043,15 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let failure = execute_source(
             "<?php function add_one(int $value): int { return $value + 1; } add_one([]);",
         );
+        // An uncaught argument type error surfaces as PHP's uncaught `TypeError`.
         assert_eq!(failure.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(failure.diagnostics[0].id(), "E_PHP_VM_PARAM_TYPE_MISMATCH");
-        let message = failure.status.message().expect("runtime error message");
+        assert_eq!(failure.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
         assert!(
-            message.contains("function add_one argument $value got array, expected int"),
-            "{message}"
+            failure.output.to_string_lossy().contains(
+                "Uncaught TypeError: add_one(): Argument #1 ($value) must be of type int, array given"
+            ),
+            "{}",
+            failure.output.to_string_lossy()
         );
     }
 
@@ -30143,12 +30180,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
                 > 0
         );
 
+        // An uncaught argument type error propagates out of the call frame and
+        // renders as PHP's uncaught `TypeError`.
         let strict = "<?php declare(strict_types=1); function takes_int(int $value): int { return $value; } takes_int('42');";
-        assert_typecheck_fast_path_error_matches_slow_path(strict, "E_PHP_VM_PARAM_TYPE_MISMATCH");
+        assert_typecheck_fast_path_error_matches_slow_path(strict, "E_PHP_VM_UNCAUGHT_EXCEPTION");
 
         let by_ref =
             "<?php function takes_ref(int &$value): void {} $value = '42'; takes_ref($value);";
-        assert_typecheck_fast_path_error_matches_slow_path(by_ref, "E_PHP_VM_PARAM_TYPE_MISMATCH");
+        assert_typecheck_fast_path_error_matches_slow_path(by_ref, "E_PHP_VM_UNCAUGHT_EXCEPTION");
 
         let variadic = "<?php function ints(int ...$xs): int { return $xs[0] + $xs[1]; } echo ints('40', 2), '|'; ints('bad');";
         let variadic_result = execute_source_with_options(
@@ -30165,9 +30204,16 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
         assert_eq!(
             variadic_result.diagnostics[0].id(),
-            "E_PHP_VM_PARAM_TYPE_MISMATCH"
+            "E_PHP_VM_UNCAUGHT_EXCEPTION"
         );
-        assert_eq!(variadic_result.output.as_bytes(), b"42|");
+        assert!(
+            variadic_result
+                .output
+                .to_string_lossy()
+                .contains("Uncaught TypeError: ints(): Argument #1 ($xs) must be of type int"),
+            "{}",
+            variadic_result.output.to_string_lossy()
+        );
 
         let return_error = "<?php function bad(): int { return 'x'; } bad();";
         assert_typecheck_fast_path_error_matches_slow_path(
