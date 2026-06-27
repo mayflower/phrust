@@ -4341,6 +4341,15 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        let span = runtime_source_span(compiled, instruction.span);
+                        if let Some(file) = span.file {
+                            object.set_property("file", Value::string(file.into_bytes()));
+                        }
+                        if let Some(line) =
+                            source_span_display_line(compiled, instruction.span, false)
+                        {
+                            object.set_property("line", Value::Int(line));
+                        }
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -15241,19 +15250,30 @@ fn make_exception_object(class_name: &str, message: &Value) -> Result<ObjectRef,
     let message = to_string(message)?.to_string_lossy();
     let class_name = internal_throwable_display_name(class_name);
     let parent = internal_throwable_parent(&class_name).map(str::to_owned);
+    let throwable_property =
+        |name: &str, default: Value, type_: RuntimeType| RuntimeClassPropertyEntry {
+            name: name.to_owned(),
+            default,
+            type_: Some(type_),
+            flags: RuntimeClassPropertyFlags::default(),
+            hooks: RuntimeClassPropertyHooks::default(),
+            attributes: Vec::new(),
+        };
     let class = RuntimeClassEntry {
         name: class_name.clone(),
         parent,
         interfaces: vec!["throwable".to_owned()],
         methods: Vec::new(),
-        properties: vec![RuntimeClassPropertyEntry {
-            name: "message".to_owned(),
-            default: Value::String(PhpString::from_test_str(&message)),
-            type_: Some(RuntimeType::String),
-            flags: RuntimeClassPropertyFlags::default(),
-            hooks: RuntimeClassPropertyHooks::default(),
-            attributes: Vec::new(),
-        }],
+        properties: vec![
+            throwable_property(
+                "message",
+                Value::String(PhpString::from_test_str(&message)),
+                RuntimeType::String,
+            ),
+            throwable_property("code", Value::Int(0), RuntimeType::Int),
+            throwable_property("file", Value::string(Vec::new()), RuntimeType::String),
+            throwable_property("line", Value::Int(0), RuntimeType::Int),
+        ],
         constants: Vec::new(),
         enum_cases: Vec::new(),
         attributes: Vec::new(),
@@ -15285,20 +15305,43 @@ fn internal_throwable_method_value(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
-    if normalize_method_name(method) != "getmessage" {
+    let normalized = normalize_method_name(method);
+    if !args.is_empty()
+        && matches!(
+            normalized.as_str(),
+            "getmessage"
+                | "getcode"
+                | "getline"
+                | "getfile"
+                | "getprevious"
+                | "gettraceasstring"
+                | "gettrace"
+        )
+    {
         return Err(format!(
-            "E_PHP_VM_UNKNOWN_METHOD: method {}::{method} is not declared",
-            object.class_name()
-        ));
-    }
-    if !args.is_empty() {
-        return Err(format!(
-            "E_PHP_VM_TOO_MANY_ARGS: {}::getMessage() expects exactly 0 arguments, {} given",
+            "E_PHP_VM_TOO_MANY_ARGS: {}::{method}() expects exactly 0 arguments, {} given",
             object.class_name(),
             args.len()
         ));
     }
-    Ok(object.get_property("message").unwrap_or(Value::Null))
+    match normalized.as_str() {
+        "getmessage" => Ok(object
+            .get_property("message")
+            .unwrap_or_else(|| Value::string(Vec::new()))),
+        "getcode" => Ok(object.get_property("code").unwrap_or(Value::Int(0))),
+        "getline" => Ok(object.get_property("line").unwrap_or(Value::Int(0))),
+        "getfile" => Ok(object
+            .get_property("file")
+            .unwrap_or_else(|| Value::string(Vec::new()))),
+        "getprevious" => Ok(object.get_property("previous").unwrap_or(Value::Null)),
+        // Trace capture is not modeled yet; top-level throws render `#0 {main}`.
+        "gettraceasstring" => Ok(Value::string(b"#0 {main}".to_vec())),
+        "gettrace" => Ok(Value::Array(PhpArray::new())),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {}::{method} is not declared",
+            object.class_name()
+        )),
+    }
 }
 
 fn handle_throw(
@@ -15344,30 +15387,46 @@ fn catch_matches(
 }
 
 fn uncaught_exception(
-    output: &OutputBuffer,
+    output: &mut OutputBuffer,
     compiled: &CompiledUnit,
     stack: &CallStack,
     value: Value,
 ) -> VmResult {
-    let message = match &value {
-        Value::Object(object) => object
-            .get_property("message")
-            .and_then(|value| to_string(&value).ok())
-            .map(|value| value.to_string_lossy())
-            .unwrap_or_default(),
-        other => format!("uncaught {}", value_type_name(other)),
+    let class_name = throwable_class_name(&value);
+    let (message, file, line) = match &value {
+        Value::Object(object) => {
+            let message = object
+                .get_property("message")
+                .and_then(|value| to_string(&value).ok())
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default();
+            let file = object
+                .get_property("file")
+                .and_then(|value| to_string(&value).ok())
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default();
+            let line = match object.get_property("line") {
+                Some(Value::Int(line)) => line,
+                _ => 0,
+            };
+            (message, file, line)
+        }
+        other => (
+            format!("uncaught {}", value_type_name(other)),
+            String::new(),
+            0,
+        ),
     };
-    let full = if message.is_empty() {
-        format!(
-            "E_PHP_VM_UNCAUGHT_EXCEPTION: Uncaught {}",
-            throwable_class_name(&value)
-        )
+    let heading = if message.is_empty() {
+        format!("Uncaught {class_name}")
     } else {
-        format!(
-            "E_PHP_VM_UNCAUGHT_EXCEPTION: Uncaught {}: {message}",
-            throwable_class_name(&value)
-        )
+        format!("Uncaught {class_name}: {message}")
     };
+    // PHP renders an uncaught throwable as a fatal error on the output stream.
+    output.write_test_str(&format!(
+        "\nFatal error: {heading} in {file}:{line}\nStack trace:\n#0 {{main}}\n  thrown in {file} on line {line}\n"
+    ));
+    let full = format!("E_PHP_VM_UNCAUGHT_EXCEPTION: {heading}");
     VmResult::runtime_error_with_diagnostic(
         output.clone(),
         full.clone(),
@@ -15820,12 +15879,18 @@ fn reflection_span_line(
     span: php_ir::source_map::IrSpan,
     end: bool,
 ) -> Value {
-    let Some(file) = compiled.unit().files.get(span.file.index()) else {
-        return Value::Bool(false);
-    };
-    let Ok(source) = std::fs::read_to_string(&file.path) else {
-        return Value::Bool(false);
-    };
+    source_span_display_line(compiled, span, end)
+        .map(Value::Int)
+        .unwrap_or(Value::Bool(false))
+}
+
+fn source_span_display_line(
+    compiled: &CompiledUnit,
+    span: php_ir::source_map::IrSpan,
+    end: bool,
+) -> Option<i64> {
+    let file = compiled.unit().files.get(span.file.index())?;
+    let source = std::fs::read_to_string(&file.path).ok()?;
     let offset = if end { span.end } else { span.start } as usize;
     let offset = offset.min(source.len());
     let line = source.as_bytes()[..offset]
@@ -15833,7 +15898,7 @@ fn reflection_span_line(
         .filter(|byte| **byte == b'\n')
         .count()
         + 1;
-    Value::Int(line as i64)
+    Some(line as i64)
 }
 
 fn reflection_bool_property(object: &ObjectRef, property: &str) -> Value {
@@ -25346,7 +25411,12 @@ mod tests {
         );
 
         assert!(!throwing.status.is_success(), "{:?}", throwing.status);
-        assert_eq!(throwing.output.to_string_lossy(), "before|");
+        assert_uncaught_exception_output_prefix(
+            &throwing.output.to_string_lossy(),
+            "before|",
+            "Exception",
+            "boom",
+        );
     }
 
     #[test]
@@ -26074,7 +26144,12 @@ mod tests {
         );
 
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(result.output.as_bytes(), b"body|destruct|");
+        assert_uncaught_exception_output_prefix(
+            &result.output.to_string_lossy(),
+            "body|destruct|",
+            "Exception",
+            "boom",
+        );
         assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
     }
 
@@ -30093,7 +30168,18 @@ echo perf_jit_unstable_types_debug(4), "\n";
             assert_eq!(on.status.exit_status(), expected_status, "{source}");
             assert_eq!(on.status.message(), off.status.message(), "{source}");
             assert_eq!(on.output, off.output, "{source}");
-            assert_eq!(on.output.as_bytes(), expected_output, "{source}");
+            if expected_status == ExitStatus::RuntimeError
+                && expected_output.is_empty()
+                && on.output.as_bytes() != expected_output
+            {
+                let output = on.output.to_string_lossy();
+                assert!(
+                    output.contains("Fatal error: Uncaught "),
+                    "{source}: {output}"
+                );
+            } else {
+                assert_eq!(on.output.as_bytes(), expected_output, "{source}");
+            }
         }
     }
 
@@ -30383,7 +30469,12 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
 
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(result.output.as_bytes(), b"finally");
+        assert_uncaught_exception_output_prefix(
+            &result.output.to_string_lossy(),
+            "finally",
+            "Exception",
+            "boom",
+        );
         assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
     }
 
@@ -30394,7 +30485,12 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
 
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(result.output.as_bytes(), b"catch|");
+        assert_uncaught_exception_output_prefix(
+            &result.output.to_string_lossy(),
+            "catch|",
+            "Exception",
+            "boom",
+        );
         assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
     }
 
@@ -31798,6 +31894,23 @@ echo perf_jit_unstable_types_debug(4), "\n";
             ..options
         })
         .execute(lowering.unit)
+    }
+
+    fn assert_uncaught_exception_output_prefix(
+        output: &str,
+        prefix: &str,
+        class_name: &str,
+        message: &str,
+    ) {
+        assert!(output.starts_with(prefix), "{output}");
+        assert!(
+            output.contains(&format!(
+                "\nFatal error: Uncaught {class_name}: {message} in "
+            )),
+            "{output}"
+        );
+        assert!(output.contains("Stack trace:\n#0 {main}\n"), "{output}");
+        assert!(output.contains("  thrown in "), "{output}");
     }
 
     fn runtime_trace_events(trace: &[String]) -> Vec<String> {

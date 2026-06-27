@@ -59,9 +59,18 @@ where
         | ExitStatus::RuntimeError
         | ExitStatus::Fatal
         | ExitStatus::Unsupported => {
-            write_runtime_diagnostics(stderr, &input.source_path, &result.diagnostics)?;
-            writeln!(stderr, "{}: {}", input.source_path, result.status)
-                .map_err(|error| error.to_string())?;
+            // An uncaught exception has already been rendered to stdout as a PHP
+            // `Fatal error:`; emitting the internal diagnostic dump as well would
+            // duplicate it and pollute PHPT output comparison.
+            let rendered_uncaught = result
+                .diagnostics
+                .first()
+                .is_some_and(|diagnostic| diagnostic.id() == "E_PHP_VM_UNCAUGHT_EXCEPTION");
+            if !rendered_uncaught {
+                write_runtime_diagnostics(stderr, &input.source_path, &result.diagnostics)?;
+                writeln!(stderr, "{}: {}", input.source_path, result.status)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(EXIT_PHP_ERROR)
         }
     }
