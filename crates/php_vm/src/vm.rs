@@ -15229,23 +15229,34 @@ impl Vm {
         state: &mut ExecutionState,
         value: Value,
     ) -> VmResult {
-        let trace = state.pending_trace.take();
-        let Some(callback) = state.exception_handlers.last().cloned() else {
-            return uncaught_exception(output, compiled, stack, value, trace);
-        };
-        let result = self.call_callable(
-            compiled,
-            Value::Callable(callback),
-            vec![CallArgument::positional(value)],
-            output,
-            stack,
-            state,
-        );
-        if result.status.is_success() {
-            VmResult::success(output.clone(), None)
-        } else {
-            result
+        // A registered exception handler may itself throw; PHP routes that new
+        // exception to the handler active at that point (which the handler may
+        // have just re-registered). Loop so a throwing handler is followed by the
+        // current handler, capped to avoid runaway recursion.
+        let mut value = value;
+        for _ in 0..256 {
+            let trace = state.pending_trace.take();
+            let Some(callback) = state.exception_handlers.last().cloned() else {
+                return uncaught_exception(output, compiled, stack, value, trace);
+            };
+            let result = self.call_callable(
+                compiled,
+                Value::Callable(callback),
+                vec![CallArgument::positional(value)],
+                output,
+                stack,
+                state,
+            );
+            if result.status.is_success() {
+                return VmResult::success(output.clone(), None);
+            }
+            match state.pending_throw.take() {
+                Some(next) => value = next,
+                None => return result,
+            }
         }
+        let trace = state.pending_trace.take();
+        uncaught_exception(output, compiled, stack, value, trace)
     }
 }
 
