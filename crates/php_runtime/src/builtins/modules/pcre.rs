@@ -72,7 +72,12 @@ pub(in crate::builtins::modules) fn builtin_preg_match(
     };
     match compiled.captures(&subject_bytes[offset as usize..]) {
         Ok(Some(captures)) => {
-            let matches = pcre::captures_to_array(&captures, flags);
+            let matches = pcre::captures_to_array_with_names(
+                &captures,
+                compiled.capture_names(),
+                flags,
+                offset as usize,
+            );
             assign_reference_arg(args.get(2), matches);
             context.clear_preg_last_error();
             Ok(Value::Int(1))
@@ -120,7 +125,12 @@ pub(in crate::builtins::modules) fn builtin_preg_match_all(
     let mut all = Vec::new();
     for captures in compiled.captures_iter(&subject_bytes[offset as usize..]) {
         match captures {
-            Ok(captures) => all.push(pcre::captures_to_array(&captures, flags)),
+            Ok(captures) => all.push(pcre::captures_to_array_with_names(
+                &captures,
+                compiled.capture_names(),
+                flags,
+                offset as usize,
+            )),
             Err(error) => return preg_failure(context, error.into()),
         }
     }

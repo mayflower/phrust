@@ -1918,7 +1918,7 @@ pub(in crate::builtins::modules) fn compile_preg_pattern(
     match context.pcre_cache().compile(&pattern) {
         Ok(compiled) => Some(compiled),
         Err(error) => {
-            context.set_preg_last_error(error.code(), error.message().to_string());
+            context.set_preg_last_error(error.code(), pcre::preg_error_message(error.code()));
             None
         }
     }
@@ -1928,7 +1928,7 @@ pub(in crate::builtins::modules) fn preg_failure(
     context: &mut BuiltinContext<'_>,
     error: pcre::PcreFailure,
 ) -> BuiltinResult {
-    context.set_preg_last_error(error.code(), error.message().to_string());
+    context.set_preg_last_error(error.code(), pcre::preg_error_message(error.code()));
     Ok(Value::Bool(false))
 }
 
@@ -2083,7 +2083,12 @@ pub(in crate::builtins::modules) fn preg_replace_callback_bytes(
         output.extend_from_slice(&subject[last_end..full.start()]);
         let callback_result = (callback.function())(
             context,
-            vec![pcre::captures_to_array(&captures, 0)],
+            vec![pcre::captures_to_array_with_names(
+                &captures,
+                compiled.capture_names(),
+                0,
+                0,
+            )],
             span.clone(),
         )?;
         let callback_text = to_string(&callback_result)
@@ -7839,7 +7844,7 @@ mod tests {
         );
         assert_eq!(
             call_in_context(&mut context, "preg_last_error_msg", Vec::new()),
-            Value::string("No ending delimiter found")
+            Value::string("Internal error")
         );
     }
 

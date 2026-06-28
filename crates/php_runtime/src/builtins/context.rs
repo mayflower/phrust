@@ -118,8 +118,8 @@ pub struct BuiltinContext<'a> {
     filesystem: FilesystemCapabilities,
     resources: Option<&'a mut ResourceTable>,
     pcre_cache: PcreCache,
-    preg_last_error: i64,
-    preg_last_error_msg: String,
+    preg_last_error: pcre::PcreLastErrorState,
+    preg_last_error_state: Option<&'a mut pcre::PcreLastErrorState>,
     json_last_error: i64,
     json_last_error_msg: String,
     strtok_state: Option<&'a mut StrtokState>,
@@ -140,8 +140,8 @@ impl<'a> BuiltinContext<'a> {
             filesystem: FilesystemCapabilities::none(),
             resources: None,
             pcre_cache: PcreCache::default(),
-            preg_last_error: pcre::PREG_NO_ERROR,
-            preg_last_error_msg: pcre::preg_error_message(pcre::PREG_NO_ERROR).to_string(),
+            preg_last_error: pcre::PcreLastErrorState::default(),
+            preg_last_error_state: None,
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
@@ -167,8 +167,8 @@ impl<'a> BuiltinContext<'a> {
             filesystem,
             resources,
             pcre_cache: PcreCache::default(),
-            preg_last_error: pcre::PREG_NO_ERROR,
-            preg_last_error_msg: pcre::preg_error_message(pcre::PREG_NO_ERROR).to_string(),
+            preg_last_error: pcre::PcreLastErrorState::default(),
+            preg_last_error_state: None,
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
@@ -316,24 +316,35 @@ impl<'a> BuiltinContext<'a> {
         &mut self.pcre_cache
     }
 
+    /// Sets request-local `preg_last_error` state storage.
+    pub fn set_preg_last_error_state(&mut self, state: &'a mut pcre::PcreLastErrorState) {
+        self.preg_last_error_state = Some(state);
+    }
+
     /// Updates request-local PCRE last-error state.
     pub fn set_preg_last_error(&mut self, code: i64, message: impl Into<String>) {
-        self.preg_last_error = code;
-        self.preg_last_error_msg = message.into();
+        match self.preg_last_error_state.as_deref_mut() {
+            Some(state) => state.set(code, message),
+            None => self.preg_last_error.set(code, message),
+        }
     }
 
     /// Clears request-local PCRE last-error state.
     pub fn clear_preg_last_error(&mut self) {
-        self.set_preg_last_error(
-            pcre::PREG_NO_ERROR,
-            pcre::preg_error_message(pcre::PREG_NO_ERROR),
-        );
+        match self.preg_last_error_state.as_deref_mut() {
+            Some(state) => state.clear(),
+            None => self.preg_last_error.clear(),
+        }
     }
 
     /// Returns request-local PCRE last-error code and message.
     #[must_use]
     pub fn preg_last_error(&self) -> (i64, &str) {
-        (self.preg_last_error, &self.preg_last_error_msg)
+        let state = self
+            .preg_last_error_state
+            .as_deref()
+            .unwrap_or(&self.preg_last_error);
+        (state.code(), state.message())
     }
 
     /// Updates request-local JSON last-error state.

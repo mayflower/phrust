@@ -805,6 +805,7 @@ struct ExecutionState {
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
     strtok_state: php_runtime::StrtokState,
+    preg_last_error: php_runtime::pcre::PcreLastErrorState,
     json_last_error: i64,
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
@@ -13518,7 +13519,12 @@ impl Vm {
             let callback_result = self.invoke_array_callback(
                 compiled,
                 callback.clone(),
-                vec![php_runtime::pcre::captures_to_array(&captures, 0)],
+                vec![php_runtime::pcre::captures_to_array_with_names(
+                    &captures,
+                    pattern.capture_names(),
+                    0,
+                    0,
+                )],
                 output,
                 stack,
                 state,
@@ -28094,6 +28100,7 @@ fn execute_builtin_entry(
     context.set_include_path(include_path);
     context.set_ini_registry(state.ini.clone());
     context.set_diagnostic_display(diagnostic_display);
+    context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
     context.set_strtok_state(&mut state.strtok_state);
     let result = (entry.function())(&mut context, args, source_span.clone());
@@ -30273,6 +30280,7 @@ fn call_builtin_args_to_positional(
         }
         let bind_by_ref = (function == "str_replace" && index == 3)
             || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
+            || (function == "preg_replace" && index == 4)
             || (function == "preg_replace_callback" && index == 4)
             || (matches!(
                 function,
@@ -30414,7 +30422,7 @@ fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static 
     match (function, index) {
         ("str_replace", 3) => "count",
         ("preg_match" | "preg_match_all", 2) => "matches",
-        ("preg_replace_callback", 4) => "count",
+        ("preg_replace" | "preg_replace_callback", 4) => "count",
         (_, 0) => "array",
         _ => "arg",
     }
@@ -32537,6 +32545,28 @@ mod tests {
         assert_eq!(
             result.output.to_string_lossy(),
             "int(0)\nstring(8) \"No error\"\nNULL\nint(4)\nstring(12) \"Syntax error\"\narray(0) {\n}\nint(0)\nstring(8) \"No error\"\n"
+        );
+    }
+
+    #[test]
+    fn builtin_context_persists_preg_last_error_across_vm_builtin_calls() {
+        let result = execute_source(
+            "<?php
+            var_dump(preg_last_error());
+            var_dump(preg_last_error_msg());
+            var_dump(preg_match('/[/', 'x'));
+            var_dump(preg_last_error());
+            var_dump(preg_last_error_msg());
+            var_dump(preg_match('/x/', 'x'));
+            var_dump(preg_last_error());
+            var_dump(preg_last_error_msg());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "int(0)\nstring(8) \"No error\"\nbool(false)\nint(1)\nstring(14) \"Internal error\"\nint(1)\nint(0)\nstring(8) \"No error\"\n"
         );
     }
 

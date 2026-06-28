@@ -39,6 +39,53 @@ pub const PREG_SPLIT_OFFSET_CAPTURE: i64 = 4;
 /// Invert `preg_grep` result selection.
 pub const PREG_GREP_INVERT: i64 = 1;
 
+/// Request-local `preg_last_error` state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcreLastErrorState {
+    code: i64,
+    message: String,
+}
+
+impl Default for PcreLastErrorState {
+    fn default() -> Self {
+        Self::new(PREG_NO_ERROR, preg_error_message(PREG_NO_ERROR))
+    }
+}
+
+impl PcreLastErrorState {
+    /// Creates PCRE last-error state.
+    #[must_use]
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Updates the stored error code and message.
+    pub fn set(&mut self, code: i64, message: impl Into<String>) {
+        self.code = code;
+        self.message = message.into();
+    }
+
+    /// Clears the state to `PREG_NO_ERROR`.
+    pub fn clear(&mut self) {
+        self.set(PREG_NO_ERROR, preg_error_message(PREG_NO_ERROR));
+    }
+
+    /// Current PHP preg error code.
+    #[must_use]
+    pub const fn code(&self) -> i64 {
+        self.code
+    }
+
+    /// Current PHP preg error message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// Request-local compiled-pattern cache.
 #[derive(Default)]
 pub struct PcreCache {
@@ -88,6 +135,12 @@ impl CompiledPattern {
         self.regex
             .is_match(subject)
             .map_err(PcreFailure::from_pcre_error)
+    }
+
+    /// Capturing group names indexed by capture slot.
+    #[must_use]
+    pub fn capture_names(&self) -> &[Option<String>] {
+        self.regex.capture_names()
     }
 }
 
@@ -225,9 +278,26 @@ fn compile_regex(body: &str, modifiers: &str) -> Result<Regex, PcreFailure> {
 /// Convert one capture set to a PHP array.
 #[must_use]
 pub fn captures_to_array(captures: &Captures<'_>, flags: i64) -> Value {
+    captures_to_array_with_names(captures, &[], flags, 0)
+}
+
+/// Convert one capture set to a PHP array with named captures and an offset base.
+#[must_use]
+pub fn captures_to_array_with_names(
+    captures: &Captures<'_>,
+    capture_names: &[Option<String>],
+    flags: i64,
+    offset_base: usize,
+) -> Value {
     let mut array = PhpArray::new();
     for index in 0..captures.len() {
-        let value = capture_slot(captures, index, flags);
+        if let Some(Some(name)) = capture_names.get(index) {
+            array.insert(
+                ArrayKey::String(name.as_bytes().to_vec().into()),
+                capture_slot(captures, index, flags, offset_base),
+            );
+        }
+        let value = capture_slot(captures, index, flags, offset_base);
         array.insert(ArrayKey::Int(index as i64), value);
     }
     Value::Array(array)
@@ -235,17 +305,25 @@ pub fn captures_to_array(captures: &Captures<'_>, flags: i64) -> Value {
 
 /// Convert one capture slot to a PHP value.
 #[must_use]
-pub fn capture_slot(captures: &Captures<'_>, index: usize, flags: i64) -> Value {
+pub fn capture_slot(
+    captures: &Captures<'_>,
+    index: usize,
+    flags: i64,
+    offset_base: usize,
+) -> Value {
     match captures.get(index) {
         Some(value) if flags & PREG_OFFSET_CAPTURE != 0 => Value::packed_array(vec![
             Value::string(value.as_bytes().to_vec()),
-            Value::Int(value.start() as i64),
+            Value::Int((offset_base + value.start()) as i64),
         ]),
         Some(value) => Value::string(value.as_bytes().to_vec()),
-        None if flags & PREG_UNMATCHED_AS_NULL != 0 => Value::Null,
+        None if flags & PREG_OFFSET_CAPTURE != 0 && flags & PREG_UNMATCHED_AS_NULL != 0 => {
+            Value::packed_array(vec![Value::Null, Value::Int(-1)])
+        }
         None if flags & PREG_OFFSET_CAPTURE != 0 => {
             Value::packed_array(vec![Value::string(Vec::new()), Value::Int(-1)])
         }
+        None if flags & PREG_UNMATCHED_AS_NULL != 0 => Value::Null,
         None => Value::string(Vec::new()),
     }
 }
