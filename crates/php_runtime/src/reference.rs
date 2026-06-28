@@ -46,6 +46,7 @@ impl ReferenceCell {
     /// Creates a reference cell containing `value`.
     #[must_use]
     pub fn new(value: Value) -> Self {
+        crate::layout_stats::record_reference_cell_creation();
         Self {
             inner: Rc::new(RefCell::new(value)),
         }

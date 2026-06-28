@@ -1,0 +1,11 @@
+packed=4:10:36
+mixed=123
+empty=0
+keys=neg:numstr:str
+cow=2:3:2
+refs=7:2
+1,2,|3
+nested=2:3
+dto=3:ab
+ambiguous=270
+overflow=9.223372036854776E+18

@@ -63,7 +63,7 @@ CATEGORIES = (
     CategorySpec(
         "strings",
         "Strings",
-        ("string_concats",),
+        ("string_concats", "concat_prealloc_hits", "string_allocations"),
         "string concatenation allocation and conversion fast paths",
         "PHP scalar conversion and binary-safe string behavior must stay exact",
         "concat, scalar conversion, encoding-neutral, and error-order fixtures",
@@ -74,6 +74,9 @@ CATEGORIES = (
         (
             "output_bytes",
             "output_buffer_appends",
+            "output_buffer_batch_writes",
+            "output_batched_appends",
+            "output_batch_bytes",
             "output_buffer_flushes",
             "output_fast_appends",
         ),
@@ -96,6 +99,29 @@ CATEGORIES = (
         "include path resolution and autoload metadata caches",
         "include side effects, working directory, once semantics, and autoload order are observable",
         "include/require, include_once/require_once, path, and autoload fixtures",
+    ),
+    CategorySpec(
+        "runtime_allocation",
+        "Runtime Allocation",
+        (
+            "frame_allocations",
+            "frame_reuses",
+            "frames_allocated",
+            "frames_reused",
+            "register_files_allocated",
+            "register_files_reused",
+            "value_clones",
+            "string_allocations",
+            "array_handle_clones",
+            "cow_separations",
+            "reference_cell_creations",
+            "object_allocations",
+            "literal_intern_hits",
+            "literal_intern_misses",
+        ),
+        "runtime value, container, frame/register, and literal-pool allocation pressure",
+        "references, COW, destructor order, and request-local lifetime are observable",
+        "destructor, reference, COW, frame reuse, and literal interning fixtures",
     ),
 )
 

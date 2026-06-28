@@ -79,8 +79,11 @@ OUTPUT_COUNTERS = (
     "output_bytes",
     "output_buffer_appends",
     "output_buffer_batch_writes",
+    "output_batched_appends",
+    "output_batch_bytes",
     "output_buffer_flushes",
     "output_fast_appends",
+    "concat_prealloc_hits",
 )
 
 FRAME_REUSE_COUNTERS = (
@@ -90,6 +93,12 @@ FRAME_REUSE_COUNTERS = (
     "frames_reused",
     "register_files_allocated",
     "register_files_reused",
+    "value_clones",
+    "string_allocations",
+    "array_handle_clones",
+    "cow_separations",
+    "reference_cell_creations",
+    "object_allocations",
 )
 
 FRAMEWORK_COUNTER_COLUMNS = (
@@ -98,12 +107,17 @@ FRAMEWORK_COUNTER_COLUMNS = (
     "method_calls",
     "frames_allocated",
     "frames_reused",
+    "value_clones",
+    "string_allocations",
+    "cow_separations",
     "array_dim_fetches",
     "property_accesses",
     "internal_function_dispatches",
     "inline_cache_hits",
     "output_bytes",
     "output_fast_appends",
+    "output_batched_appends",
+    "concat_prealloc_hits",
 )
 
 
@@ -459,6 +473,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
                         "Method calls",
                         "Frames allocated",
                         "Frames reused",
+                        "Value clones",
+                        "String allocs",
+                        "COW separations",
                         "Array fetches",
                         "Property access",
                         "Builtin calls",

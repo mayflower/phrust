@@ -61,6 +61,7 @@ impl ObjectRef {
     /// Creates an object with an explicit source-spelled display class name.
     #[must_use]
     pub fn new_with_display_name(class: &ClassEntry, display_name: impl Into<String>) -> Self {
+        crate::layout_stats::record_object_allocation();
         let display_name = display_name.into();
         let property_entries = class
             .properties
@@ -136,6 +137,7 @@ impl ObjectRef {
     /// Creates a new object identity with a shallow copy of the property map.
     #[must_use]
     pub fn clone_shallow(&self) -> Self {
+        crate::layout_stats::record_object_allocation();
         let storage = self.storage.borrow();
         Self {
             id: next_object_id(),

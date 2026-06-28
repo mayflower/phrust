@@ -104,7 +104,10 @@ The shared protocol is applied to `ADD_INT_INT`, `CONCAT_STRING_STRING`,
 class-constant/static-property inline-cache families. The baseline path remains
 the only fallback implementation, so warnings, exceptions, magic methods,
 autoload side effects, and PHP-visible conversions are not duplicated by the
-fast path.
+fast path. `quickening-smoke` allows quickening guard failures only when they
+are exactly attributed to the packed-array `numeric_string_key` fallback reason;
+all such executions must still record matching guard misses and fallback calls
+without dequickening the request.
 
 ## Thresholds
 
@@ -183,24 +186,27 @@ and argument binding logic. It must fall back for autoload/eval/include changes,
 disabled functions, dynamic callables, changed defaults, by-reference errors,
 or any exception-producing binding path.
 
-The implemented Work item function-call IC is monomorphic and caches guarded
-`CallFunction` resolution for current-unit user functions, include-defined
-dynamic functions, VM-managed builtins, and registered internal builtins. Each
-slot is keyed by compiled unit, function, block, instruction, and IC kind. The
-guard checks the normalized function name, request-local lookup epoch, arity,
-named-argument sequence, by-reference argument shape, and builtin
-implementation id/version when the target is a VM/runtime builtin. A hit still
-tail-calls the same user-function or builtin execution path as the baseline
-resolver. Includes, eval attempts, and autoload registration changes
-conservatively bump the epoch; a stale slot records an invalidation and
-refreshes through generic resolution. Guard or metadata mismatches record a
-fallback and use the generic resolver.
+The implemented Work item function-call IC caches guarded `CallFunction`
+resolution for current-unit user functions, include-defined dynamic functions,
+VM-managed builtins, and registered internal builtins. Each slot is keyed by
+compiled unit, function, block, instruction, and IC kind. The guard checks the
+normalized function name, request-local lookup epoch, arity, named-argument
+sequence, by-reference argument shape, and builtin implementation id/version
+when the target is a VM/runtime builtin. Static direct calls are effectively
+monomorphic because their IR name is fixed. Dynamic string callables share the
+same function-call IC family and grow capped polymorphic entries before the call
+site switches to megamorphic fallback. A hit still tail-calls the same
+user-function or builtin execution path as the baseline resolver. Includes,
+eval attempts, and autoload registration changes conservatively bump the epoch;
+a stale slot records an invalidation and refreshes through generic resolution.
+Guard or metadata mismatches record a fallback and use the generic resolver.
 
 The initial builtin fast-stub set is deliberately small and runs only while
 `--inline-caches=on`: `strlen` for direct strings, `count` for direct arrays,
 and `is_int`, `is_string`, and `is_array` for direct non-reference values. Wrong
 arity, named-argument errors, by-reference paths, coercion-sensitive values, and
-unsupported builtin shapes fall back to the existing builtin registry path.
+unsupported builtin shapes fall back to the existing builtin registry path with
+per-builtin fallback-reason counters.
 
 ### `CALL_METHOD` Known Method
 
@@ -212,16 +218,25 @@ back for receiver class changes, scope changes, include/eval/autoload epoch
 changes, missing methods, magic `__call`, static-as-instance errors, and any
 path that would change PHP call semantics.
 
-The implemented Work item method-call IC is monomorphic and
-resolution-only. It caches successful concrete `CallMethod` resolution for
-current-unit classes and include-defined dynamic classes. Each slot is keyed by
-compiled unit, function, block, instruction, and IC kind. The guard checks the
-normalized method name, normalized receiver class, current visibility scope,
-and request-local lookup epoch before rehydrating the declaring class/method
-from the owning compiled unit. Cache hits still call `validate_method_callable`
-and then tail-call the same `execute_function` path as baseline dispatch.
-Magic `__call` is intentionally not cached as a concrete method target; missing
-or inaccessible methods continue through generic dispatch.
+The implemented method-call IC supports capped polymorphic receiver entries for
+successful concrete `CallMethod` resolution in current-unit classes and
+include-defined dynamic classes. Each slot is keyed by compiled unit, function,
+block, instruction, and IC kind. The guarded target records receiver class id,
+class/method epoch, declaring method slot, visibility context, static/final/private
+flags, override state, call shape, by-reference compatibility, and magic
+`__call` state. Cache hits still call `validate_method_callable` and then
+tail-call the same `execute_function` path as baseline dispatch. Magic `__call`
+is intentionally not cached as a concrete method target; missing or inaccessible
+methods continue through generic dispatch.
+
+FPE-08 also reports metadata-only tiny-inline candidates. It does not inline
+method bodies. The classifier currently accepts only final/private/final-class
+leaf methods that return a scalar constant or a direct `$this` property read and
+records stable rejection reasons for non-leaf, non-final/private, magic,
+static, generator, reference, variadic, named/unpacked, or unavailable-body
+paths. By-reference method parameters remain an existing frontend/runtime
+unsupported shape, so the executable smoke fixture covers named-argument method
+fallbacks and documents by-ref method fallback as a gap.
 
 ### `FETCH_PROP` Monomorphic Class Slot
 
@@ -254,8 +269,21 @@ typed-property state before returning a value. If any check fails, the hit
 declines back to generic dispatch and records `property_ic_fallback_reasons`.
 Dynamic properties, `__get` fallback, property hooks, protected properties, and
 first reads of uninitialized typed properties are intentionally not installed as
-property-cache targets. Property assignment ICs remain deferred until assignment
-semantics have the same focused fixture coverage.
+property-cache targets.
+
+FPE-07 adds the matching interpreter-only `AssignProperty` IC for safe declared
+backed writes. The cached target carries receiver class id, layout epoch,
+declared property slot, visibility context, typed-property metadata,
+readonly/init-only state, reference-slot state, hook/magic/dynamic flags, and
+the class/property mutation epoch. The guarded write revalidates every piece of
+metadata before mutating object storage and falls back for readonly properties,
+property hooks, magic `__set`, dynamic properties, typed validation failures,
+reference slots, inaccessible visibility, uninitialized-special cases, and
+destructor-sensitive generic behavior. Dense bytecode still treats property
+assignment as an unsupported/auto-fallback family until the rich interpreter
+write helper is reusable from dense execution. Object-property references are
+also rejected during lowering today, so `reference_slot` assignment exits are
+tracked in counters but not yet reachable from an executable PHP fixture.
 
 ### `FETCH_CLASS_CONST` And Static Property Metadata
 
@@ -290,8 +318,9 @@ Inline-cache families:
 | Cache kind | Baseline operation | Guarded dependency shape |
 | --- | --- | --- |
 | Function call IC | Function lookup plus argument binding. | Normalized function name, function table epoch, resolved function id or builtin descriptor, call shape, named/variadic/by-ref/default metadata. |
-| Method call IC | Receiver/class method lookup plus call binding. | Receiver class id, method table epoch, method slot, visibility scope, static/instance mode, call shape, magic-method absence unless represented. |
+| Method call IC | Receiver/class method lookup plus call binding. | Receiver class id, class/method epoch, method slot, visibility scope, static/final/private/override state, call shape, by-reference compatibility, magic-method state. |
 | Property fetch IC | Generic property read. | Receiver class id, property table epoch, property slot, visibility scope, initialized typed-property state, no dynamic-property, magic, or hook path. |
+| Property assignment IC | Generic property write. | Receiver class id, property table epoch, property slot, visibility scope, typed-property metadata, readonly/init-only state, no dynamic-property, magic, hook, reference, or inaccessible path. |
 | Class constant/static property IC | Class constant or static-property lookup. | Class table epoch, class-composition epoch, slot id, visibility scope, initialization/storage epoch. |
 | Include path IC | Include/require path resolution and once checks. | Include path epoch, working-directory epoch, stream-wrapper/capability epoch, canonical path, include-once set epoch. |
 | Autoload/class lookup IC | Class/interface/trait/enum lookup and autoload. | Normalized class-like name, class table epoch, autoload stack epoch, declaration epoch, stable positive or negative lookup result. |
@@ -383,6 +412,7 @@ only when counter collection is enabled. Current fields:
 | `inline_cache_function_slots` | Function-call IC slots allocated. |
 | `inline_cache_method_slots` | Method-call IC slots allocated. |
 | `inline_cache_property_slots` | Property-fetch IC slots allocated. |
+| `inline_cache_property_assign_slots` | Property-assignment IC slots allocated. |
 | `inline_cache_dim_slots` | Dimension-fetch IC slots allocated. |
 | `inline_cache_class_constant_static_property_slots` | Class-constant/static-property IC slots allocated. |
 | `inline_cache_include_path_slots` | Include-path IC slots allocated. |
@@ -400,14 +430,31 @@ only when counter collection is enabled. Current fields:
 | `builtin_call_ic_misses` | Function-call IC misses that resolve to a VM/runtime builtin through fallback. |
 | `builtin_fast_stub_hits` | Per-builtin hits for the small exact fast-stub set. |
 | `builtin_fast_stub_misses` | Per-builtin misses that fell back to the generic builtin path. |
+| `builtin_fast_stub_fallback_by_reason` | Per-builtin fallback reasons for exact fast stubs, keyed as `name.reason`. |
 | `call_ic_megamorphic_fallbacks` | Function-call IC sites that reached megamorphic fallback state. |
 | `method_ic_hits` | Method-call IC guard hits. |
 | `method_ic_misses` | Method-call IC misses, including cold slots and guard failures. |
+| `method_ic_polymorphic_hits` | Method-call IC hits served by capped polymorphic receiver entries. |
 | `method_ic_guard_failures` | Method-call IC misses caused by receiver, method, or scope guard failure. |
+| `method_direct_dispatch_hits` | Cached method targets dispatched through the existing VM method-call helper. |
+| `method_direct_dispatch_fallbacks` | Method-call IC fallback observations or guarded cached targets rejected before direct dispatch. |
+| `method_tiny_inline_candidates` | Metadata-only count of tiny-safe method bodies that could be considered by a future inliner. |
+| `method_tiny_inline_rejected_by_reason` | Stable rejection reason map for metadata-only tiny inlining classification. |
 | `property_ic_hits` | Property-fetch IC guard hits. |
 | `property_ic_misses` | Property-fetch IC misses, including cold slots and guard failures. |
 | `property_ic_guard_failures` | Property-fetch IC misses caused by receiver, property, or scope guard failure. |
 | `property_ic_fallback_reasons` | Per-reason slow-path exits when a cached property target fails layout/storage/visibility revalidation. |
+| `property_assign_ic_hits` | Property-assignment IC guard hits that completed a guarded declared-property write. |
+| `property_assign_ic_misses` | Property-assignment IC misses, including cold slots and guard failures. |
+| `property_assign_ic_guard_failures` | Property-assignment IC misses caused by receiver, property, scope, or write-policy guard failure. |
+| `property_assign_ic_shape_exits` | Property-assignment exits caused by receiver class, layout epoch, slot, storage-name, or metadata mismatch. |
+| `property_assign_ic_visibility_exits` | Property-assignment exits caused by visibility or setter-visibility mismatch. |
+| `property_assign_ic_type_exits` | Property-assignment exits caused by typed-property validation failure. |
+| `property_assign_ic_readonly_exits` | Property-assignment exits caused by readonly or already-initialized readonly state. |
+| `property_assign_ic_hook_magic_exits` | Property-assignment exits caused by property hooks or magic `__set`. |
+| `property_assign_ic_reference_exits` | Property-assignment exits caused by reference-bearing object storage. |
+| `property_assign_ic_dynamic_exits` | Property-assignment exits caused by dynamic-property fallback. |
+| `property_assign_ic_fallback_reasons` | Per-reason slow-path exits for guarded property-assignment writes. |
 | `class_static_ic_hits` | Class-constant/static-property IC guard hits. |
 | `class_static_ic_misses` | Class-constant/static-property IC misses, including cold slots and guard failures. |
 | `class_static_ic_guard_failures` | Class-constant/static-property IC misses caused by class, member, kind, or scope guard failure. |

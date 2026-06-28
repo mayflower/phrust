@@ -22,15 +22,15 @@ and advisory.
 
 | Scenario | Fixture | Instructions | Function calls | Method calls | Array fetches | Property access | Builtin calls | Output bytes | Output fast appends |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `attribute_reflection_warm` | `tests/fixtures/performance/framework_smoke/attribute_reflection_warm.php` | 102 | 0 | 12 | 6 | 0 | 0 | 114 | 18 |
-| `composer_autoload_lookup` | `tests/fixtures/performance/framework_smoke/composer_autoload_lookup.php` | 131 | 8 | 3 | 3 | 6 | 5 | 49 | 7 |
-| `di_container_lookup` | `tests/fixtures/performance/framework_smoke/di_container_lookup.php` | 97 | 4 | 8 | 0 | 5 | 4 | 52 | 8 |
-| `dto_hydration` | `tests/fixtures/performance/framework_smoke/dto_hydration.php` | 168 | 3 | 3 | 9 | 18 | 3 | 34 | 6 |
-| `json_api_response` | `tests/fixtures/performance/framework_smoke/json_api_response.php` | 84 | 2 | 0 | 0 | 0 | 2 | 107 | 2 |
-| `object_property_method_loop` | `tests/fixtures/performance/framework_smoke/object_property_method_loop.php` | 174 | 0 | 5 | 0 | 20 | 0 | 74 | 25 |
-| `packed_mixed_array_traversal` | `tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php` | 107 | 4 | 0 | 0 | 0 | 4 | 44 | 17 |
-| `router_dispatch` | `tests/fixtures/performance/framework_smoke/router_dispatch.php` | 41 | 3 | 0 | 0 | 0 | 3 | 17 | 6 |
-| `template_output` | `tests/fixtures/performance/framework_smoke/template_output.php` | 45 | 3 | 0 | 0 | 0 | 3 | 51 | 12 |
+| `attribute_reflection_warm` | `tests/fixtures/performance/framework_smoke/attribute_reflection_warm.php` | 102 | 0 | 12 | 6 | 0 | 0 | 114 | 9 |
+| `composer_autoload_lookup` | `tests/fixtures/performance/framework_smoke/composer_autoload_lookup.php` | 131 | 8 | 3 | 3 | 6 | 5 | 49 | 4 |
+| `di_container_lookup` | `tests/fixtures/performance/framework_smoke/di_container_lookup.php` | 97 | 4 | 8 | 0 | 5 | 4 | 52 | 4 |
+| `dto_hydration` | `tests/fixtures/performance/framework_smoke/dto_hydration.php` | 168 | 3 | 3 | 9 | 18 | 3 | 34 | 3 |
+| `json_api_response` | `tests/fixtures/performance/framework_smoke/json_api_response.php` | 84 | 2 | 0 | 0 | 0 | 2 | 107 | 1 |
+| `object_property_method_loop` | `tests/fixtures/performance/framework_smoke/object_property_method_loop.php` | 174 | 0 | 5 | 0 | 20 | 0 | 74 | 15 |
+| `packed_mixed_array_traversal` | `tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php` | 107 | 4 | 0 | 0 | 0 | 4 | 44 | 9 |
+| `router_dispatch` | `tests/fixtures/performance/framework_smoke/router_dispatch.php` | 41 | 3 | 0 | 0 | 0 | 3 | 17 | 3 |
+| `template_output` | `tests/fixtures/performance/framework_smoke/template_output.php` | 45 | 3 | 0 | 0 | 0 | 3 | 51 | 8 |
 
 ## Covered Workload Shapes
 

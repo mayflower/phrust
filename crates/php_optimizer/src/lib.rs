@@ -3,7 +3,7 @@
 //! The optimizer pass pipeline supports the first
 //! conservative optimization pass.
 
-use php_ir::instruction::TerminatorKind;
+use php_ir::instruction::{CompareOp, TerminatorKind};
 use php_ir::{
     BinaryOp, BlockId, ConstId, InstrId, InstructionKind, IrConstant, IrFunction, IrUnit, Operand,
     RegId, UnaryOp, VerificationError, verify_unit,
@@ -409,6 +409,7 @@ impl OptimizerPass for ConstantFoldingPass {
     fn run(&self, unit: &mut IrUnit, _context: &PassContext) -> Result<PassReport, PassError> {
         let before_files = unit.files.clone();
         let before_source_map = unit.source_map.clone();
+        let before = unit.clone();
         let mut constants = unit.constants.clone();
         let mut stats = ConstantFoldingStats::default();
 
@@ -436,6 +437,28 @@ impl OptimizerPass for ConstantFoldingPass {
                                     }
                                     None => stats.skipped_unsafe += 1,
                                 }
+                            } else {
+                                stats.skipped_non_literal += 1;
+                            }
+                            continue;
+                        }
+                        InstructionKind::Compare { dst, op, lhs, rhs } => {
+                            let dst = *dst;
+                            known_constants.remove(&dst);
+                            let lhs = resolve_constant(*lhs, &known_constants);
+                            let rhs = resolve_constant(*rhs, &known_constants);
+                            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                                match fold_compare(*op, lhs, rhs, &mut constants) {
+                                    Some((constant, kind)) => {
+                                        instruction.kind =
+                                            InstructionKind::LoadConst { dst, constant };
+                                        known_constants.insert(dst, constant);
+                                        stats.record(kind);
+                                    }
+                                    None => stats.skipped_unsafe += 1,
+                                }
+                            } else {
+                                stats.skipped_non_literal += 1;
                             }
                             continue;
                         }
@@ -452,6 +475,8 @@ impl OptimizerPass for ConstantFoldingPass {
                                     }
                                     None => stats.skipped_unsafe += 1,
                                 }
+                            } else {
+                                stats.skipped_non_literal += 1;
                             }
                             continue;
                         }
@@ -467,6 +492,15 @@ impl OptimizerPass for ConstantFoldingPass {
 
         unit.constants = constants;
         let total_folded = stats.total_folded();
+        if total_folded > 0
+            && let Err(errors) = verify_unit(unit)
+        {
+            *unit = before;
+            return Err(PassError::Verification {
+                phase: self.phase(),
+                errors,
+            });
+        }
         Ok(PassReport {
             name: self.name(),
             phase: self.phase(),
@@ -484,6 +518,7 @@ enum FoldKind {
     IntegerBinary,
     BoolNot,
     StringConcat,
+    LiteralCompare,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -491,6 +526,8 @@ struct ConstantFoldingStats {
     integer_binary_folded: u64,
     bool_not_folded: u64,
     string_concat_folded: u64,
+    literal_compare_folded: u64,
+    skipped_non_literal: u64,
     skipped_unsafe: u64,
 }
 
@@ -500,25 +537,34 @@ impl ConstantFoldingStats {
             FoldKind::IntegerBinary => self.integer_binary_folded += 1,
             FoldKind::BoolNot => self.bool_not_folded += 1,
             FoldKind::StringConcat => self.string_concat_folded += 1,
+            FoldKind::LiteralCompare => self.literal_compare_folded += 1,
         }
     }
 
     fn total_folded(&self) -> u64 {
-        self.integer_binary_folded + self.bool_not_folded + self.string_concat_folded
+        self.integer_binary_folded
+            + self.bool_not_folded
+            + self.string_concat_folded
+            + self.literal_compare_folded
     }
 
     fn into_report_stats(self) -> BTreeMap<&'static str, u64> {
         BTreeMap::from([
             ("bool_not_folded", self.bool_not_folded),
             ("integer_binary_folded", self.integer_binary_folded),
+            ("literal_compare_folded", self.literal_compare_folded),
+            ("skipped_non_literal", self.skipped_non_literal),
             ("skipped_unsafe", self.skipped_unsafe),
             ("string_concat_folded", self.string_concat_folded),
             (
                 "transformations_attempted",
-                self.total_folded() + self.skipped_unsafe,
+                self.total_folded() + self.skipped_unsafe + self.skipped_non_literal,
             ),
             ("transformations_applied", self.total_folded()),
-            ("transformations_skipped", self.skipped_unsafe),
+            (
+                "transformations_skipped",
+                self.skipped_unsafe + self.skipped_non_literal,
+            ),
             ("total_folded", self.total_folded()),
         ])
     }
@@ -575,6 +621,77 @@ fn fold_unary(
             let constant = append_constant(constants, IrConstant::Bool(!value))?;
             Some((constant, FoldKind::BoolNot))
         }
+        _ => None,
+    }
+}
+
+fn fold_compare(
+    op: CompareOp,
+    lhs: ConstId,
+    rhs: ConstId,
+    constants: &mut Vec<IrConstant>,
+) -> Option<(ConstId, FoldKind)> {
+    let lhs = constants.get(lhs.index())?;
+    let rhs = constants.get(rhs.index())?;
+    let folded = match op {
+        CompareOp::Identical => IrConstant::Bool(strict_literal_identity(lhs, rhs)?),
+        CompareOp::NotIdentical => IrConstant::Bool(!strict_literal_identity(lhs, rhs)?),
+        CompareOp::Equal => IrConstant::Bool(same_type_literal_equality(lhs, rhs)?),
+        CompareOp::NotEqual => IrConstant::Bool(!same_type_literal_equality(lhs, rhs)?),
+        CompareOp::Less => IrConstant::Bool(int_pair(lhs, rhs).map(|(lhs, rhs)| lhs < rhs)?),
+        CompareOp::LessEqual => IrConstant::Bool(int_pair(lhs, rhs).map(|(lhs, rhs)| lhs <= rhs)?),
+        CompareOp::Greater => IrConstant::Bool(int_pair(lhs, rhs).map(|(lhs, rhs)| lhs > rhs)?),
+        CompareOp::GreaterEqual => {
+            IrConstant::Bool(int_pair(lhs, rhs).map(|(lhs, rhs)| lhs >= rhs)?)
+        }
+        CompareOp::Spaceship => {
+            let (lhs, rhs) = int_pair(lhs, rhs)?;
+            IrConstant::Int(match lhs.cmp(&rhs) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        }
+    };
+    let constant = append_constant(constants, folded)?;
+    Some((constant, FoldKind::LiteralCompare))
+}
+
+fn strict_literal_identity(lhs: &IrConstant, rhs: &IrConstant) -> Option<bool> {
+    match (lhs, rhs) {
+        (IrConstant::Null, IrConstant::Null) => Some(true),
+        (IrConstant::Bool(lhs), IrConstant::Bool(rhs)) => Some(lhs == rhs),
+        (IrConstant::Int(lhs), IrConstant::Int(rhs)) => Some(lhs == rhs),
+        (IrConstant::String(lhs), IrConstant::String(rhs)) => Some(lhs == rhs),
+        (IrConstant::StringBytes(lhs), IrConstant::StringBytes(rhs)) => Some(lhs == rhs),
+        (lhs, rhs) if strict_identity_scalar(lhs) && strict_identity_scalar(rhs) => Some(false),
+        _ => None,
+    }
+}
+
+fn strict_identity_scalar(value: &IrConstant) -> bool {
+    matches!(
+        value,
+        IrConstant::Null
+            | IrConstant::Bool(_)
+            | IrConstant::Int(_)
+            | IrConstant::String(_)
+            | IrConstant::StringBytes(_)
+    )
+}
+
+fn same_type_literal_equality(lhs: &IrConstant, rhs: &IrConstant) -> Option<bool> {
+    match (lhs, rhs) {
+        (IrConstant::Null, IrConstant::Null) => Some(true),
+        (IrConstant::Bool(lhs), IrConstant::Bool(rhs)) => Some(lhs == rhs),
+        (IrConstant::Int(lhs), IrConstant::Int(rhs)) => Some(lhs == rhs),
+        _ => None,
+    }
+}
+
+fn int_pair(lhs: &IrConstant, rhs: &IrConstant) -> Option<(i64, i64)> {
+    match (lhs, rhs) {
+        (IrConstant::Int(lhs), IrConstant::Int(rhs)) => Some((*lhs, *rhs)),
         _ => None,
     }
 }
@@ -1929,8 +2046,8 @@ mod tests {
     };
     use php_ir::instruction::TerminatorKind;
     use php_ir::{
-        BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan, Operand, UnaryOp,
-        UnitId,
+        BinaryOp, CompareOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan,
+        Operand, UnaryOp, UnitId,
     };
 
     fn simple_unit() -> php_ir::IrUnit {
@@ -1976,6 +2093,7 @@ mod tests {
             IrSpan::new(file, 0, 5),
         );
         let block = builder.append_block(function);
+        let _register = builder.alloc_register(function);
         builder.emit(function, block, kind, IrSpan::new(file, 6, 12));
         builder.terminate_return(function, block, None, IrSpan::new(file, 13, 14));
         builder.set_entry(function);
@@ -2149,6 +2267,86 @@ mod tests {
             constant(&unit, 2),
             &IrConstant::String("php-vm".to_string())
         );
+    }
+
+    #[test]
+    fn folds_literal_compare_safe_subset() {
+        let mut unit = folding_unit(InstructionKind::Compare {
+            dst: php_ir::RegId::new(0),
+            op: CompareOp::Less,
+            lhs: Operand::Constant(php_ir::ConstId::new(0)),
+            rhs: Operand::Constant(php_ir::ConstId::new(1)),
+        });
+        unit.constants = vec![IrConstant::Int(3), IrConstant::Int(5)];
+
+        let report = ConstantFoldingPass
+            .run(&mut unit, &PassContext::new(OptimizationLevel::O1))
+            .expect("literal int comparison should fold");
+
+        assert!(report.changed);
+        assert_eq!(report.stats["literal_compare_folded"], 1);
+        assert_eq!(constant(&unit, 2), &IrConstant::Bool(true));
+        assert!(matches!(
+            unit.functions[0].blocks[0].instructions[0].kind,
+            InstructionKind::LoadConst {
+                constant,
+                ..
+            } if constant == php_ir::ConstId::new(2)
+        ));
+
+        let mut unit = folding_unit(InstructionKind::Compare {
+            dst: php_ir::RegId::new(0),
+            op: CompareOp::Spaceship,
+            lhs: Operand::Constant(php_ir::ConstId::new(0)),
+            rhs: Operand::Constant(php_ir::ConstId::new(1)),
+        });
+        unit.constants = vec![IrConstant::Int(3), IrConstant::Int(5)];
+
+        let report = ConstantFoldingPass
+            .run(&mut unit, &PassContext::new(OptimizationLevel::O1))
+            .expect("literal int spaceship should fold");
+
+        assert_eq!(report.stats["literal_compare_folded"], 1);
+        assert_eq!(constant(&unit, 2), &IrConstant::Int(-1));
+    }
+
+    #[test]
+    fn skips_compare_folds_that_can_hide_php_semantics() {
+        for (op, lhs, rhs) in [
+            (
+                CompareOp::Equal,
+                IrConstant::String("01".to_string()),
+                IrConstant::String("1".to_string()),
+            ),
+            (
+                CompareOp::Less,
+                IrConstant::String("2".to_string()),
+                IrConstant::Int(10),
+            ),
+            (
+                CompareOp::Spaceship,
+                IrConstant::Float(1.0),
+                IrConstant::Float(1.0),
+            ),
+        ] {
+            let mut unit = folding_unit(InstructionKind::Compare {
+                dst: php_ir::RegId::new(0),
+                op,
+                lhs: Operand::Constant(php_ir::ConstId::new(0)),
+                rhs: Operand::Constant(php_ir::ConstId::new(1)),
+            });
+            unit.constants = vec![lhs, rhs];
+            let before = unit.clone();
+
+            let report = ConstantFoldingPass
+                .run(&mut unit, &PassContext::new(OptimizationLevel::O1))
+                .expect("unsafe compare fold should be skipped");
+
+            assert_eq!(unit, before);
+            assert!(!report.changed);
+            assert_eq!(report.stats["literal_compare_folded"], 0);
+            assert_eq!(report.stats["skipped_unsafe"], 1);
+        }
     }
 
     #[test]

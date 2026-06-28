@@ -5,7 +5,7 @@
 //! surface available to JIT code until a later safety audit allows anything
 //! lower level.
 
-use crate::{PhpArray, Value};
+use crate::{PhpArray, PhpArrayElementSummary, PhpArrayKind, Value};
 
 /// Stable layout version for the performance read-only packed-array helper ABI.
 pub const PHP_JIT_ARRAY_LAYOUT_VERSION: u64 = 0x0007_0014_0000_0001;
@@ -114,15 +114,15 @@ fn validate_packed_int_array(value: &Value) -> Result<&PhpArray, PhpJitArrayAbiE
     let Value::Array(array) = value else {
         return Err(PhpJitArrayAbiError::NotArray);
     };
-    if !array.is_packed_fast() {
+    let metadata = array.packed_metadata();
+    if metadata.kind != PhpArrayKind::PackedList {
         return Err(PhpJitArrayAbiError::NotPacked);
     }
-    for (_, element) in array.iter() {
-        match element {
-            Value::Int(_) => {}
-            Value::Reference(_) => return Err(PhpJitArrayAbiError::AliasedOrReferenced),
-            _ => return Err(PhpJitArrayAbiError::NonIntElement),
-        }
+    if metadata.contains_references {
+        return Err(PhpJitArrayAbiError::AliasedOrReferenced);
+    }
+    if metadata.element_summary == PhpArrayElementSummary::Mixed {
+        return Err(PhpJitArrayAbiError::NonIntElement);
     }
     Ok(array)
 }

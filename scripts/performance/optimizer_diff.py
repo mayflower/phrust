@@ -150,6 +150,80 @@ def run_sample(engine: Path, fixture: str, level: str, out_dir: Path) -> Sample:
     )
 
 
+def compile_optimizer_report(
+    engine: Path,
+    fixture: str,
+    level: str,
+    out_dir: Path,
+) -> dict[str, Any] | None:
+    report_path = out_dir / "optimizer-reports" / f"{safe_name(fixture)}.opt{level}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            str(engine),
+            "compile",
+            "--json",
+            f"--opt-level={level}",
+            fixture,
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    payload: dict[str, Any]
+    if completed.returncode == 0:
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            payload = {
+                "ok": False,
+                "error": f"compile JSON parse failed: {error}",
+                "stderr": normalize(completed.stderr),
+            }
+    else:
+        payload = {
+            "ok": False,
+            "error": f"compile exited {completed.returncode}",
+            "stderr": normalize(completed.stderr),
+        }
+    report_path.write_text(pretty_json(payload), encoding="utf-8")
+    optimizer = payload.get("optimizer")
+    return optimizer if isinstance(optimizer, dict) else None
+
+
+def summarize_optimizer_reports(
+    reports: dict[str, dict[str, dict[str, Any] | None]],
+) -> dict[str, Any]:
+    by_pass: dict[str, dict[str, int]] = {}
+    changed: dict[str, int] = {}
+    reports_seen = 0
+    for levels in reports.values():
+        for report in levels.values():
+            if not report:
+                continue
+            reports_seen += 1
+            for pass_report in report.get("passes", []):
+                name = pass_report.get("name")
+                if not isinstance(name, str):
+                    continue
+                if pass_report.get("changed") is True:
+                    changed[name] = changed.get(name, 0) + 1
+                stats = pass_report.get("stats", {})
+                if not isinstance(stats, dict):
+                    continue
+                totals = by_pass.setdefault(name, {})
+                for key, value in stats.items():
+                    if isinstance(key, str) and isinstance(value, int):
+                        totals[key] = totals.get(key, 0) + value
+    return {
+        "reports_seen": reports_seen,
+        "changed_pass_fixture_counts": changed,
+        "stats_by_pass": by_pass,
+    }
+
+
 def pretty_json(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
@@ -283,8 +357,14 @@ def run_real(engine: Path, out_dir: Path) -> int:
 
     fixtures = fixture_paths()
     differences: list[Difference] = []
+    optimizer_reports: dict[str, dict[str, dict[str, Any] | None]] = {}
     for fixture in fixtures:
         samples = {level: run_sample(engine, fixture, level, out_dir) for level in LEVELS}
+        optimizer_reports[fixture] = {
+            level: compile_optimizer_report(engine, fixture, level, out_dir)
+            for level in LEVELS
+            if level != "0"
+        }
         baseline = samples["0"]
         for level in LEVELS[1:]:
             difference = compare_samples(baseline, samples[level], out_dir)
@@ -306,6 +386,10 @@ def run_real(engine: Path, out_dir: Path) -> int:
             }
             for difference in differences
         ],
+        "optimizer_evidence": {
+            "reports_dir": rel(out_dir / "optimizer-reports"),
+            "summary": summarize_optimizer_reports(optimizer_reports),
+        },
         "compared": [
             "stdout",
             "stderr.normalized",

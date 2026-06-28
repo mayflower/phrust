@@ -4,15 +4,24 @@ use std::fmt;
 use std::rc::Rc;
 
 /// PHP string bytes without an implicit UTF-8 invariant.
-#[derive(Clone, Default, Eq, Hash, PartialEq)]
+#[derive(Default, Eq, Hash, PartialEq)]
 pub struct PhpString {
     bytes: Rc<Vec<u8>>,
+}
+
+impl Clone for PhpString {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: Rc::clone(&self.bytes),
+        }
+    }
 }
 
 impl PhpString {
     /// Creates a PHP string from raw bytes.
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        crate::layout_stats::record_string_allocation();
         Self {
             bytes: Rc::new(bytes.into()),
         }
@@ -48,11 +57,17 @@ impl PhpString {
     /// underlying bytes. Mutation must call this boundary first so writes do
     /// not leak into by-value copies.
     pub fn separate_for_write(&mut self) {
+        if self.is_shared() {
+            crate::layout_stats::record_cow_separation();
+        }
         let _ = Rc::make_mut(&mut self.bytes);
     }
 
     /// Returns mutable bytes after applying copy-on-write separation.
     pub fn bytes_mut(&mut self) -> &mut Vec<u8> {
+        if self.is_shared() {
+            crate::layout_stats::record_cow_separation();
+        }
         Rc::make_mut(&mut self.bytes)
     }
 

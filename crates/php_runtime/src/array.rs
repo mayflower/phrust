@@ -77,14 +77,58 @@ pub enum PhpArrayKind {
     MixedHash,
 }
 
+/// Cheap direct-element summary for guarded array fast paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayElementSummary {
+    /// The array has no elements.
+    Empty,
+    /// Every direct element is an integer value.
+    AllInt,
+    /// At least one direct element is not an integer.
+    Mixed,
+}
+
+/// Cheap key-shape summary for guarded array fast paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayKeyKindSummary {
+    /// The array has no keys.
+    Empty,
+    /// Integer keys are exactly `0..len` in insertion order.
+    SequentialInt,
+    /// All keys are integers, but not a packed sequential list.
+    IntOnly,
+    /// All keys are strings.
+    StringOnly,
+    /// Both integer and string keys are present.
+    Mixed,
+}
+
 /// Guard metadata for packed-array fast paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhpArrayPackedMetadata {
     pub kind: PhpArrayKind,
+    pub element_summary: PhpArrayElementSummary,
     pub is_shared: bool,
     pub contains_references: bool,
     pub mutation_epoch: u64,
     pub packed_len: Option<usize>,
+    pub key_kind_summary: PhpArrayKeyKindSummary,
+    pub numeric_string_key_ambiguity: bool,
+}
+
+/// Conservative packed-int reduction guard failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayPackedIntReductionError {
+    /// The array is mixed or has a hole.
+    NotPacked,
+    /// The array is shared through copy-on-write storage.
+    Shared,
+    /// The array contains direct reference cells.
+    ContainsReferences,
+    /// At least one element is not an integer.
+    NonIntElement,
+    /// Integer addition overflowed.
+    Overflow,
 }
 
 /// One ordered array slot.
@@ -151,7 +195,7 @@ impl Eq for ArrayStorage {}
 /// `separate_for_write` through `storage_mut`, so by-value assignment shares
 /// until the first write while true PHP references still write through their
 /// owning slot/reference cell.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PhpArray {
     storage: Rc<ArrayStorage>,
 }
@@ -159,6 +203,15 @@ pub struct PhpArray {
 impl Default for PhpArray {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clone for PhpArray {
+    fn clone(&self) -> Self {
+        crate::layout_stats::record_array_handle_clone();
+        Self {
+            storage: Rc::clone(&self.storage),
+        }
     }
 }
 
@@ -201,11 +254,24 @@ impl PhpArray {
     /// Creates a packed array with integer keys starting at zero.
     #[must_use]
     pub fn from_packed(elements: Vec<Value>) -> Self {
-        let mut array = Self::new();
-        for value in elements {
-            array.append(value);
+        let len = elements.len();
+        let entries = elements
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| ArrayEntry {
+                key: ArrayKey::Int(index as i64),
+                value,
+            })
+            .collect::<Vec<_>>();
+        Self {
+            storage: Rc::new(ArrayStorage {
+                entries,
+                next_append_key: (len > 0).then(|| i64::try_from(len).ok()).flatten(),
+                packed_len: Some(len),
+                internal_pointer: (len > 0).then_some(0),
+                mutation_epoch: len as u64,
+            }),
         }
-        array
     }
 
     /// Number of entries.
@@ -258,6 +324,63 @@ impl PhpArray {
             .any(|entry| matches!(entry.value, Value::Reference(_)))
     }
 
+    /// Returns a cheap direct-element summary.
+    #[must_use]
+    pub fn element_summary_fast(&self) -> PhpArrayElementSummary {
+        if self.storage.entries.is_empty() {
+            return PhpArrayElementSummary::Empty;
+        }
+        if self
+            .storage
+            .entries
+            .iter()
+            .all(|entry| matches!(entry.value, Value::Int(_)))
+        {
+            PhpArrayElementSummary::AllInt
+        } else {
+            PhpArrayElementSummary::Mixed
+        }
+    }
+
+    /// Returns a cheap key-shape summary.
+    #[must_use]
+    pub fn key_kind_summary_fast(&self) -> PhpArrayKeyKindSummary {
+        if self.storage.entries.is_empty() {
+            return PhpArrayKeyKindSummary::Empty;
+        }
+        if self.is_packed_fast() {
+            return PhpArrayKeyKindSummary::SequentialInt;
+        }
+        let has_int = self
+            .storage
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.key, ArrayKey::Int(_)));
+        let has_string = self
+            .storage
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.key, ArrayKey::String(_)));
+        match (has_int, has_string) {
+            (true, false) => PhpArrayKeyKindSummary::IntOnly,
+            (false, true) => PhpArrayKeyKindSummary::StringOnly,
+            (true, true) => PhpArrayKeyKindSummary::Mixed,
+            (false, false) => PhpArrayKeyKindSummary::Empty,
+        }
+    }
+
+    /// Returns true when string keys look numeric but intentionally remain
+    /// strings under PHP key-normalization rules.
+    #[must_use]
+    pub fn has_numeric_string_key_ambiguity_fast(&self) -> bool {
+        self.storage.entries.iter().any(|entry| {
+            matches!(
+                &entry.key,
+                ArrayKey::String(key) if numeric_string_key_has_coercion_risk(key)
+            )
+        })
+    }
+
     /// Returns the current structural/content mutation epoch.
     #[must_use]
     pub fn mutation_epoch(&self) -> u64 {
@@ -269,11 +392,46 @@ impl PhpArray {
     pub fn packed_metadata(&self) -> PhpArrayPackedMetadata {
         PhpArrayPackedMetadata {
             kind: self.kind_fast(),
+            element_summary: self.element_summary_fast(),
             is_shared: self.is_shared(),
             contains_references: self.contains_references_fast(),
             mutation_epoch: self.mutation_epoch(),
             packed_len: self.packed_len_fast(),
+            key_kind_summary: self.key_kind_summary_fast(),
+            numeric_string_key_ambiguity: self.has_numeric_string_key_ambiguity_fast(),
         }
+    }
+
+    /// Sums a packed all-int array only when COW/reference/overflow guards pass.
+    pub fn packed_int_sum_fast(&self) -> Result<i64, PhpArrayPackedIntReductionError> {
+        let metadata = self.packed_metadata();
+        if metadata.kind != PhpArrayKind::PackedList {
+            return Err(PhpArrayPackedIntReductionError::NotPacked);
+        }
+        if metadata.is_shared {
+            return Err(PhpArrayPackedIntReductionError::Shared);
+        }
+        if metadata.contains_references {
+            return Err(PhpArrayPackedIntReductionError::ContainsReferences);
+        }
+        match metadata.element_summary {
+            PhpArrayElementSummary::Empty => return Ok(0),
+            PhpArrayElementSummary::AllInt => {}
+            PhpArrayElementSummary::Mixed => {
+                return Err(PhpArrayPackedIntReductionError::NonIntElement);
+            }
+        }
+
+        let mut sum = 0i64;
+        for (_, value) in self.iter() {
+            let Value::Int(value) = value else {
+                return Err(PhpArrayPackedIntReductionError::NonIntElement);
+            };
+            sum = sum
+                .checked_add(*value)
+                .ok_or(PhpArrayPackedIntReductionError::Overflow)?;
+        }
+        Ok(sum)
     }
 
     /// Returns a process-local storage identity for GC debug snapshots.
@@ -523,6 +681,9 @@ impl PhpArray {
     }
 
     fn storage_mut(&mut self) -> &mut ArrayStorage {
+        if self.is_shared() {
+            crate::layout_stats::record_cow_separation();
+        }
         Rc::make_mut(&mut self.storage)
     }
 }
@@ -579,9 +740,20 @@ fn normalize_string_key(value: &PhpString) -> Option<i64> {
     Some(value)
 }
 
+fn numeric_string_key_has_coercion_risk(value: &PhpString) -> bool {
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    first.is_ascii_digit() || matches!(first, b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ArrayKey, PhpArray, PhpArrayKind};
+    use super::{
+        ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
+        PhpArrayPackedIntReductionError,
+    };
     use crate::{PhpString, Value};
 
     #[test]
@@ -612,6 +784,21 @@ mod tests {
         assert_eq!(array.append(Value::Int(3)), ArrayKey::Int(8));
         array.insert(ArrayKey::Int(4), Value::Int(4));
         assert_eq!(array.append(Value::Int(5)), ArrayKey::Int(9));
+    }
+
+    #[test]
+    fn from_packed_builds_exact_packed_shape() {
+        assert_eq!(PhpArray::from_packed(Vec::new()), PhpArray::new());
+
+        let mut array = PhpArray::from_packed(vec![Value::Int(10), Value::Int(20)]);
+
+        assert_eq!(array.len(), 2);
+        assert_eq!(array.kind_fast(), PhpArrayKind::PackedList);
+        assert_eq!(array.packed_len_fast(), Some(2));
+        assert_eq!(array.pointer_key(), Some(ArrayKey::Int(0)));
+        assert_eq!(array.append(Value::Int(30)), ArrayKey::Int(2));
+        assert_eq!(array.packed_len_fast(), Some(3));
+        assert_eq!(array.get(&ArrayKey::Int(2)), Some(&Value::Int(30)));
     }
 
     #[test]
@@ -831,7 +1018,13 @@ mod tests {
         let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
         let metadata = array.packed_metadata();
         assert_eq!(metadata.kind, PhpArrayKind::PackedList);
+        assert_eq!(metadata.element_summary, PhpArrayElementSummary::AllInt);
+        assert_eq!(
+            metadata.key_kind_summary,
+            PhpArrayKeyKindSummary::SequentialInt
+        );
         assert_eq!(metadata.packed_len, Some(2));
+        assert!(!metadata.numeric_string_key_ambiguity);
         assert!(!metadata.is_shared);
         assert!(!metadata.contains_references);
         assert_eq!(metadata.mutation_epoch, 2);
@@ -844,6 +1037,7 @@ mod tests {
         array.append(Value::Reference(cell));
         let metadata = array.packed_metadata();
         assert_eq!(metadata.kind, PhpArrayKind::PackedList);
+        assert_eq!(metadata.element_summary, PhpArrayElementSummary::Mixed);
         assert!(metadata.contains_references);
         assert_eq!(metadata.packed_len, Some(3));
         assert_eq!(metadata.mutation_epoch, 3);
@@ -851,8 +1045,73 @@ mod tests {
         array.insert(ArrayKey::String(PhpString::from("x")), Value::Int(4));
         let metadata = array.packed_metadata();
         assert_eq!(metadata.kind, PhpArrayKind::MixedHash);
+        assert_eq!(metadata.key_kind_summary, PhpArrayKeyKindSummary::Mixed);
         assert_eq!(metadata.packed_len, None);
         assert_eq!(metadata.mutation_epoch, 4);
+    }
+
+    #[test]
+    fn array_metadata_reports_key_kinds_and_numeric_string_ambiguity() {
+        let empty = PhpArray::new();
+        let metadata = empty.packed_metadata();
+        assert_eq!(metadata.element_summary, PhpArrayElementSummary::Empty);
+        assert_eq!(metadata.key_kind_summary, PhpArrayKeyKindSummary::Empty);
+
+        let mut int_only = PhpArray::new();
+        int_only.insert(ArrayKey::Int(2), Value::Int(1));
+        int_only.insert(ArrayKey::Int(4), Value::Int(2));
+        assert_eq!(
+            int_only.packed_metadata().key_kind_summary,
+            PhpArrayKeyKindSummary::IntOnly
+        );
+
+        let mut string_only = PhpArray::new();
+        string_only.insert(ArrayKey::String(PhpString::from("01")), Value::Int(1));
+        string_only.insert(ArrayKey::String(PhpString::from("name")), Value::Int(2));
+        let metadata = string_only.packed_metadata();
+        assert_eq!(
+            metadata.key_kind_summary,
+            PhpArrayKeyKindSummary::StringOnly
+        );
+        assert!(metadata.numeric_string_key_ambiguity);
+    }
+
+    #[test]
+    fn packed_int_sum_fast_is_guarded_by_layout_aliasing_type_and_overflow() {
+        assert_eq!(
+            PhpArray::from_packed(vec![Value::Int(4), Value::Int(8)]).packed_int_sum_fast(),
+            Ok(12)
+        );
+        assert_eq!(PhpArray::new().packed_int_sum_fast(), Ok(0));
+
+        let mut mixed_layout = PhpArray::from_packed(vec![Value::Int(1)]);
+        mixed_layout.insert(ArrayKey::String(PhpString::from("x")), Value::Int(2));
+        assert_eq!(
+            mixed_layout.packed_int_sum_fast(),
+            Err(PhpArrayPackedIntReductionError::NotPacked)
+        );
+
+        let shared = PhpArray::from_packed(vec![Value::Int(1)]);
+        let shared_copy = shared.clone();
+        assert_eq!(
+            shared.packed_int_sum_fast(),
+            Err(PhpArrayPackedIntReductionError::Shared)
+        );
+        drop(shared_copy);
+
+        let reference = crate::ReferenceCell::new(Value::Int(1));
+        assert_eq!(
+            PhpArray::from_packed(vec![Value::Reference(reference)]).packed_int_sum_fast(),
+            Err(PhpArrayPackedIntReductionError::ContainsReferences)
+        );
+        assert_eq!(
+            PhpArray::from_packed(vec![Value::Int(1), Value::string("2")]).packed_int_sum_fast(),
+            Err(PhpArrayPackedIntReductionError::NonIntElement)
+        );
+        assert_eq!(
+            PhpArray::from_packed(vec![Value::Int(i64::MAX), Value::Int(1)]).packed_int_sum_fast(),
+            Err(PhpArrayPackedIntReductionError::Overflow)
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ required_fields = [
     "inline_cache_function_slots",
     "inline_cache_method_slots",
     "inline_cache_property_slots",
+    "inline_cache_property_assign_slots",
     "inline_cache_dim_slots",
     "inline_cache_hits",
     "inline_cache_misses",
@@ -84,11 +85,27 @@ required_fields = [
     "inline_cache_disabled",
     "method_ic_hits",
     "method_ic_misses",
+    "method_ic_polymorphic_hits",
     "method_ic_guard_failures",
+    "method_direct_dispatch_hits",
+    "method_direct_dispatch_fallbacks",
+    "method_tiny_inline_candidates",
+    "method_tiny_inline_rejected_by_reason",
     "property_ic_hits",
     "property_ic_misses",
     "property_ic_guard_failures",
     "property_ic_fallback_reasons",
+    "property_assign_ic_hits",
+    "property_assign_ic_misses",
+    "property_assign_ic_guard_failures",
+    "property_assign_ic_shape_exits",
+    "property_assign_ic_visibility_exits",
+    "property_assign_ic_type_exits",
+    "property_assign_ic_readonly_exits",
+    "property_assign_ic_hook_magic_exits",
+    "property_assign_ic_reference_exits",
+    "property_assign_ic_dynamic_exits",
+    "property_assign_ic_fallback_reasons",
     "class_static_ic_hits",
     "class_static_ic_misses",
     "class_static_ic_guard_failures",
@@ -106,6 +123,7 @@ required_fields = [
     "builtin_call_ic_misses",
     "builtin_fast_stub_hits",
     "builtin_fast_stub_misses",
+    "builtin_fast_stub_fallback_by_reason",
     "call_ic_megamorphic_fallbacks",
 ]
 for sample in off + on:
@@ -135,6 +153,7 @@ on_observations = total(on, "inline_cache_observations")
 on_function_slots = total(on, "inline_cache_function_slots")
 on_method_slots = total(on, "inline_cache_method_slots")
 on_property_slots = total(on, "inline_cache_property_slots")
+on_property_assign_slots = total(on, "inline_cache_property_assign_slots")
 on_dim_slots = total(on, "inline_cache_dim_slots")
 on_hits = total(on, "inline_cache_hits")
 on_misses = total(on, "inline_cache_misses")
@@ -145,10 +164,21 @@ on_megamorphic = total(on, "inline_cache_megamorphic")
 on_disabled = total(on, "inline_cache_disabled")
 on_method_hits = total(on, "method_ic_hits")
 on_method_misses = total(on, "method_ic_misses")
+on_method_polymorphic_hits = total(on, "method_ic_polymorphic_hits")
 on_method_guard_failures = total(on, "method_ic_guard_failures")
+on_method_direct_dispatch_hits = total(on, "method_direct_dispatch_hits")
+on_method_direct_dispatch_fallbacks = total(on, "method_direct_dispatch_fallbacks")
+on_method_tiny_inline_candidates = total(on, "method_tiny_inline_candidates")
 on_property_hits = total(on, "property_ic_hits")
 on_property_misses = total(on, "property_ic_misses")
 on_property_guard_failures = total(on, "property_ic_guard_failures")
+on_property_assign_hits = total(on, "property_assign_ic_hits")
+on_property_assign_misses = total(on, "property_assign_ic_misses")
+on_property_assign_guard_failures = total(on, "property_assign_ic_guard_failures")
+on_property_assign_visibility_exits = total(on, "property_assign_ic_visibility_exits")
+on_property_assign_type_exits = total(on, "property_assign_ic_type_exits")
+on_property_assign_hook_magic_exits = total(on, "property_assign_ic_hook_magic_exits")
+on_property_assign_dynamic_exits = total(on, "property_assign_ic_dynamic_exits")
 on_class_static_hits = total(on, "class_static_ic_hits")
 on_class_static_misses = total(on, "class_static_ic_misses")
 on_class_static_guard_failures = total(on, "class_static_ic_guard_failures")
@@ -171,6 +201,10 @@ if off_function_call_hits or off_function_call_misses or off_builtin_call_hits o
 for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
     if total_map(off, "builtin_fast_stub_hits", builtin) or total_map(off, "builtin_fast_stub_misses", builtin):
         raise SystemExit(f"[fail] inline-caches=off recorded builtin fast-stub counters for {builtin}")
+if any(sample.get("builtin_fast_stub_fallback_by_reason", {}) for sample in off):
+    raise SystemExit("[fail] inline-caches=off recorded builtin fast-stub fallback reasons")
+if any(sample.get("property_assign_ic_fallback_reasons", {}) for sample in off):
+    raise SystemExit("[fail] inline-caches=off recorded property assignment fallback reasons")
 if on_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no slots")
 if on_observations < on_slots:
@@ -181,6 +215,8 @@ if on_method_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no method call slots")
 if on_property_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no property fetch slots")
+if on_property_assign_slots <= 0:
+    raise SystemExit("[fail] inline-caches=on recorded no property assignment slots")
 if on_dim_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no dim fetch slots")
 if on_hits <= 0:
@@ -200,14 +236,50 @@ for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
         raise SystemExit(f"[fail] builtin fast stub recorded no hits for {builtin}")
 if total_map(on, "builtin_fast_stub_misses", "strlen") <= 0:
     raise SystemExit("[fail] builtin fast stub recorded no strlen misses")
+if total_map(on, "builtin_fast_stub_fallback_by_reason", "strlen.type") <= 0:
+    raise SystemExit("[fail] builtin fast stub recorded no strlen type fallback reason")
 if on_method_hits <= 0:
     raise SystemExit("[fail] method-call inline cache recorded no hits")
 if on_method_misses <= 0:
     raise SystemExit("[fail] method-call inline cache recorded no misses")
+if on_method_polymorphic_hits <= 0:
+    raise SystemExit("[fail] method-call inline cache recorded no polymorphic hits")
+if on_method_guard_failures <= 0:
+    raise SystemExit("[fail] method-call inline cache recorded no guard failures")
+if on_method_direct_dispatch_hits <= 0:
+    raise SystemExit("[fail] method-call direct dispatch recorded no hits")
+if on_method_direct_dispatch_fallbacks <= 0:
+    raise SystemExit("[fail] method-call direct dispatch recorded no fallbacks")
+if on_method_tiny_inline_candidates <= 0:
+    raise SystemExit("[fail] method-call tiny-inline metadata recorded no candidates")
+for reason in ["not_final_or_private", "not_tiny_leaf_return"]:
+    if total_map(on, "method_tiny_inline_rejected_by_reason", reason) <= 0:
+        raise SystemExit(f"[fail] method-call tiny-inline metadata recorded no {reason} rejection")
 if on_property_hits <= 0:
     raise SystemExit("[fail] property-fetch inline cache recorded no hits")
 if on_property_misses <= 0:
     raise SystemExit("[fail] property-fetch inline cache recorded no misses")
+if on_property_assign_hits <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no hits")
+if on_property_assign_misses <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no misses")
+if on_property_assign_visibility_exits <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no visibility exits")
+if on_property_assign_type_exits <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no type exits")
+if on_property_assign_hook_magic_exits <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no hook/magic exits")
+if on_property_assign_dynamic_exits <= 0:
+    raise SystemExit("[fail] property-assignment inline cache recorded no dynamic exits")
+for reason in [
+    "dynamic_property_fallback",
+    "magic_set_metadata",
+    "property_hook_present",
+    "type_mismatch",
+    "visibility_mismatch",
+]:
+    if total_map(on, "property_assign_ic_fallback_reasons", reason) <= 0:
+        raise SystemExit(f"[fail] property-assignment IC recorded no {reason} fallback reason")
 if on_class_static_hits <= 0:
     raise SystemExit("[fail] class-constant/static-property inline cache recorded no hits")
 if on_class_static_misses <= 0:
@@ -224,14 +296,17 @@ if on_invalidations <= 0:
     raise SystemExit("[fail] inline-cache smoke recorded no IC invalidation")
 if on_property_guard_failures <= 0:
     raise SystemExit("[fail] property-fetch inline cache recorded no guard failures for shape fallback fixture")
-if on_guard_failures != on_property_guard_failures:
+expected_guard_failures = (
+    on_method_guard_failures
+    + on_property_guard_failures
+    + on_property_assign_guard_failures
+)
+if on_guard_failures != expected_guard_failures:
     raise SystemExit(
-        f"[fail] inline-cache guard failures {on_guard_failures} differ from expected property guard failures {on_property_guard_failures}"
+        f"[fail] inline-cache guard failures {on_guard_failures} differ from expected method/property-family guard failures {expected_guard_failures}"
     )
 if on_fallback_calls < on_misses:
     raise SystemExit(f"[fail] inline-cache fallback calls {on_fallback_calls} below misses {on_misses}")
-if on_method_guard_failures != 0:
-    raise SystemExit(f"[fail] method-call inline cache recorded unexpected guard failures: {on_method_guard_failures}")
 if on_class_static_guard_failures != 0:
     raise SystemExit(f"[fail] class-constant/static-property inline cache recorded unexpected guard failures: {on_class_static_guard_failures}")
 if on_include_path_guard_failures != 0:
@@ -240,8 +315,8 @@ if on_autoload_class_lookup_guard_failures != 0:
     raise SystemExit(f"[fail] autoload class lookup inline cache recorded unexpected guard failures: {on_autoload_class_lookup_guard_failures}")
 if on_disabled != 0:
     raise SystemExit(f"[fail] function-call inline cache recorded unexpected disabled transitions: {on_disabled}")
-if on_call_ic_megamorphic_fallbacks != 0:
-    raise SystemExit(f"[fail] function-call IC recorded unexpected megamorphic fallbacks: {on_call_ic_megamorphic_fallbacks}")
+if on_call_ic_megamorphic_fallbacks <= 0:
+    raise SystemExit("[fail] function-call IC recorded no megamorphic fallback for dynamic call fixture")
 PY
 
 printf '[pass] inline-cache smoke compared %s fixture(s)\n' "$fixture_count"

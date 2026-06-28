@@ -650,6 +650,9 @@ dependencies = [
 [[package]]
 name = "php_source"
 version = "0.0.0"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "php_std"

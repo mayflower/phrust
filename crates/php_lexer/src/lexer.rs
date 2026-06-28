@@ -4,6 +4,7 @@ use crate::strings::{StringScan, scan_constant_encapsed_string};
 use crate::{
     LexDiagnostic, LexDiagnosticKind, LexerMode, SymbolKind, TextRange, Token, TokenKind, TokenName,
 };
+use php_source::byte_kernel::{ascii_identifier_continue_chunk_len, find_any2, find_byte};
 
 /// Configuration for lexer behavior.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -151,7 +152,17 @@ impl<'src> Lexer<'src> {
         let start = self.cursor.position();
         let line = self.line;
         while !self.cursor.is_eof() && self.open_tag_at_cursor().is_none() {
-            self.consume_len(1);
+            let bytes = self.source.as_bytes();
+            let rest = &bytes[self.cursor.position()..];
+            let Some(relative) = find_byte(rest, b'<') else {
+                self.consume_len(rest.len());
+                break;
+            };
+            if relative == 0 {
+                self.consume_len(1);
+            } else {
+                self.consume_len(relative);
+            }
         }
 
         Some(Token::new(
@@ -444,10 +455,25 @@ impl<'src> Lexer<'src> {
     fn consume_line_comment(&mut self) -> Token {
         let start = self.cursor.position();
         let line = self.line;
-        while !self.cursor.is_eof()
-            && !self.cursor.starts_with(b"?>")
-            && !matches!(self.cursor.peek(), Some(b'\r' | b'\n'))
-        {
+        while !self.cursor.is_eof() {
+            let bytes = self.source.as_bytes();
+            let rest = &bytes[self.cursor.position()..];
+            let next_line_break = find_any2(rest, b'\r', b'\n');
+            let next_question = find_byte(rest, b'?');
+            let Some(relative) = nearest_found(next_line_break, next_question) else {
+                self.consume_len(rest.len());
+                break;
+            };
+
+            if relative > 0 {
+                self.consume_len(relative);
+                continue;
+            }
+
+            if self.cursor.starts_with(b"?>") || matches!(self.cursor.peek(), Some(b'\r' | b'\n')) {
+                break;
+            }
+
             self.consume_len(1);
         }
         Token::new(
@@ -468,6 +494,18 @@ impl<'src> Lexer<'src> {
 
         self.consume_len(2);
         while !self.cursor.is_eof() {
+            let bytes = self.source.as_bytes();
+            let rest = &bytes[self.cursor.position()..];
+            let Some(relative) = find_byte(rest, b'*') else {
+                self.consume_len(rest.len());
+                break;
+            };
+
+            if relative > 0 {
+                self.consume_len(relative);
+                continue;
+            }
+
             if self.cursor.starts_with(b"*/") {
                 self.consume_len(2);
                 return Token::new(kind, TextRange::new(start, self.cursor.position()), line);
@@ -821,8 +859,16 @@ impl<'src> Lexer<'src> {
         if self.cursor.peek().is_some_and(is_identifier_start) {
             self.consume_len(1);
         }
-        while self.cursor.peek().is_some_and(is_identifier_continue) {
-            self.consume_len(1);
+        while let Some(byte) = self.cursor.peek() {
+            let bytes = self.source.as_bytes();
+            let ascii_len = ascii_identifier_continue_chunk_len(&bytes[self.cursor.position()..]);
+            if ascii_len > 0 {
+                self.consume_len(ascii_len);
+            } else if byte >= 0x80 {
+                self.consume_len(1);
+            } else {
+                break;
+            }
         }
     }
 
@@ -1258,8 +1304,10 @@ impl<'src> Lexer<'src> {
         let start = self.cursor.position();
         let end = start.saturating_add(len).min(self.cursor.len());
         self.advance_line_for_range(start, end);
-        for _ in start..end {
+        if end - start == 1 {
             let _ = self.cursor.bump();
+        } else {
+            self.cursor.advance_by(end - start);
         }
     }
 
@@ -1267,6 +1315,11 @@ impl<'src> Lexer<'src> {
         let bytes = self.source.as_bytes();
         let mut index = start;
         while index < end {
+            let Some(relative) = find_any2(&bytes[index..end], b'\r', b'\n') else {
+                break;
+            };
+            index += relative;
+
             match bytes[index] {
                 b'\r' => {
                     self.line += 1;
@@ -1341,6 +1394,15 @@ fn is_binary_digit(byte: u8) -> bool {
 
 fn is_octal_digit(byte: u8) -> bool {
     matches!(byte, b'0'..=b'7')
+}
+
+fn nearest_found(first: Option<usize>, second: Option<usize>) -> Option<usize> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(first), None) => Some(first),
+        (None, Some(second)) => Some(second),
+        (None, None) => None,
+    }
 }
 
 fn integer_literal_overflows(bytes: &[u8]) -> bool {
@@ -1572,6 +1634,45 @@ mod tests {
             result.diagnostics[0].kind,
             LexDiagnosticKind::UnterminatedBlockComment
         );
+    }
+
+    #[test]
+    fn byte_kernel_scans_preserve_mixed_lexer_edges() {
+        let source = "<?php\r\n// c ?>\r\n<?php $x = 'a\\'b';\r\n$name = \"hi $x\";\r\n<<<'TXT'\r\nraw\r\nTXT;\r\n/* unterminated";
+        let result = lex_all(source, LexerConfig::default());
+
+        assert_eq!(result.tokens[0].kind, TokenKind::Named(TokenName::OpenTag));
+        assert_eq!(result.tokens[0].line, 1);
+        assert_eq!(result.tokens[1].kind, TokenKind::Named(TokenName::Comment));
+        assert_eq!(result.tokens[1].text(source), Some("// c "));
+        assert_eq!(result.tokens[2].kind, TokenKind::Named(TokenName::CloseTag));
+        assert_eq!(result.tokens[2].line, 2);
+
+        assert!(result.tokens.iter().any(|token| {
+            token.kind == TokenKind::Named(TokenName::Variable)
+                && token.text(source) == Some("$x")
+                && token.line == 3
+        }));
+        assert!(result.tokens.iter().any(|token| {
+            token.kind == TokenKind::Named(TokenName::ConstantEncapsedString)
+                && token.text(source) == Some("'a\\'b'")
+                && token.line == 3
+        }));
+        assert!(result.tokens.iter().any(|token| token.kind
+            == TokenKind::Named(TokenName::StartHeredoc)
+            && token.line == 5));
+        assert!(
+            result.tokens.iter().any(
+                |token| token.kind == TokenKind::Named(TokenName::EndHeredoc) && token.line == 7
+            )
+        );
+
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].kind,
+            LexDiagnosticKind::UnterminatedBlockComment
+        );
+        assert_eq!(result.diagnostics[0].line, 8);
     }
 
     #[test]

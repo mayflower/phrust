@@ -15,6 +15,18 @@ Generated artifacts:
 - `target/performance/acceleration/summary.md`
 - `target/performance/acceleration/runs/`
 
+The production-style fast preset audit is generated separately by:
+
+```bash
+nix develop -c just fast-preset-smoke
+```
+
+Generated artifacts:
+
+- `target/performance/fast-preset/summary.json`
+- `target/performance/fast-preset/summary.md`
+- `target/performance/fast-preset/runs/`
+
 Those files are local evidence only and must not be committed.
 
 ## Matrix Dimensions
@@ -33,6 +45,7 @@ records advisory timing or counters.
 | `quickening-on` | Enabled | Compares request-local quickening with fallback counters. |
 | `inline-caches-on` | Enabled | Compares guarded inline caches with fallback counters. |
 | `all-non-jit` | Enabled | Enables the non-native optimized interpreter stack without Cranelift. |
+| `fast-preset` | Enabled | Exercises the user-facing `--engine-preset=fast` shorthand for the proven non-native stack. |
 | `release-all-non-jit` | Optional | Runs when the release `php-vm` binary exists; otherwise records an explicit skip. |
 | `jit-cranelift` | Optional | Runs only when requested with `PHRUST_ACCEL_MATRIX_JIT=1` or `--include-jit` and the feature-enabled binary is available. |
 
@@ -65,6 +78,8 @@ The matrix is a correctness gate, not a speed gate.
 | Inline caches | Off unless explicitly requested | `--inline-caches=off|on` |
 | Optimizer | Explicit opt level | `--opt-level=0|1|2` |
 | Bytecode cache | Off unless explicitly requested | `--bytecode-cache=off|read|write|read-write` |
+| Fast preset | Explicit only | `--engine-preset=fast`; baseline remains the default |
+| Experimental JIT preset | Explicit and feature-gated | `--engine-preset=experimental-jit` |
 | Release profile | Measurement-only | `just release-benchmark-smoke` and optional matrix row |
 | Cranelift | Feature-gated and runtime-off | `jit-cranelift` feature plus explicit `--jit=cranelift` |
 | Baseline native tier | Research-only | No runtime switch |
@@ -130,6 +145,9 @@ committed full baseline.
 
 - Cranelift remains feature-gated and default-off; optional matrix rows skip
   unless explicitly requested.
+- `--engine-preset=fast` is available for intentional non-native acceleration,
+  but default-on promotion is deferred pending broader PHPT and production
+  workload coverage.
 - Callgrind smoke is Linux-only and skips on Darwin.
 - The safety audit miri smoke skipped locally because `cargo-miri` was present
   but not usable for the active toolchain.

@@ -57,6 +57,8 @@ if data.get("bytecode_unsupported_fallbacks") != 0:
     raise SystemExit(f"[error] {path}: expected no dense bytecode fallback")
 if data.get("superinstruction_deopt_or_fallbacks") != 0:
     raise SystemExit(f"[error] {path}: expected no superinstruction deopt/fallback")
+if data.get("superinstruction_deopt_or_fallback_by_reason") != {}:
+    raise SystemExit(f"[error] {path}: expected no superinstruction fallback reasons")
 PY
   summary_rows+=("$(json_escape "${fixture}")")
 done
@@ -69,10 +71,25 @@ total_candidates = 0
 total_emitted = 0
 total_executed = 0
 kinds = set()
+candidate_kinds = set()
+emitted_kinds = set()
+skipped_reasons = set()
 for path in sys.argv[1:]:
     data = json.loads(open(path, encoding="utf-8").read())
     total_candidates += data.get("superinstruction_candidates", 0)
     total_emitted += data.get("superinstructions_emitted", 0)
+    candidate_map = data.get("superinstruction_candidates_by_kind", {})
+    emitted_map = data.get("superinstructions_emitted_by_kind", {})
+    skipped_map = data.get("superinstruction_skipped_by_reason", {})
+    if not isinstance(candidate_map, dict):
+        raise SystemExit(f"[error] {path}: superinstruction_candidates_by_kind must be an object")
+    if not isinstance(emitted_map, dict):
+        raise SystemExit(f"[error] {path}: superinstructions_emitted_by_kind must be an object")
+    if not isinstance(skipped_map, dict):
+        raise SystemExit(f"[error] {path}: superinstruction_skipped_by_reason must be an object")
+    candidate_kinds.update(candidate_map)
+    emitted_kinds.update(emitted_map)
+    skipped_reasons.update(skipped_map)
     executed = data.get("superinstructions_executed", {})
     total_executed += sum(executed.values())
     kinds.update(executed)
@@ -86,6 +103,14 @@ required = {"load_const_echo", "load_local_echo", "binary_concat_echo"}
 missing = sorted(required - kinds)
 if missing:
     raise SystemExit(f"[error] missing executed superinstruction kinds: {', '.join(missing)}")
+missing_candidates = sorted(required - candidate_kinds)
+if missing_candidates:
+    raise SystemExit(f"[error] missing candidate superinstruction kinds: {', '.join(missing_candidates)}")
+missing_emitted = sorted(required - emitted_kinds)
+if missing_emitted:
+    raise SystemExit(f"[error] missing emitted superinstruction kinds: {', '.join(missing_emitted)}")
+if "unsupported_producer_echo_pair" not in skipped_reasons:
+    raise SystemExit("[error] expected unsupported producer+echo skip reason")
 print(f"{total_candidates} {total_emitted} {total_executed}")
 PY
 
@@ -105,5 +130,9 @@ summary="${OUT_DIR}/summary.json"
   printf ']\n'
   printf '}\n'
 } >"${summary}"
+
+scripts/performance/superinstruction_patterns.py \
+  --engine "${ENGINE}" \
+  --summary-doc docs/performance-superinstructions.md
 
 printf '[pass] superinstruction smoke compared %s fixture(s) and wrote %s\n' "${#fixtures[@]}" "${summary}"

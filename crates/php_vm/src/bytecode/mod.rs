@@ -468,19 +468,37 @@ pub struct DenseBytecodeUnit {
 pub struct SuperinstructionSelectionReport {
     /// Adjacent instruction pairs considered valid fusion candidates.
     pub candidates: u64,
+    /// Candidate pairs grouped by stable superinstruction spelling.
+    pub candidates_by_kind: BTreeMap<String, u64>,
     /// Superinstructions emitted into the dense instruction stream.
     pub emitted: u64,
     /// Emitted superinstructions grouped by stable opcode spelling.
     pub emitted_by_kind: BTreeMap<String, u64>,
+    /// Patterns intentionally left unfused, grouped by stable reason.
+    pub skipped_by_reason: BTreeMap<String, u64>,
 }
 
 impl SuperinstructionSelectionReport {
-    fn record_emitted(&mut self, opcode: DenseOpcode) {
+    fn record_candidate(&mut self, opcode: DenseOpcode) {
         self.candidates += 1;
+        *self
+            .candidates_by_kind
+            .entry(opcode.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    fn record_emitted(&mut self, opcode: DenseOpcode) {
         self.emitted += 1;
         *self
             .emitted_by_kind
             .entry(opcode.as_str().to_string())
+            .or_default() += 1;
+    }
+
+    fn record_skipped(&mut self, reason: &'static str) {
+        *self
+            .skipped_by_reason
+            .entry(reason.to_string())
             .or_default() += 1;
     }
 }
@@ -529,15 +547,18 @@ fn select_function_superinstructions(
                 continue;
             }
             let DenseOperands::Operand { src: echo_src } = next_operands else {
+                report.record_skipped("echo_operand_shape");
                 index += 1;
                 continue;
             };
             let opcode = function.instructions[index].opcode;
             let operands = function.instructions[index].operands.clone();
             let Some(fused) = select_echo_fusion(opcode, &operands, echo_src) else {
+                report.record_skipped("unsupported_producer_echo_pair");
                 index += 1;
                 continue;
             };
+            report.record_candidate(fused);
             function.instructions[index].opcode = fused;
             function.instructions[index + 1].opcode = DenseOpcode::Nop;
             function.instructions[index + 1].operands = DenseOperands::None;

@@ -1,3 +1,5 @@
+use php_source::byte_kernel::{find_any2, find_any3, find_byte};
+
 /// Result of scanning a quoted string from scripting mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StringScan {
@@ -49,6 +51,11 @@ fn add_string_prefix_len(scan: StringScan, prefix_len: usize) -> StringScan {
 fn scan_single_quoted(bytes: &[u8], start: usize) -> StringScan {
     let mut offset = start + 1;
     while offset < bytes.len() {
+        let Some(relative) = find_any2(&bytes[offset..], b'\\', b'\'') else {
+            break;
+        };
+        offset += relative;
+
         match bytes[offset] {
             b'\\' if matches!(bytes.get(offset + 1), Some(b'\\' | b'\'')) => {
                 offset += 2;
@@ -72,6 +79,13 @@ fn scan_single_quoted(bytes: &[u8], start: usize) -> StringScan {
 fn scan_double_quoted(bytes: &[u8], start: usize) -> StringScan {
     let mut offset = start + 1;
     while offset < bytes.len() {
+        let next_escape_quote_or_dollar = find_any3(&bytes[offset..], b'\\', b'"', b'$');
+        let next_open_brace = find_byte(&bytes[offset..], b'{');
+        let Some(relative) = nearest_found(next_escape_quote_or_dollar, next_open_brace) else {
+            break;
+        };
+        offset += relative;
+
         match bytes[offset] {
             b'\\' => {
                 offset += 1;
@@ -96,6 +110,15 @@ fn scan_double_quoted(bytes: &[u8], start: usize) -> StringScan {
     StringScan::Constant {
         len: bytes.len() - start,
         terminated: false,
+    }
+}
+
+fn nearest_found(first: Option<usize>, second: Option<usize>) -> Option<usize> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(first), None) => Some(first),
+        (None, Some(second)) => Some(second),
+        (None, None) => None,
     }
 }
 

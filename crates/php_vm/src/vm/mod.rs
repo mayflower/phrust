@@ -26,8 +26,9 @@ use crate::inline_cache::{
     ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallBuiltinMetadata,
     FunctionCallCacheTarget, FunctionCallShape, IncludePathCacheKey, IncludePathCacheTarget,
     InlineCacheKind, InlineCacheObservation, InlineCacheTable, InvalidationEpoch,
-    MethodCallCacheTarget, PropertyFetchCacheTarget, PropertyFetchLayoutMetadata,
-    PropertyFetchResolvedTarget,
+    MethodCallCacheTarget, MethodCallGuardMetadata, MethodCallResolvedTarget, MethodCallShape,
+    PropertyAssignCacheTarget, PropertyAssignLayoutMetadata, PropertyAssignResolvedTarget,
+    PropertyFetchCacheTarget, PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
 };
 use crate::literal_pool::LiteralPool;
 use crate::quickening::{QuickeningObservation, QuickeningSpecialization, QuickeningTable};
@@ -725,6 +726,11 @@ enum PropertyFetchCacheRead {
     Fallback,
 }
 
+enum PropertyAssignCacheWrite {
+    Written(Value),
+    Fallback,
+}
+
 enum BytecodeEntryAttempt {
     Executed(Box<VmResult>),
     Unsupported(String),
@@ -1284,6 +1290,24 @@ fn function_call_shape(args: &[CallArgument]) -> FunctionCallShape {
     }
 }
 
+fn method_call_shape(args: &[CallArgument]) -> MethodCallShape {
+    MethodCallShape {
+        arity: args.len().try_into().unwrap_or(u32::MAX),
+        named_arguments: args
+            .iter()
+            .filter_map(|arg| arg.name.clone())
+            .collect::<Vec<_>>(),
+        by_ref_arguments: args
+            .iter()
+            .map(|arg| {
+                arg.by_ref_local.is_some()
+                    || arg.by_ref_dim.is_some()
+                    || arg.by_ref_property.is_some()
+            })
+            .collect(),
+    }
+}
+
 fn function_call_builtin_metadata(
     target: &FunctionCallCacheTarget,
 ) -> Option<FunctionCallBuiltinMetadata> {
@@ -1463,6 +1487,7 @@ impl Vm {
         });
         if self.options.collect_counters {
             php_runtime::numeric_string::reset_cache_and_stats();
+            php_runtime::layout_stats::reset_layout_stats();
         }
         reset_float_string_precision();
 
@@ -1503,6 +1528,8 @@ impl Vm {
             match self.try_execute_bytecode_entry(&unit, &mut output, &mut stack, &mut state) {
                 BytecodeEntryAttempt::Executed(result) => *result,
                 BytecodeEntryAttempt::Unsupported(message) => {
+                    let reason = dense_bytecode_unsupported_reason(&message);
+                    self.record_counter_bytecode_unsupported_reason(reason);
                     if self.options.execution_format.is_strict_bytecode() {
                         VmResult {
                             status: ExecutionStatus::unsupported(message),
@@ -1518,6 +1545,7 @@ impl Vm {
                         }
                     } else {
                         self.record_counter_bytecode_unsupported_fallback();
+                        self.record_counter_bytecode_auto_fallback_reason(reason);
                         self.execute_function(
                             &unit,
                             entry,
@@ -1574,8 +1602,10 @@ impl Vm {
         }
         if self.options.collect_counters {
             let stats = php_runtime::numeric_string::take_cache_stats();
+            let layout_stats = php_runtime::layout_stats::take_layout_stats();
             if let Some(counters) = self.counters.borrow_mut().as_mut() {
                 counters.record_numeric_string_cache_stats(stats);
+                counters.record_runtime_layout_stats(layout_stats);
                 counters.record_output_stats(output_len, output_stats);
             }
             result.counters = self.counters.borrow().clone();
@@ -1622,6 +1652,24 @@ impl Vm {
         }
     }
 
+    fn record_counter_bytecode_unsupported_reason(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_unsupported_reason(reason);
+        }
+    }
+
+    fn record_counter_bytecode_auto_fallback_reason(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_bytecode_auto_fallback_reason(reason);
+        }
+    }
+
     fn record_counter_bytecode_instruction(&self, opcode: DenseOpcode) {
         if !self.options.collect_counters {
             return;
@@ -1631,12 +1679,31 @@ impl Vm {
         }
     }
 
+    fn record_counter_bytecode_lowered_families(&self, dense: &DenseBytecodeUnit) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for function in &dense.functions {
+                for instruction in &function.instructions {
+                    counters
+                        .record_bytecode_lowered_family(dense_opcode_family(instruction.opcode));
+                }
+            }
+        }
+    }
+
     fn record_counter_superinstruction_selection(&self, report: &SuperinstructionSelectionReport) {
         if !self.options.collect_counters {
             return;
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_superinstruction_selection(report.candidates, &report.emitted_by_kind);
+            counters.record_superinstruction_selection(
+                report.candidates,
+                &report.candidates_by_kind,
+                &report.emitted_by_kind,
+                &report.skipped_by_reason,
+            );
         }
     }
 
@@ -1723,12 +1790,60 @@ impl Vm {
         }
     }
 
+    fn record_counter_property_assign_ic_fallback(&self, reason: &str) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_assign_ic_fallback(reason);
+        }
+    }
+
     fn record_counter_method_call_profile(&self, observation: MethodCallProfileObservation) {
         if !self.options.collect_counters {
             return;
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_method_call_profile(observation);
+        }
+    }
+
+    fn record_counter_method_direct_dispatch_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_direct_dispatch_hit();
+        }
+    }
+
+    fn record_counter_method_direct_dispatch_fallback(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_direct_dispatch_fallback();
+        }
+    }
+
+    fn record_counter_method_tiny_inline_candidate(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_tiny_inline_candidate();
+        }
+    }
+
+    fn record_counter_method_tiny_inline_rejection(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_tiny_inline_rejection(reason);
         }
     }
 
@@ -2233,14 +2348,14 @@ impl Vm {
         let expected_builtin_metadata = self
             .inline_caches
             .borrow()
-            .peek_function_call_target(
+            .peek_function_call_builtin_metadata(
                 compiled_unit_cache_key(compiled),
                 function_id,
                 block_id,
                 instruction_id,
-            )
-            .as_ref()
-            .and_then(function_call_builtin_metadata);
+                lowered_name,
+                shape,
+            );
         let (target, observation) = self.inline_caches.borrow_mut().lookup_function_call(
             compiled_unit_cache_key(compiled),
             function_id,
@@ -2487,6 +2602,155 @@ impl Vm {
         );
     }
 
+    fn lookup_property_assign_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> Option<PropertyAssignCacheTarget> {
+        if !self.options.inline_caches.enabled() {
+            return None;
+        }
+        let (target, observation) = self.inline_caches.borrow_mut().lookup_property_assign(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            scope,
+            epoch,
+        );
+        self.record_inline_cache_event(observation);
+        target
+    }
+
+    fn install_property_assign_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+        target: PropertyAssignCacheTarget,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        self.inline_caches.borrow_mut().install_property_assign(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            scope,
+            epoch,
+            target,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "property assignment IC installation needs resolved metadata and write guard context"
+    )]
+    fn maybe_install_property_assign_inline_cache_target(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        property: &str,
+        receiver_class: &str,
+        receiver_entry: &ClassEntry,
+        declaring_class: &ClassEntry,
+        declaring_property: &ClassPropertyEntry,
+        storage_name: &str,
+        normalized_scope: Option<&str>,
+        lookup_epoch: InvalidationEpoch,
+        receiver_has_magic_set: bool,
+        state: &ExecutionState,
+        object: &ObjectRef,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        if declaring_property.flags.is_static || declaring_property.flags.is_protected {
+            return;
+        }
+        if receiver_has_magic_set {
+            return;
+        }
+        if declaring_property.flags.is_readonly || declaring_class.flags.is_readonly {
+            return;
+        }
+        if declaring_property.hooks.get.is_some()
+            || declaring_property.hooks.set.is_some()
+            || property_hook_is_active(state, object, declaring_class, declaring_property)
+        {
+            return;
+        }
+        let cache_scope = declaring_property
+            .flags
+            .is_private
+            .then(|| normalize_class_name(&declaring_class.name));
+        if declaring_property.flags.is_private && cache_scope.as_deref() != normalized_scope {
+            return;
+        }
+        if declaring_property.flags.set_is_private || declaring_property.flags.set_is_protected {
+            return;
+        }
+        if matches!(object.get_property(storage_name), Some(Value::Reference(_))) {
+            return;
+        }
+        let layout = property_assign_layout_metadata(
+            receiver_entry,
+            declaring_class,
+            declaring_property,
+            cache_scope.as_deref(),
+            lookup_epoch,
+            receiver_has_magic_set,
+            false,
+            false,
+            false,
+        );
+        let target_payload = Box::new(PropertyAssignResolvedTarget {
+            receiver_class: receiver_class.to_owned(),
+            declaring_class: declaring_class.name.clone(),
+            property: declaring_property.name.clone(),
+            storage_name: storage_name.to_owned(),
+            layout,
+        });
+        let target = match dynamic_class_owner_index_in_state(state, &declaring_class.name) {
+            Some(unit_index) => PropertyAssignCacheTarget::DynamicUnit {
+                unit_index,
+                target: target_payload,
+            },
+            None => PropertyAssignCacheTarget::CurrentUnit {
+                target: target_payload,
+            },
+        };
+        self.install_property_assign_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            receiver_class,
+            cache_scope.as_deref(),
+            lookup_epoch,
+            target,
+        );
+    }
+
     fn lookup_class_constant_static_property_inline_cache(
         &self,
         compiled: &CompiledUnit,
@@ -2631,6 +2895,24 @@ impl Vm {
         }
     }
 
+    fn record_counter_concat_prealloc_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_concat_prealloc_hit();
+        }
+    }
+
+    fn record_counter_concat_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_concat_fallback(reason);
+        }
+    }
+
     fn record_quickened_concat_guard(
         &self,
         function_id: FunctionId,
@@ -2695,6 +2977,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_cow_or_reference_fallback();
+        }
+    }
+
+    fn record_counter_array_fast_path_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_fast_path_fallback(reason);
         }
     }
 
@@ -2785,6 +3076,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_builtin_fast_stub(name, hit);
+        }
+    }
+
+    fn record_counter_builtin_fast_stub_fallback(&self, name: &str, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_builtin_fast_stub_fallback(name, reason);
         }
     }
 
@@ -2880,6 +3180,10 @@ impl Vm {
         }
         let Some(result) = fast_builtin_stub_result(name, values) else {
             self.record_counter_builtin_fast_stub(name, false);
+            self.record_counter_builtin_fast_stub_fallback(
+                name,
+                fast_builtin_stub_fallback_reason(values),
+            );
             return None;
         };
         self.record_counter_builtin_fast_stub(name, true);
@@ -3241,6 +3545,7 @@ impl Vm {
                     bytes.extend_from_slice(lhs.as_bytes());
                     bytes.extend_from_slice(rhs.as_bytes());
                     self.record_quickened_concat_guard(function_id, block_id, instruction_id, true);
+                    self.record_counter_concat_prealloc_hit();
                     Some(Value::String(PhpString::from_bytes(bytes)))
                 }
                 _ => {
@@ -3316,7 +3621,11 @@ impl Vm {
                             instruction_id,
                             false,
                         );
-                        self.record_counter_packed_fetch_layout_exit();
+                        if metadata.numeric_string_key_ambiguity {
+                            self.record_counter_array_fast_path_fallback("numeric_string_key");
+                        } else {
+                            self.record_counter_packed_fetch_layout_exit();
+                        }
                         return None;
                     }
                     if let Some(value) = array.packed_element_fast(*index as usize) {
@@ -3350,6 +3659,10 @@ impl Vm {
                     let metadata = array.packed_metadata();
                     if metadata.contains_references {
                         self.record_counter_cow_or_reference_fallback();
+                    } else if metadata.numeric_string_key_ambiguity
+                        || value_is_numeric_string_key_ambiguity(key)
+                    {
+                        self.record_counter_array_fast_path_fallback("numeric_string_key");
                     } else {
                         self.record_counter_packed_fetch_layout_exit();
                     }
@@ -3501,6 +3814,7 @@ impl Vm {
                         instruction_index,
                         true,
                     );
+                    self.record_counter_concat_prealloc_hit();
                     Some(Value::String(PhpString::from_bytes(bytes)))
                 }
                 _ => {
@@ -4289,6 +4603,7 @@ impl Vm {
                 ));
             }
         }
+        self.record_counter_bytecode_lowered_families(&dense);
         self.record_counter_bytecode_lower_success();
         let entry = compiled.unit().entry;
         let Some(dense_function) = dense.functions.get(entry.index()) else {
@@ -6223,6 +6538,7 @@ impl Vm {
             };
             let instruction_start = start_instruction_index;
             start_instruction_index = 0;
+            let mut batched_echo_skip_until = instruction_start;
 
             for (instruction_index, instruction) in block
                 .instructions
@@ -6249,6 +6565,9 @@ impl Vm {
                     instruction.id,
                     &instruction.kind,
                 );
+                if instruction_index < batched_echo_skip_until {
+                    continue;
+                }
                 match &instruction.kind {
                     InstructionKind::Nop => {}
                     InstructionKind::LoadConst { dst, constant } => {
@@ -9360,6 +9679,9 @@ impl Vm {
                             }
                         };
                         if is_std_class_runtime_class(&object.class_name()) {
+                            self.record_counter_property_assign_ic_fallback(
+                                "dynamic_property_fallback",
+                            );
                             let value = match read_operand(unit, stack, *value) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -9393,6 +9715,47 @@ impl Vm {
                                 }
                             };
                         let scope = current_scope_class(compiled, stack);
+                        let normalized_scope = scope.as_deref().map(normalize_class_name);
+                        let receiver_class = normalize_class_name(&object.class_name());
+                        let lookup_epoch = state.lookup_epoch();
+                        let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
+                        if let Some(target) = self.lookup_property_assign_inline_cache(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            property,
+                            &receiver_class,
+                            normalized_scope.as_deref(),
+                            lookup_epoch,
+                        ) {
+                            let value = match read_operand(unit, stack, *value) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            match self.write_property_assign_target(
+                                compiled, target, &object, value, stack, state,
+                            ) {
+                                Ok(PropertyAssignCacheWrite::Written(value)) => {
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                Ok(PropertyAssignCacheWrite::Fallback) => {}
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        }
                         let resolved = match lookup_property_in_hierarchy(
                             compiled,
                             &class,
@@ -9401,6 +9764,9 @@ impl Vm {
                         ) {
                             Ok(Some(resolved)) => resolved,
                             Ok(None) => {
+                                self.record_counter_property_assign_ic_fallback(
+                                    "dynamic_property_fallback",
+                                );
                                 let value = match read_operand(unit, stack, *value) {
                                     Ok(value) => value,
                                     Err(message) => {
@@ -9424,6 +9790,9 @@ impl Vm {
                                     state,
                                 ) {
                                     Ok(Some(_)) => {
+                                        self.record_counter_property_assign_ic_fallback(
+                                            "magic_set_metadata",
+                                        );
                                         if let Err(message) = stack
                                             .current_mut()
                                             .expect("frame was pushed")
@@ -9476,6 +9845,7 @@ impl Vm {
                                     )
                                 })
                         {
+                            self.record_counter_property_assign_ic_fallback("visibility_mismatch");
                             let value = match read_operand(unit, stack, *value) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -9498,6 +9868,9 @@ impl Vm {
                                 state,
                             ) {
                                 Ok(Some(_)) => {
+                                    self.record_counter_property_assign_ic_fallback(
+                                        "magic_set_metadata",
+                                    );
                                     if let Err(message) = stack
                                         .current_mut()
                                         .expect("frame was pushed")
@@ -9545,6 +9918,7 @@ impl Vm {
                             &value,
                             self.typecheck_fast_path_context(),
                         ) {
+                            self.record_counter_property_assign_ic_fallback("type_mismatch");
                             match self.raise_runtime_error(
                                 compiled,
                                 output,
@@ -9565,11 +9939,15 @@ impl Vm {
                         if let Err(message) =
                             validate_property_write(resolved.class, entry, &object, stack, compiled)
                         {
+                            self.record_counter_property_assign_ic_fallback("readonly_property");
                             return self.runtime_error(output, compiled, stack, message);
                         }
                         if !property_hook_is_active(state, &object, resolved.class, entry)
                             && let Some(function) = entry.hooks.set
                         {
+                            self.record_counter_property_assign_ic_fallback(
+                                "property_hook_present",
+                            );
                             match self.call_property_hook(
                                 compiled,
                                 object.clone(),
@@ -9599,6 +9977,9 @@ impl Vm {
                         if !entry.hooks.backed
                             && (entry.hooks.get.is_some() || entry.hooks.set.is_some())
                         {
+                            self.record_counter_property_assign_ic_fallback(
+                                "property_hook_present",
+                            );
                             return self.runtime_error(
                                 output,
                                 compiled,
@@ -9610,7 +9991,30 @@ impl Vm {
                             );
                         }
                         let storage_name = property_storage_name(resolved.class, entry);
-                        object.set_property(storage_name, value.clone());
+                        if matches!(
+                            object.get_property(&storage_name),
+                            Some(Value::Reference(_))
+                        ) {
+                            self.record_counter_property_assign_ic_fallback("reference_slot");
+                        }
+                        object.set_property(&storage_name, value.clone());
+                        self.maybe_install_property_assign_inline_cache_target(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            property,
+                            &receiver_class,
+                            &class,
+                            resolved.class,
+                            entry,
+                            &storage_name,
+                            normalized_scope.as_deref(),
+                            lookup_epoch,
+                            receiver_has_magic_set,
+                            state,
+                            &object,
+                        );
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -10580,6 +10984,21 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        if !self.options.trace
+                            && let Some((parts, skip_until)) = collect_exact_echo_batch(
+                                self,
+                                unit,
+                                stack,
+                                &block.instructions,
+                                instruction_index,
+                                value.clone(),
+                            )
+                            && skip_until > instruction_index + 1
+                        {
+                            write_exact_echo_batch(output, &parts);
+                            batched_echo_skip_until = skip_until;
+                            continue;
+                        }
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             return result;
@@ -11278,6 +11697,10 @@ impl Vm {
                                     );
                                 }
                             };
+                        let receiver_class_owner =
+                            class_owner_in_state(compiled, state, &class.name);
+                        let has_magic_call =
+                            class_has_public_magic_call(&receiver_class_owner, &class);
                         let (cached_target, cache_observation) = self
                             .lookup_method_call_inline_cache(
                                 compiled,
@@ -11298,8 +11721,12 @@ impl Vm {
                                     &class,
                                     &receiver_class,
                                     args,
+                                    &values,
+                                    has_magic_call,
+                                    epoch,
                                 )
                             {
+                                self.record_counter_method_direct_dispatch_hit();
                                 if matches!(self.options.jit, JitMode::Cranelift) {
                                     self.record_counter_direct_call_hit();
                                 }
@@ -11362,16 +11789,18 @@ impl Vm {
                                 }
                                 continue;
                             }
+                            self.record_counter_method_direct_dispatch_fallback();
                             if matches!(self.options.jit, JitMode::Cranelift) {
                                 self.record_counter_direct_call_fallback();
                             }
-                        } else if cache_observation.is_some()
-                            && matches!(self.options.jit, JitMode::Cranelift)
-                        {
-                            self.record_counter_direct_call_fallback();
+                        } else if let Some(observation) = cache_observation {
+                            if observation.fallback_call {
+                                self.record_counter_method_direct_dispatch_fallback();
+                            }
+                            if matches!(self.options.jit, JitMode::Cranelift) {
+                                self.record_counter_direct_call_fallback();
+                            }
                         }
-                        let receiver_class_owner =
-                            class_owner_in_state(compiled, state, &class.name);
                         let resolved = match lookup_resolved_method_in_state(
                             compiled,
                             state,
@@ -11459,8 +11888,6 @@ impl Vm {
                             &class_owner,
                             method_entry.function,
                         );
-                        let has_magic_call =
-                            class_has_public_magic_call(&receiver_class_owner, &class);
                         // PHP permits calling a static method through an instance
                         // (`$obj->staticMethod()`); it runs as a static call. Fall
                         // through to the normal dispatch — a static body never uses
@@ -11481,6 +11908,17 @@ impl Vm {
                             false,
                             Vec::new(),
                         ));
+                        if let Some(reason) = method_tiny_inline_rejection_reason(
+                            &class_owner,
+                            declaring_class,
+                            method_entry,
+                            args,
+                            has_magic_call,
+                        ) {
+                            self.record_counter_method_tiny_inline_rejection(reason);
+                        } else {
+                            self.record_counter_method_tiny_inline_candidate();
+                        }
                         if let Err(message) = validate_method_callable_in_state_scope(
                             compiled,
                             state,
@@ -11566,21 +12004,31 @@ impl Vm {
                         }
                         let declaring_dynamic_owner_index =
                             dynamic_class_owner_index_in_state(state, &declaring_class.name);
-                        let target = declaring_dynamic_owner_index.map_or_else(
-                            || MethodCallCacheTarget::CurrentUnit {
-                                receiver_class: receiver_class.clone(),
-                                receiver_class_id: class.id.raw(),
-                                declaring_class: declaring_class.name.clone(),
-                                function: method_entry.function,
-                            },
-                            |unit_index| MethodCallCacheTarget::DynamicUnit {
-                                unit_index,
-                                receiver_class: receiver_class.clone(),
-                                receiver_class_id: class.id.raw(),
-                                declaring_class: declaring_class.name.clone(),
-                                function: method_entry.function,
-                            },
+                        let method_guard = method_call_guard_metadata(
+                            &values,
+                            &class,
+                            declaring_class,
+                            method_entry,
+                            scope.as_deref(),
+                            epoch,
+                            has_magic_call,
+                            has_by_ref_argument,
                         );
+                        let method_target = Box::new(MethodCallResolvedTarget {
+                            receiver_class: receiver_class.clone(),
+                            declaring_class: declaring_class.name.clone(),
+                            function: method_entry.function,
+                            guard: method_guard,
+                        });
+                        let target = match declaring_dynamic_owner_index {
+                            Some(unit_index) => MethodCallCacheTarget::DynamicUnit {
+                                unit_index,
+                                target: method_target.clone(),
+                            },
+                            None => MethodCallCacheTarget::CurrentUnit {
+                                target: method_target,
+                            },
+                        };
                         let direct_call_cacheable = simple_positional_arguments
                             && !has_by_ref_argument
                             && !has_magic_call
@@ -12303,15 +12751,97 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result = self.call_callable_with_call_span(
-                            compiled,
-                            callee,
-                            values,
-                            Some(instruction.span),
-                            output,
-                            stack,
-                            state,
-                        );
+                        let result = match &callee {
+                            Value::String(name) => {
+                                let display_name = name.to_string_lossy();
+                                if display_name.contains("::") {
+                                    self.call_callable_with_call_span(
+                                        compiled,
+                                        callee,
+                                        values,
+                                        Some(instruction.span),
+                                        output,
+                                        stack,
+                                        state,
+                                    )
+                                } else {
+                                    let lowered_name = normalize_function_name(&display_name);
+                                    let epoch = state.lookup_epoch();
+                                    let call_shape = function_call_shape(&values);
+                                    let target = self
+                                        .lookup_function_call_inline_cache(
+                                            compiled,
+                                            function_id,
+                                            block_id,
+                                            instruction.id,
+                                            &lowered_name,
+                                            epoch,
+                                            &call_shape,
+                                        )
+                                        .or_else(|| {
+                                            let resolved = self.resolve_function_call_target(
+                                                compiled,
+                                                state,
+                                                &lowered_name,
+                                            )?;
+                                            if self.options.inline_caches.enabled()
+                                                && function_call_target_is_builtin(&resolved)
+                                            {
+                                                self.record_counter_builtin_call_ic(false);
+                                            }
+                                            self.install_function_call_inline_cache(
+                                                compiled,
+                                                function_id,
+                                                block_id,
+                                                instruction.id,
+                                                &lowered_name,
+                                                epoch,
+                                                call_shape.clone(),
+                                                resolved.clone(),
+                                            );
+                                            Some(resolved)
+                                        });
+                                    if let Some(target) = target {
+                                        self.execute_function_call_target(
+                                            compiled,
+                                            target,
+                                            values,
+                                            Some((
+                                                compiled_unit_cache_key(compiled),
+                                                function_id,
+                                                block_id,
+                                                instruction.id,
+                                            )),
+                                            Some(instruction.span),
+                                            output,
+                                            stack,
+                                            state,
+                                            &running_fiber,
+                                        )
+                                    } else {
+                                        let diagnostic = undefined_function(
+                                            &display_name,
+                                            RuntimeSourceSpan::default(),
+                                            stack_trace(compiled, stack),
+                                        );
+                                        VmResult::runtime_error_with_diagnostic(
+                                            output.clone(),
+                                            diagnostic.message().to_owned(),
+                                            diagnostic,
+                                        )
+                                    }
+                                }
+                            }
+                            _ => self.call_callable_with_call_span(
+                                compiled,
+                                callee,
+                                values,
+                                Some(instruction.span),
+                                output,
+                                stack,
+                                state,
+                            ),
+                        };
                         if !result.status.is_success()
                             && let Some(throwable) = state
                                 .pending_throw
@@ -15473,6 +16003,144 @@ impl Vm {
         Ok(PropertyFetchCacheRead::Value(value))
     }
 
+    fn write_property_assign_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: PropertyAssignCacheTarget,
+        object: &ObjectRef,
+        value: Value,
+        stack: &CallStack,
+        state: &ExecutionState,
+    ) -> Result<PropertyAssignCacheWrite, String> {
+        let (owner, target) = match target {
+            PropertyAssignCacheTarget::CurrentUnit { target } => (compiled.clone(), target),
+            PropertyAssignCacheTarget::DynamicUnit { unit_index, target } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    self.record_counter_property_assign_ic_fallback("dynamic_unit_missing");
+                    return Ok(PropertyAssignCacheWrite::Fallback);
+                };
+                (owner, target)
+            }
+        };
+        let PropertyAssignResolvedTarget {
+            receiver_class,
+            declaring_class: declaring_class_name,
+            property: property_name,
+            storage_name,
+            layout,
+        } = *target;
+        if state.lookup_epoch().raw() != layout.layout_version {
+            self.record_counter_property_assign_ic_fallback("layout_epoch_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if normalize_class_name(&object.class_name()) != receiver_class {
+            self.record_counter_property_assign_ic_fallback("receiver_class_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        let Some(receiver_class_entry) =
+            lookup_class_in_state(compiled, state, &object.class_name())
+        else {
+            self.record_counter_property_assign_ic_fallback("receiver_class_missing");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        };
+        if receiver_class_entry.id.raw() != layout.class_id {
+            self.record_counter_property_assign_ic_fallback("class_id_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if layout.dynamic_property_fallback {
+            self.record_counter_property_assign_ic_fallback("dynamic_property_metadata");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if layout.has_magic_set {
+            self.record_counter_property_assign_ic_fallback("magic_set_metadata");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if layout.has_property_hooks {
+            self.record_counter_property_assign_ic_fallback("property_hook_metadata");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if layout.readonly_or_init_only {
+            self.record_counter_property_assign_ic_fallback("readonly_metadata");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if layout.reference_slot {
+            self.record_counter_property_assign_ic_fallback("reference_metadata");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name) else {
+            self.record_counter_property_assign_ic_fallback("declaring_class_missing");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        };
+        let Some((property_index, property)) = declaring_class
+            .properties
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.name == property_name)
+        else {
+            self.record_counter_property_assign_ic_fallback("property_missing");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        };
+        if layout.property_slot_index != Some(property_index as u32) {
+            self.record_counter_property_assign_ic_fallback("property_slot_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if property_storage_name(declaring_class, property) != storage_name {
+            self.record_counter_property_assign_ic_fallback("storage_name_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if property.flags.is_static || property.flags.is_protected {
+            self.record_counter_property_assign_ic_fallback("static_or_protected_property");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if property.hooks.get.is_some() || property.hooks.set.is_some() {
+            self.record_counter_property_assign_ic_fallback("property_hook_present");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if property_hook_is_active(state, object, declaring_class, property) {
+            self.record_counter_property_assign_ic_fallback("property_hook_active");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if validate_property_access(&owner, stack, declaring_class, property).is_err() {
+            self.record_counter_property_assign_ic_fallback("visibility_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if validate_property_set_access(&owner, stack, declaring_class, property).is_err() {
+            self.record_counter_property_assign_ic_fallback("setter_visibility_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        let property_type = ir_runtime_type(property.type_.as_ref());
+        if check_property_type(
+            &owner,
+            declaring_class.display_name.as_str(),
+            property.name.as_str(),
+            &property_type,
+            &value,
+            self.typecheck_fast_path_context(),
+        )
+        .is_err()
+        {
+            self.record_counter_property_assign_ic_fallback("type_mismatch");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if let Err(message) =
+            validate_property_write(declaring_class, property, object, stack, &owner)
+        {
+            if message.contains("readonly") {
+                self.record_counter_property_assign_ic_fallback("readonly_property");
+            }
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        if matches!(
+            object.get_property(&storage_name),
+            Some(Value::Reference(_))
+        ) {
+            self.record_counter_property_assign_ic_fallback("reference_slot");
+            return Ok(PropertyAssignCacheWrite::Fallback);
+        }
+        object.set_property(storage_name, value.clone());
+        Ok(PropertyAssignCacheWrite::Written(value))
+    }
+
     fn read_class_constant_static_property_target(
         &self,
         compiled: &CompiledUnit,
@@ -15572,20 +16240,11 @@ impl Vm {
         state: &mut ExecutionState,
         running_fiber: &Option<FiberRef>,
     ) -> VmResult {
-        let (owner, declaring_class_name, function) = match target {
-            MethodCallCacheTarget::CurrentUnit {
-                receiver_class: _,
-                receiver_class_id: _,
-                declaring_class,
-                function,
-            } => (compiled.clone(), declaring_class, function),
-            MethodCallCacheTarget::DynamicUnit {
-                unit_index,
-                receiver_class: _,
-                receiver_class_id: _,
-                declaring_class,
-                function,
-            } => {
+        let declaring_class_name = target.resolved_target().declaring_class.clone();
+        let function = target.resolved_target().function;
+        let owner = match target {
+            MethodCallCacheTarget::CurrentUnit { .. } => compiled.clone(),
+            MethodCallCacheTarget::DynamicUnit { unit_index, .. } => {
                 let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
                     return self.runtime_error(
                         output,
@@ -15596,7 +16255,7 @@ impl Vm {
                         ),
                     );
                 };
-                (owner, declaring_class, function)
+                owner
             }
         };
         let Some(declaring_class) = owner.lookup_class(&declaring_class_name).cloned() else {
@@ -17952,13 +18611,23 @@ impl Vm {
     ) -> Result<Value, VmResult> {
         match op {
             BinaryOp::Concat => {
-                let mut bytes = self
-                    .value_to_string(compiled, lhs, output, stack, state)?
-                    .into_bytes();
-                bytes.extend_from_slice(
-                    self.value_to_string(compiled, rhs, output, stack, state)?
-                        .as_bytes(),
-                );
+                if let Some(reason) = concat_fallback_reason(lhs, rhs) {
+                    self.record_counter_concat_fallback(reason);
+                }
+                let lhs = self.value_to_string(compiled, lhs, output, stack, state)?;
+                let rhs = self.value_to_string(compiled, rhs, output, stack, state)?;
+                let bytes = if let Some(capacity) = lhs.len().checked_add(rhs.len()) {
+                    self.record_counter_concat_prealloc_hit();
+                    let mut bytes = Vec::with_capacity(capacity);
+                    bytes.extend_from_slice(lhs.as_bytes());
+                    bytes.extend_from_slice(rhs.as_bytes());
+                    bytes
+                } else {
+                    self.record_counter_concat_fallback("capacity_overflow");
+                    let mut bytes = lhs.into_bytes();
+                    bytes.extend_from_slice(rhs.as_bytes());
+                    bytes
+                };
                 Ok(Value::String(PhpString::from_bytes(bytes)))
             }
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
@@ -24104,6 +24773,17 @@ fn class_has_public_magic_get(compiled: &CompiledUnit, class: &php_ir::module::C
         })
 }
 
+fn class_has_public_magic_set(compiled: &CompiledUnit, class: &php_ir::module::ClassEntry) -> bool {
+    lookup_method_in_hierarchy(compiled, class, "__set", None)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| {
+            !resolved.method.flags.is_static
+                && !resolved.method.flags.is_private
+                && !resolved.method.flags.is_protected
+        })
+}
+
 fn class_has_public_magic_call(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
@@ -24153,6 +24833,36 @@ fn property_fetch_layout_metadata(
         typed_property_initialized,
         has_property_hooks,
         has_magic_get,
+        dynamic_property_fallback,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn property_assign_layout_metadata(
+    receiver_class: &php_ir::module::ClassEntry,
+    declaring_class: &php_ir::module::ClassEntry,
+    property: &php_ir::module::ClassPropertyEntry,
+    visibility_context: Option<&str>,
+    layout_version: InvalidationEpoch,
+    has_magic_set: bool,
+    has_property_hooks: bool,
+    dynamic_property_fallback: bool,
+    reference_slot: bool,
+) -> PropertyAssignLayoutMetadata {
+    PropertyAssignLayoutMetadata {
+        class_id: receiver_class.id.raw(),
+        layout_version: layout_version.raw(),
+        property_slot_index: declaring_class
+            .properties
+            .iter()
+            .position(|entry| entry.name == property.name)
+            .map(|index| index as u32),
+        visibility_context: visibility_context.map(str::to_owned),
+        typed_property: property.type_.is_some(),
+        readonly_or_init_only: property.flags.is_readonly || declaring_class.flags.is_readonly,
+        reference_slot,
+        has_property_hooks,
+        has_magic_set,
         dynamic_property_fallback,
     }
 }
@@ -24289,6 +24999,53 @@ fn method_call_has_by_ref_argument(
         .is_some_and(|callee| callee.params.iter().any(|param| param.by_ref))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn method_call_guard_metadata(
+    args: &[CallArgument],
+    receiver_class: &php_ir::module::ClassEntry,
+    declaring_class: &php_ir::module::ClassEntry,
+    method_entry: &php_ir::module::ClassMethodEntry,
+    visibility_context: Option<&str>,
+    epoch: InvalidationEpoch,
+    has_magic_call: bool,
+    has_by_ref_argument: bool,
+) -> MethodCallGuardMetadata {
+    MethodCallGuardMetadata {
+        receiver_class_id: receiver_class.id.raw(),
+        class_layout_epoch: epoch.raw(),
+        method_table_epoch: epoch.raw(),
+        method_slot_index: declaring_class
+            .methods
+            .iter()
+            .position(|entry| {
+                entry.name == method_entry.name && entry.function == method_entry.function
+            })
+            .and_then(|index| index.try_into().ok()),
+        visibility_context: visibility_context.map(str::to_owned),
+        method_is_final: method_entry.flags.is_final,
+        method_is_private: method_entry.flags.is_private,
+        method_is_static: method_entry.flags.is_static,
+        receiver_has_override: receiver_class.name == declaring_class.name
+            && receiver_class.parent.is_some(),
+        argument_shape: method_call_shape(args),
+        by_ref_compatible: !has_by_ref_argument,
+        has_magic_call,
+    }
+}
+
+fn method_call_cache_target_owner<'a>(
+    compiled: &'a CompiledUnit,
+    state: &'a ExecutionState,
+    target: &MethodCallCacheTarget,
+) -> Option<&'a CompiledUnit> {
+    match target {
+        MethodCallCacheTarget::CurrentUnit { .. } => Some(compiled),
+        MethodCallCacheTarget::DynamicUnit { unit_index, .. } => {
+            state.dynamic_units.get(*unit_index)
+        }
+    }
+}
+
 fn method_direct_call_target_is_eligible(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -24296,23 +25053,59 @@ fn method_direct_call_target_is_eligible(
     class: &php_ir::module::ClassEntry,
     receiver_class: &str,
     args: &[IrCallArg],
+    values: &[CallArgument],
+    has_magic_call: bool,
+    epoch: InvalidationEpoch,
 ) -> bool {
+    let resolved = target.resolved_target();
+    let guard = &resolved.guard;
     if target.receiver_class_id() != class.id.raw() || target.receiver_class() != receiver_class {
+        return false;
+    }
+    if guard.class_layout_epoch != epoch.raw() || guard.method_table_epoch != epoch.raw() {
+        return false;
+    }
+    if guard.has_magic_call != has_magic_call {
+        return false;
+    }
+    if guard.argument_shape != method_call_shape(values) {
         return false;
     }
     if !method_call_args_are_simple_positional(args) {
         return false;
     }
-    let owner = match target {
-        MethodCallCacheTarget::CurrentUnit { .. } => Some(compiled),
-        MethodCallCacheTarget::DynamicUnit { unit_index, .. } => {
-            state.dynamic_units.get(*unit_index)
-        }
-    };
+    let owner = method_call_cache_target_owner(compiled, state, target);
     let Some(owner) = owner else {
         return false;
     };
-    !method_call_has_by_ref_argument(args, Some(owner), Some(target.function()))
+    if method_call_has_by_ref_argument(args, Some(owner), Some(target.function())) {
+        return false;
+    }
+    let Some(declaring_class) = owner.lookup_class(&resolved.declaring_class) else {
+        return false;
+    };
+    let Some(method_entry) = declaring_class
+        .methods
+        .iter()
+        .find(|method| method.function == resolved.function)
+    else {
+        return false;
+    };
+    if guard.method_slot_index
+        != declaring_class
+            .methods
+            .iter()
+            .position(|entry| {
+                entry.name == method_entry.name && entry.function == method_entry.function
+            })
+            .and_then(|index| index.try_into().ok())
+    {
+        return false;
+    }
+    guard.method_is_final == method_entry.flags.is_final
+        && guard.method_is_private == method_entry.flags.is_private
+        && guard.method_is_static == method_entry.flags.is_static
+        && guard.by_ref_compatible
 }
 
 fn method_callee_shape_is_jit_eligible(owner: &CompiledUnit, function: FunctionId) -> bool {
@@ -24350,6 +25143,169 @@ fn method_callee_shape_is_jit_eligible(owner: &CompiledUnit, function: FunctionI
                         )
                 })
         })
+}
+
+fn method_tiny_inline_rejection_reason(
+    owner: &CompiledUnit,
+    class: &php_ir::module::ClassEntry,
+    method_entry: &php_ir::module::ClassMethodEntry,
+    args: &[IrCallArg],
+    has_magic_call: bool,
+) -> Option<&'static str> {
+    if has_magic_call {
+        return Some("magic_call_present");
+    }
+    if method_entry.flags.is_static {
+        return Some("static_method");
+    }
+    if !(method_entry.flags.is_final || method_entry.flags.is_private || class.flags.is_final) {
+        return Some("not_final_or_private");
+    }
+    if !method_call_args_are_simple_positional(args) {
+        return Some("named_or_unpacked_arguments");
+    }
+    let Some(function) = owner.unit().functions.get(method_entry.function.index()) else {
+        return Some("method_body_unavailable");
+    };
+    if function.flags.is_generator {
+        return Some("generator_method");
+    }
+    if function.returns_by_ref
+        || function
+            .params
+            .iter()
+            .any(|param| param.by_ref || param.variadic)
+    {
+        return Some("refs_or_variadics");
+    }
+    if method_body_has_inline_blocker(function) {
+        return Some("control_flow_or_escape");
+    }
+    if method_body_returns_scalar_constant(owner, function)
+        || method_body_returns_this_property(function)
+    {
+        None
+    } else {
+        Some("not_tiny_leaf_return")
+    }
+}
+
+fn method_body_has_inline_blocker(function: &IrFunction) -> bool {
+    function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::CallFunction { .. }
+                    | InstructionKind::CallMethod { .. }
+                    | InstructionKind::CallStaticMethod { .. }
+                    | InstructionKind::CallClosure { .. }
+                    | InstructionKind::CallCallable { .. }
+                    | InstructionKind::Pipe { .. }
+                    | InstructionKind::EnterTry { .. }
+                    | InstructionKind::LeaveTry
+                    | InstructionKind::EndFinally { .. }
+                    | InstructionKind::Throw { .. }
+                    | InstructionKind::Yield { .. }
+                    | InstructionKind::YieldFrom { .. }
+                    | InstructionKind::Include { .. }
+                    | InstructionKind::Eval { .. }
+                    | InstructionKind::AssignProperty { .. }
+                    | InstructionKind::AssignStaticProperty { .. }
+                    | InstructionKind::UnsetProperty { .. }
+            )
+        })
+    })
+}
+
+fn method_body_returns_scalar_constant(owner: &CompiledUnit, function: &IrFunction) -> bool {
+    let Some(block) = single_return_block(function) else {
+        return false;
+    };
+    let Some(value) = block
+        .terminator
+        .as_ref()
+        .and_then(|terminator| match terminator.kind {
+            TerminatorKind::Return { value, .. } => value,
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    match value {
+        Operand::Constant(constant) => owner
+            .unit()
+            .constants
+            .get(constant.index())
+            .is_some_and(is_tiny_inline_scalar_constant),
+        Operand::Register(register) => block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::LoadConst { dst, constant }
+                    if dst == register
+                        && owner
+                            .unit()
+                            .constants
+                            .get(constant.index())
+                            .is_some_and(is_tiny_inline_scalar_constant)
+            )
+        }),
+        Operand::Local(_) => false,
+    }
+}
+
+fn method_body_returns_this_property(function: &IrFunction) -> bool {
+    let Some(block) = single_return_block(function) else {
+        return false;
+    };
+    let Some(Operand::Register(return_register)) =
+        block
+            .terminator
+            .as_ref()
+            .and_then(|terminator| match terminator.kind {
+                TerminatorKind::Return { value, .. } => value,
+                _ => None,
+            })
+    else {
+        return false;
+    };
+    block.instructions.iter().any(|instruction| {
+        matches!(
+            &instruction.kind,
+            InstructionKind::FetchProperty {
+                dst,
+                object: Operand::Local(local),
+                ..
+            } if *dst == return_register
+                && function
+                    .locals
+                    .get(local.index())
+                    .is_some_and(|name| name == "this")
+        )
+    })
+}
+
+fn single_return_block(function: &IrFunction) -> Option<&php_ir::block::BasicBlock> {
+    (function.blocks.len() == 1)
+        .then(|| function.blocks.first())
+        .flatten()
+        .filter(|block| {
+            matches!(
+                block.terminator.as_ref().map(|terminator| &terminator.kind),
+                Some(TerminatorKind::Return { .. })
+            )
+        })
+}
+
+fn is_tiny_inline_scalar_constant(constant: &IrConstant) -> bool {
+    matches!(
+        constant,
+        IrConstant::Null
+            | IrConstant::Bool(_)
+            | IrConstant::Int(_)
+            | IrConstant::Float(_)
+            | IrConstant::String(_)
+            | IrConstant::StringBytes(_)
+    )
 }
 
 fn property_hook_is_active(
@@ -29957,6 +30913,20 @@ fn is_supported_builtin(name: &str) -> bool {
     BuiltinRegistry::new().contains(name)
 }
 
+fn value_is_numeric_string_key_ambiguity(value: &Value) -> bool {
+    let Value::String(string) = effective_value(value) else {
+        return false;
+    };
+    let Some(first) = string.as_bytes().first() else {
+        return false;
+    };
+    (first.is_ascii_digit() || matches!(first, b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r'))
+        && matches!(
+            ArrayKey::from_php_string(string.clone()),
+            ArrayKey::String(_)
+        )
+}
+
 fn value_needs_vm_string_coercion(value: &Value) -> bool {
     match value {
         Value::Object(_) => true,
@@ -30074,6 +31044,16 @@ fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
         ("is_array", value) => Some(Value::Bool(matches!(value, Value::Array(_)))),
         _ => None,
     }
+}
+
+fn fast_builtin_stub_fallback_reason(values: &[Value]) -> &'static str {
+    if values.len() != 1 {
+        return "arity";
+    }
+    if matches!(values.first(), Some(Value::Reference(_))) {
+        return "by_ref";
+    }
+    "type"
 }
 
 fn execute_builtin_entry(
@@ -31283,6 +32263,104 @@ fn is_globals_local(function: &IrFunction, local: LocalId) -> bool {
         .locals
         .get(local.index())
         .is_some_and(|name| name == "GLOBALS")
+}
+
+enum ExactEchoBatchPart {
+    Bytes(Vec<u8>),
+    Empty,
+}
+
+fn exact_echo_batch_part(value: &Value) -> Option<ExactEchoBatchPart> {
+    match value {
+        Value::String(value) => Some(ExactEchoBatchPart::Bytes(value.as_bytes().to_vec())),
+        Value::Int(value) => Some(ExactEchoBatchPart::Bytes(value.to_string().into_bytes())),
+        Value::Bool(true) => Some(ExactEchoBatchPart::Bytes(b"1".to_vec())),
+        Value::Bool(false) | Value::Null => Some(ExactEchoBatchPart::Empty),
+        Value::Float(_)
+        | Value::Array(_)
+        | Value::Object(_)
+        | Value::Resource(_)
+        | Value::Reference(_)
+        | Value::Callable(_)
+        | Value::Fiber(_)
+        | Value::Generator(_)
+        | Value::Uninitialized => None,
+    }
+}
+
+fn collect_exact_echo_batch(
+    vm: &Vm,
+    unit: &IrUnit,
+    stack: &CallStack,
+    instructions: &[Instruction],
+    instruction_index: usize,
+    first_value: Value,
+) -> Option<(Vec<ExactEchoBatchPart>, usize)> {
+    let mut parts = vec![exact_echo_batch_part(&first_value)?];
+    let mut next_index = instruction_index + 1;
+    while let Some(instruction) = instructions.get(next_index) {
+        match &instruction.kind {
+            InstructionKind::Echo { src } => {
+                let Ok(value) = read_operand(unit, stack, *src) else {
+                    break;
+                };
+                let Some(part) = exact_echo_batch_part(&value) else {
+                    break;
+                };
+                parts.push(part);
+                next_index += 1;
+            }
+            InstructionKind::LoadConst { dst, constant } => {
+                let Some(next) = instructions.get(next_index + 1) else {
+                    break;
+                };
+                let InstructionKind::Echo { src } = &next.kind else {
+                    break;
+                };
+                if !matches!(src, Operand::Register(register) if *register == *dst) {
+                    break;
+                }
+                let Ok(value) = vm.constant_value(unit, *constant) else {
+                    break;
+                };
+                let Some(part) = exact_echo_batch_part(&value) else {
+                    break;
+                };
+                parts.push(part);
+                next_index += 2;
+            }
+            _ => break,
+        }
+    }
+    Some((parts, next_index))
+}
+
+fn write_exact_echo_batch(output: &mut OutputBuffer, parts: &[ExactEchoBatchPart]) {
+    let slices = parts
+        .iter()
+        .filter_map(|part| match part {
+            ExactEchoBatchPart::Bytes(bytes) if !bytes.is_empty() => Some(bytes.as_slice()),
+            ExactEchoBatchPart::Bytes(_) | ExactEchoBatchPart::Empty => None,
+        })
+        .collect::<Vec<_>>();
+    output.write_fast_slices(&slices);
+}
+
+fn concat_fallback_reason(lhs: &Value, rhs: &Value) -> Option<&'static str> {
+    concat_operand_fallback_reason(lhs).or_else(|| concat_operand_fallback_reason(rhs))
+}
+
+fn concat_operand_fallback_reason(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::String(_) => None,
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) => Some("scalar_conversion"),
+        Value::Array(_) => Some("array_conversion_warning"),
+        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => Some("object_to_string"),
+        Value::Resource(_) => Some("resource_conversion"),
+        Value::Reference(_) => Some("reference_deref"),
+        Value::Callable(_) => Some("callable_conversion_error"),
+        Value::Uninitialized => Some("uninitialized_conversion_error"),
+    }
 }
 
 fn load_local_is_pre_call_by_ref_out_param(
@@ -32997,6 +34075,80 @@ fn dense_binary_op(opcode: DenseOpcode) -> Option<BinaryOp> {
     }
 }
 
+fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
+    match opcode {
+        DenseOpcode::LoadConst | DenseOpcode::LoadConstEcho => "constants",
+        DenseOpcode::Move
+        | DenseOpcode::LoadLocal
+        | DenseOpcode::LoadLocalEcho
+        | DenseOpcode::StoreLocal => "locals",
+        DenseOpcode::BinaryAdd
+        | DenseOpcode::BinarySub
+        | DenseOpcode::BinaryMul
+        | DenseOpcode::BinaryDiv
+        | DenseOpcode::BinaryMod
+        | DenseOpcode::BinaryConcat
+        | DenseOpcode::BinaryConcatEcho
+        | DenseOpcode::BinaryPow
+        | DenseOpcode::BinaryBitAnd
+        | DenseOpcode::BinaryBitOr
+        | DenseOpcode::BinaryBitXor
+        | DenseOpcode::BinaryShiftLeft
+        | DenseOpcode::BinaryShiftRight => "scalar_ops",
+        DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship => "comparisons",
+        DenseOpcode::UnaryPlus
+        | DenseOpcode::UnaryMinus
+        | DenseOpcode::UnaryNot
+        | DenseOpcode::UnaryBitNot => "unary_ops",
+        DenseOpcode::CallFunction => "function_calls",
+        DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::FetchDim
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim => "arrays",
+        DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => "foreach",
+        DenseOpcode::Echo => "output",
+        DenseOpcode::Jump
+        | DenseOpcode::JumpIfFalse
+        | DenseOpcode::JumpIfTrue
+        | DenseOpcode::JumpIf => "control_flow",
+        DenseOpcode::Return => "returns",
+        DenseOpcode::Discard | DenseOpcode::Nop => "bookkeeping",
+    }
+}
+
+fn dense_bytecode_unsupported_reason(message: &str) -> &'static str {
+    if message.contains("FetchProperty") {
+        "property_fetch"
+    } else if message.contains("AssignProperty") {
+        "property_assignment"
+    } else if message.contains("CallStaticMethod") {
+        "static_method_call"
+    } else if message.contains("CallMethod") {
+        "method_call"
+    } else if message.contains("Include") {
+        "include"
+    } else if message.contains("unpacked arguments") {
+        "unpacked_call"
+    } else if message.contains("TRACE_UNSUPPORTED") {
+        "trace"
+    } else if message.contains("VERIFY") {
+        "verifier"
+    } else if message.contains("ENTRY") {
+        "entry"
+    } else {
+        "instruction_subset"
+    }
+}
+
 fn int_int_specialization_for_binary_op(op: BinaryOp) -> Option<QuickeningSpecialization> {
     match op {
         BinaryOp::Add => Some(QuickeningSpecialization::AddIntInt),
@@ -34243,8 +35395,38 @@ mod tests {
         let counters = result.counters.expect("counters should be collected");
         assert_eq!(counters.output_bytes, expected.len() as u64);
         assert!(counters.output_buffer_appends > 0, "{counters:?}");
-        assert!(counters.output_fast_appends >= 9, "{counters:?}");
+        assert!(counters.output_fast_appends >= 3, "{counters:?}");
+        assert!(counters.output_batched_appends >= 2, "{counters:?}");
+        assert!(counters.output_batch_bytes >= 4, "{counters:?}");
         assert_eq!(counters.output_buffer_flushes, 1);
+        assert!(
+            counters.output_slow_appends_by_reason.is_empty(),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn output_batching_preserves_nested_buffers_and_binary_scalar_bytes() {
+        let result = execute_source_with_options(
+            "<?php
+            echo \"A\\x00\", 12, true, false, null, \"Z\";
+            ob_start();
+            echo 'inner', '-', 34, true;
+            $captured = ob_get_clean();
+            echo '|', $captured, '|tail';
+            ",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"A\x00121Z|inner-341|tail");
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.output_batched_appends >= 2, "{counters:?}");
+        assert!(counters.output_batch_bytes >= 12, "{counters:?}");
+        assert_eq!(counters.output_buffer_flushes, 0, "{counters:?}");
         assert!(
             counters.output_slow_appends_by_reason.is_empty(),
             "{counters:?}"
@@ -34280,6 +35462,50 @@ mod tests {
             "{counters:?}"
         );
         assert!(counters.output_fast_appends >= 2, "{counters:?}");
+
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-output-resource-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp resource root should be created");
+        let fallback = execute_source_with_options(
+            "<?php
+            echo 'before|';
+            echo [1];
+            $handle = fopen('data.txt', 'w+');
+            echo $handle;
+            ",
+            VmOptions {
+                collect_counters: true,
+                runtime_context: RuntimeContext::default()
+                    .with_cwd(root.clone())
+                    .with_filesystem_capabilities(
+                        php_runtime::FilesystemCapabilities::none()
+                            .with_allowed_roots(vec![root.clone()]),
+                    ),
+                ..VmOptions::default()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(fallback.status.is_success(), "{:?}", fallback.status);
+        assert_eq!(
+            fallback.output.to_string_lossy(),
+            "before|\nWarning: Array to string conversion in <unknown> on line 0\nArrayResource id #1"
+        );
+        let counters = fallback.counters.expect("counters should be collected");
+        assert_eq!(
+            counters
+                .output_slow_appends_by_reason
+                .get("array_conversion_warning"),
+            Some(&1),
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters
+                .output_slow_appends_by_reason
+                .get("resource_conversion"),
+            Some(&1),
+            "{counters:?}"
+        );
 
         let throwing = execute_source(
             "<?php
@@ -34371,6 +35597,59 @@ mod tests {
             ),
             "{:?}",
             result.status
+        );
+    }
+
+    #[test]
+    fn concat_prealloc_counters_cover_strings_scalars_and_object_fallbacks() {
+        let string_scalar = execute_source_with_options(
+            "<?php $a = 'a'; $b = 'b'; $value = 'id-' . 42; echo $value, '|', $a . $b;",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(
+            string_scalar.status.is_success(),
+            "{:?}",
+            string_scalar.status
+        );
+        assert_eq!(string_scalar.output.to_string_lossy(), "id-42|ab");
+        let counters = string_scalar
+            .counters
+            .expect("counters should be collected");
+        assert!(counters.concat_prealloc_hits >= 2, "{counters:?}");
+        assert_eq!(
+            counters.concat_fallback_by_reason.get("scalar_conversion"),
+            Some(&1),
+            "{counters:?}"
+        );
+
+        let object = execute_source_with_options(
+            "<?php
+            class C {
+                public function __toString(): string {
+                    echo 'side|';
+                    return 'object';
+                }
+            }
+            echo new C() . '-tail';
+            ",
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(object.status.is_success(), "{:?}", object.status);
+        assert_eq!(object.output.to_string_lossy(), "side|object-tail");
+        let counters = object.counters.expect("counters should be collected");
+        assert!(counters.concat_prealloc_hits >= 1, "{counters:?}");
+        assert_eq!(
+            counters.concat_fallback_by_reason.get("object_to_string"),
+            Some(&1),
+            "{counters:?}"
         );
     }
 
@@ -35191,6 +36470,42 @@ mod tests {
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"body|d:b|d:a|");
+    }
+
+    #[test]
+    fn runtime_layout_counters_preserve_cow_reference_and_destructor_order() {
+        let source = "<?php
+            class RuntimeLayoutD {
+                public function __destruct() { echo '|destruct'; }
+            }
+            $a = [1, 2];
+            $b = $a;
+            $b[] = 3;
+            echo count($a), ':', count($b);
+            $x = 10;
+            $y =& $x;
+            $y = 12;
+            echo '|', $x;
+            $o = new RuntimeLayoutD();
+            echo '|before';
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2:3|12|before|destruct");
+        let counters = result.counters.expect("counters");
+        assert!(counters.value_clones > 0, "{counters:?}");
+        assert!(counters.string_allocations > 0, "{counters:?}");
+        assert!(counters.array_handle_clones > 0, "{counters:?}");
+        assert!(counters.cow_separations > 0, "{counters:?}");
+        assert!(counters.reference_cell_creations > 0, "{counters:?}");
+        assert!(counters.object_allocations > 0, "{counters:?}");
     }
 
     #[test]
@@ -36789,6 +38104,69 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn function_call_inline_cache_records_polymorphic_string_callable_hits() {
+        let source = "<?php function perf_poly_call_a() { return 'A'; } function perf_poly_call_b() { return 'B'; } foreach (['perf_poly_call_a', 'perf_poly_call_b', 'perf_poly_call_a', 'perf_poly_call_b'] as $name) { echo $name(); }";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"ABAB");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.function_call_ic_hits > 0, "{counters:?}");
+        assert!(counters.function_call_ic_misses > 0, "{counters:?}");
+        assert!(counters.inline_cache_polymorphic > 0, "{counters:?}");
+        assert_eq!(counters.call_ic_megamorphic_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.inline_cache_disabled, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn function_call_inline_cache_megamorphic_string_callable_falls_back() {
+        let source = "<?php function perf_mega_call_a() { return 'A'; } function perf_mega_call_b() { return 'B'; } function perf_mega_call_c() { return 'C'; } function perf_mega_call_d() { return 'D'; } function perf_mega_call_e() { return 'E'; } foreach (['perf_mega_call_a', 'perf_mega_call_b', 'perf_mega_call_c', 'perf_mega_call_d', 'perf_mega_call_e', 'perf_mega_call_a'] as $name) { echo $name(); }";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"ABCDEA");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.function_call_ic_misses > 0, "{counters:?}");
+        assert!(counters.inline_cache_megamorphic > 0, "{counters:?}");
+        assert!(counters.call_ic_megamorphic_fallbacks > 0, "{counters:?}");
+        assert_eq!(counters.inline_cache_disabled, 0, "{counters:?}");
+    }
+
+    #[test]
     fn method_call_inline_cache_records_hot_loop_hits() {
         let source = "<?php class PerfMethodHot { public function value() { return 2; } } $object = new PerfMethodHot(); $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $object->value(); } echo $sum;";
         let off = execute_source_with_options(
@@ -36815,6 +38193,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let counters = on.counters.expect("on counters");
         assert!(counters.method_ic_hits > 0, "{counters:?}");
         assert!(counters.method_ic_misses > 0, "{counters:?}");
+        assert!(counters.method_direct_dispatch_hits > 0, "{counters:?}");
         assert_eq!(counters.method_ic_guard_failures, 0);
     }
 
@@ -36855,6 +38234,11 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let counters = on.counters.expect("on counters");
         assert!(counters.method_ic_misses > 0, "{counters:?}");
         assert!(counters.method_ic_guard_failures > 0, "{counters:?}");
+        assert!(counters.method_ic_polymorphic_hits > 0, "{counters:?}");
+        assert!(
+            counters.method_direct_dispatch_fallbacks > 0,
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -36946,6 +38330,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"28");
         let counters = result.counters.expect("counters");
+        assert!(counters.method_tiny_inline_candidates > 0, "{counters:?}");
         let profile = method_call_profile(&counters, "value");
         assert_eq!(profile.receiver_classes.len(), 1, "{profile:?}");
         assert_eq!(
@@ -37155,6 +38540,126 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(counters.property_ic_hits > 0, "{counters:?}");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
         assert_eq!(counters.property_ic_guard_failures, 0);
+    }
+
+    #[test]
+    fn property_assign_inline_cache_records_public_and_typed_hits() {
+        let source = "<?php class PerfAssignPropertyHot { public int $value = 0; } $object = new PerfAssignPropertyHot(); for ($i = 0; $i < 12; $i++) { $object->value = $i; } echo $object->value;";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"11");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_assign_ic_hits > 0, "{counters:?}");
+        assert!(counters.property_assign_ic_misses > 0, "{counters:?}");
+        assert_eq!(counters.property_assign_ic_type_exits, 0, "{counters:?}");
+        assert_eq!(
+            counters.property_assign_ic_readonly_exits, 0,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.property_assign_ic_hook_magic_exits, 0,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.property_assign_ic_reference_exits, 0,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn property_assign_inline_cache_records_required_fallback_reasons() {
+        let source = "<?php class PerfAssignTyped { public int $value = 0; } class PerfAssignDynamic {} class PerfAssignMagic { public int $seen = 0; public function __set(string $name, $value): void { $this->seen = $value; } } class PerfAssignHook { public string $name { set { $this->name = strtoupper($value); } get { return $this->name; } } } class PerfAssignPrivate { private int $value = 1; } $total = 0; $typed = new PerfAssignTyped(); try { $typed->value = 'bad'; } catch (Throwable $e) { $total += 1; } $dynamic = new PerfAssignDynamic(); $dynamic->value = 3; $total += $dynamic->value; $magic = new PerfAssignMagic(); $magic->missing = 4; $total += $magic->seen; $hook = new PerfAssignHook(); $hook->name = 'ada'; $total += strlen($hook->name); $private = new PerfAssignPrivate(); try { $private->value = 5; } catch (Throwable $e) { $total += 5; } echo $total;";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output.as_bytes(), b"16");
+        let counters = on.counters.expect("on counters");
+        assert!(counters.property_assign_ic_misses > 0, "{counters:?}");
+        assert!(
+            counters.property_assign_ic_visibility_exits > 0,
+            "{counters:?}"
+        );
+        assert!(counters.property_assign_ic_type_exits > 0, "{counters:?}");
+        assert!(
+            counters.property_assign_ic_hook_magic_exits > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters.property_assign_ic_dynamic_exits > 0,
+            "{counters:?}"
+        );
+        for reason in [
+            "visibility_mismatch",
+            "type_mismatch",
+            "property_hook_present",
+            "dynamic_property_fallback",
+            "magic_set_metadata",
+        ] {
+            assert!(
+                counters
+                    .property_assign_ic_fallback_reasons
+                    .contains_key(reason),
+                "missing {reason}: {counters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn property_assign_inline_cache_records_readonly_error_fallback() {
+        let source = "<?php class PerfAssignReadonly { public readonly int $value; public function init(): void { $this->value = 1; } } $readonly = new PerfAssignReadonly(); $readonly->init(); $readonly->value = 2;";
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(on.status.exit_status(), ExitStatus::RuntimeError);
+        assert!(
+            on.status
+                .message()
+                .is_some_and(|message| message.contains("E_PHP_VM_READONLY_PROPERTY_WRITE")),
+            "{:?}",
+            on.status
+        );
+        let counters = on.counters.expect("on counters");
+        assert!(
+            counters.property_assign_ic_readonly_exits > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .property_assign_ic_fallback_reasons
+                .contains_key("readonly_property"),
+            "{counters:?}"
+        );
     }
 
     #[test]

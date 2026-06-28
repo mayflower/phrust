@@ -7,7 +7,7 @@ use crate::{
 use std::fmt;
 
 /// Runtime value carried by the VM.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub enum Value {
     /// PHP null.
     Null,
@@ -36,6 +36,27 @@ pub enum Value {
     /// Reference cell exposed as a value only for explicit future reference
     /// operations. Ordinary local aliasing should use `ValueSlot`.
     Reference(ReferenceCell),
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        crate::layout_stats::record_value_clone();
+        match self {
+            Self::Null => Self::Null,
+            Self::Bool(value) => Self::Bool(*value),
+            Self::Int(value) => Self::Int(*value),
+            Self::Float(value) => Self::Float(*value),
+            Self::String(value) => Self::String(value.clone()),
+            Self::Uninitialized => Self::Uninitialized,
+            Self::Array(value) => Self::Array(value.clone()),
+            Self::Object(value) => Self::Object(value.clone()),
+            Self::Resource(value) => Self::Resource(value.clone()),
+            Self::Fiber(value) => Self::Fiber(value.clone()),
+            Self::Generator(value) => Self::Generator(value.clone()),
+            Self::Callable(value) => Self::Callable(value.clone()),
+            Self::Reference(value) => Self::Reference(value.clone()),
+        }
+    }
 }
 
 /// Equatable wrapper around an `f64` bit pattern.

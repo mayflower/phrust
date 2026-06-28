@@ -143,6 +143,8 @@ for sample in off + on:
             raise SystemExit(f"[fail] quickening protocol counter missing from sample: {field}")
     if "string_concat_fast_path_hits" not in sample or "string_concat_fast_path_misses" not in sample:
         raise SystemExit("[fail] string concat fast-path counters missing from sample")
+    if "concat_prealloc_hits" not in sample or "concat_fallback_by_reason" not in sample:
+        raise SystemExit("[fail] concat prealloc/fallback counters missing from sample")
     if "packed_dim_fast_path_hits" not in sample or "packed_dim_fast_path_misses" not in sample:
         raise SystemExit("[fail] packed dim fast-path counters missing from sample")
     for field in [
@@ -152,6 +154,8 @@ for sample in off + on:
         "packed_append_fast_hits",
         "packed_foreach_fast_hits",
         "cow_or_reference_fallbacks",
+        "array_fast_path_hits_by_family",
+        "array_fast_path_fallback_by_reason",
     ]:
         if field not in sample:
             raise SystemExit(f"[fail] packed-array fast-path counter missing from sample: {field}")
@@ -166,6 +170,14 @@ on_packed_hits = sum(sample.get("packed_dim_fast_path_hits", 0) for sample in on
 on_packed_fetch_hits = sum(sample.get("packed_fetch_fast_hits", 0) for sample in on)
 on_packed_append_hits = sum(sample.get("packed_append_fast_hits", 0) for sample in on)
 on_packed_foreach_hits = sum(sample.get("packed_foreach_fast_hits", 0) for sample in on)
+on_array_family_hits = sum(
+    sample.get("array_fast_path_hits_by_family", {}).get("packed_int_fetch", 0)
+    for sample in on
+)
+on_numeric_string_key_fallbacks = sum(
+    sample.get("array_fast_path_fallback_by_reason", {}).get("numeric_string_key", 0)
+    for sample in on
+)
 on_guard_failures = sum(sample.get("quickening_guard_failures", 0) for sample in on)
 on_fallback_calls = sum(sample.get("quickening_fallback_calls", 0) for sample in on)
 on_dequickens = sum(sample.get("quickening_dequickens", 0) for sample in on)
@@ -195,8 +207,14 @@ if on_packed_append_hits <= 0:
     raise SystemExit("[fail] quickening=on recorded no packed_append_fast_hits")
 if on_packed_foreach_hits <= 0:
     raise SystemExit("[fail] quickening=on recorded no packed_foreach_fast_hits")
-if on_guard_failures != 0:
-    raise SystemExit(f"[fail] quickening recorded guard failures: {on_guard_failures}")
+if on_array_family_hits <= 0:
+    raise SystemExit("[fail] quickening=on recorded no packed_int_fetch array family hits")
+if on_numeric_string_key_fallbacks <= 0:
+    raise SystemExit("[fail] quickening=on recorded no numeric_string_key array fallback")
+if on_guard_failures != on_numeric_string_key_fallbacks:
+    raise SystemExit(
+        f"[fail] quickening guard failures {on_guard_failures} != numeric-string key fallbacks {on_numeric_string_key_fallbacks}"
+    )
 if on_fallback_calls != on_guard_misses:
     raise SystemExit(f"[fail] quickening fallback calls {on_fallback_calls} != guard misses {on_guard_misses}")
 if on_dequickens != 0:

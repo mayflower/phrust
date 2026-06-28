@@ -11,6 +11,10 @@ pub struct OutputStats {
     pub appends: u64,
     /// Writes that appended more than one slice after one reserve.
     pub batch_writes: u64,
+    /// Fast-path appends that batched adjacent exact-output slices.
+    pub batched_appends: u64,
+    /// Exact bytes written by batched adjacent-output appends.
+    pub batch_bytes: u64,
     /// Active output-buffer flushes into a parent or root buffer.
     pub flushes: u64,
     /// Appends that used a VM-proven exact-output fast path.
@@ -113,6 +117,8 @@ impl OutputBuffer {
             > 1
         {
             self.stats.batch_writes += 1;
+            self.stats.batched_appends += 1;
+            self.stats.batch_bytes += total as u64;
         }
         if let Some(buffer) = self.stack.last_mut() {
             buffer.reserve(total);
@@ -261,6 +267,8 @@ mod tests {
         assert_eq!(output.as_bytes(), b"roota");
         assert_eq!(output.stats().appends, 4);
         assert_eq!(output.stats().batch_writes, 0);
+        assert_eq!(output.stats().batched_appends, 0);
+        assert_eq!(output.stats().batch_bytes, 0);
         assert_eq!(output.stats().flushes, 1);
         assert_eq!(output.stats().fast_appends, 0);
         assert!(output.stats().slow_appends_by_reason.is_empty());
@@ -275,6 +283,8 @@ mod tests {
         assert_eq!(output.as_bytes(), b"abc");
         assert_eq!(output.stats().appends, 1);
         assert_eq!(output.stats().batch_writes, 1);
+        assert_eq!(output.stats().batched_appends, 1);
+        assert_eq!(output.stats().batch_bytes, 3);
         assert_eq!(output.stats().flushes, 0);
     }
 
@@ -290,6 +300,8 @@ mod tests {
         assert_eq!(output.as_bytes(), b"abc");
         assert_eq!(output.stats().appends, 2);
         assert_eq!(output.stats().batch_writes, 1);
+        assert_eq!(output.stats().batched_appends, 1);
+        assert_eq!(output.stats().batch_bytes, 2);
         assert_eq!(output.stats().fast_appends, 2);
         assert_eq!(
             output

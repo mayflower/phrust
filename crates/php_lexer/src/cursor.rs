@@ -42,6 +42,10 @@ impl<'src> Cursor<'src> {
         self.offset += 1;
         Some(byte)
     }
+
+    pub(crate) fn advance_by(&mut self, len: usize) {
+        self.offset = self.offset.saturating_add(len).min(self.source.len());
+    }
 }
 
 #[cfg(test)]
@@ -70,5 +74,16 @@ mod tests {
         assert!(!cursor.starts_with(b"?>"));
         assert_eq!(cursor.bump(), Some(b'<'));
         assert!(cursor.starts_with(b"?php"));
+    }
+
+    #[test]
+    fn cursor_advances_by_byte_count_without_decoding() {
+        let mut cursor = Cursor::new("éabc");
+        cursor.advance_by(1);
+        assert_eq!(cursor.position(), 1);
+        assert_eq!(cursor.peek(), Some(0xa9));
+        cursor.advance_by(99);
+        assert_eq!(cursor.position(), cursor.len());
+        assert!(cursor.is_eof());
     }
 }

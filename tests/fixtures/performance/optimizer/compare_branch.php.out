@@ -1,0 +1,3 @@
+compare:lt
+compare:strict
+compare:spaceship:-1

@@ -70,6 +70,7 @@ pub enum InlineCacheKind {
     FunctionCall,
     MethodCall,
     PropertyFetch,
+    PropertyAssign,
     ClassConstantStaticProperty,
     IncludePath,
     AutoloadClassLookup,
@@ -83,6 +84,7 @@ impl InlineCacheKind {
             Self::FunctionCall => "function_call",
             Self::MethodCall => "method_call",
             Self::PropertyFetch => "property_fetch",
+            Self::PropertyAssign => "property_assign",
             Self::ClassConstantStaticProperty => "class_constant_static_property",
             Self::IncludePath => "include_path",
             Self::AutoloadClassLookup => "autoload_class_lookup",
@@ -161,51 +163,83 @@ pub struct FunctionCallBuiltinMetadata {
     pub version: u32,
 }
 
+/// One guarded function-call target in a polymorphic IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCallPolymorphicEntry {
+    pub lowered_name: String,
+    pub epoch: InvalidationEpoch,
+    pub shape: FunctionCallShape,
+    pub builtin_metadata: Option<FunctionCallBuiltinMetadata>,
+    pub target: FunctionCallCacheTarget,
+}
+
+/// Guarded argument metadata for a method-call IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodCallShape {
+    pub arity: u32,
+    pub named_arguments: Vec<String>,
+    pub by_ref_arguments: Vec<bool>,
+}
+
+/// Stable method and receiver metadata guarded by a method-call IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodCallGuardMetadata {
+    pub receiver_class_id: u32,
+    pub class_layout_epoch: u64,
+    pub method_table_epoch: u64,
+    pub method_slot_index: Option<u32>,
+    pub visibility_context: Option<String>,
+    pub method_is_final: bool,
+    pub method_is_private: bool,
+    pub method_is_static: bool,
+    pub receiver_has_override: bool,
+    pub argument_shape: MethodCallShape,
+    pub by_ref_compatible: bool,
+    pub has_magic_call: bool,
+}
+
+/// Resolved method-call target payload kept out of interpreter stack frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodCallResolvedTarget {
+    pub receiver_class: String,
+    pub declaring_class: String,
+    pub function: FunctionId,
+    pub guard: MethodCallGuardMetadata,
+}
+
 /// Resolution target cached by a method-call IC slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MethodCallCacheTarget {
     CurrentUnit {
-        receiver_class: String,
-        receiver_class_id: u32,
-        declaring_class: String,
-        function: FunctionId,
+        target: Box<MethodCallResolvedTarget>,
     },
     DynamicUnit {
         unit_index: usize,
-        receiver_class: String,
-        receiver_class_id: u32,
-        declaring_class: String,
-        function: FunctionId,
+        target: Box<MethodCallResolvedTarget>,
     },
 }
 
 impl MethodCallCacheTarget {
     #[must_use]
+    pub fn resolved_target(&self) -> &MethodCallResolvedTarget {
+        match self {
+            Self::CurrentUnit { target } | Self::DynamicUnit { target, .. } => target.as_ref(),
+        }
+    }
+
+    #[must_use]
     pub fn receiver_class(&self) -> &str {
-        match self {
-            Self::CurrentUnit { receiver_class, .. } | Self::DynamicUnit { receiver_class, .. } => {
-                receiver_class
-            }
-        }
+        &self.resolved_target().receiver_class
     }
 
     #[must_use]
-    pub const fn receiver_class_id(&self) -> u32 {
-        match self {
-            Self::CurrentUnit {
-                receiver_class_id, ..
-            }
-            | Self::DynamicUnit {
-                receiver_class_id, ..
-            } => *receiver_class_id,
-        }
+    pub fn receiver_class_id(&self) -> u32 {
+        self.resolved_target().guard.receiver_class_id
     }
 
     #[must_use]
-    pub const fn function(&self) -> FunctionId {
-        match self {
-            Self::CurrentUnit { function, .. } | Self::DynamicUnit { function, .. } => *function,
-        }
+    pub fn function(&self) -> FunctionId {
+        self.resolved_target().function
     }
 }
 
@@ -219,6 +253,21 @@ pub struct PropertyFetchLayoutMetadata {
     pub typed_property_initialized: bool,
     pub has_property_hooks: bool,
     pub has_magic_get: bool,
+    pub dynamic_property_fallback: bool,
+}
+
+/// Stable layout and write-policy metadata guarded by a property-assignment IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyAssignLayoutMetadata {
+    pub class_id: u32,
+    pub layout_version: u64,
+    pub property_slot_index: Option<u32>,
+    pub visibility_context: Option<String>,
+    pub typed_property: bool,
+    pub readonly_or_init_only: bool,
+    pub reference_slot: bool,
+    pub has_property_hooks: bool,
+    pub has_magic_set: bool,
     pub dynamic_property_fallback: bool,
 }
 
@@ -263,6 +312,37 @@ impl PropertyFetchCacheTarget {
     }
 }
 
+/// Resolved property-assignment target payload kept out of interpreter stack frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyAssignResolvedTarget {
+    pub receiver_class: String,
+    pub declaring_class: String,
+    pub property: String,
+    pub storage_name: String,
+    pub layout: PropertyAssignLayoutMetadata,
+}
+
+/// Resolution target cached by a property-assignment IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PropertyAssignCacheTarget {
+    CurrentUnit {
+        target: Box<PropertyAssignResolvedTarget>,
+    },
+    DynamicUnit {
+        unit_index: usize,
+        target: Box<PropertyAssignResolvedTarget>,
+    },
+}
+
+impl PropertyAssignCacheTarget {
+    #[must_use]
+    pub fn resolved_target(&self) -> &PropertyAssignResolvedTarget {
+        match self {
+            Self::CurrentUnit { target } | Self::DynamicUnit { target, .. } => target.as_ref(),
+        }
+    }
+}
+
 /// One guarded method-call target in a polymorphic IC slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MethodCallPolymorphicEntry {
@@ -281,6 +361,16 @@ pub struct PropertyFetchPolymorphicEntry {
     pub scope: Option<String>,
     pub epoch: InvalidationEpoch,
     pub target: PropertyFetchCacheTarget,
+}
+
+/// One guarded property-assignment target in a polymorphic IC slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyAssignPolymorphicEntry {
+    pub property: String,
+    pub receiver_class: String,
+    pub scope: Option<String>,
+    pub epoch: InvalidationEpoch,
+    pub target: PropertyAssignCacheTarget,
 }
 
 /// Sub-kind cached in the shared class-constant/static-property IC family.
@@ -378,6 +468,7 @@ pub struct InlineCacheSlot {
     pub function_call_shape: Option<FunctionCallShape>,
     pub function_call_builtin_metadata: Option<FunctionCallBuiltinMetadata>,
     pub function_call_target: Option<FunctionCallCacheTarget>,
+    pub function_call_polymorphic_entries: Vec<FunctionCallPolymorphicEntry>,
     pub method_call_name: Option<String>,
     pub method_call_receiver_class: Option<String>,
     pub method_call_scope: Option<String>,
@@ -388,6 +479,11 @@ pub struct InlineCacheSlot {
     pub property_fetch_scope: Option<String>,
     pub property_fetch_target: Option<PropertyFetchCacheTarget>,
     pub property_fetch_polymorphic_entries: Vec<PropertyFetchPolymorphicEntry>,
+    pub property_assign_name: Option<String>,
+    pub property_assign_receiver_class: Option<String>,
+    pub property_assign_scope: Option<String>,
+    pub property_assign_target: Option<PropertyAssignCacheTarget>,
+    pub property_assign_polymorphic_entries: Vec<PropertyAssignPolymorphicEntry>,
     pub class_static_kind: Option<ClassConstantStaticPropertyCacheKind>,
     pub class_static_resolved_class: Option<String>,
     pub class_static_member: Option<String>,
@@ -597,13 +693,37 @@ fn clear_slot_targets(slot: &mut InlineCacheSlot) {
     slot.function_call_shape = None;
     slot.function_call_builtin_metadata = None;
     slot.function_call_target = None;
+    slot.function_call_polymorphic_entries.clear();
     slot.method_call_target = None;
     slot.method_call_polymorphic_entries.clear();
     slot.property_fetch_target = None;
     slot.property_fetch_polymorphic_entries.clear();
+    slot.property_assign_target = None;
+    slot.property_assign_polymorphic_entries.clear();
     slot.class_static_target = None;
     slot.include_path_target = None;
     slot.autoload_class_lookup_target = None;
+}
+
+fn sync_function_call_primary(slot: &mut InlineCacheSlot) {
+    let Some(first) = slot.function_call_polymorphic_entries.first() else {
+        slot.state = InlineCacheState::Cold;
+        slot.function_call_name = None;
+        slot.function_call_shape = None;
+        slot.function_call_builtin_metadata = None;
+        slot.function_call_target = None;
+        return;
+    };
+    slot.state = if slot.function_call_polymorphic_entries.len() == 1 {
+        InlineCacheState::Monomorphic
+    } else {
+        InlineCacheState::Polymorphic
+    };
+    slot.epoch = first.epoch;
+    slot.function_call_name = Some(first.lowered_name.clone());
+    slot.function_call_shape = Some(first.shape.clone());
+    slot.function_call_builtin_metadata = first.builtin_metadata.clone();
+    slot.function_call_target = Some(first.target.clone());
 }
 
 fn method_guard_matches(
@@ -683,6 +803,7 @@ impl InlineCacheTable {
                 function_call_shape: None,
                 function_call_builtin_metadata: None,
                 function_call_target: None,
+                function_call_polymorphic_entries: Vec::new(),
                 method_call_name: None,
                 method_call_receiver_class: None,
                 method_call_scope: None,
@@ -693,6 +814,11 @@ impl InlineCacheTable {
                 property_fetch_scope: None,
                 property_fetch_target: None,
                 property_fetch_polymorphic_entries: Vec::new(),
+                property_assign_name: None,
+                property_assign_receiver_class: None,
+                property_assign_scope: None,
+                property_assign_target: None,
+                property_assign_polymorphic_entries: Vec::new(),
                 class_static_kind: None,
                 class_static_resolved_class: None,
                 class_static_member: None,
@@ -736,6 +862,36 @@ impl InlineCacheTable {
         self.slots.get(&key)?.function_call_target.clone()
     }
 
+    #[must_use]
+    pub fn peek_function_call_builtin_metadata(
+        &self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        lowered_name: &str,
+        shape: &FunctionCallShape,
+    ) -> Option<FunctionCallBuiltinMetadata> {
+        let key = inline_cache_key(
+            unit_key,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::FunctionCall,
+        );
+        let slot = self.slots.get(&key)?;
+        slot.function_call_polymorphic_entries
+            .iter()
+            .find(|entry| entry.lowered_name == lowered_name && entry.shape == *shape)
+            .and_then(|entry| entry.builtin_metadata.clone())
+            .or_else(|| {
+                (slot.function_call_name.as_deref() == Some(lowered_name)
+                    && slot.function_call_shape.as_ref() == Some(shape))
+                .then(|| slot.function_call_builtin_metadata.clone())
+                .flatten()
+            })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
@@ -772,6 +928,62 @@ impl InlineCacheTable {
                 None,
                 with_kind(InlineCacheKind::FunctionCall, disabled_slot_observation()),
             );
+        }
+        if slot.state == InlineCacheState::Megamorphic {
+            return (
+                None,
+                with_kind(
+                    InlineCacheKind::FunctionCall,
+                    megamorphic_slot_observation(),
+                ),
+            );
+        }
+        if !slot.function_call_polymorphic_entries.is_empty() {
+            if let Some(index) = slot
+                .function_call_polymorphic_entries
+                .iter()
+                .position(|entry| {
+                    entry.lowered_name == lowered_name
+                        && entry.shape == *shape
+                        && entry.builtin_metadata.as_ref() == builtin_metadata
+                })
+            {
+                let entry_epoch = slot.function_call_polymorphic_entries[index].epoch;
+                if entry_epoch != epoch {
+                    let observation = record_slot_invalidation(slot);
+                    return (None, with_kind(InlineCacheKind::FunctionCall, observation));
+                }
+                let target = slot.function_call_polymorphic_entries[index].target.clone();
+                let observation = record_slot_hit(slot);
+                return (
+                    Some(target),
+                    with_kind(InlineCacheKind::FunctionCall, observation),
+                );
+            }
+            let same_name = slot
+                .function_call_polymorphic_entries
+                .iter()
+                .any(|entry| entry.lowered_name == lowered_name);
+            let same_name_and_shape = slot
+                .function_call_polymorphic_entries
+                .iter()
+                .any(|entry| entry.lowered_name == lowered_name && entry.shape == *shape);
+            let observation = if same_name {
+                record_slot_guard_failure(slot)
+            } else if slot.function_call_polymorphic_entries.len() < POLYMORPHIC_INLINE_CACHE_LIMIT
+            {
+                record_slot_miss(slot)
+            } else {
+                let mut observation = record_slot_miss(slot);
+                mark_slot_megamorphic(slot);
+                observation.megamorphic = true;
+                observation
+            };
+            if same_name_and_shape && !observation.guard_failure && !observation.megamorphic {
+                let observation = record_slot_guard_failure(slot);
+                return (None, with_kind(InlineCacheKind::FunctionCall, observation));
+            }
+            return (None, with_kind(InlineCacheKind::FunctionCall, observation));
         }
         let Some(cached_name) = slot.function_call_name.as_deref() else {
             let observation = record_slot_miss(slot);
@@ -828,15 +1040,37 @@ impl InlineCacheTable {
             InlineCacheKind::FunctionCall,
         );
         if let Some(slot) = self.slots.get_mut(&key) {
-            if slot.state == InlineCacheState::Disabled {
+            if matches!(
+                slot.state,
+                InlineCacheState::Disabled | InlineCacheState::Megamorphic
+            ) {
                 return;
             }
-            slot.state = InlineCacheState::Monomorphic;
-            slot.epoch = epoch;
-            slot.function_call_name = Some(lowered_name.to_owned());
-            slot.function_call_shape = Some(shape);
-            slot.function_call_builtin_metadata = builtin_metadata;
-            slot.function_call_target = Some(target);
+            let new_entry = FunctionCallPolymorphicEntry {
+                lowered_name: lowered_name.to_owned(),
+                epoch,
+                shape,
+                builtin_metadata,
+                target,
+            };
+            if let Some(index) = slot
+                .function_call_polymorphic_entries
+                .iter()
+                .position(|entry| {
+                    entry.lowered_name == new_entry.lowered_name
+                        && entry.shape == new_entry.shape
+                        && entry.builtin_metadata == new_entry.builtin_metadata
+                })
+            {
+                slot.function_call_polymorphic_entries[index] = new_entry;
+            } else {
+                if slot.function_call_polymorphic_entries.len() >= POLYMORPHIC_INLINE_CACHE_LIMIT {
+                    mark_slot_megamorphic(slot);
+                    return;
+                }
+                slot.function_call_polymorphic_entries.push(new_entry);
+            }
+            sync_function_call_primary(slot);
         }
     }
 
@@ -1288,6 +1522,255 @@ impl InlineCacheTable {
         clippy::too_many_arguments,
         reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
     )]
+    pub fn lookup_property_assign(
+        &mut self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> (Option<PropertyAssignCacheTarget>, InlineCacheObservation) {
+        let key = inline_cache_key(
+            unit_key,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::PropertyAssign,
+        );
+        let Some(slot) = self.slots.get_mut(&key) else {
+            return (
+                None,
+                with_kind(
+                    InlineCacheKind::PropertyAssign,
+                    InlineCacheObservation::miss(),
+                ),
+            );
+        };
+        if slot.state == InlineCacheState::Disabled {
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, disabled_slot_observation()),
+            );
+        }
+        if slot.state == InlineCacheState::Megamorphic {
+            return (
+                None,
+                with_kind(
+                    InlineCacheKind::PropertyAssign,
+                    megamorphic_slot_observation(),
+                ),
+            );
+        }
+        if !slot.property_assign_polymorphic_entries.is_empty() {
+            if let Some(index) = slot
+                .property_assign_polymorphic_entries
+                .iter()
+                .position(|entry| {
+                    property_guard_matches(
+                        property,
+                        &entry.property,
+                        receiver_class,
+                        &entry.receiver_class,
+                        scope,
+                        entry.scope.as_deref(),
+                    )
+                })
+            {
+                let entry_epoch = slot.property_assign_polymorphic_entries[index].epoch;
+                if entry_epoch != epoch {
+                    let observation = record_slot_invalidation(slot);
+                    return (
+                        None,
+                        with_kind(InlineCacheKind::PropertyAssign, observation),
+                    );
+                }
+                let target = slot.property_assign_polymorphic_entries[index]
+                    .target
+                    .clone();
+                let observation = record_slot_hit(slot);
+                return (
+                    Some(target),
+                    with_kind(InlineCacheKind::PropertyAssign, observation),
+                );
+            }
+            let same_property_and_scope =
+                slot.property_assign_polymorphic_entries
+                    .iter()
+                    .any(|entry| {
+                        entry.property == property
+                            && property_scope_matches(entry.scope.as_deref(), scope)
+                    });
+            let observation = if same_property_and_scope
+                && slot.property_assign_polymorphic_entries.len() < POLYMORPHIC_INLINE_CACHE_LIMIT
+            {
+                record_slot_miss(slot)
+            } else {
+                record_slot_guard_failure(slot)
+            };
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, observation),
+            );
+        }
+        let Some(cached_property) = slot.property_assign_name.as_deref() else {
+            let observation = record_slot_miss(slot);
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, observation),
+            );
+        };
+        let cached_receiver = slot.property_assign_receiver_class.as_deref();
+        let cached_scope = slot.property_assign_scope.as_deref();
+        if !property_guard_matches(
+            property,
+            cached_property,
+            receiver_class,
+            cached_receiver.unwrap_or_default(),
+            scope,
+            cached_scope,
+        ) {
+            let observation = record_slot_guard_failure(slot);
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, observation),
+            );
+        }
+        if slot.epoch != epoch {
+            let observation = record_slot_invalidation(slot);
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, observation),
+            );
+        }
+        let Some(target) = slot.property_assign_target.clone() else {
+            let observation = record_slot_miss(slot);
+            return (
+                None,
+                with_kind(InlineCacheKind::PropertyAssign, observation),
+            );
+        };
+        let observation = record_slot_hit(slot);
+        (
+            Some(target),
+            with_kind(InlineCacheKind::PropertyAssign, observation),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache install APIs take the complete cache key and target metadata explicitly"
+    )]
+    pub fn install_property_assign(
+        &mut self,
+        unit_key: u64,
+        function: FunctionId,
+        block: BlockId,
+        instruction: InstrId,
+        property: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+        target: PropertyAssignCacheTarget,
+    ) {
+        let key = inline_cache_key(
+            unit_key,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::PropertyAssign,
+        );
+        if let Some(slot) = self.slots.get_mut(&key) {
+            if matches!(
+                slot.state,
+                InlineCacheState::Disabled | InlineCacheState::Megamorphic
+            ) {
+                return;
+            }
+            let new_entry = PropertyAssignPolymorphicEntry {
+                property: property.to_owned(),
+                receiver_class: receiver_class.to_owned(),
+                scope: scope.map(str::to_owned),
+                epoch,
+                target,
+            };
+            if let Some(index) = slot
+                .property_assign_polymorphic_entries
+                .iter()
+                .position(|entry| {
+                    property_guard_matches(
+                        property,
+                        &entry.property,
+                        receiver_class,
+                        &entry.receiver_class,
+                        scope,
+                        entry.scope.as_deref(),
+                    )
+                })
+            {
+                slot.property_assign_polymorphic_entries[index] = new_entry;
+                slot.state = InlineCacheState::Polymorphic;
+                return;
+            }
+            if let (Some(cached_property), Some(cached_receiver), Some(cached_target)) = (
+                slot.property_assign_name.as_deref(),
+                slot.property_assign_receiver_class.as_deref(),
+                slot.property_assign_target.clone(),
+            ) {
+                if !property_guard_matches(
+                    property,
+                    cached_property,
+                    receiver_class,
+                    cached_receiver,
+                    scope,
+                    slot.property_assign_scope.as_deref(),
+                ) {
+                    if slot.property_assign_polymorphic_entries.is_empty() {
+                        slot.property_assign_polymorphic_entries.push(
+                            PropertyAssignPolymorphicEntry {
+                                property: cached_property.to_owned(),
+                                receiver_class: cached_receiver.to_owned(),
+                                scope: slot.property_assign_scope.clone(),
+                                epoch: slot.epoch,
+                                target: cached_target,
+                            },
+                        );
+                    }
+                    if slot.property_assign_polymorphic_entries.len()
+                        >= POLYMORPHIC_INLINE_CACHE_LIMIT
+                    {
+                        mark_slot_megamorphic(slot);
+                        return;
+                    }
+                    slot.property_assign_polymorphic_entries.push(new_entry);
+                    slot.state = InlineCacheState::Polymorphic;
+                    return;
+                }
+            } else if !slot.property_assign_polymorphic_entries.is_empty() {
+                if slot.property_assign_polymorphic_entries.len() >= POLYMORPHIC_INLINE_CACHE_LIMIT
+                {
+                    mark_slot_megamorphic(slot);
+                    return;
+                }
+                slot.property_assign_polymorphic_entries.push(new_entry);
+                slot.state = InlineCacheState::Polymorphic;
+                return;
+            }
+            slot.state = InlineCacheState::Monomorphic;
+            slot.epoch = epoch;
+            slot.property_assign_name = Some(property.to_owned());
+            slot.property_assign_receiver_class = Some(receiver_class.to_owned());
+            slot.property_assign_scope = scope.map(str::to_owned);
+            slot.property_assign_target = Some(new_entry.target);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline cache lookup APIs take the complete cache key and guard metadata explicitly"
+    )]
     pub fn lookup_class_constant_static_property(
         &mut self,
         unit_key: u64,
@@ -1678,6 +2161,7 @@ pub fn inline_cache_kind_for_instruction(kind: &InstructionKind) -> Option<Inlin
             Some(InlineCacheKind::MethodCall)
         }
         InstructionKind::FetchProperty { .. } => Some(InlineCacheKind::PropertyFetch),
+        InstructionKind::AssignProperty { .. } => Some(InlineCacheKind::PropertyAssign),
         InstructionKind::FetchStaticProperty { .. }
         | InstructionKind::FetchClassConstant { .. } => {
             Some(InlineCacheKind::ClassConstantStaticProperty)
@@ -1717,7 +2201,8 @@ mod tests {
         ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind,
         FunctionCallBuiltinMetadata, FunctionCallCacheTarget, FunctionCallShape,
         IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind, InlineCacheState,
-        InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget, PropertyFetchCacheTarget,
+        InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget, MethodCallGuardMetadata,
+        MethodCallResolvedTarget, MethodCallShape, PropertyFetchCacheTarget,
         PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
     };
     use crate::include::IncludePathFileFingerprint;
@@ -1729,6 +2214,40 @@ mod tests {
             arity,
             named_arguments: Vec::new(),
             by_ref_arguments: vec![false; arity as usize],
+        }
+    }
+
+    fn method_target(
+        receiver_class: &str,
+        receiver_class_id: u32,
+        declaring_class: &str,
+        function: FunctionId,
+        epoch: InvalidationEpoch,
+    ) -> MethodCallCacheTarget {
+        MethodCallCacheTarget::CurrentUnit {
+            target: Box::new(MethodCallResolvedTarget {
+                receiver_class: receiver_class.to_owned(),
+                declaring_class: declaring_class.to_owned(),
+                function,
+                guard: MethodCallGuardMetadata {
+                    receiver_class_id,
+                    class_layout_epoch: epoch.raw(),
+                    method_table_epoch: epoch.raw(),
+                    method_slot_index: Some(0),
+                    visibility_context: None,
+                    method_is_final: false,
+                    method_is_private: false,
+                    method_is_static: false,
+                    receiver_has_override: false,
+                    argument_shape: MethodCallShape {
+                        arity: 0,
+                        named_arguments: Vec::new(),
+                        by_ref_arguments: Vec::new(),
+                    },
+                    by_ref_compatible: true,
+                    has_magic_call: false,
+                },
+            }),
         }
     }
 
@@ -1985,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_cache_type_changes_reach_megamorphic_then_disabled() {
+    fn function_call_cache_type_changes_reach_capped_megamorphic_fallback() {
         let function = FunctionId::new(0);
         let block = BlockId::new(0);
         let instruction = InstrId::new(0);
@@ -2011,7 +2530,6 @@ mod tests {
         );
 
         let mut saw_megamorphic = false;
-        let mut saw_disabled = false;
         for name in ["perf_fn_b", "perf_fn_c", "perf_fn_d", "perf_fn_e"] {
             let (target, event) = table.lookup_function_call(
                 7,
@@ -2024,10 +2542,9 @@ mod tests {
                 None,
             );
             assert!(target.is_none());
-            assert!(event.guard_failure);
             assert!(event.fallback_call);
             saw_megamorphic |= event.megamorphic;
-            saw_disabled |= event.disabled;
+            assert!(!event.disabled);
             table.install_function_call(
                 7,
                 function,
@@ -2043,13 +2560,64 @@ mod tests {
 
         let slot = table.slots.values().next().expect("slot");
         assert!(saw_megamorphic);
-        assert!(saw_disabled);
-        assert_eq!(slot.state, InlineCacheState::Disabled);
-        assert_eq!(slot.stats.guard_failures, 4);
+        assert_eq!(slot.state, InlineCacheState::Megamorphic);
+        assert_eq!(slot.stats.guard_failures, 0);
         assert_eq!(slot.stats.protocol.fallback_calls, 4);
         assert_eq!(slot.stats.megamorphic_transitions, 1);
-        assert_eq!(slot.stats.disabled_transitions, 1);
+        assert_eq!(slot.stats.disabled_transitions, 0);
         assert!(slot.function_call_target.is_none());
+    }
+
+    #[test]
+    fn function_call_cache_hits_polymorphic_entries_before_cap() {
+        let function = FunctionId::new(0);
+        let block = BlockId::new(0);
+        let instruction = InstrId::new(0);
+        let mut table = InlineCacheTable::default();
+
+        table.observe_slot(
+            7,
+            function,
+            block,
+            instruction,
+            InlineCacheKind::FunctionCall,
+        );
+        for (index, name) in ["perf_fn_a", "perf_fn_b"].iter().enumerate() {
+            table.install_function_call(
+                7,
+                function,
+                block,
+                instruction,
+                name,
+                InvalidationEpoch::new(1),
+                positional_shape(0),
+                None,
+                FunctionCallCacheTarget::CurrentUnit {
+                    function: FunctionId::new(index as u32),
+                },
+            );
+        }
+
+        let (target, event) = table.lookup_function_call(
+            7,
+            function,
+            block,
+            instruction,
+            "perf_fn_b",
+            InvalidationEpoch::new(1),
+            &positional_shape(0),
+            None,
+        );
+
+        assert_eq!(
+            target,
+            Some(FunctionCallCacheTarget::CurrentUnit {
+                function: FunctionId::new(1)
+            })
+        );
+        assert!(event.hit);
+        assert!(event.polymorphic);
+        assert!(!event.guard_failure);
     }
 
     #[test]
@@ -2069,12 +2637,13 @@ mod tests {
             "performancemethod",
             Some("performancecaller"),
             InvalidationEpoch::new(4),
-            MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "performancemethod".to_owned(),
-                receiver_class_id: 7,
-                declaring_class: "PerfMethod".to_owned(),
+            method_target(
+                "performancemethod",
+                7,
+                "PerfMethod",
                 function,
-            },
+                InvalidationEpoch::new(4),
+            ),
         );
         let (target, event) = table.lookup_method_call(
             9,
@@ -2110,12 +2679,13 @@ mod tests {
             "performancemethoda",
             None,
             InvalidationEpoch::new(4),
-            MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "performancemethoda".to_owned(),
-                receiver_class_id: 7,
-                declaring_class: "PerfMethodA".to_owned(),
+            method_target(
+                "performancemethoda",
+                7,
+                "PerfMethodA",
                 function,
-            },
+                InvalidationEpoch::new(4),
+            ),
         );
         let (target, event) = table.lookup_method_call(
             9,
@@ -2151,12 +2721,13 @@ mod tests {
             "performancemethod",
             None,
             InvalidationEpoch::new(4),
-            MethodCallCacheTarget::CurrentUnit {
-                receiver_class: "performancemethod".to_owned(),
-                receiver_class_id: 7,
-                declaring_class: "PerfMethod".to_owned(),
+            method_target(
+                "performancemethod",
+                7,
+                "PerfMethod",
                 function,
-            },
+                InvalidationEpoch::new(4),
+            ),
         );
         let (target, event) = table.lookup_method_call(
             9,
@@ -2196,12 +2767,13 @@ mod tests {
                 receiver,
                 None,
                 InvalidationEpoch::new(4),
-                MethodCallCacheTarget::CurrentUnit {
-                    receiver_class: receiver.to_owned(),
-                    receiver_class_id: function_id.raw(),
-                    declaring_class: receiver.to_owned(),
-                    function: function_id,
-                },
+                method_target(
+                    receiver,
+                    function_id.raw(),
+                    receiver,
+                    function_id,
+                    InvalidationEpoch::new(4),
+                ),
             );
         }
 
@@ -2249,12 +2821,7 @@ mod tests {
                 receiver,
                 None,
                 InvalidationEpoch::new(4),
-                MethodCallCacheTarget::CurrentUnit {
-                    receiver_class: receiver.to_owned(),
-                    receiver_class_id: 7,
-                    declaring_class: receiver.to_owned(),
-                    function,
-                },
+                method_target(receiver, 7, receiver, function, InvalidationEpoch::new(4)),
             );
         }
 

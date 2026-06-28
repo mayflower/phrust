@@ -8,6 +8,7 @@
 //! This crate intentionally contains no PHP lexer, parser, AST, CST, VM, or
 //! runtime implementation.
 
+pub mod byte_kernel;
 mod line_index;
 mod span;
 

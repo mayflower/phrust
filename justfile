@@ -56,6 +56,7 @@ help:
       '  just perf-flag-matrix     Run performance flag A/B matrix' \
       '  just cache-roundtrip      Run bytecode-cache roundtrip gate' \
       '  just optimizer-diff       Run optimizer differential gate' \
+      '  just superinstruction-patterns Mine dense opcode pairs/triples' \
       '  just quickening-smoke     Run quickening smoke gate' \
       '  just inline-cache-smoke   Run inline-cache smoke gate' \
       '  just jit-smoke            Run default-off JIT smoke gate' \
@@ -63,6 +64,7 @@ help:
       '  just release-benchmark-smoke Run production release performance smoke' \
       '  just pgo-benchmark-smoke  Run optional PGO performance smoke' \
       '  just bolt-benchmark-smoke Run optional Linux BOLT performance smoke' \
+      '  just fastest-hotpath-report Generate fastest-engine hotpath report' \
       '  just perf-report          Generate performance report' \
       '' \
       'PHPT:' \
@@ -261,6 +263,7 @@ verify-performance:
     @just framework-smoke
     @just release-benchmark-smoke
     @just acceleration-matrix
+    @just fast-preset-smoke
     @just cache-roundtrip
     @just optimizer-diff
     @just superinstruction-smoke
@@ -270,6 +273,7 @@ verify-performance:
     @just jit-smoke
     @just safety-audit-smoke
     @just hotpath-inventory
+    @just fastest-hotpath-report
     @just perf-report
     @printf '%s\n' '[pass] performance verification complete'
 
@@ -551,6 +555,10 @@ bytecode-exec-smoke:
 superinstruction-smoke:
     cargo build -p php_vm_cli --bin php-vm
     scripts/performance/superinstruction_smoke.sh
+
+superinstruction-patterns:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/superinstruction_patterns.py --summary-doc docs/performance-superinstructions.md
 
 vm-smoke:
     cargo build -p php_vm_cli
@@ -1284,6 +1292,7 @@ performance-tests:
     RUST_MIN_STACK="${PHRUST_RUST_MIN_STACK:-8388608}" cargo test --workspace
     scripts/performance/compare_perf_json.py --self-test
     scripts/performance/hotpath_inventory.py --self-test
+    scripts/performance/fastest_hotpath_report.py --self-test
     scripts/performance/perf_report.py --self-test
 
 performance-regression:
@@ -1295,6 +1304,10 @@ performance-regression:
 
 perf-flag-matrix:
     scripts/performance/perf_flag_matrix.py
+
+fast-preset-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/fast_preset_smoke.py
 
 ir-verify:
     cargo test -p php_ir verify --lib
@@ -1348,6 +1361,13 @@ acceleration-matrix:
 
 hotpath-inventory:
     scripts/performance/hotpath_inventory.py target/performance/benchmark-smoke.json --json-out target/performance/hotpaths.json --markdown-out docs/hotpath-inventory.md
+
+fastest-hotpath-report:
+    cargo build -p php_vm_cli --bin php-vm
+    @if [ ! -f target/performance/benchmark-smoke.json ]; then \
+        scripts/performance/bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/performance/benchmark-smoke.json --repetitions "${PHRUST_PERF_BENCH_SMOKE_REPETITIONS:-1}" --warmups "${PHRUST_PERF_BENCH_SMOKE_WARMUPS:-0}" --timeout "${PHRUST_PERF_BENCH_TIMEOUT:-10.0}"; \
+    fi
+    scripts/performance/fastest_hotpath_report.py --benchmark target/performance/benchmark-smoke.json --framework target/performance/framework-smoke/summary.json --acceleration target/performance/acceleration/summary.json --json-out target/performance/fastest/hotpath-report.json --markdown-out target/performance/fastest/hotpath-report.md --summary-doc docs/performance-fastest-hotpaths.md
 
 perf-baseline:
     cargo build -p php_vm_cli --bin php-vm

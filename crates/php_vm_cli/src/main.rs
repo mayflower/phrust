@@ -9,9 +9,10 @@ use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source, diagnostics::DiagnosticId};
 use php_source::{SourceText, TextRange};
 use php_vm::{
-    ExecutionFormat, IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode, QuickeningMode,
-    SuperinstructionMode, TieringOptions, Vm, VmOptions,
+    DenseBytecodeUnit, ExecutionFormat, IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode,
+    QuickeningMode, SuperinstructionMode, TieringOptions, Vm, VmOptions,
 };
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -66,6 +67,7 @@ where
     match command {
         "compile" => compile_command(&args[1..], stdout, stderr),
         "dump-ir" => dump_ir_command(&args[1..], stdout, stderr),
+        "dump-bytecode-patterns" => dump_bytecode_patterns_command(&args[1..], stdout, stderr),
         "dump-cranelift-clif" => dump_cranelift_clif_command(&args[1..], stdout, stderr),
         "run" => run_command(&args[1..], stdout, stderr),
         "report" => report_command(&args[1..], stdout, stderr),
@@ -144,15 +146,15 @@ where
     W: Write,
     E: Write,
 {
-    let (path, json) = parse_path_and_json(args)?;
-    let pipeline = match compile_pipeline(path) {
+    let options = parse_compile_args(args)?;
+    let pipeline = match compile_pipeline_with_optimization(options.path, options.opt_level) {
         Ok(pipeline) => pipeline,
         Err(error) => {
             writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
             return Ok(EXIT_COMPILE_ERROR);
         }
     };
-    if json {
+    if options.json {
         writeln!(stdout, "{}", pipeline.compile_json()).map_err(|error| error.to_string())?;
     } else if pipeline.ok() {
         writeln!(
@@ -202,6 +204,72 @@ where
     }
     write!(stdout, "{}", pipeline.lowering.unit.to_snapshot_text())
         .map_err(|error| error.to_string())?;
+    Ok(EXIT_SUCCESS)
+}
+
+fn dump_bytecode_patterns_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_bytecode_patterns_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let dense = match DenseBytecodeUnit::lower_from_ir(&pipeline.lowering.unit) {
+        Ok(dense) => dense,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                error.message
+            )
+            .map_err(|io| io.to_string())?;
+            return Ok(EXIT_UNSUPPORTED);
+        }
+    };
+    if let Err(errors) = dense.verify() {
+        writeln!(
+            stderr,
+            "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+            errors.len()
+        )
+        .map_err(|io| io.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
+    let report = collect_bytecode_patterns(&dense);
+    if json {
+        writeln!(stdout, "{}", bytecode_patterns_json(path, &dense, &report))
+            .map_err(|error| error.to_string())?;
+    } else {
+        writeln!(
+            stdout,
+            "ok path={} functions={} blocks={} instructions={}",
+            path,
+            dense.functions.len(),
+            report.blocks,
+            report.instructions
+        )
+        .map_err(|error| error.to_string())?;
+        for (pair, count) in &report.pairs {
+            writeln!(stdout, "pair {count:>6} {pair}").map_err(|error| error.to_string())?;
+        }
+        for (triple, count) in &report.triples {
+            writeln!(stdout, "triple {count:>4} {triple}").map_err(|error| error.to_string())?;
+        }
+    }
     Ok(EXIT_SUCCESS)
 }
 
@@ -415,7 +483,9 @@ impl Pipeline {
         } else {
             "false"
         });
-        out.push_str("}}");
+        out.push_str("},\"optimizer\":");
+        push_optimizer_report_json(&mut out, self.optimizer.as_ref());
+        out.push('}');
         out
     }
 
@@ -424,10 +494,6 @@ impl Pipeline {
             .as_ref()
             .map_or(0, OptimizationReport::enabled_pass_count)
     }
-}
-
-fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
-    compile_pipeline_with_optimization(path, OptimizationLevel::O0)
 }
 
 fn compile_pipeline_with_optimization(
@@ -472,6 +538,10 @@ fn compile_pipeline_with_optimization(
         lowering,
         optimizer,
     })
+}
+
+fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
+    compile_pipeline_with_optimization(path, OptimizationLevel::O0)
 }
 
 fn include_loader_for(path: &str) -> Result<IncludeLoader, String> {
@@ -668,27 +738,56 @@ fn semantic_diagnostic_uses_php_fatal_line(id: DiagnosticId) -> bool {
     )
 }
 
-fn parse_path_and_json(args: &[String]) -> Result<(&str, bool), String> {
+struct CompileOptions<'a> {
+    path: &'a str,
+    json: bool,
+    opt_level: OptimizationLevel,
+}
+
+fn parse_compile_args(args: &[String]) -> Result<CompileOptions<'_>, String> {
     let mut path = None;
     let mut json = false;
-    for arg in args {
-        if arg == "--json" {
-            json = true;
-        } else if path.is_none() {
-            path = Some(arg.as_str());
-        } else {
-            return Err(format!("unexpected compile argument `{arg}`"));
+    let mut opt_level = OptimizationLevel::O0;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--opt-level" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("compile --opt-level requires <level>".to_string());
+                };
+                opt_level = parse_optimization_level(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--opt-level=") => {
+                opt_level = parse_optimization_level(value)?;
+            }
+            arg if path.is_none() => path = Some(arg),
+            arg => return Err(format!("unexpected compile argument `{arg}`")),
         }
+        index += 1;
     }
     let Some(path) = path else {
         return Err("compile requires <path.php>".to_string());
     };
-    Ok((path, json))
+    Ok(CompileOptions {
+        path,
+        json,
+        opt_level,
+    })
 }
 
 struct DumpIrOptions<'a> {
     path: &'a str,
     with_source: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BytecodePatternReport {
+    blocks: u64,
+    instructions: u64,
+    pairs: BTreeMap<String, u64>,
+    triples: BTreeMap<String, u64>,
 }
 
 struct RunOptions<'a> {
@@ -711,6 +810,66 @@ struct RunOptions<'a> {
     jit_stats: JitStatsMode,
     tiering: TieringOptions,
     tiering_stats_json: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnginePreset {
+    Baseline,
+    Fast,
+    ExperimentalJit,
+}
+
+impl EnginePreset {
+    fn config(self) -> EnginePresetConfig {
+        match self {
+            Self::Baseline => EnginePresetConfig {
+                bytecode_cache_mode: BytecodeCacheMode::Off,
+                opt_level: OptimizationLevel::O0,
+                execution_format: ExecutionFormat::Ir,
+                superinstructions: SuperinstructionMode::Off,
+                quickening: QuickeningMode::Off,
+                inline_caches: InlineCacheMode::Off,
+                jit: JitMode::Off,
+                jit_blacklist: JitBlacklistMode::On,
+                tiering: TieringOptions::default(),
+            },
+            Self::Fast => EnginePresetConfig {
+                bytecode_cache_mode: BytecodeCacheMode::Off,
+                opt_level: OptimizationLevel::O2,
+                execution_format: ExecutionFormat::Auto,
+                superinstructions: SuperinstructionMode::Off,
+                quickening: QuickeningMode::On,
+                inline_caches: InlineCacheMode::On,
+                jit: JitMode::Off,
+                jit_blacklist: JitBlacklistMode::On,
+                tiering: TieringOptions::default(),
+            },
+            Self::ExperimentalJit => EnginePresetConfig {
+                bytecode_cache_mode: BytecodeCacheMode::Off,
+                opt_level: OptimizationLevel::O2,
+                execution_format: ExecutionFormat::Auto,
+                superinstructions: SuperinstructionMode::Off,
+                quickening: QuickeningMode::On,
+                inline_caches: InlineCacheMode::On,
+                jit: JitMode::Cranelift,
+                jit_blacklist: JitBlacklistMode::On,
+                tiering: TieringOptions::default(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnginePresetConfig {
+    bytecode_cache_mode: BytecodeCacheMode,
+    opt_level: OptimizationLevel,
+    execution_format: ExecutionFormat,
+    superinstructions: SuperinstructionMode,
+    quickening: QuickeningMode,
+    inline_caches: InlineCacheMode,
+    jit: JitMode,
+    jit_blacklist: JitBlacklistMode,
+    tiering: TieringOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -834,6 +993,26 @@ fn parse_dump_ir_args(args: &[String]) -> Result<DumpIrOptions<'_>, String> {
     Ok(DumpIrOptions { path, with_source })
 }
 
+fn parse_dump_bytecode_patterns_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!(
+                "unexpected dump-bytecode-patterns argument `{arg}`"
+            ));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-bytecode-patterns requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
 fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let Some(_) = args.first() else {
         return Err("run requires <path.php>".to_string());
@@ -863,6 +1042,41 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         match args[index].as_str() {
             "--trace" => trace = true,
             "--trace-runtime" => trace_runtime = true,
+            "--engine-preset" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(
+                        "run --engine-preset requires baseline, fast, or experimental-jit"
+                            .to_string(),
+                    );
+                };
+                let config = parse_engine_preset(value)?.config();
+                bytecode_cache.mode = config.bytecode_cache_mode;
+                opt_level = config.opt_level;
+                execution_format = config.execution_format;
+                superinstructions = config.superinstructions;
+                quickening = config.quickening;
+                inline_caches = config.inline_caches;
+                jit = config.jit;
+                jit_blacklist = config.jit_blacklist;
+                tiering = config.tiering;
+                jit_threshold = tiering.function_entry_threshold;
+                tiering_function_threshold_explicit = false;
+            }
+            arg if let Some(value) = arg.strip_prefix("--engine-preset=") => {
+                let config = parse_engine_preset(value)?.config();
+                bytecode_cache.mode = config.bytecode_cache_mode;
+                opt_level = config.opt_level;
+                execution_format = config.execution_format;
+                superinstructions = config.superinstructions;
+                quickening = config.quickening;
+                inline_caches = config.inline_caches;
+                jit = config.jit;
+                jit_blacklist = config.jit_blacklist;
+                tiering = config.tiering;
+                jit_threshold = tiering.function_entry_threshold;
+                tiering_function_threshold_explicit = false;
+            }
             "--bytecode-cache" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -1181,6 +1395,17 @@ fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {
         "on" => Ok(true),
         _ => Err(format!(
             "unsupported {flag} mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_engine_preset(value: &str) -> Result<EnginePreset, String> {
+    match value {
+        "baseline" => Ok(EnginePreset::Baseline),
+        "fast" => Ok(EnginePreset::Fast),
+        "experimental-jit" => Ok(EnginePreset::ExperimentalJit),
+        _ => Err(format!(
+            "unsupported engine preset `{value}`; expected baseline, fast, or experimental-jit"
         )),
     }
 }
@@ -1727,7 +1952,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -1774,6 +1999,116 @@ fn push_semantic_diagnostics_json(out: &mut String, path: &str, frontend: &Front
         out.push('}');
     }
     out.push(']');
+}
+
+fn collect_bytecode_patterns(dense: &DenseBytecodeUnit) -> BytecodePatternReport {
+    let mut report = BytecodePatternReport::default();
+    for function in &dense.functions {
+        for block in &function.blocks {
+            let start = block.first_instruction as usize;
+            let end = start + block.instruction_len as usize;
+            let Some(instructions) = function.instructions.get(start..end) else {
+                continue;
+            };
+            report.blocks += 1;
+            report.instructions += instructions.len() as u64;
+            for pair in instructions.windows(2) {
+                let key = format!("{} {}", pair[0].opcode.as_str(), pair[1].opcode.as_str());
+                *report.pairs.entry(key).or_default() += 1;
+            }
+            for triple in instructions.windows(3) {
+                let key = format!(
+                    "{} {} {}",
+                    triple[0].opcode.as_str(),
+                    triple[1].opcode.as_str(),
+                    triple[2].opcode.as_str()
+                );
+                *report.triples.entry(key).or_default() += 1;
+            }
+        }
+    }
+    report
+}
+
+fn bytecode_patterns_json(
+    path: &str,
+    dense: &DenseBytecodeUnit,
+    report: &BytecodePatternReport,
+) -> String {
+    let mut out = String::new();
+    out.push_str("{\"ok\":true");
+    out.push_str(",\"path\":\"");
+    out.push_str(&escape_json(path));
+    out.push('"');
+    out.push_str(",\"functions\":");
+    out.push_str(&dense.functions.len().to_string());
+    out.push_str(",\"blocks\":");
+    out.push_str(&report.blocks.to_string());
+    out.push_str(",\"instructions\":");
+    out.push_str(&report.instructions.to_string());
+    out.push_str(",\"pairs\":");
+    push_string_u64_map_json(&mut out, &report.pairs);
+    out.push_str(",\"triples\":");
+    push_string_u64_map_json(&mut out, &report.triples);
+    out.push('}');
+    out
+}
+
+fn push_string_u64_map_json(out: &mut String, values: &BTreeMap<String, u64>) {
+    out.push('{');
+    for (index, (key, value)) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(key));
+        out.push_str("\":");
+        out.push_str(&value.to_string());
+    }
+    out.push('}');
+}
+
+fn push_optimizer_report_json(out: &mut String, report: Option<&OptimizationReport>) {
+    let Some(report) = report else {
+        out.push_str("null");
+        return;
+    };
+    out.push_str("{\"level\":\"");
+    out.push_str(report.level.as_str());
+    out.push_str("\",\"enabled_pass_count\":");
+    out.push_str(&report.enabled_pass_count().to_string());
+    out.push_str(",\"passes\":[");
+    for (index, pass) in report.passes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":\"");
+        out.push_str(&escape_json(pass.name));
+        out.push_str("\",\"phase\":\"");
+        out.push_str(pass.phase.as_str());
+        out.push_str("\",\"enabled\":");
+        out.push_str(if pass.enabled { "true" } else { "false" });
+        out.push_str(",\"changed\":");
+        out.push_str(if pass.changed { "true" } else { "false" });
+        out.push_str(",\"source_spans_preserved\":");
+        out.push_str(if pass.source_spans_preserved {
+            "true"
+        } else {
+            "false"
+        });
+        out.push_str(",\"stats\":{");
+        for (stat_index, (key, value)) in pass.stats.iter().enumerate() {
+            if stat_index > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(&escape_json(key));
+            out.push_str("\":");
+            out.push_str(&value.to_string());
+        }
+        out.push_str("}}");
+    }
+    out.push_str("]}");
 }
 
 fn push_lowering_diagnostics_json(out: &mut String, path: &str, lowering: &php_ir::LoweringResult) {
@@ -2183,6 +2518,28 @@ mod tests {
     }
 
     #[test]
+    fn compile_json_reports_optimizer_stats_when_requested() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "compile".to_string(),
+                fixture("tests/fixtures/performance/optimizer/safe_folding.php"),
+                "--json".to_string(),
+                "--opt-level=1".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("\"optimizer\":{\"level\":\"1\""));
+        assert!(stdout.contains("\"constant_folding_safe_subset\""));
+        assert!(stdout.contains("\"transformations_attempted\""));
+    }
+
+    #[test]
     fn run_executes_hello_fixture() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2279,6 +2636,82 @@ mod tests {
         };
 
         assert!(error.contains("expected 0, 1, or 2"));
+    }
+
+    #[test]
+    fn run_args_accept_fast_engine_preset() {
+        let args = vec![
+            "--engine-preset=fast".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
+        assert_eq!(options.opt_level, OptimizationLevel::O2);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.superinstructions, SuperinstructionMode::Off);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::Off);
+        assert_eq!(options.jit_blacklist, JitBlacklistMode::On);
+        assert!(options.tiering.enabled);
+        assert_eq!(
+            options.jit_threshold,
+            options.tiering.function_entry_threshold
+        );
+    }
+
+    #[test]
+    fn run_args_engine_preset_accepts_later_overrides() {
+        let args = vec![
+            "--engine-preset=fast".to_string(),
+            "--opt-level=1".to_string(),
+            "--inline-caches=off".to_string(),
+            "--bytecode-cache=read".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.opt_level, OptimizationLevel::O1);
+        assert_eq!(options.inline_caches, InlineCacheMode::Off);
+        assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Read);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+    }
+
+    #[test]
+    fn run_args_accept_experimental_jit_engine_preset() {
+        let args = vec![
+            "--engine-preset".to_string(),
+            "experimental-jit".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.opt_level, OptimizationLevel::O2);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::Cranelift);
+        assert!(options.tiering.enabled);
+    }
+
+    #[test]
+    fn invalid_engine_preset_is_rejected() {
+        let args = vec![
+            "--engine-preset=turbo".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid engine preset should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected baseline, fast, or experimental-jit"));
     }
 
     #[test]

@@ -27,6 +27,11 @@ DEFAULT_SELECTED_FIXTURES = (
     ROOT / "tests/fixtures/stdlib/_harness/stdlib/array_basics.php",
     ROOT / "tests/fixtures/stdlib/_harness/json-pcre-date/json_basics.php",
     ROOT / "tests/fixtures/stdlib/_harness/spl-reflection/reflection_function.php",
+    ROOT / "tests/fixtures/performance/perf_smoke/array_fast_paths_v2.php",
+    ROOT / "tests/fixtures/performance/perf_smoke/output_batching_v2.php",
+    ROOT / "tests/fixtures/performance/inline_cache/function-call-polymorphic.php",
+    ROOT / "tests/fixtures/performance/inline_cache/method-call-guards.php",
+    ROOT / "tests/fixtures/performance/inline_cache/property-assign-guards.php",
     ROOT / "tests/fixtures/performance/inline_cache/property-shape-guards.php",
 )
 

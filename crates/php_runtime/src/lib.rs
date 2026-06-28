@@ -20,6 +20,7 @@ pub mod generator;
 pub mod globals;
 pub mod ini;
 pub mod jit_array;
+pub mod layout_stats;
 pub mod numeric_string;
 pub mod object;
 pub mod output;
@@ -38,7 +39,8 @@ pub mod types;
 pub mod value;
 
 pub use array::{
-    ArrayEntry, ArrayKey, PhpArray, PhpArrayKind, PhpArrayPackedMetadata, WeakArrayHandle,
+    ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
+    PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, WeakArrayHandle,
 };
 pub use autoload::AutoloadRegistry;
 pub use builtins::{

@@ -1,4 +1,4 @@
-use crate::BytePos;
+use crate::{BytePos, byte_kernel::find_any2};
 
 /// One-based display line and byte column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +37,11 @@ impl LineIndex {
         let mut index = 0;
 
         while index < bytes.len() {
+            let Some(relative) = find_any2(&bytes[index..], b'\n', b'\r') else {
+                break;
+            };
+            index += relative;
+
             match bytes[index] {
                 b'\n' => {
                     index += 1;
