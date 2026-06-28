@@ -75,6 +75,24 @@
 - `nix develop -c just phpt-dev-module MODULE=objects.core`
 - `nix develop -c just phpt-dev-module MODULE=objects.classes`
 
+## Branch 2 Advanced Integration Impact
+
+On `main`, after the completed object-core branch and the Branch 2 advanced
+object fixtures are integrated:
+
+- `nix develop -c just phpt-dev-module MODULE=objects.classes`
+- reference: 200 PASS
+- target: 164 PASS, 36 FAIL
+
+The four advanced submodule gates are split into `objects.magic`,
+`objects.clone`, `objects.traits`, and `objects.enums` and pass independently.
+The remaining selected aggregate failures group around autoload and
+ReflectionException catch-type behavior, iterator/destructor ordering and
+exception behavior, serialization, `__sleep`, and `__toString` object
+formatting, class constant inheritance and dynamic constant/class lookup edge
+cases, property-reference and by-reference static-property assignment gaps,
+static-as-instance edge cases, and broader object/reference COW behavior.
+
 ## Known Gaps
 
 - `runtime-error-or-diagnostic`: 983
@@ -96,8 +114,6 @@ slice. The remaining selected failures group around:
 
 ## Next Step
 
-Hand off the remaining advanced object subareas to `phpt/b3-objects-advanced`.
-Keep `objects.core` as the branch-local close gate for construction,
-constructors, public properties, public methods, `$this`, selected
-private/protected visibility errors, public static access, and typed-property
-basics.
+Keep `objects.core` as the construction/property/method/visibility/static/type
+regression gate. Continue reducing the remaining selected `objects.classes`
+failures by owned runtime area while keeping the advanced submodule gates green.
