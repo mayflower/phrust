@@ -1,6 +1,6 @@
 # Date PHPT Current Report
 
-Prompt 19 focused Date/Time verification.
+focused Date/Time verification.
 
 ## Scope
 

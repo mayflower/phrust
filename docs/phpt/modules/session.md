@@ -3,13 +3,14 @@
 - Strategy: deterministic request-local MVP
 - Classification: real-implementation-required for framework session support
 - Selected manifest: `tests/phpt/manifests/modules/session.selected.jsonl`
-- Current corpus snapshot before Prompt 4E: 260 `session` candidates, 3 PASS,
+- Current corpus snapshot before the selected gate: 260 `session` candidates, 3 PASS,
   0 SKIP, 254 FAIL, 2 BORK, and 260 known non-green outcomes.
 
 ## Implemented Scope
 
-The runtime registers the `session` extension, exposes the PHP session status
-constants, seeds `$_SESSION`, and implements:
+Request-local session state is available for CLI execution. The runtime now
+registers the `session` extension, exposes the PHP session status constants,
+seeds `$_SESSION`, and implements:
 
 - `session_start`
 - `session_status`

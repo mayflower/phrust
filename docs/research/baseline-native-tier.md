@@ -127,7 +127,7 @@ deopt points, and rejection reasons, and compares where a future mid-tier would
 sit between interpreter execution, copy-and-patch stencils, and Cranelift. It
 does not allocate executable memory or add a runtime mode.
 
-## Handoff
+## Follow-up
 
 Baseline native work may proceed to an executable prototype later only when all
 of these are true:

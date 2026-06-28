@@ -18,7 +18,7 @@ The `php_semantics` HIR module now stores:
 property, and class-constant summaries now carry typed member IDs so consumers
 can jump from class structure to the detailed member record.
 
-Validation added in this slice is structural and per class-like declaration:
+Validation added in this scope is structural and per class-like declaration:
 
 - duplicate method names are checked case-insensitively;
 - duplicate property names are checked by source variable name;

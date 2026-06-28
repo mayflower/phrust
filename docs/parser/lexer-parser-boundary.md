@@ -1,4 +1,4 @@
-# Lexer to Parser Handoff
+# Lexer to Parser Boundary
 
 Parser should consume `php_lexer::lex_all` and the public token types exported
 from `php_lexer`.

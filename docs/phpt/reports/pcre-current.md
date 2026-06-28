@@ -6,7 +6,7 @@ Reference target: PHP 8.5.7 (`php-8.5.7`).
 
 | Scope | PASS | SKIP | FAIL | BORK |
 | --- | ---: | ---: | ---: | ---: |
-| Prompt 18 focused PCRE selected manifest | 5 | 0 | 0 | 0 |
+| focused PCRE selected manifest | 5 | 0 | 0 | 0 |
 
 Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
 
@@ -14,8 +14,8 @@ Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
 
 | Measurement | Corpus | PASS | SKIP | FAIL | BORK |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Pre-Prompt 18 upstream snapshot | 165 | 41 | 5 | 117 | 0 |
-| Prompt 18 selected harness | 5 | 5 | 0 | 0 | 0 |
+| Before the selected gate upstream snapshot | 165 | 41 | 5 | 117 | 0 |
+| selected harness | 5 | 5 | 0 | 0 | 0 |
 | Full upstream probe, excluding host-locale reference failure | 164 | 50 | 10 | 104 | 0 |
 
 `PHPT_RUN_FULL=1 just phpt-full-regression` was attempted with the pinned

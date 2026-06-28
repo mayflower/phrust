@@ -1,6 +1,6 @@
 # I/O and Framework Extensions Summary
 
-Prompt pack: `prompts.md` I/O/framework extension branch.
+Scope: I/O and framework extension modules.
 
 Reference target:
 
@@ -66,7 +66,7 @@ baseline, vendor `php-src`, or promote broad upstream extension corpora.
 
 ## Closeout Gates
 
-Prompt 4I closeout validation:
+closeout validation:
 
 - `nix develop -c just verify-runtime`: PASS.
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php nix develop -c just verify-stdlib`:

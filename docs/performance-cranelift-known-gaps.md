@@ -1,10 +1,10 @@
 # Performance Cranelift Addendum Known Gaps
 
 This catalog tracks gaps specific to the Cranelift big-wins addendum. It does
-not replace `docs/performance-known-gaps.md`; it narrows the JIT-specific handoff
+not replace `docs/performance-known-gaps.md`; it narrows the JIT-specific follow-up
 items so later addendum work items can close them one by one.
 
-| Gap ID | Layer | Evidence/Test | Risk | Planned handoff |
+| Gap ID | Layer | Evidence/Test | Risk | Planned follow-up |
 | --- | --- | --- | --- | --- |
 | CL-GAP-NATIVE-EXECUTION-SUBSETS | Native code execution | Work items 07.CL.12 through 07.CL.24 execute constant-return, inline checked int add/sub/mul, simple branches, counted loops, numeric loop benchmark subsets, overflow side-exit fallback, type-switch blacklist, benchmark subsets, packed-array helper ABI, packed-array int-index fetch, packed-foreach int-sum, known-call, and string/string concat fast paths. Work item.25 records monomorphic property-load metadata. Work item.26 executes the first helper-assisted monomorphic property-load subset. Work item.27 records monomorphic method-call metadata. Work item.28 executes the first guarded monomorphic method-call dispatch helper path. Work item.29 adds conservative hot/cold/eager tiering decisions around those subsets. Work item.30 adds process-local compiled-function handle reuse for those subsets. Work item.31 consolidates the report matrix for those subsets. Work item.33 audits the current executable-memory, ABI, helper, pointer-lifetime, side-exit, and destructor boundaries. Work item.35 classifies the implemented subsets in `docs/performance-cranelift-results.md`: only all-int packed foreach reduction is a current keep-and-expand performance win; the other native paths remain experimental, default-off, or future runtime revisit items. Broader native subsets remain incomplete. | Performance claims outside the implemented, audited, and Work item.35-classified subsets would be unsupported until each executable subset has fixtures, counters, fallback behavior, safety gates, and workload evidence. | Future native-subset work item |
 | CL-GAP-LOOP-BODY-CALL | Native loop execution | `tests/fixtures/performance/cranelift/loops/non-eligible-loop-call.php` is included in the matrix and falls back with this stable gap instead of claiming native execution for loops that call functions in the body. | Loop performance claims with calls, array mutation, or other PHP-visible dynamic behavior remain unsupported until those operations have explicit guards, fallback behavior, and fixtures. | Future native-subset work item |
@@ -18,7 +18,7 @@ items so later addendum work items can close them one by one.
   fixtures, reports, or safety.
 - `Evidence/Test`: current file, command, or missing artifact proving the gap.
 - `Risk`: correctness, safety, portability, or measurement issue.
-- `Planned handoff`: work item expected to close or refine the gap.
+- `Planned follow-up`: work item expected to close or refine the gap.
 
 ## Closed Addendum Gaps
 

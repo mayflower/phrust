@@ -2,8 +2,8 @@
 
 - Priority: 19
 - Selected manifest: `tests/phpt/manifests/modules/date.selected.jsonl`
-- Focused selected counts: 7 PASS, 0 SKIP, 0 FAIL, 0 BORK from 7 Prompt
-  19 generated Date/Time fixtures
+- Focused selected counts: 7 PASS, 0 SKIP, 0 FAIL, 0 BORK from 7 generated
+  Date/Time fixtures
 - Corpus triage counts: 14 PASS, 12 SKIP, 661 FAIL, 0 BORK from 687
   upstream `ext/date` corpus candidates before this focused promotion
 
@@ -54,7 +54,7 @@
 
 ## Known Gaps
 
-- focused selected manifest contains seven generated Prompt 19 Date/Time
+- focused selected manifest contains seven generated Date/Time
   contracts and is expected to be green for both reference PHP 8.5.7 and the
   target runtime
 - broader upstream `ext/date` rows remain documented corpus/backlog work for
@@ -65,6 +65,6 @@
 
 ## Next Step
 
-Prompt 19 is closed for the focused generated Date/Time contracts. Keep the
+The selected gate is closed for the focused generated Date/Time contracts. Keep the
 selected manifest green while promoting broader upstream `ext/date` PHPT rows
 only when their timelib, tzdb, and class-surface requirements are implemented.

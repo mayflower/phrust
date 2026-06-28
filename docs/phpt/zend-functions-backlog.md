@@ -1,8 +1,9 @@
-# Prompt 13 Handover — Functions, Callables, Arity, Type Coercion (`zend.functions`)
+# zend.functions Backlog
 
-Status as of this handover: **`zend.functions` = 14 PASS / 186 non-green out of 200.**
-Scope partially implemented and stabilized; the module is **not** green. This
-document is a cold-start guide to finishing it.
+Current focused `zend.functions` status is tracked in
+`docs/phpt/reports/zend.functions-current.md`. This document keeps the
+implementation notes and backlog for functions, callables, arity, and type
+coercion.
 
 > Line numbers drift as you edit `crates/php_vm/src/vm.rs` (a ~32k-line file) and
 > `crates/php_ir/src/lower.rs`. Use the **symbol names** as the stable anchor and
@@ -38,7 +39,7 @@ jq -r 'select(.outcome=="FAIL") | .detail' \
   | sort | uniq -c | sort -rn
 ```
 
-Acceptance gates (Prompt 13): `just verify-runtime`, `just verify-stdlib`,
+Acceptance gates: `just verify-runtime`, `just verify-stdlib`,
 `just phpt-module MODULE=zend.functions`, and the full refresh
 `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHPT_RUN_FULL=1 just phpt-full-regression`.
 
@@ -229,7 +230,8 @@ include the caller location. ~9 `execute_function` call sites to thread through.
   work you are REDUCING failures, so a refresh records improvements.
 - Builtins come from arginfo (`just generate-arginfo`), not hand-written.
 - `just verify-frontend` / `verify-runtime` / `verify-stdlib` / `verify-phpt` are
-  the per-layer gates; run the one(s) for the layer you touched before handoff.
+  the per-layer gates; run the one(s) for the layer you touched before closing
+  the change.
   `clippy --workspace --all-targets -- -D warnings -D unsafe-code` must be clean.
 
 ---
@@ -251,7 +253,7 @@ include the caller location. ~9 `execute_function` call sites to thread through.
    refresh the committed baseline, then `just verify-phpt`.
 
 Target acceptance: `zend.functions` green (or near-green with every remaining
-failure recorded as a justified known-gap), all four Prompt 13 gates passing, and
+failure recorded as a justified known-gap), all four focused gates passing, and
 the "Am Ende" report (which callables work / which coercion rules work / which gaps
 remain) updated.
 

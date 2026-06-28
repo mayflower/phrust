@@ -1,6 +1,6 @@
 # standard.variables Current Focus Report
 
-Core values/arrays/strings branch Prompt 2E focused standard variable builtin
+Core values/arrays/strings branch focused standard variable builtin
 verification.
 
 ## Scope

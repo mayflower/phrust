@@ -34,7 +34,7 @@
 
 ## Selected PHPT Coverage
 
-The selected manifest starts with generated Prompt 1B contract fixtures:
+The selected manifest starts with generated selected contract fixtures:
 
 - `tests/phpt/generated/phpt.cli/argv-argc-superglobals.phpt`
 - `tests/phpt/generated/phpt.cli/ini-overrides.phpt`
@@ -101,17 +101,17 @@ coverage and skip with concrete reasons under `PHPT_TARGET_MODE=php-cli`.
 - `FPM not available in php-cli target mode`: 141 selected skips
 - `CLI built-in web server not available in php-cli target mode`: 39 selected skips
 - `CLI process-control APIs not available in php-cli target mode`: 6 selected skips
-- `process-control functions are outside the Prompt 1B CLI contract`: 5 selected skips
+- `process-control functions are outside the selected CLI contract`: 5 selected skips
 - `CLI stdio descriptor rebinding not available in php-cli target mode`: 3 selected skips
 - `phpdbg not available in php-cli target mode`: 2 selected skips
 - `CLI --ini introspection not available in php-cli target mode`: 1 selected skip
 - `CLI -R line-processing mode not available in php-cli target mode`: 1 selected skip
-- `include-path expression runtime gap outside the Prompt 1B CLI contract`: 1 selected skip
-- `STDOUT default-parameter lowering is outside the Prompt 1B CLI contract`: 1 selected skip
+- `include-path expression runtime gap outside the selected CLI contract`: 1 selected skip
+- `STDOUT default-parameter lowering is outside the selected CLI contract`: 1 selected skip
 
 ## Next Step
 
 Keep target invocation deterministic for upstream PHPT execution and route
 non-scope SAPI, HTTP server, process-control, and unrelated runtime/frontend
-gaps to their owning modules instead of measuring them as Prompt 1B CLI
+gaps to their owning modules instead of measuring them as selected CLI
 contract failures.

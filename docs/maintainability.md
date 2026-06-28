@@ -1,39 +1,43 @@
-# Refactor Maintainability Audit
+# Maintainability
 
-Date: 2026-06-28
+This document records the current maintainability ownership map, validation
+surface, and known risks. The code preserves PHP-visible behavior while keeping
+execution ownership, diagnostic formatting, source-integrity checks, known-gap
+validation, server boundaries, and quality gates explicit.
 
-This audit closes the maintainability refactor prompt pack. The pack preserved
-PHP-visible behavior while consolidating execution ownership, diagnostic
-formatting, source-integrity checks, known-gap validation, server boundaries,
-and quality gates.
+## Completed Maintenance Work
 
-## Completed Prompts
-
-| Prompt | Status | Notes |
-| ---: | --- | --- |
-| 01 | complete | Added fail-fast source-integrity checks for critical module wiring and generated arginfo shape. |
-| 02 | complete | Made generated stdlib arginfo committed, reviewable, and drift-checkable against pinned php-src. |
-| 03 | complete | Split `php_executor` into focused modules with stable public re-exports. |
-| 04 | complete | Made `php_executor` the normal compile/execute owner for CLI-compatible and server execution paths. |
-| 05 | complete | Split `php_vm_cli` process entrypoint from command implementation and shared entrypoints. |
-| 06 | complete | Kept VM compile diagnostics typed through runtime diagnostic payloads. |
-| 07 | complete | Kept CLI JSON/report status and diagnostics serialization typed. |
-| 08 | complete | Moved server filesystem and PHP execution work behind explicit blocking boundaries. |
-| 09 | complete | Added server smoke/verification and CI coverage. |
-| 10 | complete | Documented separate CLI bytecode artifact cache and server compiled-script cache boundaries. |
-| 11 | complete | Added manifest-driven runtime fixture runner and runtime gate wiring. |
-| 12 | complete | Added machine-readable known-gap manifests and validator. |
-| 13 | complete | Added `php_runtime` and `php_vm` API/experimental facades and migrated boundary imports. |
-| 14 | complete | Contained reference/object interior mutability with checked accessors and debug GC facade. |
-| 15 | complete | Split private array storage into packed and mixed variants behind `PhpArray`. |
-| 16 | complete | Promoted `quality-fast`, dependency policy, unused-dependency checks, and docs smoke to CI. |
-| 17 | complete | Updated crate docs, README links, layer contracts, and architecture docs. |
-| 18 | complete | Ran the final regression sweep and produced this audit. |
+- Source-integrity checks fail fast for critical module wiring and generated
+  arginfo shape.
+- Generated standard-library arginfo is committed, reviewable, and
+  drift-checkable against pinned php-src.
+- `php_executor` owns normal compile/execute orchestration for CLI-compatible
+  and server execution paths.
+- `php_vm_cli` keeps process entrypoint code separate from command
+  implementation and shared entrypoints.
+- VM compile diagnostics stay typed through runtime diagnostic payloads.
+- CLI JSON/report status and diagnostics serialization stay typed.
+- Server filesystem and PHP execution work run behind explicit blocking
+  boundaries.
+- Server smoke/verification and CI coverage are part of the validation surface.
+- CLI bytecode artifact cache and server compiled-script cache boundaries are
+  documented separately.
+- Runtime fixture execution is manifest-driven and wired into runtime gates.
+- Known gaps have machine-readable manifests and validator coverage.
+- `php_runtime` and `php_vm` expose API and experimental facades for boundary
+  imports.
+- Reference/object interior mutability uses checked accessors and a debug GC
+  facade.
+- `PhpArray` hides packed and mixed private storage variants behind one public
+  type.
+- `quality-fast`, dependency policy, unused-dependency checks, and docs smoke
+  run in CI.
+- Crate docs, README links, layer contracts, and architecture docs describe the
+  current code.
 
 ## Skipped Or Deferred
 
-No prompt was skipped. The following remain explicit deferred work rather than
-prompt failures:
+The following remain explicit deferred work:
 
 - Full Zend SAPI/FPM/CGI/Apache compatibility is out of scope for the integrated server.
 - Server execution timeout that safely interrupts long-running PHP VM execution is not implemented.
@@ -94,7 +98,7 @@ shell scripts as thin orchestration wrappers.
 
 | Command | Result | Notes |
 | --- | --- | --- |
-| `git status --short` | pass | Dirty worktree contains the prompt-pack changes only; no `target/` artifacts are staged. |
+| `git status --short` | pass | Dirty worktree contains the intended docs and tooling changes only; no `target/` artifacts are staged. |
 | `nix develop -c cargo fmt --all --check` | pass | Formatting clean. |
 | `nix develop -c cargo check --workspace --all-targets` | pass | Workspace compile clean. |
 | `nix develop -c cargo test --workspace` | pass | Workspace tests and doctests passed. |
@@ -105,7 +109,7 @@ shell scripts as thin orchestration wrappers.
 | `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php nix develop -c just verify-performance` | pass | Callgrind skipped on Darwin; Miri smoke skipped because cargo-miri is not usable for the active toolchain; optional JIT/persistent-feedback rows remain opt-in. |
 | `PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just verify-phpt` | pass | Verified 21,548 baseline entries, 20,428 known non-green fingerprints, and 24,475 php-src manifest entries. |
 | `nix develop -c just quality-fast` | pass | Source integrity, known gaps, dependency policy, unused deps, all-features compile, rustdoc, and doctests passed. |
-| `nix develop -c just quality-docs` | pass | Rustdoc warnings denied and doctests passed for Prompt 17 docs changes. |
+| `nix develop -c just quality-docs` | pass | Rustdoc warnings denied and doctests passed for docs changes. |
 
 `quality-fast` reports warning-only duplicate transitive crates in
 `cargo-deny`: `bitflags`, `hashbrown`, and `windows-sys`. It also reports
@@ -135,7 +139,7 @@ updated by verified gates are concise committed summaries, not raw run output:
 - Reference-sensitive gates depend on a local PHP 8.5.7 binary or php-src tree.
   This audit used the sibling checkout under `/Volumes/CrucialMusic/src/phrust/third_party/php-src`.
 
-## Recommended Next Prompt Pack
+## Recommended Next Work
 
 1. Split `php_vm_cli/src/commands.rs` into command-family modules without
    changing stdout, stderr, JSON, or exit status.

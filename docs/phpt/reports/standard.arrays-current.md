@@ -1,11 +1,11 @@
 # standard.arrays Current Focus Report
 
-Core values/arrays/strings branch Prompt 2D focused standard array builtin
+Core values/arrays/strings branch focused standard array builtin
 verification.
 
 ## Scope
 
-- Selected upstream and generated PHPTs for the Prompt 2D array builtin list.
+- Selected upstream and generated PHPTs for the selected array builtin list.
 - `count`, `array_key_exists`, `array_keys`, `array_values`, `array_merge`,
   `array_slice`, `array_splice`, `array_column`, `in_array`, `array_search`,
   `array_unique`, `range`, and deterministic `sort`/`asort`/`ksort`.
@@ -14,14 +14,14 @@ verification.
 
 - `tests/phpt/manifests/modules/standard.arrays.selected.jsonl`
 - 17 selected fixtures: 5 upstream php-src fixtures and 12 generated fixtures.
-- New Prompt 2D generated outputs were captured from
+- New generated outputs were captured from
   `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`.
 
 ## Before/After
 
-Before this Prompt 2D pass, the selected gate was already green for 10 fixtures
+Before this this pass, the selected gate was already green for 10 fixtures
 covering `count`, `array_keys`, `array_values`, `array_merge`, and
-`array_slice`. This pass promotes the rest of the Prompt 2D builtin list into
+`array_slice`. This pass promotes the rest of the selected builtin list into
 selected PHPT coverage.
 
 | Check | Before | After |
@@ -45,12 +45,12 @@ selected PHPT coverage.
 
 - VM callable dispatch exists for callback-heavy helpers such as `array_map`,
   `array_filter`, `array_walk`, callback sorting, and multisort paths, but the
-  Prompt 2D PHPT gate keeps callback-heavy breadth as follow-up coverage.
+  the selected gate PHPT gate keeps callback-heavy breadth as follow-up coverage.
 
 ## Remaining Gaps
 
 - Full upstream `ext/standard/tests/array` coverage remains much broader than
-  the selected Prompt 2D slice.
+  the selected slice.
 - Object-heavy, reference-sensitive, and callback-heavy array fixtures should be
   promoted in separate focused modules or follow-up slices.
 

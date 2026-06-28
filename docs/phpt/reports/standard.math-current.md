@@ -1,11 +1,11 @@
 # standard.math Current Focus Report
 
-Core values/arrays/strings branch Prompt 2E focused standard math verification.
+Core values/arrays/strings branch focused standard math verification.
 
 ## Scope
 
 - Selected upstream and generated PHPTs for math and numeric standard builtins.
-- Existing Prompt 16 math coverage is reused as the Prompt 2E math acceptance
+- Existing math coverage is reused as the selected math acceptance
   surface.
 
 ## Selected Manifest

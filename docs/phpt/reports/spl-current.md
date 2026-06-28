@@ -7,7 +7,7 @@ Branch: `phpt/b3-spl-reflection`
 ## Scope
 
 This report covers the selected SPL module and the SPL submodules touched by the
-Branch 3 SPL/Reflection prompt pack:
+Branch 3 SPL/Reflection implementation scope:
 
 - `spl.interfaces`
 - `spl.array-iterator`

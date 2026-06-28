@@ -1,4 +1,4 @@
-# Performance Bytecode Cache Handoff
+# Performance Bytecode Cache Follow-up
 
 Performance bytecode-cache work starts from
 `docs/adr/0072-bytecode-cache-format.md`. The design is intentionally narrower
@@ -137,7 +137,7 @@ flowchart TD
     RunB --> CleanupB["discard request runtime state"]
 ```
 
-future runtime handoff requirements:
+future runtime follow-up requirements:
 
 - Define whether workers share cache metadata, payload bytes, or neither.
 - Define cross-request invalidation when files change while workers are alive.
@@ -287,5 +287,5 @@ digest path-component rejection, and read/write hit behavior.
 - Cache corruption must never be fatal to normal no-cache execution.
 - Include/require invalidation, Composer/autoload dependency tracking,
   shared-memory OPcache behavior, preloading, and production SAPI lifecycle are
-  future runtime-or-later handoff topics unless a later Performance work item explicitly adds
+  future runtime-or-later follow-up topics unless a later Performance work item explicitly adds
   tested support.

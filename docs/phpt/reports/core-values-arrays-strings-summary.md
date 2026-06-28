@@ -1,6 +1,6 @@
 # Core Values Arrays Strings Branch Summary
 
-Prompt 2A through Prompt 2G moved the selected core values, arrays, strings,
+the selected focused slices moved the selected core values, arrays, strings,
 standard-library, and bounded mbstring gates to green target runs against PHP
 8.5.7 oracle output.
 
@@ -10,7 +10,7 @@ standard-library, and bounded mbstring gates to green target runs against PHP
   `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`
 - Read-only php-src source tree:
   `/Volumes/CrucialMusic/src/phrust/third_party/php-src`
-- mbstring-enabled oracle for Prompt 2F only:
+- mbstring-enabled oracle for the selected gate only:
   `/tmp/php-src-mbstring-oracle/sapi/cli/php`, built from the same PHP 8.5.7
   checkout with `--enable-mbstring --disable-mbregex`
 
@@ -23,7 +23,7 @@ The default oracle was kept unchanged and does not include mbstring.
 | `zend.basic` | 10 PASS | 10 PASS | Kept green while scalar/operator changes landed. |
 | `operators.conversions` | 4 PASS | 5 PASS | Added invalid array operand coverage from the PHP oracle. |
 | `strings.literals` | 6 PASS / 3 FAIL | 9 PASS | Closed `php://stdout` stream writes, `highlight_string`, and selected formatting output. |
-| `arrays.references` | 18 PASS / 58 SKIP / 124 FAIL broad audit | 6 PASS | Replaced mixed broad audit gate with focused Prompt 2C local array/reference/COW fixtures. |
+| `arrays.references` | 18 PASS / 58 SKIP / 124 FAIL broad audit | 6 PASS | Replaced mixed broad audit gate with focused selected local array/reference/COW fixtures. |
 | `standard.arrays` | 10 PASS | 17 PASS | Added selected array builtin coverage through deterministic sort paths. |
 | `standard.strings` | 15 PASS | 16 PASS | Added `str_replace`, `strtolower`, and `strtoupper` coverage. |
 | `standard.math` | 161 PASS / 11 SKIP | 161 PASS / 11 SKIP | Reused existing selected math surface with no target failures. |
@@ -44,7 +44,7 @@ The default oracle was kept unchanged and does not include mbstring.
 - Standard array builtins cover `count`, key/value helpers, merge/slice/splice,
   column/search/unique/range, and deterministic sort/asort/ksort.
 - Standard string, math, variable, and serialization selected gates remain
-  green with the Prompt 2E additions documented in their module reports.
+  green with the selected additions documented in their module reports.
 - mbstring now exposes a bounded UTF-8/ASCII MVP for `mb_strlen`, `mb_substr`,
   `mb_strtolower`, `mb_strtoupper`, `mb_detect_encoding`,
   `mb_check_encoding`, `mb_internal_encoding`, and UTF-8 to UTF-8
@@ -70,7 +70,7 @@ The default oracle was kept unchanged and does not include mbstring.
 - Do not replace the focused selected gates with broad mixed corpus audits
   without first separating out-of-scope object, SPL, extension, and frontend
   blockers.
-- Keep `third_party/php-src/` read-only. The mbstring oracle used for Prompt 2F
+- Keep `third_party/php-src/` read-only. The mbstring oracle used for the selected gate
   is a temporary clone under `/tmp`, not a vendored dependency.
 - Do not broaden mbstring extension visibility without a reference-backed
   implementation slice and selected PHPTs for each new function.

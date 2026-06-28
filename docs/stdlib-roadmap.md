@@ -1,11 +1,11 @@
-# Standard library Handoff
+# Standard Library Roadmap
 
-Standard library starts from the Runtime semantics runtime semantics boundary and should consume
-the existing frontend, HIR, IR, runtime, VM, fixture harnesses, and known-gap
-catalog. It should not add a second lexer, parser, AST, semantic frontend, or
+Standard library work builds on the runtime semantics boundary and consumes the
+existing frontend, HIR, IR, runtime, VM, fixture harnesses, and known-gap
+catalog. It must not add a second lexer, parser, AST, semantic frontend, or
 source-string execution path.
 
-## Starting Point
+## Current Inputs
 
 - Final Runtime semantics gate: `nix develop -c just verify-runtime`
 - Reference-backed coverage snapshot: `docs/runtime-semantics-coverage-matrix.md`
@@ -13,7 +13,7 @@ source-string execution path.
 - Runtime contract: `docs/runtime-semantics-contract.md`
 - Hardening audit: `docs/runtime-semantics-unsafe-audit.md`
 
-## Standard library Topics
+## Standard Library Topics
 
 | Topic | Concrete next work | Starting evidence |
 | --- | --- | --- |
@@ -27,9 +27,9 @@ source-string execution path.
 | Bytecode cache | Define a versioned cache format for lowered IR/bytecode plus invalidation on source hash, PHP target version, feature flags, and semantic metadata version. | `php_ir`, `php_vm_cli`, Runtime IR docs |
 | Extension API | Define a minimal Rust-native internal extension boundary for builtins and predefined classes before considering Zend ABI compatibility. Zend ABI emulation remains out of scope unless a later layer explicitly accepts it. | `E_PHP_RUNTIME_UNSUPPORTED_ZEND_ABI`, `crates/php_runtime/src/builtins.rs` |
 
-## First Standard library Gate Shape
+## Verification Shape
 
-The first Standard library gate should preserve all earlier gates:
+Standard library validation should preserve the earlier layer gates:
 
 ```bash
 nix develop -c just verify-foundation
@@ -40,9 +40,9 @@ nix develop -c just verify-runtime
 nix develop -c just verify-runtime
 ```
 
-Then add a narrow `verify-stdlib` target that initially runs only deterministic
-Standard library fixtures and preserves clear skip behavior for reference-dependent
-checks when `REFERENCE_PHP` is unavailable.
+The `verify-stdlib` target runs deterministic standard-library fixtures and
+preserves clear skip behavior for reference-dependent checks when
+`REFERENCE_PHP` is unavailable.
 
 ## Rules for Closing Gaps
 

@@ -238,7 +238,7 @@ Known gaps:
 - CFG checks: full `goto` boundary validation and more precise control-flow
   legality belong in Runtime.
 
-## Runtime Handoff
+## Runtime Follow-up
 
 Start Runtime from `php_semantics::query::frontend::analyze_file`.
 

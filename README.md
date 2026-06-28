@@ -47,6 +47,19 @@ nix develop -c just verify-phpt
 The narrowest relevant gate should be used while iterating. Run the broader
 domain gate before handing off a change that affects that layer.
 
+## Documentation
+
+Use [docs/README.md](docs/README.md) as the documentation front door. It maps
+the current docs into tutorials, how-to guides, reference material, and
+architecture explanations.
+
+Task-oriented guides:
+
+- [First local run](docs/how-to/first-local-run.md)
+- [Validate a change](docs/how-to/validate-a-change.md)
+- [Run the web server](docs/how-to/run-the-web-server.md)
+- [Work with PHPT](docs/how-to/work-with-phpt.md)
+
 Install the versioned git hooks once per checkout:
 
 ```bash
@@ -109,7 +122,7 @@ nix develop -c just server-benchmark-smoke
 ```
 
 Server configuration supports CLI flags and an optional simple TOML-style
-`--config <path>` file. See `docs/server-wave2-functionality.md` for config,
+`--config <path>` file. See `docs/server-functionality.md` for config,
 access-log, metrics-token, cache, and TLS options.
 
 ## Repository Layout

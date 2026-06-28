@@ -177,7 +177,7 @@ deterministic. The builtin registry recognizes `serialize`, `unserialize`, and
 `var_export`, but each returns `E_PHP_RUNTIME_SERIALIZATION_STDLIB_GAP` instead
 of producing partial output or skipping magic hooks. Runtime method metadata
 preserves `__serialize`, `__unserialize`, `__sleep`, and `__wakeup` names for
-reflection, diagnostics, and the standard library handoff.
+reflection, diagnostics, and the standard library follow-up.
 
 standard library must decide the complete standard-library serialization model,
 including object property encoding, `__serialize`/`__unserialize`,
@@ -326,7 +326,7 @@ through the same global slots. In function or closure caller scope, include and
 eval share the caller locals for the fixture-covered cases; any `global`
 statement inside that code still binds to the request global table.
 
-## Handoff From Runtime
+## Follow-up From Runtime
 
 Runtime established:
 
@@ -487,8 +487,8 @@ Runtime semantics behavior is split across these topic documents:
   sanitizer status;
 - `docs/runtime-semantics-coverage-matrix.md` and `docs/runtime-semantics-final-audit.md` for the
   final Runtime semantics gate and coverage closure state;
-- `docs/runtime-semantics-handoff.md` for the Runtime-to-Runtime semantics working handoff record;
-- `docs/stdlib-handoff.md` for the concrete standard library backlog.
+- `docs/runtime-semantics-status.md` for the Runtime-to-Runtime semantics working follow-up record;
+- `docs/stdlib-roadmap.md` for the concrete standard library backlog.
 
 Architecture decisions are recorded in:
 

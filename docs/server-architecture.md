@@ -1,9 +1,9 @@
 # Server Architecture
 
-`php_server` is an integrated in-process HTTP server for development and
-compatibility smoke coverage. It is not a Zend SAPI implementation and does not
-provide production FPM, FastCGI, CGI, Apache module, `mod_php`, or external PHP
-process compatibility.
+`php_server` is an integrated in-process HTTP/HTTPS server for development,
+compatibility smoke coverage, and simple standalone PHP application runs. It is
+not a Zend SAPI implementation and does not provide production FPM, FastCGI,
+CGI, Apache module, `mod_php`, or external PHP process compatibility.
 
 ## Ownership
 
@@ -12,10 +12,16 @@ process compatibility.
   routing, path normalization, and static-vs-PHP classification.
 - `crates/php_server/src/response.rs` owns HTTP response construction from
   static files and executor output.
-- `crates/php_server/src/server.rs` owns Hyper/Tokio request handling, blocking
-  boundaries, limits, metrics, graceful shutdown, and executor/cache wiring.
+- `crates/php_server/src/server.rs` owns Hyper/Tokio request handling, optional
+  Rustls termination, limits, metrics, graceful shutdown, and executor/cache
+  wiring.
+- `crates/php_server/src/multipart.rs` owns bounded multipart parsing and
+  upload temp-file cleanup.
+- `crates/php_server/src/session_store.rs` owns process-local web session
+  persistence on disk.
 - `php_executor` owns PHP compilation, diagnostics rendering, VM invocation,
-  request include-loader construction, and the server compiled-script cache.
+  request include-loader construction, the server compiled-script cache, and
+  the shared include cache.
 
 ## No External PHP Boundary
 
@@ -24,11 +30,29 @@ The server hot path must not call `php`, `php-vm`, `phrust-php`,
 warmed external worker. PHP requests execute through the workspace frontend,
 runtime, and VM in the server process.
 
-Static file reads, route metadata checks, and PHP compile/execute work run
-behind Tokio blocking tasks. Request body reads obey `--max-body-bytes` and the
-current `--request-timeout-ms` body-read timeout. Once PHP execution starts,
-there is no safe preemptive VM cancellation hook yet; long-running execution is
-bounded by the in-flight request limit, not a per-script timeout.
+Request body reads obey `--max-body-bytes` and the `--request-timeout-ms`
+body-read timeout. PHP execution is bounded by the cooperative
+`--max-execution-ms` VM deadline and by the server in-flight request limit.
+Deadline checks happen in VM dispatch; native blocking builtins are observed
+when control returns to dispatch rather than by preemptive Tokio cancellation.
+
+Static files stream through Tokio file I/O with `HEAD`, validators, byte
+ranges, and precompressed sidecar selection. PHP scripts execute in a blocking
+region inside the server process because the request-local PHP runtime state is
+not `Send`.
+
+## Transport And Configuration
+
+Plain HTTP is the default. When `--tls-cert` and `--tls-key` are provided, the
+same Hyper service is wrapped in Rustls and the startup handshake prints
+`listening https://<addr>`. TLS currently advertises `http/1.1` through ALPN;
+HTTP/2 and HTTP/3 are not enabled.
+
+Server configuration can come from CLI flags or a simple TOML-style
+`--config <path>` file, with CLI flags taking precedence. Production-oriented
+options include upload and session paths, request limits, cooperative execution
+deadlines, metrics endpoint controls, access logs, TLS files, script-cache
+limits, preload, and the loopback-only cache-clear endpoint.
 
 ## Cache And Metrics
 
@@ -38,9 +62,11 @@ the CLI disk bytecode artifact cache and is not an Opcache replacement. See
 `docs/cache-architecture.md` for key and invalidation rules.
 
 The optional `/__phrust/metrics` endpoint exposes process-local counters for
-requests, overloads, response classes, script-cache hits/misses/stale
-invalidations, compile errors, and current cache entries. It is an internal
-plain-text endpoint and can be disabled with `--disable-metrics-endpoint`.
+requests, overloads, response classes, upload parsing, execution timeouts,
+static streaming, script-cache hits/misses/stale invalidations, script-cache
+preload, include-cache hits/misses, compile errors, and current cache entries.
+It is an internal plain-text endpoint. It can be disabled with
+`--disable-metrics-endpoint` or protected with `--metrics-token`.
 
 ## Validation
 
@@ -49,6 +75,9 @@ Use these gates for server work:
 ```bash
 nix develop -c cargo test -p php_server -p php_executor
 nix develop -c just server-smoke
+nix develop -c just server-compat-smoke all
+nix develop -c just server-tls-smoke
+nix develop -c just server-benchmark-smoke
 nix develop -c just verify-server
 ```
 

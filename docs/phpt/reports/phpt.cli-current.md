@@ -31,24 +31,24 @@ Last focused run: 2026-06-28.
 
 The upstream `sapi/cli` selected set still contains SAPI, HTTP server,
 process-control, and unrelated runtime/frontend tests that are not part of the
-Prompt 1B CLI contract. They now skip with concrete target-mode reasons:
+the selected CLI contract. They now skip with concrete target-mode reasons:
 
 | Reason | Count |
 | --- | ---: |
 | FPM not available in php-cli target mode | 141 |
 | CLI built-in web server not available in php-cli target mode | 39 |
 | CLI process-control APIs not available in php-cli target mode | 6 |
-| process-control functions are outside the Prompt 1B CLI contract | 5 |
+| process-control functions are outside the selected CLI contract | 5 |
 | CLI stdio descriptor rebinding not available in php-cli target mode | 3 |
 | phpdbg not available in php-cli target mode | 2 |
 | CLI --ini introspection not available in php-cli target mode | 1 |
 | CLI -R line-processing mode not available in php-cli target mode | 1 |
-| include-path expression runtime gap outside the Prompt 1B CLI contract | 1 |
-| STDOUT default-parameter lowering is outside the Prompt 1B CLI contract | 1 |
+| include-path expression runtime gap outside the selected CLI contract | 1 |
+| STDOUT default-parameter lowering is outside the selected CLI contract | 1 |
 
 ## Remaining CLI Gaps
 
-No selected Prompt 1B-owned CLI contract failures remain. The skipped upstream
+No selected selected CLI contract failures remain. The skipped upstream
 cases are still visible in selected results and should be moved or implemented
 by their owning SAPI, process-control, stdio-stream, frontend, or runtime
 modules.

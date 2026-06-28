@@ -33,7 +33,7 @@ Implemented surface:
 - URL helpers: `urlencode`, `urldecode`, `rawurlencode`,
   `rawurldecode`, plus `http_build_query` for arrays.
 
-Known gaps for this slice:
+Known gaps for this scope:
 
 - `STDLIB-GAP-HTML-FULL-ENTITIES-FLAGS`
 - `STDLIB-GAP-HTTP-BUILD-QUERY-OPTIONS`

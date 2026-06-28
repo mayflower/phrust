@@ -1,6 +1,6 @@
 # mbstring Current Focus Report
 
-Prompt 2F moved mbstring from disabled platform stubs to a bounded UTF-8 MVP.
+moved mbstring from disabled platform stubs to a bounded UTF-8 MVP.
 
 ## Policy
 
@@ -24,7 +24,7 @@ fixtures, and the broader upstream `ext/mbstring` corpus remain known gaps.
 
 The default project oracle at
 `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php` was built
-without mbstring. Prompt 2F fixture expectations were captured from a temporary
+without mbstring. selected fixture expectations were captured from a temporary
 read-only PHP 8.5.7 clone at `/tmp/php-src-mbstring-oracle/sapi/cli/php` built
 from the same php-src checkout with `--enable-mbstring --disable-mbregex`.
 
@@ -83,7 +83,7 @@ Committed baseline counts for the broader mbstring-owned corpus:
 
 ## Verification
 
-Latest Prompt 2F verification:
+Latest verification:
 
 - `nix develop -c cargo test -p php_runtime mbstring`: PASS, 2 selected tests.
 - `nix develop -c cargo test -p php_std mbstring`: PASS, 1 selected test.

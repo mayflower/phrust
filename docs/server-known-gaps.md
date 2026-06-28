@@ -1,11 +1,11 @@
 # Phrust Server Known Gaps
 
-The web server is an integrated MVP for simple PHP applications. It executes
+The web server is integrated support for simple PHP applications. It executes
 through the phrust lexer, parser, frontend, runtime, VM, and request-local HTTP
 context; it is not an FPM, FastCGI, CGI, Apache module, or external PHP process
 adapter.
 
-Implemented Wave 2 surface:
+Implemented surface:
 
 - `server-compat-smoke all` is strict for static files, nested URL-encoded
   input, bounded multipart uploads, `$_FILES`, upload movement builtins,
@@ -18,7 +18,7 @@ Implemented Wave 2 surface:
 
 Remaining known gaps:
 
-- The implemented server is an MVP compatibility layer, not full PHP SAPI
+- The implemented server is an application compatibility layer, not full PHP SAPI
   compatibility. It does not emulate FPM process management, Apache module
   globals, Zend extension ABI behavior, complete INI handling, Opcache parity,
   or the full matrix of web-server environment variables.
@@ -28,7 +28,7 @@ Remaining known gaps:
   builtins are not interrupted mid-call; timeout is observed when control
   returns to VM dispatch.
 - Output buffering covers common `ob_*` capture/clean/flush operations and
-  MVP `flush()` behavior, but callback output handlers and true HTTP chunk
+  basic `flush()` behavior, but callback output handlers and true HTTP chunk
   streaming are not complete.
 - Header support covers common `header()`, `headers_list()`, `headers_sent()`,
   and `http_response_code()` behavior, but full PHP header edge cases are not

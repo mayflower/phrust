@@ -129,7 +129,7 @@ starting the next:
    fast paths, tiering policy, process-local compile cache, and consolidated
    big-win matrix.
 8. `07.CL.32` through `07.CL.36`: guard report, safety audit, CI/Nix hardening,
-   result matrix, and final handoff.
+   result matrix, and final follow-up.
 9. Optional `07.CL.A` through `07.CL.F`: AOT research, disassembly dumps,
    eligible-IR fuzz smoke, OSR/trace-JIT research
    (`docs/research/cranelift-osr-tracejit.md`), polymorphic JIT IC
@@ -857,7 +857,7 @@ conservative:
 - every Cranelift native path remains behind the non-default `jit-cranelift`
   feature and explicit runtime mode.
 
-## Work item.36 Final Audit And Performance Handoff
+## Work item.36 Final Audit And Performance Follow-up
 
 The Cranelift addendum is an optional, default-off extension to the general
 Performance performance layer. It does not replace the original Performance
@@ -944,7 +944,7 @@ Open risks:
 
 Mapping back to the original Performance work item pack:
 
-| Original Performance area | Addendum effect | Handoff status |
+| Original Performance area | Addendum effect | Follow-up status |
 | --- | --- | --- |
 | Baseline/Compare | Supplements with Cranelift-specific diff, bench smoke, Big-Win report, and guard report. | Original Work item remains the next work item for a branch that paused after 07.07 counters. |
 | Bytecode-Cache | Not replaced. Cranelift compile cache is process-local and non-persistent only. | Original bytecode-cache work items remain necessary. |
@@ -957,7 +957,7 @@ Mapping back to the original Performance work item pack:
 Recommended original Performance continuation point: Work item,
 `Performance baseline und Vergleichstool`, for any branch that inserted this
 addendum immediately after Work item. In this repository the general Performance
-pack is already implemented, so the practical handoff is to keep using
+pack is already implemented, so the practical follow-up is to keep using
 `nix develop -c just verify-performance` as the default gate and
 `nix develop -c just verify-cranelift` only for the optional Cranelift
 addendum.

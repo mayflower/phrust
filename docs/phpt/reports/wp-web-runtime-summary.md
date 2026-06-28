@@ -1,7 +1,4 @@
-# wp.web-runtime Branch Summary
-
-Prompt pack: Branch 1 WordPress web runtime, request state, filesystem,
-session, and PHAR.
+# wp.web-runtime Summary
 
 ## Implemented Behavior
 
@@ -42,9 +39,9 @@ stdlib differential gates was:
 
 `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`
 
-The branch-local `third_party/php-src` checkout is absent, so PHPT
+The local `third_party/php-src` checkout is absent, so PHPT
 source-integrity verification reports a skip. No generated `target/` reports or
-vendored `php-src` files are part of this branch.
+vendored `php-src` files are part of the repository state.
 
 ## Remaining Gaps
 
@@ -59,11 +56,11 @@ vendored `php-src` files are part of this branch.
 - PHAR support is read-only for local uncompressed entries; signing,
   compression, stub execution, metadata parity, and mutation APIs remain gaps.
 - Network streams, user stream wrappers, and external filesystem transports are
-  outside this branch.
+  outside this module scope.
 
 ## Merge Notes
 
-Likely conflict areas with adjacent branches:
+Likely conflict areas for adjacent feature work:
 
 - `crates/php_runtime/src/builtins/modules/core.rs`
 - `crates/php_runtime/src/context.rs`

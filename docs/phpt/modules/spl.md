@@ -2,13 +2,13 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.selected.jsonl`
-- Prompt 20 generated counts: 8 PASS, 0 SKIP, 0 FAIL, 0 BORK from 8 selected fixtures
-- Aggregate selected counts after adding prompt fixtures: 17 PASS, 2 SKIP, 189 FAIL, 0 BORK from 208 selected fixtures
+- generated counts: 8 PASS, 0 SKIP, 0 FAIL, 0 BORK from 8 selected fixtures
+- Aggregate selected counts after adding generated SPL fixtures: 17 PASS, 2 SKIP, 189 FAIL, 0 BORK from 208 selected fixtures
 - Full upstream corpus baseline: 39 PASS, 3 SKIP, 478 FAIL, 0 BORK from 520 corpus candidates
 
 ## Scope
 
-- Prompt 20 generated SPL MVP submodule fixtures
+- generated SPL MVP submodule fixtures
 - Submodules:
   - `spl.interfaces`
   - `spl.array-iterator`
@@ -62,15 +62,15 @@
 
 ## Target Gates
 
-- Prompt submodules: `nix develop -c just phpt-dev-module MODULE=spl.<submodule>`
+- SPL submodules: `nix develop -c just phpt-dev-module MODULE=spl.<submodule>`
 - Aggregate selected: `nix develop -c just phpt-dev-module MODULE=spl`
 - `nix develop -c just diff-spl-reflection`
 - `nix develop -c just verify-phpt`
 - `nix develop -c just verify-stdlib`
 
-The prompt submodule gates are green. The aggregate `spl` gate remains red
+The SPL submodule gates are green. The aggregate `spl` gate remains red
 because the pre-existing upstream selected SPL batch still has 189 target
-non-green outcomes; adding the prompt fixtures did not add BORKs or new prompt
+non-green outcomes; adding the generated fixtures did not add BORKs or new
 fixture failures.
 
 ## Subarea Failure Snapshot
@@ -103,7 +103,7 @@ fixture failures.
 - `STDLIB-GAP-SPL-FILE-FULL-API`
 - `STDLIB-GAP-SPL-FILE-CSV-FLAGS`
 
-## Closed During Prompt 20
+## Implemented Surface
 
 - `SplFileInfo::getExtension()` now covers leading-dot basenames such as `.test`.
 - `json_encode(new SplFixedArray(...))` now emits array-shaped JSON instead of internal storage properties.

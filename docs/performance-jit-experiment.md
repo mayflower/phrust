@@ -171,7 +171,7 @@ executable pages, does not expose a native function pointer, and does not jump
 into machine code.
 
 Because no executable memory exists in Performance, adding a dummy mprotect wrapper
-would not verify a real lifecycle. The handoff requirement is:
+would not verify a real lifecycle. The follow-up requirement is:
 
 - introduce a small executable-memory owner only in the future native-code JIT
   layer;

@@ -14,6 +14,7 @@ reference checkout.
 
 Supporting docs:
 
+- [PHPT task guide](../how-to/work-with-phpt.md)
 - [Source integrity](source-integrity.md)
 - [Source lookup](source-lookup.md)
 - [Binary discovery](binary-discovery.md)

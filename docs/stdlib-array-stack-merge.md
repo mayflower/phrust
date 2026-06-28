@@ -15,6 +15,6 @@ The VM binds the first argument of the mutating helpers by reference through
 the existing `ReferenceCell` mechanism. Copying helpers build new arrays and
 leave their input arrays untouched.
 
-Known gaps for this slice:
+Known gaps for this scope:
 
 - `STDLIB-GAP-ARRAY-MERGE-RECURSIVE-REFERENCES`

@@ -2,8 +2,8 @@
 
 - Priority: 16
 - Selected manifest: `tests/phpt/manifests/modules/standard.serialization.selected.jsonl`
-- Prompt 16.1 baseline: 16 PASS, 2 SKIP, 107 FAIL, 0 BORK from 126 corpus candidates
-- Prompt 16.9 focused gate: 5 PASS, 0 FAIL, 0 BORK
+- Corpus baseline: 16 PASS, 2 SKIP, 107 FAIL, 0 BORK from 126 corpus candidates
+- focused gate: 5 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -38,7 +38,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.serialization`
 - `nix develop -c just verify-stdlib`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Narrowed the selected manifest to scalar/array/simple-object serialization
   plus an explicit reference-record known-gap fixture.
@@ -46,10 +46,10 @@
   as `STDLIB-GAP-SERIALIZE-REFERENCES`.
 - Latest focused target run: PASS, 5 selected PHPTs.
 
-## Prompt 2E Evidence
+## Evidence
 
 - Reused the selected scalar, array, simple-object, and explicit reference-gap
-  serialization surface as the Prompt 2E serialization acceptance gate.
+  serialization surface as the selected serialization acceptance gate.
 - Latest focused target run: PASS, 5 selected PHPTs.
 - Latest oracle-backed stdlib aggregate run: PASS.
 
@@ -57,4 +57,4 @@
 
 - `R`/`r` reference identity records are not emitted or reconstructed.
 - `allowed_classes`, magic hooks, resources, and deep object/reference graphs
-  remain outside the Prompt 16 focused gate.
+  remain outside the selected focused gate.

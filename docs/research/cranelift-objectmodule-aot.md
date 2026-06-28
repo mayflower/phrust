@@ -115,7 +115,7 @@ That future prototype must be optional, excluded from default CI, and validated
 only as a diagnostic artifact. It must not be loaded by the runtime until the
 persistent native cache ADR exists.
 
-## Handoff
+## Follow-up
 
 future runtime should revisit ObjectModule only if all of these are true:
 

@@ -2,8 +2,8 @@
 
 - Priority: 15
 - Selected manifest: `tests/phpt/manifests/modules/standard.variables.selected.jsonl`
-- Prompt 16.1 baseline: 23 PASS, 74 SKIP, 348 FAIL, 0 BORK from 446 corpus candidates
-- Prompt 16.9 focused gate: 26 PASS, 1 SKIP, 0 FAIL, 0 BORK
+- Corpus baseline: 23 PASS, 74 SKIP, 348 FAIL, 0 BORK from 446 corpus candidates
+- focused gate: 26 PASS, 1 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -33,16 +33,16 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.variables`
 - `nix develop -c just verify-stdlib`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Kept the selected variable-inspection slice green after the standard-core
   follow-up changes.
 - Latest focused target run: PASS, 27 selected PHPTs with 26 PASS and 1 SKIP.
 
-## Prompt 2E Evidence
+## Evidence
 
 - Reused the selected variable-inspection and debug-output surface as the
-  Prompt 2E variables acceptance gate.
+  the selected gate variables acceptance gate.
 - Latest focused target run: PASS, 27 selected PHPTs with no non-green target
   outcomes.
 - Latest oracle-backed stdlib aggregate run: PASS.

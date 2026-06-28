@@ -2,15 +2,15 @@
 
 Date: 2026-06-28.
 
-This audit closes the fastest-engine prompt sequence, FPE-00 through FPE-30,
-against the current source tree. It is an engine/runtime performance sweep for
+This audit records the fastest-engine work, FPE-00 through FPE-30, against the
+current source tree. It is an engine/runtime performance sweep for
 the existing PHP 8.5.7 target (`php-8.5.7`). It does not introduce a web server,
 production SAPI, Zend ABI compatibility, extension ABI compatibility, OPcache
 replacement, or a pinned PHP target update.
 
-## Prompt Status
+## Feature Status
 
-| Prompt | Status | Evidence |
+| Feature | Status | Evidence |
 | --- | --- | --- |
 | FPE-00 through FPE-13 | Implemented | Prior committed slices establish the plan, hotpath reports, byte-kernel/frontend integration, dense fallback accounting, superinstruction mining, polymorphic call ICs, property/method/array/string fast paths, allocation counters, optimizer guidance, and explicit fast preset policy. |
 | FPE-14 | Implemented | Selective Cranelift expansion remains default-off and limited to proven regions; unsupported object, dynamic, and reference-heavy opcodes are conservatively rejected. See `docs/performance-selective-cranelift-regions.md`. |
@@ -31,7 +31,7 @@ replacement, or a pinned PHP target update.
 | FPE-29 | Implemented | Copy-and-patch stencil research is no-exec, maps a tiny quickening-compatible dense subset to textual stencils, and writes local reports under `target/performance/stencils/`. See `docs/research/copy-and-patch-stencil-tier.md`. |
 | FPE-30 | Implemented | PHP-aware mid-tier research is metadata-only, classifies dense functions/regions, and reports guards, helpers, deopt points, and rejection reasons under `target/performance/mid-tier/`. See `docs/research/php-mid-tier-compiler.md`. |
 
-No prompt in the FPE-00 through FPE-30 sequence is intentionally skipped.
+No FPE-00 through FPE-30 item is intentionally skipped.
 Optional tools and rows that are unavailable locally are classified below.
 
 ## Defaults And Off Switches

@@ -2,8 +2,8 @@
 
 - Priority: 14
 - Selected manifest: `tests/phpt/manifests/modules/standard.math.selected.jsonl`
-- Prompt 16.1 baseline: 99 PASS, 11 SKIP, 62 FAIL, 0 BORK from 172 corpus candidates
-- Prompt 16.9 focused gate: 161 PASS, 11 SKIP, 0 FAIL, 0 BORK
+- Corpus baseline: 99 PASS, 11 SKIP, 62 FAIL, 0 BORK from 172 corpus candidates
+- focused gate: 161 PASS, 11 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -32,7 +32,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.math`
 - `nix develop -c just verify-stdlib`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Added math-module implementations and registrations for trigonometric,
   hyperbolic, logarithmic, exponential, base-conversion, `pi`, `fpow`,
@@ -43,9 +43,9 @@
 - Latest focused target run: PASS, 172 selected PHPTs with 161 PASS and
   11 SKIP.
 
-## Prompt 2E Evidence
+## Evidence
 
-- Reused the selected Prompt 16 math surface as the Prompt 2E math acceptance
+- Reused the selected math surface as the selected math acceptance
   gate.
 - Latest focused target run: PASS, 172 selected PHPTs with no non-green target
   outcomes.

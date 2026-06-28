@@ -1,6 +1,6 @@
 # standard.serialization Current Focus Report
 
-Core values/arrays/strings branch Prompt 2E focused standard serialization
+Core values/arrays/strings branch focused standard serialization
 verification.
 
 ## Scope
@@ -32,7 +32,7 @@ verification.
 - `R`/`r` reference identity records are intentionally documented as
   `STDLIB-GAP-SERIALIZE-REFERENCES`.
 - `allowed_classes`, magic hooks, resources, and deep object/reference graphs
-  remain outside the Prompt 2E focused gate.
+  remain outside the selected focused gate.
 
 ## Verification
 

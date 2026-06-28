@@ -26,7 +26,7 @@ Core values/arrays/strings branch focused scalar and operator verification.
 ## Before/After
 
 The branch already had a green 4-fixture selected operator/conversion gate before
-this Prompt 2A pass. This pass added the missing dedicated invalid-operand PHPT
+this this pass. This pass added the missing dedicated invalid-operand PHPT
 from `Zend/tests/add_004.phpt` and expanded the selected gate to 5 fixtures.
 
 | Check | Before | After |

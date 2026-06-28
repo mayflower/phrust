@@ -2,8 +2,8 @@
 
 - Priority: 13
 - Selected manifest: `tests/phpt/manifests/modules/standard.strings.selected.jsonl`
-- Prompt 16.1 baseline: 352 PASS, 42 SKIP, 308 FAIL, 0 BORK from 727 corpus candidates
-- Prompt 2E focused gate: 16 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Corpus baseline: 352 PASS, 42 SKIP, 308 FAIL, 0 BORK from 727 corpus candidates
+- focused gate: 16 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -38,7 +38,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.strings`
 - `nix develop -c just verify-stdlib`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Narrowed the selected manifest to the green focused string slice.
 - Fixed `explode` empty-separator diagnostics and `implode` array string-cast
@@ -47,10 +47,10 @@
   `error_reporting` suppresses them consistently.
 - Latest focused target run: PASS, 15 selected PHPTs.
 
-## Prompt 2E Evidence
+## Evidence
 
 - Added generated coverage for `str_replace`, `strtolower`, and `strtoupper`
-  to complete the Prompt 2E standard string builtin list.
+  to complete the selected standard string builtin list.
 - Latest focused target run: PASS, 16 selected PHPTs.
 - Latest oracle-backed stdlib aggregate run: PASS.
 

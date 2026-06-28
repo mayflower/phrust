@@ -209,7 +209,7 @@ Allocation counters:
 
 - `frame_allocations` counts fresh frame allocations for function activations.
 - `frame_reuses` counts activations served from the request-local frame pool.
-- `frames_allocated` and `frames_reused` are prompt-facing aliases for the same
+- `frames_allocated` and `frames_reused` are compatibility aliases for the same
   activation counts.
 - `register_files_allocated` and `register_files_reused` track the register-file
   allocation/reuse event coupled to each frame activation.

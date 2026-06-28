@@ -1,4 +1,4 @@
-# Handoff to Runtime
+# Semantic Frontend to Runtime Boundary
 
 Runtime should start only after Semantic frontend provides a stable semantic frontend
 contract.

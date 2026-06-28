@@ -2,8 +2,7 @@
 
 - Priority: 9
 - Selected manifest: `tests/phpt/manifests/modules/zend.functions.selected.jsonl`
-- Focused selected counts: 29 PASS, 0 SKIP, 0 FAIL, 0 BORK from 29 Prompt
-  13 generated contract fixtures
+- Focused selected counts: 29 PASS, 0 SKIP, 0 FAIL, 0 BORK from 29 generated contract fixtures
 - Corpus triage counts: 85 PASS, 53 SKIP, 727 FAIL, 0 BORK from 887 corpus
   candidates
 
@@ -42,7 +41,7 @@
 
 ## Known Gaps
 
-- The Prompt 13 selected contract gate is green at 29 PASS for both reference
+- The selected selected contract gate is green at 29 PASS for both reference
   and target.
 - The broader 200-row php-src blocker slice remains documented in
   `docs/phpt/reports/zend.functions-current.md` and is kept as backlog
@@ -53,5 +52,5 @@
 
 ## Next Step
 
-Prompt 13 is closed for the selected generated function/callable contracts.
+The selected gate is closed for the selected generated function/callable contracts.
 Keep those contracts green while reducing the broader php-src blocker slice.

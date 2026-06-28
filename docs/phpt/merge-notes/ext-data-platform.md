@@ -1,6 +1,6 @@
 # ext-data-platform merge notes
 
-Branch prompt set: Branch 4 - Data, PHAR, Session, Opcache, SAPI, GD.
+Current module scope: Branch 4 - Data, PHAR, Session, Opcache, SAPI, GD.
 
 ## Database Policy
 

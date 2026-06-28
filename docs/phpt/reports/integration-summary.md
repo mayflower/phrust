@@ -105,7 +105,7 @@ module docs only for those extensions.
 ### `phpt/ext-xml-soap`
 
 Owns XML-family and SOAP extension behavior. It should keep `soap` out of core
-progress unless a focused prompt changes policy, and it should not hand-edit the
+progress unless a focused module scope changes policy, and it should not hand-edit the
 central baseline.
 
 ### `phpt/ext-data-platform`

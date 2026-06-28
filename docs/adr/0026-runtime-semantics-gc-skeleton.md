@@ -88,7 +88,7 @@ lifetime as known gaps until they are implemented and diff-tested.
   execution. Rejected for Runtime semantics; mutation is limited to deterministic test
   hooks until public semantics are specified.
 
-## Standard library Handoff
+## Standard library Follow-up
 
 Standard library should turn the debug root model into public GC behavior only after
 destructor ordering, weak references, suspended generator/fiber stacks, and

@@ -7,7 +7,7 @@
 
 ## Implemented Scope
 
-Prompt 4G enables PDO core because PDO_SQLite now has a real SQLite engine
+enables PDO core because PDO_SQLite now has a real SQLite engine
 under it.
 
 Implemented behavior:

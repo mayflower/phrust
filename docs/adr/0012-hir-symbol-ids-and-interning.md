@@ -8,7 +8,7 @@ Accepted
 
 Semantic frontend needs stable semantic identities for declarations, names, scopes, HIR
 nodes, types, and attributes. CST identity alone is not enough for semantic
-diagnostics or Runtime handoff.
+diagnostics or Runtime follow-up.
 
 ## Decision
 

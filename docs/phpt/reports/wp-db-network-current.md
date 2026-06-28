@@ -1,8 +1,8 @@
 # WordPress DB/Network Current Report
 
-## Prompt 3.1-3.7 Status
+## Implementation Status
 
-The branch currently owns a focused `wp.db-network` PHPT module for WordPress
+The repository includes a focused `wp.db-network` PHPT module for WordPress
 database and network extension work. The mysqli/mysqlnd policy has moved from
 negative probes to a capability-gated mysqli MVP backed by a real Rust MySQL
 client layer. cURL and OpenSSL now expose narrow MVP helpers instead of
@@ -43,18 +43,18 @@ Summary report: `docs/phpt/reports/wp-db-network-summary.md`.
 ## DSN and Network Test Strategy
 
 - `PHRUST_MYSQL_TEST_DSN=mysql://user:pass@127.0.0.1:3306/db` enables live
-  MySQL/MariaDB tests in later prompts.
+  MySQL/MariaDB tests.
 - The DSN must never be committed.
 - Default non-DSN runs skip live database tests.
 - HTTP/cURL tests use local in-process servers in Rust unit tests and
-  `PHRUST_NET_TESTS=1`; public internet tests are not part of the branch.
+  `PHRUST_NET_TESTS=1`; public internet tests are outside this scope.
 - `PHRUST_CURL_TEST_URL` is required for the optional live cURL PHPT and must
   point at loopback.
 
 ## Prepared Statement Decision
 
-No selected WordPress-style fixture in this branch requires prepared
-statements. This slice keeps `mysqli_prepare` and `mysqli_stmt_init` as explicit
+No selected WordPress-style fixture requires prepared
+statements. The current scope keeps `mysqli_prepare` and `mysqli_stmt_init` as explicit
 unsupported diagnostics rather than adding a partial statement implementation
 without fixture pressure. A future statement MVP should cover
 `mysqli_stmt_bind_param`, `mysqli_stmt_execute`, `mysqli_stmt_get_result`,
@@ -89,21 +89,19 @@ until a real key parser and signature verifier are introduced. Certificate
 parsing, key generation, PKCS#12, encrypt/decrypt APIs, and full OpenSSL parity
 remain gaps.
 
-## Remaining Work
+## Feature Status
 
-- Prompt 3.2: complete. Capability-gated MySQL/MariaDB connection layer. The selected
+- Capability-gated MySQL/MariaDB connection layer is implemented. The selected
   dependency is `mysql = 28` with default features disabled and `minimal-rust`
   enabled. It is MIT/Apache-2.0 licensed, implemented in Rust, and used only
   through `crates/php_runtime/src/db/mysql.rs`.
-- Prompt 3.3: complete for procedural connection/query/fetch/error/escape/close
-  MVP.
-- Prompt 3.4: complete for DSN-gated object `mysqli`/`mysqli_result` query and
-  fetch shape used by WordPress `wpdb`, including escaped insert and
+- Procedural connection/query/fetch/error/escape/close MVP is implemented.
+- DSN-gated object `mysqli`/`mysqli_result` query and fetch shape used by
+  WordPress `wpdb` is implemented, including escaped insert and
   `$result->num_rows`.
-- Prompt 3.5: complete as an explicit gap decision; no selected fixture in this
-  slice requires prepared statements yet.
-- Prompt 3.6: complete for local loopback HTTP GET/POST MVP behind
-  `PHRUST_NET_TESTS=1`.
-- Prompt 3.7: complete for selected digest/random/method helpers plus explicit
-  verify gap.
-- Prompt 3.8: closeout report and non-network baseline gates.
+- Prepared statements remain an explicit gap decision; no selected fixture
+  requires them yet.
+- Local loopback HTTP GET/POST MVP is available behind `PHRUST_NET_TESTS=1`.
+- Selected digest/random/method helpers are implemented with an explicit
+  verification gap.
+- Closeout reporting and non-network baseline gates are recorded.

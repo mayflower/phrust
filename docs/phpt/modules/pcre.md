@@ -2,8 +2,8 @@
 
 - Priority: 18.6 focused harness
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- Prompt 18 close gate: 5 PASS, 0 SKIP, 0 FAIL, 0 BORK from 5 selected fixtures
-- Upstream corpus snapshot before Prompt 18: 41 PASS, 5 SKIP, 117 FAIL, 0 BORK
+- the selected close gate: 5 PASS, 0 SKIP, 0 FAIL, 0 BORK from 5 selected fixtures
+- Upstream corpus snapshot before the selected gate: 41 PASS, 5 SKIP, 117 FAIL, 0 BORK
   from 165 corpus candidates
 
 ## Scope
@@ -50,7 +50,7 @@
 - `nix develop -c cargo test -p php_runtime pcre`
 - `nix develop -c cargo test -p php_vm`
 
-## Prompt 18 Evidence
+## Evidence
 
 - Replaced the broad 165-test selected manifest with a focused five-test PCRE
   harness before broad upstream promotion.
@@ -78,6 +78,6 @@
 
 ## Next Step
 
-Expand from the generated Prompt 18 harness into upstream `ext/pcre` PHPT
+Expand from the generated selected harness into upstream `ext/pcre` PHPT
 promotion after the remaining warning, UTF-8, locale, callback-array, and
 advanced PCRE gaps close.

@@ -33,7 +33,7 @@ The focused reference run is green for all 10 selected PHPTs.
 
 No blockers remain in the selected 10-test JSON PHPT harness.
 
-## Prompt 17.6 Close
+## Close
 
 Close gates passed:
 
@@ -53,7 +53,7 @@ Close gates passed:
 The broad non-green full-regression counts match the accepted PHPT baseline and
 do not leave a JSON-module blocker.
 
-## Prompt 17.3 JSON Encode
+## JSON Encode
 
 `json_encode` now preserves PHP insertion order for arrays and simple objects,
 escapes `/` by default, honors `JSON_UNESCAPED_SLASHES`, and normalizes
@@ -61,7 +61,7 @@ pretty-print indentation to PHP's four-space output shape. The selected upstream
 `json_encode_basic.phpt`, `json_decode_basic.phpt`, and
 `json_encode_unescaped_slashes.phpt` fixtures now pass.
 
-## Prompt 17.4 JSON Decode
+## JSON Decode
 
 `json_decode` success and failure paths now preserve request-local JSON error
 state and `JSON_THROW_ON_ERROR` failures route through a catchable
@@ -69,7 +69,7 @@ state and `JSON_THROW_ON_ERROR` failures route through a catchable
 hierarchy as an `Exception` subclass rather than using a separate JSON-only
 catch path.
 
-## Prompt 17.5 JsonSerializable
+## JsonSerializable
 
 `JsonSerializable` dispatch remains a documented known gap. `json_encode` is
 implemented in the runtime builtin layer, while userland method invocation is
@@ -77,7 +77,7 @@ owned by the VM call path. There is no clean `BuiltinContext` bridge for invokin
 `jsonSerialize()` without adding a second userland call mechanism inside the
 runtime encoder.
 
-## Prompt 17.2 JSON State
+## JSON State
 
 VM execution state now owns request-local JSON last-error code, seeds each
 `BuiltinContext` from it, and copies the updated code back after builtin
@@ -90,7 +90,7 @@ Focused coverage added:
 - `builtin_context_persists_json_last_error_across_vm_builtin_calls`
 - `tests/phpt/generated/json/json-last-error-state.phpt`
 
-## Prompt 17.1 Harness
+## Harness
 
 The selected manifest is intentionally narrow and covers:
 

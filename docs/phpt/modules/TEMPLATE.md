@@ -22,8 +22,8 @@ Use this template when starting a focused PHPT extension or module loop.
 
 - No edits to original `php-src` files.
 - No generated artifacts under `target/`.
-- No tokenizer code or tokenizer PHPT changes unless the prompt explicitly
-  names tokenizer.
+- No tokenizer code or tokenizer PHPT changes unless the current module scope
+  explicitly names tokenizer.
 - No new PHPT baseline without explicit acceptance.
 - No unrelated extension, stdlib, VM, or parser changes.
 
@@ -33,7 +33,7 @@ Use this template when starting a focused PHPT extension or module loop.
 - `tests/phpt/manifests/modules/<module>.json`
 - `tests/phpt/manifests/modules/<module>.selected.jsonl`
 - `tests/phpt/generated/<module>/...`
-- `<runtime or stdlib files explicitly owned by the prompt>`
+- `<runtime or stdlib files explicitly owned by the module scope>`
 
 ## PHPT Manifest Paths
 

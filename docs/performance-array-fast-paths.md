@@ -70,7 +70,7 @@ dispatching to the existing builtin.
 
 ## Key Normalization Cache
 
-No key-normalization cache is added in this slice. String key normalization is
+No key-normalization cache is added in this scope. String key normalization is
 pure, but the runtime does not yet expose a stable string-intern identity plus a
 shape or request epoch that would make such a cache invalidation-proof. Adding a
 cache without that contract would risk stale normalization across dynamically

@@ -43,12 +43,12 @@ documentation checks.
 | Reflection and attributes | `docs/runtime-semantics-reflection-attributes.md` |
 | Destructors and GC | `docs/adr/0025-runtime-semantics-destructor-queue.md`, `docs/adr/0026-runtime-semantics-gc-skeleton.md` |
 | Unsafe and hardening audit | `docs/runtime-semantics-unsafe-audit.md` |
-| Standard library handoff | `docs/stdlib-handoff.md` |
+| Standard library roadmap | `docs/stdlib-roadmap.md` |
 
 ## Docs and CI Consistency
 
 - `README.md` points to the Runtime semantics contract, known-gap catalog, coverage
-  matrix, unsafe audit, and Standard library handoff.
+  matrix, unsafe audit, and standard library roadmap.
 - `AGENTS.md` keeps Runtime semantics boundaries and requires `verify-runtime` before
   closing Runtime semantics work.
 - `.github/workflows/runtime-semantics.yml` runs `nix develop -c just verify-runtime` and

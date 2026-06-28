@@ -108,7 +108,7 @@ destructor timing must stay unchanged.
 
 ## Validation
 
-Focused validation for this slice:
+Focused validation for this scope:
 
 ```bash
 nix develop -c cargo test -p php_vm frame_reuse --lib

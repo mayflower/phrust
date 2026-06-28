@@ -1,11 +1,11 @@
 # standard.strings Current Focus Report
 
-Core values/arrays/strings branch Prompt 2E focused standard string builtin
+Core values/arrays/strings branch focused standard string builtin
 verification.
 
 ## Scope
 
-- Selected generated PHPTs for the Prompt 2E standard string builtin list.
+- Selected generated PHPTs for the selected standard string builtin list.
 - `strlen`, `substr`, `strpos`, `str_contains`, `trim`, `explode`, `implode`,
   `sprintf`, `printf`, `str_replace`, `strtolower`, `strtoupper`, and existing
   `strtok` state coverage.
@@ -14,12 +14,12 @@ verification.
 
 - `tests/phpt/manifests/modules/standard.strings.selected.jsonl`
 - 16 selected generated fixtures.
-- New Prompt 2E generated output was captured from
+- New generated output was captured from
   `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`.
 
 ## Before/After
 
-Before this Prompt 2E pass, the selected standard string gate was green for 15
+Before this this pass, the selected standard string gate was green for 15
 fixtures but did not cover `str_replace`, `strtolower`, or `strtoupper`. This
 pass promotes those functions into selected PHPT coverage.
 

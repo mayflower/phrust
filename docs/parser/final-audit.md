@@ -6,7 +6,7 @@ Audit date: 2026-06-20
 
 Complete for the parser/CST milestone. The repository has a Rust syntax crate,
 parser CLI, lossless CST, strict fixture comparison against the pinned PHP
-8.5.7 reference, and documented handoff boundaries for semantic layers.
+8.5.7 reference, and documented follow-up boundaries for semantic layers.
 
 No reference-dependent checks were skipped in this audit. The local reference
 binary was available at `third_party/php-src/sapi/cli/php` and reported PHP
@@ -70,7 +70,7 @@ No git tag was created during this audit.
 
 ## Recommendation
 
-Start the next workstream from `docs/parser/handoff-to-frontend.md`. The first
+Start semantic frontend work from `docs/parser/frontend-boundary.md`. The first
 vertical slice should build read-only declaration tables from the existing CST,
 then add separate semantic diagnostics without changing parser acceptance or
 roundtrip behavior.

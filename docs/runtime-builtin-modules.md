@@ -41,9 +41,9 @@ functional ownership.
 | SPL object helpers and SPL autoload placeholders | `builtins/modules/spl.rs` |
 | Symbol introspection, callable dispatch placeholders, class/function/method existence helpers | `builtins/modules/reflection.rs` |
 
-## Prompt 15.1 Ownership Check
+## Filesystem And Stream Ownership Check
 
-Prompt 15.1 verified that filesystem and stream builtins are owned by their
+Filesystem and stream builtins are owned by their
 module files rather than routed through temporary `core.rs` shims:
 
 - filesystem/path builtins such as `file_exists`, `file_get_contents`,
@@ -57,7 +57,7 @@ module files rather than routed through temporary `core.rs` shims:
 - `core.rs` retains only shared helper functions and cross-module tests for
   this area
 
-Prompt 15.1 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_runtime`: PASS
 - `nix develop -c just diff-streams`: PASS, 2 pass / 0 fail / 0 skip /

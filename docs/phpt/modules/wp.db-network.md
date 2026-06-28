@@ -19,7 +19,7 @@
 - Public internet dependencies in tests
 - Committing local DSNs or secrets
 
-## Prompt 3.1 Harness
+## Harness
 
 This module owns selected DB/network fixtures for WordPress. The mysqli surface
 has a capability-gated MVP backed by a real Rust MySQL client. cURL exposes a
@@ -39,7 +39,7 @@ Selected fixtures:
 - `tests/phpt/generated/wp.db-network/openssl-platform-mvp.phpt`
 - `tests/phpt/generated/wp.db-network/openssl-helpers-mvp.phpt`
 
-The MySQL live fixture uses `PHRUST_MYSQL_TEST_DSN` as the branch-wide external
+The MySQL live fixture uses `PHRUST_MYSQL_TEST_DSN` as the module-wide external
 service switch. Without that variable it must skip cleanly. Non-live mysqli
 fixtures prove the module is visible and that connection attempts do not fake
 success when the DSN gate is closed. References without native mysqli skip the
@@ -49,7 +49,7 @@ The cURL live fixture uses `PHRUST_NET_TESTS=1` and `PHRUST_CURL_TEST_URL` as
 the explicit network switch. The URL must point at a local test server; the
 runtime MVP rejects non-loopback hosts and does not use public internet tests.
 
-Prepared statements are intentionally not implemented in this slice. The
+Prepared statements are intentionally not implemented in the current scope. The
 selected WordPress-style fixtures exercise `mysqli_query` plus escaping and do
 not require `mysqli_stmt_*`; `mysqli_prepare` remains an explicit unsupported
 diagnostic until a selected fixture needs a real DB-backed statement path.

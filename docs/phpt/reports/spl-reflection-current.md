@@ -13,7 +13,7 @@ Reference target:
 ## Branch Scope
 
 This branch advances the selected SPL and Reflection PHPT slices from the Branch
-3 prompt pack. It keeps the work inside the existing standard-library, VM, and
+3 implementation scope. It keeps the work inside the existing standard-library, VM, and
 PHPT tooling boundaries:
 
 - promote focused upstream SPL and Reflection PHPTs only after the covered

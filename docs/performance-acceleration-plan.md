@@ -2,8 +2,8 @@
 
 Date: 2026-06-27.
 
-This is the coordination document for the staged performance acceleration prompt
-pack. It builds on the existing Performance layer without changing PHP-visible
+This is the coordination document for staged performance acceleration. It
+builds on the existing Performance layer without changing PHP-visible
 semantics or promoting native execution to the default path.
 
 The interpreter remains the source of truth. Optimized paths must be optional,
@@ -28,7 +28,7 @@ Current ownership:
 | `php_runtime` | PHP values, arrays, strings, output, references/COW, objects, builtins, and runtime services. | Runtime fast paths must call or preserve existing semantic helpers unless a fixture proves the exact shortcut. |
 | `php_vm` | Interpreter dispatch, frames, registers, calls, quickening, inline caches, counters, tiering, fallback, includes, dense-bytecode design/execution subset, and JIT integration. | Tier 0 and Tier 1 live here. Every optimized mode needs an off switch, fallback, and counters. Dense bytecode execution is explicit and default-off. |
 | `php_bytecode_cache` | Local disk cache for verified artifacts and corruption fallback. | Cache artifacts are untrusted inputs and cannot decide correctness. |
-| `php_jit` | Default-off JIT backend API, optional Cranelift feature, ABI/helper surface, and experimental native subsets. | Native execution remains feature-gated and runtime-off unless a future prompt explicitly changes policy. |
+| `php_jit` | Default-off JIT backend API, optional Cranelift feature, ABI/helper surface, and experimental native subsets. | Native execution remains feature-gated and runtime-off unless a future ADR explicitly changes policy. |
 | `php_perf` and `scripts/performance/` | Stable report types, benchmark smokes, flag matrix, hot-path inventory, and performance reports. | Correctness comparison comes before timing. Host wall-clock reports stay advisory. |
 
 ## Current Performance Gates
@@ -146,7 +146,7 @@ reuse completed frames and their register/local-file allocations. Conservative
 fresh-frame fallback is used for generators, generator/fiber continuations,
 by-reference params or returns, closure captures, class/method contexts, shared
 top-level locals, try/finally bodies, and object-allocation bodies that may hold
-destructor-sensitive values. Counters now include the prompt-facing
+destructor-sensitive values. Counters now include the compatibility
 `frames_allocated`, `frames_reused`, `register_files_allocated`,
 `register_files_reused`, and `frame_reuse_blocked_by_reason` fields while
 keeping the legacy `frame_allocations` and `frame_reuses` keys.
@@ -180,7 +180,7 @@ bytecode execution off, superinstructions off, and tiering off.
 
 ### Tier 2a: Optional Baseline Native Tier Research
 
-Tier 2a is research only until a dedicated prompt implements a mock or
+Tier 2a is research only until a dedicated work item implements a mock or
 no-exec prototype and records a recommendation. It should compare:
 
 - copy-and-patch or stencil baseline JIT;
@@ -234,7 +234,7 @@ Every acceleration change must satisfy these rules:
 
 ## Phase Order
 
-The prompt-pack order is:
+The planned phase order is:
 
 1. Phase 09.00: this plan and acceleration gap catalog.
 2. Phase 09.01: representative performance corpus and richer counters. The

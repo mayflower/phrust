@@ -2,7 +2,7 @@
 
 Semantic frontend declaration collection builds per-file declarations from AST views and
 records enough information for name resolution, diagnostics, snapshots, and
-Runtime handoff.
+Runtime follow-up.
 
 ## Collected Declarations
 

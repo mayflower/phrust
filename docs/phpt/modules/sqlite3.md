@@ -7,7 +7,7 @@
 
 ## Implemented Scope
 
-Prompt 4F enables `sqlite3` by default and backs it with `rusqlite`.
+enables `sqlite3` by default and backs it with `rusqlite`.
 
 Implemented behavior:
 
@@ -34,7 +34,7 @@ successful error state, close behavior, and a local file database round trip.
   streams, busy timeout, loadable extensions, and exception-mode behavior are
   outside this MVP.
 - The implementation intentionally does not provide network databases or PDO;
-  PDO_SQLite is owned by Prompt 4G.
+  PDO_SQLite owns SQLite-specific PDO integration.
 
 ## Source References
 

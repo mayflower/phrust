@@ -2,8 +2,8 @@
 
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
-- Prompt 16.1 derived baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- Prompt 16.9 focused gate: 4 PASS, 0 FAIL, 0 BORK
+- Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
+- focused gate: 4 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -37,7 +37,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.url-html`
 - `nix develop -c just verify-stdlib`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Added a dedicated selected manifest and generated smoke fixtures for the
   URL/HTML MVP.
@@ -48,4 +48,4 @@
 ## Known Gaps
 
 - Full entity-table, charset, flag, RFC-mode, object, and URL edge-case
-  behavior remains outside the Prompt 16 focused gate.
+  behavior remains outside the selected focused gate.

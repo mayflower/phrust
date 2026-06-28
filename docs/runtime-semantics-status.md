@@ -1,15 +1,14 @@
-# Runtime semantics Handoff
+# Runtime Semantics Status
 
 For the final Runtime semantics closure state, use `docs/runtime-semantics-final-audit.md`,
-`docs/runtime-semantics-coverage-matrix.md`, and `docs/stdlib-handoff.md`. This document
-remains the Runtime-to-Runtime semantics and intra-Runtime semantics working handoff record.
+`docs/runtime-semantics-coverage-matrix.md`, and `docs/stdlib-roadmap.md`.
 
-This handoff records the Runtime semantics closeout position for the PHP engine work. It
-is an audit document and Standard library backlog, not a compatibility claim.
+This document records the current runtime semantics position for the PHP engine
+work. It is a status and backlog document, not a compatibility claim.
 
 ## Runtime semantics Position
 
-Runtime semantics moved the executable core from the Runtime MVP toward PHP runtime
+Runtime semantics moves the executable core from the initial runtime subset toward PHP runtime
 semantics: references, Copy-on-Write, arrays, foreach, calls, objects, traits,
 interfaces, enums, attributes, Reflection metadata, generators, fibers,
 include/eval/autoload/globals, diagnostics, destructors, GC debug hooks,
@@ -62,7 +61,7 @@ Standard library should reuse the public Rust surface already documented in
 VM frame internals, continuation structs, GC debug IDs, and trace formatting
 are implementation details unless a Standard library ADR stabilizes them.
 
-## Standard library Handoff Backlog
+## Standard Library Backlog
 
 ### Standard Library
 
@@ -89,7 +88,7 @@ are implementation details unless a Standard library ADR stabilizes them.
 
 ### SPL and Iteration
 
-- Expand the current Iterator/IteratorAggregate metadata MVP into real SPL
+- Expand the current Iterator/IteratorAggregate metadata subset into real SPL
   interface and class surfaces.
 - Implement `ArrayAccess` offset reads/writes/isset/unset before claiming
   collection-library compatibility.
@@ -146,14 +145,14 @@ should be minimized with `scripts/minimize_runtime_failure.py` and retained in
 `just regression-fixtures` is part of `just runtime-semantics-fixtures` and therefore part
 of `just verify-runtime`.
 
-## Historical Runtime Baseline
+## Runtime Baseline
 
-The remaining sections preserve the Runtime closeout context that Runtime semantics
-started from.
+The remaining sections record the runtime baseline that the runtime semantics
+layer builds on.
 
 ## Validation Results
 
-Work item validation set, run on 2026-06-21:
+Baseline validation set, run on 2026-06-21:
 
 | Command | Result | Notes |
 | --- | --- | --- |
@@ -179,8 +178,8 @@ Runtime decisions are captured in these ADRs:
 | IR style | `docs/adr/0017-runtime-register-ir.md` |
 | VM dispatch | `docs/adr/0018-runtime-vm-dispatch.md` |
 | Value representation | `docs/adr/0019-runtime-runtime-value-representation.md` |
-| Array MVP | `docs/adr/0020-runtime-array-mvp.md` |
-| Object MVP | `docs/adr/0021-runtime-object-mvp.md` |
+| Array model | `docs/adr/0020-runtime-array-mvp.md` |
+| Object model | `docs/adr/0021-runtime-object-mvp.md` |
 | Exception model | `docs/adr/0022-runtime-exception-model.md` |
 | Include model | `docs/adr/0023-runtime-include-model.md` |
 | Known-gap policy | `docs/adr/0024-runtime-known-gap-policy.md` |
@@ -196,18 +195,18 @@ Runtime decisions are captured in these ADRs:
 | Defaults, variadics, returns | yes | yes | yes | partial | PHP type/coercion wording differs | `E_PHP_RUNTIME_WEAK_STRICT_TYPES_COERCION` |
 | Closures and arrow functions | yes | yes | yes | partial | by-value/by-reference captures, static closure locals, and arrow by-value captures execute; full Closure binding remains deferred | `E_PHP_RUNTIME_UNSUPPORTED_CLOSURE_BINDING` |
 | Dynamic function/callable forms | yes | partial | partial | partial | not PHP-compatible | `E_PHP_IR_UNSUPPORTED_DYNAMIC_FUNCTION_CALL` |
-| PHP 8.5 pipe MVP | yes | yes | yes | partial | simple callables only | `E_PHP_VM_PIPE_RHS_NOT_CALLABLE` |
-| Selected builtins | yes | yes | yes | partial | strict MVP only | `E_PHP_RUNTIME_UNSUPPORTED_STDLIB` |
+| PHP 8.5 pipe operator | yes | yes | yes | partial | simple callables only | `E_PHP_VM_PIPE_RHS_NOT_CALLABLE` |
+| Selected builtins | yes | yes | yes | partial | strict supported subset only | `E_PHP_RUNTIME_UNSUPPORTED_STDLIB` |
 | Arrays | yes | yes | yes | partial | key/COW/reference edges differ | `E_PHP_RUNTIME_ARRAY_REFERENCE_COW` |
 | Foreach over arrays | yes | yes | yes | partial | by-value snapshots and local-array by-reference foreach execute; non-array and Traversable sources deferred | `E_PHP_VM_UNSUPPORTED_FOREACH_SOURCE` |
 | References | yes | partial | partial | partial | simple local alias only | `E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS` |
 | Global and magic constants | yes | partial | partial | partial | limited predefined constants | `E_PHP_RUNTIME_PREDEFINED_CONSTANT_MATRIX` |
 | Include/require | yes | yes | yes | partial | root-constrained local model | `E_PHP_RUNTIME_INCLUDE_SCOPE_MATRIX` |
-| Concrete classes and `new` | yes | yes | yes | partial | public concrete class MVP | `E_PHP_IR_UNSUPPORTED_CLASSLIKE_OBJECT` |
+| Concrete classes and `new` | yes | yes | yes | partial | public concrete class subset | `E_PHP_IR_UNSUPPORTED_CLASSLIKE_OBJECT` |
 | Public properties and methods | yes | yes | yes | partial | visibility/inheritance missing | `E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER` |
 | Static methods | yes | partial | partial | partial | explicit class names only | `E_PHP_IR_UNSUPPORTED_LATE_STATIC_BINDING` |
-| Clone and clone-with | yes | yes | yes | partial | public shallow MVP only | `E_PHP_RUNTIME_UNSUPPORTED_CLONE_WITH_PROPERTY_RULES` |
-| Exceptions | yes | yes | yes | partial | internal Exception MVP | `E_PHP_RUNTIME_UNSUPPORTED_THROWABLE_HIERARCHY` |
+| Clone and clone-with | yes | yes | yes | partial | public shallow subset only | `E_PHP_RUNTIME_UNSUPPORTED_CLONE_WITH_PROPERTY_RULES` |
+| Exceptions | yes | yes | yes | partial | internal Exception subset | `E_PHP_RUNTIME_UNSUPPORTED_THROWABLE_HIERARCHY` |
 | Runtime type checks | yes | yes | yes | partial | exact family checks only | `E_PHP_RUNTIME_WEAK_STRICT_TYPES_COERCION` |
 | Superglobals | yes | partial | partial | partial | controlled CLI subset only | `E_PHP_RUNTIME_SUPERGLOBALS_FULL_MATRIX` |
 | Generators and `yield from` | yes | yes | classified | no | known gap | `E_PHP_IR_UNSUPPORTED_GENERATOR` |
@@ -240,7 +239,7 @@ Runtime decisions are captured in these ADRs:
    `E_PHP_RUNTIME_UNSUPPORTED_STDLIB`,
    `E_PHP_RUNTIME_BUILTIN_ARITY`,
    `E_PHP_RUNTIME_BUILTIN_TYPE`.
-8. Throwable/Error hierarchy: exceptions execute through an internal MVP, not
+8. Throwable/Error hierarchy: exceptions execute through an internal subset, not
    full PHP `Throwable` classes or stack traces. ID:
    `E_PHP_RUNTIME_UNSUPPORTED_THROWABLE_HIERARCHY`.
 9. Type coercion: runtime parameter, return, and property checks do not
@@ -277,12 +276,12 @@ Runtime decisions are captured in these ADRs:
 19. Warning and fatal text compatibility: VM emits structured diagnostics
     instead of PHP CLI wording. ID: `E_PHP_RUNTIME_WARNING_CHANNEL_COMPAT`.
 20. Zend ABI, opcache/JIT, resources, and stream wrappers are intentionally
-    deferred beyond this runtime MVP. IDs:
+    deferred beyond this runtime subset. IDs:
     `E_PHP_RUNTIME_UNSUPPORTED_ZEND_ABI`,
     `E_PHP_RUNTIME_UNSUPPORTED_JIT`,
     `E_PHP_RUNTIME_UNSUPPORTED_STREAM_WRAPPER`.
 
-## Runtime/VM TODO, Unwrap, Expect, Panic Audit
+## Runtime/VM Hardening Audit
 
 Scope checked: `crates/php_runtime`, `crates/php_vm`, `crates/php_vm_cli`,
 `crates/php_ir`, and runtime testkit paths.
@@ -314,9 +313,9 @@ Rows marked `planned` or `deferred` keep explicit examples or scope notes.
 They are not counted as implemented and must gain fixtures when Runtime semantics starts
 work on that behavior.
 
-## Runtime semantics Task List
+## Runtime Semantics Backlog
 
-1. References and Copy-on-Write: replace the local-alias MVP with PHP-like
+1. References and Copy-on-Write: replace the local-alias subset with PHP-like
    zval/reference storage for variables, parameters, returns, array elements,
    object properties, and closure captures.
 2. Arrays complete: implement full key normalization, spread/unpack, COW,
@@ -335,7 +334,7 @@ work on that behavior.
    iterator interfaces, core SPL containers, and autoload-sensitive behavior.
 8. PHPT expansion: grow local PHPT smoke coverage, classify skips and known
    gaps explicitly, and run reference comparisons where stable.
-9. Composer/framework smoke handoff: Runtime semantics has offline, hand-written
+9. Composer/framework smoke coverage: Runtime semantics has offline, hand-written
    real-world fixtures in `fixtures/runtime_semantics/real_world/`, but real Composer
    package execution remains Standard library work. Required Standard library pieces include
    broader predefined constants, common stdlib helpers (`array_map`, `count`,
@@ -344,9 +343,9 @@ work on that behavior.
    Reflection construction APIs such as `ReflectionClass::newInstanceArgs`,
    fuller SPL interfaces/classes, and exact warning/fatal text compatibility.
 
-## Handoff Position
+## Current Position
 
-Runtime is a green executable MVP for curated runtime fixtures. It is not
+Runtime is green for curated runtime fixtures. It is not
 Composer-compatible, framework-compatible, Zend-bytecode-compatible, or ABI
 compatible. Runtime semantics should treat every row in the deviation list as open until
 new implementation, fixtures, and reference-diff evidence prove otherwise.

@@ -1,7 +1,5 @@
 # wp.web-runtime Current Report
 
-Prompt pack: Branch 1 web runtime request state.
-
 Reference target:
 
 - PHP series: 8.5
@@ -27,7 +25,7 @@ Latest module run:
   `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=wp.web-runtime`
 - Reference outcomes: 1 PASS, 1 SKIP
 - Target outcomes: 1 PASS, 1 SKIP
-- Source-integrity note: skipped because this branch checkout has no pinned
+- Source-integrity note: skipped because this checkout has no pinned
   `php-src` checkout under `third_party/`.
 
 ## Required Gates

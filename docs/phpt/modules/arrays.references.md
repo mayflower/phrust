@@ -2,7 +2,7 @@
 
 - Priority: 8
 - Selected manifest: `tests/phpt/manifests/modules/arrays.references.selected.jsonl`
-- Current selected counts: 6 PASS, 0 SKIP, 0 FAIL, 0 BORK from 6 Prompt 2C generated core fixtures
+- Current selected counts: 6 PASS, 0 SKIP, 0 FAIL, 0 BORK from 6 generated core fixtures
 
 ## Scope
 
@@ -51,9 +51,9 @@
 ## Known Gaps
 
 - The previous broad 200-fixture audit still has 124 target failures and 58 target skips against a green Reference PHP run. Those failures cluster around by-reference method returns, object property references, SPL and extension iterables, ReflectionReference, property hooks, and extension availability.
-- Null used as an array offset currently normalizes to the empty-string key in unit coverage, but PHP 8.5 also emits a deprecation notice. That diagnostic is not part of the Prompt 2C selected PHPT gate.
+- Null used as an array offset currently normalizes to the empty-string key in unit coverage, but PHP 8.5 also emits a deprecation notice. That diagnostic is not part of the selected selected PHPT gate.
 - By-reference foreach remains intentionally limited to simple local array variables; nonlocal sources are a stable known gap.
 
 ## Next Step
 
-Keep the Prompt 2C core selected gate green while promoting broader php-src reference, object, SPL, and extension cases into later focused modules.
+Keep the selected core selected gate green while promoting broader php-src reference, object, SPL, and extension cases into later focused modules.

@@ -1,10 +1,8 @@
 # objects.advanced Current Focus Report
 
-Generated from Prompt Pack Branch 2.
-
 ## Scope
 
-This branch owns advanced object behavior only:
+This module owns advanced object behavior only:
 
 - `objects.magic`: `__get`, `__set`, `__isset`, `__unset`, `__call`, `__callStatic`, `__invoke`, `__toString`
 - `objects.clone`: clone identity, independent properties, `__clone`, and public clone-with MVP behavior
@@ -26,7 +24,7 @@ gate`.
 
 ## Current Gate Status
 
-Prompt 2.1 split gates:
+Selected submodule gates:
 
 | Gate | Reference | Target | Status |
 | --- | ---: | ---: | --- |
@@ -37,26 +35,25 @@ Prompt 2.1 split gates:
 | `nix develop -c just verify-phpt` | n/a | n/a | PASS |
 
 All four submodule gates use curated selected manifests under
-`tests/phpt/manifests/modules/` and isolated Prompt 2.1 work output under
-`target/phpt-work-b3-objects-advanced`.
+`tests/phpt/manifests/modules/`.
 
-Prompt 2.2 through Prompt 2.5 acceptance:
+Selected acceptance:
 
-| Prompt | Gate | Status |
+| Area | Gate | Status |
 | --- | --- | --- |
-| 2.2 magic | `nix develop -c cargo test -p php_vm` | PASS |
-| 2.2 magic | `nix develop -c just phpt-dev-module MODULE=objects.magic` | PASS |
-| 2.3 clone | `nix develop -c cargo test -p php_runtime object` | PASS |
-| 2.3 clone | `nix develop -c cargo test -p php_vm` | PASS |
-| 2.3 clone | `nix develop -c just phpt-dev-module MODULE=objects.clone` | PASS |
-| 2.4 traits | `nix develop -c cargo test -p php_ir` | PASS |
-| 2.4 traits | `nix develop -c cargo test -p php_vm` | PASS |
-| 2.4 traits | `nix develop -c just phpt-dev-module MODULE=objects.traits` | PASS |
-| 2.5 enums | `nix develop -c cargo test -p php_runtime object` | PASS |
-| 2.5 enums | `nix develop -c cargo test -p php_vm` | PASS |
-| 2.5 enums | `nix develop -c just phpt-dev-module MODULE=objects.enums` | PASS |
+| magic | `nix develop -c cargo test -p php_vm` | PASS |
+| magic | `nix develop -c just phpt-dev-module MODULE=objects.magic` | PASS |
+| clone | `nix develop -c cargo test -p php_runtime object` | PASS |
+| clone | `nix develop -c cargo test -p php_vm` | PASS |
+| clone | `nix develop -c just phpt-dev-module MODULE=objects.clone` | PASS |
+| traits | `nix develop -c cargo test -p php_ir` | PASS |
+| traits | `nix develop -c cargo test -p php_vm` | PASS |
+| traits | `nix develop -c just phpt-dev-module MODULE=objects.traits` | PASS |
+| enums | `nix develop -c cargo test -p php_runtime object` | PASS |
+| enums | `nix develop -c cargo test -p php_vm` | PASS |
+| enums | `nix develop -c just phpt-dev-module MODULE=objects.enums` | PASS |
 
-Prompt 2.6 post-core integration gates on `main`:
+Post-core integration gates on `main`:
 
 | Gate | Reference | Target | Status |
 | --- | ---: | ---: | --- |
@@ -68,7 +65,7 @@ Prompt 2.6 post-core integration gates on `main`:
 | `nix develop -c just verify-runtime` | n/a | n/a | PASS |
 | `nix develop -c just verify-phpt` | n/a | n/a | PASS |
 
-## Prompt 2.2 Magic Method MVP
+## Magic Method MVP
 
 Supported by the selected gate:
 
@@ -85,7 +82,7 @@ Remaining gaps:
 - recursive by-reference magic lvalues
 - Reflection of magic methods
 
-## Prompt 2.3 Clone and Clone-With MVP
+## Clone and Clone-With MVP
 
 Supported by the selected gate:
 
@@ -102,7 +99,7 @@ Remaining gaps:
 - full property-hook clone-with matrix
 - serialization magic
 
-## Prompt 2.4 Traits MVP
+## Traits MVP
 
 Supported by the selected gate:
 
@@ -119,7 +116,7 @@ Remaining gaps:
 - exhaustive conflict diagnostics
 - Reflection trait APIs
 
-## Prompt 2.5 Enums MVP
+## Enums MVP
 
 Supported by the selected gate:
 
@@ -136,11 +133,11 @@ Remaining gaps:
 - `ReflectionEnum`
 - exhaustive invalid enum diagnostics
 
-## Prompt 2.6 Closeout Status
+## Closeout Status
 
-The completed object-core branch is merged into `main` at `0405768`. Prompt 2.6
-integration then merged the advanced branch onto current `main` without undoing
-the object-core fixes. The four advanced submodule gates pass independently.
+The completed object-core branch is merged into `main` at `0405768`. The
+advanced object gates pass on current `main` without undoing the object-core
+fixes. The four advanced submodule gates pass independently.
 
 Current aggregate `objects.classes` impact after the core branch merge:
 
@@ -157,9 +154,10 @@ Current aggregate `objects.classes` impact after the core branch merge:
 
 ## Current Blockers
 
-No blockers remain for Prompts 2.1 through 2.5. Prompt 2.6 is integrated with
-the completed core branch, but the aggregate `objects.classes` selected gate is
-still non-green at 164 PASS / 36 FAIL on the target.
+No blockers remain for the selected advanced object gates. The selected gates
+are integrated with the completed core branch, but the aggregate
+`objects.classes` selected gate is still non-green at 164 PASS / 36 FAIL on the
+target.
 
 ## Non-Scope
 

@@ -13,7 +13,7 @@ Supported format surface:
 - `printf` and `vprintf` write through `OutputBuffer` and return byte counts.
 - `sprintf` and `vsprintf` return exact runtime strings.
 
-Known gaps for this slice:
+Known gaps for this scope:
 
 - `STDLIB-GAP-PRINTF-ADVANCED-FORMATS`
 - `STDLIB-GAP-FPRINTF-STREAM-RESOURCE`

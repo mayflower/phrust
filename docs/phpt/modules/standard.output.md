@@ -2,8 +2,8 @@
 
 - Priority: 16.6
 - Selected manifest: `tests/phpt/manifests/modules/standard.output.selected.jsonl`
-- Prompt 16.1 derived baseline: 11 PASS, 0 SKIP, 63 FAIL, 20 BORK from 94 path-filtered candidates
-- Prompt 16.9 focused gate: 11 PASS, 0 FAIL, 0 BORK
+- Derived corpus baseline: 11 PASS, 0 SKIP, 63 FAIL, 20 BORK from 94 path-filtered candidates
+- focused gate: 11 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -41,7 +41,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.output`
 - `nix develop -c cargo test -p php_vm`
 
-## Prompt 16 Evidence
+## Evidence
 
 - Added a dedicated selected manifest and generated smoke fixtures for the
   output-buffer MVP.

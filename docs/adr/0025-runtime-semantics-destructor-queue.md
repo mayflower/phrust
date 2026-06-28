@@ -48,7 +48,7 @@ locals, or shutdown interaction with generators and fibers.
 - Ignore destructors until Standard library. Rejected because object lifetime is visible
   enough to affect Runtime semantics object, clone, exception, and shutdown fixtures.
 
-## Standard library Handoff
+## Standard library Follow-up
 
 Standard library must decide unset-time destruction, cycle-collection destruction,
 shutdown ordering for globals/statics, destructor interaction with suspended

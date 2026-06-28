@@ -9,8 +9,8 @@
 ## Decision
 
 `mysqli` is now a WordPress-oriented MVP instead of a policy-only out-of-scope
-extension. It registers the selected functions/classes/constants only because
-the branch added a real MySQL/MariaDB client layer and capability-gated query
+extension. It registers the selected functions/classes/constants because the
+runtime includes a real MySQL/MariaDB client layer and capability-gated query
 path.
 
 Host database access is capability-gated by `PHRUST_MYSQL_TEST_DSN` and disabled
@@ -28,8 +28,8 @@ of opening sockets or pretending success.
    `mysqli_real_escape_string`.
 3. Object API coverage for `mysqli`, `mysqli_result`, and the wpdb-style
    connect/set-charset/query/escape/fetch flow.
-4. Prepared statements are documented as an explicit gap because no selected
-   WordPress-style fixture in this branch requires `mysqli_stmt_*`.
+4. Prepared statements are documented as an explicit gap because the selected
+   WordPress-style fixtures do not require `mysqli_stmt_*`.
 5. mysqlnd-specific behavior remains represented as driver metadata/gaps unless
    a selected fixture requires a real user-visible surface.
 
@@ -39,7 +39,7 @@ of opening sockets or pretending success.
 - Reference behavior: PHP with `mysqli` enabled exposes procedural and object
   APIs, `mysqli` classes, connection/query/result/statement behavior, errors,
   options, and mysqlnd integration.
-- Current phrust behavior: the WordPress DB/network branch exposes a narrow
+- Current phrust behavior: the WordPress DB/network runtime exposes a narrow
   `mysqli` MVP for connection/query/result/error/escape/close behavior behind
   `PHRUST_MYSQL_TEST_DSN`; prepared statements remain an explicit unsupported
   diagnostic because the selected fixtures do not require them yet.

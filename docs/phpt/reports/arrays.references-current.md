@@ -1,6 +1,6 @@
 # arrays.references Current Focus Report
 
-Core values/arrays/strings branch Prompt 2C focused array/reference/COW
+Core values/arrays/strings branch focused array/reference/COW
 verification.
 
 ## Scope
@@ -15,7 +15,7 @@ verification.
 ## Selected Manifest
 
 - `tests/phpt/manifests/modules/arrays.references.selected.jsonl`
-- 6 generated core Prompt 2C fixtures with expected output captured from
+- 6 generated core selected fixtures with expected output captured from
   `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`.
 
 ## Selected Fixtures
@@ -29,9 +29,9 @@ verification.
 
 ## Before/After
 
-Before this Prompt 2C pass, the broad selected audit had Reference PHP green
+Before this this pass, the broad selected audit had Reference PHP green
 for 200 fixtures while the target had 18 PASS, 58 SKIP, and 124 FAIL. That set
-mixed Prompt 2C local-array semantics with by-reference method returns, object
+mixed the selected gate local-array semantics with by-reference method returns, object
 property references, SPL and extension iterables, ReflectionReference, property
 hooks, and extension availability.
 
@@ -57,7 +57,7 @@ hooks, and extension availability.
 
 ## Remaining Explicit Gaps
 
-- The old broad audit remains useful as discovery data but is not the Prompt 2C
+- The old broad audit remains useful as discovery data but is not the selected
   gate. It still includes out-of-scope object, SPL, reflection, property-hook,
   and extension cases.
 - Null array offsets do not yet emit PHP 8.5's deprecation notice in the

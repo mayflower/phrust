@@ -65,7 +65,7 @@ fallback accounting.
 
 ## Remaining Work
 
-This slice does not add a new small-map or record storage representation, shape
+This scope does not add a new small-map or record storage representation, shape
 interning, immutable literal storage, dense bytecode lowering for record
 lookups, or native/JIT consumption. Those remain blocked on broader PHPT and
 framework evidence plus exact mutation, order, reference, and COW invalidation

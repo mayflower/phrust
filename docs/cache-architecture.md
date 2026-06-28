@@ -39,7 +39,7 @@ to reuse immutable compiled entry scripts across HTTP requests in the current
 server process. It does not persist artifacts across process restarts and does
 not use the `.phbc` disk format.
 
-The server cache key records the safe MVP invalidation dimensions available at
+The server cache key records the invalidation dimensions available at
 entry-script compile time:
 
 - canonical script path;

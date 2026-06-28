@@ -43,7 +43,7 @@ becomes stricter as required functionality is promoted.
 `scripts/performance_regression_smoke.sh`. This smoke does not replace the
 foundation, lexer, frontend, runtime, or standard-library gates. It checks that
 those gates remain discoverable in `just`, that their verification scripts
-remain present, and that the handoff and final audit artifacts are still
+remain present, and that the follow-up and final audit artifacts are still
 available. Run the owned gates directly when changing those layers:
 
 ```bash

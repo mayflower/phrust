@@ -4,7 +4,7 @@ Date: 2026-06-28.
 
 ## Scope
 
-This report closes the Prompt 1A through 1D PHPT parity slice:
+This report closes the selected through 1D PHPT parity slice:
 
 - PHPT runner section, expectation, `SKIPIF`, `INI`, `ENV`, `ARGS`, `STDIN`,
   `FILEEOF`, and local external-file handling.

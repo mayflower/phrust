@@ -1,21 +1,17 @@
-# Server Wave 2 Functionality Plan
+# Server Functionality
 
-Wave 2 builds on the integrated web-server MVP with unmodified PHP application
-functionality first, then server speed and hardening. The server architecture
-remains direct and integrated: Hyper/Tokio accepts HTTP requests, `php_server`
-routes them, `php_executor` compiles and executes PHP in-process through phrust
-crates, and the response is emitted directly by the server.
+The integrated web server runs simple PHP applications in-process through the
+phrust frontend, runtime, and VM. Hyper/Tokio accepts HTTP requests,
+`php_server` routes them, `php_executor` compiles and executes PHP in-process,
+and the response is emitted directly by the server.
 
 The server must not use FPM, FastCGI, CGI, Apache module behavior, `mod_php`,
 external PHP subprocesses, external PHP worker sockets, or a replacement web
 framework stack in the hot path.
 
-## Scope
+## Implemented Surface
 
-This wave is organized as a serial set of prompts. Each prompt lands with its
-own focused fixtures, tests, and validation gates before the next prompt starts.
-
-Planned functionality:
+The current server surface includes:
 
 - A compatibility fixture app and `server-compat-smoke` harness for incremental
   app-surface checks.
@@ -32,31 +28,25 @@ Planned functionality:
   cache invalidation.
 - Static file streaming, conditional requests, ranges, and precompressed asset
   selection.
-- Production-oriented config, access logs, metrics hardening, TLS, and optional
-  HTTP/2 transport.
+- Production-oriented config, access logs, metrics hardening, and Rustls
+  HTTP/1.1 TLS termination.
 
-Final implemented status:
-
-- Prompts 00 through 12 are implemented and committed as focused slices.
 - `server-compat-smoke all` is strict for every compatibility section currently
-  listed in the harness; there are no Wave 2 placeholder skips.
+  listed in the harness.
 - HTTP/2 remains intentionally unimplemented. TLS is HTTP/1.1 over Rustls with
   `http/1.1` ALPN.
-- Remaining gaps are tracked in `docs/server-known-gaps.md`; this wave improves
-  standalone operability but does not turn the integrated server into full PHP
+- Remaining gaps are tracked in `docs/server-known-gaps.md`; the current server
+  improves standalone operability but does not turn phrust into full PHP
   SAPI compatibility.
 
 ## Out Of Scope
 
-Wave 2 does not introduce FPM, FastCGI, CGI, Apache modules, `mod_php`,
-external PHP process execution, Zend ABI emulation, a complete SAPI
-compatibility layer, HTTP/3, Opcache parity, a full standard library, or a
-production process manager.
+The integrated server does not provide FPM, FastCGI, CGI, Apache modules,
+`mod_php`, external PHP process execution, Zend ABI emulation, a complete SAPI
+compatibility layer, HTTP/2, HTTP/3, Opcache parity, a full standard library,
+or a production process manager.
 
-Known gaps should stay explicit until implemented and verified. For example,
-`server-compat-smoke` starts as a compatibility framework in Prompt 00. Future
-sections are intentionally skipped until the prompt that owns that behavior
-makes the section strict.
+Known gaps should stay explicit until implemented and verified.
 
 ## Compatibility Harness
 
@@ -69,12 +59,13 @@ can run named sections:
 - `cookie`
 - `session`
 - `output-buffer`
+- `include`
 - `all`
 
-Prompt 00 makes `static` strict. Prompt 01 makes `input` strict for nested
-URL-encoded query and form data. Prompt 02 makes `upload` strict for bounded
-multipart fields and scalar `$_FILES` metadata. Later prompts make their
-corresponding sections strict as support lands.
+All listed sections are strict. `all` runs the same fixture server once and
+executes static serving, nested URL-encoded input, bounded multipart uploads,
+upload movement, cookies, persistent sessions, output-buffer basics, and
+include execution.
 
 ## Persistent Web Sessions
 
@@ -108,7 +99,7 @@ with body `php execution timeout`.
 
 `set_time_limit($seconds)` resets the request-local deadline when a mutable
 execution deadline is configured. Passing `0` disables the deadline for that
-request, matching the supported web-mode behavior for this wave. The optional
+request, matching the supported web-mode behavior. The optional
 `--disable-execution-deadline` flag disables server-created deadlines for
 development and deterministic tests; metrics expose both timeout totals and
 disabled-deadline request counts.
@@ -259,25 +250,22 @@ access logging, and metrics stay on the same integrated path. Plain HTTP remains
 the default for local development when no TLS files are configured.
 
 The TLS transport advertises `http/1.1` through ALPN. HTTP/2 and HTTP/3 are not
-enabled in this prompt. The local TLS smoke uses the committed self-signed
+enabled. The local TLS smoke uses the committed self-signed
 localhost fixture under `fixtures/server/tls/` and `curl -k`:
 
 ```bash
 nix develop -c just server-tls-smoke
 ```
 
-## Expected Acceptance Commands
-
-Prompt 00 baseline:
+## Validation
 
 ```bash
 nix develop -c cargo fmt --all --check
 nix develop -c cargo clippy -p php_server -p php_executor -p php_runtime --all-targets -- -D warnings
 nix develop -c cargo test -p php_server
-nix develop -c bash scripts/server/compat_smoke.sh static
 nix develop -c just server-smoke
+nix develop -c just server-compat-smoke all
+nix develop -c just server-tls-smoke
+nix develop -c just server-benchmark-smoke
 nix develop -c rg "FastCGI|php-fpm|mod_php|CGI|std::process::Command|Command::new" crates/php_server crates/php_executor docs README.md
 ```
-
-The full wave ends with the broader final integration gates documented in the
-serial prompt pack.

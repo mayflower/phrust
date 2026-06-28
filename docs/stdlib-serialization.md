@@ -10,7 +10,7 @@ Work item implements bounded `serialize` and `unserialize` support for:
 - runtime `ReferenceCell` values by serializing the effective value
 - malformed-input handling without panics
 
-Reference identity records are intentionally out of scope for this slice:
+Reference identity records are intentionally out of scope for this scope:
 `serialize` does not emit PHP `R`/`r` records, and `unserialize` rejects them
 as `STDLIB-GAP-SERIALIZE-REFERENCES` rather than fabricating aliases.
 
@@ -26,4 +26,4 @@ the PHP-style malformed-offset warning. The internal parser returns a structured
 
 Known gaps are tracked in `docs/stdlib-known-gaps.md`: `allowed_classes`,
 serialized `R`/`r` reference records, resource payloads, magic methods, and
-full object hook behavior are not implemented in this slice.
+full object hook behavior are not implemented in this scope.

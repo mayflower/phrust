@@ -69,7 +69,7 @@ fresh non-pooled frames for closure captures, by-reference params or returns,
 generator/fiber continuations, class contexts, shared top-level locals,
 try/finally bodies, and object-allocation bodies that may retain
 destructor-sensitive values. Raw counters expose both legacy
-`frame_allocations`/`frame_reuses` and prompt-facing `frames_allocated`,
+`frame_allocations`/`frame_reuses` and compatibility `frames_allocated`,
 `frames_reused`, `register_files_allocated`, `register_files_reused`, and
 `frame_reuse_blocked_by_reason`.
 
@@ -185,7 +185,7 @@ baseline, and require correctness-first evidence before any new speed claim.
 - `07.48` to `07.55`: experimental Cranelift JIT ADR, crate, eligibility, ABI,
   lowering, execution smoke, tiering, and safety audit.
 - `07.56` to `07.60`: A/B flag matrix, performance result consolidation,
-  developer docs, CI/Nix hardening, final audit, and future runtime handoff.
+  developer docs, CI/Nix hardening, final audit, and future runtime follow-up.
 - `07.A` to `07.F`: optional profiling workflow, optional LTO/PGO plan,
   shared-cache research, polymorphic inline caches, framework-like smokes, and
   optional W^X/mprotect JIT memory prototype.

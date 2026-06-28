@@ -7,7 +7,7 @@
 
 ## Implemented Scope
 
-Prompt 4G enables `pdo_sqlite` by reusing the Prompt 4F `rusqlite` connection
+enables `pdo_sqlite` by reusing the selected `rusqlite` connection
 and result layer.
 
 Implemented behavior:

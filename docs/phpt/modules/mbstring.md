@@ -29,7 +29,7 @@ locale data, or broad upstream `ext/mbstring` parity.
 
 The default project oracle at
 `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php` was built
-without mbstring. The selected Prompt 2F outputs were captured from a temporary
+without mbstring. The selected selected outputs were captured from a temporary
 read-only PHP 8.5.7 clone at `/tmp/php-src-mbstring-oracle/sapi/cli/php` built
 from the same php-src checkout with `--enable-mbstring --disable-mbregex`.
 

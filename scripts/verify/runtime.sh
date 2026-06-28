@@ -31,7 +31,7 @@ require_file docs/runtime-reference.md
 require_file docs/runtime-reference-diff.md
 require_file docs/runtime-supported-subset.md
 require_file docs/runtime-known-gaps.md
-require_file docs/runtime-semantics-handoff.md
+require_file docs/runtime-semantics-status.md
 require_file docs/research/zend-opcode-mapping-runtime.md
 require_file docs/research/embedding-spike.md
 require_file docs/research/runtime-bench-smoke.md
@@ -220,10 +220,10 @@ require_grep 'ReferenceCell' docs/runtime-values.md
 require_grep 'Include Execution' docs/runtime-vm.md
 require_grep 'normalize_runtime_stderr' docs/runtime-reference-diff.md
 require_grep 'runtime-semantics' docs/runtime-known-gaps.md
-require_grep 'Feature Matrix' docs/runtime-semantics-handoff.md
-require_grep 'Top 20 Reference Deviations' docs/runtime-semantics-handoff.md
-require_grep 'Runtime/VM TODO, Unwrap, Expect, Panic Audit' docs/runtime-semantics-handoff.md
-require_grep 'runtime-semantics Task List' docs/runtime-semantics-handoff.md
+require_grep 'Feature Matrix' docs/runtime-semantics-status.md
+require_grep 'Top 20 Reference Deviations' docs/runtime-semantics-status.md
+require_grep 'Runtime/VM Hardening Audit' docs/runtime-semantics-status.md
+require_grep 'Runtime Semantics Backlog' docs/runtime-semantics-status.md
 require_grep 'Zend Opcode Mapping' docs/research/zend-opcode-mapping-runtime.md
 require_grep 'does not claim Zend bytecode compatibility' docs/research/zend-opcode-mapping-runtime.md
 require_grep 'Embedding and WASI Spike' docs/research/embedding-spike.md

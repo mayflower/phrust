@@ -30,7 +30,7 @@ verification.
 
 ## Before/After
 
-Before this Prompt 2B pass, the selected target run had 6 PASS and 3 FAIL:
+Before this this pass, the selected target run had 6 PASS and 3 FAIL:
 `highlight_string()` was undefined in two upstream fixtures, and `fprintf()` to
 `php://stdout` did not contribute to PHPT stdout comparison.
 

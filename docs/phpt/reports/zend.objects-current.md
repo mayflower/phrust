@@ -20,15 +20,15 @@ Current focused selected run:
 
 The selected harness covers construction, property read/write, method calls,
 visibility, static access, and generated magic-method, clone, trait, and enum
-contracts. The selected manifest is the generated Prompt 14 contract set, which
-keeps the close gate aligned with the prompt's MVP scope.
+contracts. The selected manifest is the generated contract set, which keeps the
+close gate aligned with the supported object subset.
 
 The broader php-src seed rows that previously produced 7 PASS / 5 FAIL are not
-used as the focused Prompt 14 close gate because the five failing rows cover
+used as the selected close gate because the five failing rows cover
 dynamic property references, object-return assignment lowering, foreach
 visibility parity, static property array-dim initialization, and
 static-as-instance edge cases. Those remain documented corpus/backlog gaps.
-`verify-runtime` passes after the Prompt 14.10 closeout checks.
+`verify-runtime` passes after the selected closeout checks.
 
 ## Selected Scope
 
@@ -44,7 +44,7 @@ static-as-instance edge cases. Those remain documented corpus/backlog gaps.
 
 | Count | Group | Primary blocker | Representative files |
 | ---: | --- | --- | --- |
-| 0 | focused Prompt 14 selected gate | none | 43 selected generated contracts |
+| 0 | focused selected gate | none | 43 selected generated contracts |
 
 ## Group Notes
 
@@ -63,7 +63,7 @@ static-as-instance edge cases. Those remain documented corpus/backlog gaps.
 
 ## Recommendation
 
-Prompt 14.2 class table and internal class lookup hygiene is implemented.
+Class table and internal class lookup hygiene is implemented.
 Class lookup names are normalized by trimming a leading namespace root slash and
 ASCII-lowercasing the remaining name. PHP-visible display names preserve source
 spelling without the leading root slash. IR and VM lookup use
@@ -79,7 +79,7 @@ IR-injected throwable/interface classes, runtime-created `stdClass`, `Closure`
 metadata consumers, and standard-library helper objects all flow through the
 same case-insensitive lookup rule.
 
-Prompt 14.2 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_ir`: PASS
 - `nix develop -c cargo test -p php_runtime object`: PASS
@@ -92,9 +92,9 @@ lookup/display rules intact. Property references, complex assignment lowering,
 foreach visibility parity, and static property cases remain explicit follow-up
 blockers.
 
-## Prompt 14.3 Basic Object Contracts
+## Basic Object Contracts
 
-Prompt 14.3 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `constructor-property.phpt`
 - `property-read-write.phpt`
@@ -106,12 +106,12 @@ instance method dispatch, basic method return values, and `$this` property state
 inside methods. The VM unit suite already covers the same behavior in
 `methods_execute_instance_calls_and_this_property`.
 
-The focused selected module is green after using the generated Prompt 14
+The focused selected module is green after using the generated selected
 contract manifest as the module close gate. The broader php-src rows for
 dynamic property references, complex assignment lowering, foreach visibility
 parity, and static property edge cases remain corpus/backlog blockers.
 
-Prompt 14.3 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_runtime object`: PASS
 - `nix develop -c cargo test -p php_vm`: PASS
@@ -119,9 +119,9 @@ Prompt 14.3 validation:
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 12 PASS, target 12 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.4 Visibility Error Routing
+## Visibility Error Routing
 
-Prompt 14.4 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `private-property-external-error.phpt`
 - `protected-method-external-error.phpt`
@@ -136,16 +136,16 @@ Remaining message wording gaps are limited to broader object gaps outside this
 slice, especially foreach visibility output parity in
 `tests/classes/visibility_005.phpt`.
 
-Prompt 14.4 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_vm`: PASS
 - `nix develop -c just phpt-dev-build`: PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 15 PASS, target 15 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.5 Static Access Contracts
+## Static Access Contracts
 
-Prompt 14.5 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `public-static-method.phpt`
 - `static-property-read-write.phpt`
@@ -158,10 +158,10 @@ the VM, and the generated contract covers runtime-owned invalid static access:
 undeclared static property read/write and non-static method called statically.
 
 Late static binding remains limited to the existing focused metadata-backed
-cases. The selected static property failures remain outside this slice because
+cases. The selected static property failures remain outside this scope because
 they depend on broader property-reference and complex assignment lowering gaps.
 
-Prompt 14.5 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_ir`: PASS
 - `nix develop -c cargo test -p php_vm`: PASS
@@ -169,9 +169,9 @@ Prompt 14.5 validation:
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 18 PASS, target 18 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.6 Typed Property Contracts
+## Typed Property Contracts
 
-Prompt 14.6 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `typed-property-uninitialized.phpt`
 - `nullable-property.phpt`
@@ -183,7 +183,7 @@ PHP `Error`, and property type mismatches route through catchable PHP
 `TypeError`. Nullable properties preserve null defaults and accept null writes
 for the focused cases.
 
-Prompt 14.6 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_runtime object`: PASS
 - `nix develop -c cargo test -p php_vm`: PASS
@@ -191,9 +191,9 @@ Prompt 14.6 validation:
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 21 PASS, target 21 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.7 Magic Method Contracts
+## Magic Method Contracts
 
-Prompt 14.7 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `magic-get.phpt`
 - `magic-set.phpt`
@@ -215,20 +215,20 @@ runtime diagnostics:
 - `E_PHP_VM_MAGIC_PROPERTY_RECURSION`
 - `E_PHP_VM_MAGIC_METHOD_RECURSION`
 
-Magic gaps remain outside this slice for serialization magic, full signature
+Magic gaps remain outside this scope for serialization magic, full signature
 validation parity, and wider edge cases such as reference-returning overloaded
 properties.
 
-Prompt 14.7 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_vm`: PASS
 - `nix develop -c just phpt-dev-build`: PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 29 PASS, target 29 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.8 Clone and Clone-With Contracts
+## Clone and Clone-With Contracts
 
-Prompt 14.8 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `clone-identity.phpt`
 - `clone-independent-properties.phpt`
@@ -248,7 +248,7 @@ the clone-with MVP. Unsupported replacement modifiers route through catchable
 PHP `Error` with stable `E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER` diagnostics
 underneath.
 
-Prompt 14.8 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_runtime object`: PASS
 - `nix develop -c cargo test -p php_vm`: PASS
@@ -256,9 +256,9 @@ Prompt 14.8 validation:
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 36 PASS, target 36 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.9 Trait and Enum Contracts
+## Trait and Enum Contracts
 
-Prompt 14.9 adds generated PHPT contracts for:
+The selected gate adds generated PHPT contracts for:
 
 - `trait-method.phpt`
 - `trait-method-alias.phpt`
@@ -269,7 +269,7 @@ Prompt 14.9 adds generated PHPT contracts for:
 - `enum-method.phpt`
 
 The focused trait MVP covers trait method composition into a class and a simple
-method alias. Wider trait semantics remain outside this slice: trait
+method alias. Wider trait semantics remain outside this scope: trait
 properties, trait constants, nested trait uses, conflict resolution beyond the
 focused alias path, and generator trait methods.
 
@@ -279,17 +279,17 @@ access, and enum instance methods. Wider enum semantics remain outside this
 slice for exhaustive `ValueError` parity, serialization/reflection completion,
 interfaces beyond the current metadata surface, and edge-case diagnostics.
 
-Prompt 14.9 validation:
+Validation:
 
 - `nix develop -c cargo test -p php_runtime object`: PASS
 - `nix develop -c cargo test -p php_vm`: PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_MANIFEST=tests/phpt/manifests/zend.objects-generated.jsonl nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zend.objects`: reference 43 PASS, target 43 PASS.
 
-## Prompt 14.10 Closeout
+## Closeout
 
-Prompt 14.10 closes the object prompt sequence without starting Prompt 15 or
-filesystem/stdlib work.
+The selected object gate closes without starting filesystem or standard-library
+work.
 
 Closeout validation:
 
@@ -301,9 +301,9 @@ Closeout validation:
   fingerprints. Artifacts are in
   `/private/tmp/phrust-phpt-work/full-runs/20260627T210436Z/`.
 
-Object corpus tracking before and after Prompt 14 remains 178 PASS, 33 SKIP,
+Object corpus tracking before and after the selected gate remains 178 PASS, 33 SKIP,
 1,924 FAIL, and 0 BORK from 2,136 object/class corpus candidates. The selected
-Prompt 14 contract manifest improved through the sequence and is now green at
+contract manifest is now green at
 reference 43 PASS and target 43 PASS.
 
 The full-regression failure is not accepted as green and the full baseline was

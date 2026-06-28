@@ -2,7 +2,7 @@
 
 - Priority: 17.6 closed
 - Selected manifest: `tests/phpt/manifests/modules/json.selected.jsonl`
-- Prompt 17 close gate: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK from 10 selected fixtures
+- the selected close gate: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK from 10 selected fixtures
 
 ## Scope
 
@@ -45,7 +45,7 @@
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=json`
 - `nix develop -c just verify-phpt`
 
-## Prompt 17.1 Evidence
+## Evidence
 
 - Replaced the broad 88-test selected manifest with a focused 10-test harness.
 - Added generated oracle fixtures for encode basics, encode common flags, decode
@@ -66,6 +66,6 @@
 
 ## Next Step
 
-Prompt 17 is closed for the selected JSON module. Keep
+The selected gate is closed for the selected JSON module. Keep
 `STDLIB-GAP-JSONSERIALIZABLE-DISPATCH` as the next semantic expansion point once
 runtime builtins have a clean bridge into VM userland method dispatch.

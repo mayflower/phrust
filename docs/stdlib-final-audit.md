@@ -2,9 +2,8 @@
 
 Reference target: PHP 8.5.7 (`php-8.5.7`).
 
-This audit is the Work item handoff artifact. It records the required
-Standard library gates, the optional coverage that was implemented in-tree, and the
-remaining known gaps carried as Performance input.
+This audit records the required standard-library gates, the optional coverage
+implemented in-tree, and the remaining known gaps carried as performance input.
 
 ## Required Gates
 
@@ -27,7 +26,7 @@ must not be replaced by placeholder skip scripts.
 
 ## Fixture Coverage
 
-- `tests/fixtures/stdlib/_harness/stdlib`: broad standard-library MVP
+- `tests/fixtures/stdlib/_harness/stdlib`: broad standard-library subset
   differential fixtures, including optional `hash`, `hash_hmac`,
   `random_bytes`, and `random_int` shape/range coverage.
 - `tests/fixtures/stdlib/_harness/streams`: resource, `php://memory`, and
@@ -42,7 +41,7 @@ must not be replaced by placeholder skip scripts.
 
 ## Optional Coverage
 
-- Work item: reference metadata extraction exists through
+- Reference metadata extraction exists through
   `scripts/stdlib/list_reference_functions.php`,
   `scripts/stdlib/list_reference_classes.php`,
   `scripts/stdlib/list_reference_constants.php`, and
@@ -51,18 +50,18 @@ must not be replaced by placeholder skip scripts.
   verification is available through `just verify-generated-arginfo`;
   `performance-tests` runs the generator against a local php-src-style fixture
   with manual overrides.
-- Work item: PHAR remains governed by ADR-0066. Composer source mode is the
+- PHAR remains governed by ADR-0066. Composer source mode is the
   required path; read-only PHAR support is not enabled in Standard library.
-- Work item: tokenizer extension metadata and runtime smoke coverage are
+- Tokenizer extension metadata and runtime smoke coverage are
   included in `performance-tests`.
-- Work item: online Composer and Packagist access are default-off; local
+- Online Composer and Packagist access are default-off; local
   source-mode Composer smoke is available through `composer-smoke-source`.
-- Work item: hash/random MVP is implemented and covered by
+- Hash/random support is implemented and covered by
   `STDLIB_HASH_RANDOM`.
-- Work item: larger Composer source checkouts are opt-in through
+- Larger Composer source checkouts are opt-in through
   `PHRUST_STDLIB_COMPOSER_SOURCE_DIR` and skip explicitly when absent.
 
-## Performance Handoff
+## Performance Inputs
 
 Performance should consume `docs/stdlib-known-gaps.md`,
 `docs/function-stdlib-coverage.md`, and `docs/extension-stdlib-coverage.md` as

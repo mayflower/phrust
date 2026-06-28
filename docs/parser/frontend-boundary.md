@@ -1,4 +1,4 @@
-# Handoff to Semantic Layers
+# Parser to Semantic Frontend Boundary
 
 The parser and CST provide syntax structure only. Later semantic work should
 consume the CST and build higher-level views without changing parser
@@ -13,7 +13,7 @@ correctness requirements.
 - Fixture and reference acceptance data.
 - Documented known gaps.
 
-## Work for the Next Layer
+## Semantic Frontend Responsibilities
 
 - AST/HIR or typed-AST views over CST nodes.
 - Declaration tables for functions, classes, interfaces, traits, enums,

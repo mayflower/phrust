@@ -22,11 +22,11 @@ Current focused selected run:
 | SKIP | 0 |
 | BORK | 0 |
 
-The selected manifest is the generated Prompt 13 contract set and is green for
+The selected manifest is the generated contract set and is green for
 both reference and target. A broader 200-row php-src blocker slice was also run:
 the reference run was green for all 200 PHPTs, while the target run remained
 83 PASS and 117 FAIL. That broader slice is retained below as backlog analysis,
-not as the Prompt 13 close gate.
+not as the selected close gate.
 
 | Broader php-src blocker slice outcome | Count |
 | --- | ---: |
@@ -35,7 +35,7 @@ not as the Prompt 13 close gate.
 | SKIP | 0 |
 | BORK | 0 |
 
-## Prompt 13.3 Arginfo Arity Status
+## Arginfo Arity Status
 
 Internal registry builtins now run through generated `php_std::arginfo`
 metadata for arity and supported scalar coercion before their module-owned
@@ -55,7 +55,7 @@ blocker. The remaining arity-adjacent failures are user-function defaults,
 constant-expression defaults, by-reference returns, callable acquisition, and
 Closure metadata/output parity rather than builtin arginfo dispatch.
 
-## Prompt 13.4 User Argument Status
+## User Argument Status
 
 User-function argument preparation now has green generated PHPT coverage for:
 
@@ -71,7 +71,7 @@ remaining focused blockers are advanced constant-expression defaults,
 by-reference returns/sends, complex `isset`/`unset` lowering, Closure constant
 expressions, and callable acquisition/parity errors.
 
-## Prompt 13.5 By-Reference Send Status
+## By-Reference Send Status
 
 By-reference parameter sends now have green generated PHPT coverage for:
 
@@ -89,7 +89,7 @@ Remaining by-reference focused blockers are outside the 13.5 send MVP:
 by-reference returns (`E_PHP_IR_UNSUPPORTED_BY_REF_RETURN` and
 `E_PHP_VM_BY_REF_RETURN_*`) and callback/value-warning parity paths.
 
-## Prompt 13.6 Closure Runtime Class Status
+## Closure Runtime Class Status
 
 Closure runtime-class behavior now has green generated PHPT coverage for:
 
@@ -105,9 +105,9 @@ Closure runtime-class behavior now has green generated PHPT coverage for:
 runtime behaviors rather than complete Zend binding parity. The full closure
 binding model is still tracked as
 `E_PHP_RUNTIME_UNSUPPORTED_CLOSURE_BINDING`; Reflection parity for Closure
-metadata remains outside this prompt.
+metadata remains outside this scope.
 
-## Prompt 13.7 Callable Acquisition Status
+## Callable Acquisition Status
 
 Callable acquisition and invocation now have green generated PHPT coverage for:
 
@@ -127,7 +127,7 @@ parity. Unsupported direct calls still report stable VM diagnostics such as
 wording in every path. First-class callable constant-expression forms and pipe
 RHS callability remain separate lowering/acquisition blockers.
 
-## Prompt 13.8 Scalar Coercion Status
+## Scalar Coercion Status
 
 Scalar parameter coercion now has green generated PHPT coverage for:
 
@@ -144,7 +144,7 @@ are not simple scalar parameter coercion gaps; they are mostly relative type
 context, advanced defaults, return variance wording, and callable/Closure
 parity cases.
 
-## Prompt 13.9 Pipe Callable Status
+## Pipe Callable Status
 
 Pipe RHS dispatch now has green generated PHPT coverage for:
 
@@ -160,14 +160,14 @@ callable-dispatch failures; the representative source cases feed `null` from
 unsupported constant-expression/property-initializer paths before the pipe
 executes.
 
-## Prompt 13.10 Closeout
+## Closeout
 
-Prompt 13 closed with the selected generated `zend.functions` contract manifest
+The selected gate closed with the selected generated `zend.functions` contract manifest
 green at 29 PASS for both reference and target. The broader 200-row php-src
 blocker slice remains 83 PASS and 117 FAIL on the target; those remaining rows
-are outside the Prompt 13 contracts landed so far.
+are outside the selected contracts landed so far.
 
-Before/after for the continued Prompt 13 slice:
+Before/after for the continued selected slice:
 
 | Scope | Before | After |
 | --- | ---: | ---: |
@@ -197,7 +197,7 @@ new or changed:
 
 Those fingerprints were not accepted into the tracked full-baseline manifests.
 
-Recommendation: proceed to Prompt 14.1 by establishing the `zend.objects`
+Recommendation: establish the `zend.objects`
 harness. Defer constant-expression closure/property-initializer work to a
 dedicated frontend/IR slice; those rows now obscure callable progress more than
 they exercise ordinary runtime callable dispatch.

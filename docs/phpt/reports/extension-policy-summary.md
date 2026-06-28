@@ -29,7 +29,7 @@ Every extension decision must use the central classifications from
 Unsupported extension areas are tracked with stable `extension-policy-*` IDs in
 `tests/phpt/manifests/known-gap-catalog.jsonl`. Each ID carries the reference
 behavior summary, current phrust behavior, PHPT path or fixture example, and
-next owner layer required by the prompt pack.
+next owner layer required by the implementation scope.
 
 ## Implement Next
 
@@ -47,7 +47,7 @@ acceptance:
 ## Stub-Only Or Optional
 
 The following extensions should remain visible in the full PHPT accounting but
-start as stubs or deferred optional work unless a focused prompt requests real
+start as stubs or deferred optional work unless a focused module scope requests real
 behavior:
 
 | Extension | Policy |

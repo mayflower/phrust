@@ -100,9 +100,9 @@ carryovers are:
 - production native JIT execution, executable-memory ownership, W^X, and native
   entry/exit ABI proof.
 
-These are not silent failures. They are explicit future runtime-or-later handoffs.
+These are not silent failures. They are explicit future runtime-or-later follow-ups.
 
-## future runtime Handoff
+## future runtime Follow-up
 
 Recommended future runtime entry points:
 
