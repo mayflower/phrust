@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"objects.clone",
+  "priority":10,
+  "selected_manifest":"tests/phpt/manifests/modules/objects.clone.selected.jsonl",
+  "corpus_count":7,
+  "selected_count":7,
+  "pass_count":7,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["shallow clone","object identity difference","independent property map after clone","__clone","PHP 8.5 clone-with public property replacements","simple typed public replacement checks"],
+  "non_scope":["private/protected clone-with replacements","readonly clone-with matrix","full property-hook clone-with matrix","serialization magic"],
+  "target_gates":["nix develop -c just phpt-dev-module MODULE=objects.clone"],
+  "next_step":"Prompt 2.3 clone MVP is green; keep selected clone and clone-with contracts green while preserving explicit unsupported replacement gaps."
+}

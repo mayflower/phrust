@@ -20454,8 +20454,8 @@ impl Vm {
             compiled,
             state,
             current_scope_class(compiled, stack).as_deref(),
-            &resolved.class,
-            &resolved.method,
+            resolved.class,
+            resolved.method,
         ) {
             return Err(self.runtime_error(output, compiled, stack, message));
         }
@@ -25411,7 +25411,7 @@ fn reflection_class_constant_object(
                 constant
                     .doc_comment
                     .as_ref()
-                    .map_or(Value::Bool(false), |comment| reflection_string(comment)),
+                    .map_or(Value::Bool(false), reflection_string),
             ),
             ("has_default", Value::Bool(value.is_some())),
             ("default", value.unwrap_or(Value::Null)),

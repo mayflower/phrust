@@ -71,6 +71,22 @@
 
 - `nix develop -c just phpt-module MODULE=zend.objects`
 
+## Branch 2 Advanced Pre-Closeout Impact
+
+On `phpt/b3-objects-advanced`, before merging a completed
+`phpt/b3-objects-core` branch:
+
+- `nix develop -c just phpt-dev-module MODULE=objects.classes`
+- reference: 200 PASS
+- target: 164 PASS, 36 FAIL
+
+The remaining failures are still dominated by object-core and adjacent runtime
+coverage: static properties and property references, serialization magic,
+iterator/autoload behavior, class constants, exception catch-type gaps, eval
+declaration merging, and Reflection-adjacent paths. The four advanced submodule
+gates are split into `objects.magic`, `objects.clone`, `objects.traits`, and
+`objects.enums` and pass independently.
+
 ## Known Gaps
 
 - `runtime-error-or-diagnostic`: 983

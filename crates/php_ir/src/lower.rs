@@ -102,6 +102,15 @@ struct HirTryParts {
     finally_body: Vec<StmtId>,
 }
 
+struct MethodFunctionInput<'a> {
+    class_name: &'a str,
+    method_name: &'a str,
+    display_class_name: &'a str,
+    display_method_name: &'a str,
+    signature: &'a FunctionSignature,
+    main_function: FunctionId,
+}
+
 impl UnsupportedFeature {
     /// Stable diagnostic ID for this unsupported feature.
     #[must_use]
@@ -850,12 +859,14 @@ impl LoweringContext<'_> {
                         }
                         let function = self.lower_method_function(
                             builder,
-                            &name,
-                            &method_name,
-                            &display_class_name,
-                            &display_method_name,
-                            &signature,
-                            main_function,
+                            MethodFunctionInput {
+                                class_name: &name,
+                                method_name: &method_name,
+                                display_class_name: &display_class_name,
+                                display_method_name: &display_method_name,
+                                signature: &signature,
+                                main_function,
+                            },
                         );
                         if method.magic_kind() == Some(MagicMethodKind::Construct) {
                             constructor = Some(function);
@@ -1098,16 +1109,14 @@ impl LoweringContext<'_> {
     fn lower_method_function(
         &mut self,
         builder: &mut IrBuilder,
-        class_name: &str,
-        method_name: &str,
-        display_class_name: &str,
-        display_method_name: &str,
-        signature: &FunctionSignature,
-        main_function: FunctionId,
+        input: MethodFunctionInput<'_>,
     ) -> FunctionId {
-        let span = span_from_range(self.file, signature.span());
+        let span = span_from_range(self.file, input.signature.span());
         let function = builder.start_function(
-            format!("{display_class_name}::{display_method_name}"),
+            format!(
+                "{}::{}",
+                input.display_class_name, input.display_method_name
+            ),
             FunctionFlags {
                 is_method: true,
                 ..FunctionFlags::default()
@@ -1117,25 +1126,31 @@ impl LoweringContext<'_> {
         let attributes = self.lower_attributes_for_target_span(
             builder,
             AttributeTarget::Method,
-            signature.span(),
+            input.signature.span(),
         );
         builder.set_function_attributes(function, attributes);
         self.class_names
-            .insert(function, display_class_name.to_owned());
+            .insert(function, input.display_class_name.to_owned());
         self.method_names
-            .insert(function, display_method_name.to_owned());
+            .insert(function, input.display_method_name.to_owned());
         self.function_names.insert(
             function,
-            format!("{display_class_name}::{display_method_name}"),
+            format!(
+                "{}::{}",
+                input.display_class_name, input.display_method_name
+            ),
         );
-        builder.set_return_type(function, self.lower_return_type(signature.return_type()));
+        builder.set_return_type(
+            function,
+            self.lower_return_type(input.signature.return_type()),
+        );
         builder.intern_local(function, "this");
         builder.add_source_map(
             IrSourceMapTarget::Function { function },
-            format!("hir:method:{class_name}::{method_name}"),
+            format!("hir:method:{}::{}", input.class_name, input.method_name),
             span,
         );
-        for param in signature.parameters() {
+        for param in input.signature.parameters() {
             if param.flags().is_by_ref() {
                 self.unsupported(
                     UnsupportedFeature::ByReferenceParameter,
@@ -1156,16 +1171,20 @@ impl LoweringContext<'_> {
             if self.param_default_triggers_implicit_nullable_deprecation(param, &default) {
                 let span = span_from_range(self.file, param.span());
                 self.record_early_diagnostic_origin(
-                    main_function,
+                    input.main_function,
                     format!(
                         "hir:method:{class_name}::{method_name}:parameter:{}",
-                        param.name()
+                        param.name(),
+                        class_name = input.class_name,
+                        method_name = input.method_name,
                     ),
                     span,
                     IrDiagnosticSeverity::Deprecation,
                     "E_PHP_RUNTIME_IMPLICIT_NULLABLE_PARAMETER",
                     format!(
-                        "{display_class_name}::{display_method_name}(): Implicitly marking parameter {} as nullable is deprecated, the explicit nullable type must be used instead",
+                        "{}::{}(): Implicitly marking parameter {} as nullable is deprecated, the explicit nullable type must be used instead",
+                        input.display_class_name,
+                        input.display_method_name,
                         param.name()
                     ),
                 );
@@ -1189,22 +1208,25 @@ impl LoweringContext<'_> {
         let block = builder.append_block(function);
         builder.add_source_map(
             IrSourceMapTarget::Block { function, block },
-            format!("hir:method:{class_name}::{method_name}:body"),
+            format!(
+                "hir:method:{}::{}:body",
+                input.class_name, input.method_name
+            ),
             span,
         );
         let current = self.lower_constructor_property_promotions(
             builder,
             function,
             block,
-            signature,
-            class_name,
-            method_name,
+            input.signature,
+            input.class_name,
+            input.method_name,
         );
         let current = self.lower_stmt_list(
             builder,
             function,
             current,
-            self.method_body_statement_ids(signature),
+            self.method_body_statement_ids(input.signature),
         );
         if !builder.is_terminated(function, current) {
             builder.terminate_return(function, current, None, span);
@@ -1561,12 +1583,14 @@ impl LoweringContext<'_> {
         for candidate in composed {
             let function = self.lower_method_function(
                 builder,
-                class_name,
-                &candidate.method_name,
-                display_class_name,
-                &candidate.display_method_name,
-                &candidate.signature,
-                main_function,
+                MethodFunctionInput {
+                    class_name,
+                    method_name: &candidate.method_name,
+                    display_class_name,
+                    display_method_name: &candidate.display_method_name,
+                    signature: &candidate.signature,
+                    main_function,
+                },
             );
             let attributes = self.lower_attributes_for_target_span(
                 builder,
@@ -9721,22 +9745,23 @@ fn parse_interpolated_double_quoted_body(
             index += usize::from(index + 1 < body.len()) + 1;
             continue;
         }
-        if body[index] == b'{' && body.get(index + 1).copied() == Some(b'$') {
-            if let Some(parsed) = parse_braced_interpolated_method_call(body, index) {
-                parts.push(InterpolatedPart::Bytes(
-                    unescape_double_quoted_php_string_with_quote_mode(
-                        &body[chunk_start..index],
-                        decode_escaped_quote,
-                    ),
-                ));
-                parts.push(InterpolatedPart::MethodCall {
-                    receiver: parsed.receiver,
-                    method: parsed.method,
-                });
-                index = parsed.end;
-                chunk_start = parsed.end;
-                continue;
-            }
+        if body[index] == b'{'
+            && body.get(index + 1).copied() == Some(b'$')
+            && let Some(parsed) = parse_braced_interpolated_method_call(body, index)
+        {
+            parts.push(InterpolatedPart::Bytes(
+                unescape_double_quoted_php_string_with_quote_mode(
+                    &body[chunk_start..index],
+                    decode_escaped_quote,
+                ),
+            ));
+            parts.push(InterpolatedPart::MethodCall {
+                receiver: parsed.receiver,
+                method: parsed.method,
+            });
+            index = parsed.end;
+            chunk_start = parsed.end;
+            continue;
         }
         let parsed = if body[index] == b'$' {
             parse_deprecated_dollar_brace_interpolated_variable(body, index).or_else(|| {

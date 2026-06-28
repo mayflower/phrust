@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"objects.traits",
+  "priority":10,
+  "selected_manifest":"tests/phpt/manifests/modules/objects.traits.selected.jsonl",
+  "corpus_count":3,
+  "selected_count":3,
+  "pass_count":3,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["importing trait methods into classes","simple alias","simple precedence","method origin metadata preservation"],
+  "non_scope":["trait properties","trait constants","nested trait uses","exhaustive conflict diagnostics","Reflection trait APIs"],
+  "target_gates":["nix develop -c just phpt-dev-module MODULE=objects.traits"],
+  "next_step":"Prompt 2.4 traits MVP is green; keep trait work bounded to selected method-composition behavior until final objects-core closeout."
+}
