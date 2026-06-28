@@ -1235,6 +1235,131 @@ impl ExtensionRegistry {
                     "pcre",
                     ConstantValue::Int(512),
                 )),
+            ExtensionDescriptor::new("session")
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_SESSION_DISABLED",
+                    "session",
+                    ConstantValue::Int(0),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_SESSION_NONE",
+                    "session",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_SESSION_ACTIVE",
+                    "session",
+                    ConstantValue::Int(2),
+                ))
+                .with_function(FunctionDescriptor::php("session_destroy", "session"))
+                .with_function(FunctionDescriptor::php("session_id", "session"))
+                .with_function(FunctionDescriptor::php("session_name", "session"))
+                .with_function(FunctionDescriptor::php("session_start", "session"))
+                .with_function(FunctionDescriptor::php("session_status", "session")),
+            ExtensionDescriptor::new("pdo")
+                .with_function(FunctionDescriptor::php("pdo_drivers", "pdo"))
+                .with_class(ClassDescriptor::new("PDO", "pdo", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "PDOException",
+                    "pdo",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new("PDORow", "pdo", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "PDOStatement",
+                    "pdo",
+                    ClassKind::Class,
+                )),
+            ExtensionDescriptor::new("pdo_sqlite").with_class(ClassDescriptor::new(
+                "PDO_SQLite_Ext",
+                "pdo_sqlite",
+                ClassKind::Class,
+            )),
+            ExtensionDescriptor::new("phar")
+                .with_class(ClassDescriptor::new("Phar", "phar", ClassKind::Class))
+                .with_class(ClassDescriptor::new("PharData", "phar", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "PharFileInfo",
+                    "phar",
+                    ClassKind::Class,
+                )),
+            ExtensionDescriptor::new("sqlite3")
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_ASSOC",
+                    "sqlite3",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_NUM",
+                    "sqlite3",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_BOTH",
+                    "sqlite3",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_INTEGER",
+                    "sqlite3",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_FLOAT",
+                    "sqlite3",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_TEXT",
+                    "sqlite3",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_BLOB",
+                    "sqlite3",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_NULL",
+                    "sqlite3",
+                    ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_OPEN_READONLY",
+                    "sqlite3",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_OPEN_READWRITE",
+                    "sqlite3",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_OPEN_CREATE",
+                    "sqlite3",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SQLITE3_DETERMINISTIC",
+                    "sqlite3",
+                    ConstantValue::Int(2048),
+                ))
+                .with_class(ClassDescriptor::new("SQLite3", "sqlite3", ClassKind::Class))
+                .with_class(ClassDescriptor::new(
+                    "SQLite3Exception",
+                    "sqlite3",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "SQLite3Result",
+                    "sqlite3",
+                    ClassKind::Class,
+                ))
+                .with_class(ClassDescriptor::new(
+                    "SQLite3Stmt",
+                    "sqlite3",
+                    ClassKind::Class,
+                )),
             ExtensionDescriptor::new("mbstring")
                 .enabled_by_default(true)
                 .with_function(FunctionDescriptor::php("mb_check_encoding", "mbstring"))

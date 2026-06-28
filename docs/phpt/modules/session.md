@@ -1,47 +1,61 @@
 # session
 
-- Strategy: classify, no CLI session MVP yet
+- Strategy: deterministic CLI-only MVP
 - Classification: real-implementation-required for framework session support
 - Selected manifest: `tests/phpt/manifests/modules/session.selected.jsonl`
-- Current corpus snapshot: 260 `session` candidates, 3 PASS, 0 SKIP, 254 FAIL,
-  2 BORK, and 260 known non-green outcomes.
+- Current corpus snapshot before Prompt 4E: 260 `session` candidates, 3 PASS,
+  0 SKIP, 254 FAIL, 2 BORK, and 260 known non-green outcomes.
 
-## Decision
+## Implemented Scope
 
-Do not implement session state in this branch.
+Prompt 4E adds request-local session state for CLI execution. The runtime now
+registers the `session` extension, exposes the PHP session status constants,
+seeds `$_SESSION`, and implements:
 
-A deterministic CLI-only MVP is possible later, but it must be request-local
-state integrated with superglobals, INI options, serialization, filesystem
-storage policy, and warning/error behavior. This branch does not add partial
-`$_SESSION` mutation or fake persistence. Platform probes stay negative.
+- `session_start`
+- `session_status`
+- `session_id`
+- `session_name`
+- `session_destroy`
 
-## Unsupported Area
+The implementation is intentionally request-local and deterministic. It does
+not write session files or depend on HTTP state. `$_SESSION` mutations persist
+inside one VM request and are synchronized back to the request-local session
+store around session builtin calls.
 
-- Stable ID: `PHPT-DATA-SESSION`
-- Reference behavior: PHP with `session` enabled exposes `session_start`,
-  `session_id`, `session_status`, `$_SESSION`, handlers, serializers, INI
-  options, and request lifecycle behavior.
-- Current phrust behavior: `extension_loaded("session")`,
-  `function_exists("session_start")`, and `class_exists("SessionHandler")` are
-  false; no session lifecycle exists.
+## Remaining Gaps
+
+- Stable ID: `PHPT-SESSION-CLI-MVP-GAPS`
+- Reference behavior: PHP with `session` enabled includes web SAPI lifecycle,
+  cookie headers, file-backed storage, serializers, INI configuration, custom
+  save handlers, locking, and `SessionHandler` classes/interfaces.
+- Current phrust behavior: CLI session basics pass through generated coverage,
+  while cookie/SAPI lifecycle, persistent storage, custom handlers, upload
+  lifecycle, and the full session handler matrix remain unsupported.
 - Fixture: `tests/phpt/generated/session/platform-checks.phpt`
-- Next owner layer: future request/runtime state layer after filesystem and
-  superglobal behavior are ready.
+- Next owner layer: future request/runtime state work for SAPI lifecycle,
+  filesystem-backed persistence, INI policy, and handler objects.
 
 ## Non-Scope
 
-- HTTP cookies
+- HTTP cookies and headers
 - web SAPI lifecycle
 - uploads/request lifecycle
-- full session handler matrix
+- file-backed persistence and locking
+- custom session handlers
+- `SessionHandler` and related handler classes/interfaces
 
 ## Source References
 
 - `ext/session/session.stub.php`
+- `ext/session/php_session.h`
 - `ext/session/tests/`
 
 ## Target Gates
 
+- `nix develop -c cargo test -p php_runtime session -- --nocapture`
+- `nix develop -c cargo test -p php_std introspection -- --nocapture`
+- `nix develop -c cargo test -p php_vm session -- --nocapture`
 - `nix develop -c just phpt-dev-module MODULE=session`
 - `nix develop -c just verify-stdlib` if runtime code changes
 - `nix develop -c just verify-phpt`

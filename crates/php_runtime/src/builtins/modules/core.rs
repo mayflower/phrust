@@ -1690,6 +1690,22 @@ pub(in crate::builtins::modules) fn read_file_value(
     path: &str,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
+    if crate::phar::is_phar_uri(path) {
+        return match crate::phar::read_uri(path, context.cwd(), context.filesystem_capabilities()) {
+            Ok(bytes) => Ok(Value::string(bytes)),
+            Err(error) => {
+                context.php_warning(
+                    error.diagnostic_id(),
+                    format!(
+                        "{function}({path}): Failed to open stream: {}",
+                        error.message()
+                    ),
+                    span,
+                );
+                Ok(Value::Bool(false))
+            }
+        };
+    }
     let resolved = resolve_runtime_path(context, path);
     if !context.filesystem_capabilities().allows_path(&resolved) {
         context.php_warning(

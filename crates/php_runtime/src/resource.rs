@@ -292,6 +292,9 @@ impl StreamWrapperRegistry {
         if let Some(target) = uri.strip_prefix("php://") {
             return open_php_stream(table, target, mode, parsed_mode, capabilities);
         }
+        if uri.starts_with("phar://") {
+            return open_phar_stream(table, uri, mode, parsed_mode, cwd, capabilities);
+        }
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         open_file_stream(table, path, mode, parsed_mode, cwd, capabilities)
     }
@@ -1030,6 +1033,32 @@ fn open_file_stream(
             path: normalized,
             buffer,
             cursor,
+        },
+    ))
+}
+
+fn open_phar_stream(
+    table: &mut ResourceTable,
+    uri: &str,
+    mode: &str,
+    parsed_mode: StreamOpenMode,
+    cwd: &Path,
+    capabilities: &FilesystemCapabilities,
+) -> Result<ResourceRef, StreamOpenError> {
+    if parsed_mode.writable {
+        return Err(StreamOpenError::new(
+            "E_PHP_RUNTIME_PHAR_READONLY",
+            format!("phar:// streams are read-only in the current MVP: `{uri}`"),
+        ));
+    }
+    let bytes = crate::phar::read_uri(uri, cwd, capabilities)
+        .map_err(|error| StreamOpenError::new(error.diagnostic_id(), error.message().to_owned()))?;
+    Ok(table.register_stream_data(
+        StreamFlags::new(true, false, true),
+        StreamMetadata::new("phar", "stream", mode, uri),
+        StreamData::Memory {
+            buffer: bytes,
+            cursor: 0,
         },
     ))
 }

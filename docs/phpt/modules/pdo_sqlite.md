@@ -1,31 +1,34 @@
 # pdo_sqlite
 
-- Strategy: platform-negative classification
-- Classification: real-implementation-required before enabling
+- Strategy: SQLite-backed PDO MVP
+- Classification: real implementation, still incomplete
 - Selected manifest: `tests/phpt/manifests/modules/pdo_sqlite.selected.jsonl`
-- Current corpus snapshot: 80 `pdo_sqlite` candidates, 0 PASS, 6 SKIP, 73
-  FAIL, 1 BORK, and 80 known non-green outcomes.
-
-## Decision
-
-Do not expose a PDO SQLite stub or in-memory MVP in this branch.
-
-The safe minimum for `pdo_sqlite` is still real PDO object behavior, statements,
-errors, transactions, and SQLite-backed query semantics. The current dependency
-and runtime architecture do not provide that surface, and the prompt forbids
-fake query success. Until PDO core and a real SQLite engine boundary exist, the
-platform contract remains negative.
-
-## Unsupported Area
-
-- Stable ID: `PHPT-DATA-PDO-SQLITE`
-- Reference behavior: PHP with `pdo_sqlite` enabled exposes the extension,
-  SQLite PDO driver metadata, `sqliteCreateFunction`, `sqliteCreateAggregate`,
-  `sqliteCreateCollation`, and real SQLite queries through PDO.
-- Current phrust behavior: `extension_loaded("pdo_sqlite")` is false and PDO
-  classes are unavailable.
 - Fixture: `tests/phpt/generated/pdo_sqlite/platform-checks.phpt`
-- Next owner layer: future database extension layer after PDO core exists.
+
+## Implemented Scope
+
+Prompt 4G enables `pdo_sqlite` by reusing the Prompt 4F `rusqlite` connection
+and result layer.
+
+Implemented behavior:
+
+- `extension_loaded("pdo_sqlite")` and PDO driver discovery with `sqlite`.
+- SQLite `:memory:` and root-constrained local file DSNs.
+- `PDO::exec`, `query`, and `prepare` with `PDOStatement::execute`.
+- `PDOStatement::fetch`, `fetchAll`, `fetchColumn`, `columnCount`, and
+  `closeCursor` for associative, numeric, both, and column fetch modes.
+- Basic `errorCode` and `errorInfo` plumbing through the SQLite connection.
+
+## Remaining Gaps
+
+- Stable ID: `PHPT-DATA-PDO-SQLITE-MVP-GAPS`
+- Bound parameters are not implemented; prepared statements currently execute
+  stored SQL without non-empty parameter arrays.
+- SQLite-specific PDO callbacks (`sqliteCreateFunction`,
+  `sqliteCreateAggregate`, and `sqliteCreateCollation`) are not implemented.
+- Transactions, persistent connections, full attribute behavior, exact warning
+  text, exception-mode behavior, and advanced fetch modes remain incomplete.
+- Non-SQLite PDO drivers remain unavailable.
 
 ## Source References
 
@@ -35,5 +38,6 @@ platform contract remains negative.
 
 ## Target Gates
 
+- `nix develop -c cargo test -p php_runtime`
+- `nix develop -c cargo test -p php_vm`
 - `nix develop -c just phpt-dev-module MODULE=pdo_sqlite`
-- `nix develop -c just verify-phpt`

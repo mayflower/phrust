@@ -24,9 +24,12 @@ pub mod numeric_string;
 pub mod object;
 pub mod output;
 pub mod pcre;
+pub mod phar;
 pub mod reference;
 pub mod resource;
 pub mod serialization;
+pub mod session;
+pub mod sqlite;
 pub mod status;
 pub mod string;
 pub mod todo_runtime;
@@ -92,6 +95,7 @@ pub use pcre::{
     PREG_PATTERN_ORDER, PREG_RECURSION_LIMIT_ERROR, PREG_SET_ORDER, PREG_SPLIT_DELIM_CAPTURE,
     PREG_SPLIT_NO_EMPTY, PREG_SPLIT_OFFSET_CAPTURE, PREG_UNMATCHED_AS_NULL, PcreCache,
 };
+pub use phar::{PharArchive, PharEntry, PharError, PharUri};
 pub use reference::{
     ReferenceCell, ReferencePlaceholder, Slot, TempValue, ValueSlot, WeakReferenceHandle,
 };
@@ -100,6 +104,12 @@ pub use resource::{
     StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamWrapperRegistry,
 };
 pub use serialization::{SerializationError, UnserializeOptions, serialize, unserialize};
+pub use session::{PHP_SESSION_ACTIVE, PHP_SESSION_DISABLED, PHP_SESSION_NONE, SessionState};
+pub use sqlite::{
+    SQLITE3_ASSOC, SQLITE3_BLOB, SQLITE3_BOTH, SQLITE3_DETERMINISTIC, SQLITE3_FLOAT,
+    SQLITE3_INTEGER, SQLITE3_NULL, SQLITE3_NUM, SQLITE3_OPEN_CREATE, SQLITE3_OPEN_READONLY,
+    SQLITE3_OPEN_READWRITE, SQLITE3_TEXT, SqliteState,
+};
 pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
 pub use todo_runtime::{RuntimeTodo, runtime_skeleton_status};

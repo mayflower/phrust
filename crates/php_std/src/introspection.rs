@@ -59,6 +59,11 @@ mod tests {
         assert!(extension_loaded(&registry, "JSON"));
         assert!(extension_loaded(&registry, "PCRE"));
         assert!(extension_loaded(&registry, "mbstring"));
+        assert!(extension_loaded(&registry, "phar"));
+        assert!(extension_loaded(&registry, "pdo"));
+        assert!(extension_loaded(&registry, "pdo_sqlite"));
+        assert!(extension_loaded(&registry, "session"));
+        assert!(extension_loaded(&registry, "sqlite3"));
 
         registry.disable_extension("json").expect("disable json");
         assert!(!extension_loaded(&registry, "Json"));
@@ -79,8 +84,13 @@ mod tests {
                 "json",
                 "mbstring",
                 "pcre",
+                "pdo",
+                "pdo_sqlite",
+                "phar",
                 "random",
+                "session",
                 "spl",
+                "sqlite3",
                 "standard",
                 "tokenizer"
             ]
@@ -88,7 +98,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 10);
+        assert_eq!(array.len(), 15);
     }
 
     #[test]
@@ -98,6 +108,7 @@ mod tests {
 
         assert!(function_exists(&registry, "STRLEN"));
         assert!(function_exists(&registry, "mb_strlen"));
+        assert!(function_exists(&registry, "pdo_drivers"));
         assert!(!function_exists(&registry, "__php_std_test_probe"));
         assert!(!function_exists(&registry, "composer_missing_function"));
     }

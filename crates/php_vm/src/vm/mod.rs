@@ -19,7 +19,7 @@ use crate::compiled_unit::CompiledUnit;
 use crate::counters::JitCompileDescriptor;
 use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservation, VmCounters};
 use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument};
-use crate::include::include_path_file_fingerprint;
+use crate::include::{LoadedInclude, include_path_file_fingerprint};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
     AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
@@ -773,7 +773,7 @@ impl InternalFunctionDispatchCache {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 struct ExecutionState {
     globals: GlobalSymbolTable,
     included_once: Vec<PathBuf>,
@@ -809,6 +809,8 @@ struct ExecutionState {
     mb_internal_encoding: String,
     preg_last_error: php_runtime::pcre::PcreLastErrorState,
     json_last_error: i64,
+    session: php_runtime::SessionState,
+    sqlite: php_runtime::SqliteState,
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -7034,6 +7036,71 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_sqlite_runtime_class(&class_name) {
+                            let object = match new_sqlite_object(
+                                &class_name,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_pdo_runtime_class(&class_name) {
+                            let object = match new_pdo_object(
+                                &class_name,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_phar_runtime_class(&class_name) {
+                            let object = match new_phar_object(
+                                &class_name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let Some(class) = lookup_class_in_state(compiled, state, &class_name)
                         else {
                             return self.runtime_error(
@@ -7302,6 +7369,89 @@ impl Vm {
                                 class_name,
                                 values,
                                 &state.default_timezone,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_sqlite_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_sqlite_object(
+                                class_name,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_pdo_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_pdo_object(
+                                class_name,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_phar_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_phar_object(
+                                class_name,
+                                values,
+                                &self.options.runtime_context,
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
@@ -7981,6 +8131,18 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_pdo_runtime_class(&object.class_name()) {
+                            let value = object.get_property(property).unwrap_or(Value::Null);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let class =
                             match lookup_class_in_state(compiled, state, &object.class_name()) {
                                 Some(class) => class,
@@ -8611,6 +8773,9 @@ impl Vm {
                             };
                         let value = if constant.eq_ignore_ascii_case("class") {
                             Value::String(PhpString::from_test_str(&class.display_name))
+                        } else if let Some(value) = pdo_class_constant_value(&class.name, constant)
+                        {
+                            value
                         } else {
                             let scope = current_scope_class(compiled, stack);
                             let normalized_scope = scope.as_deref().map(normalize_class_name);
@@ -11031,6 +11196,52 @@ impl Vm {
                         }
                         if is_date_time_runtime_class(&object.class_name()) {
                             let value = match call_date_time_method(object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_sqlite_runtime_class(&object.class_name()) {
+                            let value = match call_sqlite_method(
+                                &object,
+                                method,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_pdo_runtime_class(&object.class_name()) {
+                            let value = match call_pdo_method(
+                                &object,
+                                method,
+                                values,
+                                &mut state.sqlite,
+                                &self.options.runtime_context,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -18130,17 +18341,6 @@ impl Vm {
             Ok(path) => path.to_string_lossy(),
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
-        let Some(loader) = &self.options.include_loader else {
-            return include_failure(
-                output,
-                compiled,
-                instruction_span,
-                kind,
-                "E_PHP_VM_INCLUDE_DISABLED: include/require loader is not configured",
-                state,
-                stack_trace(compiled, stack),
-            );
-        };
         let including_file = current_source_path(compiled, stack);
         let include_path = state_include_path(state);
         let cwd = state.cwd.clone();
@@ -18153,130 +18353,9 @@ impl Vm {
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
         };
-        let cached = self.lookup_include_path_inline_cache(
-            unit_key,
-            function_id,
-            block_id,
-            instruction_id,
-            &request,
-            InvalidationEpoch::default(),
-        );
-        let loaded = if let Some(target) = cached {
-            match include_path_file_fingerprint(&target.canonical_path) {
-                Ok(current) if current == target.fingerprint => {
-                    self.record_include_path_inline_cache_hit(
-                        unit_key,
-                        function_id,
-                        block_id,
-                        instruction_id,
-                    );
-                    match loader.load_resolved(target.canonical_path) {
-                        Ok(loaded) => loaded,
-                        Err(message) => {
-                            return include_failure(
-                                output,
-                                compiled,
-                                instruction_span,
-                                kind,
-                                message,
-                                state,
-                                stack_trace(compiled, stack),
-                            );
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    self.record_include_path_inline_cache_invalidation(
-                        unit_key,
-                        function_id,
-                        block_id,
-                        instruction_id,
-                    );
-                    match loader.resolve_with_include_path(
-                        including_file.as_deref(),
-                        &path,
-                        &include_path,
-                        Some(&cwd),
-                    ) {
-                        Ok(resolved) => {
-                            let target = IncludePathCacheTarget {
-                                canonical_path: resolved.canonical_path.clone(),
-                                fingerprint: resolved.fingerprint.clone(),
-                            };
-                            self.install_include_path_inline_cache(
-                                unit_key,
-                                function_id,
-                                block_id,
-                                instruction_id,
-                                request.clone(),
-                                InvalidationEpoch::default(),
-                                target,
-                            );
-                            match loader.load_resolved(resolved.canonical_path) {
-                                Ok(loaded) => loaded,
-                                Err(message) => {
-                                    return include_failure(
-                                        output,
-                                        compiled,
-                                        instruction_span,
-                                        kind,
-                                        message,
-                                        state,
-                                        stack_trace(compiled, stack),
-                                    );
-                                }
-                            }
-                        }
-                        Err(message) => {
-                            return include_failure(
-                                output,
-                                compiled,
-                                instruction_span,
-                                kind,
-                                message,
-                                state,
-                                stack_trace(compiled, stack),
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            match loader.resolve_with_include_path(
-                including_file.as_deref(),
-                &path,
-                &include_path,
-                Some(&cwd),
-            ) {
-                Ok(resolved) => {
-                    let target = IncludePathCacheTarget {
-                        canonical_path: resolved.canonical_path.clone(),
-                        fingerprint: resolved.fingerprint.clone(),
-                    };
-                    self.install_include_path_inline_cache(
-                        unit_key,
-                        function_id,
-                        block_id,
-                        instruction_id,
-                        request,
-                        InvalidationEpoch::default(),
-                        target,
-                    );
-                    match loader.load_resolved(resolved.canonical_path) {
-                        Ok(loaded) => loaded,
-                        Err(message) => {
-                            return include_failure(
-                                output,
-                                compiled,
-                                instruction_span,
-                                kind,
-                                message,
-                                state,
-                                stack_trace(compiled, stack),
-                            );
-                        }
-                    }
-                }
+        let loaded = if php_runtime::phar::is_phar_uri(&path) {
+            match load_phar_include(&path, &cwd, &self.options.runtime_context.filesystem) {
+                Ok(loaded) => loaded,
                 Err(message) => {
                     return include_failure(
                         output,
@@ -18287,6 +18366,155 @@ impl Vm {
                         state,
                         stack_trace(compiled, stack),
                     );
+                }
+            }
+        } else {
+            let Some(loader) = &self.options.include_loader else {
+                return include_failure(
+                    output,
+                    compiled,
+                    instruction_span,
+                    kind,
+                    "E_PHP_VM_INCLUDE_DISABLED: include/require loader is not configured",
+                    state,
+                    stack_trace(compiled, stack),
+                );
+            };
+            let cached = self.lookup_include_path_inline_cache(
+                unit_key,
+                function_id,
+                block_id,
+                instruction_id,
+                &request,
+                InvalidationEpoch::default(),
+            );
+            if let Some(target) = cached {
+                match include_path_file_fingerprint(&target.canonical_path) {
+                    Ok(current) if current == target.fingerprint => {
+                        self.record_include_path_inline_cache_hit(
+                            unit_key,
+                            function_id,
+                            block_id,
+                            instruction_id,
+                        );
+                        match loader.load_resolved(target.canonical_path) {
+                            Ok(loaded) => loaded,
+                            Err(message) => {
+                                return include_failure(
+                                    output,
+                                    compiled,
+                                    instruction_span,
+                                    kind,
+                                    message,
+                                    state,
+                                    stack_trace(compiled, stack),
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        self.record_include_path_inline_cache_invalidation(
+                            unit_key,
+                            function_id,
+                            block_id,
+                            instruction_id,
+                        );
+                        match loader.resolve_with_include_path(
+                            including_file.as_deref(),
+                            &path,
+                            &include_path,
+                            Some(&cwd),
+                        ) {
+                            Ok(resolved) => {
+                                let target = IncludePathCacheTarget {
+                                    canonical_path: resolved.canonical_path.clone(),
+                                    fingerprint: resolved.fingerprint.clone(),
+                                };
+                                self.install_include_path_inline_cache(
+                                    unit_key,
+                                    function_id,
+                                    block_id,
+                                    instruction_id,
+                                    request.clone(),
+                                    InvalidationEpoch::default(),
+                                    target,
+                                );
+                                match loader.load_resolved(resolved.canonical_path) {
+                                    Ok(loaded) => loaded,
+                                    Err(message) => {
+                                        return include_failure(
+                                            output,
+                                            compiled,
+                                            instruction_span,
+                                            kind,
+                                            message,
+                                            state,
+                                            stack_trace(compiled, stack),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(message) => {
+                                return include_failure(
+                                    output,
+                                    compiled,
+                                    instruction_span,
+                                    kind,
+                                    message,
+                                    state,
+                                    stack_trace(compiled, stack),
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                match loader.resolve_with_include_path(
+                    including_file.as_deref(),
+                    &path,
+                    &include_path,
+                    Some(&cwd),
+                ) {
+                    Ok(resolved) => {
+                        let target = IncludePathCacheTarget {
+                            canonical_path: resolved.canonical_path.clone(),
+                            fingerprint: resolved.fingerprint.clone(),
+                        };
+                        self.install_include_path_inline_cache(
+                            unit_key,
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            request,
+                            InvalidationEpoch::default(),
+                            target,
+                        );
+                        match loader.load_resolved(resolved.canonical_path) {
+                            Ok(loaded) => loaded,
+                            Err(message) => {
+                                return include_failure(
+                                    output,
+                                    compiled,
+                                    instruction_span,
+                                    kind,
+                                    message,
+                                    state,
+                                    stack_trace(compiled, stack),
+                                );
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        return include_failure(
+                            output,
+                            compiled,
+                            instruction_span,
+                            kind,
+                            message,
+                            state,
+                            stack_trace(compiled, stack),
+                        );
+                    }
                 }
             }
         };
@@ -23764,6 +23992,15 @@ fn object_instanceof(
             if let Some(result) = internal_date_time_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if let Some(result) = internal_sqlite_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
+            if let Some(result) = internal_pdo_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
+            if let Some(result) = internal_phar_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
             class_is_or_implements(compiled, &object.class_name(), class_name)
         }
         _ => Ok(false),
@@ -24834,6 +25071,902 @@ fn call_date_time_method(
             "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
         )),
     }
+}
+
+fn is_sqlite_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "sqlite3" | "sqlite3result" | "sqlite3stmt"
+    )
+}
+
+fn internal_sqlite_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_sqlite_runtime_class(object_class) {
+        return None;
+    }
+    Some(normalize_class_name(object_class) == normalize_class_name(target_class))
+}
+
+fn is_pdo_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "pdo" | "pdostatement" | "pdorow"
+    )
+}
+
+fn internal_pdo_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_pdo_runtime_class(object_class) {
+        return None;
+    }
+    Some(normalize_class_name(object_class) == normalize_class_name(target_class))
+}
+
+fn is_phar_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "phar" | "phardata" | "pharfileinfo"
+    )
+}
+
+fn internal_phar_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_phar_runtime_class(object_class) {
+        return None;
+    }
+    Some(normalize_class_name(object_class) == normalize_class_name(target_class))
+}
+
+fn new_phar_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
+    let normalized = normalize_class_name(class_name);
+    match normalized.as_str() {
+        "phar" => {
+            let values = call_args_to_positional("Phar::__construct", args)?;
+            validate_phar_arg_count("Phar::__construct", values.len(), 1, 3)?;
+            let filename = to_string(&values[0])?.to_string_lossy();
+            let raw = Path::new(&filename);
+            let path = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                runtime_context.cwd.join(raw)
+            };
+            if !runtime_context.filesystem.allows_path(&path) {
+                return Err(format!(
+                    "E_PHP_VM_PHAR_PATH_DENIED: PHAR archive path {} is outside allowed filesystem roots",
+                    path.display()
+                ));
+            }
+            let archive = php_runtime::PharArchive::open(&path)
+                .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+            let object = ObjectRef::new_with_display_name(&phar_runtime_class("Phar"), "Phar");
+            object.set_property(
+                "__phar_path",
+                Value::string(path.to_string_lossy().as_bytes().to_vec()),
+            );
+            if let Some(alias) = archive.alias {
+                object.set_property("__phar_alias", Value::string(alias));
+            }
+            Ok(object)
+        }
+        "phardata" => Err(
+            "E_PHP_VM_PHAR_DATA_GAP: PharData tar/zip archive objects are not implemented in the PHAR MVP"
+                .to_owned(),
+        ),
+        "pharfileinfo" => Err(
+            "E_PHP_VM_PHAR_FILEINFO_GAP: PharFileInfo objects are created by archive iteration, which is not implemented in the PHAR MVP"
+                .to_owned(),
+        ),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        )),
+    }
+}
+
+fn phar_runtime_class(name: &str) -> RuntimeClassEntry {
+    RuntimeClassEntry {
+        name: normalize_class_name(name),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn validate_phar_arg_count(
+    function: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if actual < min || actual > max {
+        return Err(format!(
+            "E_PHP_VM_PHAR_ARG_COUNT: {function} expects {min}..{max} argument(s), {actual} given"
+        ));
+    }
+    Ok(())
+}
+
+fn new_pdo_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
+    match normalize_class_name(class_name).as_str() {
+        "pdo" => {
+            let values = call_args_to_positional("PDO::__construct", args)?;
+            validate_pdo_arg_count("PDO::__construct", values.len(), 1, 4)?;
+            let dsn = to_string(&values[0])?.to_string_lossy();
+            let _username = values.get(1).map(to_string).transpose()?;
+            let _password = values.get(2).map(to_string).transpose()?;
+            if let Some(options) = values.get(3)
+                && !matches!(options, Value::Array(_) | Value::Null)
+            {
+                return Err(format!(
+                    "E_PHP_VM_PDO_TYPE: PDO::__construct argument 4 must be array or null, {} given",
+                    value_type_name(options)
+                ));
+            }
+            let database = pdo_resolve_sqlite_dsn(&dsn, runtime_context)?;
+            let id = sqlite
+                .open(
+                    &database,
+                    php_runtime::SQLITE3_OPEN_READWRITE | php_runtime::SQLITE3_OPEN_CREATE,
+                )
+                .map_err(|message| {
+                    format!(
+                        "E_PHP_VM_PDO_SQLITE_OPEN: could not open PDO SQLite DSN {dsn:?}: {message}"
+                    )
+                })?;
+            Ok(pdo_object(id))
+        }
+        "pdostatement" => Err(
+            "E_PHP_VM_PDO_STATEMENT_CONSTRUCT: PDOStatement objects are created by PDO".to_owned(),
+        ),
+        "pdorow" => Err("E_PHP_VM_PDO_ROW_CONSTRUCT: PDORow cannot be constructed".to_owned()),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        )),
+    }
+}
+
+fn call_pdo_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    match normalize_class_name(&object.class_name()).as_str() {
+        "pdo" => call_pdo_connection_method(object, method, args, sqlite, runtime_context),
+        "pdostatement" => call_pdo_statement_method(object, method, args, sqlite),
+        other => Err(format!(
+            "E_PHP_VM_PDO_METHOD_GAP: method {other}::{method} is not implemented in the PDO MVP"
+        )),
+    }
+}
+
+fn call_pdo_connection_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let values = call_args_to_positional(&format!("PDO::{method}"), args)?;
+    match method {
+        "__construct" => {
+            validate_pdo_arg_count("PDO::__construct", values.len(), 1, 4)?;
+            let dsn = to_string(&values[0])?.to_string_lossy();
+            let database = pdo_resolve_sqlite_dsn(&dsn, runtime_context)?;
+            let id = sqlite
+                .open(
+                    &database,
+                    php_runtime::SQLITE3_OPEN_READWRITE | php_runtime::SQLITE3_OPEN_CREATE,
+                )
+                .map_err(pdo_runtime_error)?;
+            if let Some(old_id) = pdo_connection_id(object) {
+                sqlite.close(old_id);
+            }
+            pdo_set_connection_id(object, id);
+            Ok(Value::Null)
+        }
+        "exec" => {
+            validate_pdo_arg_count("PDO::exec", values.len(), 1, 1)?;
+            let Some(id) = pdo_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            Ok(sqlite
+                .exec_changes(id, &sql)
+                .map(Value::Int)
+                .unwrap_or(Value::Bool(false)))
+        }
+        "query" => {
+            validate_pdo_arg_count("PDO::query", values.len(), 1, 4)?;
+            let Some(id) = pdo_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            let Some(result_id) = sqlite.query(id, &sql) else {
+                return Ok(Value::Bool(false));
+            };
+            Ok(Value::Object(pdo_statement_object(
+                id,
+                &sql,
+                pdo_default_fetch_mode(object),
+                Some(result_id),
+            )))
+        }
+        "prepare" => {
+            validate_pdo_arg_count("PDO::prepare", values.len(), 1, 2)?;
+            let Some(id) = pdo_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            Ok(Value::Object(pdo_statement_object(
+                id,
+                &sql,
+                pdo_default_fetch_mode(object),
+                None,
+            )))
+        }
+        "errorcode" => {
+            validate_pdo_arg_count("PDO::errorCode", values.len(), 0, 0)?;
+            Ok(pdo_error_code(sqlite, pdo_connection_id(object)))
+        }
+        "errorinfo" => {
+            validate_pdo_arg_count("PDO::errorInfo", values.len(), 0, 0)?;
+            Ok(pdo_error_info(sqlite, pdo_connection_id(object)))
+        }
+        "getattribute" => {
+            validate_pdo_arg_count("PDO::getAttribute", values.len(), 1, 1)?;
+            let attribute = to_int(&values[0])?;
+            Ok(match attribute {
+                3 => pdo_int_property(object, "__pdo_errmode", 0),
+                16 => Value::string("sqlite"),
+                19 => Value::Int(pdo_default_fetch_mode(object)),
+                _ => Value::Null,
+            })
+        }
+        "setattribute" => {
+            validate_pdo_arg_count("PDO::setAttribute", values.len(), 2, 2)?;
+            let attribute = to_int(&values[0])?;
+            let value = to_int(&values[1])?;
+            match attribute {
+                3 => object.set_property("__pdo_errmode", Value::Int(value)),
+                19 => object.set_property("__pdo_default_fetch_mode", Value::Int(value)),
+                _ => return Ok(Value::Bool(false)),
+            }
+            Ok(Value::Bool(true))
+        }
+        "quote" => {
+            validate_pdo_arg_count("PDO::quote", values.len(), 1, 2)?;
+            let value = to_string(&values[0])?.to_string_lossy();
+            Ok(Value::string(format!("'{}'", value.replace('\'', "''"))))
+        }
+        other => Err(format!(
+            "E_PHP_VM_PDO_METHOD_GAP: method PDO::{other} is not implemented in the PDO MVP"
+        )),
+    }
+}
+
+fn call_pdo_statement_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+) -> Result<Value, String> {
+    let values = call_args_to_positional(&format!("PDOStatement::{method}"), args)?;
+    match method {
+        "execute" => {
+            validate_pdo_arg_count("PDOStatement::execute", values.len(), 0, 1)?;
+            if let Some(Value::Array(params)) = values.first()
+                && !params.is_empty()
+            {
+                return Ok(Value::Bool(false));
+            }
+            let Some(id) = pdo_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            if let Some(result_id) = pdo_result_id(object) {
+                sqlite.finalize_result(result_id);
+                object.unset_property("__pdo_result");
+            }
+            let query = pdo_query_string(object);
+            if pdo_query_returns_rows(&query) {
+                let Some(result_id) = sqlite.query(id, &query) else {
+                    return Ok(Value::Bool(false));
+                };
+                object.set_property("__pdo_result", Value::Int(result_id));
+                object.set_property("__pdo_row_count", Value::Int(0));
+            } else {
+                let Some(changes) = sqlite.exec_changes(id, &query) else {
+                    return Ok(Value::Bool(false));
+                };
+                object.set_property("__pdo_row_count", Value::Int(changes));
+            }
+            Ok(Value::Bool(true))
+        }
+        "fetch" => {
+            validate_pdo_arg_count("PDOStatement::fetch", values.len(), 0, 3)?;
+            let Some(result_id) = pdo_result_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let mode = pdo_fetch_mode(object, values.first())?;
+            if mode == 7 {
+                return Ok(pdo_fetch_column(sqlite, result_id, 0));
+            }
+            Ok(sqlite.fetch_array(result_id, pdo_sqlite_fetch_mode(mode)))
+        }
+        "fetchall" => {
+            validate_pdo_arg_count("PDOStatement::fetchAll", values.len(), 0, usize::MAX)?;
+            let Some(result_id) = pdo_result_id(object) else {
+                return Ok(Value::Array(PhpArray::new()));
+            };
+            let mode = pdo_fetch_mode(object, values.first())?;
+            if mode == 7 {
+                let mut rows = PhpArray::new();
+                loop {
+                    let value = pdo_fetch_column(sqlite, result_id, 0);
+                    if matches!(value, Value::Bool(false)) {
+                        break;
+                    }
+                    rows.append(value);
+                }
+                return Ok(Value::Array(rows));
+            }
+            Ok(sqlite.fetch_all(result_id, pdo_sqlite_fetch_mode(mode)))
+        }
+        "fetchcolumn" => {
+            validate_pdo_arg_count("PDOStatement::fetchColumn", values.len(), 0, 1)?;
+            let Some(result_id) = pdo_result_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let column = values.first().map(to_int).transpose()?.unwrap_or(0);
+            Ok(pdo_fetch_column(sqlite, result_id, column))
+        }
+        "columncount" => {
+            validate_pdo_arg_count("PDOStatement::columnCount", values.len(), 0, 0)?;
+            Ok(Value::Int(
+                pdo_result_id(object).map_or(0, |id| sqlite.num_columns(id)),
+            ))
+        }
+        "rowcount" => {
+            validate_pdo_arg_count("PDOStatement::rowCount", values.len(), 0, 0)?;
+            Ok(pdo_int_property(object, "__pdo_row_count", 0))
+        }
+        "closecursor" => {
+            validate_pdo_arg_count("PDOStatement::closeCursor", values.len(), 0, 0)?;
+            if let Some(result_id) = pdo_result_id(object) {
+                sqlite.finalize_result(result_id);
+                object.unset_property("__pdo_result");
+            }
+            Ok(Value::Bool(true))
+        }
+        "errorcode" => {
+            validate_pdo_arg_count("PDOStatement::errorCode", values.len(), 0, 0)?;
+            Ok(pdo_error_code(sqlite, pdo_connection_id(object)))
+        }
+        "errorinfo" => {
+            validate_pdo_arg_count("PDOStatement::errorInfo", values.len(), 0, 0)?;
+            Ok(pdo_error_info(sqlite, pdo_connection_id(object)))
+        }
+        "setfetchmode" => {
+            validate_pdo_arg_count("PDOStatement::setFetchMode", values.len(), 1, usize::MAX)?;
+            let mode = to_int(&values[0])?;
+            object.set_property("__pdo_default_fetch_mode", Value::Int(mode));
+            Ok(Value::Bool(true))
+        }
+        other => Err(format!(
+            "E_PHP_VM_PDO_STATEMENT_METHOD_GAP: method PDOStatement::{other} is not implemented in the PDO MVP"
+        )),
+    }
+}
+
+fn pdo_object(connection_id: i64) -> ObjectRef {
+    let object = ObjectRef::new_with_display_name(&pdo_runtime_class("PDO"), "PDO");
+    pdo_set_connection_id(&object, connection_id);
+    object.set_property("__pdo_errmode", Value::Int(0));
+    object.set_property("__pdo_default_fetch_mode", Value::Int(4));
+    object
+}
+
+fn pdo_statement_object(
+    connection_id: i64,
+    query: &str,
+    default_fetch_mode: i64,
+    result_id: Option<i64>,
+) -> ObjectRef {
+    let object =
+        ObjectRef::new_with_display_name(&pdo_runtime_class("PDOStatement"), "PDOStatement");
+    pdo_set_connection_id(&object, connection_id);
+    object.set_property("queryString", Value::string(query));
+    object.set_property("__pdo_query", Value::string(query));
+    object.set_property("__pdo_default_fetch_mode", Value::Int(default_fetch_mode));
+    object.set_property("__pdo_row_count", Value::Int(0));
+    if let Some(result_id) = result_id {
+        object.set_property("__pdo_result", Value::Int(result_id));
+    }
+    object
+}
+
+fn pdo_runtime_class(name: &str) -> RuntimeClassEntry {
+    RuntimeClassEntry {
+        name: normalize_class_name(name),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn pdo_set_connection_id(object: &ObjectRef, id: i64) {
+    object.set_property("__pdo_connection", Value::Int(id));
+}
+
+fn pdo_connection_id(object: &ObjectRef) -> Option<i64> {
+    match object.get_property("__pdo_connection") {
+        Some(Value::Int(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn pdo_result_id(object: &ObjectRef) -> Option<i64> {
+    match object.get_property("__pdo_result") {
+        Some(Value::Int(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn pdo_query_string(object: &ObjectRef) -> String {
+    match object.get_property("__pdo_query") {
+        Some(Value::String(value)) => value.to_string_lossy(),
+        _ => String::new(),
+    }
+}
+
+fn pdo_default_fetch_mode(object: &ObjectRef) -> i64 {
+    match object.get_property("__pdo_default_fetch_mode") {
+        Some(Value::Int(mode)) => mode,
+        _ => 4,
+    }
+}
+
+fn pdo_fetch_mode(object: &ObjectRef, value: Option<&Value>) -> Result<i64, String> {
+    let mode = value.map(to_int).transpose()?.unwrap_or(0);
+    Ok(if mode == 0 {
+        pdo_default_fetch_mode(object)
+    } else {
+        mode
+    })
+}
+
+fn pdo_sqlite_fetch_mode(mode: i64) -> i64 {
+    match mode {
+        2 => php_runtime::SQLITE3_ASSOC,
+        3 => php_runtime::SQLITE3_NUM,
+        4 | 0 => php_runtime::SQLITE3_BOTH,
+        _ => php_runtime::SQLITE3_BOTH,
+    }
+}
+
+fn pdo_fetch_column(sqlite: &mut php_runtime::SqliteState, result_id: i64, column: i64) -> Value {
+    let row = sqlite.fetch_array(result_id, php_runtime::SQLITE3_NUM);
+    let Value::Array(array) = row else {
+        return row;
+    };
+    array
+        .get(&ArrayKey::Int(column))
+        .cloned()
+        .unwrap_or(Value::Bool(false))
+}
+
+fn pdo_int_property(object: &ObjectRef, property: &str, default: i64) -> Value {
+    match object.get_property(property) {
+        Some(Value::Int(value)) => Value::Int(value),
+        _ => Value::Int(default),
+    }
+}
+
+fn pdo_error_code(sqlite: &php_runtime::SqliteState, connection_id: Option<i64>) -> Value {
+    let code = connection_id.map_or(1, |id| sqlite.last_error_code(id));
+    if code == 0 {
+        Value::string("00000")
+    } else {
+        Value::string("HY000")
+    }
+}
+
+fn pdo_error_info(sqlite: &php_runtime::SqliteState, connection_id: Option<i64>) -> Value {
+    let mut info = PhpArray::new();
+    let code = connection_id.map_or(1, |id| sqlite.last_error_code(id));
+    if code == 0 {
+        info.append(Value::string("00000"));
+        info.append(Value::Null);
+        info.append(Value::Null);
+    } else {
+        info.append(Value::string("HY000"));
+        info.append(Value::Int(code));
+        info.append(Value::string(
+            connection_id
+                .map_or_else(
+                    || "not an open SQLite database".to_owned(),
+                    |id| sqlite.last_error_msg(id),
+                )
+                .into_bytes(),
+        ));
+    }
+    Value::Array(info)
+}
+
+fn pdo_query_returns_rows(query: &str) -> bool {
+    let query = query.trim_start().to_ascii_lowercase();
+    ["select", "pragma", "with", "values"]
+        .iter()
+        .any(|prefix| query.starts_with(prefix))
+}
+
+fn pdo_resolve_sqlite_dsn(dsn: &str, runtime_context: &RuntimeContext) -> Result<String, String> {
+    let Some(database) = dsn.strip_prefix("sqlite:") else {
+        return Err(format!(
+            "E_PHP_VM_PDO_DSN_GAP: only sqlite: PDO DSNs are implemented, got {dsn:?}"
+        ));
+    };
+    sqlite_resolve_database_path(database, runtime_context)
+}
+
+fn pdo_runtime_error(message: String) -> String {
+    format!("E_PHP_VM_PDO_SQLITE_ERROR: {message}")
+}
+
+fn pdo_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
+    if normalize_class_name(class_name) != "pdo" {
+        return None;
+    }
+    let value = match constant.to_ascii_uppercase().as_str() {
+        "PARAM_NULL" => Value::Int(0),
+        "PARAM_INT" => Value::Int(1),
+        "PARAM_STR" => Value::Int(2),
+        "PARAM_LOB" => Value::Int(3),
+        "PARAM_STMT" => Value::Int(4),
+        "PARAM_BOOL" => Value::Int(5),
+        "FETCH_DEFAULT" => Value::Int(0),
+        "FETCH_LAZY" => Value::Int(1),
+        "FETCH_ASSOC" => Value::Int(2),
+        "FETCH_NUM" => Value::Int(3),
+        "FETCH_BOTH" => Value::Int(4),
+        "FETCH_OBJ" => Value::Int(5),
+        "FETCH_BOUND" => Value::Int(6),
+        "FETCH_COLUMN" => Value::Int(7),
+        "ATTR_ERRMODE" => Value::Int(3),
+        "ATTR_DRIVER_NAME" => Value::Int(16),
+        "ATTR_DEFAULT_FETCH_MODE" => Value::Int(19),
+        "ERRMODE_SILENT" => Value::Int(0),
+        "ERRMODE_WARNING" => Value::Int(1),
+        "ERRMODE_EXCEPTION" => Value::Int(2),
+        "ERR_NONE" => Value::string("00000"),
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn validate_pdo_arg_count(
+    function: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if actual < min || actual > max {
+        let expected = if min == max {
+            min.to_string()
+        } else {
+            format!("{min} to {max}")
+        };
+        return Err(format!(
+            "E_PHP_VM_PDO_ARITY: {function} expects {expected} argument(s), {actual} given"
+        ));
+    }
+    Ok(())
+}
+
+fn new_sqlite_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
+    let normalized = normalize_class_name(class_name);
+    match normalized.as_str() {
+        "sqlite3" => {
+            let values = call_args_to_positional("SQLite3::__construct", args)?;
+            validate_sqlite_arg_count("SQLite3::__construct", values.len(), 1, 3)?;
+            let filename = to_string(&values[0])?.to_string_lossy();
+            let flags = values
+                .get(1)
+                .map(to_int)
+                .transpose()?
+                .unwrap_or(php_runtime::SQLITE3_OPEN_READWRITE | php_runtime::SQLITE3_OPEN_CREATE);
+            let _encryption_key = values.get(2).map(to_string).transpose()?;
+            let resolved = sqlite_resolve_database_path(&filename, runtime_context)?;
+            let id = sqlite.open(&resolved, flags).map_err(|message| {
+                format!("E_PHP_VM_SQLITE_OPEN: could not open SQLite3 database {filename:?}: {message}")
+            })?;
+            let object = ObjectRef::new_with_display_name(
+                &sqlite_class("SQLite3"),
+                sqlite_display_name(class_name),
+            );
+            sqlite_set_connection_id(&object, id);
+            Ok(object)
+        }
+        "sqlite3result" => Err(
+            "E_PHP_VM_SQLITE_RESULT_CONSTRUCT: SQLite3Result objects are created by SQLite3::query"
+                .to_owned(),
+        ),
+        "sqlite3stmt" => Err(
+            "E_PHP_VM_SQLITE_STMT_GAP: SQLite3Stmt prepared statements are not implemented in the SQLite3 MVP"
+                .to_owned(),
+        ),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        )),
+    }
+}
+
+fn call_sqlite_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let method = normalize_method_name(method);
+    match normalize_class_name(&class_name).as_str() {
+        "sqlite3" => call_sqlite3_method(object, &method, args, sqlite, runtime_context),
+        "sqlite3result" => call_sqlite3_result_method(object, &method, args, sqlite),
+        "sqlite3stmt" => Err(format!(
+            "E_PHP_VM_SQLITE_STMT_GAP: method SQLite3Stmt::{method} is not implemented in the SQLite3 MVP"
+        )),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn call_sqlite3_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let values = call_args_to_positional(&format!("SQLite3::{method}"), args)?;
+    match method {
+        "__construct" | "open" => {
+            validate_sqlite_arg_count("SQLite3::open", values.len(), 1, 3)?;
+            let filename = to_string(&values[0])?.to_string_lossy();
+            let flags =
+                values.get(1).map(to_int).transpose()?.unwrap_or(
+                    php_runtime::SQLITE3_OPEN_READWRITE | php_runtime::SQLITE3_OPEN_CREATE,
+                );
+            let _encryption_key = values.get(2).map(to_string).transpose()?;
+            let resolved = sqlite_resolve_database_path(&filename, runtime_context)?;
+            let id = sqlite.open(&resolved, flags).map_err(|message| {
+                format!(
+                    "E_PHP_VM_SQLITE_OPEN: could not open SQLite3 database {filename:?}: {message}"
+                )
+            })?;
+            if let Some(old_id) = sqlite_connection_id(object) {
+                sqlite.close(old_id);
+            }
+            sqlite_set_connection_id(object, id);
+            Ok(Value::Null)
+        }
+        "exec" => {
+            validate_sqlite_arg_count("SQLite3::exec", values.len(), 1, 1)?;
+            let Some(id) = sqlite_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            Ok(Value::Bool(sqlite.exec(id, &sql)))
+        }
+        "query" => {
+            validate_sqlite_arg_count("SQLite3::query", values.len(), 1, 1)?;
+            let Some(id) = sqlite_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            Ok(sqlite
+                .query(id, &sql)
+                .map(sqlite_result_object)
+                .unwrap_or(Value::Bool(false)))
+        }
+        "querysingle" => {
+            validate_sqlite_arg_count("SQLite3::querySingle", values.len(), 1, 2)?;
+            let Some(id) = sqlite_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            let entire_row = values.get(1).map(to_bool).transpose()?.unwrap_or(false);
+            Ok(sqlite.query_single(id, &sql, entire_row))
+        }
+        "lasterrorcode" | "lastextendederrorcode" => {
+            validate_sqlite_arg_count("SQLite3::lastErrorCode", values.len(), 0, 0)?;
+            Ok(Value::Int(
+                sqlite_connection_id(object).map_or(1, |id| sqlite.last_error_code(id)),
+            ))
+        }
+        "lasterrormsg" => {
+            validate_sqlite_arg_count("SQLite3::lastErrorMsg", values.len(), 0, 0)?;
+            Ok(Value::string(
+                sqlite_connection_id(object)
+                    .map_or_else(
+                        || "not an open SQLite3 database".to_owned(),
+                        |id| sqlite.last_error_msg(id),
+                    )
+                    .into_bytes(),
+            ))
+        }
+        "close" => {
+            validate_sqlite_arg_count("SQLite3::close", values.len(), 0, 0)?;
+            let Some(id) = sqlite_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            object.unset_property("__sqlite3_connection");
+            Ok(Value::Bool(sqlite.close(id)))
+        }
+        other => Err(format!(
+            "E_PHP_VM_SQLITE_METHOD_GAP: method SQLite3::{other} is not implemented in the SQLite3 MVP"
+        )),
+    }
+}
+
+fn call_sqlite3_result_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    sqlite: &mut php_runtime::SqliteState,
+) -> Result<Value, String> {
+    let values = call_args_to_positional(&format!("SQLite3Result::{method}"), args)?;
+    let Some(id) = sqlite_result_id(object) else {
+        return Ok(Value::Bool(false));
+    };
+    match method {
+        "fetcharray" => {
+            validate_sqlite_arg_count("SQLite3Result::fetchArray", values.len(), 0, 1)?;
+            let mode = values
+                .first()
+                .map(to_int)
+                .transpose()?
+                .unwrap_or(php_runtime::SQLITE3_BOTH);
+            Ok(sqlite.fetch_array(id, mode))
+        }
+        "fetchall" => {
+            validate_sqlite_arg_count("SQLite3Result::fetchAll", values.len(), 0, 1)?;
+            let mode = values
+                .first()
+                .map(to_int)
+                .transpose()?
+                .unwrap_or(php_runtime::SQLITE3_BOTH);
+            Ok(sqlite.fetch_all(id, mode))
+        }
+        "finalize" => {
+            validate_sqlite_arg_count("SQLite3Result::finalize", values.len(), 0, 0)?;
+            object.unset_property("__sqlite3_result");
+            Ok(Value::Bool(sqlite.finalize_result(id)))
+        }
+        "reset" => {
+            validate_sqlite_arg_count("SQLite3Result::reset", values.len(), 0, 0)?;
+            Ok(Value::Bool(sqlite.reset_result(id)))
+        }
+        "numcolumns" => {
+            validate_sqlite_arg_count("SQLite3Result::numColumns", values.len(), 0, 0)?;
+            Ok(Value::Int(sqlite.num_columns(id)))
+        }
+        other => Err(format!(
+            "E_PHP_VM_SQLITE_RESULT_METHOD_GAP: method SQLite3Result::{other} is not implemented in the SQLite3 MVP"
+        )),
+    }
+}
+
+fn sqlite_result_object(result_id: i64) -> Value {
+    let object = ObjectRef::new_with_display_name(&sqlite_class("SQLite3Result"), "SQLite3Result");
+    object.set_property("__sqlite3_result", Value::Int(result_id));
+    Value::Object(object)
+}
+
+fn sqlite_class(name: &str) -> RuntimeClassEntry {
+    RuntimeClassEntry {
+        name: normalize_class_name(name),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn sqlite_display_name(class_name: &str) -> String {
+    match normalize_class_name(class_name).as_str() {
+        "sqlite3" => "SQLite3".to_owned(),
+        "sqlite3result" => "SQLite3Result".to_owned(),
+        "sqlite3stmt" => "SQLite3Stmt".to_owned(),
+        _ => class_name.to_owned(),
+    }
+}
+
+fn sqlite_set_connection_id(object: &ObjectRef, id: i64) {
+    object.set_property("__sqlite3_connection", Value::Int(id));
+}
+
+fn sqlite_connection_id(object: &ObjectRef) -> Option<i64> {
+    match object.get_property("__sqlite3_connection") {
+        Some(Value::Int(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn sqlite_result_id(object: &ObjectRef) -> Option<i64> {
+    match object.get_property("__sqlite3_result") {
+        Some(Value::Int(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn sqlite_resolve_database_path(
+    filename: &str,
+    runtime_context: &RuntimeContext,
+) -> Result<String, String> {
+    if filename == ":memory:" {
+        return Ok(filename.to_owned());
+    }
+    let raw = Path::new(filename);
+    let path = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        runtime_context.cwd.join(raw)
+    };
+    if !runtime_context.filesystem.allows_path(&path) {
+        return Err(format!(
+            "E_PHP_VM_SQLITE_PATH_DENIED: SQLite3 database path {} is outside allowed filesystem roots",
+            path.display()
+        ));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn validate_sqlite_arg_count(
+    function: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if actual < min || actual > max {
+        return Err(format!(
+            "E_PHP_VM_SQLITE_ARG_COUNT: {function} expects {min}..{max} argument(s), {actual} given"
+        ));
+    }
+    Ok(())
 }
 
 fn call_date_time_like_method(
@@ -26412,6 +27545,24 @@ fn include_failure(
     VmResult::runtime_error_with_diagnostic(output.clone(), message.clone(), diagnostic)
 }
 
+fn load_phar_include(
+    uri: &str,
+    cwd: &Path,
+    filesystem: &php_runtime::FilesystemCapabilities,
+) -> Result<LoadedInclude, String> {
+    let parsed = php_runtime::phar::parse_uri(uri, cwd, filesystem)
+        .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+    let bytes = php_runtime::phar::read_entry(&parsed.archive_path, &parsed.entry_path)
+        .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+    let source = String::from_utf8(bytes).map_err(|_| {
+        format!("E_PHP_VM_INCLUDE_READ: {uri}: PHAR entry is not valid UTF-8 PHP source")
+    })?;
+    Ok(LoadedInclude {
+        canonical_path: parsed.synthetic_path,
+        source,
+    })
+}
+
 fn include_failure_id(message: &str) -> &str {
     message
         .split_once(':')
@@ -26846,14 +27997,39 @@ fn lookup_class_in_state(
             .iter()
             .find(|entry| normalize_class_name(&entry.class.name) == normalized)
             .map(|entry| entry.class.clone())
-            .or_else(|| internal_enum_class_entry(&normalized))
+            .or_else(|| internal_runtime_class_entry(&normalized))
     })
 }
 
-fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
+fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
     match normalized {
         "roundingmode" => Some(rounding_mode_class_entry()),
+        "pdo" => Some(internal_empty_class_entry("pdo", "PDO")),
+        "pdostatement" => Some(internal_empty_class_entry("pdostatement", "PDOStatement")),
+        "pdorow" => Some(internal_empty_class_entry("pdorow", "PDORow")),
+        "phar" => Some(internal_empty_class_entry("phar", "Phar")),
+        "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
+        "pharfileinfo" => Some(internal_empty_class_entry("pharfileinfo", "PharFileInfo")),
         _ => None,
+    }
+}
+
+fn internal_empty_class_entry(name: &str, display_name: &str) -> php_ir::module::ClassEntry {
+    php_ir::module::ClassEntry {
+        id: ClassId::new(u32::MAX - 1),
+        name: name.to_owned(),
+        display_name: display_name.to_owned(),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: php_ir::module::ClassFlags::default(),
+        span: IrSpan::default(),
     }
 }
 
@@ -26965,6 +28141,9 @@ fn class_constant_value_by_name(
     let class = lookup_class_in_state(compiled, state, class_name)?;
     if constant_name.eq_ignore_ascii_case("class") {
         return Some(Value::String(PhpString::from_test_str(&class.display_name)));
+    }
+    if let Some(value) = pdo_class_constant_value(class_name, constant_name) {
+        return Some(value);
     }
     if class.flags.is_enum
         && let Some(case) = class
@@ -27844,6 +29023,7 @@ fn import_shared_locals(
 fn seed_runtime_globals(globals: &mut GlobalSymbolTable, context: &RuntimeContext) {
     for name in [
         "argc", "argv", "_SERVER", "_ENV", "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST",
+        "_SESSION",
     ] {
         if let Some(value) = context.global_value(name) {
             globals.set(name, value);
@@ -28928,8 +30108,14 @@ fn execute_builtin_entry(
     } else {
         state.mb_internal_encoding.clone()
     });
+    let session_global = state
+        .globals
+        .ensure_slot("_SESSION", state.session.data_value());
+    context.set_session_state(&mut state.session, session_global);
+    context.sync_session_state_from_global();
     let result = (entry.function())(&mut context, args, source_span.clone());
     let output = context.output().clone();
+    context.sync_session_state_from_global();
     state.cwd = context.cwd().to_path_buf();
     state.json_last_error = context.json_last_error().0;
     state.default_timezone = context.default_timezone().to_owned();

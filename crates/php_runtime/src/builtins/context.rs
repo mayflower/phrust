@@ -2,8 +2,8 @@
 
 use crate::{
     FilesystemCapabilities, IniRegistry, OutputBuffer, PHP_E_DEPRECATED, PHP_E_WARNING, PcreCache,
-    PhpDiagnosticChannel, PhpDiagnosticDisplayOptions, ResourceTable, RuntimeDiagnostic,
-    RuntimeSeverity, datetime, emit_php_diagnostic, pcre,
+    PhpDiagnosticChannel, PhpDiagnosticDisplayOptions, ReferenceCell, ResourceTable,
+    RuntimeDiagnostic, RuntimeSeverity, SessionState, Value, datetime, emit_php_diagnostic, pcre,
 };
 use std::path::{Path, PathBuf};
 
@@ -124,6 +124,8 @@ pub struct BuiltinContext<'a> {
     json_last_error_msg: String,
     strtok_state: Option<&'a mut StrtokState>,
     mb_internal_encoding: String,
+    session_state: Option<&'a mut SessionState>,
+    session_global: Option<ReferenceCell>,
     diagnostic_display: PhpDiagnosticDisplayOptions,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -147,6 +149,8 @@ impl<'a> BuiltinContext<'a> {
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
             mb_internal_encoding: "UTF-8".to_owned(),
+            session_state: None,
+            session_global: None,
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
@@ -175,6 +179,8 @@ impl<'a> BuiltinContext<'a> {
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
             mb_internal_encoding: "UTF-8".to_owned(),
+            session_state: None,
+            session_global: None,
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
@@ -323,6 +329,44 @@ impl<'a> BuiltinContext<'a> {
     /// Updates the request-local mbstring internal encoding.
     pub fn set_mb_internal_encoding(&mut self, encoding: impl Into<String>) {
         self.mb_internal_encoding = encoding.into();
+    }
+
+    /// Sets request-local session state and the live `$_SESSION` global slot.
+    pub fn set_session_state(
+        &mut self,
+        state: &'a mut SessionState,
+        session_global: ReferenceCell,
+    ) {
+        self.session_state = Some(state);
+        self.session_global = Some(session_global);
+    }
+
+    /// Request-local session state.
+    pub fn session_state(&mut self) -> Option<&mut SessionState> {
+        self.session_state.as_deref_mut()
+    }
+
+    /// Writes the current session data into the live `$_SESSION` global.
+    pub fn sync_session_global_from_state(&mut self) {
+        let Some(data) = self.session_state.as_ref().map(|state| state.data_value()) else {
+            return;
+        };
+        if let Some(global) = &self.session_global {
+            global.set(data);
+        }
+    }
+
+    /// Captures the live `$_SESSION` global back into request-local session state.
+    pub fn sync_session_state_from_global(&mut self) {
+        let Some(global) = &self.session_global else {
+            return;
+        };
+        let Value::Array(array) = global.get() else {
+            return;
+        };
+        if let Some(state) = self.session_state.as_deref_mut() {
+            state.set_data(array);
+        }
     }
 
     /// Request-local PCRE pattern cache.

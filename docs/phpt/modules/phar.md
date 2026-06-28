@@ -1,51 +1,47 @@
 # phar
 
-- Strategy: classify, no read-only MVP yet
+- Strategy: read-only local PHAR MVP
 - Classification: real-implementation-required for Composer PHAR mode
 - Selected manifest: `tests/phpt/manifests/modules/phar.selected.jsonl`
-- Current corpus snapshot: 553 `phar` candidates, 3 PASS, 6 SKIP, 403 FAIL,
-  141 BORK, and 552 known non-green outcomes.
 
-## Decision
+## Implemented Scope
 
-Do not implement PHAR in this branch.
+- `extension_loaded("phar")` reports true through the standard-library
+  extension registry.
+- `class_exists("Phar")`, `class_exists("PharData")`, and
+  `class_exists("PharFileInfo")` report true.
+- `new Phar($path)` opens and validates a local uncompressed `.phar` archive
+  under runtime filesystem capabilities.
+- `phar://local.phar/file` supports read-only `file_get_contents`, `fopen`,
+  `stream_get_contents`, and `include` for uncompressed file entries.
+- `include_once` / `require_once` tracking uses stable synthetic `phar://`
+  paths.
 
-Composer source mode is the required compatibility path today. Composer PHAR
-support is useful later, but a read-only `phar://` MVP must still parse PHAR
-archives, expose deterministic wrapper behavior, handle stub/bootstrap rules,
-and define a signing policy. The current filesystem/stream support does not
-make that a tiny safe patch, so this branch records the policy and keeps
-platform probes negative.
+## Fixture
 
-## Unsupported Area
+- `tests/phpt/generated/phar/platform-checks.phpt` writes a deterministic
+  uncompressed archive with `hex2bin()`, reads `data.txt` through
+  `file_get_contents` and `fopen`, includes `lib/hello.php`, constructs
+  `Phar`, and removes the temporary archive.
 
-- Stable ID: `PHPT-DATA-PHAR`
-- Reference behavior: PHP with PHAR enabled exposes `Phar`, `PharData`,
-  `PharFileInfo`, archive metadata, stubs, signatures, compression handling,
-  and the `phar://` stream wrapper.
-- Current phrust behavior: `extension_loaded("phar")`,
-  `class_exists("Phar")`, `class_exists("PharData")`, and
-  `class_exists("PharFileInfo")` are false. `phar://` is not a supported
-  wrapper.
-- Fixture: `tests/phpt/generated/phar/platform-checks.phpt`
-- Next owner layer: future filesystem/streams plus PHAR archive layer.
+## Remaining Gaps
 
-## Failure Classification
-
-- Archive object API and metadata PHPTs: `PHPT-DATA-PHAR`.
-- `phar://` wrapper PHPTs: `PHPT-DATA-PHAR-WRAPPER`.
-- Stub/signature/compression PHPTs: `PHPT-DATA-PHAR-ARCHIVE`.
-- Runner BORKs from unsupported sections or source layout remain runner/tooling
-  issues and are not accepted as a new baseline by this branch.
+- PHAR archive writing and mutation APIs are not implemented.
+- Signature validation/enforcement, compression, tar/zip `PharData`, archive
+  iteration, metadata APIs, and `PharFileInfo` object creation remain known
+  gaps.
+- `phar://` metadata/stat functions are intentionally narrower than full PHP
+  stream-wrapper parity.
 
 ## Source References
 
+- `ext/phar/phar.c`
 - `ext/phar/phar_object.stub.php`
-- `ext/phar/makestub.php`
 - `ext/phar/tests/`
 
 ## Target Gates
 
+- `nix develop -c cargo test -p php_runtime`
+- `nix develop -c cargo test -p php_vm`
 - `nix develop -c just phpt-dev-module MODULE=phar`
 - `nix develop -c just composer-smoke`
-- `nix develop -c just verify-phpt`

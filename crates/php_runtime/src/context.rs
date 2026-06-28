@@ -203,7 +203,7 @@ impl RuntimeContext {
             "argv" => Some(self.argv_array()),
             "_SERVER" => Some(Value::Array(self.server_array())),
             "_ENV" => Some(Value::Array(self.env_array())),
-            "_GET" | "_POST" | "_COOKIE" | "_FILES" | "_REQUEST" | "GLOBALS" => {
+            "_GET" | "_POST" | "_COOKIE" | "_FILES" | "_REQUEST" | "_SESSION" | "GLOBALS" => {
                 Some(Value::Array(PhpArray::new()))
             }
             _ => None,

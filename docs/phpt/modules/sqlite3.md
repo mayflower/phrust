@@ -1,32 +1,40 @@
 # sqlite3
 
-- Strategy: platform-negative classification
-- Classification: real-implementation-required before enabling
+- Strategy: deterministic local MVP
+- Classification: real implementation, still incomplete
 - Selected manifest: `tests/phpt/manifests/modules/sqlite3.selected.jsonl`
-- Current corpus snapshot: 96 `sqlite3` candidates, 0 PASS, 7 SKIP, 89 FAIL,
-  0 BORK, and 96 known non-green outcomes.
-
-## Decision
-
-Do not implement an in-memory SQLite MVP in this branch.
-
-The `SQLite3` extension is smaller than PDO, but even the minimal useful
-surface requires a real SQLite dependency, object lifetime, result objects,
-parameter binding, error codes, and deterministic storage semantics. This branch
-should classify first; enabling `SQLite3` without that support would make
-framework probes believe database behavior exists.
-
-## Unsupported Area
-
-- Stable ID: `PHPT-DATA-SQLITE3`
-- Reference behavior: PHP with `sqlite3` enabled exposes `SQLite3`,
-  `SQLite3Stmt`, `SQLite3Result`, constants, in-memory/file databases, queries,
-  prepared statements, errors, callbacks, and BLOB handling.
-- Current phrust behavior: `extension_loaded("sqlite3")` and
-  `class_exists("SQLite3")` are false.
 - Fixture: `tests/phpt/generated/sqlite3/platform-checks.phpt`
-- Next owner layer: future database extension layer with an approved SQLite
-  dependency and real query execution.
+
+## Implemented Scope
+
+Prompt 4F enables `sqlite3` by default and backs it with `rusqlite`.
+
+Implemented behavior:
+
+- `SQLite3`, `SQLite3Result`, `SQLite3Stmt`, and `SQLite3Exception` class
+  visibility for framework probes.
+- `:memory:` databases and root-constrained local file databases.
+- `SQLite3::__construct`, `open`, `exec`, `query`, `querySingle`,
+  `lastErrorCode`, `lastExtendedErrorCode`, `lastErrorMsg`, and `close`.
+- `SQLite3Result::fetchArray`, `fetchAll`, `reset`, `finalize`, and
+  `numColumns`.
+- Common SQLite3 constants for fetch modes, value types, open flags, and
+  deterministic functions.
+
+The generated fixture covers in-memory query execution, result iteration,
+successful error state, close behavior, and a local file database round trip.
+
+## Remaining Gaps
+
+- Stable ID: `PHPT-DATA-SQLITE3-MVP-GAPS`
+- `SQLite3Stmt` exists for compatibility probes, but prepared statements,
+  scalar binding, and statement execution are not implemented yet.
+- Exact PHP warning text and all error-code edge cases are not complete.
+- Callbacks, custom SQL functions, collations, authorizers, backups, blob
+  streams, busy timeout, loadable extensions, and exception-mode behavior are
+  outside this MVP.
+- The implementation intentionally does not provide network databases or PDO;
+  PDO_SQLite is owned by Prompt 4G.
 
 ## Source References
 
@@ -35,5 +43,6 @@ framework probes believe database behavior exists.
 
 ## Target Gates
 
+- `nix develop -c cargo test -p php_runtime`
+- `nix develop -c cargo test -p php_vm`
 - `nix develop -c just phpt-dev-module MODULE=sqlite3`
-- `nix develop -c just verify-phpt`
