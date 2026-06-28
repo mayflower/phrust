@@ -207,6 +207,8 @@ request_timeout_ms = 30000
 max_execution_ms = 30000
 metrics_endpoint_enabled = true
 metrics_token = "replace-with-deployment-secret"
+tls_cert = "/etc/phrust/tls/fullchain.pem"
+tls_key = "/etc/phrust/tls/privkey.pem"
 script_cache_enabled = true
 script_cache_shards = 16
 script_cache_max_entries = 4096
@@ -227,9 +229,31 @@ Operators can protect it with `--metrics-token <token>`, which requires
 requests. `--disable-metrics-endpoint` still removes the route entirely.
 
 At startup the first stdout line remains the stable machine-readable
-`listening http://<addr>` handshake. A separate stderr summary reports the
-resolved docroot, front controller, script-cache settings, upload/session temp
-directories, metrics exposure, and access-log target.
+`listening http://<addr>` or `listening https://<addr>` handshake. A separate
+stderr summary reports the resolved docroot, front controller, script-cache
+settings, upload/session temp directories, metrics exposure, access-log target,
+and TLS/ALPN state.
+
+## TLS Transport
+
+`phrust-server` supports first-class Rustls termination with `--tls-cert <path>`
+and `--tls-key <path>`, or the equivalent `tls_cert` and `tls_key` config-file
+keys. Both files must be PEM encoded and both must be provided together. Invalid
+or unreadable certificate/key configuration fails startup with a clear
+diagnostic before the server accepts traffic.
+
+TLS wraps the same Hyper service and request handler as plaintext HTTP, so
+routing, request body limits, PHP execution, script/include caches, sessions,
+access logging, and metrics stay on the same integrated path. Plain HTTP remains
+the default for local development when no TLS files are configured.
+
+The TLS transport advertises `http/1.1` through ALPN. HTTP/2 and HTTP/3 are not
+enabled in this prompt. The local TLS smoke uses the committed self-signed
+localhost fixture under `fixtures/server/tls/` and `curl -k`:
+
+```bash
+nix develop -c just server-tls-smoke
+```
 
 ## Expected Acceptance Commands
 

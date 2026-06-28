@@ -54,6 +54,7 @@ help:
       '  just verify-server        Run integrated web server verification' \
       '  just server-smoke         Run integrated web server smoke checks' \
       '  just server-compat-smoke [SECTION=all] Run Wave 2 server compatibility smoke checks' \
+      '  just server-tls-smoke     Run integrated HTTPS server smoke checks' \
       '  just server-benchmark-smoke Run short optional server benchmark smoke' \
       '' \
       'Standard library and compatibility:' \
@@ -129,6 +130,9 @@ verify-server:
 
 server-compat-smoke SECTION="all":
     scripts/server/compat_smoke.sh {{SECTION}}
+
+server-tls-smoke:
+    scripts/server/tls_smoke.sh
 
 server-benchmark-smoke:
     scripts/server/benchmark_smoke.sh

@@ -32,7 +32,7 @@ use std::{
     fmt,
     fs::Metadata,
     fs::OpenOptions,
-    io::{SeekFrom, Write},
+    io::{BufReader, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -43,11 +43,18 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite},
     net::TcpListener,
     sync::Semaphore,
     task::{self, JoinSet},
     time::timeout,
+};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{
+        ServerConfig as RustlsServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer},
+    },
 };
 use tracing::{debug, warn};
 
@@ -283,6 +290,7 @@ pub enum ServerError {
     Config(ConfigError),
     Io(std::io::Error),
     Preload(String),
+    Tls(String),
 }
 
 impl fmt::Display for ServerError {
@@ -291,6 +299,7 @@ impl fmt::Display for ServerError {
             Self::Config(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Preload(error) => write!(f, "{error}"),
+            Self::Tls(error) => write!(f, "{error}"),
         }
     }
 }
@@ -324,6 +333,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_metrics_endpoint_enabled = config.metrics_endpoint_enabled;
     let startup_metrics_token_enabled = config.metrics_token.is_some();
     let startup_access_log = config.access_log.clone();
+    let startup_tls_enabled = config.tls_cert.is_some();
+    let tls_acceptor = build_tls_acceptor(config.tls_cert.as_deref(), config.tls_key.as_deref())?;
     let access_log = config
         .access_log
         .as_deref()
@@ -336,9 +347,10 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .ensure_ready()
             .map_err(std::io::Error::other)?;
     }
-    println!("listening http://{local_addr}");
+    let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
+    println!("listening {startup_scheme}://{local_addr}");
     eprintln!(
-        "startup docroot={} front_controller={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={}",
+        "startup docroot={} front_controller={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} tls={} tls_alpn={}",
         docroot.display(),
         startup_front_controller
             .as_ref()
@@ -351,6 +363,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         startup_metrics_endpoint_enabled,
         startup_metrics_token_enabled,
         startup_access_log.as_deref().unwrap_or("-"),
+        startup_tls_enabled,
+        if startup_tls_enabled { "http/1.1" } else { "-" },
     );
     debug!(%local_addr, docroot=%docroot.display(), "starting phrust server");
     let state = Arc::new(AppState {
@@ -396,8 +410,77 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         local_addr,
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
-    serve_until_shutdown(listener, state).await;
+    serve_until_shutdown(listener, state, tls_acceptor).await;
     Ok(())
+}
+
+fn build_tls_acceptor(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<Option<TlsAcceptor>, ServerError> {
+    let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
+        return Ok(None);
+    };
+    let certs = load_tls_certs(cert_path)?;
+    let key = load_tls_private_key(key_path)?;
+    let mut config = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| {
+            ServerError::Tls(format!(
+                "TLS certificate/key configuration is invalid: {error}"
+            ))
+        })?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn load_tls_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ServerError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        ServerError::Tls(format!(
+            "TLS certificate `{}` cannot be read: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            ServerError::Tls(format!(
+                "TLS certificate `{}` cannot be parsed: {error}",
+                path.display()
+            ))
+        })?;
+    if certs.is_empty() {
+        return Err(ServerError::Tls(format!(
+            "TLS certificate `{}` does not contain any certificates",
+            path.display()
+        )));
+    }
+    Ok(certs)
+}
+
+fn load_tls_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ServerError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        ServerError::Tls(format!(
+            "TLS private key `{}` cannot be read: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|error| {
+            ServerError::Tls(format!(
+                "TLS private key `{}` cannot be parsed: {error}",
+                path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            ServerError::Tls(format!(
+                "TLS private key `{}` does not contain a private key",
+                path.display()
+            ))
+        })
 }
 
 fn preload_script_cache(
@@ -465,7 +548,11 @@ fn preload_script_cache(
     Ok(())
 }
 
-async fn serve_until_shutdown(listener: TcpListener, state: Arc<AppState>) {
+async fn serve_until_shutdown(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    tls_acceptor: Option<TlsAcceptor>,
+) {
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
@@ -474,14 +561,16 @@ async fn serve_until_shutdown(listener: TcpListener, state: Arc<AppState>) {
                     continue;
                 };
                 let state = Arc::clone(&state);
+                let tls_acceptor = tls_acceptor.clone();
                 tasks.spawn(async move {
-                    let service = service_fn(move |request| {
-                        let state = Arc::clone(&state);
-                        async move { Ok::<_, Infallible>(handle(request, state, peer).await) }
-                    });
-                    let io = TokioIo::new(stream);
-                    let builder = Builder::new(TokioExecutor::new());
-                    let _ = builder.serve_connection(io, service).await;
+                    if let Some(tls_acceptor) = tls_acceptor {
+                        match tls_acceptor.accept(stream).await {
+                            Ok(stream) => serve_connection(stream, state, peer).await,
+                            Err(error) => warn!(%peer, %error, "TLS handshake failed"),
+                        }
+                    } else {
+                        serve_connection(stream, state, peer).await;
+                    }
                 });
             }
             Some(_) = tasks.join_next() => {}
@@ -498,6 +587,19 @@ async fn serve_until_shutdown(listener: TcpListener, state: Arc<AppState>) {
     })
     .await;
     tasks.abort_all();
+}
+
+async fn serve_connection<S>(stream: S, state: Arc<AppState>, peer: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request| {
+        let state = Arc::clone(&state);
+        async move { Ok::<_, Infallible>(handle(request, state, peer).await) }
+    });
+    let io = TokioIo::new(stream);
+    let builder = Builder::new(TokioExecutor::new());
+    let _ = builder.serve_connection(io, service).await;
 }
 
 async fn handle(
@@ -1773,6 +1875,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn tls_fixture_cert_and_key_load() {
+        let cert = tls_fixture("localhost.crt");
+        let key = tls_fixture("localhost.key");
+
+        assert_eq!(load_tls_certs(&cert).expect("load cert").len(), 1);
+        assert!(load_tls_private_key(&key).is_ok());
+        assert!(
+            build_tls_acceptor(Some(&cert), Some(&key))
+                .expect("build acceptor")
+                .is_some()
+        );
+    }
+
     fn test_state(
         fixture: &ServerCacheFixture,
         cache: Arc<CompiledScriptCache>,
@@ -1847,5 +1963,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn tls_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("fixtures/server/tls")
+            .join(name)
+            .canonicalize()
+            .expect("tls fixture")
     }
 }

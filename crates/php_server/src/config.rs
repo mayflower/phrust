@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub execution_deadline_enabled: bool,
     pub metrics_endpoint_enabled: bool,
     pub metrics_token: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
     pub script_cache_enabled: bool,
     pub script_cache_shards: usize,
     pub script_cache_max_entries: usize,
@@ -135,6 +137,8 @@ impl ServerConfig {
             .bool("metrics_endpoint_enabled")?
             .unwrap_or(true);
         let mut metrics_token = file_config.string("metrics_token");
+        let mut tls_cert = file_config.path("tls_cert");
+        let mut tls_key = file_config.path("tls_key");
         let mut script_cache_enabled = file_config.bool("script_cache_enabled")?.unwrap_or(true);
         let mut script_cache_shards = file_config
             .positive_usize("script_cache_shards")?
@@ -215,6 +219,8 @@ impl ServerConfig {
                 "--metrics-token" => {
                     metrics_token = Some(required_value(&arg, &mut args)?);
                 }
+                "--tls-cert" => tls_cert = Some(PathBuf::from(required_value(&arg, &mut args)?)),
+                "--tls-key" => tls_key = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 "--no-script-cache" => script_cache_enabled = false,
                 "--script-cache-shards" => {
                     script_cache_shards =
@@ -247,6 +253,11 @@ impl ServerConfig {
         }
         validate_cookie_name("session_cookie_name", &session_cookie_name)?;
         validate_cookie_path("session_cookie_path", &session_cookie_path)?;
+        if tls_cert.is_some() != tls_key.is_some() {
+            return Err(ConfigError::new(
+                "--tls-cert and --tls-key must be provided together",
+            ));
+        }
 
         if help {
             return Ok(Self {
@@ -268,6 +279,8 @@ impl ServerConfig {
                 execution_deadline_enabled,
                 metrics_endpoint_enabled,
                 metrics_token,
+                tls_cert,
+                tls_key,
                 script_cache_enabled,
                 script_cache_shards,
                 script_cache_max_entries,
@@ -300,6 +313,8 @@ impl ServerConfig {
             execution_deadline_enabled,
             metrics_endpoint_enabled,
             metrics_token,
+            tls_cert,
+            tls_key,
             script_cache_enabled,
             script_cache_shards,
             script_cache_max_entries,
@@ -335,6 +350,8 @@ Options:\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
   --metrics-token <token>      require Authorization: Bearer token for metrics\n\
+  --tls-cert <path>            PEM certificate chain for HTTPS\n\
+  --tls-key <path>             PEM private key for HTTPS\n\
   --access-log <path|->        write compact access logs to file or stdout\n\
   --no-script-cache            disable process-local compiled script cache\n\
   --script-cache-shards <n>    compiled script cache shard count (default: 16)\n\
@@ -625,6 +642,8 @@ mod tests {
         assert!(config.execution_deadline_enabled);
         assert!(config.metrics_endpoint_enabled);
         assert_eq!(config.metrics_token, None);
+        assert_eq!(config.tls_cert, None);
+        assert_eq!(config.tls_key, None);
         assert_eq!(config.access_log, None);
         assert!(config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 16);
@@ -674,6 +693,10 @@ mod tests {
             "--disable-metrics-endpoint",
             "--metrics-token",
             "secret",
+            "--tls-cert",
+            "tls/cert.pem",
+            "--tls-key",
+            "tls/key.pem",
             "--access-log",
             "-",
             "--no-script-cache",
@@ -707,6 +730,8 @@ mod tests {
         assert!(!config.execution_deadline_enabled);
         assert!(!config.metrics_endpoint_enabled);
         assert_eq!(config.metrics_token, Some("secret".to_string()));
+        assert_eq!(config.tls_cert, Some(PathBuf::from("tls/cert.pem")));
+        assert_eq!(config.tls_key, Some(PathBuf::from("tls/key.pem")));
         assert_eq!(config.access_log, Some("-".to_string()));
         assert!(!config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 3);
@@ -737,6 +762,8 @@ index = "home.php"
 max_body_bytes = 64
 metrics_token = "from-file-token"
 access_log = "access.log"
+tls_cert = "cert.pem"
+tls_key = "key.pem"
 script_cache_max_entries = 12
 strict_preload = true
 "#,
@@ -765,6 +792,8 @@ strict_preload = true
         assert_eq!(config.max_body_bytes, 128);
         assert_eq!(config.metrics_token, Some("from-cli-token".to_string()));
         assert_eq!(config.access_log, Some("access.log".to_string()));
+        assert_eq!(config.tls_cert, Some(PathBuf::from("cert.pem")));
+        assert_eq!(config.tls_key, Some(PathBuf::from("key.pem")));
         assert_eq!(config.script_cache_max_entries, 12);
         assert!(config.strict_preload);
     }
@@ -886,6 +915,17 @@ index = "../bad.php"
         assert_eq!(
             error.to_string(),
             "--session-cookie-path must be a non-empty cookie path without response separators"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_tls_pair() {
+        let error = ServerConfig::parse_from(["--docroot", "public", "--tls-cert", "cert.pem"])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--tls-cert and --tls-key must be provided together"
         );
     }
 
