@@ -61,6 +61,26 @@ pub enum NumericStringKind {
     NonNumeric,
 }
 
+/// Canonical form recognized by the numeric-string classifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NumericStringCanonicalKind {
+    /// Not a canonical numeric string for specialization purposes.
+    None,
+    /// Canonical decimal integer string that can also normalize to an array key.
+    Integer,
+    /// Canonical full float string in the modeled runtime subset.
+    Float,
+}
+
+/// PHP array-key classification derived from the numeric-string model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NumericStringArrayKey {
+    /// String key normalizes to this integer key.
+    Integer(i64),
+    /// String key remains a string key.
+    String,
+}
+
 /// Classification result.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NumericString {
@@ -68,15 +88,25 @@ pub struct NumericString {
     pub kind: NumericStringKind,
     /// Parsed value for full or leading numeric strings.
     pub value: Option<NumericStringValue>,
+    /// Canonical representation class for guarded specialization.
+    pub canonical: NumericStringCanonicalKind,
+    /// True when classification fell back through a precision-sensitive path.
+    pub overflow_or_precision_sensitive: bool,
 }
 
 /// Numeric-string cache stats collected by the VM when counters are enabled.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NumericStringCacheStats {
+    /// Calls to the cached classifier.
+    pub classify_calls: u64,
     /// Cache hits.
     pub hits: u64,
     /// Cache misses.
     pub misses: u64,
+    /// Leading-numeric classifications that require warning-sensitive handling.
+    pub warning_sensitive_fallbacks: u64,
+    /// Classifications that crossed an overflow or precision-sensitive boundary.
+    pub overflow_precision_fallbacks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -102,6 +132,7 @@ impl NumericString {
 /// same.
 #[must_use]
 pub fn classify_php_string(value: &PhpString) -> NumericString {
+    CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().classify_calls += 1);
     let key = NumericStringCacheKey {
         storage_id: value.storage_id(),
         len: value.len(),
@@ -109,6 +140,7 @@ pub fn classify_php_string(value: &PhpString) -> NumericString {
     };
     if let Some(classified) = CLASSIFICATION_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
         CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().hits += 1);
+        record_sensitive_classification(classified);
         return classified;
     }
     let classified = classify(value.as_bytes());
@@ -120,7 +152,34 @@ pub fn classify_php_string(value: &PhpString) -> NumericString {
         cache.insert(key, classified);
     });
     CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().misses += 1);
+    record_sensitive_classification(classified);
     classified
+}
+
+/// Classifies PHP array-key conversion for a string through the same cached
+/// numeric-string model used by scalar conversion.
+#[must_use]
+pub fn classify_array_key(value: &PhpString) -> NumericStringArrayKey {
+    let classified = classify_php_string(value);
+    match (classified.canonical, classified.value) {
+        (NumericStringCanonicalKind::Integer, Some(NumericStringValue::Int(value))) => {
+            NumericStringArrayKey::Integer(value)
+        }
+        _ => NumericStringArrayKey::String,
+    }
+}
+
+/// Returns true when a string key looks numeric but does not normalize to an
+/// integer key under PHP array-key rules.
+#[must_use]
+pub fn array_key_has_numeric_string_ambiguity(value: &PhpString) -> bool {
+    let Some(first) = value.as_bytes().first() else {
+        return false;
+    };
+    if !(first.is_ascii_digit() || matches!(first, b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r')) {
+        return false;
+    }
+    matches!(classify_array_key(value), NumericStringArrayKey::String)
 }
 
 /// Clears cache contents and hit/miss stats for deterministic VM executions.
@@ -152,32 +211,43 @@ pub fn classify(bytes: &[u8]) -> NumericString {
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(bytes.len());
-    let bytes = &bytes[start..];
-    if bytes.is_empty() {
+    let original = bytes;
+    let trimmed_start = &bytes[start..];
+    if trimmed_start.is_empty() {
         return non_numeric();
     }
-    let Some(prefix) = numeric_prefix_len(bytes) else {
+    let Some(prefix) = numeric_prefix_len(trimmed_start) else {
         return non_numeric();
     };
-    let value = parse_numeric_prefix(&bytes[..prefix]);
-    let Some(value) = value else {
+    let parsed = parse_numeric_prefix(&trimmed_start[..prefix]);
+    let Some(parsed) = parsed else {
         return non_numeric();
     };
-    let trailing = &bytes[prefix..];
+    let trailing = &trimmed_start[prefix..];
     if trailing.iter().all(u8::is_ascii_whitespace) {
-        let kind = if value.is_float() {
+        let kind = if parsed.value.is_float() {
             NumericStringKind::FloatString
         } else {
             NumericStringKind::IntString
         };
+        let has_surrounding_whitespace = start != 0 || !trailing.is_empty();
         return NumericString {
             kind,
-            value: Some(value),
+            value: Some(parsed.value),
+            canonical: canonical_kind(
+                original,
+                &trimmed_start[..prefix],
+                has_surrounding_whitespace,
+                parsed.value,
+            ),
+            overflow_or_precision_sensitive: parsed.overflow_or_precision_sensitive,
         };
     }
     NumericString {
         kind: NumericStringKind::LeadingNumeric,
-        value: Some(value),
+        value: Some(parsed.value),
+        canonical: NumericStringCanonicalKind::None,
+        overflow_or_precision_sensitive: parsed.overflow_or_precision_sensitive,
     }
 }
 
@@ -194,6 +264,8 @@ fn non_numeric() -> NumericString {
     NumericString {
         kind: NumericStringKind::NonNumeric,
         value: None,
+        canonical: NumericStringCanonicalKind::None,
+        overflow_or_precision_sensitive: false,
     }
 }
 
@@ -236,22 +308,104 @@ fn numeric_prefix_len(bytes: &[u8]) -> Option<usize> {
     Some(index)
 }
 
-fn parse_numeric_prefix(bytes: &[u8]) -> Option<NumericStringValue> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParsedNumeric {
+    value: NumericStringValue,
+    overflow_or_precision_sensitive: bool,
+}
+
+fn parse_numeric_prefix(bytes: &[u8]) -> Option<ParsedNumeric> {
     let text = std::str::from_utf8(bytes).ok()?;
     let is_float = bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E'));
     if is_float {
-        return text.parse::<f64>().ok().map(NumericStringValue::Float);
+        let value = text.parse::<f64>().ok()?;
+        return Some(ParsedNumeric {
+            value: NumericStringValue::Float(value),
+            overflow_or_precision_sensitive: !value.is_finite() || significant_digits(bytes) > 15,
+        });
     }
-    text.parse::<i64>()
-        .map(NumericStringValue::Int)
-        .or_else(|_| text.parse::<f64>().map(NumericStringValue::Float))
-        .ok()
+    match text.parse::<i64>() {
+        Ok(value) => Some(ParsedNumeric {
+            value: NumericStringValue::Int(value),
+            overflow_or_precision_sensitive: false,
+        }),
+        Err(_) => {
+            let value = text.parse::<f64>().ok()?;
+            Some(ParsedNumeric {
+                value: NumericStringValue::Float(value),
+                overflow_or_precision_sensitive: true,
+            })
+        }
+    }
+}
+
+fn canonical_kind(
+    original: &[u8],
+    numeric_prefix: &[u8],
+    has_surrounding_whitespace: bool,
+    value: NumericStringValue,
+) -> NumericStringCanonicalKind {
+    if has_surrounding_whitespace || original != numeric_prefix {
+        return NumericStringCanonicalKind::None;
+    }
+    if canonical_integer_value(numeric_prefix, value).is_some() {
+        return NumericStringCanonicalKind::Integer;
+    }
+    if matches!(value, NumericStringValue::Float(_))
+        && numeric_prefix
+            .iter()
+            .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+    {
+        return NumericStringCanonicalKind::Float;
+    }
+    NumericStringCanonicalKind::None
+}
+
+fn canonical_integer_value(bytes: &[u8], value: NumericStringValue) -> Option<i64> {
+    let NumericStringValue::Int(value) = value else {
+        return None;
+    };
+    let (negative, digits) = bytes
+        .strip_prefix(b"-")
+        .map(|digits| (true, digits))
+        .unwrap_or((false, bytes));
+    if bytes.starts_with(b"+") || digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    if negative && value == 0 {
+        return None;
+    }
+    Some(value)
+}
+
+fn significant_digits(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_digit())
+        .skip_while(|byte| **byte == b'0')
+        .count()
+}
+
+fn record_sensitive_classification(classified: NumericString) {
+    CLASSIFICATION_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        if classified.kind == NumericStringKind::LeadingNumeric {
+            stats.warning_sensitive_fallbacks += 1;
+        }
+        if classified.overflow_or_precision_sensitive {
+            stats.overflow_precision_fallbacks += 1;
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NumericStringKind, NumericStringValue, classify, classify_php_string,
+        NumericStringArrayKey, NumericStringCanonicalKind, NumericStringKind, NumericStringValue,
+        array_key_has_numeric_string_ambiguity, classify, classify_array_key, classify_php_string,
         reset_cache_and_stats, take_cache_stats,
     };
     use crate::PhpString;
@@ -260,10 +414,22 @@ mod tests {
     fn numeric_string_classifies_full_int_float_and_whitespace() {
         assert_eq!(classify(b"0").kind, NumericStringKind::IntString);
         assert_eq!(classify(b"0").value, Some(NumericStringValue::Int(0)));
+        assert_eq!(
+            classify(b"0").canonical,
+            NumericStringCanonicalKind::Integer
+        );
         assert_eq!(classify(b"0.0").kind, NumericStringKind::FloatString);
         assert_eq!(classify(b"0.0").value, Some(NumericStringValue::Float(0.0)));
+        assert_eq!(
+            classify(b"0.0").canonical,
+            NumericStringCanonicalKind::Float
+        );
         assert_eq!(classify(b" 42\t").kind, NumericStringKind::IntString);
         assert_eq!(classify(b" 42\t").value, Some(NumericStringValue::Int(42)));
+        assert_eq!(
+            classify(b" 42\t").canonical,
+            NumericStringCanonicalKind::None
+        );
     }
 
     #[test]
@@ -285,9 +451,12 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.kind, NumericStringKind::FloatString);
         assert!(matches!(first.value, Some(NumericStringValue::Float(_))));
+        assert!(first.overflow_or_precision_sensitive);
         let stats = take_cache_stats();
+        assert_eq!(stats.classify_calls, 2);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
+        assert_eq!(stats.overflow_precision_fallbacks, 2);
     }
 
     #[test]
@@ -314,8 +483,10 @@ mod tests {
             NumericStringKind::NonNumeric
         );
         let stats = take_cache_stats();
+        assert_eq!(stats.classify_calls, 4);
         assert_eq!(stats.misses, 3);
         assert_eq!(stats.hits, 1);
+        assert_eq!(stats.warning_sensitive_fallbacks, 1);
     }
 
     #[test]
@@ -348,5 +519,41 @@ mod tests {
         let stats = take_cache_stats();
         assert_eq!(stats.misses, 4);
         assert_eq!(stats.hits, 0);
+    }
+
+    #[test]
+    fn numeric_string_array_key_classification_matches_php_key_rules() {
+        reset_cache_and_stats();
+
+        assert_eq!(
+            classify_array_key(&PhpString::from("42")),
+            NumericStringArrayKey::Integer(42)
+        );
+        assert_eq!(
+            classify_array_key(&PhpString::from("-42")),
+            NumericStringArrayKey::Integer(-42)
+        );
+        assert_eq!(
+            classify_array_key(&PhpString::from("042")),
+            NumericStringArrayKey::String
+        );
+        assert_eq!(
+            classify_array_key(&PhpString::from("+42")),
+            NumericStringArrayKey::String
+        );
+        assert_eq!(
+            classify_array_key(&PhpString::from(" 42")),
+            NumericStringArrayKey::String
+        );
+        assert_eq!(
+            classify_array_key(&PhpString::from("42.0")),
+            NumericStringArrayKey::String
+        );
+        assert!(array_key_has_numeric_string_ambiguity(&PhpString::from(
+            "042"
+        )));
+        assert!(!array_key_has_numeric_string_ambiguity(&PhpString::from(
+            "name"
+        )));
     }
 }

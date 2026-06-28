@@ -81,8 +81,10 @@ Recommended path:
 1. future runtime: do not pursue OSR as a product feature. Continue entry-point JIT
    expansion only where interpreter fallback and side exits already have stable
    reports.
-2. future runtime research only: add non-executing metadata for loop headers and live
-   locals if it is useful for diagnostics or future planning.
+2. future runtime research only: build on the non-executing VM-owned metadata in
+   `php_vm::deopt` and `docs/performance-deopt-live-state-osr-metadata.md` for
+   dense resume points, live-state slots, foreach markers, and explicit
+   rejection reasons.
 3. PHPT runtime: reconsider OSR only after deopt snapshots, live-state maps,
    `foreach` iteration state, exception/finally/destructor order, and
    reference-cell identity are represented in VM-owned structures and tested

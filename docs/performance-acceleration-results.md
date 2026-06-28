@@ -46,6 +46,7 @@ records advisory timing or counters.
 | `inline-caches-on` | Enabled | Compares guarded inline caches with fallback counters. |
 | `all-non-jit` | Enabled | Enables the non-native optimized interpreter stack without Cranelift. |
 | `fast-preset` | Enabled | Exercises the user-facing `--engine-preset=fast` shorthand for the proven non-native stack. |
+| `persistent-feedback-advisory` | Optional | Runs only when requested with `PHRUST_ACCEL_MATRIX_PERSISTENT_FEEDBACK=1` or `--include-persistent-feedback`; validates advisory metadata and writes feedback stats outside PHP stdout without changing execution. |
 | `release-all-non-jit` | Optional | Runs when the release `php-vm` binary exists; otherwise records an explicit skip. |
 | `jit-cranelift` | Optional | Runs only when requested with `PHRUST_ACCEL_MATRIX_JIT=1` or `--include-jit` and the feature-enabled binary is available. |
 
@@ -79,6 +80,7 @@ The matrix is a correctness gate, not a speed gate.
 | Optimizer | Explicit opt level | `--opt-level=0|1|2` |
 | Bytecode cache | Off unless explicitly requested | `--bytecode-cache=off|read|write|read-write` |
 | Fast preset | Explicit only | `--engine-preset=fast`; baseline remains the default |
+| Persistent feedback | Advisory/default-off | `--persistent-feedback-read <path>` plus `--persistent-feedback-stats-json <path>`; optional matrix rows require `--include-persistent-feedback` |
 | Experimental JIT preset | Explicit and feature-gated | `--engine-preset=experimental-jit` |
 | Release profile | Measurement-only | `just release-benchmark-smoke` and optional matrix row |
 | Cranelift | Feature-gated and runtime-off | `jit-cranelift` feature plus explicit `--jit=cranelift` |

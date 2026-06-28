@@ -40,7 +40,8 @@ pub mod value;
 
 pub use array::{
     ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
-    PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, WeakArrayHandle,
+    PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, PhpArrayShapeKind,
+    PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata, WeakArrayHandle,
 };
 pub use autoload::AutoloadRegistry;
 pub use builtins::{

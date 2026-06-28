@@ -1365,13 +1365,13 @@ fn check_function_shape(
     if function.flags.is_closure && !function.captures.is_empty() {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_CLOSURE_CAPTURE",
-            "capturing closures may observe reference and lifetime behavior",
+            "capturing closures may observe reference and lifetime behavior; alias_state=unknown_aliasing",
         ));
     }
     if function.returns_by_ref {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_BY_REF_RETURN",
-            "by-reference returns are outside the performance JIT subset",
+            "by-reference returns are outside the performance JIT subset; alias_state=escaped_reference",
         ));
     }
     if function.blocks.is_empty() {
@@ -1396,7 +1396,10 @@ fn check_param(param: &IrParam, rejected: &mut Vec<JitEligibilityReason>) {
     if param.by_ref {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_BY_REF_PARAM",
-            format!("parameter `${}` is by-reference", param.name),
+            format!(
+                "parameter `${}` is by-reference; alias_state=escaped_reference",
+                param.name
+            ),
         ));
     }
     if param.variadic {
@@ -1421,7 +1424,10 @@ fn check_capture(capture: &IrCapture, rejected: &mut Vec<JitEligibilityReason>) 
     if capture.by_ref {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_BY_REF_CAPTURE",
-            format!("capture `${}` is by-reference", capture.name),
+            format!(
+                "capture `${}` is by-reference; alias_state=escaped_reference",
+                capture.name
+            ),
         ));
     }
 }
@@ -1517,7 +1523,7 @@ fn check_instruction(
         | InstructionKind::BindReferenceFromCall { .. } => {
             rejected.push(JitEligibilityReason::instruction(
                 "JIT_ELIGIBILITY_REJECT_REFERENCE_OPCODE",
-                "reference-producing opcodes are outside the JIT subset",
+                "reference-producing opcodes are outside the JIT subset; alias_state=unknown_aliasing",
                 block,
                 id,
             ))
@@ -1649,7 +1655,7 @@ fn check_terminator(
             if by_ref_local.is_some() {
                 rejected.push(JitEligibilityReason::function(
                     "JIT_ELIGIBILITY_REJECT_BY_REF_RETURN",
-                    "return terminator returns a local by reference",
+                    "return terminator returns a local by reference; alias_state=escaped_reference",
                 ));
             }
             if let Some(value) = value {

@@ -24,8 +24,12 @@ CACHE_COUNTERS = (
     "cache_misses",
     "internal_function_dispatch_cache_hits",
     "internal_function_dispatch_cache_misses",
+    "numeric_string_classify_calls",
     "numeric_string_cache_hits",
     "numeric_string_cache_misses",
+    "numeric_string_specialization_hits",
+    "numeric_string_warning_sensitive_fallbacks",
+    "numeric_string_overflow_precision_fallbacks",
 )
 
 QUICKENING_COUNTERS = (
@@ -93,12 +97,26 @@ FRAME_REUSE_COUNTERS = (
     "frames_reused",
     "register_files_allocated",
     "register_files_reused",
+    "fast_path_disabled_by_reference",
+    "dequickened_by_reference",
+    "IC_invalidated_by_reference",
+    "dense_bytecode_fallback_by_reference",
     "value_clones",
     "string_allocations",
     "array_handle_clones",
     "cow_separations",
     "reference_cell_creations",
     "object_allocations",
+)
+
+ARRAY_SHAPE_COUNTERS = (
+    "record_shape_hits",
+    "record_shape_misses",
+    "small_map_hits",
+    "small_map_misses",
+    "key_coercion_fallbacks",
+    "order_semantics_fallbacks",
+    "cow_or_reference_fallbacks",
 )
 
 FRAMEWORK_COUNTER_COLUMNS = (
@@ -114,6 +132,7 @@ FRAMEWORK_COUNTER_COLUMNS = (
     "property_accesses",
     "internal_function_dispatches",
     "inline_cache_hits",
+    "fast_path_disabled_by_reference",
     "output_bytes",
     "output_fast_appends",
     "output_batched_appends",
@@ -185,10 +204,14 @@ def measurement_counters(measurement: dict[str, Any]) -> dict[str, int]:
             parsed[key] = value
         elif key in {
             "frame_reuse_blocked_by_reason",
+            "frame_alias_state",
+            "alias_state_transitions",
             "builtin_fast_stub_hits",
             "builtin_fast_stub_misses",
             "property_ic_fallback_reasons",
+            "property_assign_ic_fallback_reasons",
             "output_slow_appends_by_reason",
+            "array_shape_observed_by_kind",
         } and isinstance(value, dict):
             for reason, count in value.items():
                 if isinstance(reason, str) and isinstance(count, int):
@@ -287,6 +310,18 @@ def summarize_report(
                     (key.removeprefix("frame_reuse_blocked_by_reason."), value)
                     for key, value in counter_totals.items()
                     if key.startswith("frame_reuse_blocked_by_reason.")
+                )
+            )
+        ),
+        "array_shape_counters": {
+            key: counter_totals.get(key, 0) for key in ARRAY_SHAPE_COUNTERS
+        },
+        "array_shape_observed_by_kind": dict(
+            sorted(
+                (
+                    (key.removeprefix("array_shape_observed_by_kind."), value)
+                    for key, value in counter_totals.items()
+                    if key.startswith("array_shape_observed_by_kind.")
                 )
             )
         ),
@@ -443,6 +478,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
             summary["frame_reuse_blocked_by_reason"],
         )
     )
+    lines.extend(render_counter_table("Array Shape Fast Paths", summary["array_shape_counters"]))
+    lines.extend(
+        render_counter_table(
+            "Array Shapes Observed",
+            summary["array_shape_observed_by_kind"],
+        )
+    )
 
     framework = summary.get("framework_smoke")
     lines.extend(["## Framework Micro-Smokes", ""])
@@ -571,6 +613,14 @@ def run_self_test() -> int:
                     "quickening_guard_hits": 3,
                     "inline_cache_hits": 4,
                     "inline_cache_misses": 1,
+                    "array_shape_observed_by_kind": {
+                        "shape_stable_record_like": 2,
+                        "small_inline_map": 1,
+                    },
+                    "record_shape_hits": 5,
+                    "record_shape_misses": 1,
+                    "small_map_hits": 2,
+                    "key_coercion_fallbacks": 1,
                 },
             }
         ],
@@ -588,6 +638,9 @@ def run_self_test() -> int:
     assert "performance Performance Report" in markdown
     assert "performance.perf_smoke.rust-vm.loop" in markdown
     assert "Cache Hits and Misses" in markdown
+    assert "Array Shape Fast Paths" in markdown
+    assert summary["array_shape_observed_by_kind"]["shape_stable_record_like"] == 2
+    assert summary["array_shape_counters"]["record_shape_hits"] == 5
     assert summary["cache_counters"]["cache_hits"] == 2
 
     missing = summarize_report(

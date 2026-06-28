@@ -33,6 +33,13 @@ both the total side-exit count and a per-reason JSON map. The compact
 `php-vm run --jit-stats=json` payload exposes the same per-reason map as
 `side_exit_reasons`.
 
+FPE-16 adds VM-owned report-only deoptimization metadata in `php_vm::deopt`.
+`VmDeoptReason` keeps the Cranelift reason codes above as its code 1 through 7
+prefix, then extends the VM-level model with call-frame, reference/COW,
+foreach, pending-finally, generator/fiber, output-buffer, and unsupported
+control-flow reasons. Future optimized tiers should consume or extend the
+VM-owned metadata instead of inventing tier-specific resume records.
+
 ## Resume Point Reporting
 
 `JitSideExit` carries optional `resume_block` and `resume_instruction` values

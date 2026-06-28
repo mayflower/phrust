@@ -57,26 +57,37 @@ default or handle general PHP code:
 | Generators and fibers | No native entry or resume until suspended VM state and native live state can be represented without losing identity. |
 | Diagnostics and output | Stderr/runtime diagnostics, warning order, output buffering, callbacks, and conversion errors must match interpreter order. |
 
-## Prototype Decision
+## No-Exec Stencil Prototype
 
-No new Rust prototype is added in Phase 09.15. A no-exec textual backend is
-low-risk only if it reuses an existing backend abstraction without implying an
-execution policy. The repository already has that shape in the Cranelift
-addendum: the backend can emit deterministic diagnostics, CLIF descriptors, ABI
-hashes, guard reports, and non-default reports without enabling default native
-execution.
+FPE-15 adds a no-exec baseline-native stencil report that reuses the normal
+frontend and dense bytecode lowerer:
 
-A future baseline-native prototype should start with a separate ADR and write
-only local artifacts under:
+```bash
+php-vm dump-baseline-native-stencil <file.php> --json
+```
+
+The command emits deterministic planning data only. It records instruction
+counts, helper-call estimates, required deopt slots, compile-cost units,
+estimated code size, opcode counts, and unsupported reasons. It explicitly
+reports `native_execution: false` and `executable_memory: false`, and it does
+not add a runtime switch or machine-code path.
+
+The focused smoke gate writes local artifacts under:
 
 ```text
 target/performance/baseline-native/
 ```
 
-The first acceptable prototype should be non-executing and should emit a
-deterministic stencil descriptor for one verified dense-bytecode sequence, for
-example `load_const`, `binary add`, `echo`, and `return`. It must also emit the
-required deopt slots even if they are all marked unsupported.
+or, for the FPE-15 report-only implementation:
+
+```text
+target/performance/baseline-native-stencil/
+```
+
+The current prototype is intentionally conservative. It treats scalar
+load/store/control-flow bytecodes as stencilable, estimates helper/deopt slots
+for PHP-semantic scalar operations, and marks calls, arrays, and foreach state
+unsupported until VM-owned live-state and deopt metadata exists.
 
 ## Handoff
 

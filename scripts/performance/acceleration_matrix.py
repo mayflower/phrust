@@ -52,6 +52,7 @@ class Variant:
     flags: tuple[str, ...]
     optional: bool = False
     strict_bytecode_subset: bool = False
+    persistent_feedback: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=os.getenv("PHRUST_ACCEL_MATRIX_JIT") == "1",
         help="Include the optional feature-gated Cranelift row.",
+    )
+    parser.add_argument(
+        "--include-persistent-feedback",
+        action="store_true",
+        default=os.getenv("PHRUST_ACCEL_MATRIX_PERSISTENT_FEEDBACK") == "1",
+        help="Include the optional default-off persistent-feedback advisory row.",
     )
     return parser.parse_args()
 
@@ -195,6 +202,21 @@ def variants(args: argparse.Namespace) -> tuple[Variant, list[Variant]]:
         ),
         Variant("fast-preset", engine, ("--engine-preset=fast",)),
         Variant(
+            "persistent-feedback-advisory",
+            engine,
+            (
+                "--exec-format=auto",
+                "--opt-level=2",
+                "--superinstructions=off",
+                "--quickening=on",
+                "--inline-caches=on",
+                "--bytecode-cache=off",
+                "--jit=off",
+            ),
+            optional=True,
+            persistent_feedback=True,
+        ),
+        Variant(
             "release-all-non-jit",
             release_engine,
             (
@@ -226,6 +248,8 @@ def variants(args: argparse.Namespace) -> tuple[Variant, list[Variant]]:
                 optional=True,
             )
         )
+    if not args.include_persistent_feedback:
+        rows = [row for row in rows if not row.persistent_feedback]
     return baseline, rows
 
 
@@ -257,10 +281,19 @@ def run_once(
     run_dir = out_dir / "runs" / stem / variant.label
     run_dir.mkdir(parents=True, exist_ok=True)
     counters_path = run_dir / f"iter-{iteration}.counters.json"
+    feedback_args: list[str] = []
+    if variant.persistent_feedback:
+        feedback_args = [
+            "--persistent-feedback-read",
+            str(run_dir / "advisory-feedback.pff"),
+            "--persistent-feedback-stats-json",
+            str(run_dir / f"iter-{iteration}.persistent-feedback.json"),
+        ]
     command = [
         str(variant.engine),
         "run",
         *variant.flags,
+        *feedback_args,
         "--counters-json",
         str(counters_path),
         rel(fixture),
@@ -509,6 +542,7 @@ def main() -> int:
         "enabled_row_count": enabled,
         "skipped_row_count": skipped,
         "include_jit": args.include_jit,
+        "include_persistent_feedback": args.include_persistent_feedback,
         "rows": rows,
     }
     json_path = out_dir / "summary.json"
@@ -522,6 +556,8 @@ def main() -> int:
     )
     if not args.include_jit:
         print("[skip] acceleration matrix JIT row: feature/platform not requested")
+    if not args.include_persistent_feedback:
+        print("[skip] acceleration matrix persistent-feedback row: default-off policy")
     return 0
 
 

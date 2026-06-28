@@ -10,6 +10,7 @@ mod result;
 pub use options::{ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions};
 pub use result::{VmControlFlow, VmResult};
 
+use crate::aliasing::{AliasState, slot_alias_state};
 use crate::bytecode::{
     DenseBytecodeUnit, DenseCallArg, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
     DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
@@ -45,6 +46,7 @@ use php_ir::operand::Operand;
 use php_ir::source_map::IrSpan;
 use php_ir::verify::verify_unit;
 use php_runtime::IniRegistry;
+use php_runtime::numeric_string::{NumericStringKind, NumericStringValue, classify_php_string};
 use php_runtime::{
     ArrayKey, AttributeEntry as RuntimeAttributeEntry, AutoloadRegistry, BuiltinContext,
     BuiltinEntry, BuiltinRegistry, CallableMethodTarget, CallableValue,
@@ -58,9 +60,10 @@ use php_runtime::{
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureContext,
     ClosureDebugInfo, ClosurePayload, ExecutionStatus, FiberRef, FiberState, GcEntityId,
     GcEntityKind, GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef,
-    OutputBuffer, PhpArray, PhpArrayKind, PhpString, ProcessCapability, ReferenceCell,
-    RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity,
-    RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, Value, compare, division_by_zero_mvp,
+    OutputBuffer, PhpArray, PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup,
+    PhpArrayShapeLookupFallback, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
+    RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan,
+    RuntimeStackFrame, RuntimeType, Slot, Value, compare, division_by_zero_mvp,
     emit_php_diagnostic, equal, error_reporting_allows_level, identical,
     reset_float_string_precision, runtime_type_name, set_float_string_precision,
     to_arithmetic_number, to_bool, to_float, to_int, to_number, to_string, undefined_function,
@@ -1973,12 +1976,13 @@ impl Vm {
         }
     }
 
-    fn record_counter_frame_activation(&self, reused: bool) {
+    fn record_counter_frame_activation(&self, reused: bool, register_count: u32, local_count: u32) {
         if !self.options.collect_counters {
             return;
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_frame_activation(reused);
+            counters.record_frame_activation(reused, register_count, local_count);
+            counters.record_alias_state(AliasState::NoReferencesObserved);
         }
     }
 
@@ -1988,6 +1992,42 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_frame_reuse_blocked(reason);
+        }
+    }
+
+    fn record_counter_alias_state(&self, state: AliasState) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_alias_state(state);
+        }
+    }
+
+    fn record_counter_alias_state_transition(&self, from: AliasState, to: AliasState) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_alias_state_transition(from, to);
+        }
+    }
+
+    fn record_counter_fast_path_disabled_by_reference(&self, state: AliasState) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_fast_path_disabled_by_reference(state);
+        }
+    }
+
+    fn record_counter_dequickened_by_reference(&self, state: AliasState) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dequickened_by_reference(state);
         }
     }
 
@@ -3255,6 +3295,110 @@ impl Vm {
         }
     }
 
+    fn record_counter_array_shape_observed(&self, array: &PhpArray) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_shape_observed(array.shape_metadata().kind);
+        }
+    }
+
+    fn record_counter_record_shape_lookup(&self, lookup: &PhpArrayShapeLookup<'_>) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            match lookup {
+                PhpArrayShapeLookup::Hit(_) => counters.record_record_shape_lookup_hit(),
+                PhpArrayShapeLookup::Miss => counters.record_record_shape_lookup_miss(),
+                PhpArrayShapeLookup::Fallback(fallback) => {
+                    counters.record_array_shape_lookup_fallback(*fallback);
+                }
+            }
+        }
+    }
+
+    fn record_counter_small_map_lookup(&self, lookup: &PhpArrayShapeLookup<'_>) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            match lookup {
+                PhpArrayShapeLookup::Hit(_) => counters.record_small_map_lookup_hit(),
+                PhpArrayShapeLookup::Miss => counters.record_small_map_lookup_miss(),
+                PhpArrayShapeLookup::Fallback(fallback) => {
+                    counters.record_array_shape_lookup_fallback(*fallback);
+                }
+            }
+        }
+    }
+
+    fn record_counter_array_shape_lookup_fallback(&self, fallback: PhpArrayShapeLookupFallback) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_shape_lookup_fallback(fallback);
+        }
+    }
+
+    fn try_array_shape_lookup(&self, array: &PhpArray, key: &ArrayKey) -> Option<Option<Value>> {
+        let metadata = array.shape_metadata();
+        self.record_counter_array_shape_observed(array);
+        if metadata.numeric_string_key_ambiguity {
+            self.record_counter_array_shape_lookup_fallback(
+                PhpArrayShapeLookupFallback::KeyCoercion,
+            );
+            return None;
+        }
+        match metadata.kind {
+            PhpArrayShapeKind::InternedStringKeyRecord
+            | PhpArrayShapeKind::ShapeStableRecordLike => {
+                let lookup = array.record_shape_string_key_lookup(key);
+                self.record_counter_record_shape_lookup(&lookup);
+                match lookup {
+                    PhpArrayShapeLookup::Hit(value) => Some(Some(effective_value(value))),
+                    PhpArrayShapeLookup::Miss => Some(None),
+                    PhpArrayShapeLookup::Fallback(_) => None,
+                }
+            }
+            PhpArrayShapeKind::SmallInlineMap => {
+                let lookup = array.small_map_lookup(key);
+                self.record_counter_small_map_lookup(&lookup);
+                match lookup {
+                    PhpArrayShapeLookup::Hit(value) => Some(Some(effective_value(value))),
+                    PhpArrayShapeLookup::Miss => Some(None),
+                    PhpArrayShapeLookup::Fallback(_) => None,
+                }
+            }
+            PhpArrayShapeKind::CowOrReferenceFallback => {
+                self.record_counter_array_shape_lookup_fallback(
+                    PhpArrayShapeLookupFallback::CowOrReference,
+                );
+                None
+            }
+            PhpArrayShapeKind::PackedWithHoles | PhpArrayShapeKind::MixedHash => {
+                self.record_counter_array_shape_lookup_fallback(
+                    PhpArrayShapeLookupFallback::OrderSemantics,
+                );
+                None
+            }
+            PhpArrayShapeKind::Empty
+            | PhpArrayShapeKind::Packed
+            | PhpArrayShapeKind::SharedImmutableLiteralArray => None,
+        }
+    }
+
+    fn record_counter_numeric_string_specialization_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_numeric_string_specialization_hit();
+        }
+    }
+
     fn record_array_count_fast_path_if_applicable(&self, name: &str, values: &[Value]) {
         if name != "count" {
             return;
@@ -3867,6 +4011,9 @@ impl Vm {
                 (Value::Array(array), Value::Int(index)) if *index >= 0 => {
                     let metadata = array.packed_metadata();
                     if metadata.contains_references {
+                        self.record_counter_dequickened_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
                         self.record_quickened_packed_dim_guard(
                             function_id,
                             block_id,
@@ -3920,6 +4067,9 @@ impl Vm {
                     );
                     let metadata = array.packed_metadata();
                     if metadata.contains_references {
+                        self.record_counter_dequickened_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
                         self.record_counter_cow_or_reference_fallback();
                     } else if metadata.numeric_string_key_ambiguity
                         || value_is_numeric_string_key_ambiguity(key)
@@ -4909,7 +5059,11 @@ impl Vm {
             dense_function.local_count,
             FrameActivationContext::default(),
         );
-        self.record_counter_frame_activation(reused_frame);
+        self.record_counter_frame_activation(
+            reused_frame,
+            dense_function.register_count,
+            dense_function.local_count,
+        );
         if ir_function.flags.is_top_level {
             bind_top_level_global_locals(ir_function, stack, state);
         }
@@ -6822,7 +6976,11 @@ impl Vm {
                     activation_context,
                 )
             };
-            self.record_counter_frame_activation(reused_frame);
+            self.record_counter_frame_activation(
+                reused_frame,
+                function.register_count,
+                function.local_count,
+            );
             {
                 let frame = stack.current_mut().expect("frame was pushed");
                 frame.arguments = args.iter().map(|arg| arg.value.clone()).collect();
@@ -6832,6 +6990,13 @@ impl Vm {
                 let result = self.runtime_error(output, compiled, stack, message);
                 stack.pop_recycle();
                 return result;
+            }
+            if function.captures.iter().any(|capture| capture.by_ref) {
+                self.record_counter_alias_state_transition(
+                    AliasState::NoReferencesObserved,
+                    AliasState::EscapedReference,
+                );
+                self.record_counter_fast_path_disabled_by_reference(AliasState::EscapedReference);
             }
             if let Some(this_value) = call.this_value
                 && let Err(message) = initialize_this(function, this_value, stack)
@@ -6844,6 +7009,7 @@ impl Vm {
                 import_shared_locals(function, stack, shared);
             } else if function.flags.is_top_level {
                 bind_top_level_global_locals(function, stack, state);
+                self.record_counter_alias_state(AliasState::GlobalOrSuperglobalReference);
             }
             for (arg_index, (param, mut arg)) in function.params.iter().zip(args).enumerate() {
                 if let Err(message) = coerce_or_check_param_type(
@@ -6870,6 +7036,13 @@ impl Vm {
                 let locals = &mut stack.current_mut().expect("frame was pushed").locals;
                 let result = if param.by_ref {
                     if let Some(reference) = arg.reference {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::EscapedReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::EscapedReference,
+                        );
                         locals.bind_reference_cell(param.local, reference)
                     } else {
                         locals.set(param.local, arg.value)
@@ -6881,6 +7054,9 @@ impl Vm {
                     let result = self.runtime_error(output, compiled, stack, message);
                     stack.pop_recycle();
                     return result;
+                }
+                if param.by_ref {
+                    self.record_counter_alias_state(local_alias_state(stack, param.local));
                 }
             }
             block_id = BlockId::new(0);
@@ -7441,6 +7617,13 @@ impl Vm {
                         }
                     }
                     InstructionKind::BindReference { target, source } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::LocalOnlyReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::LocalOnlyReference,
+                        );
                         self.record_counter_local_slot_fast_path(
                             local_slot_is_in_bounds(stack, *target)
                                 && local_slot_is_in_bounds(stack, *source),
@@ -7455,6 +7638,13 @@ impl Vm {
                         }
                     }
                     InstructionKind::BindGlobal { local, name } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::GlobalOrSuperglobalReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::GlobalOrSuperglobalReference,
+                        );
                         let cell = state.globals.ensure_slot(name.clone(), Value::Null);
                         self.record_counter_local_slot_fast_path(false);
                         if let Err(message) = stack
@@ -7472,6 +7662,13 @@ impl Vm {
                         append,
                         source,
                     } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
                         let dims = match read_dim_operands(unit, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
@@ -7498,6 +7695,7 @@ impl Vm {
                         {
                             return self.runtime_error(output, compiled, stack, message);
                         }
+                        self.record_counter_alias_state(local_alias_state(stack, *local));
                         self.record_lvalue_trace_event(
                             if *append {
                                 "bind-reference-dim-append"
@@ -7513,6 +7711,13 @@ impl Vm {
                         local,
                         dims,
                     } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
                         let dims = match read_dim_operands(unit, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
@@ -7533,6 +7738,7 @@ impl Vm {
                         {
                             return self.runtime_error(output, compiled, stack, message);
                         }
+                        self.record_counter_alias_state(local_alias_state(stack, *target));
                         self.record_lvalue_trace_event("bind-reference-from-dim", *local, &dims);
                     }
                     InstructionKind::InitStaticLocal {
@@ -7540,6 +7746,13 @@ impl Vm {
                         name,
                         default,
                     } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::EscapedReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::EscapedReference,
+                        );
                         let key = (function_id.raw(), name.clone());
                         let cell = if let Some(cell) = state.static_locals.get(&key) {
                             cell.clone()
@@ -7562,8 +7775,16 @@ impl Vm {
                         {
                             return self.runtime_error(output, compiled, stack, message);
                         }
+                        self.record_counter_alias_state(local_alias_state(stack, *local));
                     }
                     InstructionKind::BindReferenceFromCall { target, name, args } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::EscapedReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::EscapedReference,
+                        );
                         let values = match read_call_args(unit, stack, args) {
                             Ok(values) => values,
                             Err(message) => {
@@ -7610,6 +7831,7 @@ impl Vm {
                         {
                             return self.runtime_error(output, compiled, stack, message);
                         }
+                        self.record_counter_alias_state(local_alias_state(stack, *target));
                     }
                     InstructionKind::EnterTry {
                         catch,
@@ -12279,6 +12501,34 @@ impl Vm {
                                                 }
                                             }
                                         }
+                                    } else if let Value::Array(array_value) = &base {
+                                        match self.try_array_shape_lookup(array_value, &key) {
+                                            Some(Some(value)) => value,
+                                            Some(None) if *quiet => Value::Null,
+                                            Some(None) => {
+                                                diagnostics.push(undefined_array_key_warning(
+                                                    &key,
+                                                    stack_trace(compiled, stack),
+                                                ));
+                                                Value::Null
+                                            }
+                                            None => match fetch_dim_value(&array, &key) {
+                                                Ok(Some(value)) => value,
+                                                Ok(None) if *quiet => Value::Null,
+                                                Ok(None) => {
+                                                    diagnostics.push(undefined_array_key_warning(
+                                                        &key,
+                                                        stack_trace(compiled, stack),
+                                                    ));
+                                                    Value::Null
+                                                }
+                                                Err(message) => {
+                                                    return self.runtime_error(
+                                                        output, compiled, stack, message,
+                                                    );
+                                                }
+                                            },
+                                        }
                                     } else {
                                         match fetch_dim_value(&array, &key) {
                                             Ok(Some(value)) => value,
@@ -12543,8 +12793,24 @@ impl Vm {
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
                             stack, *local,
                         ));
-                        let value = read_local_value(stack, *local)
-                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten());
+                        let local_value = read_local_value(stack, *local);
+                        let value = if let (Some(base_value), [key]) =
+                            (local_value.as_ref(), dims.as_slice())
+                        {
+                            let base = effective_value(base_value);
+                            if let Value::Array(array) = &base {
+                                match self.try_array_shape_lookup(array, key) {
+                                    Some(value) => value,
+                                    None => fetch_dim_path_value(base_value, &dims).ok().flatten(),
+                                }
+                            } else {
+                                fetch_dim_path_value(base_value, &dims).ok().flatten()
+                            }
+                        } else {
+                            local_value.and_then(|value| {
+                                fetch_dim_path_value(&value, &dims).ok().flatten()
+                            })
+                        };
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -12823,6 +13089,13 @@ impl Vm {
                         }
                     }
                     InstructionKind::ForeachInitRef { iterator, local } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
                             stack, *local,
                         ));
@@ -12948,6 +13221,7 @@ impl Vm {
                         if let Err(message) = frame.locals.bind_reference_cell(*value_local, cell) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
+                        self.record_counter_alias_state(AliasState::PropertyOrArrayDimReference);
                     }
                     InstructionKind::Echo { src } => {
                         let value = match read_operand(unit, stack, *src) {
@@ -15122,6 +15396,13 @@ impl Vm {
                         }
                     };
                     let return_ref = if function.returns_by_ref {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::EscapedReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::EscapedReference,
+                        );
                         let Some(local) = by_ref_local else {
                             return self.runtime_error(
                                 output,
@@ -20963,6 +21244,11 @@ impl Vm {
                         source_span,
                     ));
                 }
+                if let Some(value) = self
+                    .execute_numeric_string_int_binary(compiled, op, lhs, rhs, output, stack, state)
+                {
+                    return value;
+                }
                 let lhs = to_arithmetic_number(lhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 let rhs = to_arithmetic_number(rhs)
@@ -20997,6 +21283,70 @@ impl Vm {
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))
             }
         }
+    }
+
+    fn execute_numeric_string_int_binary(
+        &self,
+        compiled: &CompiledUnit,
+        op: BinaryOp,
+        lhs: &Value,
+        rhs: &Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<Result<Value, VmResult>> {
+        let lhs = effective_value(lhs);
+        let rhs = effective_value(rhs);
+        let (string, int, string_is_lhs) = match (&lhs, &rhs) {
+            (Value::String(string), Value::Int(int)) => (string, *int, true),
+            (Value::Int(int), Value::String(string)) => (string, *int, false),
+            _ => return None,
+        };
+
+        let classified = classify_php_string(string);
+        let Some(value) = classified.value else {
+            return Some(Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number"
+                    .to_owned(),
+            )));
+        };
+        if classified.kind == NumericStringKind::LeadingNumeric {
+            write_non_numeric_value_warning(output, state);
+        }
+
+        let string_number = match value {
+            NumericStringValue::Int(value) => NumericValue::Int(value),
+            NumericStringValue::Float(value) => NumericValue::Float(value),
+        };
+        let (lhs_number, rhs_number) = if string_is_lhs {
+            (string_number, NumericValue::Int(int))
+        } else {
+            (NumericValue::Int(int), string_number)
+        };
+
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+            && classified.kind == NumericStringKind::IntString
+            && !classified.overflow_or_precision_sensitive
+            && let NumericStringValue::Int(string_int) = value
+        {
+            let (left, right) = if string_is_lhs {
+                (string_int, int)
+            } else {
+                (int, string_int)
+            };
+            if let Some(result) = checked_int_binary(op, left, right) {
+                self.record_counter_numeric_string_specialization_hit();
+                return Some(Ok(Value::Int(result)));
+            }
+        }
+
+        Some(
+            execute_arithmetic(op, lhs_number, rhs_number)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+        )
     }
 
     fn execute_cast(
@@ -32560,7 +32910,7 @@ fn emit_vm_diagnostic_with_options(
     leading_newline: bool,
 ) -> bool {
     let mut options = diagnostic_display_options(state);
-    options.leading_newline = leading_newline && !output.is_empty();
+    options.leading_newline = leading_newline;
     emit_php_diagnostic(output, diagnostic, channel, level, options)
 }
 
@@ -34283,14 +34633,7 @@ fn value_is_numeric_string_key_ambiguity(value: &Value) -> bool {
     let Value::String(string) = effective_value(value) else {
         return false;
     };
-    let Some(first) = string.as_bytes().first() else {
-        return false;
-    };
-    (first.is_ascii_digit() || matches!(first, b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r'))
-        && matches!(
-            ArrayKey::from_php_string(string.clone()),
-            ArrayKey::String(_)
-        )
+    php_runtime::numeric_string::array_key_has_numeric_string_ambiguity(&string)
 }
 
 fn value_needs_vm_string_coercion(compiled: &CompiledUnit, value: &Value) -> bool {
@@ -35580,6 +35923,14 @@ fn local_slot_is_in_bounds(stack: &CallStack, local: LocalId) -> bool {
     stack
         .current()
         .is_some_and(|frame| frame.locals.contains(local))
+}
+
+fn local_alias_state(stack: &CallStack, local: LocalId) -> AliasState {
+    stack
+        .current()
+        .and_then(|frame| frame.locals.get_slot(local))
+        .map(slot_alias_state)
+        .unwrap_or(AliasState::UnknownAliasing)
 }
 
 fn local_array_is_packed_fast(stack: &CallStack, local: LocalId) -> bool {
@@ -37644,9 +37995,27 @@ fn dense_bytecode_unsupported_reason(message: &str) -> &'static str {
         "verifier"
     } else if message.contains("ENTRY") {
         "entry"
+    } else if dense_bytecode_reference_aliasing_message(message) {
+        "reference_aliasing"
     } else {
         "instruction_subset"
     }
+}
+
+fn dense_bytecode_reference_aliasing_message(message: &str) -> bool {
+    message.contains("BindReference")
+        || message.contains("BindGlobal")
+        || message.contains("BindReferenceDim")
+        || message.contains("BindReferenceFromDim")
+        || message.contains("BindReferenceFromCall")
+        || message.contains("ForeachInitRef")
+        || message.contains("ForeachNextRef")
+        || message.contains("reference/COW")
+        || message.contains("reference_cow")
+        || message.contains("cow_or_reference")
+        || message.contains("by-reference")
+        || message.contains("by reference")
+        || message.contains("COW")
 }
 
 fn int_int_specialization_for_binary_op(op: BinaryOp) -> Option<QuickeningSpecialization> {
@@ -44036,6 +44405,106 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn array_shape_observers_record_record_small_map_and_fallbacks() {
+        let record_source = "<?php
+            $route = ['id' => 42, 'slug' => 'post'];
+            $config = ['name' => 'app', 'env' => 'test'];
+            $json = ['id' => 7, 'name' => 'Ada'];
+            $row = ['id' => 3, 'email' => 'a@example.test'];
+            echo isset($route['id']) ? $route['id'] : 0;
+            echo '|', $config['name'], '|', $json['name'], '|', $row['email'];
+            echo '|', isset($route['missing']) ? 'yes' : 'no';
+        ";
+        let record = execute_source_with_options(
+            record_source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        assert!(record.status.is_success(), "{:?}", record.status);
+        assert_eq!(record.output.as_bytes(), b"42|app|Ada|a@example.test|no");
+        let counters = record.counters.expect("record counters");
+        let record_observations = counters
+            .array_shape_observed_by_kind
+            .get("shape_stable_record_like")
+            .copied()
+            .unwrap_or_default()
+            + counters
+                .array_shape_observed_by_kind
+                .get("interned_string_key_record")
+                .copied()
+                .unwrap_or_default();
+        assert!(record_observations > 0, "{counters:?}");
+        assert!(counters.record_shape_hits >= 4, "{counters:?}");
+        assert!(counters.record_shape_misses >= 1, "{counters:?}");
+
+        let small_map_source = "<?php
+            $mixed = [1 => 'one', 'name' => 'two'];
+            echo $mixed['name'], '|', isset($mixed[1]) ? $mixed[1] : 'missing';
+        ";
+        let small = execute_source_with_options(
+            small_map_source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        assert!(small.status.is_success(), "{:?}", small.status);
+        assert_eq!(small.output.as_bytes(), b"two|one");
+        let counters = small.counters.expect("small counters");
+        assert!(
+            counters
+                .array_shape_observed_by_kind
+                .get("small_inline_map")
+                .copied()
+                .unwrap_or_default()
+                > 0,
+            "{counters:?}"
+        );
+        assert!(counters.small_map_hits >= 2, "{counters:?}");
+
+        let fallback_source = "<?php
+            $numeric = ['01' => 'leading'];
+            echo $numeric['01'];
+            $order = [0 => 'a', 2 => 'b'];
+            echo '|', $order[2];
+            $unset = ['id' => 1, 'name' => 2];
+            unset($unset['id']);
+            $unset['id'] = 3;
+            echo '|', $unset['id'];
+            $cow = ['id' => 4];
+            $copy = $cow;
+            echo '|', $copy['id'];
+            $ref = ['id' => 5];
+            $alias =& $ref['id'];
+            echo '|', $ref['id'];
+        ";
+        let fallback = execute_source_with_options(
+            fallback_source,
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        assert!(fallback.status.is_success(), "{:?}", fallback.status);
+        assert_eq!(fallback.output.as_bytes(), b"leading|b|3|4|5");
+        let counters = fallback.counters.expect("fallback counters");
+        assert!(counters.key_coercion_fallbacks >= 1, "{counters:?}");
+        assert!(counters.order_semantics_fallbacks >= 1, "{counters:?}");
+        assert!(counters.cow_or_reference_fallbacks >= 1, "{counters:?}");
+        assert!(
+            counters
+                .array_shape_observed_by_kind
+                .get("cow_or_reference_fallback")
+                .copied()
+                .unwrap_or_default()
+                > 0,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
     fn array_fast_paths_record_packed_to_mixed_transitions() {
         let source = "<?php
             $nonseq = [1, 2];
@@ -44139,8 +44608,17 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"516|42|4");
         let counters = result.counters.expect("counters");
+        assert!(counters.numeric_string_classify_calls > 0, "{counters:?}");
         assert!(counters.numeric_string_cache_hits > 0, "{counters:?}");
         assert!(counters.numeric_string_cache_misses > 0, "{counters:?}");
+        assert!(
+            counters.numeric_string_specialization_hits > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters.numeric_string_overflow_precision_fallbacks > 0,
+            "{counters:?}"
+        );
         assert!(
             counters.numeric_string_cache_hits > counters.numeric_string_cache_misses,
             "{counters:?}"
@@ -44164,8 +44642,13 @@ echo perf_jit_unstable_types_debug(4), "\n";
             Some("E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number")
         );
         let counters = result.counters.expect("counters");
+        assert_eq!(counters.numeric_string_classify_calls, 1, "{counters:?}");
         assert_eq!(counters.numeric_string_cache_misses, 1, "{counters:?}");
         assert_eq!(counters.numeric_string_cache_hits, 0, "{counters:?}");
+        assert_eq!(
+            counters.numeric_string_specialization_hits, 0,
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -44280,6 +44763,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
             counters.frame_allocations
         );
         assert_eq!(counters.register_files_reused, counters.frame_reuses);
+        assert_eq!(
+            counters.request_arena_allocations,
+            counters.frames_allocated
+        );
+        assert!(counters.request_arena_bytes > 0, "{counters:?}");
+        assert_eq!(counters.request_pool_resets, counters.frames_reused);
+        assert_eq!(counters.persistent_engine_allocations, 0);
+        assert_eq!(counters.persistent_engine_bytes, 0);
     }
 
     #[test]
@@ -44386,6 +44877,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
             Some(&1),
             "{counters:?}"
         );
+        assert_eq!(
+            counters
+                .arena_fallback_allocations_by_reason
+                .get("destructor_sensitive_value"),
+            Some(&1),
+            "{counters:?}"
+        );
+        assert_eq!(counters.destructor_sensitive_arena_blocks, 1);
     }
 
     #[test]
@@ -44540,6 +45039,111 @@ echo perf_jit_unstable_types_debug(4), "\n";
             "{:?}",
             undefined_source.diagnostics
         );
+    }
+
+    #[test]
+    fn alias_counters_identify_no_reference_hot_path() {
+        let result = execute_source_with_options(
+            "<?php function sum_plain($n) { $s = 0; for ($i = 0; $i < $n; $i++) { $s = $s + $i; } return $s; } echo sum_plain(12);",
+            VmOptions {
+                collect_counters: true,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"66");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters
+                .frame_alias_state
+                .get("no_references_observed")
+                .is_some_and(|count| *count >= 1),
+            "{counters:?}"
+        );
+        assert_eq!(counters.fast_path_disabled_by_reference, 0, "{counters:?}");
+    }
+
+    #[test]
+    fn alias_counters_classify_reference_fixture_cases() {
+        let cases = [
+            (
+                "local-only",
+                "<?php $a = 1; $b =& $a; $b = 2; echo $a;",
+                b"2".as_slice(),
+                "local_only_reference",
+            ),
+            (
+                "by-ref-param",
+                "<?php function bump_alias(&$x) { $x = $x + 1; } $v = 1; bump_alias($v); echo $v;",
+                b"2".as_slice(),
+                "escaped_reference",
+            ),
+            (
+                "by-ref-return",
+                "<?php function &ret_alias(&$x) { return $x; } $v = 1; $r =& ret_alias($v); $r = 3; echo $v;",
+                b"3".as_slice(),
+                "escaped_reference",
+            ),
+            (
+                "array-element",
+                "<?php $a = []; $v = 1; $a['k'] =& $v; $v = 4; echo $a['k'];",
+                b"4".as_slice(),
+                "property_or_array_dim_reference",
+            ),
+            (
+                "global",
+                "<?php $g = 1; function set_global_alias() { global $g; $g = 5; } set_global_alias(); echo $g;",
+                b"5".as_slice(),
+                "global_or_superglobal_reference",
+            ),
+            (
+                "unset-rebind",
+                "<?php $a = 1; $b =& $a; unset($a); $c = 2; $b =& $c; $b = 6; echo isset($a) ? 'bad' : 'unset', '|', $c;",
+                b"unset|6".as_slice(),
+                "local_only_reference",
+            ),
+            (
+                "foreach-by-ref",
+                "<?php $a = [1, 2]; foreach ($a as &$v) { $v = $v + 1; } unset($v); echo $a[0], $a[1];",
+                b"23".as_slice(),
+                "property_or_array_dim_reference",
+            ),
+            (
+                "closure-escape",
+                "<?php $x = 1; $f = function () use (&$x) { $x = 7; }; $f(); echo $x;",
+                b"7".as_slice(),
+                "escaped_reference",
+            ),
+        ];
+
+        for (name, source, output, expected_state) in cases {
+            let result = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    quickening: QuickeningMode::On,
+                    inline_caches: InlineCacheMode::On,
+                    ..VmOptions::default()
+                },
+            );
+
+            assert!(result.status.is_success(), "{name}: {:?}", result.status);
+            assert_eq!(result.output.as_bytes(), output, "{name}");
+            let counters = result.counters.expect("counters");
+            assert!(
+                counters
+                    .frame_alias_state
+                    .get(expected_state)
+                    .is_some_and(|count| *count >= 1),
+                "{name}: {counters:?}"
+            );
+            assert!(
+                counters.fast_path_disabled_by_reference >= 1,
+                "{name}: {counters:?}"
+            );
+        }
     }
 
     #[test]
@@ -46730,7 +47334,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "Notice: Only variables should be passed by reference in <unknown> on line 0\nint(1)\n"
+            "\nNotice: Only variables should be passed by reference in <unknown> on line 0\nint(1)\n"
         );
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.id() == "E_PHP_VM_BY_REF_ARG_INDIRECT_TEMPORARY_NOTICE"
@@ -47136,7 +47740,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
         );
         assert_eq!(
             leading_numeric.output.to_string_lossy(),
-            "Warning: A non-numeric value encountered in <unknown> on line 0\nint(3)\n"
+            "\nWarning: A non-numeric value encountered in <unknown> on line 0\nint(3)\n"
         );
         assert_eq!(
             leading_numeric.diagnostics[0].id(),

@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use php_ir::instruction::{BinaryOp, InstructionKind};
-use php_runtime::OutputStats;
+use php_runtime::{OutputStats, PhpArrayShapeKind, PhpArrayShapeLookupFallback, Slot, TempValue};
 
+use crate::aliasing::{AliasState, alias_transition_key};
 use crate::inline_cache::POLYMORPHIC_INLINE_CACHE_LIMIT;
 use crate::{InlineCacheKind, InlineCacheObservation};
 
@@ -128,6 +129,19 @@ pub struct VmCounters {
     pub register_files_allocated: u64,
     pub register_files_reused: u64,
     pub frame_reuse_blocked_by_reason: BTreeMap<String, u64>,
+    pub frame_alias_state: BTreeMap<String, u64>,
+    pub alias_state_transitions: BTreeMap<String, u64>,
+    pub fast_path_disabled_by_reference: u64,
+    pub dequickened_by_reference: u64,
+    pub ic_invalidated_by_reference: u64,
+    pub dense_bytecode_fallback_by_reference: u64,
+    pub request_arena_allocations: u64,
+    pub request_arena_bytes: u64,
+    pub request_pool_resets: u64,
+    pub persistent_engine_allocations: u64,
+    pub persistent_engine_bytes: u64,
+    pub arena_fallback_allocations_by_reason: BTreeMap<String, u64>,
+    pub destructor_sensitive_arena_blocks: u64,
     pub value_clones: u64,
     pub string_allocations: u64,
     pub array_handle_clones: u64,
@@ -142,13 +156,24 @@ pub struct VmCounters {
     pub array_sequential_foreach_fast_path_hits: u64,
     pub array_fast_path_hits_by_family: BTreeMap<String, u64>,
     pub array_fast_path_fallback_by_reason: BTreeMap<String, u64>,
+    pub array_shape_observed_by_kind: BTreeMap<String, u64>,
+    pub record_shape_hits: u64,
+    pub record_shape_misses: u64,
+    pub small_map_hits: u64,
+    pub small_map_misses: u64,
+    pub key_coercion_fallbacks: u64,
+    pub order_semantics_fallbacks: u64,
     pub packed_append_fast_hits: u64,
     pub packed_foreach_fast_hits: u64,
     pub cow_or_reference_fallbacks: u64,
     pub array_count_fast_path_hits: u64,
     pub array_packed_to_mixed_transitions: u64,
+    pub numeric_string_classify_calls: u64,
     pub numeric_string_cache_hits: u64,
     pub numeric_string_cache_misses: u64,
+    pub numeric_string_specialization_hits: u64,
+    pub numeric_string_warning_sensitive_fallbacks: u64,
+    pub numeric_string_overflow_precision_fallbacks: u64,
     pub typecheck_fast_path_hits: u64,
     pub typecheck_fast_path_misses: u64,
     pub output_bytes: u64,
@@ -370,15 +395,25 @@ impl VmCounters {
         self.autoloads += 1;
     }
 
-    pub(crate) fn record_frame_activation(&mut self, reused: bool) {
+    pub(crate) fn record_frame_activation(
+        &mut self,
+        reused: bool,
+        register_count: u32,
+        local_count: u32,
+    ) {
         if reused {
             self.frame_reuses += 1;
             self.frames_reused += 1;
             self.register_files_reused += 1;
+            self.request_pool_resets += 1;
         } else {
             self.frame_allocations += 1;
             self.frames_allocated += 1;
             self.register_files_allocated += 1;
+            self.record_request_arena_allocation(request_frame_allocation_bytes(
+                register_count,
+                local_count,
+            ));
         }
     }
 
@@ -387,6 +422,73 @@ impl VmCounters {
             .frame_reuse_blocked_by_reason
             .entry(reason.to_owned())
             .or_default() += 1;
+        *self
+            .arena_fallback_allocations_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+        if matches!(
+            reason,
+            "destructor_sensitive_value" | "try_finally" | "generator" | "fiber_continuation"
+        ) {
+            self.destructor_sensitive_arena_blocks += 1;
+        }
+        if alias_sensitive_reason(reason) {
+            self.record_alias_state(AliasState::EscapedReference);
+            self.fast_path_disabled_by_reference += 1;
+        }
+    }
+
+    pub(crate) fn record_alias_state(&mut self, state: AliasState) {
+        *self
+            .frame_alias_state
+            .entry(state.as_str().to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_alias_state_transition(&mut self, from: AliasState, to: AliasState) {
+        self.record_alias_state(to);
+        if from != to {
+            *self
+                .alias_state_transitions
+                .entry(alias_transition_key(from, to))
+                .or_default() += 1;
+        }
+    }
+
+    pub(crate) fn record_fast_path_disabled_by_reference(&mut self, state: AliasState) {
+        if state.is_reference_sensitive() {
+            self.record_alias_state(state);
+            self.fast_path_disabled_by_reference += 1;
+        }
+    }
+
+    pub(crate) fn record_dequickened_by_reference(&mut self, state: AliasState) {
+        if state.is_reference_sensitive() {
+            self.record_alias_state(state);
+            self.dequickened_by_reference += 1;
+            self.fast_path_disabled_by_reference += 1;
+        }
+    }
+
+    pub(crate) fn record_ic_invalidated_by_reference(&mut self, state: AliasState) {
+        if state.is_reference_sensitive() {
+            self.record_alias_state(state);
+            self.ic_invalidated_by_reference += 1;
+            self.fast_path_disabled_by_reference += 1;
+        }
+    }
+
+    pub(crate) fn record_dense_bytecode_fallback_by_reference(&mut self, state: AliasState) {
+        if state.is_reference_sensitive() {
+            self.record_alias_state(state);
+            self.dense_bytecode_fallback_by_reference += 1;
+            self.fast_path_disabled_by_reference += 1;
+        }
+    }
+
+    pub(crate) fn record_request_arena_allocation(&mut self, bytes: usize) {
+        self.request_arena_allocations += 1;
+        self.request_arena_bytes += bytes as u64;
     }
 
     pub(crate) fn record_runtime_layout_stats(
@@ -418,6 +520,9 @@ impl VmCounters {
             .bytecode_unsupported_reasons
             .entry(reason.to_owned())
             .or_default() += 1;
+        if alias_sensitive_reason(reason) {
+            self.record_dense_bytecode_fallback_by_reference(AliasState::UnknownAliasing);
+        }
     }
 
     pub(crate) fn record_bytecode_auto_fallback_reason(&mut self, reason: &str) {
@@ -425,6 +530,9 @@ impl VmCounters {
             .bytecode_auto_fallback_reasons
             .entry(reason.to_owned())
             .or_default() += 1;
+        if alias_sensitive_reason(reason) {
+            self.record_dense_bytecode_fallback_by_reference(AliasState::UnknownAliasing);
+        }
     }
 
     pub(crate) fn record_bytecode_lowered_family(&mut self, family: &str) {
@@ -540,6 +648,7 @@ impl VmCounters {
     pub(crate) fn record_cow_or_reference_fallback(&mut self) {
         self.cow_or_reference_fallbacks += 1;
         self.record_array_fast_path_fallback("cow_or_reference");
+        self.record_fast_path_disabled_by_reference(AliasState::PropertyOrArrayDimReference);
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -572,6 +681,44 @@ impl VmCounters {
             .array_fast_path_hits_by_family
             .entry(family.to_owned())
             .or_default() += 1;
+    }
+
+    pub(crate) fn record_array_shape_observed(&mut self, kind: PhpArrayShapeKind) {
+        *self
+            .array_shape_observed_by_kind
+            .entry(kind.as_str().to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_record_shape_lookup_hit(&mut self) {
+        self.record_shape_hits += 1;
+        self.record_array_fast_path_hit("record_shape_fetch");
+    }
+
+    pub(crate) fn record_record_shape_lookup_miss(&mut self) {
+        self.record_shape_misses += 1;
+    }
+
+    pub(crate) fn record_small_map_lookup_hit(&mut self) {
+        self.small_map_hits += 1;
+        self.record_array_fast_path_hit("small_map_lookup");
+    }
+
+    pub(crate) fn record_small_map_lookup_miss(&mut self) {
+        self.small_map_misses += 1;
+    }
+
+    pub(crate) fn record_array_shape_lookup_fallback(
+        &mut self,
+        fallback: PhpArrayShapeLookupFallback,
+    ) {
+        match fallback {
+            PhpArrayShapeLookupFallback::KeyCoercion => self.key_coercion_fallbacks += 1,
+            PhpArrayShapeLookupFallback::OrderSemantics => self.order_semantics_fallbacks += 1,
+            PhpArrayShapeLookupFallback::CowOrReference => self.record_cow_or_reference_fallback(),
+            PhpArrayShapeLookupFallback::UnsupportedShape => {}
+        }
+        self.record_array_fast_path_fallback(fallback.as_str());
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -626,8 +773,15 @@ impl VmCounters {
         &mut self,
         stats: php_runtime::numeric_string::NumericStringCacheStats,
     ) {
+        self.numeric_string_classify_calls += stats.classify_calls;
         self.numeric_string_cache_hits += stats.hits;
         self.numeric_string_cache_misses += stats.misses;
+        self.numeric_string_warning_sensitive_fallbacks += stats.warning_sensitive_fallbacks;
+        self.numeric_string_overflow_precision_fallbacks += stats.overflow_precision_fallbacks;
+    }
+
+    pub(crate) fn record_numeric_string_specialization_hit(&mut self) {
+        self.numeric_string_specialization_hits += 1;
     }
 
     pub(crate) fn record_typecheck_fast_path(&mut self, hit: bool) {
@@ -735,7 +889,10 @@ impl VmCounters {
             | "property_hook_active"
             | "property_hook_metadata"
             | "magic_set_metadata" => self.property_assign_ic_hook_magic_exits += 1,
-            "reference_slot" | "reference_metadata" => self.property_assign_ic_reference_exits += 1,
+            "reference_slot" | "reference_metadata" => {
+                self.property_assign_ic_reference_exits += 1;
+                self.record_ic_invalidated_by_reference(AliasState::PropertyOrArrayDimReference);
+            }
             "dynamic_property_fallback" | "dynamic_property_metadata" => {
                 self.property_assign_ic_dynamic_exits += 1;
             }
@@ -1359,6 +1516,84 @@ impl VmCounters {
             &self.frame_reuse_blocked_by_reason,
             true,
         );
+        push_string_u64_map_field(
+            &mut json,
+            "frame_alias_state",
+            &self.frame_alias_state,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "alias_state_transitions",
+            &self.alias_state_transitions,
+            true,
+        );
+        push_field(
+            &mut json,
+            "fast_path_disabled_by_reference",
+            self.fast_path_disabled_by_reference,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dequickened_by_reference",
+            self.dequickened_by_reference,
+            true,
+        );
+        push_field(
+            &mut json,
+            "IC_invalidated_by_reference",
+            self.ic_invalidated_by_reference,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_bytecode_fallback_by_reference",
+            self.dense_bytecode_fallback_by_reference,
+            true,
+        );
+        push_field(
+            &mut json,
+            "request_arena_allocations",
+            self.request_arena_allocations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "request_arena_bytes",
+            self.request_arena_bytes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "request_pool_resets",
+            self.request_pool_resets,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_engine_allocations",
+            self.persistent_engine_allocations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_engine_bytes",
+            self.persistent_engine_bytes,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "arena_fallback_allocations_by_reason",
+            &self.arena_fallback_allocations_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "destructor_sensitive_arena_blocks",
+            self.destructor_sensitive_arena_blocks,
+            true,
+        );
         push_field(&mut json, "value_clones", self.value_clones, true);
         push_field(
             &mut json,
@@ -1428,6 +1663,33 @@ impl VmCounters {
             &self.array_fast_path_fallback_by_reason,
             true,
         );
+        push_string_u64_map_field(
+            &mut json,
+            "array_shape_observed_by_kind",
+            &self.array_shape_observed_by_kind,
+            true,
+        );
+        push_field(&mut json, "record_shape_hits", self.record_shape_hits, true);
+        push_field(
+            &mut json,
+            "record_shape_misses",
+            self.record_shape_misses,
+            true,
+        );
+        push_field(&mut json, "small_map_hits", self.small_map_hits, true);
+        push_field(&mut json, "small_map_misses", self.small_map_misses, true);
+        push_field(
+            &mut json,
+            "key_coercion_fallbacks",
+            self.key_coercion_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "order_semantics_fallbacks",
+            self.order_semantics_fallbacks,
+            true,
+        );
         push_field(
             &mut json,
             "packed_append_fast_hits",
@@ -1460,6 +1722,12 @@ impl VmCounters {
         );
         push_field(
             &mut json,
+            "numeric_string_classify_calls",
+            self.numeric_string_classify_calls,
+            true,
+        );
+        push_field(
+            &mut json,
             "numeric_string_cache_hits",
             self.numeric_string_cache_hits,
             true,
@@ -1468,6 +1736,24 @@ impl VmCounters {
             &mut json,
             "numeric_string_cache_misses",
             self.numeric_string_cache_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "numeric_string_specialization_hits",
+            self.numeric_string_specialization_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "numeric_string_warning_sensitive_fallbacks",
+            self.numeric_string_warning_sensitive_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "numeric_string_overflow_precision_fallbacks",
+            self.numeric_string_overflow_precision_fallbacks,
             true,
         );
         push_field(
@@ -2260,6 +2546,15 @@ impl VmCounters {
     }
 }
 
+fn request_frame_allocation_bytes(register_count: u32, local_count: u32) -> usize {
+    register_count as usize * std::mem::size_of::<TempValue>()
+        + local_count as usize * std::mem::size_of::<Slot>()
+}
+
+fn alias_sensitive_reason(reason: &str) -> bool {
+    reason.contains("reference") || reason.contains("by_ref") || reason.contains("cow")
+}
+
 fn push_method_call_profiles(json: &mut String, profiles: &BTreeMap<String, MethodCallProfile>) {
     json.push_str("  \"method_call_profiles\": [");
     if !profiles.is_empty() {
@@ -2848,9 +3143,10 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{InlineCacheKind, InlineCacheObservation, QuickeningObservation};
+    use crate::{AliasState, InlineCacheKind, InlineCacheObservation, QuickeningObservation};
     use php_ir::ids::RegId;
     use php_ir::instruction::{BinaryOp, InstructionKind};
+    use php_runtime::{PhpArrayShapeKind, PhpArrayShapeLookupFallback};
     use std::collections::BTreeMap;
 
     use super::{
@@ -2872,9 +3168,18 @@ mod tests {
             name: "f".to_owned(),
             args: Vec::new(),
         });
-        counters.record_frame_activation(false);
-        counters.record_frame_activation(true);
+        counters.record_frame_activation(false, 4, 3);
+        counters.record_frame_activation(true, 4, 3);
         counters.record_frame_reuse_blocked("by_ref_param");
+        counters.record_alias_state(AliasState::NoReferencesObserved);
+        counters.record_alias_state_transition(
+            AliasState::NoReferencesObserved,
+            AliasState::LocalOnlyReference,
+        );
+        counters.record_fast_path_disabled_by_reference(AliasState::PropertyOrArrayDimReference);
+        counters.record_dequickened_by_reference(AliasState::PropertyOrArrayDimReference);
+        counters.record_ic_invalidated_by_reference(AliasState::PropertyOrArrayDimReference);
+        counters.record_dense_bytecode_fallback_by_reference(AliasState::UnknownAliasing);
         counters.record_runtime_layout_stats(php_runtime::layout_stats::RuntimeLayoutStats {
             value_clones: 11,
             string_allocations: 7,
@@ -2898,9 +3203,24 @@ mod tests {
         counters.record_cow_or_reference_fallback();
         counters.record_array_count_fast_path_hit();
         counters.record_array_packed_to_mixed_transition();
+        counters.record_array_shape_observed(PhpArrayShapeKind::ShapeStableRecordLike);
+        counters.record_array_shape_observed(PhpArrayShapeKind::SmallInlineMap);
+        counters.record_record_shape_lookup_hit();
+        counters.record_record_shape_lookup_miss();
+        counters.record_small_map_lookup_hit();
+        counters.record_small_map_lookup_miss();
+        counters.record_array_shape_lookup_fallback(PhpArrayShapeLookupFallback::KeyCoercion);
+        counters.record_array_shape_lookup_fallback(PhpArrayShapeLookupFallback::OrderSemantics);
         counters.record_numeric_string_cache_stats(
-            php_runtime::numeric_string::NumericStringCacheStats { hits: 2, misses: 3 },
+            php_runtime::numeric_string::NumericStringCacheStats {
+                classify_calls: 7,
+                hits: 2,
+                misses: 3,
+                warning_sensitive_fallbacks: 4,
+                overflow_precision_fallbacks: 5,
+            },
         );
+        counters.record_numeric_string_specialization_hit();
         counters.record_typecheck_fast_path(false);
         counters.record_typecheck_fast_path(true);
         counters.record_output_stats(
@@ -3048,10 +3368,40 @@ mod tests {
         assert_eq!(counters.frames_reused, 1);
         assert_eq!(counters.register_files_allocated, 1);
         assert_eq!(counters.register_files_reused, 1);
+        assert_eq!(counters.request_arena_allocations, 1);
+        assert!(counters.request_arena_bytes > 0);
+        assert_eq!(counters.request_pool_resets, 1);
+        assert_eq!(counters.persistent_engine_allocations, 0);
+        assert_eq!(counters.persistent_engine_bytes, 0);
+        assert_eq!(
+            counters
+                .arena_fallback_allocations_by_reason
+                .get("by_ref_param"),
+            Some(&1)
+        );
+        assert_eq!(counters.destructor_sensitive_arena_blocks, 0);
         assert_eq!(
             counters.frame_reuse_blocked_by_reason.get("by_ref_param"),
             Some(&1)
         );
+        assert_eq!(
+            counters.frame_alias_state.get("no_references_observed"),
+            Some(&1)
+        );
+        assert_eq!(
+            counters.frame_alias_state.get("local_only_reference"),
+            Some(&1)
+        );
+        assert_eq!(
+            counters
+                .alias_state_transitions
+                .get("no_references_observed->local_only_reference"),
+            Some(&1)
+        );
+        assert_eq!(counters.fast_path_disabled_by_reference, 7);
+        assert_eq!(counters.dequickened_by_reference, 1);
+        assert_eq!(counters.ic_invalidated_by_reference, 2);
+        assert_eq!(counters.dense_bytecode_fallback_by_reference, 1);
         assert_eq!(counters.value_clones, 11);
         assert_eq!(counters.string_allocations, 7);
         assert_eq!(counters.array_handle_clones, 5);
@@ -3085,8 +3435,30 @@ mod tests {
         assert_eq!(counters.cow_or_reference_fallbacks, 1);
         assert_eq!(counters.array_count_fast_path_hits, 1);
         assert_eq!(counters.array_packed_to_mixed_transitions, 1);
+        assert_eq!(
+            counters
+                .array_shape_observed_by_kind
+                .get("shape_stable_record_like"),
+            Some(&1)
+        );
+        assert_eq!(
+            counters
+                .array_shape_observed_by_kind
+                .get("small_inline_map"),
+            Some(&1)
+        );
+        assert_eq!(counters.record_shape_hits, 1);
+        assert_eq!(counters.record_shape_misses, 1);
+        assert_eq!(counters.small_map_hits, 1);
+        assert_eq!(counters.small_map_misses, 1);
+        assert_eq!(counters.key_coercion_fallbacks, 1);
+        assert_eq!(counters.order_semantics_fallbacks, 1);
+        assert_eq!(counters.numeric_string_classify_calls, 7);
         assert_eq!(counters.numeric_string_cache_hits, 2);
         assert_eq!(counters.numeric_string_cache_misses, 3);
+        assert_eq!(counters.numeric_string_specialization_hits, 1);
+        assert_eq!(counters.numeric_string_warning_sensitive_fallbacks, 4);
+        assert_eq!(counters.numeric_string_overflow_precision_fallbacks, 5);
         assert_eq!(counters.typecheck_fast_path_hits, 1);
         assert_eq!(counters.typecheck_fast_path_misses, 1);
         assert_eq!(counters.output_bytes, 12);
@@ -3335,6 +3707,19 @@ mod tests {
         assert!(json.contains("\"register_files_allocated\": 0"));
         assert!(json.contains("\"register_files_reused\": 0"));
         assert!(json.contains("\"frame_reuse_blocked_by_reason\": {}"));
+        assert!(json.contains("\"frame_alias_state\": {}"));
+        assert!(json.contains("\"alias_state_transitions\": {}"));
+        assert!(json.contains("\"fast_path_disabled_by_reference\": 0"));
+        assert!(json.contains("\"dequickened_by_reference\": 0"));
+        assert!(json.contains("\"IC_invalidated_by_reference\": 0"));
+        assert!(json.contains("\"dense_bytecode_fallback_by_reference\": 0"));
+        assert!(json.contains("\"request_arena_allocations\": 0"));
+        assert!(json.contains("\"request_arena_bytes\": 0"));
+        assert!(json.contains("\"request_pool_resets\": 0"));
+        assert!(json.contains("\"persistent_engine_allocations\": 0"));
+        assert!(json.contains("\"persistent_engine_bytes\": 0"));
+        assert!(json.contains("\"arena_fallback_allocations_by_reason\": {}"));
+        assert!(json.contains("\"destructor_sensitive_arena_blocks\": 0"));
         assert!(json.contains("\"value_clones\": 0"));
         assert!(json.contains("\"string_allocations\": 0"));
         assert!(json.contains("\"array_handle_clones\": 0"));
@@ -3348,13 +3733,24 @@ mod tests {
         assert!(json.contains("\"array_sequential_foreach_fast_path_hits\": 0"));
         assert!(json.contains("\"array_fast_path_hits_by_family\": {}"));
         assert!(json.contains("\"array_fast_path_fallback_by_reason\": {}"));
+        assert!(json.contains("\"array_shape_observed_by_kind\": {}"));
+        assert!(json.contains("\"record_shape_hits\": 0"));
+        assert!(json.contains("\"record_shape_misses\": 0"));
+        assert!(json.contains("\"small_map_hits\": 0"));
+        assert!(json.contains("\"small_map_misses\": 0"));
+        assert!(json.contains("\"key_coercion_fallbacks\": 0"));
+        assert!(json.contains("\"order_semantics_fallbacks\": 0"));
         assert!(json.contains("\"packed_append_fast_hits\": 0"));
         assert!(json.contains("\"packed_foreach_fast_hits\": 0"));
         assert!(json.contains("\"cow_or_reference_fallbacks\": 0"));
         assert!(json.contains("\"array_count_fast_path_hits\": 0"));
         assert!(json.contains("\"array_packed_to_mixed_transitions\": 0"));
+        assert!(json.contains("\"numeric_string_classify_calls\": 0"));
         assert!(json.contains("\"numeric_string_cache_hits\": 0"));
         assert!(json.contains("\"numeric_string_cache_misses\": 0"));
+        assert!(json.contains("\"numeric_string_specialization_hits\": 0"));
+        assert!(json.contains("\"numeric_string_warning_sensitive_fallbacks\": 0"));
+        assert!(json.contains("\"numeric_string_overflow_precision_fallbacks\": 0"));
         assert!(json.contains("\"typecheck_fast_path_hits\": 0"));
         assert!(json.contains("\"typecheck_fast_path_misses\": 0"));
         assert!(json.contains("\"output_bytes\": 0"));

@@ -1,6 +1,11 @@
 //! Opaque ordered PHP array storage for runtime-semantics.
 
-use crate::{PhpString, Value};
+use crate::{
+    PhpString, Value,
+    numeric_string::{
+        NumericStringArrayKey, array_key_has_numeric_string_ambiguity, classify_array_key,
+    },
+};
 use std::rc::{Rc, Weak};
 
 /// PHP array key after runtime-semantics key normalization.
@@ -46,7 +51,10 @@ impl ArrayKey {
     /// Normalizes a PHP string key in the tested MVP range.
     #[must_use]
     pub fn from_php_string(value: PhpString) -> Self {
-        normalize_string_key(&value).map_or(Self::String(value), Self::Int)
+        match classify_array_key(&value) {
+            NumericStringArrayKey::Integer(key) => Self::Int(key),
+            NumericStringArrayKey::String => Self::String(value),
+        }
     }
 
     /// Returns the integer key when present.
@@ -101,6 +109,78 @@ pub enum PhpArrayKeyKindSummary {
     StringOnly,
     /// Both integer and string keys are present.
     Mixed,
+}
+
+/// Coarse PHP array shape observed for guarded lookup policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayShapeKind {
+    Empty,
+    Packed,
+    PackedWithHoles,
+    SmallInlineMap,
+    InternedStringKeyRecord,
+    ShapeStableRecordLike,
+    MixedHash,
+    SharedImmutableLiteralArray,
+    CowOrReferenceFallback,
+}
+
+impl PhpArrayShapeKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Packed => "packed",
+            Self::PackedWithHoles => "packed_with_holes",
+            Self::SmallInlineMap => "small_inline_map",
+            Self::InternedStringKeyRecord => "interned_string_key_record",
+            Self::ShapeStableRecordLike => "shape_stable_record_like",
+            Self::MixedHash => "mixed_hash",
+            Self::SharedImmutableLiteralArray => "shared_immutable_literal_array",
+            Self::CowOrReferenceFallback => "cow_or_reference_fallback",
+        }
+    }
+}
+
+/// Metadata snapshot for non-mutating array-shape observers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhpArrayShapeMetadata {
+    pub kind: PhpArrayShapeKind,
+    pub len: usize,
+    pub mutation_epoch: u64,
+    pub is_shared: bool,
+    pub contains_references: bool,
+    pub key_kind_summary: PhpArrayKeyKindSummary,
+    pub numeric_string_key_ambiguity: bool,
+}
+
+/// Conservative reason a shape lookup must use the generic array path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayShapeLookupFallback {
+    KeyCoercion,
+    OrderSemantics,
+    CowOrReference,
+    UnsupportedShape,
+}
+
+impl PhpArrayShapeLookupFallback {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyCoercion => "key_coercion",
+            Self::OrderSemantics => "order_semantics",
+            Self::CowOrReference => "cow_or_reference",
+            Self::UnsupportedShape => "unsupported_shape",
+        }
+    }
+}
+
+/// Result of an exact guarded array-shape lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayShapeLookup<'a> {
+    Hit(&'a Value),
+    Miss,
+    Fallback(PhpArrayShapeLookupFallback),
 }
 
 /// Guard metadata for packed-array fast paths.
@@ -376,7 +456,7 @@ impl PhpArray {
         self.storage.entries.iter().any(|entry| {
             matches!(
                 &entry.key,
-                ArrayKey::String(key) if numeric_string_key_has_coercion_risk(key)
+                ArrayKey::String(key) if array_key_has_numeric_string_ambiguity(key)
             )
         })
     }
@@ -400,6 +480,97 @@ impl PhpArray {
             key_kind_summary: self.key_kind_summary_fast(),
             numeric_string_key_ambiguity: self.has_numeric_string_key_ambiguity_fast(),
         }
+    }
+
+    /// Returns conservative shape metadata for non-packed lookup observers.
+    #[must_use]
+    pub fn shape_metadata(&self) -> PhpArrayShapeMetadata {
+        let key_kind_summary = self.key_kind_summary_fast();
+        let contains_references = self.contains_references_fast();
+        let numeric_string_key_ambiguity = self.has_numeric_string_key_ambiguity_fast();
+        let kind = if contains_references {
+            PhpArrayShapeKind::CowOrReferenceFallback
+        } else if self.is_empty() {
+            PhpArrayShapeKind::Empty
+        } else if self.is_packed_fast() {
+            PhpArrayShapeKind::Packed
+        } else if key_kind_summary == PhpArrayKeyKindSummary::StringOnly
+            && !numeric_string_key_ambiguity
+            && self.string_keys_share_storage_fast()
+        {
+            PhpArrayShapeKind::InternedStringKeyRecord
+        } else if key_kind_summary == PhpArrayKeyKindSummary::StringOnly
+            && !numeric_string_key_ambiguity
+        {
+            PhpArrayShapeKind::ShapeStableRecordLike
+        } else if key_kind_summary == PhpArrayKeyKindSummary::IntOnly {
+            PhpArrayShapeKind::PackedWithHoles
+        } else if self.len() <= 4 && !numeric_string_key_ambiguity {
+            PhpArrayShapeKind::SmallInlineMap
+        } else if self.is_shared() {
+            PhpArrayShapeKind::SharedImmutableLiteralArray
+        } else {
+            PhpArrayShapeKind::MixedHash
+        };
+
+        PhpArrayShapeMetadata {
+            kind,
+            len: self.len(),
+            mutation_epoch: self.mutation_epoch(),
+            is_shared: self.is_shared(),
+            contains_references,
+            key_kind_summary,
+            numeric_string_key_ambiguity,
+        }
+    }
+
+    /// Exact guarded read for string-key record-like arrays.
+    #[must_use]
+    pub fn record_shape_string_key_lookup(&self, key: &ArrayKey) -> PhpArrayShapeLookup<'_> {
+        let ArrayKey::String(_) = key else {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::KeyCoercion);
+        };
+        let metadata = self.shape_metadata();
+        if metadata.contains_references {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::CowOrReference);
+        }
+        if metadata.numeric_string_key_ambiguity {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::KeyCoercion);
+        }
+        if !matches!(
+            metadata.kind,
+            PhpArrayShapeKind::InternedStringKeyRecord | PhpArrayShapeKind::ShapeStableRecordLike
+        ) {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::UnsupportedShape);
+        }
+        self.get(key)
+            .map_or(PhpArrayShapeLookup::Miss, PhpArrayShapeLookup::Hit)
+    }
+
+    /// Exact guarded read for very small non-packed maps.
+    #[must_use]
+    pub fn small_map_lookup(&self, key: &ArrayKey) -> PhpArrayShapeLookup<'_> {
+        let metadata = self.shape_metadata();
+        if metadata.contains_references {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::CowOrReference);
+        }
+        if metadata.numeric_string_key_ambiguity {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::KeyCoercion);
+        }
+        if metadata.kind != PhpArrayShapeKind::SmallInlineMap {
+            return PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::UnsupportedShape);
+        }
+        self.get(key)
+            .map_or(PhpArrayShapeLookup::Miss, PhpArrayShapeLookup::Hit)
+    }
+
+    fn string_keys_share_storage_fast(&self) -> bool {
+        self.storage.entries.iter().all(|entry| {
+            matches!(
+                &entry.key,
+                ArrayKey::String(key) if key.is_shared()
+            )
+        })
     }
 
     /// Sums a packed all-int array only when COW/reference/overflow guards pass.
@@ -716,43 +887,12 @@ fn adjust_pointer_after_remove(storage: &mut ArrayStorage, removed_index: usize)
     };
 }
 
-fn normalize_string_key(value: &PhpString) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let (negative, digits) = if let Some(rest) = bytes.strip_prefix(b"-") {
-        (true, rest)
-    } else {
-        (false, bytes)
-    };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    if digits.len() > 1 && digits[0] == b'0' {
-        return None;
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let value = text.parse::<i64>().ok()?;
-    if negative && value == 0 {
-        return None;
-    }
-    Some(value)
-}
-
-fn numeric_string_key_has_coercion_risk(value: &PhpString) -> bool {
-    let bytes = value.as_bytes();
-    let Some(first) = bytes.first() else {
-        return false;
-    };
-    first.is_ascii_digit() || matches!(first, b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r')
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
-        PhpArrayPackedIntReductionError,
+        PhpArrayPackedIntReductionError, PhpArrayShapeKind, PhpArrayShapeLookup,
+        PhpArrayShapeLookupFallback,
     };
     use crate::{PhpString, Value};
 
@@ -1142,5 +1282,121 @@ mod tests {
 
         assert_ne!(first.mutation_epoch(), second.mutation_epoch());
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn array_shape_metadata_classifies_prompt_shapes() {
+        let empty = PhpArray::new();
+        assert_eq!(empty.shape_metadata().kind, PhpArrayShapeKind::Empty);
+
+        let packed = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(packed.shape_metadata().kind, PhpArrayShapeKind::Packed);
+
+        let mut holes = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
+        holes.remove(&ArrayKey::Int(0));
+        assert_eq!(
+            holes.shape_metadata().kind,
+            PhpArrayShapeKind::PackedWithHoles
+        );
+
+        let mut small = PhpArray::new();
+        small.insert(ArrayKey::Int(1), Value::Int(1));
+        small.insert(ArrayKey::String(PhpString::from("name")), Value::Int(2));
+        assert_eq!(
+            small.shape_metadata().kind,
+            PhpArrayShapeKind::SmallInlineMap
+        );
+
+        let mut record = PhpArray::new();
+        record.insert(ArrayKey::String(PhpString::from("id")), Value::Int(1));
+        record.insert(ArrayKey::String(PhpString::from("name")), Value::Int(2));
+        assert_eq!(
+            record.shape_metadata().kind,
+            PhpArrayShapeKind::ShapeStableRecordLike
+        );
+
+        let shared_key = PhpString::from("id");
+        let mut interned_record = PhpArray::new();
+        interned_record.insert(ArrayKey::String(shared_key.clone()), Value::Int(1));
+        assert!(shared_key.is_shared());
+        assert_eq!(
+            interned_record.shape_metadata().kind,
+            PhpArrayShapeKind::InternedStringKeyRecord
+        );
+
+        let mut shared_candidate = PhpArray::new();
+        shared_candidate.insert(ArrayKey::Int(1), Value::Int(1));
+        shared_candidate.insert(ArrayKey::String(PhpString::from("name")), Value::Int(2));
+        shared_candidate.insert(ArrayKey::Int(3), Value::Int(3));
+        shared_candidate.insert(ArrayKey::String(PhpString::from("slug")), Value::Int(4));
+        shared_candidate.insert(ArrayKey::Int(5), Value::Int(5));
+        let shared = shared_candidate.clone();
+        assert_eq!(
+            shared.shape_metadata().kind,
+            PhpArrayShapeKind::SharedImmutableLiteralArray
+        );
+
+        let cell = crate::ReferenceCell::new(Value::Int(1));
+        let mut reference_array = PhpArray::new();
+        reference_array.insert(
+            ArrayKey::String(PhpString::from("id")),
+            Value::Reference(cell),
+        );
+        assert_eq!(
+            reference_array.shape_metadata().kind,
+            PhpArrayShapeKind::CowOrReferenceFallback
+        );
+    }
+
+    #[test]
+    fn record_and_small_map_shape_lookups_fail_closed() {
+        let mut record = PhpArray::new();
+        record.insert(ArrayKey::String(PhpString::from("id")), Value::Int(1));
+
+        assert!(matches!(
+            record.record_shape_string_key_lookup(&ArrayKey::String(PhpString::from("id"))),
+            PhpArrayShapeLookup::Hit(Value::Int(1))
+        ));
+        assert_eq!(
+            record.record_shape_string_key_lookup(&ArrayKey::String(PhpString::from("missing"))),
+            PhpArrayShapeLookup::Miss
+        );
+        assert_eq!(
+            record.record_shape_string_key_lookup(&ArrayKey::Int(0)),
+            PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::KeyCoercion)
+        );
+
+        let mut numeric_string = PhpArray::new();
+        numeric_string.insert(ArrayKey::String(PhpString::from("01")), Value::Int(1));
+        assert_eq!(
+            numeric_string.record_shape_string_key_lookup(&ArrayKey::String(PhpString::from("01"))),
+            PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::KeyCoercion)
+        );
+
+        let mut small = PhpArray::new();
+        small.insert(ArrayKey::Int(1), Value::Int(1));
+        small.insert(ArrayKey::String(PhpString::from("name")), Value::Int(2));
+        assert!(matches!(
+            small.small_map_lookup(&ArrayKey::String(PhpString::from("name"))),
+            PhpArrayShapeLookup::Hit(Value::Int(2))
+        ));
+
+        let shared = small.clone();
+        assert!(matches!(
+            shared.small_map_lookup(&ArrayKey::String(PhpString::from("name"))),
+            PhpArrayShapeLookup::Hit(Value::Int(2))
+        ));
+
+        let cell = crate::ReferenceCell::new(Value::Int(1));
+        let mut reference_array = PhpArray::new();
+        reference_array.insert(
+            ArrayKey::String(PhpString::from("id")),
+            Value::Reference(cell),
+        );
+        assert_eq!(
+            reference_array
+                .record_shape_string_key_lookup(&ArrayKey::String(PhpString::from("id"))),
+            PhpArrayShapeLookup::Fallback(PhpArrayShapeLookupFallback::CowOrReference)
+        );
     }
 }

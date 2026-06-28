@@ -570,7 +570,10 @@ uses fresh frames for closure captures, by-reference calls/returns, class
 contexts, shared top-level locals, try/finally bodies, and object-allocation
 bodies that may retain destructor-sensitive values. These rules are observable
 only through VM counters; they must not alter PHP-visible output, diagnostics,
-side-effect order, references, or destructor timing.
+side-effect order, references, or destructor timing. FPE-19 adds
+request-arena-shaped counters for this existing pool, but does not add bulk
+arena reset for values, objects, arrays, references, resources, generators,
+fibers, output buffers, or any userland state.
 
 ## performance-critical Boundaries
 

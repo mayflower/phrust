@@ -4,23 +4,32 @@
 //! control flow, exceptions, includes, tracing, and VM results. The current layer keeps
 //! it as a compile-tested skeleton only.
 
+pub mod aliasing;
 pub mod bytecode;
 pub mod compiled_unit;
 pub mod counters;
+pub mod deopt;
 pub mod fallback;
 pub mod frame;
 pub mod include;
 pub mod inline_cache;
 pub mod literal_pool;
+pub mod persistent_feedback;
 pub mod quickening;
 pub mod std_builtins;
 pub mod tiering;
 pub mod todo_runtime;
 pub mod vm;
 
+pub use aliasing::{AliasState, alias_transition_key, slot_alias_state, value_alias_state};
 pub use bytecode::{DenseBytecodeUnit, DenseOpcode};
 pub use compiled_unit::CompiledUnit;
 pub use counters::{JitCompileDescriptor, VmCounters};
+pub use deopt::{
+    ControlStateMarker, DeoptMetadata, DeoptMetadataError, DeoptRegionMetadata, DeoptResumePoint,
+    DeoptSideExitPoint, LiveIdentityMarker, LiveStateSnapshot, LiveValueClass, LiveValueSlot,
+    VmDeoptReason,
+};
 pub use fallback::{
     DEQUICKEN_AFTER_GUARD_MISSES, DISABLE_AFTER_GUARD_MISSES, FallbackProtocolEvent,
     FallbackProtocolStats,
@@ -34,6 +43,14 @@ pub use inline_cache::{
     PropertyFetchCacheTarget,
 };
 pub use literal_pool::{InternedLiteral, LiteralPool};
+pub use persistent_feedback::{
+    PERSISTENT_FEEDBACK_FORMAT_VERSION, PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION,
+    PersistentArrayKeyShape, PersistentArrayLayout, PersistentBranchBias, PersistentCallsiteState,
+    PersistentFeedbackContext, PersistentFeedbackEntry, PersistentFeedbackEpochs,
+    PersistentFeedbackKey, PersistentFeedbackLoadReport, PersistentFeedbackPayload,
+    PersistentFeedbackStats, PersistentFeedbackStore, PersistentGuardFailureSummary,
+    PersistentIncludeAutoloadStability, PersistentObjectShapeObservation, PersistentScalarKind,
+};
 pub use quickening::{
     QuickeningMode, QuickeningObservation, QuickeningSpecialization, QuickeningState,
     QuickeningTable,

@@ -68,6 +68,7 @@ help:
       '  just release-benchmark-smoke Run production release performance smoke' \
       '  just pgo-benchmark-smoke  Run optional PGO performance smoke' \
       '  just bolt-benchmark-smoke Run optional Linux BOLT performance smoke' \
+      '  just fastest-engine-matrix Generate baseline/release/reference comparison matrix' \
       '  just fastest-hotpath-report Generate fastest-engine hotpath report' \
       '  just perf-report          Generate performance report' \
       '' \
@@ -273,7 +274,9 @@ verify-performance:
     @just framework-smoke
     @just release-benchmark-smoke
     @just acceleration-matrix
+    @just fastest-engine-matrix
     @just fast-preset-smoke
+    @just baseline-native-stencil-smoke
     @just cache-roundtrip
     @just optimizer-diff
     @just superinstruction-smoke
@@ -673,12 +676,12 @@ runtime-fixtures:
     grep -q 'E_PHP_RUNTIME_UNDEFINED_CONSTANT' "$tmp_dir/constants-undefined.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/known_gaps/variables/undefined.php > "$tmp_dir/variables-undefined.out" 2> "$tmp_dir/variables-undefined.err"; \
     sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/variables-undefined.out" > "$tmp_dir/variables-undefined.normalized"; \
-    printf 'Warning: Undefined variable $missing in %s/fixtures/runtime/known_gaps/variables/undefined.php on line <line>\nx\n' "$PWD" > "$tmp_dir/variables-undefined.expected"; \
+    printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/known_gaps/variables/undefined.php on line <line>\nx\n' "$PWD" > "$tmp_dir/variables-undefined.expected"; \
     cmp "$tmp_dir/variables-undefined.expected" "$tmp_dir/variables-undefined.normalized"; \
     test ! -s "$tmp_dir/variables-undefined.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/errors/warning-continuation.php > "$tmp_dir/errors-warning-continuation.out" 2> "$tmp_dir/errors-warning-continuation.err"; \
     sed -E 's/on line [0-9]+/on line <line>/' "$tmp_dir/errors-warning-continuation.out" > "$tmp_dir/errors-warning-continuation.normalized"; \
-    printf 'Warning: Undefined variable $missing in %s/fixtures/runtime/valid/errors/warning-continuation.php on line <line>\nok\n' "$PWD" > "$tmp_dir/errors-warning-continuation.expected"; \
+    printf '\nWarning: Undefined variable $missing in %s/fixtures/runtime/valid/errors/warning-continuation.php on line <line>\nok\n' "$PWD" > "$tmp_dir/errors-warning-continuation.expected"; \
     cmp "$tmp_dir/errors-warning-continuation.expected" "$tmp_dir/errors-warning-continuation.normalized"; \
     test ! -s "$tmp_dir/errors-warning-continuation.err"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm run fixtures/runtime/valid/control_flow/if-true-false.php > "$tmp_dir/control-if.out"; \
@@ -1320,6 +1323,10 @@ fast-preset-smoke:
     cargo build -p php_vm_cli --bin php-vm
     scripts/performance/fast_preset_smoke.py
 
+baseline-native-stencil-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/baseline_native_stencil_smoke.py
+
 ir-verify:
     cargo test -p php_ir verify --lib
 
@@ -1369,6 +1376,10 @@ framework-smoke:
 acceleration-matrix:
     cargo build -p php_vm_cli --bin php-vm
     scripts/performance/acceleration_matrix.py
+
+fastest-engine-matrix:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/fastest_engine_matrix.py
 
 hotpath-inventory:
     scripts/performance/hotpath_inventory.py target/performance/benchmark-smoke.json --json-out target/performance/hotpaths.json --markdown-out docs/hotpath-inventory.md

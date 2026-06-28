@@ -336,12 +336,13 @@ struct LoopTargets {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LowerMethodContext<'a> {
+struct MethodFunctionInput<'a> {
     class_name: &'a str,
     method_name: &'a str,
     display_class_name: &'a str,
     display_method_name: &'a str,
     signature: &'a FunctionSignature,
+    main_function: FunctionId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -857,15 +858,17 @@ impl LoweringContext<'_> {
                             );
                             continue;
                         }
-                        let method_context = LowerMethodContext {
-                            class_name: &name,
-                            method_name: &method_name,
-                            display_class_name: &display_class_name,
-                            display_method_name: &display_method_name,
-                            signature: &signature,
-                        };
-                        let function =
-                            self.lower_method_function(builder, method_context, main_function);
+                        let function = self.lower_method_function(
+                            builder,
+                            MethodFunctionInput {
+                                class_name: &name,
+                                method_name: &method_name,
+                                display_class_name: &display_class_name,
+                                display_method_name: &display_method_name,
+                                signature: &signature,
+                                main_function,
+                            },
+                        );
                         if method.magic_kind() == Some(MagicMethodKind::Construct) {
                             constructor = Some(function);
                         }
@@ -1107,19 +1110,14 @@ impl LoweringContext<'_> {
     fn lower_method_function(
         &mut self,
         builder: &mut IrBuilder,
-        context: LowerMethodContext<'_>,
-        main_function: FunctionId,
+        input: MethodFunctionInput<'_>,
     ) -> FunctionId {
-        let LowerMethodContext {
-            class_name,
-            method_name,
-            display_class_name,
-            display_method_name,
-            signature,
-        } = context;
-        let span = span_from_range(self.file, signature.span());
+        let span = span_from_range(self.file, input.signature.span());
         let function = builder.start_function(
-            format!("{display_class_name}::{display_method_name}"),
+            format!(
+                "{}::{}",
+                input.display_class_name, input.display_method_name
+            ),
             FunctionFlags {
                 is_method: true,
                 ..FunctionFlags::default()
@@ -1129,25 +1127,31 @@ impl LoweringContext<'_> {
         let attributes = self.lower_attributes_for_target_span(
             builder,
             AttributeTarget::Method,
-            signature.span(),
+            input.signature.span(),
         );
         builder.set_function_attributes(function, attributes);
         self.class_names
-            .insert(function, display_class_name.to_owned());
+            .insert(function, input.display_class_name.to_owned());
         self.method_names
-            .insert(function, display_method_name.to_owned());
+            .insert(function, input.display_method_name.to_owned());
         self.function_names.insert(
             function,
-            format!("{display_class_name}::{display_method_name}"),
+            format!(
+                "{}::{}",
+                input.display_class_name, input.display_method_name
+            ),
         );
-        builder.set_return_type(function, self.lower_return_type(signature.return_type()));
+        builder.set_return_type(
+            function,
+            self.lower_return_type(input.signature.return_type()),
+        );
         builder.intern_local(function, "this");
         builder.add_source_map(
             IrSourceMapTarget::Function { function },
-            format!("hir:method:{class_name}::{method_name}"),
+            format!("hir:method:{}::{}", input.class_name, input.method_name),
             span,
         );
-        for param in signature.parameters() {
+        for param in input.signature.parameters() {
             if param.flags().is_by_ref() {
                 self.unsupported(
                     UnsupportedFeature::ByReferenceParameter,
@@ -1168,11 +1172,11 @@ impl LoweringContext<'_> {
             if self.param_default_triggers_implicit_nullable_deprecation(param, &default) {
                 let span = span_from_range(self.file, param.span());
                 self.record_early_diagnostic_origin(
-                    main_function,
+                    input.main_function,
                     format!(
                         "hir:method:{}::{}:parameter:{}",
-                        class_name,
-                        method_name,
+                        input.class_name,
+                        input.method_name,
                         param.name()
                     ),
                     span,
@@ -1180,8 +1184,8 @@ impl LoweringContext<'_> {
                     "E_PHP_RUNTIME_IMPLICIT_NULLABLE_PARAMETER",
                     format!(
                         "{}::{}(): Implicitly marking parameter {} as nullable is deprecated, the explicit nullable type must be used instead",
-                        display_class_name,
-                        display_method_name,
+                        input.display_class_name,
+                        input.display_method_name,
                         param.name()
                     ),
                 );
@@ -1205,22 +1209,25 @@ impl LoweringContext<'_> {
         let block = builder.append_block(function);
         builder.add_source_map(
             IrSourceMapTarget::Block { function, block },
-            format!("hir:method:{class_name}::{method_name}:body"),
+            format!(
+                "hir:method:{}::{}:body",
+                input.class_name, input.method_name
+            ),
             span,
         );
         let current = self.lower_constructor_property_promotions(
             builder,
             function,
             block,
-            signature,
-            class_name,
-            method_name,
+            input.signature,
+            input.class_name,
+            input.method_name,
         );
         let current = self.lower_stmt_list(
             builder,
             function,
             current,
-            self.method_body_statement_ids(signature),
+            self.method_body_statement_ids(input.signature),
         );
         if !builder.is_terminated(function, current) {
             builder.terminate_return(function, current, None, span);
@@ -1575,14 +1582,17 @@ impl LoweringContext<'_> {
         }
 
         for candidate in composed {
-            let method_context = LowerMethodContext {
-                class_name,
-                method_name: &candidate.method_name,
-                display_class_name,
-                display_method_name: &candidate.display_method_name,
-                signature: &candidate.signature,
-            };
-            let function = self.lower_method_function(builder, method_context, main_function);
+            let function = self.lower_method_function(
+                builder,
+                MethodFunctionInput {
+                    class_name,
+                    method_name: &candidate.method_name,
+                    display_class_name,
+                    display_method_name: &candidate.display_method_name,
+                    signature: &candidate.signature,
+                    main_function,
+                },
+            );
             let attributes = self.lower_attributes_for_target_span(
                 builder,
                 AttributeTarget::Method,

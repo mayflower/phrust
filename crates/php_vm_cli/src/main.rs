@@ -2,6 +2,7 @@
 
 use php_bytecode_cache::{
     CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
+    PHP_TARGET_VERSION,
 };
 use php_ir::{
     LoweringOptions, lower_frontend_result,
@@ -13,8 +14,10 @@ use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source, diagnostics::DiagnosticId};
 use php_source::{SourceText, TextRange};
 use php_vm::{
-    DenseBytecodeUnit, ExecutionFormat, IncludeLoader, InlineCacheMode, JitBlacklistMode, JitMode,
-    QuickeningMode, SuperinstructionMode, TieringOptions, Vm, VmOptions,
+    DenseBytecodeUnit, DenseOpcode, ExecutionFormat, IncludeLoader, InlineCacheMode,
+    JitBlacklistMode, JitMode, PersistentFeedbackContext, PersistentFeedbackEpochs,
+    PersistentFeedbackLoadReport, PersistentFeedbackStats, PersistentFeedbackStore, QuickeningMode,
+    SuperinstructionMode, TieringOptions, Vm, VmOptions,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -72,6 +75,9 @@ where
         "compile" => compile_command(&args[1..], stdout, stderr),
         "dump-ir" => dump_ir_command(&args[1..], stdout, stderr),
         "dump-bytecode-patterns" => dump_bytecode_patterns_command(&args[1..], stdout, stderr),
+        "dump-baseline-native-stencil" => {
+            dump_baseline_native_stencil_command(&args[1..], stdout, stderr)
+        }
         "dump-cranelift-clif" => dump_cranelift_clif_command(&args[1..], stdout, stderr),
         "run" => run_command(&args[1..], stdout, stderr),
         "report" => report_command(&args[1..], stdout, stderr),
@@ -277,6 +283,81 @@ where
     Ok(EXIT_SUCCESS)
 }
 
+fn dump_baseline_native_stencil_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_baseline_native_stencil_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let dense = match DenseBytecodeUnit::lower_from_ir(&pipeline.lowering.unit) {
+        Ok(dense) => dense,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                error.message
+            )
+            .map_err(|io| io.to_string())?;
+            return Ok(EXIT_UNSUPPORTED);
+        }
+    };
+    if let Err(errors) = dense.verify() {
+        writeln!(
+            stderr,
+            "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+            errors.len()
+        )
+        .map_err(|io| io.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
+
+    let report = collect_baseline_native_stencil(&dense);
+    if json {
+        writeln!(
+            stdout,
+            "{}",
+            baseline_native_stencil_json(path, &dense, &report)
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        writeln!(
+            stdout,
+            "ok backend=baseline-native-stencil status=no-exec path={} functions={} blocks={} instructions={} stencilable={} unsupported={} helpers={} deopt_slots={} compile_cost={} code_size_estimate={}",
+            path,
+            report.functions,
+            report.blocks,
+            report.instructions,
+            report.stencilable_instructions,
+            report.unsupported_instructions,
+            report.helper_calls,
+            report.deopt_slots,
+            report.compile_cost_units,
+            report.code_size_bytes_estimate
+        )
+        .map_err(|error| error.to_string())?;
+        for (reason, count) in &report.unsupported_by_reason {
+            writeln!(stdout, "unsupported {count:>4} {reason}")
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(EXIT_SUCCESS)
+}
+
 fn run_command<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32, String>
 where
     W: Write,
@@ -331,6 +412,7 @@ where
         include_loader.as_ref(),
     );
     let jit_eligibility_json = build_jit_eligibility_json(&unit, run_options.jit);
+    let persistent_feedback = load_persistent_feedback(&run_options, path, &unit)?;
     let vm = Vm::with_options(VmOptions {
         include_loader,
         runtime_context,
@@ -372,6 +454,9 @@ where
             return Err("tiering stats were requested but not collected".to_string());
         };
         write_tiering_stats_json(path, stats)?;
+    }
+    if let Some(path) = run_options.persistent_feedback.stats_json {
+        write_persistent_feedback_stats_json(path, &persistent_feedback.stats)?;
     }
     if run_options.bytecode_cache.stats {
         write_cache_stats_json(stderr, &cache_stats)?;
@@ -1209,6 +1294,30 @@ struct BytecodePatternReport {
     triples: BTreeMap<String, u64>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BaselineNativeStencilReport {
+    functions: u64,
+    blocks: u64,
+    instructions: u64,
+    stencilable_instructions: u64,
+    unsupported_instructions: u64,
+    helper_calls: u64,
+    deopt_slots: u64,
+    compile_cost_units: u64,
+    code_size_bytes_estimate: u64,
+    opcode_counts: BTreeMap<String, u64>,
+    unsupported_by_reason: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BaselineStencilClass {
+    helper_calls: u64,
+    deopt_slots: u64,
+    compile_cost_units: u64,
+    code_size_bytes_estimate: u64,
+    unsupported_reason: Option<&'static str>,
+}
+
 struct RunOptions<'a> {
     path: &'a str,
     script_args: Vec<String>,
@@ -1229,6 +1338,7 @@ struct RunOptions<'a> {
     jit_stats: JitStatsMode,
     tiering: TieringOptions,
     tiering_stats_json: Option<String>,
+    persistent_feedback: PersistentFeedbackOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1324,6 +1434,12 @@ struct BytecodeCacheOptions {
     dir: Option<PathBuf>,
     stats: bool,
     clear: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PersistentFeedbackOptions {
+    read: Option<String>,
+    stats_json: Option<String>,
 }
 
 impl Default for BytecodeCacheOptions {
@@ -1432,6 +1548,26 @@ fn parse_dump_bytecode_patterns_args(args: &[String]) -> Result<(&str, bool), St
     Ok((path, json))
 }
 
+fn parse_dump_baseline_native_stencil_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!(
+                "unexpected dump-baseline-native-stencil argument `{arg}`"
+            ));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-baseline-native-stencil requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
 fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let Some(_) = args.first() else {
         return Err("run requires <path.php>".to_string());
@@ -1455,6 +1591,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let mut jit_stats = JitStatsMode::Off;
     let mut tiering = TieringOptions::default();
     let mut tiering_stats_json = None;
+    let mut persistent_feedback = PersistentFeedbackOptions::default();
     let mut tiering_function_threshold_explicit = false;
     let mut index = 0;
     while index < args.len() {
@@ -1727,6 +1864,26 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 tiering_stats_json = Some(value.to_owned());
                 tiering.collect_stats = true;
             }
+            "--persistent-feedback-read" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --persistent-feedback-read requires <path>".to_string());
+                };
+                persistent_feedback.read = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--persistent-feedback-read=") => {
+                persistent_feedback.read = Some(value.to_owned());
+            }
+            "--persistent-feedback-stats-json" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --persistent-feedback-stats-json requires <path>".to_string());
+                };
+                persistent_feedback.stats_json = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--persistent-feedback-stats-json=") => {
+                persistent_feedback.stats_json = Some(value.to_owned());
+            }
             "--counters-json" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -1771,6 +1928,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     jit_stats,
                     tiering,
                     tiering_stats_json,
+                    persistent_feedback,
                 });
             }
             arg if path.is_none() => path = Some(arg),
@@ -1805,6 +1963,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         jit_stats,
         tiering,
         tiering_stats_json,
+        persistent_feedback,
     })
 }
 
@@ -1977,6 +2136,95 @@ fn prepare_bytecode_cache(
         fingerprint,
         cache_file,
     }))
+}
+
+fn load_persistent_feedback(
+    run_options: &RunOptions<'_>,
+    path: &str,
+    unit: &IrUnit,
+) -> Result<PersistentFeedbackLoadReport, String> {
+    let Some(feedback_path) = run_options.persistent_feedback.read.as_deref() else {
+        return Ok(PersistentFeedbackLoadReport::new(
+            PersistentFeedbackStore::default(),
+            PersistentFeedbackStats::default(),
+        ));
+    };
+    let context = persistent_feedback_context(path, run_options, unit)?;
+    let bytes = match fs::read(feedback_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let stats = PersistentFeedbackStats {
+                files_considered: 1,
+                rejected_corrupt: 1,
+                fallback_to_baseline: true,
+                ..PersistentFeedbackStats::default()
+            };
+            return Ok(PersistentFeedbackLoadReport::new(
+                PersistentFeedbackStore::default(),
+                stats,
+            ));
+        }
+    };
+    Ok(context.validate_bytes(&bytes))
+}
+
+fn persistent_feedback_context(
+    path: &str,
+    run_options: &RunOptions<'_>,
+    unit: &IrUnit,
+) -> Result<PersistentFeedbackContext, String> {
+    let source = fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+    let source_path = fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let fingerprint = CacheFingerprint::from_inputs(
+        CacheFingerprintInput::new(source, env!("CARGO_PKG_VERSION"), rust_target_label())
+            .with_source_path(source_path)
+            .with_opt_level(run_options.opt_level.as_str())
+            .with_feature_flag("persistent_feedback", true)
+            .with_runtime_config(
+                "compile_options",
+                persistent_feedback_compile_options(run_options),
+            )
+            .with_runtime_config("script_env_count", run_options.env.len().to_string()),
+    )
+    .map_err(|error| format!("persistent feedback fingerprint: {error}"))?;
+    Ok(PersistentFeedbackContext::new(
+        fingerprint.digest,
+        env!("CARGO_PKG_VERSION"),
+        PHP_TARGET_VERSION,
+        persistent_feedback_compile_options(run_options),
+        stable_feedback_fingerprint(unit.to_snapshot_text().as_bytes()),
+        PersistentFeedbackEpochs::default(),
+        rust_target_label(),
+    ))
+}
+
+fn persistent_feedback_compile_options(run_options: &RunOptions<'_>) -> String {
+    format!(
+        "opt={},exec={},super={},quickening={},inline_caches={},bytecode_cache={},jit={},tiering={}",
+        run_options.opt_level.as_str(),
+        run_options.execution_format.as_str(),
+        run_options.superinstructions.as_str(),
+        on_off(run_options.quickening.enabled()),
+        on_off(run_options.inline_caches.enabled()),
+        run_options.bytecode_cache.mode.as_str(),
+        run_options.jit.as_str(),
+        on_off(run_options.tiering.enabled),
+    )
+}
+
+fn stable_feedback_fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 fn try_load_bytecode_cache(
@@ -2321,6 +2569,19 @@ fn write_tiering_stats_json(path: String, stats: &php_vm::TieringStats) -> Resul
     fs::write(path, stats.to_json()).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+fn write_persistent_feedback_stats_json(
+    path: String,
+    stats: &PersistentFeedbackStats,
+) -> Result<(), String> {
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    fs::write(path, stats.to_json()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn parse_env_assignment(value: &str) -> Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("run --env requires KEY=VALUE".to_string());
@@ -2371,7 +2632,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -2449,6 +2710,139 @@ fn collect_bytecode_patterns(dense: &DenseBytecodeUnit) -> BytecodePatternReport
     report
 }
 
+fn collect_baseline_native_stencil(dense: &DenseBytecodeUnit) -> BaselineNativeStencilReport {
+    let mut report = BaselineNativeStencilReport {
+        functions: dense.functions.len() as u64,
+        ..BaselineNativeStencilReport::default()
+    };
+    for function in &dense.functions {
+        for block in &function.blocks {
+            let start = block.first_instruction as usize;
+            let end = start + block.instruction_len as usize;
+            let Some(instructions) = function.instructions.get(start..end) else {
+                continue;
+            };
+            report.blocks += 1;
+            for instruction in instructions {
+                report.instructions += 1;
+                *report
+                    .opcode_counts
+                    .entry(instruction.opcode.as_str().to_string())
+                    .or_default() += 1;
+                let class = classify_baseline_stencil_instruction(instruction.opcode);
+                report.helper_calls += class.helper_calls;
+                report.deopt_slots += class.deopt_slots;
+                report.compile_cost_units += class.compile_cost_units;
+                report.code_size_bytes_estimate += class.code_size_bytes_estimate;
+                if let Some(reason) = class.unsupported_reason {
+                    report.unsupported_instructions += 1;
+                    *report
+                        .unsupported_by_reason
+                        .entry(reason.to_string())
+                        .or_default() += 1;
+                } else {
+                    report.stencilable_instructions += 1;
+                }
+            }
+        }
+    }
+    report
+}
+
+fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencilClass {
+    match opcode {
+        DenseOpcode::Nop => BaselineStencilClass {
+            helper_calls: 0,
+            deopt_slots: 0,
+            compile_cost_units: 1,
+            code_size_bytes_estimate: 1,
+            unsupported_reason: None,
+        },
+        DenseOpcode::LoadConst
+        | DenseOpcode::Move
+        | DenseOpcode::LoadLocal
+        | DenseOpcode::StoreLocal
+        | DenseOpcode::LoadConstEcho
+        | DenseOpcode::LoadLocalEcho
+        | DenseOpcode::Echo
+        | DenseOpcode::Return
+        | DenseOpcode::Discard => BaselineStencilClass {
+            helper_calls: 0,
+            deopt_slots: 1,
+            compile_cost_units: 1,
+            code_size_bytes_estimate: 8,
+            unsupported_reason: None,
+        },
+        DenseOpcode::Jump
+        | DenseOpcode::JumpIfFalse
+        | DenseOpcode::JumpIfTrue
+        | DenseOpcode::JumpIf => BaselineStencilClass {
+            helper_calls: 0,
+            deopt_slots: 1,
+            compile_cost_units: 2,
+            code_size_bytes_estimate: 12,
+            unsupported_reason: None,
+        },
+        DenseOpcode::BinaryAdd
+        | DenseOpcode::BinarySub
+        | DenseOpcode::BinaryMul
+        | DenseOpcode::BinaryDiv
+        | DenseOpcode::BinaryMod
+        | DenseOpcode::BinaryConcat
+        | DenseOpcode::BinaryPow
+        | DenseOpcode::BinaryBitAnd
+        | DenseOpcode::BinaryBitOr
+        | DenseOpcode::BinaryBitXor
+        | DenseOpcode::BinaryShiftLeft
+        | DenseOpcode::BinaryShiftRight
+        | DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship
+        | DenseOpcode::UnaryPlus
+        | DenseOpcode::UnaryMinus
+        | DenseOpcode::UnaryNot
+        | DenseOpcode::UnaryBitNot
+        | DenseOpcode::BinaryConcatEcho => BaselineStencilClass {
+            helper_calls: 1,
+            deopt_slots: 1,
+            compile_cost_units: 3,
+            code_size_bytes_estimate: 16,
+            unsupported_reason: None,
+        },
+        DenseOpcode::CallFunction => BaselineStencilClass {
+            helper_calls: 1,
+            deopt_slots: 1,
+            compile_cost_units: 5,
+            code_size_bytes_estimate: 0,
+            unsupported_reason: Some("call_frame_and_userland_side_effect_state"),
+        },
+        DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::FetchDim
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim => BaselineStencilClass {
+            helper_calls: 1,
+            deopt_slots: 1,
+            compile_cost_units: 5,
+            code_size_bytes_estimate: 0,
+            unsupported_reason: Some("array_reference_cow_and_key_state"),
+        },
+        DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => BaselineStencilClass {
+            helper_calls: 1,
+            deopt_slots: 1,
+            compile_cost_units: 5,
+            code_size_bytes_estimate: 0,
+            unsupported_reason: Some("foreach_iterator_state"),
+        },
+    }
+}
+
 fn bytecode_patterns_json(
     path: &str,
     dense: &DenseBytecodeUnit,
@@ -2469,6 +2863,52 @@ fn bytecode_patterns_json(
     push_string_u64_map_json(&mut out, &report.pairs);
     out.push_str(",\"triples\":");
     push_string_u64_map_json(&mut out, &report.triples);
+    out.push('}');
+    out
+}
+
+fn baseline_native_stencil_json(
+    path: &str,
+    dense: &DenseBytecodeUnit,
+    report: &BaselineNativeStencilReport,
+) -> String {
+    let mut out = String::new();
+    out.push_str("{\"ok\":true");
+    out.push_str(",\"schema_version\":1");
+    out.push_str(",\"backend\":\"baseline-native-stencil\"");
+    out.push_str(",\"status\":\"no-exec\"");
+    out.push_str(",\"native_execution\":false");
+    out.push_str(",\"executable_memory\":false");
+    out.push_str(",\"path\":\"");
+    out.push_str(&escape_json(path));
+    out.push('"');
+    out.push_str(",\"dense_bytecode_version\":");
+    out.push_str(&dense.version.to_string());
+    out.push_str(",\"functions\":");
+    out.push_str(&report.functions.to_string());
+    out.push_str(",\"blocks\":");
+    out.push_str(&report.blocks.to_string());
+    out.push_str(",\"instructions\":");
+    out.push_str(&report.instructions.to_string());
+    out.push_str(",\"stencilable_instructions\":");
+    out.push_str(&report.stencilable_instructions.to_string());
+    out.push_str(",\"unsupported_instructions\":");
+    out.push_str(&report.unsupported_instructions.to_string());
+    out.push_str(",\"helper_calls_estimate\":");
+    out.push_str(&report.helper_calls.to_string());
+    out.push_str(",\"required_deopt_slots\":");
+    out.push_str(&report.deopt_slots.to_string());
+    out.push_str(",\"compile_cost_units\":");
+    out.push_str(&report.compile_cost_units.to_string());
+    out.push_str(",\"code_size_bytes_estimate\":");
+    out.push_str(&report.code_size_bytes_estimate.to_string());
+    out.push_str(
+        ",\"cache_policy\":\"no native cache; future cache must key ABI/config/ISA/epoch\"",
+    );
+    out.push_str(",\"opcode_counts\":");
+    push_string_u64_map_json(&mut out, &report.opcode_counts);
+    out.push_str(",\"unsupported_by_reason\":");
+    push_string_u64_map_json(&mut out, &report.unsupported_by_reason);
     out.push('}');
     out
 }
@@ -2851,10 +3291,10 @@ fn workspace_relative_path(path: &str) -> PathBuf {
 mod tests {
     use super::{
         BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, JitStatsMode,
-        OptimizationLevel, QuickeningMode, cache_file_for, compile_pipeline_with_optimization,
-        parse_run_args, run, vm_compile_error_child_constant, vm_compile_error_child_method,
-        vm_compile_error_child_property, vm_compile_error_interface_constant,
-        vm_compile_error_interface_method_missing,
+        OptimizationLevel, PersistentFeedbackOptions, QuickeningMode, cache_file_for,
+        compile_pipeline_with_optimization, parse_run_args, run, vm_compile_error_child_constant,
+        vm_compile_error_child_method, vm_compile_error_child_property,
+        vm_compile_error_interface_constant, vm_compile_error_interface_method_missing,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
     use php_vm::{
@@ -2958,6 +3398,33 @@ mod tests {
         assert!(stdout.contains("\"optimizer\":{\"level\":\"1\""));
         assert!(stdout.contains("\"constant_folding_safe_subset\""));
         assert!(stdout.contains("\"transformations_attempted\""));
+    }
+
+    #[test]
+    fn dump_baseline_native_stencil_is_report_only() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-baseline-native-stencil".to_string(),
+                fixture("tests/fixtures/performance/perf_smoke/arrays_packed.php"),
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("\"backend\":\"baseline-native-stencil\""));
+        assert!(stdout.contains("\"status\":\"no-exec\""));
+        assert!(stdout.contains("\"native_execution\":false"));
+        assert!(stdout.contains("\"executable_memory\":false"));
+        assert!(stdout.contains("\"compile_cost_units\":"));
+        assert!(stdout.contains("\"code_size_bytes_estimate\":"));
+        assert!(stdout.contains("\"required_deopt_slots\":"));
+        assert!(stdout.contains("array_reference_cow_and_key_state"));
     }
 
     #[test]
@@ -3472,6 +3939,10 @@ mod tests {
         assert!(!options.tiering.collect_stats);
         assert_eq!(options.tiering_stats_json, None);
         assert_eq!(
+            options.persistent_feedback,
+            PersistentFeedbackOptions::default()
+        );
+        assert_eq!(
             options.env,
             vec![
                 ("COMPOSER_HOME".to_string(), "/tmp/composer".to_string()),
@@ -3510,6 +3981,9 @@ mod tests {
             "--tiering-guard-failure-threshold".to_string(),
             "6".to_string(),
             "--tiering-stats-json=target/performance/tiering.json".to_string(),
+            "--persistent-feedback-read=target/performance/feedback/input.pff".to_string(),
+            "--persistent-feedback-stats-json".to_string(),
+            "target/performance/feedback/stats.json".to_string(),
             "fixtures/runtime/valid/hello.php".to_string(),
         ];
 
@@ -3548,6 +4022,14 @@ mod tests {
             options.tiering_stats_json,
             Some("target/performance/tiering.json".to_string())
         );
+        assert_eq!(
+            options.persistent_feedback.read,
+            Some("target/performance/feedback/input.pff".to_string())
+        );
+        assert_eq!(
+            options.persistent_feedback.stats_json,
+            Some("target/performance/feedback/stats.json".to_string())
+        );
     }
 
     #[test]
@@ -3576,6 +4058,44 @@ mod tests {
         assert!(json.contains("\"function_entry_count\""));
         assert!(json.contains("\"tier0_interpreter_entries\""));
         assert!(json.contains("\"tiering_disabled_entries\""));
+    }
+
+    #[test]
+    fn run_persistent_feedback_stats_json_reports_corrupt_fallback_without_stdout_leak() {
+        let base = std::env::temp_dir().join(format!(
+            "phrust-vm-persistent-feedback-{}",
+            std::process::id()
+        ));
+        let feedback_path = base.with_extension("pff");
+        let stats_path = base.with_extension("json");
+        let _ = std::fs::remove_file(&feedback_path);
+        let _ = std::fs::remove_file(&stats_path);
+        std::fs::write(&feedback_path, "not-valid-feedback\n").expect("feedback fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--persistent-feedback-read".to_string(),
+                feedback_path.display().to_string(),
+                "--persistent-feedback-stats-json".to_string(),
+                stats_path.display().to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello runtime\n");
+        assert!(stderr.is_empty());
+        let json = std::fs::read_to_string(&stats_path).expect("feedback JSON should be written");
+        let _ = std::fs::remove_file(&feedback_path);
+        let _ = std::fs::remove_file(&stats_path);
+        assert!(json.contains("\"advisory_only\": true"));
+        assert!(json.contains("\"default_enabled\": false"));
+        assert!(json.contains("\"rejected_corrupt\": 1"));
+        assert!(json.contains("\"fallback_to_baseline\": true"));
     }
 
     #[test]

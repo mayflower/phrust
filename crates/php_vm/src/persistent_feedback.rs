@@ -1,0 +1,684 @@
+//! Advisory persistent feedback metadata for future cross-request acceleration.
+//!
+//! This module owns metadata shape and invalidation only. It never stores
+//! request-local VM values, object handles, arrays, resources, or non-interned
+//! request strings, and the VM does not currently use accepted entries to alter
+//! execution.
+
+use std::collections::BTreeMap;
+
+/// Stable line-format header for advisory persistent feedback files.
+pub const PERSISTENT_FEEDBACK_FORMAT_VERSION: &str = "phrust-persistent-feedback-v1";
+
+/// JSON/report schema version for persistent feedback stats.
+pub const PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION: u32 = 1;
+
+/// Invalidation epochs that must match before feedback can be advisory input.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistentFeedbackEpochs {
+    pub class_table: u64,
+    pub function_table: u64,
+    pub autoload: u64,
+    pub include_path: u64,
+}
+
+/// Current-source context used to validate persisted feedback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackContext {
+    pub source_fingerprint: String,
+    pub engine_version: String,
+    pub php_target_version: String,
+    pub compile_options: String,
+    pub ir_fingerprint: String,
+    pub epochs: PersistentFeedbackEpochs,
+    pub target_arch_config: String,
+}
+
+impl PersistentFeedbackContext {
+    #[must_use]
+    pub fn new(
+        source_fingerprint: impl Into<String>,
+        engine_version: impl Into<String>,
+        php_target_version: impl Into<String>,
+        compile_options: impl Into<String>,
+        ir_fingerprint: impl Into<String>,
+        epochs: PersistentFeedbackEpochs,
+        target_arch_config: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_fingerprint: source_fingerprint.into(),
+            engine_version: engine_version.into(),
+            php_target_version: php_target_version.into(),
+            compile_options: compile_options.into(),
+            ir_fingerprint: ir_fingerprint.into(),
+            epochs,
+            target_arch_config: target_arch_config.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn validate_bytes(&self, bytes: &[u8]) -> PersistentFeedbackLoadReport {
+        let mut stats = PersistentFeedbackStats {
+            files_considered: 1,
+            metadata_bytes: bytes.len() as u64,
+            ..PersistentFeedbackStats::default()
+        };
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                stats.rejected_corrupt = 1;
+                stats.fallback_to_baseline = true;
+                return PersistentFeedbackLoadReport::new(
+                    PersistentFeedbackStore::default(),
+                    stats,
+                );
+            }
+        };
+        let mut lines = text.lines();
+        match lines.next().map(str::trim) {
+            Some(PERSISTENT_FEEDBACK_FORMAT_VERSION) => {
+                stats.files_loaded = 1;
+            }
+            _ => {
+                stats.rejected_corrupt = 1;
+                stats.fallback_to_baseline = true;
+                return PersistentFeedbackLoadReport::new(
+                    PersistentFeedbackStore::default(),
+                    stats,
+                );
+            }
+        }
+
+        let mut store = PersistentFeedbackStore::default();
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            stats.entries_seen = stats.entries_seen.saturating_add(1);
+            match parse_entry_line(line) {
+                Ok(entry) => match self.validate_entry(entry) {
+                    Ok(entry) => {
+                        stats.entries_accepted = stats.entries_accepted.saturating_add(1);
+                        store.entries.push(entry);
+                    }
+                    Err(PersistentFeedbackRejectReason::Stale) => {
+                        stats.rejected_stale = stats.rejected_stale.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
+                    Err(PersistentFeedbackRejectReason::UserlandState) => {
+                        stats.rejected_userland_state =
+                            stats.rejected_userland_state.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
+                    Err(PersistentFeedbackRejectReason::Corrupt) => {
+                        stats.rejected_corrupt = stats.rejected_corrupt.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
+                },
+                Err(PersistentFeedbackRejectReason::UserlandState) => {
+                    stats.rejected_userland_state = stats.rejected_userland_state.saturating_add(1);
+                    stats.fallback_to_baseline = true;
+                }
+                Err(_) => {
+                    stats.rejected_corrupt = stats.rejected_corrupt.saturating_add(1);
+                    stats.fallback_to_baseline = true;
+                }
+            }
+        }
+
+        PersistentFeedbackLoadReport::new(store, stats)
+    }
+
+    fn validate_entry(
+        &self,
+        entry: PersistentFeedbackEntry,
+    ) -> Result<PersistentFeedbackEntry, PersistentFeedbackRejectReason> {
+        if entry.contains_userland_state {
+            return Err(PersistentFeedbackRejectReason::UserlandState);
+        }
+        let key = &entry.key;
+        if key.source_fingerprint != self.source_fingerprint
+            || key.engine_version != self.engine_version
+            || key.php_target_version != self.php_target_version
+            || key.compile_options != self.compile_options
+            || key.ir_fingerprint != self.ir_fingerprint
+            || key.epochs != self.epochs
+            || key.target_arch_config != self.target_arch_config
+        {
+            return Err(PersistentFeedbackRejectReason::Stale);
+        }
+        Ok(entry)
+    }
+}
+
+/// Stable key dimensions for one feedback slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackKey {
+    pub source_fingerprint: String,
+    pub engine_version: String,
+    pub php_target_version: String,
+    pub compile_options: String,
+    pub function_id: u32,
+    pub ir_fingerprint: String,
+    pub instruction_id: u32,
+    pub epochs: PersistentFeedbackEpochs,
+    pub target_arch_config: String,
+}
+
+/// Advisory persistent feedback entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackEntry {
+    pub key: PersistentFeedbackKey,
+    pub payload: PersistentFeedbackPayload,
+    contains_userland_state: bool,
+}
+
+/// Accepted metadata-only feedback entries.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentFeedbackStore {
+    entries: Vec<PersistentFeedbackEntry>,
+}
+
+impl PersistentFeedbackStore {
+    #[must_use]
+    pub fn entries(&self) -> &[PersistentFeedbackEntry] {
+        &self.entries
+    }
+}
+
+/// Result of loading one advisory feedback source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackLoadReport {
+    pub store: PersistentFeedbackStore,
+    pub stats: PersistentFeedbackStats,
+}
+
+impl PersistentFeedbackLoadReport {
+    #[must_use]
+    pub const fn new(store: PersistentFeedbackStore, stats: PersistentFeedbackStats) -> Self {
+        Self { store, stats }
+    }
+}
+
+/// Feedback load/validation counters. These are reported outside PHP stdout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackStats {
+    pub schema_version: u32,
+    pub advisory_only: bool,
+    pub default_enabled: bool,
+    pub files_considered: u64,
+    pub files_loaded: u64,
+    pub entries_seen: u64,
+    pub entries_accepted: u64,
+    pub rejected_stale: u64,
+    pub rejected_corrupt: u64,
+    pub rejected_userland_state: u64,
+    pub fallback_to_baseline: bool,
+    pub metadata_bytes: u64,
+}
+
+impl Default for PersistentFeedbackStats {
+    fn default() -> Self {
+        Self {
+            schema_version: PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION,
+            advisory_only: true,
+            default_enabled: false,
+            files_considered: 0,
+            files_loaded: 0,
+            entries_seen: 0,
+            entries_accepted: 0,
+            rejected_stale: 0,
+            rejected_corrupt: 0,
+            rejected_userland_state: 0,
+            fallback_to_baseline: false,
+            metadata_bytes: 0,
+        }
+    }
+}
+
+impl PersistentFeedbackStats {
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"schema_version\": {},\n",
+                "  \"advisory_only\": {},\n",
+                "  \"default_enabled\": {},\n",
+                "  \"files_considered\": {},\n",
+                "  \"files_loaded\": {},\n",
+                "  \"entries_seen\": {},\n",
+                "  \"entries_accepted\": {},\n",
+                "  \"rejected_stale\": {},\n",
+                "  \"rejected_corrupt\": {},\n",
+                "  \"rejected_userland_state\": {},\n",
+                "  \"fallback_to_baseline\": {},\n",
+                "  \"metadata_bytes\": {}\n",
+                "}}\n"
+            ),
+            self.schema_version,
+            self.advisory_only,
+            self.default_enabled,
+            self.files_considered,
+            self.files_loaded,
+            self.entries_seen,
+            self.entries_accepted,
+            self.rejected_stale,
+            self.rejected_corrupt,
+            self.rejected_userland_state,
+            self.fallback_to_baseline,
+            self.metadata_bytes
+        )
+    }
+}
+
+/// Monomorphic/polymorphic callsite state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PersistentCallsiteState {
+    #[default]
+    Cold,
+    Monomorphic,
+    Polymorphic,
+    Megamorphic,
+    Blacklisted,
+}
+
+/// Scalar metadata observed at a feedback site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentScalarKind {
+    Null,
+    Bool,
+    Int,
+    Float,
+    String,
+    NumericString,
+    Array,
+    Object,
+    Resource,
+    Unknown,
+}
+
+/// Array layout metadata only, never array contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentArrayLayout {
+    Empty,
+    Packed,
+    Mixed,
+    Unknown,
+}
+
+/// Observed array key shape metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentArrayKeyShape {
+    IntOnly,
+    StringOnly,
+    IntString,
+    Unknown,
+}
+
+/// Object shape metadata only, never object handles or property values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistentObjectShapeObservation {
+    pub class_id: u32,
+    pub layout_epoch: u64,
+    pub property_slot: Option<u32>,
+}
+
+/// Branch bias metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentBranchBias {
+    Unknown,
+    MostlyTrue,
+    MostlyFalse,
+    Balanced,
+}
+
+/// Include/autoload target stability summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentIncludeAutoloadStability {
+    pub stable: bool,
+    pub target_fingerprint: Option<String>,
+}
+
+/// Guard failure and blacklist summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistentGuardFailureSummary {
+    pub failures: u64,
+    pub blacklisted: bool,
+}
+
+/// Metadata-only payload for one feedback slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentFeedbackPayload {
+    pub callsite_state: PersistentCallsiteState,
+    pub scalar_kinds: Vec<PersistentScalarKind>,
+    pub array_layout: Option<PersistentArrayLayout>,
+    pub array_key_shape: Option<PersistentArrayKeyShape>,
+    pub object_shape: Option<PersistentObjectShapeObservation>,
+    pub branch_bias: Option<PersistentBranchBias>,
+    pub include_autoload: Option<PersistentIncludeAutoloadStability>,
+    pub guard_failures: PersistentGuardFailureSummary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentFeedbackRejectReason {
+    Stale,
+    Corrupt,
+    UserlandState,
+}
+
+fn parse_entry_line(line: &str) -> Result<PersistentFeedbackEntry, PersistentFeedbackRejectReason> {
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("entry") {
+        return Err(PersistentFeedbackRejectReason::Corrupt);
+    }
+    let mut fields = BTreeMap::new();
+    for part in parts {
+        let Some((name, value)) = part.split_once('=') else {
+            return Err(PersistentFeedbackRejectReason::Corrupt);
+        };
+        if name.is_empty() {
+            return Err(PersistentFeedbackRejectReason::Corrupt);
+        }
+        fields.insert(name, value);
+    }
+
+    let contains_userland_state = contains_forbidden_userland_state(&fields);
+    if contains_userland_state {
+        return Err(PersistentFeedbackRejectReason::UserlandState);
+    }
+
+    let key = PersistentFeedbackKey {
+        source_fingerprint: required(&fields, "source")?.to_owned(),
+        engine_version: required(&fields, "engine")?.to_owned(),
+        php_target_version: required(&fields, "php")?.to_owned(),
+        compile_options: required(&fields, "compile")?.to_owned(),
+        function_id: parse_u32(required(&fields, "function")?)?,
+        ir_fingerprint: required(&fields, "ir")?.to_owned(),
+        instruction_id: parse_u32(required(&fields, "instruction")?)?,
+        epochs: PersistentFeedbackEpochs {
+            class_table: parse_u64(required(&fields, "class_epoch")?)?,
+            function_table: parse_u64(required(&fields, "function_epoch")?)?,
+            autoload: parse_u64(required(&fields, "autoload_epoch")?)?,
+            include_path: parse_u64(required(&fields, "include_epoch")?)?,
+        },
+        target_arch_config: required(&fields, "target")?.to_owned(),
+    };
+    let payload = PersistentFeedbackPayload {
+        callsite_state: parse_callsite_state(required(&fields, "state")?)?,
+        scalar_kinds: parse_scalar_kinds(fields.get("scalars").copied().unwrap_or("unknown"))?,
+        array_layout: parse_optional_array_layout(fields.get("array_layout").copied())?,
+        array_key_shape: parse_optional_array_key_shape(fields.get("array_key").copied())?,
+        object_shape: parse_object_shape(&fields)?,
+        branch_bias: parse_optional_branch_bias(fields.get("branch").copied())?,
+        include_autoload: parse_include_autoload(&fields)?,
+        guard_failures: PersistentGuardFailureSummary {
+            failures: parse_u64(fields.get("guard_failures").copied().unwrap_or("0"))?,
+            blacklisted: parse_bool(fields.get("blacklisted").copied().unwrap_or("false"))?,
+        },
+    };
+
+    Ok(PersistentFeedbackEntry {
+        key,
+        payload,
+        contains_userland_state,
+    })
+}
+
+fn contains_forbidden_userland_state(fields: &BTreeMap<&str, &str>) -> bool {
+    for forbidden in [
+        "userland_value",
+        "object_handle",
+        "array_value",
+        "resource_handle",
+    ] {
+        if fields
+            .get(forbidden)
+            .is_some_and(|value| !matches!(*value, "" | "none" | "false"))
+        {
+            return true;
+        }
+    }
+    fields.get("request_string").is_some_and(|value| {
+        !matches!(
+            *value,
+            "" | "none" | "false" | "interned" | "engine_immutable"
+        )
+    })
+}
+
+fn required<'a>(
+    fields: &'a BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<&'a str, PersistentFeedbackRejectReason> {
+    fields
+        .get(name)
+        .copied()
+        .filter(|value| !value.is_empty())
+        .ok_or(PersistentFeedbackRejectReason::Corrupt)
+}
+
+fn parse_u32(value: &str) -> Result<u32, PersistentFeedbackRejectReason> {
+    value
+        .parse()
+        .map_err(|_| PersistentFeedbackRejectReason::Corrupt)
+}
+
+fn parse_u64(value: &str) -> Result<u64, PersistentFeedbackRejectReason> {
+    value
+        .parse()
+        .map_err(|_| PersistentFeedbackRejectReason::Corrupt)
+}
+
+fn parse_bool(value: &str) -> Result<bool, PersistentFeedbackRejectReason> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(PersistentFeedbackRejectReason::Corrupt),
+    }
+}
+
+fn parse_callsite_state(
+    value: &str,
+) -> Result<PersistentCallsiteState, PersistentFeedbackRejectReason> {
+    match value {
+        "cold" => Ok(PersistentCallsiteState::Cold),
+        "monomorphic" => Ok(PersistentCallsiteState::Monomorphic),
+        "polymorphic" => Ok(PersistentCallsiteState::Polymorphic),
+        "megamorphic" => Ok(PersistentCallsiteState::Megamorphic),
+        "blacklisted" => Ok(PersistentCallsiteState::Blacklisted),
+        _ => Err(PersistentFeedbackRejectReason::Corrupt),
+    }
+}
+
+fn parse_scalar_kinds(
+    value: &str,
+) -> Result<Vec<PersistentScalarKind>, PersistentFeedbackRejectReason> {
+    if value == "none" || value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|scalar| match scalar {
+            "null" => Ok(PersistentScalarKind::Null),
+            "bool" => Ok(PersistentScalarKind::Bool),
+            "int" => Ok(PersistentScalarKind::Int),
+            "float" => Ok(PersistentScalarKind::Float),
+            "string" => Ok(PersistentScalarKind::String),
+            "numeric_string" => Ok(PersistentScalarKind::NumericString),
+            "array" => Ok(PersistentScalarKind::Array),
+            "object" => Ok(PersistentScalarKind::Object),
+            "resource" => Ok(PersistentScalarKind::Resource),
+            "unknown" => Ok(PersistentScalarKind::Unknown),
+            _ => Err(PersistentFeedbackRejectReason::Corrupt),
+        })
+        .collect()
+}
+
+fn parse_optional_array_layout(
+    value: Option<&str>,
+) -> Result<Option<PersistentArrayLayout>, PersistentFeedbackRejectReason> {
+    value
+        .map(|value| match value {
+            "empty" => Ok(PersistentArrayLayout::Empty),
+            "packed" => Ok(PersistentArrayLayout::Packed),
+            "mixed" => Ok(PersistentArrayLayout::Mixed),
+            "unknown" => Ok(PersistentArrayLayout::Unknown),
+            _ => Err(PersistentFeedbackRejectReason::Corrupt),
+        })
+        .transpose()
+}
+
+fn parse_optional_array_key_shape(
+    value: Option<&str>,
+) -> Result<Option<PersistentArrayKeyShape>, PersistentFeedbackRejectReason> {
+    value
+        .map(|value| match value {
+            "int" => Ok(PersistentArrayKeyShape::IntOnly),
+            "string" => Ok(PersistentArrayKeyShape::StringOnly),
+            "int_string" => Ok(PersistentArrayKeyShape::IntString),
+            "unknown" => Ok(PersistentArrayKeyShape::Unknown),
+            _ => Err(PersistentFeedbackRejectReason::Corrupt),
+        })
+        .transpose()
+}
+
+fn parse_object_shape(
+    fields: &BTreeMap<&str, &str>,
+) -> Result<Option<PersistentObjectShapeObservation>, PersistentFeedbackRejectReason> {
+    let Some(class_id) = fields.get("object_class_id").copied() else {
+        return Ok(None);
+    };
+    let layout_epoch = required(fields, "object_layout_epoch")?;
+    let property_slot = match fields.get("property_slot").copied() {
+        Some("none") | None => None,
+        Some(value) => Some(parse_u32(value)?),
+    };
+    Ok(Some(PersistentObjectShapeObservation {
+        class_id: parse_u32(class_id)?,
+        layout_epoch: parse_u64(layout_epoch)?,
+        property_slot,
+    }))
+}
+
+fn parse_optional_branch_bias(
+    value: Option<&str>,
+) -> Result<Option<PersistentBranchBias>, PersistentFeedbackRejectReason> {
+    value
+        .map(|value| match value {
+            "unknown" => Ok(PersistentBranchBias::Unknown),
+            "mostly_true" => Ok(PersistentBranchBias::MostlyTrue),
+            "mostly_false" => Ok(PersistentBranchBias::MostlyFalse),
+            "balanced" => Ok(PersistentBranchBias::Balanced),
+            _ => Err(PersistentFeedbackRejectReason::Corrupt),
+        })
+        .transpose()
+}
+
+fn parse_include_autoload(
+    fields: &BTreeMap<&str, &str>,
+) -> Result<Option<PersistentIncludeAutoloadStability>, PersistentFeedbackRejectReason> {
+    let Some(stable) = fields.get("include_autoload_stable").copied() else {
+        return Ok(None);
+    };
+    Ok(Some(PersistentIncludeAutoloadStability {
+        stable: parse_bool(stable)?,
+        target_fingerprint: fields
+            .get("include_autoload_target")
+            .copied()
+            .filter(|value| !value.is_empty() && *value != "none")
+            .map(ToOwned::to_owned),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> PersistentFeedbackContext {
+        PersistentFeedbackContext::new(
+            "source-1",
+            "engine-1",
+            "8.5.7",
+            "opt=2,exec=auto",
+            "ir-1",
+            PersistentFeedbackEpochs {
+                class_table: 1,
+                function_table: 2,
+                autoload: 3,
+                include_path: 4,
+            },
+            "test-target",
+        )
+    }
+
+    fn valid_entry() -> String {
+        format!(
+            "{PERSISTENT_FEEDBACK_FORMAT_VERSION}\n\
+             entry source=source-1 engine=engine-1 php=8.5.7 compile=opt=2,exec=auto \
+             function=0 ir=ir-1 instruction=7 class_epoch=1 function_epoch=2 \
+             autoload_epoch=3 include_epoch=4 target=test-target state=monomorphic \
+             scalars=int,numeric_string array_layout=packed array_key=int \
+             branch=mostly_true guard_failures=0 blacklisted=false\n"
+        )
+    }
+
+    #[test]
+    fn accepts_metadata_only_feedback() {
+        let report = context().validate_bytes(valid_entry().as_bytes());
+
+        assert_eq!(report.stats.entries_seen, 1);
+        assert_eq!(report.stats.entries_accepted, 1);
+        assert_eq!(report.stats.rejected_stale, 0);
+        assert!(!report.stats.fallback_to_baseline);
+        assert_eq!(report.store.entries().len(), 1);
+        assert_eq!(
+            report.store.entries()[0].payload.callsite_state,
+            PersistentCallsiteState::Monomorphic
+        );
+    }
+
+    #[test]
+    fn stale_source_feedback_falls_back_to_baseline() {
+        let text = valid_entry().replace("source=source-1", "source=old");
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.entries_seen, 1);
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert_eq!(report.stats.rejected_stale, 1);
+        assert!(report.stats.fallback_to_baseline);
+    }
+
+    #[test]
+    fn corrupt_feedback_falls_back_to_baseline() {
+        let report = context().validate_bytes(b"not-a-feedback-file\nentry");
+
+        assert_eq!(report.stats.rejected_corrupt, 1);
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert!(report.stats.fallback_to_baseline);
+    }
+
+    #[test]
+    fn userland_state_is_rejected() {
+        let text = valid_entry().replace("blacklisted=false", "blacklisted=false object_handle=9");
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.rejected_userland_state, 1);
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert!(report.stats.fallback_to_baseline);
+    }
+
+    #[test]
+    fn stats_json_is_stable_and_outside_php_stdout() {
+        let json = context()
+            .validate_bytes(valid_entry().as_bytes())
+            .stats
+            .to_json();
+
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"advisory_only\": true"));
+        assert!(json.contains("\"default_enabled\": false"));
+        assert!(json.contains("\"entries_accepted\": 1"));
+    }
+}

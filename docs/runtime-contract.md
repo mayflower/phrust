@@ -239,7 +239,14 @@ try/finally bodies, and object-allocation bodies that may retain
 destructor-sensitive values. Frame/register counters include
 `frames_allocated`, `frames_reused`, `register_files_allocated`,
 `register_files_reused`, and `frame_reuse_blocked_by_reason`; the older
-`frame_allocations` and `frame_reuses` keys remain for compatibility.
+`frame_allocations` and `frame_reuses` keys remain for compatibility. FPE-19
+also reports the same safe reuse boundary through request-arena counters:
+`request_arena_allocations`, `request_arena_bytes`, `request_pool_resets`,
+`persistent_engine_allocations`, `persistent_engine_bytes`,
+`arena_fallback_allocations_by_reason`, and
+`destructor_sensitive_arena_blocks`. Persistent-engine counters stay zero until
+an owning immutable metadata API lands; no userland value, object, resource, or
+reference state is preserved across requests.
 
 Local slots are indexed by `LocalId` in the IR function table. The VM stores
 `ValueSlot`s in the slot array so ordinary assignments stay by-value while the
