@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"objects.magic",
+  "priority":10,
+  "selected_manifest":"tests/phpt/manifests/modules/objects.magic.selected.jsonl",
+  "corpus_count":8,
+  "selected_count":8,
+  "pass_count":8,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["__get","__set","__isset","__unset","__call","__callStatic","__invoke","__toString"],
+  "non_scope":["serialization magic","__debugInfo","recursive by-reference magic lvalues","Reflection of magic methods"],
+  "target_gates":["nix develop -c just phpt-dev-module MODULE=objects.magic"],
+  "next_step":"Prompt 2.2 magic MVP is green; keep selected magic-method contracts green until final objects-core closeout."
+}
