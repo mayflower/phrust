@@ -857,6 +857,10 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("get_resource_id", "standard"))
                 .with_function(FunctionDescriptor::php("get_resource_type", "standard"))
                 .with_function(FunctionDescriptor::php("getimagesize", "standard"))
+                .with_function(FunctionDescriptor::php(
+                    "getimagesizefromstring",
+                    "standard",
+                ))
                 .with_function(FunctionDescriptor::php("getcwd", "standard"))
                 .with_function(FunctionDescriptor::php("getenv", "standard"))
                 .with_function(FunctionDescriptor::php("gettype", "standard"))
@@ -1710,11 +1714,14 @@ impl ExtensionRegistry {
                     ConstantValue::String("bounded-utf8-ascii"),
                 )),
             ExtensionDescriptor::new("zlib")
+                .with_function(FunctionDescriptor::php("gzdeflate", "zlib"))
                 .with_function(FunctionDescriptor::php("gzcompress", "zlib"))
                 .with_function(FunctionDescriptor::php("gzdecode", "zlib"))
                 .with_function(FunctionDescriptor::php("gzencode", "zlib"))
+                .with_function(FunctionDescriptor::php("gzinflate", "zlib"))
                 .with_function(FunctionDescriptor::php("gzuncompress", "zlib"))
                 .with_function(FunctionDescriptor::php("zlib_decode", "zlib"))
+                .with_function(FunctionDescriptor::php("zlib_encode", "zlib"))
                 .with_constant(ConstantDescriptor::with_value(
                     "FORCE_DEFLATE",
                     "zlib",
@@ -1747,6 +1754,7 @@ impl ExtensionRegistry {
             )),
             ExtensionDescriptor::new("fileinfo")
                 .with_function(FunctionDescriptor::php("finfo_buffer", "fileinfo"))
+                .with_function(FunctionDescriptor::php("finfo_close", "fileinfo"))
                 .with_function(FunctionDescriptor::php("finfo_file", "fileinfo"))
                 .with_function(FunctionDescriptor::php("finfo_open", "fileinfo"))
                 .with_constant(ConstantDescriptor::with_value(
@@ -1770,7 +1778,21 @@ impl ExtensionRegistry {
                     ConstantValue::Int(1040),
                 )),
             ExtensionDescriptor::new("exif")
-                .with_function(FunctionDescriptor::php("exif_imagetype", "exif")),
+                .with_function(FunctionDescriptor::php("exif_imagetype", "exif"))
+                .with_function(FunctionDescriptor::php("exif_read_data", "exif")),
+            ExtensionDescriptor::new("gd")
+                .with_function(FunctionDescriptor::php("gd_info", "gd"))
+                .with_function(FunctionDescriptor::php("imagecopyresampled", "gd"))
+                .with_function(FunctionDescriptor::php("imagecreatefromjpeg", "gd"))
+                .with_function(FunctionDescriptor::php("imagecreatefrompng", "gd"))
+                .with_function(FunctionDescriptor::php("imagecreatefromstring", "gd"))
+                .with_function(FunctionDescriptor::php("imagecreatetruecolor", "gd"))
+                .with_function(FunctionDescriptor::php("imagedestroy", "gd"))
+                .with_function(FunctionDescriptor::php("imagejpeg", "gd"))
+                .with_function(FunctionDescriptor::php("imagepng", "gd"))
+                .with_function(FunctionDescriptor::php("imagesx", "gd"))
+                .with_function(FunctionDescriptor::php("imagesy", "gd"))
+                .with_class(ClassDescriptor::new("GdImage", "gd", ClassKind::Class)),
             ExtensionDescriptor::new("random")
                 .with_function(FunctionDescriptor::php("random_bytes", "random"))
                 .with_function(FunctionDescriptor::php("random_int", "random")),

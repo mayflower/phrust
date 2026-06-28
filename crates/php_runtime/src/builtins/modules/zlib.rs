@@ -7,13 +7,15 @@ use crate::builtins::{
 };
 use flate2::Compression;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
-use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use std::io::{Read, Write};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new("gzdeflate", builtin_gzdeflate, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzcompress", builtin_gzcompress, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzdecode", builtin_gzdecode, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzencode", builtin_gzencode, BuiltinCompatibility::Php),
+    BuiltinEntry::new("gzinflate", builtin_gzinflate, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "gzuncompress",
         builtin_gzuncompress,
@@ -24,7 +26,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_zlib_decode,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "zlib_encode",
+        builtin_zlib_encode,
+        BuiltinCompatibility::Php,
+    ),
 ];
+
+pub(in crate::builtins::modules) const ZLIB_ENCODING_RAW: i64 = -15;
+pub(in crate::builtins::modules) const ZLIB_ENCODING_GZIP: i64 = 31;
+pub(in crate::builtins::modules) const ZLIB_ENCODING_DEFLATE: i64 = 15;
 
 fn builtin_gzencode(
     _context: &mut BuiltinContext<'_>,
@@ -60,6 +71,23 @@ fn builtin_gzcompress(
     Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
 }
 
+fn builtin_gzdeflate(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 3 {
+        return Err(arity_error("gzdeflate", "one to three argument(s)"));
+    }
+    let input = string_arg("gzdeflate", &args[0])?;
+    let level = compression_level("gzdeflate", args.get(1))?;
+    let mut encoder = DeflateEncoder::new(Vec::new(), level);
+    if encoder.write_all(input.as_bytes()).is_err() {
+        return Ok(Value::Bool(false));
+    }
+    Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+}
+
 fn builtin_gzdecode(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -84,6 +112,18 @@ fn builtin_gzuncompress(
     decode_with(ZlibDecoder::new(input.as_bytes()))
 }
 
+fn builtin_gzinflate(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_error("gzinflate", "one or two argument(s)"));
+    }
+    let input = string_arg("gzinflate", &args[0])?;
+    decode_with(DeflateDecoder::new(input.as_bytes()))
+}
+
 fn builtin_zlib_decode(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -103,6 +143,43 @@ fn builtin_zlib_decode(
         return zlib;
     }
     decode_with(DeflateDecoder::new(bytes))
+}
+
+fn builtin_zlib_encode(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_error("zlib_encode", "two or three argument(s)"));
+    }
+    let input = string_arg("zlib_encode", &args[0])?;
+    let encoding = int_arg("zlib_encode", &args[1])?;
+    let level = compression_level("zlib_encode", args.get(2))?;
+    match encoding {
+        ZLIB_ENCODING_RAW => {
+            let mut encoder = DeflateEncoder::new(Vec::new(), level);
+            if encoder.write_all(input.as_bytes()).is_err() {
+                return Ok(Value::Bool(false));
+            }
+            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+        }
+        ZLIB_ENCODING_GZIP => {
+            let mut encoder = GzEncoder::new(Vec::new(), level);
+            if encoder.write_all(input.as_bytes()).is_err() {
+                return Ok(Value::Bool(false));
+            }
+            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+        }
+        ZLIB_ENCODING_DEFLATE => {
+            let mut encoder = ZlibEncoder::new(Vec::new(), level);
+            if encoder.write_all(input.as_bytes()).is_err() {
+                return Ok(Value::Bool(false));
+            }
+            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
 }
 
 fn compression_level(

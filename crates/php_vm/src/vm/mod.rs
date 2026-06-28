@@ -28939,6 +28939,9 @@ fn object_instanceof(
             if let Some(result) = internal_zip_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if let Some(result) = internal_gd_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
             class_is_or_implements(compiled, &object.class_name(), class_name)
         }
         _ => Ok(false),
@@ -30440,6 +30443,17 @@ fn internal_zip_instanceof(object_class: &str, target_class: &str) -> Option<boo
     Some(normalize_class_name(target_class) == "ziparchive")
 }
 
+fn is_gd_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "gdimage"
+}
+
+fn internal_gd_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_gd_runtime_class(object_class) {
+        return None;
+    }
+    Some(normalize_class_name(target_class) == "gdimage")
+}
+
 fn new_zip_object(
     class_name: &str,
     args: Vec<CallArgument>,
@@ -30898,6 +30912,17 @@ fn call_zip_method(
                 None => Ok(Value::Bool(false)),
             }
         }
+        "getnameindex" => {
+            validate_zip_arg_count("ZipArchive::getNameIndex", values.len(), 1, 2)?;
+            let index = to_int(&values[0])?;
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_name_index(&path, index)? {
+                Some(name) => Ok(Value::string(name.into_bytes())),
+                None => Ok(Value::Bool(false)),
+            }
+        }
         "extractto" => {
             validate_zip_arg_count("ZipArchive::extractTo", values.len(), 1, 2)?;
             let destination = to_string(&values[0])?.to_string_lossy();
@@ -31047,6 +31072,19 @@ fn zip_stat_index(path: &Path, index: i64) -> Result<Option<PhpArray>, String> {
     }
     let file = zip_file_by_index(&mut archive, index, path)?;
     Ok(Some(zip_file_stat(index, &file)))
+}
+
+fn zip_name_index(path: &Path, index: i64) -> Result<Option<String>, String> {
+    if index < 0 {
+        return Ok(None);
+    }
+    let mut archive = zip_open_archive(path)?;
+    let index = index as usize;
+    if index >= archive.len() {
+        return Ok(None);
+    }
+    let file = zip_file_by_index(&mut archive, index, path)?;
+    Ok(Some(file.name().to_owned()))
 }
 
 fn zip_open_archive(path: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
@@ -34143,6 +34181,7 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
         "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
         "pharfileinfo" => Some(internal_empty_class_entry("pharfileinfo", "PharFileInfo")),
         "ziparchive" => Some(internal_empty_class_entry("ziparchive", "ZipArchive")),
+        "gdimage" => Some(internal_empty_class_entry("gdimage", "GdImage")),
         _ => None,
     }
 }

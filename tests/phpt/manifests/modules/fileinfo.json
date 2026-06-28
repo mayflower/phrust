@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"fileinfo",
+  "priority":"media/archive MIME detection",
+  "selected_manifest":"tests/phpt/manifests/modules/fileinfo.selected.jsonl",
+  "corpus_count":1,
+  "selected_count":1,
+  "pass_count":1,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["finfo_open","finfo_close","finfo_file","finfo_buffer","mime_content_type","common upload MIME sniffing"],
+  "non_scope":["full libmagic database","host magic.mgc loading","obscure media formats"],
+  "target_gates":["nix develop -c cargo test -p php_runtime fileinfo","nix develop -c just phpt-dev-module MODULE=fileinfo","nix develop -c just verify-phpt"],
+  "next_step":"Grow selected MIME slices only when deterministic libmagic-independent behavior is implemented."
+}

@@ -6,6 +6,7 @@ pub(in crate::builtins) mod exif;
 pub(in crate::builtins) mod fileinfo;
 pub(in crate::builtins) mod filesystem;
 pub(in crate::builtins) mod filter;
+pub(in crate::builtins) mod gd;
 pub(in crate::builtins) mod hash;
 pub(in crate::builtins) mod iconv;
 pub(in crate::builtins) mod intl;

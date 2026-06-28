@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"zlib",
+  "priority":"archive and HTTP payload compression",
+  "selected_manifest":"tests/phpt/manifests/modules/zlib.selected.jsonl",
+  "corpus_count":1,
+  "selected_count":1,
+  "pass_count":1,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["gzencode","gzdecode","gzcompress","gzuncompress","gzdeflate","gzinflate","zlib_encode","zlib_decode"],
+  "non_scope":["stream filters","SAPI output compression","all window-size edge cases"],
+  "target_gates":["nix develop -c cargo test -p php_runtime zlib","nix develop -c just phpt-dev-module MODULE=zlib","nix develop -c just verify-stdlib"],
+  "next_step":"Keep roundtrip and invalid-data behavior stable before expanding edge-case parity."
+}

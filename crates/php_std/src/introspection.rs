@@ -88,6 +88,7 @@ mod tests {
                 "exif",
                 "fileinfo",
                 "filter",
+                "gd",
                 "hash",
                 "iconv",
                 "json",
@@ -112,7 +113,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 25);
+        assert_eq!(array.len(), 26);
     }
 
     #[test]
@@ -126,6 +127,7 @@ mod tests {
         assert!(function_exists(&registry, "mysqli_query"));
         assert!(function_exists(&registry, "openssl_digest"));
         assert!(function_exists(&registry, "pdo_drivers"));
+        assert!(function_exists(&registry, "imagecreatefromstring"));
         assert!(!function_exists(&registry, "__php_std_test_probe"));
         assert!(!function_exists(&registry, "composer_missing_function"));
     }

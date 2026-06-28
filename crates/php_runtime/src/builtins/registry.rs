@@ -93,6 +93,7 @@ const MODULE_SLICES: &[&[BuiltinEntry]] = &[
     modules::zlib::ENTRIES,
     modules::fileinfo::ENTRIES,
     modules::exif::ENTRIES,
+    modules::gd::ENTRIES,
     modules::math::ENTRIES,
     modules::filesystem::ENTRIES,
     modules::streams::ENTRIES,

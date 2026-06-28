@@ -18,7 +18,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "tokio"] }
 php_executor = { path = "../php_executor", version = "0.0.0" }
 php_runtime = { path = "../php_runtime", version = "0.0.0" }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1", features = ["std"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["io"] }

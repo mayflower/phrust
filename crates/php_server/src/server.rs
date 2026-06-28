@@ -27,12 +27,13 @@ use php_runtime::api::{
     PHP_SESSION_ACTIVE, RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState,
     SessionState, parse_cookie_header, parse_form_urlencoded_body,
 };
+use rustls_pki_types::pem::PemObject;
 use std::{
     convert::Infallible,
     fmt,
     fs::Metadata,
     fs::OpenOptions,
-    io::{BufReader, SeekFrom, Write},
+    io::{SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -436,14 +437,13 @@ fn build_tls_acceptor(
 }
 
 fn load_tls_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ServerError> {
-    let file = std::fs::File::open(path).map_err(|error| {
-        ServerError::Tls(format!(
-            "TLS certificate `{}` cannot be read: {error}",
-            path.display()
-        ))
-    })?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|error| {
+            ServerError::Tls(format!(
+                "TLS certificate `{}` cannot be parsed: {error}",
+                path.display()
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             ServerError::Tls(format!(
@@ -461,26 +461,12 @@ fn load_tls_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ServerErr
 }
 
 fn load_tls_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ServerError> {
-    let file = std::fs::File::open(path).map_err(|error| {
+    PrivateKeyDer::from_pem_file(path).map_err(|error| {
         ServerError::Tls(format!(
-            "TLS private key `{}` cannot be read: {error}",
+            "TLS private key `{}` cannot be parsed: {error}",
             path.display()
         ))
-    })?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| {
-            ServerError::Tls(format!(
-                "TLS private key `{}` cannot be parsed: {error}",
-                path.display()
-            ))
-        })?
-        .ok_or_else(|| {
-            ServerError::Tls(format!(
-                "TLS private key `{}` does not contain a private key",
-                path.display()
-            ))
-        })
+    })
 }
 
 fn preload_script_cache(

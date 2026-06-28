@@ -12,6 +12,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_finfo_buffer,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "finfo_close",
+        builtin_finfo_close,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("finfo_file", builtin_finfo_file, BuiltinCompatibility::Php),
     BuiltinEntry::new("finfo_open", builtin_finfo_open, BuiltinCompatibility::Php),
     BuiltinEntry::new(
@@ -44,6 +49,17 @@ fn builtin_finfo_open(
         return Ok(Value::Bool(false));
     };
     Ok(Value::Resource(resources.register_fileinfo()))
+}
+
+fn builtin_finfo_close(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error("finfo_close", "one argument"));
+    }
+    Ok(Value::Bool(is_fileinfo_resource(&args[0])))
 }
 
 fn builtin_finfo_buffer(
@@ -131,6 +147,11 @@ pub(in crate::builtins::modules) fn mime_for_bytes(
     bytes: &[u8],
     path: Option<&str>,
 ) -> &'static str {
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .skip_while(|byte| byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
     if bytes.starts_with(b"\xFF\xD8\xFF") {
         "image/jpeg"
     } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
@@ -143,10 +164,28 @@ pub(in crate::builtins::modules) fn mime_for_bytes(
         "image/avif"
     } else if bytes.starts_with(b"%PDF-") {
         "application/pdf"
+    } else if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        "application/zip"
+    } else if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
+        "application/json"
+    } else if trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<svg") {
+        "text/xml"
+    } else if is_likely_text(bytes) {
+        "text/plain"
     } else {
         path.and_then(mime_from_extension)
             .unwrap_or("application/octet-stream")
     }
+}
+
+fn is_likely_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| matches!(*byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e) || *byte >= 0x80)
 }
 
 fn mime_from_extension(path: &str) -> Option<&'static str> {

@@ -1,38 +1,48 @@
 # gd
 
-- Strategy: classify, do not implement image processing
-- Classification: out-of-scope
+- Priority: bounded GD-compatible media fallback
 - Selected manifest: `tests/phpt/manifests/modules/gd.selected.jsonl`
-- Current corpus snapshot: 312 `gd` candidates, 1 PASS, 55 SKIP, 255 FAIL,
-  0 BORK, and 310 known non-green outcomes.
+- Current focused snapshot: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK from 1 selected
+  generated fixture
 
-## Decision
+## Scope
 
-Keep GD out of scope for this branch.
+- `extension_loaded("gd")`, `class_exists("GdImage")`, and `gd_info`
+- `imagecreatefromstring`, `imagecreatefromjpeg`, and `imagecreatefrompng`
+- `imagecreatetruecolor`, `imagesx`, and `imagesy`
+- `imagecopyresampled` for the selected crop/resize/copy path
+- `imagejpeg` and `imagepng` file output
+- `imagedestroy`
 
-GD requires image decoders/encoders, drawing primitives, color management,
-resource/object modeling, binary output parity, and image-library dependencies.
-This branch must not start a graphics subsystem. Platform probes remain
-negative so applications do not assume image processing is available.
+## Non-Scope
 
-## Unsupported Area
+- Full upstream `ext/gd` drawing, filter, palette, alpha, font, text, and color
+  management APIs
+- AVIF/WebP/GIF/BMP/TIFF write support
+- Imagick compatibility
+- Binary encoder parity beyond readable JPEG and PNG files for the selected
+  media fixture
 
-- Stable ID: `PHPT-DATA-GD`
-- Reference behavior: PHP with GD enabled exposes `GdImage`, image creation,
-  decoding/encoding, drawing, filters, font handling, metadata, and many format
-  conditionals.
-- Current phrust behavior: `extension_loaded("gd")`,
-  `class_exists("GdImage")`, and representative `image*` functions are false.
-- Fixture: `tests/phpt/generated/gd/platform-checks.phpt`
-- Next owner layer: future optional graphics extension with explicit image
-  library policy.
+## Selected PHPT Fixtures
 
-## Source References
+- `tests/phpt/generated/gd/image-basic.phpt`
 
-- `ext/gd/gd.stub.php`
-- `ext/gd/tests/`
+## Relevant Source Areas
+
+- `crates/php_runtime/src/builtins/modules/gd.rs`
+- `crates/php_runtime/src/builtins/registry.rs`
+- `crates/php_std/src/lib.rs`
+- `crates/php_std/src/introspection.rs`
+- `crates/php_vm/src/vm/mod.rs`
 
 ## Target Gates
 
+- `nix develop -c cargo test -p php_runtime gd`
+- `nix develop -c cargo test -p php_vm`
 - `nix develop -c just phpt-dev-module MODULE=gd`
 - `nix develop -c just verify-phpt`
+
+## Known Gaps
+
+- Keep full GD parity tracked as `PHPT-DATA-GD`.
+- Expand only through focused fixtures and approved image dependency policy.

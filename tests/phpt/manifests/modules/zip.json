@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"zip",
+  "priority":"plugin/theme archive handling",
+  "selected_manifest":"tests/phpt/manifests/modules/zip.selected.jsonl",
+  "corpus_count":1,
+  "selected_count":1,
+  "pass_count":1,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["ZipArchive open","close","count","getFromName","getFromIndex","getNameIndex","locateName","statName","statIndex","extractTo"],
+  "non_scope":["encryption","archive comments","zip64 parity","zip:// stream wrapper","archive writing"],
+  "target_gates":["nix develop -c cargo test -p php_vm","nix develop -c just phpt-dev-module MODULE=zip"],
+  "next_step":"Keep extraction root-constrained and add write support only with explicit fixtures."
+}
