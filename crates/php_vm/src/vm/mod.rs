@@ -75,8 +75,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MAX_EVAL_DEPTH: usize = 16;
+const EXECUTION_DEADLINE_CHECK_INTERVAL: usize = 64;
+const EXECUTION_TIMEOUT_DIAGNOSTIC_ID: &str = "E_PHP_VM_EXECUTION_TIMEOUT";
 const SORT_REGULAR: i64 = 0;
 const SORT_NUMERIC: i64 = 1;
 const SORT_STRING: i64 = 2;
@@ -838,6 +841,8 @@ struct ExecutionState {
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
     diagnostics: Vec<RuntimeDiagnostic>,
+    execution_deadline_at: Option<Instant>,
+    execution_deadline_mutable: bool,
     /// Throwable propagating up the call stack toward an enclosing handler.
     ///
     /// Set when a frame cannot handle a throw locally; each caller frame gets a
@@ -878,6 +883,24 @@ impl ExecutionState {
     fn bump_include_config_epoch(&mut self) {
         self.include_config_epoch = self.include_config_epoch.saturating_add(1);
         self.bump_lookup_epoch();
+    }
+
+    fn execution_deadline_expired(&self) -> bool {
+        match self.execution_deadline_at {
+            Some(deadline) => Instant::now() >= deadline,
+            None => false,
+        }
+    }
+
+    fn reset_execution_deadline_seconds(&mut self, seconds: u64) {
+        if !self.execution_deadline_mutable {
+            return;
+        }
+        self.execution_deadline_at = if seconds == 0 {
+            None
+        } else {
+            Instant::now().checked_add(Duration::from_secs(seconds))
+        };
     }
 }
 
@@ -1887,6 +1910,12 @@ impl Vm {
             env: self.options.runtime_context.env.clone(),
             upload_registry: self.options.runtime_context.upload_registry(),
             session: self.options.runtime_context.session.clone(),
+            execution_deadline_at: self
+                .options
+                .runtime_context
+                .execution_time_limit
+                .and_then(|limit| Instant::now().checked_add(limit)),
+            execution_deadline_mutable: self.options.runtime_context.execution_time_limit.is_some(),
             ..ExecutionState::default()
         };
         state.stdin = Some(
@@ -5326,6 +5355,13 @@ impl Vm {
         let mut steps = 0_usize;
         'dispatch: loop {
             steps += 1;
+            if steps.is_multiple_of(EXECUTION_DEADLINE_CHECK_INTERVAL)
+                && state.execution_deadline_expired()
+            {
+                let result = self.execution_timeout(output, compiled, stack);
+                stack.pop_recycle();
+                return result;
+            }
             if steps > self.options.max_steps {
                 let result = self.runtime_error(output, compiled, stack, "VM step limit exceeded");
                 stack.pop_recycle();
@@ -7346,6 +7382,11 @@ impl Vm {
 
         'dispatch: loop {
             steps += 1;
+            if steps.is_multiple_of(EXECUTION_DEADLINE_CHECK_INTERVAL)
+                && state.execution_deadline_expired()
+            {
+                return self.execution_timeout(output, compiled, stack);
+            }
             if steps > self.options.max_steps {
                 return self.runtime_error(output, compiled, stack, "VM step limit exceeded");
             }
@@ -23568,6 +23609,20 @@ impl Vm {
         VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic)
     }
 
+    fn execution_timeout(
+        &self,
+        output: &OutputBuffer,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+    ) -> VmResult {
+        self.runtime_error(
+            output,
+            compiled,
+            stack,
+            format!("{EXECUTION_TIMEOUT_DIAGNOSTIC_ID}: maximum execution time exceeded"),
+        )
+    }
+
     /// Records `throwable` as unwinding past the current frame, pops that frame,
     /// and returns a non-success result so the caller re-throws it through its
     /// own handlers (or, at the entry point, renders it as uncaught).
@@ -35326,6 +35381,7 @@ fn execute_builtin_entry(
         .ensure_slot("_SESSION", state.session.data_value());
     context.set_session_state(&mut state.session, session_global);
     context.sync_session_state_from_global();
+    let time_limit_arg = (entry.name() == "set_time_limit").then(|| args.first().cloned());
     let result = (entry.function())(&mut context, args, source_span.clone());
     let output = context.output().clone();
     context.sync_session_state_from_global();
@@ -35335,7 +35391,15 @@ fn execute_builtin_entry(
     state.mb_internal_encoding = context.mb_internal_encoding().to_owned();
     let mut diagnostics = context.take_diagnostics();
     match result {
-        Ok(value) => VmResult::success_with_diagnostics(output, Some(value), diagnostics),
+        Ok(value) => {
+            if let Some(Some(seconds_value)) = time_limit_arg
+                && let Ok(seconds) = to_int(&seconds_value)
+                && seconds >= 0
+            {
+                state.reset_execution_deadline_seconds(seconds as u64);
+            }
+            VmResult::success_with_diagnostics(output, Some(value), diagnostics)
+        }
         Err(error) => {
             let error_diagnostic = RuntimeDiagnostic::new(
                 error.diagnostic_id(),
@@ -48781,6 +48845,57 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             unsupported.diagnostics[0].severity(),
             RuntimeSeverity::UnsupportedFeature
         );
+    }
+
+    #[test]
+    fn execution_deadline_reports_stable_timeout_diagnostic() {
+        let result = execute_source_with_options(
+            "<?php while (true) { }",
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli("timeout.php", Vec::new())
+                    .with_execution_time_limit(Some(Duration::ZERO)),
+                max_steps: 1_000_000,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_EXECUTION_TIMEOUT");
+        assert!(
+            result
+                .status
+                .message()
+                .is_some_and(|message| message.contains("maximum execution time exceeded")),
+            "{:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn set_time_limit_resets_or_disables_mutable_execution_deadline() {
+        let reset = execute_source_with_options(
+            "<?php set_time_limit(1); echo \"ok\\n\";",
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli("reset.php", Vec::new())
+                    .with_execution_time_limit(Some(Duration::ZERO)),
+                max_steps: 1_000_000,
+                ..VmOptions::default()
+            },
+        );
+        assert!(reset.status.is_success(), "{:?}", reset.status);
+        assert_eq!(reset.output.to_string_lossy(), "ok\n");
+
+        let disabled = execute_source_with_options(
+            "<?php set_time_limit(0); for ($i = 0; $i < 200; $i++) { } echo \"ok\\n\";",
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli("disable.php", Vec::new())
+                    .with_execution_time_limit(Some(Duration::ZERO)),
+                max_steps: 1_000_000,
+                ..VmOptions::default()
+            },
+        );
+        assert!(disabled.status.is_success(), "{:?}", disabled.status);
+        assert_eq!(disabled.output.to_string_lossy(), "ok\n");
     }
 
     fn manual_return_unit(value: IrConstant) -> php_ir::IrUnit {

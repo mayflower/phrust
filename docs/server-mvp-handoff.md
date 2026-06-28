@@ -51,8 +51,8 @@ See `docs/server-known-gaps.md` for the current known-gap list.
 
 - Follow the serial Wave 2 plan in `docs/server-wave2-functionality.md` for
   unmodified PHP app compatibility first, then speed and hardening work.
-- Add execution deadlines for long-running PHP code, not only request body read
-  timeouts.
+- Continue hardening execution deadlines beyond the cooperative VM checks,
+  including coverage for more blocking builtin paths as those paths expand.
 - Replace simple static-file reads with streaming or platform sendfile support.
 - Add cache invalidation policy and optional shared cache storage.
 - Add targeted load tests for cache hit paths, front controllers, body limits,

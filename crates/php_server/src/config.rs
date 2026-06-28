@@ -9,6 +9,7 @@ const DEFAULT_INDEX: &str = "index.php";
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_UPLOAD_FILES: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
 const DEFAULT_SESSION_COOKIE_NAME: &str = "PHPSESSID";
 const DEFAULT_SESSION_COOKIE_PATH: &str = "/";
@@ -29,6 +30,8 @@ pub struct ServerConfig {
     pub sessions_enabled: bool,
     pub max_in_flight: usize,
     pub request_timeout_ms: u64,
+    pub max_execution_ms: u64,
+    pub execution_deadline_enabled: bool,
     pub metrics_endpoint_enabled: bool,
     pub script_cache_enabled: bool,
     pub script_cache_shards: usize,
@@ -80,6 +83,8 @@ impl ServerConfig {
         let mut sessions_enabled = true;
         let mut max_in_flight = default_max_in_flight();
         let mut request_timeout_ms = DEFAULT_REQUEST_TIMEOUT_MS;
+        let mut max_execution_ms = DEFAULT_MAX_EXECUTION_MS;
+        let mut execution_deadline_enabled = true;
         let mut metrics_endpoint_enabled = true;
         let mut script_cache_enabled = true;
         let mut script_cache_shards = DEFAULT_SCRIPT_CACHE_SHARDS;
@@ -136,6 +141,10 @@ impl ServerConfig {
                     request_timeout_ms =
                         parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
                 }
+                "--max-execution-ms" => {
+                    max_execution_ms = parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--disable-execution-deadline" => execution_deadline_enabled = false,
                 "--disable-metrics-endpoint" => metrics_endpoint_enabled = false,
                 "--no-script-cache" => script_cache_enabled = false,
                 "--script-cache-shards" => {
@@ -165,6 +174,8 @@ impl ServerConfig {
                 sessions_enabled,
                 max_in_flight,
                 request_timeout_ms,
+                max_execution_ms,
+                execution_deadline_enabled,
                 metrics_endpoint_enabled,
                 script_cache_enabled,
                 script_cache_shards,
@@ -188,6 +199,8 @@ impl ServerConfig {
             sessions_enabled,
             max_in_flight,
             request_timeout_ms,
+            max_execution_ms,
+            execution_deadline_enabled,
             metrics_endpoint_enabled,
             script_cache_enabled,
             script_cache_shards,
@@ -213,6 +226,8 @@ Options:\n\
   --disable-sessions           disable persistent web sessions\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
+  --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
+  --disable-execution-deadline disable cooperative PHP execution deadline\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
   --no-script-cache            disable process-local compiled script cache\n\
   --script-cache-shards <n>    compiled script cache shard count (default: 16)\n\
@@ -352,6 +367,8 @@ mod tests {
         assert_eq!(config.session_cookie_path, "/");
         assert!(config.sessions_enabled);
         assert_eq!(config.request_timeout_ms, 30_000);
+        assert_eq!(config.max_execution_ms, 30_000);
+        assert!(config.execution_deadline_enabled);
         assert!(config.metrics_endpoint_enabled);
         assert!(config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 16);
@@ -390,6 +407,9 @@ mod tests {
             "2",
             "--request-timeout-ms",
             "250",
+            "--max-execution-ms",
+            "125",
+            "--disable-execution-deadline",
             "--disable-metrics-endpoint",
             "--no-script-cache",
             "--script-cache-shards",
@@ -410,6 +430,8 @@ mod tests {
         assert!(!config.sessions_enabled);
         assert_eq!(config.max_in_flight, 2);
         assert_eq!(config.request_timeout_ms, 250);
+        assert_eq!(config.max_execution_ms, 125);
+        assert!(!config.execution_deadline_enabled);
         assert!(!config.metrics_endpoint_enabled);
         assert!(!config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 3);
@@ -477,6 +499,14 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--request-timeout-ms must be greater than zero"
+        );
+
+        let error = ServerConfig::parse_from(["--docroot", "public", "--max-execution-ms", "0"])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--max-execution-ms must be greater than zero"
         );
     }
 

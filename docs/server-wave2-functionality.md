@@ -86,6 +86,26 @@ finalizing a request. This prevents in-process concurrent request corruption.
 It is not a cross-process lock, so multiple server processes sharing the same
 session save path are outside the current guarantee.
 
+## PHP Execution Deadlines
+
+The integrated server configures a cooperative PHP execution deadline with
+`--max-execution-ms`, defaulting to `30000`. The deadline is separate from
+`--request-timeout-ms`, which only bounds request body reads. When PHP execution
+exceeds its request-local deadline, the VM returns the stable diagnostic
+`E_PHP_VM_EXECUTION_TIMEOUT` and the server maps it to `504 Gateway Timeout`
+with body `php execution timeout`.
+
+`set_time_limit($seconds)` resets the request-local deadline when a mutable
+execution deadline is configured. Passing `0` disables the deadline for that
+request, matching the supported web-mode behavior for this wave. The optional
+`--disable-execution-deadline` flag disables server-created deadlines for
+development and deterministic tests; metrics expose both timeout totals and
+disabled-deadline request counts.
+
+Deadline enforcement is cooperative in the VM dispatch loops. It does not use
+Tokio task cancellation as the primary safety mechanism, so native blocking
+builtins are checked when control returns to VM dispatch.
+
 ## Expected Acceptance Commands
 
 Prompt 00 baseline:

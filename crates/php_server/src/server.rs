@@ -46,6 +46,7 @@ struct AppState {
     max_body_bytes: usize,
     multipart_config: MultipartConfig,
     request_timeout: Duration,
+    execution_time_limit: Option<Duration>,
     in_flight: Arc<Semaphore>,
     max_in_flight: usize,
     metrics: Arc<ServerMetrics>,
@@ -93,6 +94,8 @@ struct ServerMetrics {
     upload_parse_errors: AtomicU64,
     upload_bytes_accepted: AtomicU64,
     upload_files_rejected: AtomicU64,
+    execution_timeouts: AtomicU64,
+    execution_deadline_disabled: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -119,6 +122,8 @@ phrust_server_uploads_total {}\n\
 phrust_server_upload_parse_errors_total {}\n\
 phrust_server_upload_bytes_accepted_total {}\n\
 phrust_server_upload_files_rejected_total {}\n\
+phrust_server_execution_timeouts_total {}\n\
+phrust_server_execution_deadline_disabled_total {}\n\
 phrust_server_script_cache_hits_total {}\n\
 phrust_server_script_cache_misses_total {}\n\
 phrust_server_script_cache_stale_invalidations_total {}\n\
@@ -136,6 +141,8 @@ phrust_server_script_cache_entries {}\n",
             self.upload_parse_errors.load(Ordering::Relaxed),
             self.upload_bytes_accepted.load(Ordering::Relaxed),
             self.upload_files_rejected.load(Ordering::Relaxed),
+            self.execution_timeouts.load(Ordering::Relaxed),
+            self.execution_deadline_disabled.load(Ordering::Relaxed),
             cache.hits,
             cache.misses,
             cache.stale_invalidations,
@@ -200,6 +207,9 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             max_upload_file_bytes: config.max_upload_file_bytes,
         },
         request_timeout: Duration::from_millis(config.request_timeout_ms),
+        execution_time_limit: config
+            .execution_deadline_enabled
+            .then(|| Duration::from_millis(config.max_execution_ms)),
         in_flight: Arc::new(Semaphore::new(config.max_in_flight)),
         max_in_flight: config.max_in_flight,
         metrics: Arc::new(ServerMetrics::default()),
@@ -443,7 +453,14 @@ async fn execute_php_request(
     let mut runtime_context = RuntimeContext::controlled_http(request_context)
         .with_cwd(state.route_config.docroot.clone())
         .with_include_path(vec![state.route_config.docroot.clone()])
-        .with_session_state(session_state);
+        .with_session_state(session_state)
+        .with_execution_time_limit(state.execution_time_limit);
+    if state.execution_time_limit.is_none() {
+        state
+            .metrics
+            .execution_deadline_disabled
+            .fetch_add(1, Ordering::Relaxed);
+    }
     runtime_context = runtime_context.with_stdin(body.clone());
     let is_head = parts.method == Method::HEAD;
     let script_log_path = script_path.clone();
@@ -458,6 +475,13 @@ async fn execute_php_request(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "session storage failed\n",
                 );
+            }
+            if php_execution_timed_out(&output) {
+                state
+                    .metrics
+                    .execution_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                return php_timeout_response(is_head, &output.http_response);
             }
             debug!(script=%script_log_path.display(), hit=lookup.hit, "compiled script cache lookup");
             php_output_response(output, is_head)
@@ -616,6 +640,35 @@ fn php_output_response(output: PhpExecutionOutput, is_head: bool) -> Response<Re
     };
     let content_length = if is_head { stdout_len } else { body.len() };
     php_transport_response(status, body, content_length, &output.http_response)
+}
+
+fn php_execution_timed_out(output: &PhpExecutionOutput) -> bool {
+    output
+        .runtime_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.id() == "E_PHP_VM_EXECUTION_TIMEOUT")
+}
+
+fn php_timeout_response(
+    is_head: bool,
+    http_response: &RuntimeHttpResponseState,
+) -> Response<ResponseBody> {
+    let body = if is_head {
+        Bytes::new()
+    } else {
+        Bytes::from_static(b"php execution timeout\n")
+    };
+    let content_length = if is_head {
+        "php execution timeout\n".len()
+    } else {
+        body.len()
+    };
+    php_transport_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        body,
+        content_length,
+        http_response,
+    )
 }
 
 fn php_transport_response(
@@ -827,6 +880,7 @@ mod tests {
                 max_upload_file_bytes: 1024,
             },
             request_timeout: Duration::from_secs(30),
+            execution_time_limit: Some(Duration::from_secs(30)),
             in_flight: Arc::new(Semaphore::new(1)),
             max_in_flight: 1,
             metrics: Arc::new(ServerMetrics::default()),

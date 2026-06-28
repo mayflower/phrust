@@ -140,6 +140,72 @@ fn server_executes_php_script() {
 }
 
 #[test]
+fn server_execution_deadline_returns_timeout_response_and_metric() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("loop.php"),
+        "<?php while (true) { usleep(1000); }\n",
+    )
+    .expect("write loop fixture");
+    let mut child = start_server(&docroot, &["--max-execution-ms", "1"]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/loop.php");
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(
+        response.starts_with("HTTP/1.1 504 Gateway Timeout"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "php execution timeout\n");
+    assert!(
+        metrics.contains("phrust_server_execution_timeouts_total 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn server_execution_deadline_leaves_short_script_unaffected() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("short.php"), "<?php echo \"short\\n\";\n")
+        .expect("write short fixture");
+    let mut child = start_server(&docroot, &["--max-execution-ms", "1000"]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/short.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "short\n");
+}
+
+#[test]
+fn server_reports_disabled_execution_deadline_metric() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("short.php"), "<?php echo \"short\\n\";\n")
+        .expect("write short fixture");
+    let mut child = start_server(&docroot, &["--disable-execution-deadline"]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/short.php");
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        metrics.contains("phrust_server_execution_deadline_disabled_total 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn server_applies_php_response_header() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);
@@ -693,16 +759,22 @@ fn start_server(docroot: &std::path::Path, extra_args: &[&str]) -> Child {
 }
 
 fn temp_docroot() -> std::path::PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "phrust-server-health-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&path).expect("create temp docroot");
-    path
+    for attempt in 0..100 {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phrust-server-health-{}-{unique}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create temp docroot: {error}"),
+        }
+    }
+    panic!("create unique temp docroot");
 }
 
 fn fixture_docroot(path: &str) -> std::path::PathBuf {

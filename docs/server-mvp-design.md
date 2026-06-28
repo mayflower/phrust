@@ -40,8 +40,9 @@ behavior, `mod_php`, subprocess PHP execution, or a warmed external worker.
   compatibility layer and not an Opcache replacement.
 - The MVP applies backpressure with a bounded in-flight request semaphore and
   enforces `--max-body-bytes` while streaming request bodies into memory.
-- `--request-timeout-ms` currently bounds request body reads. A full execution
-  timeout that interrupts long-running PHP code is later work.
+- `--request-timeout-ms` bounds request body reads. `--max-execution-ms`
+  configures a separate cooperative PHP execution deadline that the VM checks
+  during dispatch.
 - Default logging is intentionally quiet. Set `RUST_LOG=php_server=debug` to
   inspect startup, route classification, cache lookup, overload, and request
   error decisions.

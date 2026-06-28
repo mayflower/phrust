@@ -5,6 +5,7 @@ use crate::{
 };
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Minimal ini-like runtime options carried by the VM.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,6 +391,8 @@ pub struct RuntimeContext {
     pub request_mode: RuntimeRequestMode,
     /// Request-local session state seed.
     pub session: SessionState,
+    /// Optional cooperative PHP execution budget for the VM.
+    pub execution_time_limit: Option<Duration>,
 }
 
 impl Default for RuntimeContext {
@@ -407,6 +410,7 @@ impl Default for RuntimeContext {
             process: ProcessCapability::Disabled,
             request_mode: RuntimeRequestMode::Cli,
             session: SessionState::default(),
+            execution_time_limit: None,
         }
     }
 }
@@ -517,6 +521,13 @@ impl RuntimeContext {
     #[must_use]
     pub fn with_session_state(mut self, session: SessionState) -> Self {
         self.session = session;
+        self
+    }
+
+    /// Sets an optional cooperative PHP execution budget for this request.
+    #[must_use]
+    pub fn with_execution_time_limit(mut self, limit: Option<Duration>) -> Self {
+        self.execution_time_limit = limit;
         self
     }
 
