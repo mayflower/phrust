@@ -13,7 +13,8 @@ without changing PHP behavior.
 
 Current execution remains interpreter-first. Cranelift is feature-gated and
 default-off. This ADR defines the prerequisites for any future executable
-baseline-native tier and records the no-exec stencil evidence added for FPE-15.
+baseline-native tier and records the no-exec stencil evidence added for the
+baseline-native research path.
 
 ## Mandatory Prerequisites Before Execution
 
@@ -40,7 +41,7 @@ documented, and covered by focused tests:
 
 ## No-Exec Stencil Prototype
 
-FPE-15 adds a report-only prototype:
+The baseline-native report-only prototype is:
 
 ```bash
 php-vm dump-baseline-native-stencil <file.php> --json
@@ -72,6 +73,8 @@ reference/COW/key state, and foreach iterator state.
 | Quickening, inline caches, superinstructions | Safe near-term acceleration because execution remains inside the VM. | Continue expanding these while collecting fallback/deopt counters that future native tiers can reuse. |
 | Cranelift selective regions | Default-off native subset for proven hot regions with helper ABI, side exits, blacklist, and guard reports. | Keep selective and feature-gated. Do not use Cranelift as an excuse to skip baseline-native executable-memory and live-state prerequisites. |
 | Baseline-native stencil | No-exec evidence for dense bytecode suitability, compile cost, code-size estimates, helper pressure, and unsupported state. | Useful as planning data only. It cannot justify native execution until every prerequisite above is satisfied. |
+| Copy-and-patch stencil library | No-exec textual stencil records over quickening-compatible dense bytecode, including patch sites, guards, helpers, live-state needs, side exits, unsupported reasons, code-size estimates, and work-to-compile ratio. | Useful for deciding whether a future low-latency baseline tier is worth its prerequisites. It still cannot allocate executable memory or bypass live-state/deopt requirements. |
+| PHP-aware mid-tier plan | Metadata-only design and report over dense bytecode, IC feedback, shape metadata, numeric-string feedback, branch bias, persistent feedback, and deopt/live-state requirements. | Useful for deciding when guard sharing, shape hoisting, and PHP-specific specialization justify a tier above stencils and below Cranelift. It cannot execute until the same live-state, deopt, invalidation, and PHPT prerequisites are satisfied. |
 | Region profile report | Metadata-only framework trace-shape evidence from VM counters, IC states, source maps, and shape summaries. | Useful for ranking future inline-cache, superinstruction, baseline-native, and Cranelift candidates. It does not satisfy executable-memory, live-state, deopt, exception, generator/fiber, or PHPT prerequisites. |
 
 ## Validation
@@ -80,9 +83,11 @@ The focused no-exec gate is:
 
 ```bash
 nix develop -c just baseline-native-stencil-smoke
+nix develop -c just copy-patch-stencil-smoke
+nix develop -c just mid-tier-plan-smoke
 ```
 
-The broader FPE-15 gates are:
+The broader native-tier prerequisite gates are:
 
 ```bash
 nix develop -c cargo test -p php_jit -p php_vm

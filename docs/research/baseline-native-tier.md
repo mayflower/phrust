@@ -4,11 +4,10 @@ Date: 2026-06-27.
 
 Reference target: PHP 8.5.7 (`php-8.5.7`).
 
-This document covers Phase 09.15 of the Performance acceleration plan. It
-compares possible default-off baseline native tiers for `phrust` and records
-the safety pieces required before any executable prototype can become a product
-path. It does not change runtime defaults and does not add executable native
-code.
+This document compares possible default-off baseline native tiers for `phrust`
+and records the safety pieces required before any executable prototype can
+become a product path. It does not change runtime defaults and does not add
+executable native code.
 
 ## Recommendation
 
@@ -21,13 +20,15 @@ The near-term acceleration path should stay:
 
 1. Tier 0: compact interpreter and dense bytecode coverage.
 2. Tier 1: quickening, inline caches, superinstructions, and runtime fast paths.
-3. Tier 2b: default-off Cranelift only for proven hot regions.
+3. Tier 2a: report-only PHP-aware mid-tier planning until deopt and feedback
+   prerequisites are satisfied.
+4. Tier 2b: default-off Cranelift only for proven hot regions.
 
 The existing `CraneliftNoExecBackend` and Cranelift report tooling are enough
 for deterministic non-production native-shape experiments. Adding a second
 mock backend only for one textual stencil would duplicate the JIT abstraction
-without proving PHP-visible behavior, so Phase 09.15 intentionally remains
-docs-only.
+without proving PHP-visible behavior, so baseline-native work intentionally
+remains report-only until prerequisites are closed.
 
 ## Strategy Comparison
 
@@ -57,10 +58,10 @@ default or handle general PHP code:
 | Generators and fibers | No native entry or resume until suspended VM state and native live state can be represented without losing identity. |
 | Diagnostics and output | Stderr/runtime diagnostics, warning order, output buffering, callbacks, and conversion errors must match interpreter order. |
 
-## No-Exec Stencil Prototype
+## No-Exec Stencil And Mid-Tier Prototypes
 
-FPE-15 adds a no-exec baseline-native stencil report that reuses the normal
-frontend and dense bytecode lowerer:
+The baseline-native stencil report reuses the normal frontend and dense
+bytecode lowerer:
 
 ```bash
 php-vm dump-baseline-native-stencil <file.php> --json
@@ -78,16 +79,53 @@ The focused smoke gate writes local artifacts under:
 target/performance/baseline-native/
 ```
 
-or, for the FPE-15 report-only implementation:
+or, for the baseline-native report-only implementation:
 
 ```text
 target/performance/baseline-native-stencil/
 ```
 
-The current prototype is intentionally conservative. It treats scalar
-load/store/control-flow bytecodes as stencilable, estimates helper/deopt slots
-for PHP-semantic scalar operations, and marks calls, arrays, and foreach state
-unsupported until VM-owned live-state and deopt metadata exists.
+The current baseline-native estimate is intentionally conservative. It treats
+scalar load/store/control-flow bytecodes as stencilable, estimates helper/deopt
+slots for PHP-semantic scalar operations, and marks calls, arrays, and foreach
+state unsupported until VM-owned live-state and deopt metadata exists.
+
+The copy-and-patch research prototype now adds a more explicit textual stencil
+library shape:
+
+```bash
+php-vm dump-copy-patch-stencils <file.php> --json
+```
+
+The focused smoke gate writes reports under:
+
+```text
+target/performance/stencils/
+```
+
+This second report is still no-exec. It maps a tiny quickening-compatible dense
+bytecode subset to load-local, guarded integer arithmetic, packed-array fetch,
+known-builtin, branch, return, and side-exit stencils while recording patch
+sites, guard dependencies, helper calls, live-state requirements, unsupported
+reasons, estimated code size, and work-to-compile ratio.
+
+The PHP-aware mid-tier plan adds a higher-level metadata report:
+
+```bash
+php-vm dump-mid-tier-plan <file.php> --json
+```
+
+Its focused smoke gate writes reports under:
+
+```text
+target/performance/mid-tier/
+```
+
+This report classifies dense functions/regions as metadata-only eligible or
+ineligible, lists candidate optimizations, expected guards, required helpers,
+deopt points, and rejection reasons, and compares where a future mid-tier would
+sit between interpreter execution, copy-and-patch stencils, and Cranelift. It
+does not allocate executable memory or add a runtime mode.
 
 ## Handoff
 

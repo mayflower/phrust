@@ -277,6 +277,8 @@ verify-performance:
     @just fastest-engine-matrix
     @just fast-preset-smoke
     @just baseline-native-stencil-smoke
+    @just copy-patch-stencil-smoke
+    @just mid-tier-plan-smoke
     @just cache-roundtrip
     @just optimizer-diff
     @just superinstruction-smoke
@@ -1326,6 +1328,14 @@ fast-preset-smoke:
 baseline-native-stencil-smoke:
     cargo build -p php_vm_cli --bin php-vm
     scripts/performance/baseline_native_stencil_smoke.py
+
+copy-patch-stencil-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/copy_patch_stencil_smoke.py
+
+mid-tier-plan-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/mid_tier_plan_smoke.py
 
 ir-verify:
     cargo test -p php_ir verify --lib

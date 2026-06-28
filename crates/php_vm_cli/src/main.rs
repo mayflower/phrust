@@ -14,7 +14,7 @@ use php_runtime::{ExitStatus, FilesystemCapabilities, RuntimeContext};
 use php_semantics::{FrontendResult, Severity, analyze_source, diagnostics::DiagnosticId};
 use php_source::{SourceText, TextRange};
 use php_vm::{
-    DenseBytecodeUnit, DenseOpcode, ExecutionFormat, IncludeLoader, InlineCacheMode,
+    DenseBytecodeUnit, DenseOpcode, DenseOperands, ExecutionFormat, IncludeLoader, InlineCacheMode,
     JitBlacklistMode, JitMode, PersistentFeedbackContext, PersistentFeedbackEpochs,
     PersistentFeedbackLoadReport, PersistentFeedbackStats, PersistentFeedbackStore, QuickeningMode,
     RegionProfile, SuperinstructionMode, TieringOptions, Vm, VmOptions,
@@ -78,6 +78,8 @@ where
         "dump-baseline-native-stencil" => {
             dump_baseline_native_stencil_command(&args[1..], stdout, stderr)
         }
+        "dump-copy-patch-stencils" => dump_copy_patch_stencils_command(&args[1..], stdout, stderr),
+        "dump-mid-tier-plan" => dump_mid_tier_plan_command(&args[1..], stdout, stderr),
         "dump-cranelift-clif" => dump_cranelift_clif_command(&args[1..], stdout, stderr),
         "run" => run_command(&args[1..], stdout, stderr),
         "report" => report_command(&args[1..], stdout, stderr),
@@ -353,6 +355,175 @@ where
         for (reason, count) in &report.unsupported_by_reason {
             writeln!(stdout, "unsupported {count:>4} {reason}")
                 .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(EXIT_SUCCESS)
+}
+
+fn dump_copy_patch_stencils_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_copy_patch_stencils_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let mut dense = match DenseBytecodeUnit::lower_from_ir(&pipeline.lowering.unit) {
+        Ok(dense) => dense,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                error.message
+            )
+            .map_err(|io| io.to_string())?;
+            return Ok(EXIT_UNSUPPORTED);
+        }
+    };
+    let superinstructions = dense.select_superinstructions();
+    if let Err(errors) = dense.verify() {
+        writeln!(
+            stderr,
+            "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+            errors.len()
+        )
+        .map_err(|io| io.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
+
+    let report = collect_copy_patch_stencils(&dense, superinstructions.emitted);
+    if json {
+        writeln!(
+            stdout,
+            "{}",
+            copy_patch_stencils_json(path, &dense, &report)
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        writeln!(
+            stdout,
+            "ok backend=copy-patch-stencil status=no-exec path={} functions={} blocks={} instructions={} stencils={} unsupported={} patch_sites={} helpers={} code_size_estimate={} compile_cost={} work_to_compile_ratio={}",
+            path,
+            report.functions,
+            report.blocks,
+            report.instructions,
+            report.stencils.len(),
+            report.unsupported_instructions,
+            report.patch_sites,
+            report.helper_calls,
+            report.code_size_bytes_estimate,
+            report.compile_cost_units,
+            report.work_to_compile_ratio()
+        )
+        .map_err(|error| error.to_string())?;
+        for stencil in &report.stencils {
+            writeln!(
+                stdout,
+                "stencil function={} block={} instruction={} kind={} opcode={} patches={} helpers={} side_exit={}",
+                stencil.function,
+                stencil.block,
+                stencil.instruction,
+                stencil.kind,
+                stencil.opcode,
+                stencil.patch_sites.len(),
+                stencil.helper_calls.len(),
+                stencil.side_exit_target
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        for (reason, count) in &report.unsupported_by_reason {
+            writeln!(stdout, "unsupported {count:>4} {reason}")
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(EXIT_SUCCESS)
+}
+
+fn dump_mid_tier_plan_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_mid_tier_plan_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let mut dense = match DenseBytecodeUnit::lower_from_ir(&pipeline.lowering.unit) {
+        Ok(dense) => dense,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                error.message
+            )
+            .map_err(|io| io.to_string())?;
+            return Ok(EXIT_UNSUPPORTED);
+        }
+    };
+    let superinstructions = dense.select_superinstructions();
+    if let Err(errors) = dense.verify() {
+        writeln!(
+            stderr,
+            "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+            errors.len()
+        )
+        .map_err(|io| io.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
+
+    let report = collect_mid_tier_plan(&dense, superinstructions.emitted);
+    if json {
+        writeln!(stdout, "{}", mid_tier_plan_json(path, &dense, &report))
+            .map_err(|error| error.to_string())?;
+    } else {
+        writeln!(
+            stdout,
+            "ok backend=php-mid-tier-plan status=metadata-only path={} functions={} eligible={} rejected={} candidate_optimizations={} guards={} helpers={} deopt_points={}",
+            path,
+            report.functions.len(),
+            report.eligible_functions,
+            report.rejected_functions,
+            report.candidate_optimizations.len(),
+            report.expected_guards.len(),
+            report.required_helpers.len(),
+            report.deopt_points
+        )
+        .map_err(|error| error.to_string())?;
+        for function in &report.functions {
+            writeln!(
+                stdout,
+                "function {} classification={} reason_count={} optimization_count={}",
+                function.function,
+                function.classification,
+                function.rejection_reasons.len(),
+                function.candidate_optimizations.len()
+            )
+            .map_err(|error| error.to_string())?;
         }
     }
     Ok(EXIT_SUCCESS)
@@ -1339,6 +1510,90 @@ struct BaselineStencilClass {
     unsupported_reason: Option<&'static str>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CopyPatchStencilReport {
+    functions: u64,
+    blocks: u64,
+    instructions: u64,
+    quickened_superinstructions: u64,
+    unsupported_instructions: u64,
+    patch_sites: u64,
+    helper_calls: u64,
+    live_state_slots: u64,
+    deopt_points: u64,
+    compile_cost_units: u64,
+    code_size_bytes_estimate: u64,
+    stencils: Vec<CopyPatchStencil>,
+    unsupported_by_reason: BTreeMap<String, u64>,
+    stencil_kinds: BTreeMap<String, u64>,
+}
+
+impl CopyPatchStencilReport {
+    fn work_to_compile_ratio(&self) -> String {
+        if self.compile_cost_units == 0 {
+            return "0.000".to_string();
+        }
+        format!(
+            "{:.3}",
+            self.stencils.len() as f64 / self.compile_cost_units as f64
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CopyPatchStencil {
+    function: u32,
+    block: u32,
+    instruction: u32,
+    opcode: &'static str,
+    kind: &'static str,
+    patch_sites: Vec<&'static str>,
+    guard_dependencies: Vec<&'static str>,
+    helper_calls: Vec<&'static str>,
+    live_state_requirements: Vec<&'static str>,
+    side_exit_target: &'static str,
+    code_size_bytes_estimate: u64,
+    compile_cost_units: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CopyPatchStencilClass {
+    kind: &'static str,
+    patch_sites: &'static [&'static str],
+    guard_dependencies: &'static [&'static str],
+    helper_calls: &'static [&'static str],
+    live_state_requirements: &'static [&'static str],
+    side_exit_target: &'static str,
+    code_size_bytes_estimate: u64,
+    compile_cost_units: u64,
+    unsupported_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MidTierPlanReport {
+    quickened_superinstructions: u64,
+    functions: Vec<MidTierFunctionPlan>,
+    eligible_functions: u64,
+    rejected_functions: u64,
+    candidate_optimizations: BTreeMap<String, u64>,
+    rejection_reasons: BTreeMap<String, u64>,
+    expected_guards: BTreeMap<String, u64>,
+    required_helpers: BTreeMap<String, u64>,
+    deopt_points: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MidTierFunctionPlan {
+    function: u32,
+    instruction_count: u64,
+    classification: &'static str,
+    candidate_optimizations: Vec<&'static str>,
+    rejection_reasons: Vec<&'static str>,
+    expected_guards: Vec<&'static str>,
+    required_helpers: Vec<&'static str>,
+    deopt_points: u64,
+}
+
 struct RunOptions<'a> {
     path: &'a str,
     script_args: Vec<String>,
@@ -1586,6 +1841,44 @@ fn parse_dump_baseline_native_stencil_args(args: &[String]) -> Result<(&str, boo
     }
     let Some(path) = path else {
         return Err("dump-baseline-native-stencil requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
+fn parse_dump_copy_patch_stencils_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!(
+                "unexpected dump-copy-patch-stencils argument `{arg}`"
+            ));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-copy-patch-stencils requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
+fn parse_dump_mid_tier_plan_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!("unexpected dump-mid-tier-plan argument `{arg}`"));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-mid-tier-plan requires <path.php>".to_string());
     };
     Ok((path, json))
 }
@@ -2684,7 +2977,7 @@ fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] [--counters-json <path>] [--region-profile-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] [--counters-json <path>] [--region-profile-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -2895,6 +3188,506 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
     }
 }
 
+fn collect_copy_patch_stencils(
+    dense: &DenseBytecodeUnit,
+    quickened_superinstructions: u64,
+) -> CopyPatchStencilReport {
+    let mut report = CopyPatchStencilReport {
+        functions: dense.functions.len() as u64,
+        quickened_superinstructions,
+        ..CopyPatchStencilReport::default()
+    };
+    for (function_index, function) in dense.functions.iter().enumerate() {
+        for block in &function.blocks {
+            let start = block.first_instruction as usize;
+            let end = start + block.instruction_len as usize;
+            let Some(instructions) = function.instructions.get(start..end) else {
+                continue;
+            };
+            report.blocks += 1;
+            for (offset, instruction) in instructions.iter().enumerate() {
+                report.instructions += 1;
+                let instruction_index = start + offset;
+                let class = classify_copy_patch_stencil_instruction(
+                    dense,
+                    instruction.opcode,
+                    &instruction.operands,
+                );
+                report.patch_sites += class.patch_sites.len() as u64;
+                report.helper_calls += class.helper_calls.len() as u64;
+                report.live_state_slots += class.live_state_requirements.len() as u64;
+                if class.side_exit_target != "none" {
+                    report.deopt_points += 1;
+                }
+                report.compile_cost_units += class.compile_cost_units;
+                report.code_size_bytes_estimate += class.code_size_bytes_estimate;
+                if let Some(reason) = class.unsupported_reason {
+                    report.unsupported_instructions += 1;
+                    *report
+                        .unsupported_by_reason
+                        .entry(reason.to_string())
+                        .or_default() += 1;
+                    continue;
+                }
+                *report
+                    .stencil_kinds
+                    .entry(class.kind.to_string())
+                    .or_default() += 1;
+                report.stencils.push(CopyPatchStencil {
+                    function: function_index as u32,
+                    block: block.id,
+                    instruction: instruction_index as u32,
+                    opcode: instruction.opcode.as_str(),
+                    kind: class.kind,
+                    patch_sites: class.patch_sites.to_vec(),
+                    guard_dependencies: class.guard_dependencies.to_vec(),
+                    helper_calls: class.helper_calls.to_vec(),
+                    live_state_requirements: class.live_state_requirements.to_vec(),
+                    side_exit_target: class.side_exit_target,
+                    code_size_bytes_estimate: class.code_size_bytes_estimate,
+                    compile_cost_units: class.compile_cost_units,
+                });
+            }
+        }
+    }
+    if !dense
+        .functions
+        .iter()
+        .flat_map(|function| &function.instructions)
+        .any(|instruction| matches!(instruction.opcode, DenseOpcode::FetchDim))
+    {
+        report
+            .unsupported_by_reason
+            .entry("object_shape_property_load_dense_opcode_absent".to_string())
+            .or_insert(1);
+    }
+    report
+}
+
+fn classify_copy_patch_stencil_instruction(
+    dense: &DenseBytecodeUnit,
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+) -> CopyPatchStencilClass {
+    match opcode {
+        DenseOpcode::LoadLocal | DenseOpcode::LoadLocalEcho => CopyPatchStencilClass {
+            kind: "load_local",
+            patch_sites: &["frame_local_slot", "destination_register"],
+            guard_dependencies: &["frame_layout_epoch"],
+            helper_calls: &[],
+            live_state_requirements: &["destination_register", "source_span"],
+            side_exit_target: "none",
+            code_size_bytes_estimate: 8,
+            compile_cost_units: 1,
+            unsupported_reason: None,
+        },
+        DenseOpcode::BinaryAdd | DenseOpcode::BinarySub | DenseOpcode::BinaryMul => {
+            let helper_calls: &'static [&'static str] = match opcode {
+                DenseOpcode::BinaryAdd => &["phrust_jit_i64_add_checked"],
+                DenseOpcode::BinaryMul => &["phrust_jit_i64_mul_checked"],
+                _ => &["inline_i64_sub_checked"],
+            };
+            CopyPatchStencilClass {
+                kind: "guarded_int_arithmetic",
+                patch_sites: &[
+                    "lhs_register",
+                    "rhs_register",
+                    "destination_register",
+                    "overflow_exit",
+                ],
+                guard_dependencies: &["lhs_is_int", "rhs_is_int"],
+                helper_calls,
+                live_state_requirements: &[
+                    "operand_registers",
+                    "destination_register",
+                    "source_span",
+                    "resume_instruction",
+                ],
+                side_exit_target: "interpreter_overflow_or_type_exit",
+                code_size_bytes_estimate: 32,
+                compile_cost_units: 3,
+                unsupported_reason: None,
+            }
+        }
+        DenseOpcode::FetchDim => CopyPatchStencilClass {
+            kind: "packed_array_guard_fetch",
+            patch_sites: &[
+                "array_register",
+                "key_register",
+                "destination_register",
+                "oob_exit",
+            ],
+            guard_dependencies: &["array_is_packed", "key_is_int", "no_by_ref_element"],
+            helper_calls: &[
+                "php_jit_array_is_packed_ints",
+                "php_jit_array_fetch_int_slow",
+            ],
+            live_state_requirements: &[
+                "array_value",
+                "key_value",
+                "destination_register",
+                "diagnostic_order",
+                "resume_instruction",
+            ],
+            side_exit_target: "interpreter_array_fetch_exit",
+            code_size_bytes_estimate: 48,
+            compile_cost_units: 5,
+            unsupported_reason: None,
+        },
+        DenseOpcode::CallFunction if is_known_builtin_copy_patch_call(dense, operands) => {
+            CopyPatchStencilClass {
+                kind: "known_builtin_call",
+                patch_sites: &[
+                    "function_symbol",
+                    "argument_registers",
+                    "destination_register",
+                ],
+                guard_dependencies: &["function_table_epoch", "builtin_identity", "argument_shape"],
+                helper_calls: &["phrust_jit_strlen_known_or_count_known"],
+                live_state_requirements: &[
+                    "call_destination",
+                    "arguments",
+                    "diagnostic_order",
+                    "resume_instruction",
+                ],
+                side_exit_target: "interpreter_builtin_fallback_exit",
+                code_size_bytes_estimate: 40,
+                compile_cost_units: 5,
+                unsupported_reason: None,
+            }
+        }
+        DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue | DenseOpcode::JumpIf => {
+            CopyPatchStencilClass {
+                kind: "branch_guard",
+                patch_sites: &["condition_register", "taken_target", "fallthrough_target"],
+                guard_dependencies: &["condition_is_bool", "branch_bias_feedback"],
+                helper_calls: &[],
+                live_state_requirements: &["condition_value", "source_span", "resume_block"],
+                side_exit_target: "interpreter_branch_type_exit",
+                code_size_bytes_estimate: 16,
+                compile_cost_units: 2,
+                unsupported_reason: None,
+            }
+        }
+        DenseOpcode::Return => CopyPatchStencilClass {
+            kind: "return",
+            patch_sites: &["return_value", "caller_resume"],
+            guard_dependencies: &["frame_is_current"],
+            helper_calls: &[],
+            live_state_requirements: &["return_value", "caller_frame", "destructor_order"],
+            side_exit_target: "interpreter_return_slow_exit",
+            code_size_bytes_estimate: 16,
+            compile_cost_units: 2,
+            unsupported_reason: None,
+        },
+        DenseOpcode::LoadConst
+        | DenseOpcode::Move
+        | DenseOpcode::StoreLocal
+        | DenseOpcode::LoadConstEcho
+        | DenseOpcode::Echo
+        | DenseOpcode::Discard
+        | DenseOpcode::Nop => CopyPatchStencilClass {
+            kind: "simple_value_move_or_output",
+            patch_sites: &["value_slot"],
+            guard_dependencies: &["frame_layout_epoch"],
+            helper_calls: &[],
+            live_state_requirements: &["source_span"],
+            side_exit_target: "none",
+            code_size_bytes_estimate: 8,
+            compile_cost_units: 1,
+            unsupported_reason: None,
+        },
+        DenseOpcode::Jump => CopyPatchStencilClass {
+            kind: "direct_branch",
+            patch_sites: &["target_block"],
+            guard_dependencies: &["block_layout_epoch"],
+            helper_calls: &[],
+            live_state_requirements: &["resume_block"],
+            side_exit_target: "none",
+            code_size_bytes_estimate: 8,
+            compile_cost_units: 1,
+            unsupported_reason: None,
+        },
+        DenseOpcode::CallFunction => {
+            unsupported_copy_patch_class("dynamic_or_userland_call_requires_frame_and_symbol_state")
+        }
+        DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim => unsupported_copy_patch_class(
+            "array_mutation_requires_reference_cow_and_allocator_state",
+        ),
+        DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => {
+            unsupported_copy_patch_class("foreach_requires_iterator_mutation_and_resume_state")
+        }
+        DenseOpcode::BinaryDiv
+        | DenseOpcode::BinaryMod
+        | DenseOpcode::BinaryConcat
+        | DenseOpcode::BinaryPow
+        | DenseOpcode::BinaryBitAnd
+        | DenseOpcode::BinaryBitOr
+        | DenseOpcode::BinaryBitXor
+        | DenseOpcode::BinaryShiftLeft
+        | DenseOpcode::BinaryShiftRight
+        | DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship
+        | DenseOpcode::UnaryPlus
+        | DenseOpcode::UnaryMinus
+        | DenseOpcode::UnaryNot
+        | DenseOpcode::UnaryBitNot
+        | DenseOpcode::BinaryConcatEcho => {
+            unsupported_copy_patch_class("opcode_needs_php_semantic_helper_or_string_state")
+        }
+    }
+}
+
+fn unsupported_copy_patch_class(reason: &'static str) -> CopyPatchStencilClass {
+    CopyPatchStencilClass {
+        kind: "unsupported",
+        patch_sites: &[],
+        guard_dependencies: &[],
+        helper_calls: &[],
+        live_state_requirements: &[],
+        side_exit_target: "none",
+        code_size_bytes_estimate: 0,
+        compile_cost_units: 1,
+        unsupported_reason: Some(reason),
+    }
+}
+
+fn is_known_builtin_copy_patch_call(dense: &DenseBytecodeUnit, operands: &DenseOperands) -> bool {
+    let DenseOperands::Call { name, .. } = operands else {
+        return false;
+    };
+    dense
+        .names
+        .get(*name as usize)
+        .map(|name| matches!(name.to_ascii_lowercase().as_str(), "strlen" | "count"))
+        .unwrap_or(false)
+}
+
+fn collect_mid_tier_plan(
+    dense: &DenseBytecodeUnit,
+    quickened_superinstructions: u64,
+) -> MidTierPlanReport {
+    let mut report = MidTierPlanReport {
+        quickened_superinstructions,
+        ..MidTierPlanReport::default()
+    };
+    for (function_index, function) in dense.functions.iter().enumerate() {
+        let mut plan = MidTierFunctionPlan {
+            function: function_index as u32,
+            ..MidTierFunctionPlan::default()
+        };
+        for instruction in &function.instructions {
+            plan.instruction_count += 1;
+            classify_mid_tier_instruction(
+                dense,
+                instruction.opcode,
+                &instruction.operands,
+                &mut plan,
+            );
+        }
+        if plan.instruction_count <= 24
+            && plan.rejection_reasons.is_empty()
+            && !plan
+                .candidate_optimizations
+                .contains(&"tiny_leaf_method_inlining_candidate")
+        {
+            plan.candidate_optimizations
+                .push("tiny_leaf_method_inlining_candidate");
+        }
+        if plan.rejection_reasons.is_empty() && !plan.candidate_optimizations.is_empty() {
+            plan.classification = "eligible";
+            report.eligible_functions += 1;
+        } else {
+            plan.classification = "ineligible";
+            report.rejected_functions += 1;
+        }
+        plan.candidate_optimizations.sort_unstable();
+        plan.candidate_optimizations.dedup();
+        plan.rejection_reasons.sort_unstable();
+        plan.rejection_reasons.dedup();
+        plan.expected_guards.sort_unstable();
+        plan.expected_guards.dedup();
+        plan.required_helpers.sort_unstable();
+        plan.required_helpers.dedup();
+
+        for value in &plan.candidate_optimizations {
+            *report
+                .candidate_optimizations
+                .entry((*value).to_string())
+                .or_default() += 1;
+        }
+        for value in &plan.rejection_reasons {
+            *report
+                .rejection_reasons
+                .entry((*value).to_string())
+                .or_default() += 1;
+        }
+        for value in &plan.expected_guards {
+            *report
+                .expected_guards
+                .entry((*value).to_string())
+                .or_default() += 1;
+        }
+        for value in &plan.required_helpers {
+            *report
+                .required_helpers
+                .entry((*value).to_string())
+                .or_default() += 1;
+        }
+        report.deopt_points += plan.deopt_points;
+        report.functions.push(plan);
+    }
+    if !report
+        .candidate_optimizations
+        .contains_key("method_property_shape_check_hoisting")
+    {
+        report
+            .rejection_reasons
+            .entry("method_property_shape_metadata_missing".to_string())
+            .or_insert(1);
+    }
+    for reason in [
+        "eval_include_mutation_requires_invalidation",
+        "exceptions_try_finally_need_live_state_support",
+        "generators_fibers_require_suspend_state",
+        "destructor_sensitive_values_need_materialization",
+    ] {
+        report
+            .rejection_reasons
+            .entry(reason.to_string())
+            .or_insert(1);
+    }
+    report
+}
+
+fn classify_mid_tier_instruction(
+    dense: &DenseBytecodeUnit,
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    plan: &mut MidTierFunctionPlan,
+) {
+    match opcode {
+        DenseOpcode::BinaryAdd | DenseOpcode::BinarySub | DenseOpcode::BinaryMul => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "numeric_string_guard_specialization",
+            );
+            push_unique(&mut plan.expected_guards, "int_or_numeric_string_operands");
+            push_unique(&mut plan.expected_guards, "overflow_precision_guard");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::FetchDim => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "packed_array_loop_specialization",
+            );
+            push_unique(&mut plan.expected_guards, "packed_array_shape");
+            push_unique(&mut plan.expected_guards, "integer_array_key");
+            push_unique(&mut plan.required_helpers, "php_jit_array_fetch_int_slow");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::CallFunction if is_known_builtin_copy_patch_call(dense, operands) => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "builtin_intrinsic_inlining",
+            );
+            push_unique(&mut plan.expected_guards, "builtin_identity");
+            push_unique(&mut plan.expected_guards, "argument_shape");
+            push_unique(&mut plan.required_helpers, "known_builtin_helper");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::CallFunction => {
+            push_unique(&mut plan.rejection_reasons, "magic_hooks_or_dynamic_calls");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue | DenseOpcode::JumpIf => {
+            push_unique(&mut plan.candidate_optimizations, "branch_layout");
+            push_unique(&mut plan.expected_guards, "branch_bias_feedback");
+            push_unique(&mut plan.expected_guards, "bool_condition");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim => {
+            push_unique(&mut plan.rejection_reasons, "cow_mutation_ambiguity");
+            push_unique(
+                &mut plan.rejection_reasons,
+                "references_or_unknown_aliasing",
+            );
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => {
+            push_unique(&mut plan.rejection_reasons, "cow_mutation_ambiguity");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::BinaryConcat | DenseOpcode::BinaryConcatEcho | DenseOpcode::Echo => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "allocation_scratch_buffer_elision",
+            );
+            push_unique(&mut plan.expected_guards, "string_or_output_buffer_state");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::Return => {
+            push_unique(
+                &mut plan.expected_guards,
+                "destructor_sensitive_value_state",
+            );
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::LoadConst
+        | DenseOpcode::Move
+        | DenseOpcode::LoadLocal
+        | DenseOpcode::StoreLocal
+        | DenseOpcode::LoadConstEcho
+        | DenseOpcode::LoadLocalEcho
+        | DenseOpcode::Jump
+        | DenseOpcode::Discard
+        | DenseOpcode::Nop => {}
+        DenseOpcode::BinaryDiv
+        | DenseOpcode::BinaryMod
+        | DenseOpcode::BinaryPow
+        | DenseOpcode::BinaryBitAnd
+        | DenseOpcode::BinaryBitOr
+        | DenseOpcode::BinaryBitXor
+        | DenseOpcode::BinaryShiftLeft
+        | DenseOpcode::BinaryShiftRight
+        | DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship
+        | DenseOpcode::UnaryPlus
+        | DenseOpcode::UnaryMinus
+        | DenseOpcode::UnaryNot
+        | DenseOpcode::UnaryBitNot => {
+            push_unique(&mut plan.expected_guards, "php_scalar_semantics");
+            plan.deopt_points += 1;
+        }
+    }
+}
+
+fn push_unique(values: &mut Vec<&'static str>, value: &'static str) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn bytecode_patterns_json(
     path: &str,
     dense: &DenseBytecodeUnit,
@@ -2963,6 +3756,170 @@ fn baseline_native_stencil_json(
     push_string_u64_map_json(&mut out, &report.unsupported_by_reason);
     out.push('}');
     out
+}
+
+fn copy_patch_stencils_json(
+    path: &str,
+    dense: &DenseBytecodeUnit,
+    report: &CopyPatchStencilReport,
+) -> String {
+    let mut out = String::new();
+    out.push_str("{\"ok\":true");
+    out.push_str(",\"schema_version\":1");
+    out.push_str(",\"backend\":\"copy-patch-stencil\"");
+    out.push_str(",\"status\":\"no-exec\"");
+    out.push_str(",\"native_execution\":false");
+    out.push_str(",\"executable_memory\":false");
+    out.push_str(",\"path\":\"");
+    out.push_str(&escape_json(path));
+    out.push('"');
+    out.push_str(",\"dense_bytecode_version\":");
+    out.push_str(&dense.version.to_string());
+    out.push_str(",\"input\":\"quickened dense bytecode metadata\"");
+    out.push_str(",\"functions\":");
+    out.push_str(&report.functions.to_string());
+    out.push_str(",\"blocks\":");
+    out.push_str(&report.blocks.to_string());
+    out.push_str(",\"instructions\":");
+    out.push_str(&report.instructions.to_string());
+    out.push_str(",\"quickened_superinstructions\":");
+    out.push_str(&report.quickened_superinstructions.to_string());
+    out.push_str(",\"stencil_count\":");
+    out.push_str(&report.stencils.len().to_string());
+    out.push_str(",\"unsupported_instructions\":");
+    out.push_str(&report.unsupported_instructions.to_string());
+    out.push_str(",\"estimated_code_size_bytes\":");
+    out.push_str(&report.code_size_bytes_estimate.to_string());
+    out.push_str(",\"patch_sites\":");
+    out.push_str(&report.patch_sites.to_string());
+    out.push_str(",\"helper_calls\":");
+    out.push_str(&report.helper_calls.to_string());
+    out.push_str(",\"live_state_slots\":");
+    out.push_str(&report.live_state_slots.to_string());
+    out.push_str(",\"deopt_points\":");
+    out.push_str(&report.deopt_points.to_string());
+    out.push_str(",\"compile_cost_units\":");
+    out.push_str(&report.compile_cost_units.to_string());
+    out.push_str(",\"work_to_compile_ratio\":\"");
+    out.push_str(&report.work_to_compile_ratio());
+    out.push('"');
+    out.push_str(",\"stencil_kinds\":");
+    push_string_u64_map_json(&mut out, &report.stencil_kinds);
+    out.push_str(",\"unsupported_by_reason\":");
+    push_string_u64_map_json(&mut out, &report.unsupported_by_reason);
+    out.push_str(",\"stencils\":[");
+    for (index, stencil) in report.stencils.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        copy_patch_stencil_json(&mut out, stencil);
+    }
+    out.push_str("]}");
+    out
+}
+
+fn copy_patch_stencil_json(out: &mut String, stencil: &CopyPatchStencil) {
+    out.push_str("{\"function\":");
+    out.push_str(&stencil.function.to_string());
+    out.push_str(",\"block\":");
+    out.push_str(&stencil.block.to_string());
+    out.push_str(",\"instruction\":");
+    out.push_str(&stencil.instruction.to_string());
+    out.push_str(",\"opcode\":\"");
+    out.push_str(stencil.opcode);
+    out.push_str("\",\"instruction_kind\":\"");
+    out.push_str(stencil.kind);
+    out.push_str("\",\"patch_sites\":");
+    push_string_array_json(out, &stencil.patch_sites);
+    out.push_str(",\"guard_dependencies\":");
+    push_string_array_json(out, &stencil.guard_dependencies);
+    out.push_str(",\"helper_calls\":");
+    push_string_array_json(out, &stencil.helper_calls);
+    out.push_str(",\"live_state_requirements\":");
+    push_string_array_json(out, &stencil.live_state_requirements);
+    out.push_str(",\"side_exit_target\":\"");
+    out.push_str(stencil.side_exit_target);
+    out.push_str("\",\"code_size_bytes_estimate\":");
+    out.push_str(&stencil.code_size_bytes_estimate.to_string());
+    out.push_str(",\"compile_cost_units\":");
+    out.push_str(&stencil.compile_cost_units.to_string());
+    out.push('}');
+}
+
+fn mid_tier_plan_json(path: &str, dense: &DenseBytecodeUnit, report: &MidTierPlanReport) -> String {
+    let mut out = String::new();
+    out.push_str("{\"ok\":true");
+    out.push_str(",\"schema_version\":1");
+    out.push_str(",\"backend\":\"php-mid-tier-plan\"");
+    out.push_str(",\"status\":\"metadata-only\"");
+    out.push_str(",\"native_execution\":false");
+    out.push_str(",\"executable_memory\":false");
+    out.push_str(",\"path\":\"");
+    out.push_str(&escape_json(path));
+    out.push('"');
+    out.push_str(",\"dense_bytecode_version\":");
+    out.push_str(&dense.version.to_string());
+    out.push_str(",\"tier_kind\":\"PHP-semantics-aware-mid-tier\"");
+    out.push_str(",\"input_metadata\":[\"quickened_dense_bytecode\",\"inline_cache_feedback\",\"array_object_shapes\",\"numeric_string_classifications\",\"alias_reference_state\",\"branch_bias\",\"persistent_feedback\",\"deopt_live_state_maps\"]");
+    out.push_str(",\"output\":\"pseudo-ir-or-report-only\"");
+    out.push_str(",\"quickened_superinstructions\":");
+    out.push_str(&report.quickened_superinstructions.to_string());
+    out.push_str(",\"eligible_functions\":");
+    out.push_str(&report.eligible_functions.to_string());
+    out.push_str(",\"rejected_functions\":");
+    out.push_str(&report.rejected_functions.to_string());
+    out.push_str(",\"deopt_points\":");
+    out.push_str(&report.deopt_points.to_string());
+    out.push_str(",\"candidate_optimizations\":");
+    push_string_u64_map_json(&mut out, &report.candidate_optimizations);
+    out.push_str(",\"rejection_reasons\":");
+    push_string_u64_map_json(&mut out, &report.rejection_reasons);
+    out.push_str(",\"expected_guards\":");
+    push_string_u64_map_json(&mut out, &report.expected_guards);
+    out.push_str(",\"required_helpers\":");
+    push_string_u64_map_json(&mut out, &report.required_helpers);
+    out.push_str(",\"functions\":[");
+    for (index, function) in report.functions.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        mid_tier_function_json(&mut out, function);
+    }
+    out.push_str("]}");
+    out
+}
+
+fn mid_tier_function_json(out: &mut String, function: &MidTierFunctionPlan) {
+    out.push_str("{\"function\":");
+    out.push_str(&function.function.to_string());
+    out.push_str(",\"instruction_count\":");
+    out.push_str(&function.instruction_count.to_string());
+    out.push_str(",\"classification\":\"");
+    out.push_str(function.classification);
+    out.push_str("\",\"candidate_optimizations\":");
+    push_string_array_json(out, &function.candidate_optimizations);
+    out.push_str(",\"rejection_reasons\":");
+    push_string_array_json(out, &function.rejection_reasons);
+    out.push_str(",\"expected_guards\":");
+    push_string_array_json(out, &function.expected_guards);
+    out.push_str(",\"required_helpers\":");
+    push_string_array_json(out, &function.required_helpers);
+    out.push_str(",\"deopt_points\":");
+    out.push_str(&function.deopt_points.to_string());
+    out.push('}');
+}
+
+fn push_string_array_json(out: &mut String, values: &[&str]) {
+    out.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(value));
+        out.push('"');
+    }
+    out.push(']');
 }
 
 fn push_string_u64_map_json(out: &mut String, values: &BTreeMap<String, u64>) {
@@ -3477,6 +4434,68 @@ mod tests {
         assert!(stdout.contains("\"code_size_bytes_estimate\":"));
         assert!(stdout.contains("\"required_deopt_slots\":"));
         assert!(stdout.contains("array_reference_cow_and_key_state"));
+    }
+
+    #[test]
+    fn dump_copy_patch_stencils_is_report_only() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-copy-patch-stencils".to_string(),
+                fixture("tests/fixtures/performance/perf_smoke/arrays_packed.php"),
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("\"backend\":\"copy-patch-stencil\""));
+        assert!(stdout.contains("\"status\":\"no-exec\""));
+        assert!(stdout.contains("\"native_execution\":false"));
+        assert!(stdout.contains("\"executable_memory\":false"));
+        assert!(stdout.contains("\"instruction_kind\":\"packed_array_guard_fetch\""));
+        assert!(stdout.contains("\"patch_sites\":"));
+        assert!(stdout.contains("\"guard_dependencies\":"));
+        assert!(stdout.contains("\"live_state_requirements\":"));
+        assert!(stdout.contains("\"side_exit_target\":\"interpreter_array_fetch_exit\""));
+        assert!(stdout.contains("\"work_to_compile_ratio\":"));
+        assert!(stdout.contains("array_mutation_requires_reference_cow_and_allocator_state"));
+    }
+
+    #[test]
+    fn dump_mid_tier_plan_is_metadata_only() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-mid-tier-plan".to_string(),
+                fixture("tests/fixtures/performance/perf_smoke/arrays_packed.php"),
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("\"backend\":\"php-mid-tier-plan\""));
+        assert!(stdout.contains("\"status\":\"metadata-only\""));
+        assert!(stdout.contains("\"native_execution\":false"));
+        assert!(stdout.contains("\"executable_memory\":false"));
+        assert!(stdout.contains("\"quickened_dense_bytecode\""));
+        assert!(stdout.contains("\"packed_array_loop_specialization\""));
+        assert!(stdout.contains("\"cow_mutation_ambiguity\""));
+        assert!(stdout.contains("\"expected_guards\":"));
+        assert!(stdout.contains("\"deopt_points\":"));
+        assert!(stdout.contains("eval_include_mutation_requires_invalidation"));
+        assert!(stdout.contains("exceptions_try_finally_need_live_state_support"));
+        assert!(stdout.contains("generators_fibers_require_suspend_state"));
+        assert!(stdout.contains("destructor_sensitive_values_need_materialization"));
     }
 
     #[test]

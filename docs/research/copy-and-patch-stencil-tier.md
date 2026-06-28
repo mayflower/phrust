@@ -1,0 +1,167 @@
+# Copy-And-Patch Stencil Tier Research
+
+Date: 2026-06-28.
+
+Reference target: PHP 8.5.7 (`php-8.5.7`).
+
+This document defines a no-exec copy-and-patch stencil prototype for dense VM
+bytecode. It is research and planning evidence only: the prototype does not
+allocate executable memory, does not emit machine code, does not install a
+runtime mode, and does not run native code.
+
+## Why This Tier Exists
+
+Cranelift is valuable for a small set of proven numeric and packed-array
+kernels, but its setup cost can be too high for warm PHP request traces where
+the region is short, guard-heavy, and helper-heavy. A copy-and-patch tier could
+compile faster by selecting predesigned instruction templates, patching frame
+slots, register indexes, branch targets, helper IDs, and side-exit targets, then
+falling back to the interpreter for any semantic ambiguity.
+
+That lower compile latency is only useful if the template library consumes the
+same dense bytecode, quickening metadata, inline-cache state, deopt maps, and
+helper ABI as the interpreter and Cranelift paths. It must not introduce a
+second parser, AST, semantic frontend, bytecode format, or source-string
+execution path.
+
+## Stencil Format
+
+The report-only format is intentionally textual and platform-neutral:
+
+```text
+stencil {
+  instruction_kind: guarded_int_arithmetic
+  dense_opcode: binary_add
+  patch_sites: lhs_register, rhs_register, destination_register, overflow_exit
+  guard_dependencies: lhs_is_int, rhs_is_int
+  helper_calls: phrust_jit_i64_add_checked
+  live_state_requirements: operand_registers, destination_register,
+    source_span, resume_instruction
+  side_exit_target: interpreter_overflow_or_type_exit
+}
+```
+
+The JSON command uses the same fields for each stencil:
+
+- `instruction_kind`;
+- `patch_sites`;
+- `guard_dependencies`;
+- `helper_calls`;
+- `live_state_requirements`;
+- `side_exit_target`;
+- `code_size_bytes_estimate`;
+- `compile_cost_units`.
+
+The top-level report includes `native_execution: false`,
+`executable_memory: false`, estimated code size, patch-site counts,
+helper-call counts, unsupported reasons, deopt point counts, live-state slot
+counts, and a `work_to_compile_ratio`.
+
+## Current Generator
+
+The report generator is:
+
+```bash
+php-vm dump-copy-patch-stencils <file.php> --json
+```
+
+The smoke gate is:
+
+```bash
+nix develop -c just copy-patch-stencil-smoke
+```
+
+It writes per-fixture reports and an aggregate summary under:
+
+```text
+target/performance/stencils/
+```
+
+The generator compiles through the normal frontend, lowers verified IR to dense
+bytecode, applies conservative superinstruction selection metadata, verifies
+dense bytecode, then maps a tiny quickening-compatible dense subset to
+stencils. It never allocates executable memory.
+
+The current smoke summary covers four fixtures and produced:
+
+| Metric | Value |
+| --- | ---: |
+| Dense instructions | 313 |
+| Stencils | 276 |
+| Patch sites | 414 |
+| Helper calls | 27 |
+| Live-state slots | 425 |
+| Deopt points | 41 |
+| Estimated code size | 3016 bytes |
+| Compile-cost units | 394 |
+| Work-to-compile ratio | 0.701 |
+
+## Candidate Stencils
+
+| Candidate | Current report shape | Required exits and metadata |
+| --- | --- | --- |
+| Load local | `load_local` over `load_local` and fused `load_local_echo`. | Frame-layout epoch, local-slot patch, destination register, source span. |
+| Guard int/string/bool | Represented through guarded arithmetic, known builtin calls, and branch guards. | Exact value class feedback, source span, resume instruction, guard failure reason. |
+| Int add/sub/mul with overflow exit | `guarded_int_arithmetic` over `binary_add`, `binary_sub`, and `binary_mul`. | Operand registers, destination register, overflow exit, type exit, checked helper/inline op identity. |
+| Packed array guard/fetch | `packed_array_guard_fetch` over dense `fetch_dim`. | Packed-array guard, integer key guard, OOB exit, warning/diagnostic ordering, no by-reference element state. |
+| Object shape guard/property slot load | Documented candidate, currently reported as `object_shape_property_load_dense_opcode_absent` because dense bytecode has no property-load opcode yet. | Receiver class/layout epoch, property slot, visibility scope, magic/get/hook rejection, uninitialized typed-property exit. |
+| Known builtin call | `known_builtin_call` for dense direct calls to `strlen` and `count`. | Function-table epoch, builtin identity, argument shape, helper return-status exit, diagnostics order. |
+| Branch guard | `branch_guard` over conditional dense jumps. | Boolean condition guard, branch-bias metadata, taken/fallthrough patch sites, resume block. |
+| Return | `return` over dense `return`. | Return value, caller frame, destructor order, slow return exit. |
+| Side exit to interpreter | Each guarded stencil records an interpreter side-exit target. | Exact resume instruction, live locals/registers/temporaries, source span, pending diagnostics/output state. |
+
+## Unsupported Shapes
+
+The prototype rejects or records gaps for:
+
+- array creation, insertion, append, and assignment, because mutation needs
+  reference/COW identity, allocator state, and diagnostics order;
+- dynamic or userland calls, because call frames, symbol state, autoload, and
+  by-reference arguments need exact live-state maps;
+- foreach, because iterator position, mutation epoch, by-reference mode, and
+  resume state are not native-representable yet;
+- property loads, because dense bytecode does not expose an object property-load
+  opcode for this tier yet;
+- string, comparison, division, modulo, bitwise, unary, and concat opcodes that
+  still need PHP-semantic helper contracts or string/allocation state.
+
+## Required Deopt Metadata
+
+Before any executable stencil tier can exist, every patch point and helper call
+needs:
+
+- dense function, block, and instruction indexes;
+- source span and source-map target;
+- VM register/local live-state map;
+- side-exit reason and interpreter resume target;
+- helper ABI hash and helper status contract;
+- frame identity and caller/callee return slot;
+- reference/COW/alias state for values reachable from the stencil;
+- diagnostic, output buffering, exception, destructor, generator, and fiber
+  state rejection or materialization rules;
+- invalidation epochs for functions, classes, properties, includes, autoload,
+  array/object shape metadata, and persistent feedback.
+
+## Placement Against Existing Tiers
+
+| Situation | Preferred tier |
+| --- | --- |
+| Cold code, unsupported semantic state, dynamic calls, mutation-heavy paths, or weak feedback. | Interpreter with counters. |
+| Short warm regions dominated by simple locals, int arithmetic, branch guards, known builtins, or packed fetches. | Future copy-and-patch stencils, after executable-memory and deopt prerequisites are owned. |
+| Hot regions where quickening, inline caches, and superinstructions already preserve behavior inside the VM. | Keep Tier 1 in the interpreter. |
+| Warm regions that need shared shape guards, numeric-string specialization, branch layout, and exact PHP live-state metadata. | Future PHP-aware mid-tier, still report-only until prerequisites are closed. |
+| Stable packed/numeric kernels that justify higher compile cost and pass Cranelift eligibility. | Default-off Cranelift packed/numeric region. |
+
+## Architecture Decision
+
+The prototype makes stencil-library research concrete enough to compare against
+the current Cranelift no-exec/reporting flow. It does not justify native
+execution. The next useful work is prerequisite closure: property dense opcodes,
+typed live-state/deopt maps, helper status contracts, frame identity maps,
+reference/COW materialization, invalidation epochs, and executable-memory/W^X
+policy.
+
+The PHP-aware mid-tier design in `docs/research/php-mid-tier-compiler.md` is the
+next higher research layer. It consumes the same dense bytecode, feedback, and
+deopt prerequisites, but targets guard sharing and PHP-semantic region planning
+instead of very low-latency instruction templates.

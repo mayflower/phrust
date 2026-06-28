@@ -23,7 +23,7 @@ pub mod todo_runtime;
 pub mod vm;
 
 pub use aliasing::{AliasState, alias_transition_key, slot_alias_state, value_alias_state};
-pub use bytecode::{DenseBytecodeUnit, DenseOpcode};
+pub use bytecode::{DenseBytecodeUnit, DenseOpcode, DenseOperands};
 pub use compiled_unit::CompiledUnit;
 pub use counters::{JitCompileDescriptor, VmCounters};
 pub use deopt::{
