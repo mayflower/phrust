@@ -31,14 +31,15 @@ use std::{
     convert::Infallible,
     fmt,
     fs::Metadata,
-    io::SeekFrom,
+    fs::OpenOptions,
+    io::{SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::File,
@@ -62,10 +63,75 @@ struct AppState {
     metrics: Arc<ServerMetrics>,
     script_cache: Arc<CompiledScriptCache>,
     include_cache: Arc<IncludeCache>,
+    metrics_token: Option<String>,
+    access_log: Option<Arc<AccessLogger>>,
     session_config: SessionConfig,
     session_store: Arc<SessionStore>,
     session_lock: Arc<Mutex<()>>,
     local_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+struct AccessLogger {
+    target: AccessLogTarget,
+}
+
+#[derive(Debug)]
+enum AccessLogTarget {
+    Stdout,
+    File(Mutex<std::fs::File>),
+}
+
+impl AccessLogger {
+    fn open(value: &str) -> Result<Self, std::io::Error> {
+        let target = if value == "-" {
+            AccessLogTarget::Stdout
+        } else {
+            AccessLogTarget::File(Mutex::new(
+                OpenOptions::new().create(true).append(true).open(value)?,
+            ))
+        };
+        Ok(Self { target })
+    }
+
+    fn write(&self, entry: &AccessLogEntry<'_>) -> Result<(), std::io::Error> {
+        let cache_hit = entry
+            .cache_hit
+            .map_or("-", |hit| if hit { "hit" } else { "miss" });
+        let line = format!(
+            "ts={} method={} path=\"{}\" status={} bytes={} duration_ms={} route={} cache={}\n",
+            entry.timestamp,
+            entry.method,
+            escape_log_value(entry.path),
+            entry.status.as_u16(),
+            entry.bytes,
+            entry.duration.as_millis(),
+            entry.route,
+            cache_hit
+        );
+        match &self.target {
+            AccessLogTarget::Stdout => {
+                print!("{line}");
+                Ok(())
+            }
+            AccessLogTarget::File(file) => file
+                .lock()
+                .expect("access log file mutex poisoned")
+                .write_all(line.as_bytes()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AccessLogEntry<'a> {
+    timestamp: u64,
+    method: &'a str,
+    path: &'a str,
+    status: StatusCode,
+    bytes: u64,
+    duration: Duration,
+    route: &'static str,
+    cache_hit: Option<bool>,
 }
 
 impl AppState {
@@ -249,6 +315,21 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let local_addr = listener.local_addr()?;
     let script_cache_preload = config.script_cache_preload.clone();
     let strict_preload = config.strict_preload;
+    let startup_front_controller = config.front_controller.clone();
+    let startup_upload_temp_dir = config.upload_temp_dir.clone();
+    let startup_session_save_path = config.session_save_path.clone();
+    let startup_script_cache_enabled = config.script_cache_enabled;
+    let startup_script_cache_shards = config.script_cache_shards;
+    let startup_script_cache_max_entries = config.script_cache_max_entries;
+    let startup_metrics_endpoint_enabled = config.metrics_endpoint_enabled;
+    let startup_metrics_token_enabled = config.metrics_token.is_some();
+    let startup_access_log = config.access_log.clone();
+    let access_log = config
+        .access_log
+        .as_deref()
+        .map(AccessLogger::open)
+        .transpose()?
+        .map(Arc::new);
     let session_store = Arc::new(SessionStore::new(config.session_save_path));
     if config.sessions_enabled {
         session_store
@@ -256,6 +337,21 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .map_err(std::io::Error::other)?;
     }
     println!("listening http://{local_addr}");
+    eprintln!(
+        "startup docroot={} front_controller={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={}",
+        docroot.display(),
+        startup_front_controller
+            .as_ref()
+            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
+        startup_script_cache_enabled,
+        startup_script_cache_shards,
+        startup_script_cache_max_entries,
+        startup_upload_temp_dir.display(),
+        startup_session_save_path.display(),
+        startup_metrics_endpoint_enabled,
+        startup_metrics_token_enabled,
+        startup_access_log.as_deref().unwrap_or("-"),
+    );
     debug!(%local_addr, docroot=%docroot.display(), "starting phrust server");
     let state = Arc::new(AppState {
         route_config: RouteConfig {
@@ -288,6 +384,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             CompiledScriptCache::disabled()
         }),
         include_cache: Arc::new(IncludeCache::new(config.script_cache_shards)),
+        metrics_token: config.metrics_token,
+        access_log,
         session_config: SessionConfig {
             enabled: config.sessions_enabled,
             cookie_name: config.session_cookie_name,
@@ -407,26 +505,35 @@ async fn handle(
     state: Arc<AppState>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
+    let started = Instant::now();
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let (parts, body) = request.into_parts();
+    let method = parts.method.clone();
+    let request_target = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), |value| value.to_string());
     let Ok(_permit) = Arc::clone(&state.in_flight).try_acquire_owned() else {
         state.metrics.overload.fetch_add(1, Ordering::Relaxed);
         let response = overloaded();
         state.metrics.record_response(response.status());
+        write_access_log(
+            &state,
+            AccessLogEntry {
+                timestamp: request_time() as u64,
+                method: method.as_str(),
+                path: &request_target,
+                status: response.status(),
+                bytes: response_content_length(&response),
+                duration: started.elapsed(),
+                route: "overload",
+                cache_hit: None,
+            },
+        );
         debug!(%peer, "request rejected because max in-flight limit is exhausted");
         return response;
     };
-    let (parts, body) = request.into_parts();
-    let method = parts.method.clone();
-    let route =
-        match resolve_route_on_blocking_thread(method.as_str(), parts.uri.path(), &state).await {
-            Ok(route) => route,
-            Err(error) => {
-                warn!(%peer, %error, "route resolution task failed");
-                let response = response::text(StatusCode::INTERNAL_SERVER_ERROR, "server error\n");
-                state.metrics.record_response(response.status());
-                return response;
-            }
-        };
+    let route = resolve_route(method.as_str(), parts.uri.path(), &state.route_config);
     debug!(
         %peer,
         method=%method,
@@ -434,52 +541,132 @@ async fn handle(
         route=?route,
         "classified request"
     );
-    let response = match route {
+    let (response, route_kind, cache_hit) = match route {
         ResolvedRoute::Health => match method {
-            Method::GET => response::text(StatusCode::OK, "ok\n"),
-            Method::HEAD => response::empty(StatusCode::OK),
-            _ => method_not_allowed(),
+            Method::GET => (response::text(StatusCode::OK, "ok\n"), "health", None),
+            Method::HEAD => (response::empty(StatusCode::OK), "health", None),
+            _ => (method_not_allowed(), "health", None),
         },
-        ResolvedRoute::Metrics => response::text_dynamic(
-            StatusCode::OK,
-            state.metrics.render(
-                state
-                    .max_in_flight
-                    .saturating_sub(state.in_flight.available_permits()) as u64,
-                state.script_cache.cache_stats(),
-                state.include_cache.cache_stats(),
-            ),
-            "text/plain; charset=UTF-8",
-        ),
-        ResolvedRoute::CacheClear => clear_cache_response(&state, peer),
+        ResolvedRoute::Metrics => (metrics_response(&state, &parts), "metrics", None),
+        ResolvedRoute::CacheClear => (clear_cache_response(&state, peer), "cache-clear", None),
         ResolvedRoute::StaticFile { path, metadata } => {
             state
                 .metrics
                 .static_responses
                 .fetch_add(1, Ordering::Relaxed);
-            static_file_response(&parts, &state, path, metadata).await
+            (
+                static_file_response(&parts, &state, path, metadata).await,
+                "static",
+                None,
+            )
         }
         ResolvedRoute::PhpScript {
             script_path,
             path_info,
         } => {
             state.metrics.php_responses.fetch_add(1, Ordering::Relaxed);
-            execute_php_request(
+            let route_kind = if path_info.is_some() {
+                "front-controller"
+            } else {
+                "php"
+            };
+            let (response, cache_hit) = execute_php_request(
                 PartsAndBody { parts, body },
                 Arc::clone(&state),
                 script_path,
                 path_info,
                 peer,
             )
-            .await
+            .await;
+            (response, route_kind, cache_hit)
         }
-        ResolvedRoute::NotFound => response::text(StatusCode::NOT_FOUND, "not found\n"),
-        ResolvedRoute::Forbidden => response::text(StatusCode::FORBIDDEN, "forbidden\n"),
-        ResolvedRoute::BadRequest => response::text(StatusCode::BAD_REQUEST, "bad request\n"),
-        ResolvedRoute::MethodNotAllowed => method_not_allowed(),
+        ResolvedRoute::NotFound => (
+            response::text(StatusCode::NOT_FOUND, "not found\n"),
+            "not-found",
+            None,
+        ),
+        ResolvedRoute::Forbidden => (
+            response::text(StatusCode::FORBIDDEN, "forbidden\n"),
+            "forbidden",
+            None,
+        ),
+        ResolvedRoute::BadRequest => (
+            response::text(StatusCode::BAD_REQUEST, "bad request\n"),
+            "bad-request",
+            None,
+        ),
+        ResolvedRoute::MethodNotAllowed => (method_not_allowed(), "method-not-allowed", None),
     };
     state.metrics.record_response(response.status());
+    write_access_log(
+        &state,
+        AccessLogEntry {
+            timestamp: request_time() as u64,
+            method: method.as_str(),
+            path: &request_target,
+            status: response.status(),
+            bytes: response_content_length(&response),
+            duration: started.elapsed(),
+            route: route_kind,
+            cache_hit,
+        },
+    );
     response
+}
+
+fn write_access_log(state: &AppState, entry: AccessLogEntry<'_>) {
+    if let Some(access_log) = &state.access_log
+        && let Err(error) = access_log.write(&entry)
+    {
+        warn!(%error, "access log write failed");
+    }
+}
+
+fn response_content_length(response: &Response<ResponseBody>) -> u64 {
+    response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn escape_log_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn metrics_response(state: &AppState, parts: &Parts) -> Response<ResponseBody> {
+    if let Some(token) = &state.metrics_token
+        && !metrics_token_authorized(&parts.headers, token)
+    {
+        return response::text(StatusCode::FORBIDDEN, "forbidden\n");
+    }
+    response::text_dynamic(
+        StatusCode::OK,
+        state.metrics.render(
+            state
+                .max_in_flight
+                .saturating_sub(state.in_flight.available_permits()) as u64,
+            state.script_cache.cache_stats(),
+            state.include_cache.cache_stats(),
+        ),
+        "text/plain; charset=UTF-8",
+    )
+}
+
+fn metrics_token_authorized(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {token}"))
+        || headers
+            .get("x-phrust-metrics-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == token)
 }
 
 async fn static_file_response(
@@ -878,24 +1065,13 @@ struct PartsAndBody {
     body: Incoming,
 }
 
-async fn resolve_route_on_blocking_thread(
-    method: &str,
-    path: &str,
-    state: &AppState,
-) -> Result<ResolvedRoute, task::JoinError> {
-    let method = method.to_string();
-    let path = path.to_string();
-    let route_config = state.route_config.clone();
-    task::spawn_blocking(move || resolve_route(&method, &path, &route_config)).await
-}
-
 async fn execute_php_request(
     request: PartsAndBody,
     state: Arc<AppState>,
     script_path: PathBuf,
     path_info: Option<String>,
     peer: SocketAddr,
-) -> Response<ResponseBody> {
+) -> (Response<ResponseBody>, Option<bool>) {
     let PartsAndBody { parts, body } = request;
     let body = match timeout(
         state.request_timeout,
@@ -904,19 +1080,48 @@ async fn execute_php_request(
     .await
     {
         Err(_) => {
-            return response::text(StatusCode::REQUEST_TIMEOUT, "request timeout\n");
+            return (
+                response::text(StatusCode::REQUEST_TIMEOUT, "request timeout\n"),
+                None,
+            );
         }
         Ok(Ok(body)) => body,
         Ok(Err(BodyReadError::TooLarge)) => {
             state.metrics.body_too_large.fetch_add(1, Ordering::Relaxed);
             debug!(%peer, max_body_bytes=state.max_body_bytes, "request body too large");
-            return response::text(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n");
+            return (
+                response::text(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n"),
+                None,
+            );
         }
         Ok(Err(BodyReadError::Invalid)) => {
             warn!(%peer, "failed to read request body");
-            return response::text(StatusCode::BAD_REQUEST, "bad request\n");
+            return (
+                response::text(StatusCode::BAD_REQUEST, "bad request\n"),
+                None,
+            );
         }
     };
+    let lookup = match state.compile_script(&script_path) {
+        Ok(lookup) => {
+            debug!(script=%script_path.display(), hit=lookup.hit, "compiled script cache lookup");
+            lookup
+        }
+        Err(PhpExecutionError::Compile(output)) => {
+            return (
+                php_output_response(*output, parts.method == Method::HEAD),
+                None,
+            );
+        }
+        Err(PhpExecutionError::Engine(_)) => {
+            warn!(script=%script_path.display(), "php execution engine error");
+            return (
+                response::text(StatusCode::INTERNAL_SERVER_ERROR, "php execution failed\n"),
+                None,
+            );
+        }
+    };
+    let script_cache_hit = Some(lookup.hit);
     let script_name = script_name_for(&state.route_config.docroot, &script_path);
     let mut request_context = http_runtime_context(
         &parts,
@@ -929,7 +1134,12 @@ async fn execute_php_request(
     );
     if let Some(boundary) = match multipart_boundary(request_context.content_type.as_deref()) {
         Ok(boundary) => boundary,
-        Err(error) => return multipart_error_response(error, &state, peer),
+        Err(error) => {
+            return (
+                multipart_error_response(error, &state, peer),
+                script_cache_hit,
+            );
+        }
     } {
         match parse_multipart_into_context(
             &mut request_context,
@@ -947,7 +1157,12 @@ async fn execute_php_request(
                     .upload_bytes_accepted
                     .fetch_add(stats.upload_bytes_accepted, Ordering::Relaxed);
             }
-            Err(error) => return multipart_error_response(error, &state, peer),
+            Err(error) => {
+                return (
+                    multipart_error_response(error, &state, peer),
+                    script_cache_hit,
+                );
+            }
         }
     }
     let upload_cleanup = request_context.uploaded_files.clone();
@@ -960,9 +1175,12 @@ async fn execute_php_request(
         Ok(session) => session,
         Err(error) => {
             warn!(%peer, error=%error, "session state preparation failed");
-            return response::text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session storage failed\n",
+            return (
+                response::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session storage failed\n",
+                ),
+                script_cache_hit,
             );
         }
     };
@@ -980,15 +1198,23 @@ async fn execute_php_request(
     runtime_context = runtime_context.with_stdin(body.clone());
     let is_head = parts.method == Method::HEAD;
     let script_log_path = script_path.clone();
-    let result = execute_php_in_blocking_region(Arc::clone(&state), script_path, runtime_context);
+    let result = execute_compiled_php_in_blocking_region(
+        Arc::clone(&state),
+        lookup,
+        script_path,
+        runtime_context,
+    );
     match result {
-        Ok((lookup, mut output)) => {
+        Ok(mut output) => {
             output.upload_registry.cleanup_unmoved();
             if let Err(error) = finalize_session_state(&mut output, &state) {
                 warn!(%peer, error=%error, "session state finalization failed");
-                return response::text(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "session storage failed\n",
+                return (
+                    response::text(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "session storage failed\n",
+                    ),
+                    script_cache_hit,
                 );
             }
             if php_execution_timed_out(&output) {
@@ -996,30 +1222,35 @@ async fn execute_php_request(
                     .metrics
                     .execution_timeouts
                     .fetch_add(1, Ordering::Relaxed);
-                return php_timeout_response(is_head, &output.http_response);
+                return (
+                    php_timeout_response(is_head, &output.http_response),
+                    script_cache_hit,
+                );
             }
-            debug!(script=%script_log_path.display(), hit=lookup.hit, "compiled script cache lookup");
-            php_output_response(output, is_head)
+            (php_output_response(output, is_head), script_cache_hit)
         }
         Err(PhpExecutionError::Compile(output)) => {
             cleanup_uploaded_files(&upload_cleanup);
-            php_output_response(*output, is_head)
+            (php_output_response(*output, is_head), script_cache_hit)
         }
         Err(PhpExecutionError::Engine(error)) => {
             cleanup_uploaded_files(&upload_cleanup);
             warn!(script=%script_log_path.display(), %error, "php execution engine error");
-            response::text(StatusCode::INTERNAL_SERVER_ERROR, "php execution failed\n")
+            (
+                response::text(StatusCode::INTERNAL_SERVER_ERROR, "php execution failed\n"),
+                script_cache_hit,
+            )
         }
     }
 }
 
-fn execute_php_in_blocking_region(
+fn execute_compiled_php_in_blocking_region(
     state: Arc<AppState>,
+    lookup: CompiledScriptCacheLookup,
     script_path: PathBuf,
     runtime_context: RuntimeContext,
-) -> Result<(CompiledScriptCacheLookup, PhpExecutionOutput), PhpExecutionError> {
+) -> Result<PhpExecutionOutput, PhpExecutionError> {
     task::block_in_place(move || {
-        let lookup = state.compile_script(&script_path)?;
         let executor = PhpExecutor::with_options(PhpExecutorOptions {
             vm_options: VmOptions {
                 include_cache: Some(Arc::clone(&state.include_cache)),
@@ -1037,7 +1268,7 @@ fn execute_php_in_blocking_region(
                 collect_counters: false,
             },
         );
-        Ok((lookup, output))
+        Ok(output)
     })
 }
 
@@ -1568,6 +1799,8 @@ mod tests {
             metrics: Arc::new(ServerMetrics::default()),
             script_cache: cache,
             include_cache: Arc::new(IncludeCache::new(1)),
+            metrics_token: None,
+            access_log: None,
             session_config: SessionConfig {
                 enabled: false,
                 cookie_name: "PHPSESSID".to_string(),

@@ -332,6 +332,58 @@ fn server_reuses_compiled_script_cache_for_repeated_php_requests() {
 }
 
 #[test]
+fn server_protects_metrics_with_configured_token() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let mut child = start_server(&docroot, &["--metrics-token", "secret"]);
+
+    let address = read_listening_address(&mut child);
+    let forbidden = http_request(&address, "GET", "/__phrust/metrics");
+    let authorized = http_request_with_headers(
+        &address,
+        "GET",
+        "/__phrust/metrics",
+        &[("Authorization", "Bearer secret")],
+        "",
+    );
+
+    stop_child(child);
+
+    assert!(
+        forbidden.starts_with("HTTP/1.1 403 Forbidden"),
+        "{forbidden}"
+    );
+    assert!(authorized.starts_with("HTTP/1.1 200 OK"), "{authorized}");
+    assert!(
+        authorized.contains("phrust_server_requests_total"),
+        "{authorized}"
+    );
+}
+
+#[test]
+fn server_writes_compact_access_log_line() {
+    let docroot = temp_docroot();
+    let log_path = docroot.join("access.log");
+    let log_arg = log_path.to_string_lossy().to_string();
+    fs::write(docroot.join("static.txt"), "static bytes\n").expect("write static fixture");
+    let mut child = start_server(&docroot, &["--access-log", &log_arg]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/static.txt?cache=1");
+
+    stop_child(child);
+    let log = fs::read_to_string(&log_path).expect("read access log");
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(log.contains("method=GET"), "{log}");
+    assert!(log.contains("path=\"/static.txt?cache=1\""), "{log}");
+    assert!(log.contains("status=200"), "{log}");
+    assert!(log.contains("bytes=13"), "{log}");
+    assert!(log.contains("route=static"), "{log}");
+    assert!(log.contains("cache=-"), "{log}");
+}
+
+#[test]
 fn server_executes_php_script() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);

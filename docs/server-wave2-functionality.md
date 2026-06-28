@@ -185,6 +185,52 @@ original path's content type. No dynamic compression is performed.
 Metrics expose streamed static bytes, `304` responses, `206` responses, and
 precompressed static hits under `/__phrust/metrics`.
 
+## Production Server Configuration
+
+The server can read an optional simple TOML-style config file with
+`--config <path>`. CLI flags keep their existing names and override values from
+the file, so a shared config can define production defaults while deployment
+scripts override listen addresses, docroots, or tokens.
+
+Example:
+
+```toml
+listen = "127.0.0.1:8080"
+docroot = "public"
+index = "index.php"
+front_controller = "index.php"
+max_body_bytes = 1048576
+upload_temp_dir = "/var/tmp/phrust-uploads"
+session_save_path = "/var/tmp/phrust-sessions"
+max_in_flight = 128
+request_timeout_ms = 30000
+max_execution_ms = 30000
+metrics_endpoint_enabled = true
+metrics_token = "replace-with-deployment-secret"
+script_cache_enabled = true
+script_cache_shards = 16
+script_cache_max_entries = 4096
+script_cache_check_interval_ms = 1000
+access_log = "/var/log/phrust/access.log"
+```
+
+Access logging is disabled by default. `--access-log <path|->` enables one
+compact line per request, appending to a file path or writing to stdout when the
+target is `-`. Each line records epoch timestamp, method, path/query target,
+status, response bytes from `Content-Length`, duration in milliseconds, route
+kind (`static`, `php`, `front-controller`, `health`, `metrics`, or rejection
+kind), and script-cache hit state when a PHP cache lookup happened.
+
+`GET /__phrust/metrics` remains available by default for local development.
+Operators can protect it with `--metrics-token <token>`, which requires
+`Authorization: Bearer <token>` or `X-Phrust-Metrics-Token: <token>` on metrics
+requests. `--disable-metrics-endpoint` still removes the route entirely.
+
+At startup the first stdout line remains the stable machine-readable
+`listening http://<addr>` handshake. A separate stderr summary reports the
+resolved docroot, front controller, script-cache settings, upload/session temp
+directories, metrics exposure, and access-log target.
+
 ## Expected Acceptance Commands
 
 Prompt 00 baseline:

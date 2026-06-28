@@ -1,5 +1,6 @@
 use std::{
-    env, fmt,
+    collections::HashMap,
+    env, fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -35,6 +36,7 @@ pub struct ServerConfig {
     pub max_execution_ms: u64,
     pub execution_deadline_enabled: bool,
     pub metrics_endpoint_enabled: bool,
+    pub metrics_token: Option<String>,
     pub script_cache_enabled: bool,
     pub script_cache_shards: usize,
     pub script_cache_max_entries: usize,
@@ -42,6 +44,7 @@ pub struct ServerConfig {
     pub script_cache_check_interval_ms: u64,
     pub strict_preload: bool,
     pub cache_clear_endpoint_enabled: bool,
+    pub access_log: Option<String>,
     pub help: bool,
 }
 
@@ -76,36 +79,87 @@ impl ServerConfig {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut listen = parse_listen(DEFAULT_LISTEN)?;
-        let mut docroot = None;
-        let mut index = DEFAULT_INDEX.to_string();
-        let mut front_controller = None;
-        let mut max_body_bytes = DEFAULT_MAX_BODY_BYTES;
-        let mut upload_temp_dir = std::env::temp_dir().join("phrust-uploads");
-        let mut max_upload_files = DEFAULT_MAX_UPLOAD_FILES;
-        let mut max_upload_file_bytes = None;
-        let mut session_save_path = std::env::temp_dir().join("phrust-sessions");
-        let mut session_cookie_name = DEFAULT_SESSION_COOKIE_NAME.to_string();
-        let mut session_cookie_path = DEFAULT_SESSION_COOKIE_PATH.to_string();
-        let mut sessions_enabled = true;
-        let mut max_in_flight = default_max_in_flight();
-        let mut request_timeout_ms = DEFAULT_REQUEST_TIMEOUT_MS;
-        let mut max_execution_ms = DEFAULT_MAX_EXECUTION_MS;
-        let mut execution_deadline_enabled = true;
-        let mut metrics_endpoint_enabled = true;
-        let mut script_cache_enabled = true;
-        let mut script_cache_shards = DEFAULT_SCRIPT_CACHE_SHARDS;
-        let mut script_cache_max_entries = DEFAULT_SCRIPT_CACHE_MAX_ENTRIES;
-        let mut script_cache_preload = None;
-        let mut script_cache_check_interval_ms = DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS;
-        let mut strict_preload = false;
-        let mut cache_clear_endpoint_enabled = false;
+        let raw_args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let help_requested = raw_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+        let file_config = if help_requested {
+            FileConfig::default()
+        } else if let Some(path) = config_path_from_args(&raw_args)? {
+            FileConfig::load(&path)?
+        } else {
+            FileConfig::default()
+        };
+
+        let mut listen = file_config
+            .parse_listen("listen")?
+            .unwrap_or(parse_listen(DEFAULT_LISTEN)?);
+        let mut docroot = file_config.path("docroot");
+        let mut index = file_config
+            .string("index")
+            .unwrap_or_else(|| DEFAULT_INDEX.to_string());
+        let mut front_controller = file_config.path("front_controller");
+        let mut max_body_bytes = file_config
+            .positive_usize("max_body_bytes")?
+            .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+        let mut upload_temp_dir = file_config
+            .path("upload_temp_dir")
+            .unwrap_or_else(|| std::env::temp_dir().join("phrust-uploads"));
+        let mut max_upload_files = file_config
+            .positive_usize("max_upload_files")?
+            .unwrap_or(DEFAULT_MAX_UPLOAD_FILES);
+        let mut max_upload_file_bytes = file_config.positive_usize("max_upload_file_bytes")?;
+        let mut session_save_path = file_config
+            .path("session_save_path")
+            .unwrap_or_else(|| std::env::temp_dir().join("phrust-sessions"));
+        let mut session_cookie_name = file_config
+            .string("session_cookie_name")
+            .unwrap_or_else(|| DEFAULT_SESSION_COOKIE_NAME.to_string());
+        let mut session_cookie_path = file_config
+            .string("session_cookie_path")
+            .unwrap_or_else(|| DEFAULT_SESSION_COOKIE_PATH.to_string());
+        let mut sessions_enabled = file_config.bool("sessions_enabled")?.unwrap_or(true);
+        let mut max_in_flight = file_config
+            .positive_usize("max_in_flight")?
+            .unwrap_or_else(default_max_in_flight);
+        let mut request_timeout_ms = file_config
+            .positive_u64("request_timeout_ms")?
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+        let mut max_execution_ms = file_config
+            .positive_u64("max_execution_ms")?
+            .unwrap_or(DEFAULT_MAX_EXECUTION_MS);
+        let mut execution_deadline_enabled = file_config
+            .bool("execution_deadline_enabled")?
+            .unwrap_or(true);
+        let mut metrics_endpoint_enabled = file_config
+            .bool("metrics_endpoint_enabled")?
+            .unwrap_or(true);
+        let mut metrics_token = file_config.string("metrics_token");
+        let mut script_cache_enabled = file_config.bool("script_cache_enabled")?.unwrap_or(true);
+        let mut script_cache_shards = file_config
+            .positive_usize("script_cache_shards")?
+            .unwrap_or(DEFAULT_SCRIPT_CACHE_SHARDS);
+        let mut script_cache_max_entries = file_config
+            .positive_usize("script_cache_max_entries")?
+            .unwrap_or(DEFAULT_SCRIPT_CACHE_MAX_ENTRIES);
+        let mut script_cache_preload = file_config.path("script_cache_preload");
+        let mut script_cache_check_interval_ms = file_config
+            .nonnegative_u64("script_cache_check_interval_ms")?
+            .unwrap_or(DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS);
+        let mut strict_preload = file_config.bool("strict_preload")?.unwrap_or(false);
+        let mut cache_clear_endpoint_enabled = file_config
+            .bool("cache_clear_endpoint_enabled")?
+            .unwrap_or(false);
+        let mut access_log = file_config.string("access_log");
         let mut help = false;
-        let mut args = args.into_iter().map(Into::into);
+        let mut args = raw_args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => help = true,
+                "--config" => {
+                    let _ = required_value(&arg, &mut args)?;
+                }
                 "--listen" => listen = parse_listen(&required_value(&arg, &mut args)?)?,
                 "--docroot" => docroot = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 "--index" => {
@@ -158,6 +212,9 @@ impl ServerConfig {
                 }
                 "--disable-execution-deadline" => execution_deadline_enabled = false,
                 "--disable-metrics-endpoint" => metrics_endpoint_enabled = false,
+                "--metrics-token" => {
+                    metrics_token = Some(required_value(&arg, &mut args)?);
+                }
                 "--no-script-cache" => script_cache_enabled = false,
                 "--script-cache-shards" => {
                     script_cache_shards =
@@ -176,12 +233,20 @@ impl ServerConfig {
                 }
                 "--strict-preload" => strict_preload = true,
                 "--enable-cache-clear-endpoint" => cache_clear_endpoint_enabled = true,
+                "--access-log" => access_log = Some(required_value(&arg, &mut args)?),
                 _ if arg.starts_with('-') => {
                     return Err(ConfigError::new(format!("unknown flag `{arg}`")));
                 }
                 _ => return Err(ConfigError::new(format!("unexpected argument `{arg}`"))),
             }
         }
+
+        validate_index(&index)?;
+        if let Some(path) = &front_controller {
+            validate_relative_path("front_controller", path)?;
+        }
+        validate_cookie_name("session_cookie_name", &session_cookie_name)?;
+        validate_cookie_path("session_cookie_path", &session_cookie_path)?;
 
         if help {
             return Ok(Self {
@@ -202,6 +267,7 @@ impl ServerConfig {
                 max_execution_ms,
                 execution_deadline_enabled,
                 metrics_endpoint_enabled,
+                metrics_token,
                 script_cache_enabled,
                 script_cache_shards,
                 script_cache_max_entries,
@@ -209,6 +275,7 @@ impl ServerConfig {
                 script_cache_check_interval_ms,
                 strict_preload,
                 cache_clear_endpoint_enabled,
+                access_log,
                 help,
             });
         }
@@ -232,6 +299,7 @@ impl ServerConfig {
             max_execution_ms,
             execution_deadline_enabled,
             metrics_endpoint_enabled,
+            metrics_token,
             script_cache_enabled,
             script_cache_shards,
             script_cache_max_entries,
@@ -239,6 +307,7 @@ impl ServerConfig {
             script_cache_check_interval_ms,
             strict_preload,
             cache_clear_endpoint_enabled,
+            access_log,
             help,
         })
     }
@@ -248,6 +317,7 @@ impl ServerConfig {
 \n\
 Options:\n\
   --listen <addr>              TCP listen address (default: 127.0.0.1:8080)\n\
+  --config <path>              read simple TOML-style server config\n\
   --docroot <path>             document root (required unless --help)\n\
   --index <name>               directory index file name (default: index.php)\n\
   --front-controller <path>    optional front controller, relative to docroot\n\
@@ -264,6 +334,8 @@ Options:\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
+  --metrics-token <token>      require Authorization: Bearer token for metrics\n\
+  --access-log <path|->        write compact access logs to file or stdout\n\
   --no-script-cache            disable process-local compiled script cache\n\
   --script-cache-shards <n>    compiled script cache shard count (default: 16)\n\
   --script-cache-max-entries <n> maximum compiled script cache entries (default: 4096)\n\
@@ -297,6 +369,137 @@ fn required_value(
 ) -> Result<String, ConfigError> {
     args.next()
         .ok_or_else(|| ConfigError::new(format!("{flag} requires a value")))
+}
+
+fn config_path_from_args(args: &[String]) -> Result<Option<PathBuf>, ConfigError> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--config" {
+            let Some(path) = iter.next() else {
+                return Err(ConfigError::new("--config requires a value"));
+            };
+            return Ok(Some(PathBuf::from(path)));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FileConfig {
+    values: HashMap<String, String>,
+}
+
+impl FileConfig {
+    fn load(path: &Path) -> Result<Self, ConfigError> {
+        let contents = fs::read_to_string(path).map_err(|error| {
+            ConfigError::new(format!(
+                "config `{}` cannot be read: {error}",
+                path.display()
+            ))
+        })?;
+        let mut values = HashMap::new();
+        for (line_index, line) in contents.lines().enumerate() {
+            let line = strip_config_comment(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(ConfigError::new(format!(
+                    "config `{}` line {} must use key = value",
+                    path.display(),
+                    line_index + 1
+                )));
+            };
+            let key = normalize_config_key(key.trim());
+            let value = parse_config_value(value.trim()).map_err(|message| {
+                ConfigError::new(format!(
+                    "config `{}` line {} {message}",
+                    path.display(),
+                    line_index + 1
+                ))
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Self { values })
+    }
+
+    fn string(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned()
+    }
+
+    fn path(&self, key: &str) -> Option<PathBuf> {
+        self.string(key).map(PathBuf::from)
+    }
+
+    fn parse_listen(&self, key: &str) -> Result<Option<SocketAddr>, ConfigError> {
+        self.values
+            .get(key)
+            .map(|value| parse_listen(value))
+            .transpose()
+    }
+
+    fn positive_usize(&self, key: &str) -> Result<Option<usize>, ConfigError> {
+        self.values
+            .get(key)
+            .map(|value| parse_positive_usize(key, value))
+            .transpose()
+    }
+
+    fn positive_u64(&self, key: &str) -> Result<Option<u64>, ConfigError> {
+        self.values
+            .get(key)
+            .map(|value| parse_positive_u64(key, value))
+            .transpose()
+    }
+
+    fn nonnegative_u64(&self, key: &str) -> Result<Option<u64>, ConfigError> {
+        self.values
+            .get(key)
+            .map(|value| parse_nonnegative_u64(key, value))
+            .transpose()
+    }
+
+    fn bool(&self, key: &str) -> Result<Option<bool>, ConfigError> {
+        self.values
+            .get(key)
+            .map(|value| match value.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(ConfigError::new(format!(
+                    "{key} must be true or false in config"
+                ))),
+            })
+            .transpose()
+    }
+}
+
+fn normalize_config_key(key: &str) -> String {
+    key.replace('-', "_")
+}
+
+fn strip_config_comment(line: &str) -> &str {
+    let mut in_quote = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match byte {
+            b'"' => in_quote = !in_quote,
+            b'#' if !in_quote => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_config_value(value: &str) -> Result<String, &'static str> {
+    if let Some(value) = value.strip_prefix('"') {
+        let Some(value) = value.strip_suffix('"') else {
+            return Err("has an unterminated quoted value");
+        };
+        return Ok(value.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    if value.is_empty() {
+        return Err("has an empty value");
+    }
+    Ok(value.to_string())
 }
 
 fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
@@ -386,7 +589,12 @@ fn default_max_in_flight() -> usize {
 #[cfg(test)]
 mod tests {
     use super::ServerConfig;
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::{
+        fs,
+        net::SocketAddr,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn parses_required_docroot_and_defaults() {
@@ -416,6 +624,8 @@ mod tests {
         assert_eq!(config.max_execution_ms, 30_000);
         assert!(config.execution_deadline_enabled);
         assert!(config.metrics_endpoint_enabled);
+        assert_eq!(config.metrics_token, None);
+        assert_eq!(config.access_log, None);
         assert!(config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 16);
         assert_eq!(config.script_cache_max_entries, 4096);
@@ -462,6 +672,10 @@ mod tests {
             "125",
             "--disable-execution-deadline",
             "--disable-metrics-endpoint",
+            "--metrics-token",
+            "secret",
+            "--access-log",
+            "-",
             "--no-script-cache",
             "--script-cache-shards",
             "3",
@@ -492,6 +706,8 @@ mod tests {
         assert_eq!(config.max_execution_ms, 125);
         assert!(!config.execution_deadline_enabled);
         assert!(!config.metrics_endpoint_enabled);
+        assert_eq!(config.metrics_token, Some("secret".to_string()));
+        assert_eq!(config.access_log, Some("-".to_string()));
         assert!(!config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 3);
         assert_eq!(config.script_cache_max_entries, 64);
@@ -509,6 +725,66 @@ mod tests {
         let config = ServerConfig::parse_from(["--help"]).unwrap();
 
         assert!(config.help);
+    }
+
+    #[test]
+    fn parses_config_file_and_cli_overrides_values() {
+        let path = temp_config(
+            r#"
+listen = "127.0.0.1:9000"
+docroot = "from-file"
+index = "home.php"
+max_body_bytes = 64
+metrics_token = "from-file-token"
+access_log = "access.log"
+script_cache_max_entries = 12
+strict_preload = true
+"#,
+        );
+
+        let config = ServerConfig::parse_from([
+            "--config",
+            path.to_str().unwrap(),
+            "--docroot",
+            "from-cli",
+            "--max-body-bytes",
+            "128",
+            "--metrics-token",
+            "from-cli-token",
+        ])
+        .unwrap();
+
+        fs::remove_file(path).expect("remove config");
+
+        assert_eq!(
+            config.listen,
+            "127.0.0.1:9000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.docroot, PathBuf::from("from-cli"));
+        assert_eq!(config.index, "home.php");
+        assert_eq!(config.max_body_bytes, 128);
+        assert_eq!(config.metrics_token, Some("from-cli-token".to_string()));
+        assert_eq!(config.access_log, Some("access.log".to_string()));
+        assert_eq!(config.script_cache_max_entries, 12);
+        assert!(config.strict_preload);
+    }
+
+    #[test]
+    fn cli_override_replaces_invalid_file_value_before_final_validation() {
+        let path = temp_config(
+            r#"
+docroot = "from-file"
+index = "../bad.php"
+"#,
+        );
+
+        let config =
+            ServerConfig::parse_from(["--config", path.to_str().unwrap(), "--index", "index.php"])
+                .unwrap();
+
+        fs::remove_file(path).expect("remove config");
+
+        assert_eq!(config.index, "index.php");
     }
 
     #[test]
@@ -611,5 +887,18 @@ mod tests {
             error.to_string(),
             "--session-cookie-path must be a non-empty cookie path without response separators"
         );
+    }
+
+    fn temp_config(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phrust-server-config-{}-{unique}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, contents).expect("write config");
+        path
     }
 }
