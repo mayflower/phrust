@@ -5,6 +5,16 @@ use crate::builtins::{BuiltinCompatibility, BuiltinEntry};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
+        "iterator_count",
+        core::builtin_spl_autoload_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "iterator_to_array",
+        core::builtin_spl_autoload_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "spl_autoload_call",
         core::builtin_spl_autoload_requires_vm,
         BuiltinCompatibility::Php,
