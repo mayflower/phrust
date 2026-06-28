@@ -41,6 +41,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_mb_strtoupper,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("mb_strpos", builtin_mb_strpos, BuiltinCompatibility::Php),
     BuiltinEntry::new("mb_substr", builtin_mb_substr, BuiltinCompatibility::Php),
 ];
 
@@ -256,6 +257,61 @@ fn builtin_mb_substr(
     Ok(Value::string(
         text.as_bytes()[byte_start..byte_end].to_vec(),
     ))
+}
+
+fn builtin_mb_strpos(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(2..=4).contains(&args.len()) {
+        return Err(arity_error("mb_strpos", "two to four argument(s)"));
+    }
+    let haystack = string_arg("mb_strpos", &args[0])?;
+    let needle = string_arg("mb_strpos", &args[1])?;
+    let offset = args
+        .get(2)
+        .map(|value| int_arg("mb_strpos", value))
+        .transpose()?
+        .unwrap_or(0);
+    let encoding = args
+        .get(3)
+        .map(|value| encoding_arg("mb_strpos", value))
+        .transpose()?
+        .unwrap_or_else(|| context.mb_internal_encoding().to_owned());
+    let Some(canonical) = canonical_encoding(&encoding) else {
+        return Err(unsupported_encoding_error("mb_strpos", &encoding));
+    };
+    let haystack_chars = encoded_chars("mb_strpos", haystack.as_bytes(), canonical)?;
+    let needle_string = encoded_chars("mb_strpos", needle.as_bytes(), canonical)?
+        .into_iter()
+        .collect::<String>();
+    let start = if offset < 0 {
+        haystack_chars
+            .len()
+            .saturating_sub(offset.unsigned_abs() as usize)
+    } else {
+        (offset as usize).min(haystack_chars.len())
+    };
+    let tail = haystack_chars[start..].iter().collect::<String>();
+    Ok(tail
+        .find(&needle_string)
+        .map_or(Value::Bool(false), |byte_offset| {
+            Value::Int((start + tail[..byte_offset].chars().count()) as i64)
+        }))
+}
+
+fn encoded_chars(function: &str, bytes: &[u8], encoding: &str) -> Result<Vec<char>, BuiltinError> {
+    match encoding {
+        "UTF-8" => Ok(validate_utf8(function, bytes)?.chars().collect()),
+        "ASCII" if bytes.is_ascii() => Ok(bytes.iter().map(|byte| char::from(*byte)).collect()),
+        "ASCII" => Err(argument_value_error(
+            function,
+            "#1 ($string)",
+            "is not valid for encoding ASCII",
+        )),
+        _ => Err(unsupported_encoding_error(function, encoding)),
+    }
 }
 
 fn convert_case_builtin(

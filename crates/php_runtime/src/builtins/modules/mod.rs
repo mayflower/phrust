@@ -1,7 +1,12 @@
 pub(in crate::builtins) mod arrays;
 pub(in crate::builtins) mod core;
 pub(in crate::builtins) mod date;
+pub(in crate::builtins) mod exif;
+pub(in crate::builtins) mod fileinfo;
 pub(in crate::builtins) mod filesystem;
+pub(in crate::builtins) mod filter;
+pub(in crate::builtins) mod hash;
+pub(in crate::builtins) mod iconv;
 pub(in crate::builtins) mod intl;
 pub(in crate::builtins) mod json;
 pub(in crate::builtins) mod math;
@@ -13,3 +18,4 @@ pub(in crate::builtins) mod session;
 pub(in crate::builtins) mod spl;
 pub(in crate::builtins) mod streams;
 pub(in crate::builtins) mod strings;
+pub(in crate::builtins) mod zlib;

@@ -35,6 +35,8 @@ pub enum ResourceKind {
     Directory,
     /// Stream context resource.
     StreamContext,
+    /// File information detector resource.
+    FileInfo,
     /// Closed resource placeholder.
     Closed,
 }
@@ -344,6 +346,7 @@ enum StreamData {
     Context {
         options: PhpArray,
     },
+    FileInfo,
 }
 
 /// Reference-counted runtime resource handle.
@@ -400,6 +403,7 @@ impl ResourceRef {
             ResourceKind::Directory | ResourceKind::StreamContext => {
                 state.metadata.stream_type.clone()
             }
+            ResourceKind::FileInfo => "file_info".to_string(),
             ResourceKind::Closed => "Unknown".to_string(),
         }
     }
@@ -433,7 +437,7 @@ impl ResourceRef {
                 buffer[*cursor..end].copy_from_slice(bytes);
                 *cursor = end;
             }
-            StreamData::Directory { .. } | StreamData::Context { .. } => {
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
                 return Err(StreamOpenError::new(
                     "E_PHP_RUNTIME_STREAM_NOT_WRITABLE",
                     "directory resource is not writable",
@@ -468,10 +472,12 @@ impl ResourceRef {
                 *cursor = end;
                 Ok(bytes)
             }
-            StreamData::Directory { .. } | StreamData::Context { .. } => Err(StreamOpenError::new(
-                "E_PHP_RUNTIME_STREAM_NOT_READABLE",
-                "directory resource is not byte-readable",
-            )),
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
+                Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_NOT_READABLE",
+                    "directory resource is not byte-readable",
+                ))
+            }
         }
     }
 
@@ -504,10 +510,12 @@ impl ResourceRef {
                 *cursor = end;
                 Ok(bytes)
             }
-            StreamData::Directory { .. } | StreamData::Context { .. } => Err(StreamOpenError::new(
-                "E_PHP_RUNTIME_STREAM_NOT_READABLE",
-                "directory resource is not line-readable",
-            )),
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
+                Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_NOT_READABLE",
+                    "directory resource is not line-readable",
+                ))
+            }
         }
     }
 
@@ -534,10 +542,12 @@ impl ResourceRef {
                 *cursor = buffer.len();
                 Ok(bytes)
             }
-            StreamData::Directory { .. } | StreamData::Context { .. } => Err(StreamOpenError::new(
-                "E_PHP_RUNTIME_STREAM_NOT_READABLE",
-                "directory resource is not byte-readable",
-            )),
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
+                Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_NOT_READABLE",
+                    "directory resource is not byte-readable",
+                ))
+            }
         }
     }
 
@@ -565,7 +575,7 @@ impl ResourceRef {
             StreamData::Memory { cursor, .. }
             | StreamData::Stdio { cursor, .. }
             | StreamData::File { cursor, .. } => *cursor = offset,
-            StreamData::Directory { .. } | StreamData::Context { .. } => {
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
                 return Err(StreamOpenError::new(
                     "E_PHP_RUNTIME_STREAM_NOT_SEEKABLE",
                     "directory resource is not byte-seekable",
@@ -599,7 +609,7 @@ impl ResourceRef {
                     *cursor = length;
                 }
             }
-            StreamData::Directory { .. } | StreamData::Context { .. } => {
+            StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
                 return Err(StreamOpenError::new(
                     "E_PHP_RUNTIME_STREAM_NOT_WRITABLE",
                     "resource is not a writable byte stream",
@@ -624,6 +634,7 @@ impl ResourceRef {
             | StreamData::File { cursor, .. }
             | StreamData::Directory { cursor, .. } => *cursor,
             StreamData::Context { .. } => 0,
+            StreamData::FileInfo => 0,
         })
     }
 
@@ -644,6 +655,7 @@ impl ResourceRef {
                 entries, cursor, ..
             } => *cursor >= entries.len(),
             StreamData::Context { .. } => true,
+            StreamData::FileInfo => true,
         })
     }
 
@@ -867,6 +879,21 @@ impl ResourceTable {
             flags: StreamFlags::new(false, false, false),
             metadata: StreamMetadata::new("PHP", "stream-context", "", "stream-context"),
             data: StreamData::Context { options },
+        })));
+        self.resources.insert(id, resource.clone());
+        resource
+    }
+
+    /// Registers a fileinfo detector resource.
+    pub fn register_fileinfo(&mut self) -> ResourceRef {
+        let id = ResourceId::new(self.next_id);
+        self.next_id += 1;
+        let resource = ResourceRef(Rc::new(RefCell::new(ResourceState {
+            id,
+            kind: ResourceKind::FileInfo,
+            flags: StreamFlags::new(false, false, false),
+            metadata: StreamMetadata::new("fileinfo", "file_info", "", "fileinfo"),
+            data: StreamData::FileInfo,
         })));
         self.resources.insert(id, resource.clone());
         resource

@@ -856,6 +856,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("getrandmax", "standard"))
                 .with_function(FunctionDescriptor::php("get_resource_id", "standard"))
                 .with_function(FunctionDescriptor::php("get_resource_type", "standard"))
+                .with_function(FunctionDescriptor::php("getimagesize", "standard"))
                 .with_function(FunctionDescriptor::php("getcwd", "standard"))
                 .with_function(FunctionDescriptor::php("getenv", "standard"))
                 .with_function(FunctionDescriptor::php("gettype", "standard"))
@@ -913,6 +914,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("method_exists", "standard"))
                 .with_function(FunctionDescriptor::php("min", "standard"))
                 .with_function(FunctionDescriptor::php("mkdir", "standard"))
+                .with_function(FunctionDescriptor::php("mime_content_type", "standard"))
                 .with_function(FunctionDescriptor::php("natcasesort", "standard"))
                 .with_function(FunctionDescriptor::php("natsort", "standard"))
                 .with_function(FunctionDescriptor::php("number_format", "standard"))
@@ -1078,6 +1080,31 @@ impl ExtensionRegistry {
                     "PHP_URL_FRAGMENT",
                     "standard",
                     ConstantValue::Int(constants::PHP_URL_FRAGMENT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "IMAGETYPE_GIF",
+                    "standard",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "IMAGETYPE_JPEG",
+                    "standard",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "IMAGETYPE_PNG",
+                    "standard",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "IMAGETYPE_WEBP",
+                    "standard",
+                    ConstantValue::Int(18),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "IMAGETYPE_AVIF",
+                    "standard",
+                    ConstantValue::Int(19),
                 )),
             ExtensionDescriptor::new("json")
                 .with_function(FunctionDescriptor::php("json_decode", "json"))
@@ -1369,6 +1396,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("mb_strlen", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_strtolower", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_strtoupper", "mbstring"))
+                .with_function(FunctionDescriptor::php("mb_strpos", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_substr", "mbstring")),
             ExtensionDescriptor::new("intl")
                 .enabled_by_default(false)
@@ -1385,7 +1413,184 @@ impl ExtensionRegistry {
                 )),
             ExtensionDescriptor::new("hash")
                 .with_function(FunctionDescriptor::php("hash", "hash"))
+                .with_function(FunctionDescriptor::php("hash_algos", "hash"))
+                .with_function(FunctionDescriptor::php("hash_equals", "hash"))
                 .with_function(FunctionDescriptor::php("hash_hmac", "hash")),
+            ExtensionDescriptor::new("filter")
+                .with_function(FunctionDescriptor::php("filter_input", "filter"))
+                .with_function(FunctionDescriptor::php("filter_var", "filter"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INPUT_POST",
+                    "filter",
+                    ConstantValue::Int(0),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INPUT_GET",
+                    "filter",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INPUT_COOKIE",
+                    "filter",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INPUT_ENV",
+                    "filter",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INPUT_SERVER",
+                    "filter",
+                    ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_DEFAULT",
+                    "filter",
+                    ConstantValue::Int(516),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_BOOL",
+                    "filter",
+                    ConstantValue::Int(258),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_BOOLEAN",
+                    "filter",
+                    ConstantValue::Int(258),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_URL",
+                    "filter",
+                    ConstantValue::Int(273),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_EMAIL",
+                    "filter",
+                    ConstantValue::Int(274),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_IP",
+                    "filter",
+                    ConstantValue::Int(275),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_SANITIZE_EMAIL",
+                    "filter",
+                    ConstantValue::Int(517),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_SANITIZE_URL",
+                    "filter",
+                    ConstantValue::Int(518),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_SANITIZE_NUMBER_INT",
+                    "filter",
+                    ConstantValue::Int(519),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_NULL_ON_FAILURE",
+                    "filter",
+                    ConstantValue::Int(134_217_728),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_FLAG_IPV4",
+                    "filter",
+                    ConstantValue::Int(1_048_576),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_FLAG_IPV6",
+                    "filter",
+                    ConstantValue::Int(2_097_152),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_FLAG_PATH_REQUIRED",
+                    "filter",
+                    ConstantValue::Int(262_144),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_FLAG_QUERY_REQUIRED",
+                    "filter",
+                    ConstantValue::Int(524_288),
+                )),
+            ExtensionDescriptor::new("iconv")
+                .with_function(FunctionDescriptor::php("iconv", "iconv"))
+                .with_function(FunctionDescriptor::php("iconv_strlen", "iconv"))
+                .with_function(FunctionDescriptor::php("iconv_strpos", "iconv"))
+                .with_function(FunctionDescriptor::php("iconv_substr", "iconv"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ICONV_IMPL",
+                    "iconv",
+                    ConstantValue::String("phrust"),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ICONV_VERSION",
+                    "iconv",
+                    ConstantValue::String("bounded-utf8-ascii"),
+                )),
+            ExtensionDescriptor::new("zlib")
+                .with_function(FunctionDescriptor::php("gzcompress", "zlib"))
+                .with_function(FunctionDescriptor::php("gzdecode", "zlib"))
+                .with_function(FunctionDescriptor::php("gzencode", "zlib"))
+                .with_function(FunctionDescriptor::php("gzuncompress", "zlib"))
+                .with_function(FunctionDescriptor::php("zlib_decode", "zlib"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FORCE_DEFLATE",
+                    "zlib",
+                    ConstantValue::Int(15),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FORCE_GZIP",
+                    "zlib",
+                    ConstantValue::Int(31),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ZLIB_ENCODING_RAW",
+                    "zlib",
+                    ConstantValue::Int(-15),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ZLIB_ENCODING_GZIP",
+                    "zlib",
+                    ConstantValue::Int(31),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ZLIB_ENCODING_DEFLATE",
+                    "zlib",
+                    ConstantValue::Int(15),
+                )),
+            ExtensionDescriptor::new("zip").with_class(ClassDescriptor::new(
+                "ZipArchive",
+                "zip",
+                ClassKind::Class,
+            )),
+            ExtensionDescriptor::new("fileinfo")
+                .with_function(FunctionDescriptor::php("finfo_buffer", "fileinfo"))
+                .with_function(FunctionDescriptor::php("finfo_file", "fileinfo"))
+                .with_function(FunctionDescriptor::php("finfo_open", "fileinfo"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILEINFO_NONE",
+                    "fileinfo",
+                    ConstantValue::Int(0),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILEINFO_MIME_TYPE",
+                    "fileinfo",
+                    ConstantValue::Int(16),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILEINFO_MIME_ENCODING",
+                    "fileinfo",
+                    ConstantValue::Int(1024),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILEINFO_MIME",
+                    "fileinfo",
+                    ConstantValue::Int(1040),
+                )),
+            ExtensionDescriptor::new("exif")
+                .with_function(FunctionDescriptor::php("exif_imagetype", "exif")),
             ExtensionDescriptor::new("random")
                 .with_function(FunctionDescriptor::php("random_bytes", "random"))
                 .with_function(FunctionDescriptor::php("random_int", "random")),

@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"wp.stdlib",
+  "priority":"WordPress-focused core stdlib",
+  "selected_manifest":"tests/phpt/manifests/modules/wp.stdlib.selected.jsonl",
+  "corpus_count":7,
+  "selected_count":7,
+  "pass_count":7,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["common array/string/variable helpers","hash and HMAC helpers","filter validation and sanitization","bounded mbstring and iconv UTF-8 helpers","fileinfo and EXIF media probes","zlib roundtrips","ZipArchive local read and extract MVP"],
+  "non_scope":["database access","SAPI request handling","HTTP client behavior","full encoding databases","full libmagic and EXIF metadata parity","zip archive writing and encryption"],
+  "target_gates":["nix develop -c cargo test -p php_runtime","nix develop -c cargo test -p php_std","nix develop -c just phpt-dev-module MODULE=wp.stdlib","nix develop -c just verify-stdlib","nix develop -c just verify-phpt"],
+  "next_step":"Keep the selected WordPress-critical stdlib surface green before promoting broader upstream extension corpora."
+}

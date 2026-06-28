@@ -10,9 +10,10 @@ surface:
 - `extension_loaded("mbstring")` is true.
 - `function_exists()` is true for `mb_strlen`, `mb_substr`,
   `mb_strtolower`, `mb_strtoupper`, `mb_detect_encoding`,
-  `mb_check_encoding`, `mb_internal_encoding`, and `mb_convert_encoding`.
-- Unsupported mbstring functions remain absent rather than pretending full
-  extension parity.
+  `mb_check_encoding`, `mb_internal_encoding`, `mb_convert_encoding`, and
+  `mb_strpos`.
+- Unsupported mbstring functions outside the selected surface remain absent
+  rather than pretending full extension parity.
 
 The MVP covers UTF-8 length, substring, case conversion, UTF-8/ASCII detection,
 request-local internal encoding, and UTF-8 to UTF-8 conversion. Legacy
@@ -71,6 +72,7 @@ Committed baseline counts for the broader mbstring-owned corpus:
   UTF-8 behavior backed by focused PHP 8.5.7 oracle output.
 - `mb_detect_encoding` and `mb_check_encoding` accept UTF-8 and ASCII aliases.
 - `mb_convert_encoding` supports the selected UTF-8 to UTF-8 no-op case only.
+- `mb_strpos` supports selected UTF-8/ASCII string position checks.
 
 ## Target Gates
 

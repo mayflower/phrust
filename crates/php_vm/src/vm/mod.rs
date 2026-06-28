@@ -74,6 +74,7 @@ use php_runtime::{
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8451,6 +8452,27 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_zip_runtime_class(&class_name) {
+                            let object = match new_zip_object(
+                                &class_name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let Some(class) = lookup_class_in_state(compiled, state, &class_name)
                         else {
                             return self.runtime_error(
@@ -8866,6 +8888,33 @@ impl Vm {
                                 }
                             };
                             let object = match new_phar_object(
+                                class_name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_zip_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_zip_object(
                                 class_name,
                                 values,
                                 &self.options.runtime_context,
@@ -14260,6 +14309,28 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_zip_runtime_class(&object.class_name()) {
+                            let value = match call_zip_method(
+                                &object,
+                                method,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let receiver_class = normalize_class_name(&object.class_name());
                         let lowered_method = normalize_method_name(method);
                         let scope = current_scope_class(compiled, stack);
@@ -19630,6 +19701,12 @@ impl Vm {
                 method,
                 args.into_iter().map(|arg| arg.value).collect(),
             ) {
+                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Err(message) => self.runtime_error(output, compiled, stack, message),
+            };
+        }
+        if is_zip_runtime_class(&object.class_name()) {
+            return match call_zip_method(&object, method, args, &self.options.runtime_context) {
                 Ok(value) => VmResult::success(output.clone(), Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
@@ -28790,6 +28867,9 @@ fn object_instanceof(
             if let Some(result) = internal_phar_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if let Some(result) = internal_zip_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
             class_is_or_implements(compiled, &object.class_name(), class_name)
         }
         _ => Ok(false),
@@ -30264,6 +30344,482 @@ fn validate_phar_arg_count(
         ));
     }
     Ok(())
+}
+
+fn is_zip_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "ziparchive"
+}
+
+fn internal_zip_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_zip_runtime_class(object_class) {
+        return None;
+    }
+    Some(normalize_class_name(target_class) == "ziparchive")
+}
+
+fn new_zip_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    _runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
+    if !is_zip_runtime_class(class_name) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        ));
+    }
+    let values = call_args_to_positional("ZipArchive::__construct", args)?;
+    validate_zip_arg_count("ZipArchive::__construct", values.len(), 0, 0)?;
+    let object = ObjectRef::new_with_display_name(&zip_runtime_class(), "ZipArchive");
+    zip_reset_object(&object);
+    Ok(object)
+}
+
+fn zip_runtime_class() -> RuntimeClassEntry {
+    RuntimeClassEntry {
+        name: "ziparchive".to_owned(),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn validate_zip_arg_count(
+    function: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if actual < min || actual > max {
+        return Err(format!(
+            "E_PHP_VM_ZIP_ARG_COUNT: {function} expects {min}..{max} argument(s), {actual} given"
+        ));
+    }
+    Ok(())
+}
+
+fn call_zip_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let values = call_args_to_positional(&format!("ZipArchive::{method}"), args)?;
+    match normalize_method_name(method).as_str() {
+        "open" => {
+            validate_zip_arg_count("ZipArchive::open", values.len(), 1, 2)?;
+            let filename = to_string(&values[0])?.to_string_lossy();
+            let path = zip_resolve_path(&filename, runtime_context)?;
+            let entry_count = match zip_entry_count(&path) {
+                Ok(count) => count,
+                Err(_) => {
+                    zip_reset_object(object);
+                    return Ok(Value::Bool(false));
+                }
+            };
+            object.set_property(
+                "__zip_path",
+                Value::string(path.to_string_lossy().as_bytes().to_vec()),
+            );
+            object.set_property(
+                "filename",
+                Value::string(path.to_string_lossy().as_bytes().to_vec()),
+            );
+            object.set_property("numFiles", Value::Int(entry_count as i64));
+            object.set_property("status", Value::Int(0));
+            Ok(Value::Bool(true))
+        }
+        "close" => {
+            validate_zip_arg_count("ZipArchive::close", values.len(), 0, 0)?;
+            zip_reset_object(object);
+            Ok(Value::Bool(true))
+        }
+        "count" => {
+            validate_zip_arg_count("ZipArchive::count", values.len(), 0, 0)?;
+            Ok(Value::Int(zip_entry_count_for_object(object)? as i64))
+        }
+        "getfromname" => {
+            validate_zip_arg_count("ZipArchive::getFromName", values.len(), 1, 3)?;
+            let name = to_string(&values[0])?.to_string_lossy();
+            let max_len = zip_optional_length(values.get(1))?;
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_read_name(&path, &name, max_len)? {
+                Some(bytes) => Ok(Value::string(bytes)),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "getfromindex" => {
+            validate_zip_arg_count("ZipArchive::getFromIndex", values.len(), 1, 3)?;
+            let index = to_int(&values[0])?;
+            let max_len = zip_optional_length(values.get(1))?;
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_read_index(&path, index, max_len)? {
+                Some(bytes) => Ok(Value::string(bytes)),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "locatename" => {
+            validate_zip_arg_count("ZipArchive::locateName", values.len(), 1, 2)?;
+            let name = to_string(&values[0])?.to_string_lossy();
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_locate_name(&path, &name)? {
+                Some(index) => Ok(Value::Int(index as i64)),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "statindex" => {
+            validate_zip_arg_count("ZipArchive::statIndex", values.len(), 1, 2)?;
+            let index = to_int(&values[0])?;
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_stat_index(&path, index)? {
+                Some(stat) => Ok(Value::Array(stat)),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "statname" => {
+            validate_zip_arg_count("ZipArchive::statName", values.len(), 1, 2)?;
+            let name = to_string(&values[0])?.to_string_lossy();
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            match zip_stat_name(&path, &name)? {
+                Some(stat) => Ok(Value::Array(stat)),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "extractto" => {
+            validate_zip_arg_count("ZipArchive::extractTo", values.len(), 1, 2)?;
+            let destination = to_string(&values[0])?.to_string_lossy();
+            let entries = zip_extract_entries(values.get(1))?;
+            let Some(path) = zip_object_path(object) else {
+                return Ok(Value::Bool(false));
+            };
+            zip_extract_to(&path, &destination, entries, runtime_context).map(Value::Bool)
+        }
+        _ => Err(format!(
+            "E_PHP_VM_ZIP_METHOD_GAP: ZipArchive::{method} is not implemented"
+        )),
+    }
+}
+
+fn zip_reset_object(object: &ObjectRef) {
+    object.set_property("__zip_path", Value::Null);
+    object.set_property("filename", Value::string(Vec::new()));
+    object.set_property("numFiles", Value::Int(0));
+    object.set_property("status", Value::Int(0));
+}
+
+fn zip_object_path(object: &ObjectRef) -> Option<PathBuf> {
+    match object.get_property("__zip_path") {
+        Some(Value::String(path)) if !path.as_bytes().is_empty() => {
+            Some(PathBuf::from(path.to_string_lossy()))
+        }
+        _ => None,
+    }
+}
+
+fn zip_resolve_path(path: &str, runtime_context: &RuntimeContext) -> Result<PathBuf, String> {
+    let raw = Path::new(path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        runtime_context.cwd.join(raw)
+    };
+    if !runtime_context.filesystem.allows_path(&resolved) {
+        return Err(format!(
+            "E_PHP_VM_ZIP_PATH_DENIED: ZipArchive path {} is outside allowed filesystem roots",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn zip_entry_count_for_object(object: &ObjectRef) -> Result<usize, String> {
+    let Some(path) = zip_object_path(object) else {
+        return Ok(0);
+    };
+    zip_entry_count(&path)
+}
+
+fn zip_entry_count(path: &Path) -> Result<usize, String> {
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_OPEN: failed to open zip archive `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let archive = zip::ZipArchive::new(file).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_READ: failed to read zip archive `{}`: {error}",
+            path.display()
+        )
+    })?;
+    Ok(archive.len())
+}
+
+fn zip_optional_length(value: Option<&Value>) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let length = to_int(value)?;
+    if length <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(length as usize))
+}
+
+fn zip_read_name(
+    path: &Path,
+    name: &str,
+    max_len: Option<usize>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut archive = zip_open_archive(path)?;
+    for index in 0..archive.len() {
+        let mut file = zip_file_by_index(&mut archive, index, path)?;
+        if file.name() == name {
+            return zip_read_file(&mut file, max_len).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn zip_read_index(
+    path: &Path,
+    index: i64,
+    max_len: Option<usize>,
+) -> Result<Option<Vec<u8>>, String> {
+    if index < 0 {
+        return Ok(None);
+    }
+    let mut archive = zip_open_archive(path)?;
+    let index = index as usize;
+    if index >= archive.len() {
+        return Ok(None);
+    }
+    let mut file = zip_file_by_index(&mut archive, index, path)?;
+    zip_read_file(&mut file, max_len).map(Some)
+}
+
+fn zip_locate_name(path: &Path, name: &str) -> Result<Option<usize>, String> {
+    let mut archive = zip_open_archive(path)?;
+    for index in 0..archive.len() {
+        let file = zip_file_by_index(&mut archive, index, path)?;
+        if file.name() == name {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn zip_stat_name(path: &Path, name: &str) -> Result<Option<PhpArray>, String> {
+    let mut archive = zip_open_archive(path)?;
+    for index in 0..archive.len() {
+        let file = zip_file_by_index(&mut archive, index, path)?;
+        if file.name() == name {
+            return Ok(Some(zip_file_stat(index, &file)));
+        }
+    }
+    Ok(None)
+}
+
+fn zip_stat_index(path: &Path, index: i64) -> Result<Option<PhpArray>, String> {
+    if index < 0 {
+        return Ok(None);
+    }
+    let mut archive = zip_open_archive(path)?;
+    let index = index as usize;
+    if index >= archive.len() {
+        return Ok(None);
+    }
+    let file = zip_file_by_index(&mut archive, index, path)?;
+    Ok(Some(zip_file_stat(index, &file)))
+}
+
+fn zip_open_archive(path: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_OPEN: failed to open zip archive `{}`: {error}",
+            path.display()
+        )
+    })?;
+    zip::ZipArchive::new(file).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_READ: failed to read zip archive `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+fn zip_file_by_index<'a>(
+    archive: &'a mut zip::ZipArchive<fs::File>,
+    index: usize,
+    path: &Path,
+) -> Result<zip::read::ZipFile<'a>, String> {
+    archive.by_index(index).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_ENTRY_READ: failed to read zip entry {index} from `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+fn zip_read_file(
+    file: &mut zip::read::ZipFile<'_>,
+    max_len: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("E_PHP_VM_ZIP_ENTRY_READ: failed to read zip entry: {error}"))?;
+    if let Some(max_len) = max_len {
+        bytes.truncate(max_len);
+    }
+    Ok(bytes)
+}
+
+fn zip_file_stat(index: usize, file: &zip::read::ZipFile<'_>) -> PhpArray {
+    let mut array = PhpArray::new();
+    zip_array_insert(
+        &mut array,
+        "name",
+        Value::string(file.name().as_bytes().to_vec()),
+    );
+    zip_array_insert(&mut array, "index", Value::Int(index as i64));
+    zip_array_insert(&mut array, "size", Value::Int(file.size() as i64));
+    zip_array_insert(
+        &mut array,
+        "comp_size",
+        Value::Int(file.compressed_size() as i64),
+    );
+    zip_array_insert(&mut array, "crc", Value::Int(file.crc32() as i64));
+    array
+}
+
+fn zip_extract_entries(value: Option<&Value>) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let mut entries = BTreeSet::new();
+    match value {
+        Value::String(_) => {
+            entries.insert(to_string(value)?.to_string_lossy());
+        }
+        Value::Array(array) => {
+            for (_, entry) in array.iter() {
+                entries.insert(to_string(entry)?.to_string_lossy());
+            }
+        }
+        _ => {
+            return Err(format!(
+                "E_PHP_VM_ZIP_TYPE: ZipArchive::extractTo argument 2 must be string, array, or null, {} given",
+                value_type_name(value)
+            ));
+        }
+    }
+    Ok(Some(entries))
+}
+
+fn zip_extract_to(
+    archive_path: &Path,
+    destination: &str,
+    entries: Option<BTreeSet<String>>,
+    runtime_context: &RuntimeContext,
+) -> Result<bool, String> {
+    let destination = zip_resolve_path(destination, runtime_context)?;
+    if !runtime_context.filesystem.allows_path(&destination) {
+        return Err(format!(
+            "E_PHP_VM_ZIP_PATH_DENIED: ZipArchive extraction path {} is outside allowed filesystem roots",
+            destination.display()
+        ));
+    }
+    fs::create_dir_all(&destination).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_EXTRACT: failed to create extraction directory `{}`: {error}",
+            destination.display()
+        )
+    })?;
+
+    let mut archive = zip_open_archive(archive_path)?;
+    for index in 0..archive.len() {
+        let mut file = zip_file_by_index(&mut archive, index, archive_path)?;
+        if let Some(entries) = &entries
+            && !entries.contains(file.name())
+        {
+            continue;
+        }
+        let Some(enclosed_name) = file.enclosed_name() else {
+            return Err(format!(
+                "E_PHP_VM_ZIP_EXTRACT_PATH: zip entry `{}` has an unsafe path",
+                file.name()
+            ));
+        };
+        let output_path = destination.join(enclosed_name);
+        if !output_path.starts_with(&destination)
+            || !runtime_context.filesystem.allows_path(&output_path)
+        {
+            return Err(format!(
+                "E_PHP_VM_ZIP_EXTRACT_PATH: zip entry `{}` escapes the extraction directory",
+                file.name()
+            ));
+        }
+        if file.name().ends_with('/') {
+            fs::create_dir_all(&output_path).map_err(|error| {
+                format!(
+                    "E_PHP_VM_ZIP_EXTRACT: failed to create directory `{}`: {error}",
+                    output_path.display()
+                )
+            })?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "E_PHP_VM_ZIP_EXTRACT: failed to create directory `{}`: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|error| {
+            format!(
+                "E_PHP_VM_ZIP_EXTRACT: failed to read zip entry `{}`: {error}",
+                file.name()
+            )
+        })?;
+        fs::write(&output_path, bytes).map_err(|error| {
+            format!(
+                "E_PHP_VM_ZIP_EXTRACT: failed to write `{}`: {error}",
+                output_path.display()
+            )
+        })?;
+    }
+    Ok(true)
+}
+
+fn zip_array_insert(array: &mut PhpArray, key: &str, value: Value) {
+    array.insert(
+        ArrayKey::String(PhpString::from_bytes(key.as_bytes().to_vec())),
+        value,
+    );
 }
 
 fn new_pdo_object(
@@ -33181,6 +33737,7 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
         "phar" => Some(internal_empty_class_entry("phar", "Phar")),
         "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
         "pharfileinfo" => Some(internal_empty_class_entry("pharfileinfo", "PharFileInfo")),
+        "ziparchive" => Some(internal_empty_class_entry("ziparchive", "ZipArchive")),
         _ => None,
     }
 }
@@ -39474,7 +40031,7 @@ mod tests {
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "loaded|mb_check_encoding:yes|mb_convert_encoding:yes|mb_strlen:yes|mb_substr:yes|mb_strtolower:yes|mb_strtoupper:yes|mb_detect_encoding:yes|mb_strpos:no"
+            "loaded|mb_check_encoding:yes|mb_convert_encoding:yes|mb_strlen:yes|mb_substr:yes|mb_strtolower:yes|mb_strtoupper:yes|mb_detect_encoding:yes|mb_strpos:yes"
         );
     }
 

@@ -21,6 +21,7 @@ Enable a deliberately narrow mbstring surface for Composer and framework probes:
 - `mb_check_encoding`
 - `mb_internal_encoding`
 - `mb_convert_encoding` for UTF-8 to UTF-8 only
+- `mb_strpos`
 
 The implementation uses the existing runtime and Rust standard-library Unicode
 primitives. It does not introduce a full encoding database, mbregex, Oniguruma,
@@ -36,8 +37,8 @@ from the same php-src checkout with `--enable-mbstring --disable-mbregex`.
 
 - `extension_loaded("mbstring")` returns `true`.
 - `function_exists()` returns `true` only for the selected MVP functions.
-- Unsupported mbstring functions, including `mb_strpos`, remain absent rather
-  than returning fake results.
+- Unsupported mbstring functions outside the selected surface remain absent
+  rather than returning fake results.
 - Supported encodings are `UTF-8` and `ASCII` aliases accepted by the selected
   fixtures.
 - `mb_internal_encoding()` is request-local runtime state with default `UTF-8`.
@@ -51,6 +52,8 @@ Required for this strategy:
 - `tests/phpt/generated/mbstring/platform-checks.phpt`
 - `tests/phpt/generated/mbstring/utf8-common-functions.phpt`
 - `tests/phpt/generated/mbstring/utf8-encoding-state.phpt`
+- `tests/phpt/generated/wp.stdlib/text-encoding-basic.phpt` covers the
+  `mb_strpos` addition selected by the WordPress stdlib harness.
 
 These PHPTs keep the enabled surface explicit and reference-backed without
 promoting the full upstream mbstring corpus.

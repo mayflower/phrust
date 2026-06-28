@@ -37,8 +37,6 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
     BuiltinEntry::new("crc32", builtin_crc32, BuiltinCompatibility::Php),
     BuiltinEntry::new("explode", builtin_explode, BuiltinCompatibility::Php),
-    BuiltinEntry::new("hash", builtin_hash, BuiltinCompatibility::Php),
-    BuiltinEntry::new("hash_hmac", builtin_hash_hmac, BuiltinCompatibility::Php),
     BuiltinEntry::new("hex2bin", builtin_hex2bin, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "highlight_string",

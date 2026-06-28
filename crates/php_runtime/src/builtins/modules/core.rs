@@ -19,6 +19,7 @@ use crate::{
 use md5::{Digest, Md5};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sha1::Sha1;
+use sha2::{Sha256, Sha384, Sha512};
 use std::collections::BTreeSet;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -5633,6 +5634,9 @@ pub(in crate::builtins::modules) fn hash_digest_bytes(
     match normalized_hash_algorithm(algorithm).as_deref() {
         Some("md5") => Ok(Md5::digest(input).to_vec()),
         Some("sha1") => Ok(Sha1::digest(input).to_vec()),
+        Some("sha256") => Ok(Sha256::digest(input).to_vec()),
+        Some("sha384") => Ok(Sha384::digest(input).to_vec()),
+        Some("sha512") => Ok(Sha512::digest(input).to_vec()),
         Some("crc32") | Some("crc32b") => Ok(crc32fast::hash(input).to_be_bytes().to_vec()),
         _ => Err(value_error(name, "unsupported hash algorithm")),
     }
@@ -5663,16 +5667,55 @@ pub(in crate::builtins::modules) fn hmac_digest_bytes(
             input,
             |bytes| Sha1::digest(bytes).to_vec(),
         )),
+        Some("sha256") => Ok(hmac_with_block(
+            if key.len() > 64 {
+                Sha256::digest(key).to_vec()
+            } else {
+                key.to_vec()
+            },
+            input,
+            64,
+            |bytes| Sha256::digest(bytes).to_vec(),
+        )),
+        Some("sha384") => Ok(hmac_with_block(
+            if key.len() > 128 {
+                Sha384::digest(key).to_vec()
+            } else {
+                key.to_vec()
+            },
+            input,
+            128,
+            |bytes| Sha384::digest(bytes).to_vec(),
+        )),
+        Some("sha512") => Ok(hmac_with_block(
+            if key.len() > 128 {
+                Sha512::digest(key).to_vec()
+            } else {
+                key.to_vec()
+            },
+            input,
+            128,
+            |bytes| Sha512::digest(bytes).to_vec(),
+        )),
         _ => Err(value_error(name, "unsupported hash algorithm")),
     }
 }
 
 pub(in crate::builtins::modules) fn hmac_with_block_64(
-    mut key: Vec<u8>,
+    key: Vec<u8>,
     input: &[u8],
     digest: impl Fn(&[u8]) -> Vec<u8>,
 ) -> Vec<u8> {
-    key.resize(64, 0);
+    hmac_with_block(key, input, 64, digest)
+}
+
+pub(in crate::builtins::modules) fn hmac_with_block(
+    mut key: Vec<u8>,
+    input: &[u8],
+    block_size: usize,
+    digest: impl Fn(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
+    key.resize(block_size, 0);
     let outer_pad = key.iter().map(|byte| byte ^ 0x5c).collect::<Vec<_>>();
     let mut inner = key.iter().map(|byte| byte ^ 0x36).collect::<Vec<_>>();
     inner.extend_from_slice(input);
@@ -5686,6 +5729,7 @@ pub(in crate::builtins::modules) fn normalized_hash_algorithm(algorithm: &str) -
     let normalized = algorithm.to_ascii_lowercase().replace('-', "");
     match normalized.as_str() {
         "md5" | "sha1" | "crc32" | "crc32b" => Some(normalized),
+        "sha256" | "sha384" | "sha512" => Some(normalized),
         _ => None,
     }
 }

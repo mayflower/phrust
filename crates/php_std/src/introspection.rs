@@ -81,7 +81,11 @@ mod tests {
             [
                 "core",
                 "date",
+                "exif",
+                "fileinfo",
+                "filter",
                 "hash",
+                "iconv",
                 "json",
                 "mbstring",
                 "pcre",
@@ -94,13 +98,15 @@ mod tests {
                 "spl",
                 "sqlite3",
                 "standard",
-                "tokenizer"
+                "tokenizer",
+                "zip",
+                "zlib"
             ]
         );
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 16);
+        assert_eq!(array.len(), 22);
     }
 
     #[test]
