@@ -20663,10 +20663,33 @@ fn reflection_bool_property(object: &ObjectRef, property: &str) -> Value {
     object.get_property(property).unwrap_or(Value::Bool(false))
 }
 
+fn reflection_short_class_name(name: &str) -> &str {
+    name.rsplit_once('\\')
+        .map(|(_, short)| short)
+        .unwrap_or(name)
+}
+
+fn reflection_namespace_name(name: &str) -> &str {
+    name.rsplit_once('\\')
+        .map(|(namespace, _)| namespace)
+        .unwrap_or("")
+}
+
 fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<ObjectRef, String> {
     let Some(target) = compiled.lookup_class(class_name) else {
         return reflection_internal_class_object(class_name);
     };
+    let parent = target
+        .parent
+        .as_ref()
+        .map(|parent| {
+            compiled
+                .lookup_class(parent)
+                .map(|entry| entry.display_name.clone())
+                .unwrap_or_else(|| parent.clone())
+        })
+        .map(reflection_string)
+        .unwrap_or(Value::Bool(false));
     Ok(reflection_object(
         "ReflectionClass",
         vec![
@@ -20678,6 +20701,7 @@ fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<
                 "class",
                 Value::String(PhpString::from_test_str(&target.name)),
             ),
+            ("parent", parent),
             (
                 "attributes",
                 reflection_attributes_value(compiled, &target.attributes)?,
@@ -20876,6 +20900,18 @@ fn reflection_method_value(
         },
         "reflectionclass" => match method.as_str() {
             "getname" => Ok(object.get_property("name").unwrap_or(Value::Null)),
+            "getshortname" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(reflection_string(reflection_short_class_name(&name)))
+            }
+            "getnamespacename" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(reflection_string(reflection_namespace_name(&name)))
+            }
+            "innamespace" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(Value::Bool(!reflection_namespace_name(&name).is_empty()))
+            }
             "getattributes" => Ok(object
                 .get_property("attributes")
                 .unwrap_or_else(empty_array_value)),
@@ -20891,6 +20927,13 @@ fn reflection_method_value(
             "getinterfacenames" => Ok(object
                 .get_property("interfaces")
                 .unwrap_or_else(empty_array_value)),
+            "getparentclass" => match object.get_property("parent") {
+                Some(Value::String(parent)) => {
+                    let parent = parent.to_string_lossy();
+                    Ok(Value::Object(reflection_class_object(compiled, &parent)?))
+                }
+                _ => Ok(Value::Bool(false)),
+            },
             "getfilename" => Ok(object.get_property("file").unwrap_or(Value::Bool(false))),
             "getstartline" => Ok(object.get_property("start_line").unwrap_or(Value::Bool(false))),
             "getendline" => Ok(object.get_property("end_line").unwrap_or(Value::Bool(false))),
@@ -21232,7 +21275,7 @@ fn signature_from_params(
                 name: param.name,
                 type_name: reflection_type_name(param.type_decl),
                 allows_null: reflection_type_allows_null(param.type_decl),
-                optional: param.optional,
+                optional: param.optional || param.variadic,
                 default: reflection_default_value(param.default_value),
                 by_ref: param.by_ref,
                 variadic: param.variadic,
@@ -21275,7 +21318,7 @@ fn reflection_default_value(default: Option<&str>) -> Value {
 fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> Value {
     let mut array = PhpArray::new();
     for param in params {
-        let has_default = param.optional;
+        let has_default = param.optional && !param.variadic;
         array.append(Value::Object(reflection_object(
             "ReflectionParameter",
             vec![
@@ -21366,6 +21409,12 @@ fn reflection_internal_class_object(class_name: &str) -> Result<ObjectRef, Strin
         vec![
             ("name", reflection_string(descriptor.name())),
             ("class", reflection_string(descriptor.name())),
+            (
+                "parent",
+                internal_throwable_parent(descriptor.name())
+                    .map(reflection_string)
+                    .unwrap_or(Value::Bool(false)),
+            ),
             ("attributes", empty_array_value()),
             ("is_interface", Value::Bool(is_interface)),
             ("is_trait", Value::Bool(is_trait)),
@@ -33250,52 +33299,60 @@ mod tests {
 
     #[test]
     fn autoload_lookup_cache_invalidates_after_spl_autoload_register() {
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("crate should live under workspace/crates/php_vm")
-            .canonicalize()
-            .expect("canonical workspace");
-        let class_file =
-            workspace.join("tests/fixtures/performance/inline_cache/PerfRegisteredCache.php");
-        let source = "<?php
-            function perf_registered_exists() {
-                return class_exists('PerfRegisteredCache', true);
-            }
-            if (perf_registered_exists()) {
-                echo 'bad';
-            } else {
-                echo 'miss';
-            }
-            spl_autoload_register(function ($class) {
-                if (strtolower($class) === 'perfregisteredcache') {
-                    include '__CLASS_FILE__';
-                }
-            });
-            if (perf_registered_exists()) {
-                echo ':hit';
-            } else {
-                echo ':bad';
-            }
-            "
-        .replace("__CLASS_FILE__", &class_file.to_string_lossy());
-        let result = execute_source_with_options(
-            &source,
-            VmOptions {
-                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
-                collect_counters: true,
-                inline_caches: InlineCacheMode::On,
-                ..VmOptions::default()
-            },
-        );
+        std::thread::Builder::new()
+            .name("autoload_lookup_cache_invalidates_after_spl_autoload_register".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("crate should live under workspace/crates/php_vm")
+                    .canonicalize()
+                    .expect("canonical workspace");
+                let class_file = workspace
+                    .join("tests/fixtures/performance/inline_cache/PerfRegisteredCache.php");
+                let source = "<?php
+                    function perf_registered_exists() {
+                        return class_exists('PerfRegisteredCache', true);
+                    }
+                    if (perf_registered_exists()) {
+                        echo 'bad';
+                    } else {
+                        echo 'miss';
+                    }
+                    spl_autoload_register(function ($class) {
+                        if (strtolower($class) === 'perfregisteredcache') {
+                            include '__CLASS_FILE__';
+                        }
+                    });
+                    if (perf_registered_exists()) {
+                        echo ':hit';
+                    } else {
+                        echo ':bad';
+                    }
+                    "
+                .replace("__CLASS_FILE__", &class_file.to_string_lossy());
+                let result = execute_source_with_options(
+                    &source,
+                    VmOptions {
+                        include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                        collect_counters: true,
+                        inline_caches: InlineCacheMode::On,
+                        ..VmOptions::default()
+                    },
+                );
 
-        assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "miss:hit");
-        let counters = result.counters.expect("counters");
-        assert!(
-            counters.autoload_class_lookup_ic_invalidations > 0,
-            "{counters:?}"
-        );
+                assert!(result.status.is_success(), "{:?}", result.status);
+                assert_eq!(result.output.to_string_lossy(), "miss:hit");
+                let counters = result.counters.expect("counters");
+                assert!(
+                    counters.autoload_class_lookup_ic_invalidations > 0,
+                    "{counters:?}"
+                );
+            })
+            .expect("autoload test thread should spawn")
+            .join()
+            .expect("autoload test thread should finish");
     }
 
     #[test]
@@ -38022,6 +38079,19 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert_eq!(
             result.output.as_bytes(),
             b"ArrayObject|spl|internal|nofile|count|ArrayObject|internal|0|spl"
+        );
+    }
+
+    #[test]
+    fn reflection_class_exposes_names_parent_interfaces_and_member_counts() {
+        let result = execute_source(
+            "<?php namespace P21\\Ns; class Base {} interface I {} abstract class Child extends Base implements I { public const C = 1; public string $name; public function run(): void {} } $class = new \\ReflectionClass(Child::class); echo $class->getName(), '|', $class->getShortName(), '|', $class->getNamespaceName(), '|', ($class->inNamespace() ? 'namespace' : 'global'), '|'; echo $class->isAbstract() ? 'abstract|' : 'concrete|'; echo $class->isInterface() ? 'iface|' : 'class|'; echo $class->isEnum() ? 'enum|' : 'notenum|'; echo $class->getParentClass()->getName(), '|', $class->getInterfaceNames()[0], '|'; echo count($class->getMethods()), ':', count($class->getProperties()), ':', count($class->getConstants());",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"P21\\Ns\\Child|Child|P21\\Ns|namespace|abstract|class|notenum|P21\\Ns\\Base|P21\\Ns\\I|1:1:1"
         );
     }
 
