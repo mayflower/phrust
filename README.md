@@ -49,16 +49,15 @@ domain gate before handing off a change that affects that layer.
 
 ## Documentation
 
-Use [docs/README.md](docs/README.md) as the documentation front door. It maps
-the current docs into tutorials, how-to guides, reference material, and
-architecture explanations.
+Use [docs/README.md](docs/README.md) as the documentation front door.
 
-Task-oriented guides:
+Primary guides:
 
-- [First local run](docs/how-to/first-local-run.md)
-- [Validate a change](docs/how-to/validate-a-change.md)
-- [Run the web server](docs/how-to/run-the-web-server.md)
-- [Work with PHPT](docs/how-to/work-with-phpt.md)
+- [Getting started](docs/getting-started.md)
+- [CLI usage](docs/cli.md)
+- [Web server](docs/web-server.md)
+- [Compatibility](docs/compatibility.md)
+- [Contributor guide](docs/contributing.md)
 
 Install the versioned git hooks once per checkout:
 

@@ -24,7 +24,7 @@ The server supports CLI flags and a simple TOML-style config file:
 nix develop -c cargo run -p php_server --bin phrust-server -- --config path/to/server.toml
 ```
 
-See [server functionality](../server-functionality.md) for config keys,
+See [server functionality](server-functionality.md) for config keys,
 timeouts, access-log settings, metrics-token handling, cache options, and TLS
 options.
 
@@ -40,8 +40,8 @@ nix develop -c just verify-server
 
 ## Related Docs
 
-- [Server functionality](../server-functionality.md)
-- [Server architecture](../server-architecture.md)
-- [Server known gaps](../server-known-gaps.md)
-- [Cache architecture](../cache-architecture.md)
-- [API facades](../api-facades.md)
+- [Server functionality](server-functionality.md)
+- [Server architecture](server-architecture.md)
+- [Server known gaps](server-known-gaps.md)
+- [Cache architecture](cache-architecture.md)
+- [API facades](api-facades.md)
