@@ -1,8 +1,22 @@
 {"path":"tests/phpt/generated/reflection.functions/builtin-and-user-functions.phpt"}
+{"path":"ext/reflection/tests/ReflectionFunction_getExtensionName.phpt","module":"reflection.functions","kind":"upstream","reason":"upstream ReflectionFunction extension-owner metadata now matches generated arginfo registry behavior"}
+{"path":"ext/reflection/tests/ReflectionFunction_isClosure_basic.phpt","module":"reflection.functions","kind":"upstream","reason":"upstream ReflectionFunction closure flag coverage fits existing IR closure metadata"}
 {"path":"tests/phpt/generated/reflection.parameters/internal-parameter-arginfo.phpt"}
+{"path":"ext/reflection/tests/ReflectionParameter_isVariadic_basic.phpt","module":"reflection.parameters","kind":"upstream","reason":"upstream ReflectionParameter variadic metadata coverage fits arginfo and IR parameter flags"}
+{"path":"ext/reflection/tests/ReflectionParameter_getPosition_basic.phpt","module":"reflection.parameters","kind":"upstream","reason":"upstream ReflectionParameter position coverage is backed by generated arginfo and IR parameter order"}
 {"path":"tests/phpt/generated/reflection.classes/class-basics.phpt"}
+{"path":"ext/reflection/tests/ReflectionClass_isEnum.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass enum flag coverage fits frontend class metadata"}
+{"path":"ext/reflection/tests/ReflectionClass_getNamespaceName.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass namespace-name coverage fits existing class-name metadata"}
+{"path":"ext/reflection/tests/ReflectionClass_isAbstract_basic.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass abstract flag coverage fits frontend class flags"}
+{"path":"ext/reflection/tests/ReflectionClass_getExtensionName_basic.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass extension-owner coverage fits stdlib registry metadata"}
 {"path":"tests/phpt/generated/reflection.methods/method-metadata.phpt"}
 {"path":"tests/phpt/generated/reflection.properties/property-metadata.phpt"}
+{"path":"ext/reflection/tests/ReflectionProperty_getModifiers.001.phpt","module":"reflection.properties","kind":"upstream","reason":"upstream ReflectionProperty modifier bit coverage fits runtime property flag metadata"}
 {"path":"tests/phpt/generated/reflection.attributes/attribute-metadata.phpt"}
 {"path":"tests/phpt/generated/reflection.enums/enum-metadata.phpt"}
+{"path":"ext/reflection/tests/ReflectionEnum_getBackingType.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum backing type coverage fits frontend enum backing metadata"}
+{"path":"ext/reflection/tests/ReflectionEnum_isBacked.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum backed flag coverage fits frontend enum backing metadata"}
+{"path":"ext/reflection/tests/ReflectionEnum_hasCase.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum case-existence coverage fits runtime enum case metadata"}
 {"path":"tests/phpt/generated/reflection.extensions/extension-symbols.phpt"}
+{"path":"ext/reflection/tests/ReflectionExtension_getName_basic.phpt","module":"reflection.extensions","kind":"upstream","reason":"upstream ReflectionExtension canonical name coverage fits registry-backed Reflection extension metadata"}
+{"path":"ext/reflection/tests/ReflectionExtension_getClassNames_variation1.phpt","module":"reflection.extensions","kind":"upstream","reason":"upstream ReflectionExtension class-name listing coverage fits generated arginfo class ownership metadata"}

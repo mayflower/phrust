@@ -62,6 +62,7 @@ mod tests {
         assert!(extension_loaded(&registry, "phar"));
         assert!(extension_loaded(&registry, "pdo"));
         assert!(extension_loaded(&registry, "pdo_sqlite"));
+        assert!(extension_loaded(&registry, "reflection"));
         assert!(extension_loaded(&registry, "session"));
         assert!(extension_loaded(&registry, "sqlite3"));
 
@@ -88,6 +89,7 @@ mod tests {
                 "pdo_sqlite",
                 "phar",
                 "random",
+                "reflection",
                 "session",
                 "spl",
                 "sqlite3",
@@ -98,7 +100,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 15);
+        assert_eq!(array.len(), 16);
     }
 
     #[test]

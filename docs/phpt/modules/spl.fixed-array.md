@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.fixed-array.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -21,6 +21,7 @@
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.fixed-array/fixed-array-mvp.phpt`
+- `ext/spl/tests/splfixedarray_json_encode.phpt`
 
 ## Target Gates
 
@@ -35,3 +36,5 @@
 
 The selected fixture covers fixed-size construction, nullable slots, offset
 write/read/unset, array conversion, resizing, and iteration order.
+The upstream fixture verifies `json_encode()` emits array-shaped output for
+empty, null-filled, and sparse `SplFixedArray` slots.

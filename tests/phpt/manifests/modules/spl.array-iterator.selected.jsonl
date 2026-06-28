@@ -1,1 +1,6 @@
 {"path":"tests/phpt/generated/spl.array-iterator/iterator-mvps.phpt","module":"spl.array-iterator","kind":"contract","generated_timestamp":"20260628T000000Z","generator_version":"phpt-spl-v1","reason":"ArrayIterator, IteratorIterator, RecursiveArrayIterator, LimitIterator, EmptyIterator, and AppendIterator MVP behavior"}
+{"path":"tests/phpt/generated/spl.array-iterator/iterator-helpers.phpt","module":"spl.array-iterator","kind":"contract","generated_timestamp":"20260628T000000Z","generator_version":"phpt-spl-v1","reason":"iterator_count and iterator_to_array coverage for arrays and ArrayIterator through VM Traversable helpers"}
+{"path":"ext/spl/tests/iterator_to_array_array.phpt","module":"spl.array-iterator","kind":"upstream","reason":"upstream iterator_to_array coverage for plain array inputs promoted from aggregate spl"}
+{"path":"ext/spl/tests/iterator_count_array.phpt","module":"spl.array-iterator","kind":"upstream","reason":"upstream iterator_count coverage for plain array inputs promoted from aggregate spl"}
+{"path":"ext/spl/tests/spl_006.phpt","module":"spl.array-iterator","kind":"upstream","reason":"upstream AppendIterator iterator_to_array key preservation coverage"}
+{"path":"ext/spl/tests/gh19577.phpt","module":"spl.array-iterator","kind":"upstream","reason":"upstream LimitIterator large-count regression coverage"}

@@ -1,11 +1,12 @@
 # reflection.properties
 
 - Selected manifest: `tests/phpt/manifests/modules/reflection.properties.selected.jsonl`
-- Current selected gate: 1 generated PHPT
+- Current selected gate: 2 PHPTs (1 generated, 1 upstream)
 
 ## Scope
 
-- `ReflectionProperty` name, declaring class, visibility, static, readonly, type, default metadata, and property-hook flags where modeled
+- `ReflectionProperty` name, declaring class, visibility, static, readonly, modifier bits, type, default metadata, and property-hook flags where modeled
+- Upstream coverage: `ReflectionProperty_getModifiers.001.phpt`
 
 ## Non-Scope
 

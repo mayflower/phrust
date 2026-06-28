@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.object-storage.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -12,17 +12,19 @@
 - `count`
 - `current`, `key`, `next`, `rewind`, and `valid`
 - `foreach`
+- bracket `ArrayAccess` assignment
 - simple object identity keys via `ObjectRef::id()`
 
 ## Non-Scope
 
 - info data edge cases
 - serialization
-- object-key bracket syntax edge cases if the lvalue model cannot express them
+- object-key bracket lvalue edge cases beyond selected direct assignment
 
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.object-storage/object-storage-mvp.phpt`
+- `ext/spl/tests/SplObjectStorage/SplObjectStorage_offsetGet.phpt`
 
 ## Target Gates
 
@@ -38,4 +40,5 @@
 
 The selected fixture verifies object-identity keyed storage with two distinct
 objects, info lookup through `offsetGet`, deterministic foreach order, and
-`offsetUnset` count updates.
+`offsetUnset` count updates. The upstream fixture verifies object-key bracket
+assignment stores info retrievable by `offsetGet`.

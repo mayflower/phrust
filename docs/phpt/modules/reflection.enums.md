@@ -1,7 +1,7 @@
 # reflection.enums
 
 - Selected manifest: `tests/phpt/manifests/modules/reflection.enums.selected.jsonl`
-- Current selected gate: 1 generated PHPT
+- Current selected gate: 4 PHPTs (1 generated, 3 upstream)
 
 ## Scope
 
@@ -12,6 +12,7 @@
 - `ReflectionEnumUnitCase`
 - `ReflectionEnumBackedCase`
 - Backed case values where metadata is available
+- Upstream coverage: `ReflectionEnum_getBackingType.phpt`, `ReflectionEnum_isBacked.phpt`, `ReflectionEnum_hasCase.phpt`
 
 ## Non-Scope
 

@@ -1,13 +1,14 @@
 # reflection.classes
 
 - Selected manifest: `tests/phpt/manifests/modules/reflection.classes.selected.jsonl`
-- Current selected gate: 1 generated PHPT
+- Current selected gate: 5 PHPTs (1 generated, 4 upstream)
 
 ## Scope
 
-- `ReflectionClass` names, short names, namespace names, class/interface/enum flags, abstract/final flags, parent class, interface names, methods, properties, and constants
+- `ReflectionClass` names, short names, namespace names, extension owners, class/interface/enum flags, abstract/final flags, parent class, interface names, methods, properties, and constants
 - Userland metadata from the runtime class table
 - Internal class metadata where the standard-library registry exposes it
+- Upstream coverage: `ReflectionClass_isEnum.phpt`, `ReflectionClass_getNamespaceName.phpt`, `ReflectionClass_isAbstract_basic.phpt`, `ReflectionClass_getExtensionName_basic.phpt`
 
 ## Non-Scope
 

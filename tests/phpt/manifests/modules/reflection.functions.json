@@ -3,8 +3,8 @@
   "module":"reflection.functions",
   "priority":21,
   "selected_manifest":"tests/phpt/manifests/modules/reflection.functions.selected.jsonl",
-  "corpus_count":1,
-  "pass_count":1,
+  "corpus_count":3,
+  "pass_count":3,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
@@ -12,5 +12,5 @@
   "scope":["ReflectionFunction for internal and userland functions"],
   "non_scope":["callable invocation through Reflection","doc comment parity"],
   "target_gates":["nix develop -c just phpt-dev-module MODULE=reflection.functions"],
-  "next_step":"Expand upstream ReflectionFunction coverage as callable and doc-comment gaps close."
+  "next_step":"Expand upstream ReflectionFunction coverage as callable, variadic stringification, and doc-comment gaps close."
 }

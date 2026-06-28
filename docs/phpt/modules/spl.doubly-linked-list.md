@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.doubly-linked-list.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 6 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -12,6 +12,10 @@
 - `push`, `pop`, `shift`, `unshift`
 - `top`, `bottom`
 - `count`
+- `isEmpty`
+- `current`
+- `key`
+- `offsetExists`
 - simple-order `foreach`
 
 ## Non-Scope
@@ -23,6 +27,11 @@
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.doubly-linked-list/linear-containers-mvp.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_current.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_key.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_isEmpty_empty.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_isEmpty_not-empty.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_offsetExists_success.phpt`
 
 ## Target Gates
 
@@ -36,4 +45,6 @@
 ## Coverage
 
 The selected fixture covers shared linear storage behavior across list, stack,
-and queue classes, including subclass metadata for stack and queue.
+and queue classes, including subclass metadata for stack and queue. The
+upstream fixtures add direct coverage for list cursor reads, empty-list `key()`,
+`isEmpty()`, and positive `offsetExists()`.

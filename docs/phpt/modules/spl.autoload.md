@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.autoload.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -12,6 +12,7 @@
 - callback order
 - string/function callbacks
 - closure callbacks
+- exception propagation from autoload callbacks
 - class lookup invokes autoload
 
 ## Non-Scope
@@ -22,6 +23,7 @@
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.autoload/autoload-mvp.phpt`
+- `ext/spl/tests/spl_autoload_003.phpt`
 
 ## Target Gates
 
@@ -37,4 +39,5 @@
 
 The selected fixture covers function and closure registration, callback order,
 autoload on missing class lookup, callback listing count, unregistering a
-function callback, and explicit `spl_autoload_call`.
+function callback, and explicit `spl_autoload_call`. The upstream fixture adds
+callback-order coverage for class lookup when a registered callback throws.

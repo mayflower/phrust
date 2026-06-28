@@ -1,1 +1,2 @@
 {"path":"tests/phpt/generated/reflection.properties/property-metadata.phpt"}
+{"path":"ext/reflection/tests/ReflectionProperty_getModifiers.001.phpt","module":"reflection.properties","kind":"upstream","reason":"upstream ReflectionProperty modifier bit coverage fits runtime property flag metadata"}

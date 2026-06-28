@@ -29,12 +29,27 @@
 
 - `tests/phpt/generated/spl.interfaces/interface-method-surface.phpt`
 - `tests/phpt/generated/spl.array-iterator/iterator-mvps.phpt`
+- `tests/phpt/generated/spl.array-iterator/iterator-helpers.phpt`
+- `ext/spl/tests/iterator_to_array_array.phpt`
+- `ext/spl/tests/iterator_count_array.phpt`
+- `ext/spl/tests/spl_006.phpt`
+- `ext/spl/tests/gh19577.phpt`
 - `tests/phpt/generated/spl.array-object/array-object-mvp.phpt`
+- `ext/spl/tests/spl_001.phpt`
 - `tests/phpt/generated/spl.fixed-array/fixed-array-mvp.phpt`
+- `ext/spl/tests/splfixedarray_json_encode.phpt`
 - `tests/phpt/generated/spl.object-storage/object-storage-mvp.phpt`
+- `ext/spl/tests/SplObjectStorage/SplObjectStorage_offsetGet.phpt`
 - `tests/phpt/generated/spl.doubly-linked-list/linear-containers-mvp.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_current.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_key.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_isEmpty_empty.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_isEmpty_not-empty.phpt`
+- `ext/spl/tests/SplDoublyLinkedList_offsetExists_success.phpt`
 - `tests/phpt/generated/spl.file/file-classes-mvp.phpt`
+- `ext/spl/tests/spl_fileinfo_getextension_leadingdot.phpt`
 - `tests/phpt/generated/spl.autoload/autoload-mvp.phpt`
+- `ext/spl/tests/spl_autoload_003.phpt`
 
 ## Relevant php-src Source Areas
 
@@ -96,6 +111,10 @@ fixture failures.
   and `count($object)` dispatches to their `count()` method.
 - `iterator_count()` and `iterator_to_array()` now cover array inputs and the
   existing Traversable/ArrayIterator MVP path.
+- `SplObjectStorage` bracket assignment now accepts object keys for direct
+  ArrayAccess attachment.
+- `SplDoublyLinkedList` now covers selected upstream `isEmpty()`, empty
+  `key()`, `current()`, and `offsetExists()` behavior.
 
 ## Next Step
 
