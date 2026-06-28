@@ -78,7 +78,7 @@ pub(in crate::builtins::modules) fn builtin_openssl_digest(
     let method = string_arg("openssl_digest", &args[1])?.to_string_lossy();
     let raw_output = args
         .get(2)
-        .map(|value| crate::convert::to_bool(value))
+        .map(crate::convert::to_bool)
         .transpose()
         .map_err(|message| BuiltinError::new("E_PHP_RUNTIME_BUILTIN_TYPE", message))?
         .unwrap_or(false);

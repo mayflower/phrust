@@ -11,6 +11,8 @@ use crate::{
 };
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
@@ -37,6 +39,8 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 ];
 
 pub const PHRUST_NET_TESTS_ENV: &str = "PHRUST_NET_TESTS";
+#[cfg(test)]
+static NET_TESTS_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
 const CURLOPT_URL: i64 = 10002;
 const CURLOPT_RETURNTRANSFER: i64 = 19913;
 const CURLOPT_TIMEOUT: i64 = 13;
@@ -134,7 +138,7 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
 ) -> BuiltinResult {
     expect_arity("curl_exec", &args, 1)?;
     let handle = curl_handle_arg("curl_exec", args.first())?;
-    if std::env::var(PHRUST_NET_TESTS_ENV).as_deref() != Ok("1") {
+    if !curl_network_requests_enabled() {
         set_curl_error(
             &handle,
             1,
@@ -173,6 +177,18 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
         context.output().write_bytes(&response.body);
         Ok(Value::Bool(true))
     }
+}
+
+fn curl_network_requests_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = *NET_TESTS_OVERRIDE
+        .lock()
+        .expect("network test override lock")
+    {
+        return enabled;
+    }
+
+    std::env::var(PHRUST_NET_TESTS_ENV).as_deref() == Ok("1")
 }
 
 pub(in crate::builtins::modules) fn builtin_curl_getinfo(
@@ -501,7 +517,6 @@ mod tests {
     use crate::OutputBuffer;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex;
     use std::thread;
 
     static NET_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -509,10 +524,7 @@ mod tests {
     #[test]
     fn curl_exec_is_network_disabled_by_default() {
         let _guard = NET_TEST_ENV_LOCK.lock().expect("env lock");
-        let old_env = std::env::var(PHRUST_NET_TESTS_ENV).ok();
-        unsafe {
-            std::env::remove_var(PHRUST_NET_TESTS_ENV);
-        }
+        let _override = NetTestsOverride::set(false);
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
         let handle = builtin_curl_init(
@@ -536,13 +548,12 @@ mod tests {
                 .expect("errno"),
             Value::Int(1)
         );
-        restore_net_tests_env(old_env);
     }
 
     #[test]
     fn curl_exec_gets_local_http_when_net_tests_are_enabled() {
         let _guard = NET_TEST_ENV_LOCK.lock().expect("env lock");
-        let old_env = std::env::var(PHRUST_NET_TESTS_ENV).ok();
+        let _override = NetTestsOverride::set(true);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local server");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
@@ -555,9 +566,6 @@ mod tests {
                 .expect("write response");
         });
 
-        unsafe {
-            std::env::set_var(PHRUST_NET_TESTS_ENV, "1");
-        }
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
         let handle = builtin_curl_init(
@@ -595,16 +603,29 @@ mod tests {
             .expect("info"),
             Value::Int(200)
         );
-        restore_net_tests_env(old_env);
         server.join().expect("server");
     }
 
-    fn restore_net_tests_env(value: Option<String>) {
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var(PHRUST_NET_TESTS_ENV, value),
-                None => std::env::remove_var(PHRUST_NET_TESTS_ENV),
-            }
+    struct NetTestsOverride {
+        previous: Option<bool>,
+    }
+
+    impl NetTestsOverride {
+        fn set(enabled: bool) -> Self {
+            let mut override_value = NET_TESTS_OVERRIDE
+                .lock()
+                .expect("network test override lock");
+            let previous = *override_value;
+            *override_value = Some(enabled);
+            Self { previous }
+        }
+    }
+
+    impl Drop for NetTestsOverride {
+        fn drop(&mut self) {
+            *NET_TESTS_OVERRIDE
+                .lock()
+                .expect("network test override lock") = self.previous;
         }
     }
 }

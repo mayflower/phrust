@@ -36,7 +36,7 @@ fn builtin_iconv(
     let from = encoding_arg("iconv", &args[0])?;
     let to = encoding_arg("iconv", &args[1])?;
     let input = string_arg("iconv", &args[2])?;
-    convert_encoding("iconv", input.as_bytes(), &from, &to)
+    convert_encoding("iconv", input.as_bytes(), from, to)
 }
 
 fn builtin_iconv_strlen(
