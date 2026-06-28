@@ -4,13 +4,14 @@
   "priority":18,
   "selected_manifest":"tests/phpt/manifests/modules/pcre.selected.jsonl",
   "corpus_count":165,
-  "pass_count":41,
-  "skip_count":5,
-  "fail_count":117,
+  "selected_count":5,
+  "pass_count":5,
+  "skip_count":0,
+  "fail_count":0,
   "bork_count":0,
-  "known_failure_count":126,
-  "scope":["preg_* builtins backed by PCRE2"],
-  "non_scope":["PCRE JIT/callout parity"],
-  "target_gates":["nix develop -c just phpt-module MODULE=pcre"],
-  "next_step":"Use PCRE2 while documenting unsupported modifier/callout gaps."
+  "known_failure_count":160,
+  "scope":["preg_match captures and offsets","preg_match_all set-order captures","preg_last_error state","preg_replace replacement/count MVP","preg_split flags MVP","preg_grep MVP","preg_quote delimiter escaping","preg_replace_callback named function and closure dispatch"],
+  "non_scope":["full ext/pcre corpus","PCRE JIT/callout parity","preg_filter","preg_replace_callback_array","byte-perfect warning text","locale-sensitive ctype behavior"],
+  "target_gates":["PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=pcre"],
+  "next_step":"Expand from focused generated PCRE coverage into upstream PHPT promotion as remaining warning, UTF-8, locale, callback-array, and advanced PCRE gaps close."
 }
