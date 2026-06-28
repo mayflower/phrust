@@ -12,9 +12,9 @@ use crate::convert::float_to_php_string;
 use crate::numeric_string::{NumericStringKind, NumericStringValue, classify_php_string};
 use crate::{
     ArrayKey, CallableValue, ClassEntry, ClassFlags, NumericValue, ObjectRef, OutputBuffer,
-    PhpArray, PhpString, ResourceKind, UnserializeOptions, Value, compare, equal, identical,
-    normalize_class_name, pcre, serialize as serialize_value, to_bool, to_float, to_int, to_number,
-    to_string, unserialize as unserialize_value, value::FloatValue,
+    PhpArray, PhpString, ResourceKind, StreamWrapperRegistry, UnserializeOptions, Value, compare,
+    equal, identical, normalize_class_name, pcre, serialize as serialize_value, to_bool, to_float,
+    to_int, to_number, to_string, unserialize as unserialize_value, value::FloatValue,
 };
 use md5::{Digest, Md5};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -2028,6 +2028,54 @@ pub(in crate::builtins::modules) fn read_file_value(
     path: &str,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
+    if path.starts_with("php://") {
+        let cwd = context.cwd().to_path_buf();
+        let filesystem = context.filesystem_capabilities().clone();
+        let php_input = context.php_input().to_vec();
+        let Some(resources) = context.resources() else {
+            context.php_warning(
+                "E_PHP_RUNTIME_STREAM_RESOURCE_TABLE",
+                format!("{function}({path}): Failed to open stream: resources unavailable"),
+                span,
+            );
+            return Ok(Value::Bool(false));
+        };
+        let resource = match StreamWrapperRegistry::new().open(
+            resources,
+            path,
+            "rb",
+            &cwd,
+            &filesystem,
+            &php_input,
+        ) {
+            Ok(resource) => resource,
+            Err(error) => {
+                context.php_warning(
+                    error.diagnostic_id(),
+                    format!(
+                        "{function}({path}): Failed to open stream: {}",
+                        error.message()
+                    ),
+                    span,
+                );
+                return Ok(Value::Bool(false));
+            }
+        };
+        return match resource.read_to_end() {
+            Ok(bytes) => Ok(Value::string(bytes)),
+            Err(error) => {
+                context.php_warning(
+                    error.diagnostic_id(),
+                    format!(
+                        "{function}({path}): Failed to open stream: {}",
+                        error.message()
+                    ),
+                    span,
+                );
+                Ok(Value::Bool(false))
+            }
+        };
+    }
     if crate::phar::is_phar_uri(path) {
         return match crate::phar::read_uri(path, context.cwd(), context.filesystem_capabilities()) {
             Ok(bytes) => Ok(Value::string(bytes)),
@@ -6858,6 +6906,120 @@ mod tests {
     }
 
     #[test]
+    fn http_response_builtins_track_headers_status_and_cookies() {
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        let mut response = RuntimeHttpResponseState::default();
+        context.set_http_response_state(&mut response);
+
+        assert_eq!(
+            call_in_context(&mut context, "header", vec![Value::string("X-Test: one")]),
+            Value::Null
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "header",
+                vec![Value::string("X-Test: two"), Value::Bool(false)]
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            call_in_context(&mut context, "http_response_code", vec![Value::Int(201)]),
+            Value::Int(200)
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "setcookie",
+                vec![
+                    Value::string("sid"),
+                    Value::string("a b"),
+                    Value::Int(1),
+                    Value::string("/")
+                ],
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "setrawcookie",
+                vec![Value::string("raw"), Value::string("a/b")]
+            ),
+            Value::Bool(true)
+        );
+
+        let headers = array_strings(call_in_context(&mut context, "headers_list", Vec::new()));
+        assert_eq!(
+            headers,
+            vec![
+                "X-Test: one",
+                "X-Test: two",
+                "Set-Cookie: sid=a+b; expires=Thu, 01 Jan 1970 00:00:01 GMT; path=/",
+                "Set-Cookie: raw=a/b",
+            ]
+        );
+        assert_eq!(
+            call_in_context(&mut context, "http_response_code", Vec::new()),
+            Value::Int(201)
+        );
+    }
+
+    #[test]
+    fn setcookie_supports_array_options_and_rejects_invalid_names() {
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        let mut response = RuntimeHttpResponseState::default();
+        context.set_http_response_state(&mut response);
+        let mut options = PhpArray::new();
+        options.insert(
+            ArrayKey::String(PhpString::from_test_str("path")),
+            Value::string("/admin"),
+        );
+        options.insert(
+            ArrayKey::String(PhpString::from_test_str("secure")),
+            Value::Bool(true),
+        );
+        options.insert(
+            ArrayKey::String(PhpString::from_test_str("httponly")),
+            Value::Bool(true),
+        );
+        options.insert(
+            ArrayKey::String(PhpString::from_test_str("samesite")),
+            Value::string("Lax"),
+        );
+
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "setcookie",
+                vec![
+                    Value::string("prefs"),
+                    Value::string("x"),
+                    Value::Array(options)
+                ],
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "setcookie",
+                vec![Value::string("bad name"), Value::string("x")],
+            ),
+            Value::Bool(false)
+        );
+
+        let headers = array_strings(call_in_context(&mut context, "headers_list", Vec::new()));
+        assert_eq!(
+            headers,
+            vec!["Set-Cookie: prefs=x; path=/admin; secure; httponly; samesite=Lax"]
+        );
+        assert!(output.to_string_lossy().contains("invalid cookie name"));
+    }
+
+    #[test]
     fn builtins_registry_is_sorted_and_classified() {
         let registry = BuiltinRegistry::new();
         let names = registry
@@ -7399,6 +7561,34 @@ mod tests {
         assert_eq!(call("clearstatcache", Vec::new(), &mut output), Value::Null);
 
         let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
+    fn file_get_contents_reads_php_input_from_request_context() {
+        let root = std::env::temp_dir().join(format!("phrust-stdlib-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let capabilities = FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]);
+        let mut output = OutputBuffer::new();
+        let mut resources = ResourceTable::new();
+        let mut context = BuiltinContext::with_runtime(
+            &mut output,
+            root.clone(),
+            capabilities,
+            Some(&mut resources),
+        );
+        context.set_php_input(b"name=phrust".to_vec());
+
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "file_get_contents",
+                vec![Value::string("php://input")]
+            ),
+            Value::string("name=phrust")
+        );
+
         let _ = std::fs::remove_dir(root);
     }
 

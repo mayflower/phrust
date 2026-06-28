@@ -596,7 +596,14 @@ pub(in crate::builtins::modules) fn builtin_tmpfile(
         return Ok(Value::Bool(false));
     };
     Ok(StreamWrapperRegistry::new()
-        .open(resources, &path.to_string_lossy(), "c+", &cwd, &filesystem)
+        .open(
+            resources,
+            &path.to_string_lossy(),
+            "c+",
+            &cwd,
+            &filesystem,
+            &[],
+        )
         .map_or(Value::Bool(false), Value::Resource))
 }
 

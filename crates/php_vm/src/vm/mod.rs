@@ -22566,6 +22566,7 @@ impl Vm {
                     Some(Value::Bool(
                         compiled.lookup_function(&function_name).is_some()
                             || dynamic_function_in_state(state, &function_name).is_some()
+                            || BuiltinRegistry::new().contains(&function_name)
                             || php_std::introspection::function_exists(&registry, &function_name),
                     )),
                 )

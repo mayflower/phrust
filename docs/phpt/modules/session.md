@@ -1,6 +1,6 @@
 # session
 
-- Strategy: deterministic CLI-only MVP
+- Strategy: deterministic request-local MVP
 - Classification: real-implementation-required for framework session support
 - Selected manifest: `tests/phpt/manifests/modules/session.selected.jsonl`
 - Current corpus snapshot before Prompt 4E: 260 `session` candidates, 3 PASS,
@@ -8,9 +8,8 @@
 
 ## Implemented Scope
 
-Prompt 4E adds request-local session state for CLI execution. The runtime now
-registers the `session` extension, exposes the PHP session status constants,
-seeds `$_SESSION`, and implements:
+The runtime registers the `session` extension, exposes the PHP session status
+constants, seeds `$_SESSION`, and implements:
 
 - `session_start`
 - `session_status`
@@ -18,10 +17,11 @@ seeds `$_SESSION`, and implements:
 - `session_name`
 - `session_destroy`
 
-The implementation is intentionally request-local and deterministic. It does
-not write session files or depend on HTTP state. `$_SESSION` mutations persist
-inside one VM request and are synchronized back to the request-local session
-store around session builtin calls.
+The implementation is intentionally request-local and deterministic. `$_SESSION`
+mutations persist inside one VM request and are synchronized back to the
+request-local session store around session builtin calls. The in-process web
+runtime reuses incoming `PHPSESSID` cookies and emits a `Set-Cookie` header
+when `session_start()` creates a new deterministic id.
 
 ## Remaining Gaps
 
@@ -29,17 +29,17 @@ store around session builtin calls.
 - Reference behavior: PHP with `session` enabled includes web SAPI lifecycle,
   cookie headers, file-backed storage, serializers, INI configuration, custom
   save handlers, locking, and `SessionHandler` classes/interfaces.
-- Current phrust behavior: CLI session basics pass through generated coverage,
-  while cookie/SAPI lifecycle, persistent storage, custom handlers, upload
-  lifecycle, and the full session handler matrix remain unsupported.
+- Current phrust behavior: request-local session basics pass through generated
+  coverage; the web runtime covers deterministic `PHPSESSID` cookie reuse and
+  creation. Persistent storage, custom handlers, upload lifecycle, INI policy,
+  and the full session handler matrix remain unsupported.
 - Fixture: `tests/phpt/generated/session/platform-checks.phpt`
-- Next owner layer: future request/runtime state work for SAPI lifecycle,
-  filesystem-backed persistence, INI policy, and handler objects.
+- Next owner layer: future request/runtime state work for filesystem-backed
+  persistence, INI policy, and handler objects.
 
 ## Non-Scope
 
-- HTTP cookies and headers
-- web SAPI lifecycle
+- Full web SAPI lifecycle outside the in-process server
 - uploads/request lifecycle
 - file-backed persistence and locking
 - custom session handlers

@@ -10,8 +10,8 @@
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":260,
-  "scope":["extension_loaded(\"session\")","session function/class platform probes"],
-  "non_scope":["HTTP cookies","web SAPI lifecycle","session handlers","persistent storage"],
+  "scope":["extension_loaded(\"session\")","session function/class platform probes","request-local PHPSESSID reuse in the in-process web runtime"],
+  "non_scope":["full web SAPI lifecycle","session handlers","persistent storage"],
   "target_gates":["nix develop -c just phpt-dev-module MODULE=session","nix develop -c just verify-phpt"],
-  "next_step":"Implement deterministic CLI-only session state only after request-local state and superglobals are ready."
+  "next_step":"Keep deterministic request-local sessions green while adding persistent handlers and INI policy in a later session module slice."
 }

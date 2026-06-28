@@ -10,8 +10,8 @@
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":552,
-  "scope":["extension_loaded(\"phar\")","Phar class platform probes","Composer PHAR policy"],
-  "non_scope":["phar archive parser","phar:// wrapper","signing","compression","stub execution"],
+  "scope":["extension_loaded(\"phar\")","Phar class platform probes","read-only local phar:// reads and includes","Composer PHAR policy"],
+  "non_scope":["signing","compression","stub execution","archive mutation APIs"],
   "target_gates":["nix develop -c just phpt-dev-module MODULE=phar","nix develop -c just composer-smoke","nix develop -c just verify-phpt"],
-  "next_step":"Keep Composer source mode as the supported path until a read-only PHAR MVP is designed."
+  "next_step":"Keep the read-only PHAR MVP green while deferring signing, compression, stub execution, and mutation APIs."
 }

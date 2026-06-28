@@ -96,10 +96,12 @@ pub(in crate::builtins::modules) fn builtin_session_start(
     {
         return Err(type_error("session_start", "array", options));
     }
-    let Some(state) = context.session_state() else {
-        return Err(session_context_error("session_start"));
-    };
-    state.start();
+    {
+        let Some(state) = context.session_state() else {
+            return Err(session_context_error("session_start"));
+        };
+        state.start();
+    }
     context.sync_session_global_from_state();
     Ok(Value::Bool(true))
 }

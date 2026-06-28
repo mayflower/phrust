@@ -111,8 +111,12 @@ impl SessionState {
         self.newly_created
     }
 
-    /// Starts a deterministic CLI session.
-    pub fn start(&mut self) {
+    /// Starts a deterministic request-local session.
+    ///
+    /// Returns `true` when a new deterministic id was generated for this
+    /// request, or `false` when an existing id was reused.
+    pub fn start(&mut self) -> bool {
+        let generated = self.id.is_empty();
         if self.id.is_empty() {
             self.id = self.pending_generated_id.take().unwrap_or_else(|| {
                 let id = format!("phrustcli{:08}", self.next_id);
@@ -125,6 +129,7 @@ impl SessionState {
         self.started = true;
         self.destroyed = false;
         self.destroyed_id = None;
+        generated
     }
 
     /// Destroys the current deterministic CLI session.

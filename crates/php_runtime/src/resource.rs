@@ -283,6 +283,7 @@ impl StreamWrapperRegistry {
         mode: &str,
         cwd: &Path,
         capabilities: &FilesystemCapabilities,
+        php_input: &[u8],
     ) -> Result<ResourceRef, StreamOpenError> {
         let parsed_mode = StreamOpenMode::parse(mode)?;
         if is_remote_uri(uri) {
@@ -292,7 +293,7 @@ impl StreamWrapperRegistry {
             ));
         }
         if let Some(target) = uri.strip_prefix("php://") {
-            return open_php_stream(table, target, mode, parsed_mode, capabilities);
+            return open_php_stream(table, target, mode, parsed_mode, capabilities, php_input);
         }
         if uri.starts_with("phar://") {
             return open_phar_stream(table, uri, mode, parsed_mode, cwd, capabilities);
@@ -936,6 +937,7 @@ fn open_php_stream(
     mode: &str,
     parsed_mode: StreamOpenMode,
     capabilities: &FilesystemCapabilities,
+    php_input: &[u8],
 ) -> Result<ResourceRef, StreamOpenError> {
     match target {
         "memory" | "temp" => Ok(table.register_stream_data(
@@ -951,6 +953,22 @@ fn open_php_stream(
                 cursor: 0,
             },
         )),
+        "input" => {
+            if parsed_mode.writable {
+                return Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_NOT_WRITABLE",
+                    "php://input is read-only",
+                ));
+            }
+            Ok(table.register_stream_data(
+                StreamFlags::new(true, false, true),
+                StreamMetadata::new("PHP", "stream", "r", "php://input"),
+                StreamData::Memory {
+                    buffer: php_input.to_vec(),
+                    cursor: 0,
+                },
+            ))
+        }
         "stdin" => {
             if !capabilities.allows_stdio() {
                 return Err(StreamOpenError::new(
@@ -1190,7 +1208,7 @@ mod tests {
 
         for uri in ["php://memory", "php://temp"] {
             let resource = registry
-                .open(&mut table, uri, "w+", Path::new("."), &capabilities)
+                .open(&mut table, uri, "w+", Path::new("."), &capabilities, &[])
                 .expect("php memory/temp opens");
             assert_eq!(resource.metadata().wrapper_type, "PHP");
             assert_eq!(resource.metadata().mode, "w+b");
@@ -1199,6 +1217,27 @@ mod tests {
             resource.rewind().expect("rewind");
             assert_eq!(resource.read_to_end().expect("read"), b"stdlib");
         }
+    }
+
+    #[test]
+    fn php_input_stream_reads_request_body() {
+        let registry = StreamWrapperRegistry::new();
+        let capabilities = FilesystemCapabilities::none();
+        let mut table = ResourceTable::new();
+
+        let resource = registry
+            .open(
+                &mut table,
+                "php://input",
+                "rb",
+                Path::new("."),
+                &capabilities,
+                b"name=phrust",
+            )
+            .expect("php input opens");
+
+        assert_eq!(resource.read_to_end().expect("read input"), b"name=phrust");
+        assert_eq!(resource.flags(), StreamFlags::new(true, false, true));
     }
 
     #[test]
@@ -1214,7 +1253,7 @@ mod tests {
         let mut table = ResourceTable::new();
 
         let implicit = registry
-            .open(&mut table, "fixture.txt", "r", &root, &capabilities)
+            .open(&mut table, "fixture.txt", "r", &root, &capabilities, &[])
             .expect("implicit file wrapper opens inside root");
         assert_eq!(implicit.metadata().wrapper_type, "plainfile");
         assert_eq!(implicit.read_to_end().expect("read file"), b"fixture");
@@ -1226,6 +1265,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
+                &[],
             )
             .expect("file:// wrapper opens inside root");
         assert_eq!(explicit.read_to_end().expect("read file://"), b"fixture");
@@ -1242,6 +1282,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
+                &[],
             )
             .expect_err("outside root is rejected");
         assert_eq!(error.diagnostic_id(), "E_PHP_RUNTIME_STREAM_CAPABILITY");
@@ -1264,6 +1305,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
+                &[],
             )
             .expect_err("remote streams are disabled");
         assert_eq!(
@@ -1278,6 +1320,7 @@ mod tests {
                 "w",
                 Path::new("."),
                 &capabilities,
+                &[],
             )
             .expect_err("stdio is disabled without capability");
         assert_eq!(stdio.diagnostic_id(), "E_PHP_RUNTIME_STREAM_STDIO_DISABLED");
@@ -1289,6 +1332,7 @@ mod tests {
                 "w",
                 Path::new("."),
                 &FilesystemCapabilities::none().with_stdio(true),
+                &[],
             )
             .expect("stdio opens with explicit capability");
         assert_eq!(stdout.flags(), StreamFlags::new(false, true, false));

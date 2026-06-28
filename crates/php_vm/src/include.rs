@@ -1,6 +1,7 @@
 //! Local include/require loader for the runtime VM MVP.
 
 use crate::compiled_unit::CompiledUnit;
+use php_runtime::{FilesystemCapabilities, phar};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -353,6 +354,9 @@ impl IncludeLoader {
                 "E_PHP_VM_INCLUDE_DISABLED: include loader has no allowed roots".to_owned(),
             );
         }
+        if phar::is_phar_uri(path) {
+            return self.resolve_phar_include(path, cwd);
+        }
         if path.contains("://") {
             return Err(format!(
                 "E_PHP_VM_INCLUDE_UNSUPPORTED_SCHEME: stream include `{path}` is not supported"
@@ -414,6 +418,10 @@ impl IncludeLoader {
     /// Loads a previously resolved canonical include path, rechecking that the
     /// path remains inside an allowed root.
     pub fn load_resolved(&self, canonical: PathBuf) -> Result<LoadedInclude, String> {
+        let canonical_text = canonical.to_string_lossy();
+        if phar::is_phar_uri(&canonical_text) {
+            return self.load_phar_include(&canonical_text);
+        }
         if !self
             .allowed_roots
             .iter()
@@ -428,6 +436,44 @@ impl IncludeLoader {
             .map_err(|error| format!("E_PHP_VM_INCLUDE_READ: {}: {error}", canonical.display()))?;
         Ok(LoadedInclude {
             canonical_path: canonical,
+            source,
+        })
+    }
+
+    fn resolve_phar_include(
+        &self,
+        path: &str,
+        cwd: Option<&Path>,
+    ) -> Result<ResolvedIncludePath, String> {
+        let cwd = cwd
+            .or_else(|| self.allowed_roots.first().map(PathBuf::as_path))
+            .unwrap_or_else(|| Path::new("."));
+        let capabilities =
+            FilesystemCapabilities::none().with_allowed_roots(self.allowed_roots.clone());
+        let parsed = phar::parse_uri(path, cwd, &capabilities)
+            .map_err(|error| format!("E_PHP_VM_INCLUDE_PHAR: {error}"))?;
+        let canonical_path = PathBuf::from(format!(
+            "phar://{}/{}",
+            parsed.archive_path.display(),
+            parsed.entry_path
+        ));
+        let fingerprint = include_path_file_fingerprint(&parsed.archive_path)?;
+        Ok(ResolvedIncludePath {
+            canonical_path,
+            fingerprint,
+        })
+    }
+
+    fn load_phar_include(&self, path: &str) -> Result<LoadedInclude, String> {
+        let capabilities =
+            FilesystemCapabilities::none().with_allowed_roots(self.allowed_roots.clone());
+        let bytes = phar::read_uri(path, Path::new("."), &capabilities)
+            .map_err(|error| format!("E_PHP_VM_INCLUDE_READ: {error}"))?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            format!("E_PHP_VM_INCLUDE_READ: phar entry `{path}` is not valid UTF-8: {error}")
+        })?;
+        Ok(LoadedInclude {
+            canonical_path: PathBuf::from(path),
             source,
         })
     }
@@ -609,6 +655,61 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(cache.cache_stats().compile_misses, 2);
         assert!(cache.cache_stats().stale_invalidations >= 1);
+    }
+
+    #[test]
+    fn include_loader_reads_phar_entries_under_allowed_roots() {
+        let fixture = IncludeCacheFixture::new("phar");
+        let archive = fixture.root.join("fixture.phar");
+        fs::write(&archive, fixture_phar()).expect("write phar fixture");
+        let archive = archive.canonicalize().expect("canonical archive");
+        let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
+        let uri = format!("phar://{}/lib/hello.php", archive.to_string_lossy());
+
+        let resolved = loader
+            .resolve_with_include_path(None, &uri, &[], Some(&fixture.root))
+            .expect("resolve phar include");
+        assert!(
+            resolved
+                .canonical_path
+                .to_string_lossy()
+                .starts_with("phar://")
+        );
+        let loaded = loader
+            .load_resolved(resolved.canonical_path)
+            .expect("load phar include");
+
+        assert_eq!(
+            loaded.source,
+            "<?php echo 'from-phar|';\nreturn 'include-ok';\n"
+        );
+    }
+
+    fn fixture_phar() -> Vec<u8> {
+        hex_decode(
+            "3c3f706870205f5f48414c545f434f4d50494c455228293b203f3e0a6b000000020000001101000000000c000000666978747572652e70686172000000000d0000006c69622f68656c6c6f2e7068702e000000800092652e00000000000000000000000000000008000000646174612e7478740700000080009265070000000000000000000000000000003c3f706870206563686f202766726f6d2d706861727c273b0a72657475726e2027696e636c7564652d6f6b273b0a7061796c6f6164",
+        )
+    }
+
+    fn hex_decode(input: &str) -> Vec<u8> {
+        input
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = hex_value(pair[0]);
+                let low = hex_value(pair[1]);
+                high << 4 | low
+            })
+            .collect()
+    }
+
+    fn hex_value(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("invalid hex byte"),
+        }
     }
 
     struct IncludeCacheFixture {

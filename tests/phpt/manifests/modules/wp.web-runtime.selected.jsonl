@@ -1,0 +1,2 @@
+{"path":"tests/phpt/generated/wp.web-runtime/platform-surface.phpt","module":"wp.web-runtime","kind":"generated","reason":"CLI-comparable response function and request superglobal surface for Branch 1 web runtime"}
+{"path":"tests/phpt/generated/wp.web-runtime/transport-web-only.phpt","module":"wp.web-runtime","kind":"generated-skip","reason":"Web request state is verified through php_server tests and server-smoke rather than the CLI PHPT oracle"}

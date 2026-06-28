@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"wp.web-runtime",
+  "priority":"WordPress-like in-process web/runtime request state",
+  "selected_manifest":"tests/phpt/manifests/modules/wp.web-runtime.selected.jsonl",
+  "corpus_count":0,
+  "selected_count":2,
+  "pass_count":1,
+  "skip_count":1,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["HTTP response functions","request superglobal surface","server transport request parsing","multipart upload metadata","php://input","request-local sessions","read-only phar:// includes"],
+  "non_scope":["FPM","FastCGI","CGI","Apache SAPI","mod_php","phpdbg","tokenizer changes","Zend ABI emulation"],
+  "target_gates":["nix develop -c cargo test -p php_runtime","nix develop -c cargo test -p php_vm","nix develop -c cargo test -p php_server","nix develop -c just server-smoke","nix develop -c just phpt-dev-module MODULE=wp.web-runtime","nix develop -c just verify-server","nix develop -c just verify-phpt"],
+  "next_step":"Promote web-only behavior into additional server fixtures as request-state coverage expands."
+}

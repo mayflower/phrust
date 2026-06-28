@@ -117,6 +117,7 @@ pub struct BuiltinContext<'a> {
     ini: IniRegistry,
     default_timezone: String,
     filesystem: FilesystemCapabilities,
+    php_input: Vec<u8>,
     resources: Option<&'a mut ResourceTable>,
     http_response: RuntimeHttpResponseState,
     http_response_state: Option<&'a mut RuntimeHttpResponseState>,
@@ -145,6 +146,7 @@ impl<'a> BuiltinContext<'a> {
             ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
             filesystem: FilesystemCapabilities::none(),
+            php_input: Vec::new(),
             resources: None,
             http_response: RuntimeHttpResponseState::default(),
             http_response_state: None,
@@ -178,6 +180,7 @@ impl<'a> BuiltinContext<'a> {
             ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
             filesystem,
+            php_input: Vec::new(),
             resources,
             http_response: RuntimeHttpResponseState::default(),
             http_response_state: None,
@@ -313,6 +316,17 @@ impl<'a> BuiltinContext<'a> {
     #[must_use]
     pub const fn filesystem_capabilities(&self) -> &FilesystemCapabilities {
         &self.filesystem
+    }
+
+    /// Sets deterministic bytes exposed through `php://input`.
+    pub fn set_php_input(&mut self, input: Vec<u8>) {
+        self.php_input = input;
+    }
+
+    /// Deterministic bytes exposed through `php://input`.
+    #[must_use]
+    pub fn php_input(&self) -> &[u8] {
+        &self.php_input
     }
 
     /// Request-local resource table for stream builtins.

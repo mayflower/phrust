@@ -25,7 +25,7 @@ baseline, vendor `php-src`, or promote broad upstream extension corpora.
 | `json` | 10 selected fixtures green | Encode/decode basics, common flags, request-local last-error state, `JSON_THROW_ON_ERROR`. |
 | `pcre` | 5 selected fixtures green | Match captures, last-error state, replace/split/grep/quote, selected callback dispatch. |
 | `date` | 7 selected fixtures green | Request timezone state, selected Date/Time functions and classes, deterministic timezone/interval MVP. |
-| `session` | Platform fixture green | CLI-only in-memory session state, `$_SESSION`, selected session status/id/name/save-path/cache helpers. |
+| `session` | Platform fixture green | Request-local in-memory session state, `$_SESSION`, selected session status/id/name/save-path/cache helpers, and in-process web `PHPSESSID` reuse. |
 | `sqlite3` | Platform fixture green | `SQLite3` backed by `rusqlite`, local file and `:memory:` databases, query/result helpers, selected constants. |
 | `pdo` | Platform fixture green | SQLite-only PDO core surface, `pdo_drivers`, constants, `PDOException`, statement/result basics. |
 | `pdo_sqlite` | Platform fixture green | SQLite DSN support through PDO, `exec`, `query`, `prepare`, `execute`, fetch helpers. |
@@ -34,7 +34,8 @@ baseline, vendor `php-src`, or promote broad upstream extension corpora.
 ## Branch Changes
 
 - Session support now lives in request execution state instead of global state,
-  with CLI-only persistence for the current VM request.
+  with deterministic request-local persistence for the current VM request and
+  in-process web cookie reuse.
 - SQLite support uses the approved `rusqlite` dependency in `php_runtime` and
   exposes runtime-owned connection/result handles through VM internal objects.
 - PDO and PDO_SQLite reuse the same SQLite runtime layer and intentionally keep
@@ -48,8 +49,9 @@ baseline, vendor `php-src`, or promote broad upstream extension corpora.
 
 ## Remaining Gaps
 
-- `session`: cookie transport, file-backed session handlers, custom handlers,
-  serialization formats, and web SAPI behavior are outside the CLI-only MVP.
+- `session`: file-backed session handlers, custom handlers, serialization
+  formats, INI policy, and full web SAPI behavior remain outside the
+  request-local MVP.
 - `sqlite3`: prepared statements, callbacks, aggregate/collation hooks, backup,
   blob I/O, and byte-perfect SQLite warning/exception parity remain future work.
 - `pdo` and `pdo_sqlite`: non-SQLite drivers, attributes, transactions, bound
