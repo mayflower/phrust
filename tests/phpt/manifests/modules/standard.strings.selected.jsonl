@@ -13,3 +13,4 @@
 {"path":"tests/phpt/generated/standard.strings/trim-explode-implode-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.strings/printf-sprintf-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.strings/strtok-state-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.strings/str-replace-case-smoke.phpt"}

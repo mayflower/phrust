@@ -2,80 +2,58 @@
 
 - Priority: 8
 - Selected manifest: `tests/phpt/manifests/modules/arrays.references.selected.jsonl`
-- Current counts: 26 PASS, 1 SKIP, 246 FAIL, 0 BORK from 273 corpus candidates
+- Current selected counts: 6 PASS, 0 SKIP, 0 FAIL, 0 BORK from 6 Prompt 2C generated core fixtures
 
 ## Scope
 
 - ordered arrays
-- key conversion
+- key normalization
+- append
+- unset holes
+- isset/empty array dimensions
 - references
 - copy-on-write
-- foreach
+- foreach by-value snapshots
+- foreach by-reference over local arrays
 
 ## Non-Scope
 
 - SPL collection classes
+- object property references
+- by-reference method returns
+- ReflectionReference
+- extension-specific iterable objects
 
 ## Relevant PHPT Paths
 
-- `tests/lang/returnByReference.009.phpt`
-- `tests/lang/returnByReference.008.phpt`
-- `tests/lang/returnByReference.007.phpt`
-- `tests/lang/returnByReference.006.phpt`
-- `tests/lang/returnByReference.005.phpt`
-- `tests/lang/returnByReference.004.phpt`
-- `tests/lang/returnByReference.003.phpt`
-- `tests/lang/returnByReference.002.phpt`
-- `tests/lang/passByReference_012.phpt`
-- `tests/lang/passByReference_010.phpt`
-- `tests/lang/passByReference_008.phpt`
-- `tests/lang/passByReference_007.phpt`
-- `tests/lang/passByReference_006.phpt`
-- `tests/lang/passByReference_005.phpt`
-- `tests/lang/passByReference_004.phpt`
-- `tests/lang/passByReference_003.phpt`
-- `tests/lang/passByReference_002.phpt`
-- `tests/lang/passByReference_001.phpt`
-- `tests/lang/foreach_with_object_001.phpt`
-- `tests/lang/foreachLoopObjects.006.phpt`
-- `tests/lang/foreachLoopObjects.005.phpt`
-- `tests/lang/foreachLoopObjects.004.phpt`
-- `tests/lang/foreachLoopObjects.003.phpt`
-- `tests/lang/foreachLoopObjects.002.phpt`
-- `tests/lang/foreachLoopObjects.001.phpt`
-- `tests/lang/foreachLoopIteratorAggregate.004.phpt`
-- `tests/lang/foreachLoopIteratorAggregate.003.phpt`
-- `tests/lang/foreachLoopIteratorAggregate.002.phpt`
-- `tests/lang/foreachLoopIteratorAggregate.001.phpt`
-- `tests/lang/foreachLoopIterator.002.phpt`
-- `tests/lang/foreachLoopIterator.001.phpt`
-- `tests/lang/foreachLoop.017.phpt`
-- `tests/lang/foreachLoop.016.phpt`
-- `tests/lang/foreachLoop.015.phpt`
-- `tests/lang/foreachLoop.014.phpt`
-- `tests/lang/foreachLoop.013.phpt`
-- `tests/lang/foreachLoop.012.phpt`
-- `tests/lang/foreachLoop.011.phpt`
-- `tests/lang/foreachLoop.009.phpt`
-- `tests/lang/foreachLoop.006.phpt`
+- `tests/phpt/generated/arrays.references/core-key-normalization-append-unset.phpt`
+- `tests/phpt/generated/arrays.references/core-isset-empty-dimensions.phpt`
+- `tests/phpt/generated/arrays.references/core-cow-separation-on-write.phpt`
+- `tests/phpt/generated/arrays.references/core-foreach-by-value-snapshot.phpt`
+- `tests/phpt/generated/arrays.references/core-foreach-by-reference-local.phpt`
+- `tests/phpt/generated/arrays.references/core-array-element-references.phpt`
 
 ## Relevant php-src Source Areas
 
-- `crates/php_runtime/`
-- `crates/php_vm/`
+- `crates/php_runtime/src/array.rs`
+- `crates/php_runtime/src/reference.rs`
+- `crates/php_ir/src/lower.rs`
+- `crates/php_vm/src/vm/mod.rs`
 
 ## Target Gates
 
-- `nix develop -c just phpt-module MODULE=standard.arrays`
+- `nix develop -c cargo test -p php_runtime array`
+- `nix develop -c cargo test -p php_runtime reference`
+- `nix develop -c cargo test -p php_vm`
+- `nix develop -c just phpt-dev-module MODULE=arrays.references`
+- `nix develop -c just verify-runtime`
 
 ## Known Gaps
 
-- `runtime-unsupported-feature`: 145
-- `runtime-error-or-diagnostic`: 80
-- `runtime-output-mismatch`: 31
-- `runtime-timeout`: 3
-- `frontend-parse-or-compile`: 1
+- The previous broad 200-fixture audit still has 124 target failures and 58 target skips against a green Reference PHP run. Those failures cluster around by-reference method returns, object property references, SPL and extension iterables, ReflectionReference, property hooks, and extension availability.
+- Null used as an array offset currently normalizes to the empty-string key in unit coverage, but PHP 8.5 also emits a deprecation notice. That diagnostic is not part of the Prompt 2C selected PHPT gate.
+- By-reference foreach remains intentionally limited to simple local array variables; nonlocal sources are a stable known gap.
 
 ## Next Step
 
-Close array data-model and reference/COW gaps before array builtins.
+Keep the Prompt 2C core selected gate green while promoting broader php-src reference, object, SPL, and extension cases into later focused modules.

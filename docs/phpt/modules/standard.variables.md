@@ -39,6 +39,14 @@
   follow-up changes.
 - Latest focused target run: PASS, 27 selected PHPTs with 26 PASS and 1 SKIP.
 
+## Prompt 2E Evidence
+
+- Reused the selected variable-inspection and debug-output surface as the
+  Prompt 2E variables acceptance gate.
+- Latest focused target run: PASS, 27 selected PHPTs with no non-green target
+  outcomes.
+- Latest oracle-backed stdlib aggregate run: PASS.
+
 ## Known Gaps
 
 - Full `var_dump`/`print_r` object visibility, magic behavior, and reference

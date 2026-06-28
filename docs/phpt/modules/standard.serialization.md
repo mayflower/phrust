@@ -46,6 +46,13 @@
   as `STDLIB-GAP-SERIALIZE-REFERENCES`.
 - Latest focused target run: PASS, 5 selected PHPTs.
 
+## Prompt 2E Evidence
+
+- Reused the selected scalar, array, simple-object, and explicit reference-gap
+  serialization surface as the Prompt 2E serialization acceptance gate.
+- Latest focused target run: PASS, 5 selected PHPTs.
+- Latest oracle-backed stdlib aggregate run: PASS.
+
 ## Known Gaps
 
 - `R`/`r` reference identity records are not emitted or reconstructed.

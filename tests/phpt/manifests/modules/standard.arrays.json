@@ -4,14 +4,14 @@
   "priority":12,
   "selected_manifest":"tests/phpt/manifests/modules/standard.arrays.selected.jsonl",
   "corpus_count":821,
-  "selected_count":10,
-  "pass_count":10,
+  "selected_count":17,
+  "pass_count":17,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":735,
-  "scope":["ext/standard array builtins"],
-  "non_scope":["array COW engine work"],
+  "scope":["count","array_key_exists","array_keys","array_values","array_merge","array_slice","array_splice","array_column","in_array","array_search","array_unique","range","deterministic sort/asort/ksort"],
+  "non_scope":["array COW engine work","callback-heavy array builtins without VM callable dispatch"],
   "target_gates":["PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.arrays","nix develop -c just verify-stdlib"],
-  "next_step":"Prompt 16.4 selected array contracts are closed and green; keep them green while expanding beyond the focused array builtin slice."
+  "next_step":"Keep the Prompt 2D selected array builtin gate green while expanding callback and broader upstream array PHPT coverage."
 }

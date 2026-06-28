@@ -58,7 +58,7 @@ mod tests {
         assert!(extension_loaded(&registry, "DATE"));
         assert!(extension_loaded(&registry, "JSON"));
         assert!(extension_loaded(&registry, "PCRE"));
-        assert!(!extension_loaded(&registry, "mbstring"));
+        assert!(extension_loaded(&registry, "mbstring"));
 
         registry.disable_extension("json").expect("disable json");
         assert!(!extension_loaded(&registry, "Json"));
@@ -77,6 +77,7 @@ mod tests {
                 "date",
                 "hash",
                 "json",
+                "mbstring",
                 "pcre",
                 "random",
                 "spl",
@@ -87,7 +88,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 9);
+        assert_eq!(array.len(), 10);
     }
 
     #[test]
@@ -96,7 +97,7 @@ mod tests {
         registry.enable_extension("test").expect("enable test");
 
         assert!(function_exists(&registry, "STRLEN"));
-        assert!(!function_exists(&registry, "mb_strlen"));
+        assert!(function_exists(&registry, "mb_strlen"));
         assert!(!function_exists(&registry, "__php_std_test_probe"));
         assert!(!function_exists(&registry, "composer_missing_function"));
     }

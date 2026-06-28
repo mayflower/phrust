@@ -8,3 +8,10 @@
 {"path":"tests/phpt/generated/standard.arrays/array-values-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.arrays/array-merge-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.arrays/array-slice-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/array-key-exists-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/array-splice-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/array-column-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/in-array-search-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/array-unique-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/range-smoke.phpt"}
+{"path":"tests/phpt/generated/standard.arrays/sort-deterministic-smoke.phpt"}

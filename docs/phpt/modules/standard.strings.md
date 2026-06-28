@@ -3,13 +3,14 @@
 - Priority: 13
 - Selected manifest: `tests/phpt/manifests/modules/standard.strings.selected.jsonl`
 - Prompt 16.1 baseline: 352 PASS, 42 SKIP, 308 FAIL, 0 BORK from 727 corpus candidates
-- Prompt 16.9 focused gate: 15 PASS, 0 FAIL, 0 BORK
+- Prompt 2E focused gate: 16 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
 - Common binary-safe string helpers
 - Focused generated fixtures for length, substring, search, trimming,
-  split/join, formatted output, and tokenizer state
+  split/join, formatted output, replacement, ASCII case conversion, and
+  tokenizer state
 
 ## Non-Scope
 
@@ -24,6 +25,7 @@
 - `tests/phpt/generated/standard.strings/trim-explode-implode-smoke.phpt`
 - `tests/phpt/generated/standard.strings/printf-sprintf-smoke.phpt`
 - `tests/phpt/generated/standard.strings/strtok-state-smoke.phpt`
+- `tests/phpt/generated/standard.strings/str-replace-case-smoke.phpt`
 
 ## Relevant Source Areas
 
@@ -44,6 +46,13 @@
 - Routed generated arginfo deprecations through VM diagnostics so
   `error_reporting` suppresses them consistently.
 - Latest focused target run: PASS, 15 selected PHPTs.
+
+## Prompt 2E Evidence
+
+- Added generated coverage for `str_replace`, `strtolower`, and `strtoupper`
+  to complete the Prompt 2E standard string builtin list.
+- Latest focused target run: PASS, 16 selected PHPTs.
+- Latest oracle-backed stdlib aggregate run: PASS.
 
 ## Known Gaps
 

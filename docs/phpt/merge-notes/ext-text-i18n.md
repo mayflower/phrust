@@ -4,12 +4,11 @@ Branch: `phpt/ext-text-i18n`
 
 ## mbstring
 
-- Classification: `required-composer`, `stub-only`.
-- Selected behavior: `extension_loaded("mbstring")` is false and selected
-  common functions remain unavailable to PHP code.
-- Runtime direct-call stubs return `E_PHP_RUNTIME_UNSUPPORTED_MBSTRING`.
-- First real implementation slice remains blocked on an approved Unicode and
-  legacy-encoding strategy.
+- Classification: `required-composer`, bounded UTF-8 `MVP`.
+- Selected behavior: `extension_loaded("mbstring")` is true and the selected
+  UTF-8/ASCII common functions are available to PHP code.
+- Unsupported mbstring functions remain absent, and legacy encodings, mbregex,
+  Oniguruma, and broad upstream `ext/mbstring` parity remain out of scope.
 
 ## intl
 
@@ -24,7 +23,7 @@ Branch: `phpt/ext-text-i18n`
 
 ## Merge Risks
 
-- Do not enable either extension in the standard-library registry without a
+- Do not broaden either extension in the standard-library registry without a
   corresponding reference-backed implementation slice.
 - Do not promote broad upstream `ext/mbstring` or `ext/intl` PHPTs without
   updating the module reports and selected manifests.
@@ -37,8 +36,10 @@ Branch: `phpt/ext-text-i18n`
 - `nix develop -c just verify-stdlib`
 - `nix develop -c just verify-phpt`
 
-Latest closeout used
-`/Volumes/CrucialMusic/src/phrust/third_party/php-src` as the read-only oracle:
+Latest closeout used `/tmp/php-src-mbstring-oracle/sapi/cli/php` for the
+mbstring-enabled oracle and
+`/Volumes/CrucialMusic/src/phrust/third_party/php-src` as the read-only source
+tree:
 
 - `mbstring` module gate: PASS, reference 3 PASS and target 3 PASS.
 - `intl` module gate: PASS, reference 3 PASS and target 3 PASS.

@@ -1236,8 +1236,11 @@ impl ExtensionRegistry {
                     ConstantValue::Int(512),
                 )),
             ExtensionDescriptor::new("mbstring")
-                .enabled_by_default(false)
+                .enabled_by_default(true)
+                .with_function(FunctionDescriptor::php("mb_check_encoding", "mbstring"))
+                .with_function(FunctionDescriptor::php("mb_convert_encoding", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_detect_encoding", "mbstring"))
+                .with_function(FunctionDescriptor::php("mb_internal_encoding", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_strlen", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_strtolower", "mbstring"))
                 .with_function(FunctionDescriptor::php("mb_strtoupper", "mbstring"))
@@ -1669,25 +1672,36 @@ mod tests {
     }
 
     #[test]
-    fn disabled_text_i18n_extensions_hide_platform_symbols() {
+    fn bounded_mbstring_is_enabled_while_intl_stays_hidden() {
         let registry = ExtensionRegistry::standard_library();
 
-        assert!(!registry.is_extension_enabled("mbstring"));
+        assert!(registry.is_extension_enabled("mbstring"));
         assert!(!registry.is_extension_enabled("intl"));
 
         for name in [
+            "mb_check_encoding",
+            "mb_convert_encoding",
             "mb_detect_encoding",
+            "mb_internal_encoding",
             "mb_strlen",
             "mb_strtolower",
             "mb_strtoupper",
             "mb_substr",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be visible in the bounded mbstring MVP"
+            );
+        }
+
+        for name in [
             "grapheme_strlen",
             "intl_get_error_code",
             "normalizer_normalize",
         ] {
             assert!(
                 registry.enabled_php_function(name).is_none(),
-                "{name} should stay hidden while its extension is disabled"
+                "{name} should stay hidden while intl is disabled"
             );
         }
 

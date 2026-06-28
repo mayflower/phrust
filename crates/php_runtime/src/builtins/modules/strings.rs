@@ -8,6 +8,7 @@ use crate::builtins::{
 use crate::{ArrayKey, PhpArray, PhpString, Value, to_bool};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest, Md5};
+use php_lexer::{LexerConfig, SymbolKind, TokenKind, TokenName, lex_all};
 use sha1::Sha1;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
@@ -39,6 +40,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("hash", builtin_hash, BuiltinCompatibility::Php),
     BuiltinEntry::new("hash_hmac", builtin_hash_hmac, BuiltinCompatibility::Php),
     BuiltinEntry::new("hex2bin", builtin_hex2bin, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "highlight_string",
+        builtin_highlight_string,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "htmlentities",
         builtin_htmlentities,
@@ -185,6 +191,170 @@ pub(in crate::builtins::modules) fn builtin_strlen(
     expect_arity("strlen", &args, 1)?;
     let value = string_arg("strlen", &args[0])?;
     Ok(Value::Int(value.len() as i64))
+}
+
+pub(in crate::builtins::modules) fn builtin_highlight_string(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_error("highlight_string", "one or two argument(s)"));
+    }
+    let source = string_arg("highlight_string", &args[0])?.to_string_lossy();
+    let should_return = args
+        .get(1)
+        .map_or(Ok(false), to_bool)
+        .map_err(|message| conversion_error("highlight_string", message))?;
+    let rendered = highlight_php_source(context, &source);
+    if should_return {
+        Ok(Value::string(rendered))
+    } else {
+        context.output().write_bytes(rendered.as_bytes());
+        Ok(Value::Bool(true))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HighlightClass {
+    Html,
+    Default,
+    Keyword,
+    String,
+    Comment,
+}
+
+struct HighlightColors {
+    html: String,
+    default: String,
+    keyword: String,
+    string: String,
+    comment: String,
+}
+
+fn highlight_php_source(context: &BuiltinContext<'_>, source: &str) -> String {
+    let colors = HighlightColors {
+        html: highlight_color(context, "highlight.html", "#000000"),
+        default: highlight_color(context, "highlight.default", "#0000BB"),
+        keyword: highlight_color(context, "highlight.keyword", "#007700"),
+        string: highlight_color(context, "highlight.string", "#DD0000"),
+        comment: highlight_color(context, "highlight.comment", "#FF9900"),
+    };
+    let lexed = lex_all(source, LexerConfig::default());
+    let mut output = String::new();
+    output.push_str("<pre><code style=\"color: ");
+    output.push_str(&colors.html);
+    output.push_str("\">");
+
+    let mut active_class: Option<HighlightClass> = None;
+    let mut in_encapsed_string = false;
+    for (index, token) in lexed.tokens.iter().enumerate() {
+        let Some(text) = token.text(source) else {
+            continue;
+        };
+        let next_kind = lexed.tokens.get(index + 1).map(|next| next.kind);
+        let mut class = highlight_class_for_token(token.kind, text, active_class, next_kind);
+        if is_double_quote_symbol(token.kind, text)
+            && (in_encapsed_string || starts_encapsed_string(next_kind))
+        {
+            class = HighlightClass::String;
+            in_encapsed_string = !in_encapsed_string;
+        }
+        append_highlighted_text(&mut output, &mut active_class, &colors, class, text);
+    }
+
+    close_highlight_span(&mut output, &mut active_class);
+    output.push_str("</code></pre>");
+    output
+}
+
+fn highlight_color(context: &BuiltinContext<'_>, name: &str, default: &str) -> String {
+    context.ini_get(name).unwrap_or(default).to_owned()
+}
+
+fn highlight_class_for_token(
+    kind: TokenKind,
+    text: &str,
+    active_class: Option<HighlightClass>,
+    next_kind: Option<TokenKind>,
+) -> HighlightClass {
+    match kind {
+        TokenKind::Named(TokenName::InlineHtml) => HighlightClass::Html,
+        TokenKind::Named(TokenName::OpenTag | TokenName::OpenTagWithEcho | TokenName::CloseTag) => {
+            HighlightClass::Default
+        }
+        TokenKind::Named(TokenName::Variable) => HighlightClass::Default,
+        TokenKind::Named(TokenName::ConstantEncapsedString | TokenName::EncapsedAndWhitespace) => {
+            HighlightClass::String
+        }
+        TokenKind::Named(TokenName::Comment | TokenName::DocComment) => HighlightClass::Comment,
+        TokenKind::Named(TokenName::Whitespace) => active_class
+            .filter(|class| *class != HighlightClass::Html)
+            .unwrap_or(HighlightClass::Keyword),
+        _ if is_double_quote_symbol(kind, text) && starts_encapsed_string(next_kind) => {
+            HighlightClass::String
+        }
+        _ => HighlightClass::Keyword,
+    }
+}
+
+fn append_highlighted_text(
+    output: &mut String,
+    active_class: &mut Option<HighlightClass>,
+    colors: &HighlightColors,
+    class: HighlightClass,
+    text: &str,
+) {
+    if class == HighlightClass::Html {
+        close_highlight_span(output, active_class);
+    } else if *active_class != Some(class) {
+        close_highlight_span(output, active_class);
+        output.push_str("<span style=\"color: ");
+        output.push_str(color_for_class(colors, class));
+        output.push_str("\">");
+        *active_class = Some(class);
+    }
+    push_highlight_escaped(output, text);
+}
+
+fn close_highlight_span(output: &mut String, active_class: &mut Option<HighlightClass>) {
+    if active_class.take().is_some() {
+        output.push_str("</span>");
+    }
+}
+
+fn color_for_class(colors: &HighlightColors, class: HighlightClass) -> &str {
+    match class {
+        HighlightClass::Html => &colors.html,
+        HighlightClass::Default => &colors.default,
+        HighlightClass::Keyword => &colors.keyword,
+        HighlightClass::String => &colors.string,
+        HighlightClass::Comment => &colors.comment,
+    }
+}
+
+fn is_double_quote_symbol(kind: TokenKind, text: &str) -> bool {
+    kind == TokenKind::Symbol(SymbolKind::Char(b'"')) && text == "\""
+}
+
+fn starts_encapsed_string(kind: Option<TokenKind>) -> bool {
+    matches!(
+        kind,
+        Some(TokenKind::Named(
+            TokenName::EncapsedAndWhitespace | TokenName::Variable
+        ))
+    )
+}
+
+fn push_highlight_escaped(output: &mut String, text: &str) {
+    for byte in text.bytes() {
+        match byte {
+            b'&' => output.push_str("&amp;"),
+            b'<' => output.push_str("&lt;"),
+            b'>' => output.push_str("&gt;"),
+            _ => output.push(char::from(byte)),
+        }
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_strtoupper(

@@ -5112,8 +5112,16 @@ fn format_float_decimal(name: &str, spec: &PrintfSpec, value: f64) -> Result<Str
     if let Some(text) = non_finite_float_text(value) {
         return Ok(text.to_string());
     }
-    let precision = spec.precision.unwrap_or(6);
+    let mut precision = spec.precision.unwrap_or(6);
     let negative = value.is_sign_negative();
+    if spec.left_align
+        && spec.zero_pad
+        && let Some(width) = spec.width
+    {
+        let sign_len = usize::from(negative || spec.force_sign);
+        let integer_digits = format!("{:.0}", value.abs().trunc()).len();
+        precision = precision.max(width.saturating_sub(sign_len + integer_digits + 1));
+    }
     let digits = format!("{:.precision$}", value.abs());
     Ok(format_numeric_sign(name, spec, negative, digits))
 }
@@ -9490,6 +9498,37 @@ mod tests {
     }
 
     #[test]
+    fn highlight_string_renders_php_style_markup() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "highlight_string",
+                vec![Value::string("<br /><?php echo \"foo\"; ?><br />")],
+                &mut output
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            output.to_string_lossy(),
+            "<pre><code style=\"color: #000000\">&lt;br /&gt;<span style=\"color: #0000BB\">&lt;?php </span><span style=\"color: #007700\">echo </span><span style=\"color: #DD0000\">\"foo\"</span><span style=\"color: #007700\">; </span><span style=\"color: #0000BB\">?&gt;</span>&lt;br /&gt;</code></pre>"
+        );
+
+        assert_eq!(
+            call(
+                "highlight_string",
+                vec![
+                    Value::string("<?php echo \"foo[] $a \\n\"; ?>"),
+                    Value::Bool(true)
+                ],
+                &mut output
+            ),
+            Value::string(
+                "<pre><code style=\"color: #000000\"><span style=\"color: #0000BB\">&lt;?php </span><span style=\"color: #007700\">echo </span><span style=\"color: #DD0000\">\"foo[] </span><span style=\"color: #0000BB\">$a</span><span style=\"color: #DD0000\"> \\n\"</span><span style=\"color: #007700\">; </span><span style=\"color: #0000BB\">?&gt;</span></code></pre>"
+            )
+        );
+    }
+
+    #[test]
     fn string_split_replace_reports_value_errors() {
         for (name, args) in [
             ("explode", vec![Value::string(""), Value::string("abc")]),
@@ -9934,6 +9973,14 @@ mod tests {
         assert_eq!(
             call(
                 "sprintf",
+                vec![Value::string("%-010.2f"), Value::float(2.5)],
+                &mut output,
+            ),
+            Value::string("2.50000000")
+        );
+        assert_eq!(
+            call(
+                "sprintf",
                 vec![
                     Value::string("%3$s %1$s %2$04d %4$'#5s %5$ls"),
                     Value::string("one"),
@@ -10157,6 +10204,33 @@ mod tests {
             stream.read_to_end().expect("memory stream read"),
             b"id:7|next:8|"
         );
+
+        let mut stdout_output = OutputBuffer::new();
+        let stdout = ResourceTable::new().register_stream(
+            StreamFlags::new(true, true, true),
+            StreamMetadata::new("php", "stream", "w+", "php://stdout"),
+        );
+        assert_eq!(
+            call(
+                "fprintf",
+                vec![
+                    Value::Resource(stdout.clone()),
+                    Value::string("stdout:%d"),
+                    Value::Int(3)
+                ],
+                &mut stdout_output
+            ),
+            Value::Int(8)
+        );
+        assert_eq!(
+            call(
+                "fwrite",
+                vec![Value::Resource(stdout), Value::string("|tail")],
+                &mut stdout_output
+            ),
+            Value::Int(5)
+        );
+        assert_eq!(stdout_output.to_string_lossy(), "stdout:3|tail");
     }
 
     #[test]

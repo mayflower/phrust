@@ -5,7 +5,7 @@ use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     RuntimeSourceSpan,
 };
-use crate::{ArrayKey, StreamWrapperRegistry, Value};
+use crate::{ArrayKey, ResourceRef, StreamWrapperRegistry, Value};
 use std::path::Path;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
@@ -93,9 +93,7 @@ pub(in crate::builtins::modules) fn builtin_fprintf(
     };
     let format = string_arg("fprintf", &args[1])?;
     let rendered = php_format("fprintf", format.as_bytes(), &args[2..], context, span)?;
-    let written = stream
-        .write_bytes(&rendered)
-        .map_err(|error| value_error("fprintf", &error.to_string()))?;
+    let written = write_stream_bytes(context, &stream, &rendered, "fprintf")?;
     Ok(Value::Int(written as i64))
 }
 pub(in crate::builtins::modules) fn builtin_vfprintf(
@@ -123,9 +121,7 @@ pub(in crate::builtins::modules) fn builtin_vfprintf(
     let format = string_needle_arg("vfprintf", "#2 ($format)", &args[1])?;
     let values = format_array_values("vfprintf", "#3 ($values)", &args[2])?;
     let rendered = php_format("vfprintf", format.as_bytes(), &values, context, span)?;
-    let written = stream
-        .write_bytes(&rendered)
-        .map_err(|error| value_error("vfprintf", &error.to_string()))?;
+    let written = write_stream_bytes(context, &stream, &rendered, "vfprintf")?;
     Ok(Value::Int(written as i64))
 }
 pub(in crate::builtins::modules) fn builtin_fopen(
@@ -179,7 +175,7 @@ pub(in crate::builtins::modules) fn builtin_fread(
         .map_or(Value::Bool(false), Value::string))
 }
 pub(in crate::builtins::modules) fn builtin_fwrite(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -193,9 +189,23 @@ pub(in crate::builtins::modules) fn builtin_fwrite(
     if let Some(length) = args.get(2) {
         bytes.truncate(int_arg("fwrite", length)?.max(0) as usize);
     }
-    Ok(resource
-        .write_bytes(&bytes)
+    Ok(write_stream_bytes(context, &resource, &bytes, "fwrite")
         .map_or(Value::Bool(false), |written| Value::Int(written as i64)))
+}
+
+fn write_stream_bytes(
+    context: &mut BuiltinContext<'_>,
+    resource: &ResourceRef,
+    bytes: &[u8],
+    function_name: &str,
+) -> Result<usize, BuiltinError> {
+    let written = resource
+        .write_bytes(bytes)
+        .map_err(|error| value_error(function_name, &error.to_string()))?;
+    if resource.metadata().uri == "php://stdout" {
+        context.output().write_bytes(&bytes[..written]);
+    }
+    Ok(written)
 }
 pub(in crate::builtins::modules) fn builtin_fgets(
     _context: &mut BuiltinContext<'_>,

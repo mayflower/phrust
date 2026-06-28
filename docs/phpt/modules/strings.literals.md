@@ -2,7 +2,8 @@
 
 - Priority: 7
 - Selected manifest: `tests/phpt/manifests/modules/strings.literals.selected.jsonl`
-- Current counts: 0 PASS, 0 SKIP, 9 FAIL, 0 BORK from 9 corpus candidates
+- Current counts: 9 PASS, 0 SKIP, 0 FAIL, 0 BORK from 9 selected
+  candidates
 
 ## Scope
 
@@ -34,14 +35,23 @@
 
 ## Target Gates
 
-- `nix develop -c just verify-frontend`
+- `nix develop -c just phpt-dev-module MODULE=strings.literals`
+
+Last focused run on 2026-06-28:
+
+- Selected module gate:
+  `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_DISABLE_REFERENCE_REUSE=1 PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=strings.literals`
+  - Reference: 9 PASS, 0 SKIP, 0 FAIL, 0 BORK
+  - Target: 9 PASS, 0 SKIP, 0 FAIL, 0 BORK
+  - Source integrity: 24475 php-src manifest entries verified
 
 ## Known Gaps
 
-- `runtime-error-or-diagnostic`: 6
-- `runtime-unsupported-feature`: 2
-- `runtime-output-mismatch`: 1
+The selected nine-fixture gate is green. Broader string-literal coverage should
+expand heredoc/nowdoc combinations, interpolation edge cases, and additional
+standard string formatting fixtures in follow-up selected slices.
 
 ## Next Step
 
-Separate frontend literal gaps from runtime string builtin gaps.
+Keep the selected literal/string gate green while expanding heredoc,
+interpolation, and standard string formatting coverage.

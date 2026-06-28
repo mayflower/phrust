@@ -35,7 +35,7 @@ Reference target: PHP 8.5.7 (`php-8.5.7`).
 | Regression corpus | `tests/fixtures/stdlib/corpus` and `compat-corpus-smoke` cover Composer/framework-adjacent snippets for container autoload, env parsing, JSON config, regex routing, DateTime/version parsing, array manipulation, and reflection attributes without vendoring external frameworks. | `compat-corpus-smoke` |
 | Composer source-mode fixtures | Local Composer-style PSR-4 autoload fixtures cover `require 'autoload.php'` through `include_path`, PHP autoload callback resolution through `stream_resolve_include_path`, `class_exists(..., true)` loading from `tests/fixtures/stdlib/composer/project/src`, deterministic generated-autoload fixtures for PSR-4/classmap/files metadata, platform checks, default-off process capability behavior, and opt-in Composer source checkout runs via `PHRUST_STDLIB_COMPOSER_SOURCE_DIR`. | `composer-smoke`, `composer-smoke-autoload`, `composer-smoke-platform`, `process-capability-smoke`, `composer-smoke-source` |
 | PHAR | ADR-0066 keeps PHAR out of required standard-library gates; Composer source mode is mandatory first, and any read-only PHAR MVP must be accepted with explicit archive, wrapper, stub, and diagnostic boundaries | `stdlib-coverage` |
-| mbstring / intl / ICU | Out of required scope; optional stubs only | `stdlib-coverage` |
+| mbstring / intl / ICU | Bounded mbstring UTF-8 MVP; full mbstring, intl, and ICU semantics remain out of required scope | `stdlib-coverage` |
 | DOM / XML / SimpleXML | Out of required scope | `stdlib-coverage` |
 | PDO | Out of required scope | `stdlib-coverage` |
 | curl / openssl / network streams | Out of required scope | `stdlib-coverage` |

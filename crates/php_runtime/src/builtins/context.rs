@@ -123,6 +123,7 @@ pub struct BuiltinContext<'a> {
     json_last_error: i64,
     json_last_error_msg: String,
     strtok_state: Option<&'a mut StrtokState>,
+    mb_internal_encoding: String,
     diagnostic_display: PhpDiagnosticDisplayOptions,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -145,6 +146,7 @@ impl<'a> BuiltinContext<'a> {
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
+            mb_internal_encoding: "UTF-8".to_owned(),
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
@@ -172,6 +174,7 @@ impl<'a> BuiltinContext<'a> {
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
+            mb_internal_encoding: "UTF-8".to_owned(),
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
@@ -309,6 +312,17 @@ impl<'a> BuiltinContext<'a> {
     /// Returns request-local `strtok` state.
     pub fn strtok_state(&mut self) -> Option<&mut StrtokState> {
         self.strtok_state.as_deref_mut()
+    }
+
+    /// Current request-local mbstring internal encoding.
+    #[must_use]
+    pub fn mb_internal_encoding(&self) -> &str {
+        &self.mb_internal_encoding
+    }
+
+    /// Updates the request-local mbstring internal encoding.
+    pub fn set_mb_internal_encoding(&mut self, encoding: impl Into<String>) {
+        self.mb_internal_encoding = encoding.into();
     }
 
     /// Request-local PCRE pattern cache.

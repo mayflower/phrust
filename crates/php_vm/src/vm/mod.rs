@@ -806,6 +806,7 @@ struct ExecutionState {
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
     strtok_state: php_runtime::StrtokState,
+    mb_internal_encoding: String,
     preg_last_error: php_runtime::pcre::PcreLastErrorState,
     json_last_error: i64,
     error_handlers: Vec<ErrorHandlerEntry>,
@@ -28922,11 +28923,17 @@ fn execute_builtin_entry(
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
     context.set_strtok_state(&mut state.strtok_state);
+    context.set_mb_internal_encoding(if state.mb_internal_encoding.is_empty() {
+        "UTF-8".to_owned()
+    } else {
+        state.mb_internal_encoding.clone()
+    });
     let result = (entry.function())(&mut context, args, source_span.clone());
     let output = context.output().clone();
     state.cwd = context.cwd().to_path_buf();
     state.json_last_error = context.json_last_error().0;
     state.default_timezone = context.default_timezone().to_owned();
+    state.mb_internal_encoding = context.mb_internal_encoding().to_owned();
     let mut diagnostics = context.take_diagnostics();
     match result {
         Ok(value) => VmResult::success_with_diagnostics(output, Some(value), diagnostics),
@@ -32579,16 +32586,19 @@ mod tests {
     }
 
     #[test]
-    fn symbol_introspection_hides_disabled_mbstring_stubs() {
+    fn symbol_introspection_exposes_bounded_mbstring_mvp() {
         let result = execute_source(
             "<?php
             echo extension_loaded('mbstring') ? 'loaded' : 'missing';
             foreach ([
+                'mb_check_encoding',
+                'mb_convert_encoding',
                 'mb_strlen',
                 'mb_substr',
                 'mb_strtolower',
                 'mb_strtoupper',
                 'mb_detect_encoding',
+                'mb_strpos',
             ] as $name) {
                 echo '|', $name, ':', function_exists($name) ? 'yes' : 'no';
             }
@@ -32598,7 +32608,7 @@ mod tests {
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "missing|mb_strlen:no|mb_substr:no|mb_strtolower:no|mb_strtoupper:no|mb_detect_encoding:no"
+            "loaded|mb_check_encoding:yes|mb_convert_encoding:yes|mb_strlen:yes|mb_substr:yes|mb_strtolower:yes|mb_strtoupper:yes|mb_detect_encoding:yes|mb_strpos:no"
         );
     }
 

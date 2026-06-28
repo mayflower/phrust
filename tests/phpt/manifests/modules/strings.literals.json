@@ -4,13 +4,13 @@
   "priority":7,
   "selected_manifest":"tests/phpt/manifests/modules/strings.literals.selected.jsonl",
   "corpus_count":9,
-  "pass_count":0,
+  "pass_count":9,
   "skip_count":0,
-  "fail_count":9,
+  "fail_count":0,
   "bork_count":0,
-  "known_failure_count":9,
+  "known_failure_count":0,
   "scope":["string literal decoding","heredoc/nowdoc","string interpolation basics"],
   "non_scope":["full ext/standard string API"],
-  "target_gates":["nix develop -c just verify-frontend"],
-  "next_step":"Separate frontend literal gaps from runtime string builtin gaps."
+  "target_gates":["nix develop -c just phpt-dev-module MODULE=strings.literals"],
+  "next_step":"Keep the selected literal/string gate green while expanding heredoc, interpolation, and standard string formatting coverage."
 }

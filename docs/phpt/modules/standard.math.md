@@ -43,6 +43,14 @@
 - Latest focused target run: PASS, 172 selected PHPTs with 161 PASS and
   11 SKIP.
 
+## Prompt 2E Evidence
+
+- Reused the selected Prompt 16 math surface as the Prompt 2E math acceptance
+  gate.
+- Latest focused target run: PASS, 172 selected PHPTs with no non-green target
+  outcomes.
+- Latest oracle-backed stdlib aggregate run: PASS.
+
 ## Known Gaps
 
 - The 11 SKIPs are preserved as selected-gate skips, not failures.
