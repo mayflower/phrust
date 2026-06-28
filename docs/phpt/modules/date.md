@@ -2,74 +2,69 @@
 
 - Priority: 19
 - Selected manifest: `tests/phpt/manifests/modules/date.selected.jsonl`
-- Current counts: 14 PASS, 12 SKIP, 661 FAIL, 0 BORK from 687 corpus candidates
+- Focused selected counts: 7 PASS, 0 SKIP, 0 FAIL, 0 BORK from 7 Prompt
+  19 generated Date/Time fixtures
+- Corpus triage counts: 14 PASS, 12 SKIP, 661 FAIL, 0 BORK from 687
+  upstream `ext/date` corpus candidates before this focused promotion
 
 ## Scope
 
-- date/time builtins and DateTime MVP
+- request-local `date_default_timezone_get` / `date_default_timezone_set`
+- `time`, `microtime`, `date`, and `gmdate` over selected format characters
+- `DateTime` and `DateTimeImmutable` construction, formatting, timestamps,
+  timezone access/mutation, `add`, `sub`, `modify`, and `diff` MVP paths
+- `DateTimeZone` construction, `getName`, `timezone_open`,
+  `timezone_name_get`, and deterministic identifier listing
+- controlled `strtotime` parsing for ISO-like dates, numeric timestamps, and
+  simple day-relative modifiers
+- `DateInterval` ISO subset parsing, basic properties, formatting, and
+  DateTime `add`/`sub` integration
 
 ## Non-Scope
 
-- complete timelib natural-language parity
+- complete timelib natural-language parsing
+- full timezone database transitions, aliases, and historical DST behavior
+- complete Date/Time class method, property, warning, and exception parity
 
-## Relevant PHPT Paths
+## Selected PHPT Fixture Groups
 
-- `ext/date/tests/unserialize-test.phpt`
-- `ext/date/tests/timezones.phpt`
-- `ext/date/tests/timezones-list.phpt`
-- `ext/date/tests/timezone_version_get_basic1.phpt`
-- `ext/date/tests/timezone_version_get.phpt`
-- `ext/date/tests/timezone_transitions_get_basic1.phpt`
-- `ext/date/tests/timezone_open_warning.phpt`
-- `ext/date/tests/timezone_open_basic1.phpt`
-- `ext/date/tests/timezone_offset_get_error.phpt`
-- `ext/date/tests/timezone_offset_get_basic1.phpt`
-- `ext/date/tests/timezone_name_from_abbr_basic1.phpt`
-- `ext/date/tests/timezone_location_get.phpt`
-- `ext/date/tests/timezone_identifiers_list_wrong_constructor.phpt`
-- `ext/date/tests/timezone_identifiers_list_basic1.phpt`
-- `ext/date/tests/timezone_abbreviations_list_basic1.phpt`
-- `ext/date/tests/timezone-configuration.phpt`
-- `ext/date/tests/timestamp-in-dst.phpt`
-- `ext/date/tests/test-parse-from-format.phpt`
-- `ext/date/tests/sunfuncts_partial_hour_utc_offset.phpt`
-- `ext/date/tests/sunfuncts.phpt`
-- `ext/date/tests/strtotime_variation_scottish.phpt`
-- `ext/date/tests/strtotime_basic.phpt`
-- `ext/date/tests/strtotime3.phpt`
-- `ext/date/tests/strtotime3-64bit.phpt`
-- `ext/date/tests/strtotime2.phpt`
-- `ext/date/tests/strtotime.phpt`
-- `ext/date/tests/strtotime-relative.phpt`
-- `ext/date/tests/strtotime-mysql.phpt`
-- `ext/date/tests/strtotime-mysql-64bit.phpt`
-- `ext/date/tests/strftime_variation9.phpt`
-- `ext/date/tests/strftime_variation8.phpt`
-- `ext/date/tests/strftime_variation7.phpt`
-- `ext/date/tests/strftime_variation6.phpt`
-- `ext/date/tests/strftime_variation5.phpt`
-- `ext/date/tests/strftime_variation4.phpt`
-- `ext/date/tests/strftime_variation3.phpt`
-- `ext/date/tests/strftime_variation22.phpt`
-- `ext/date/tests/strftime_variation21.phpt`
-- `ext/date/tests/strftime_variation20.phpt`
-- `ext/date/tests/strftime_variation19.phpt`
+- `tests/phpt/generated/date/timezone-state.phpt`
+- `tests/phpt/generated/date/date-time-functions.phpt`
+- `tests/phpt/generated/date/datetime-format.phpt`
+- `tests/phpt/generated/date/datetimeimmutable-format.phpt`
+- `tests/phpt/generated/date/datetimezone-mvp.phpt`
+- `tests/phpt/generated/date/strtotime-mvp.phpt`
+- `tests/phpt/generated/date/dateinterval-mvp.phpt`
 
-## Relevant php-src Source Areas
+## Relevant Source Areas
 
-- `ext/date/tests/`
+- `crates/php_runtime/src/datetime.rs`
+- `crates/php_runtime/src/builtins/modules/date.rs`
+- `crates/php_vm/src/vm/mod.rs`
+- `docs/stdlib-known-gaps.md`
 
 ## Target Gates
 
-- `nix develop -c just phpt-module MODULE=date`
+- `nix develop -c cargo test -p php_runtime datetime`
+- `nix develop -c cargo test -p php_vm`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=date`
+- `nix develop -c just diff-json-pcre-date`
+- `nix develop -c just verify-stdlib`
+- `nix develop -c just verify-phpt`
 
 ## Known Gaps
 
-- `runtime-error-or-diagnostic`: 535
-- `runtime-unsupported-feature`: 67
-- `runtime-output-mismatch`: 58
-- `frontend-parse-or-compile`: 15
+- focused selected manifest contains seven generated Prompt 19 Date/Time
+  contracts and is expected to be green for both reference PHP 8.5.7 and the
+  target runtime
+- broader upstream `ext/date` rows remain documented corpus/backlog work for
+  full timelib parsing, complete timezone database behavior, DatePeriod,
+  `createFromFormat`, advanced interval behavior, and byte-perfect diagnostics
+- the Date/Time MVP intentionally uses a deterministic fixed-offset timezone
+  registry instead of importing PHP timelib/tzdb
 
 ## Next Step
 
-Stabilize timezone persistence and common formatting/parsing.
+Prompt 19 is closed for the focused generated Date/Time contracts. Keep the
+selected manifest green while promoting broader upstream `ext/date` PHPT rows
+only when their timelib, tzdb, and class-surface requirements are implemented.

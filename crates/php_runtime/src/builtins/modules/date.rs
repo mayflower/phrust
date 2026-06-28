@@ -10,6 +10,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("date", builtin_date, BuiltinCompatibility::Php),
     BuiltinEntry::new(
+        "date_format",
+        builtin_date_format,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "date_interval_format",
+        builtin_date_interval_format,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "date_default_timezone_get",
         builtin_date_default_timezone_get,
         BuiltinCompatibility::Php,
@@ -19,12 +29,24 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_date_default_timezone_set,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("gmdate", builtin_gmdate, BuiltinCompatibility::Php),
+    BuiltinEntry::new("microtime", builtin_microtime, BuiltinCompatibility::Php),
     BuiltinEntry::new("strtotime", builtin_strtotime, BuiltinCompatibility::Php),
     BuiltinEntry::new("hrtime", builtin_hrtime, BuiltinCompatibility::Php),
     BuiltinEntry::new("time", builtin_time, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "timezone_identifiers_list",
         builtin_timezone_identifiers_list,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "timezone_name_get",
+        builtin_timezone_name_get,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "timezone_open",
+        builtin_timezone_open,
         BuiltinCompatibility::Php,
     ),
 ];
@@ -57,6 +79,24 @@ pub(in crate::builtins::modules) fn builtin_date(
         &format,
     )))
 }
+pub(in crate::builtins::modules) fn builtin_gmdate(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_error("gmdate", "one or two argument(s)"));
+    }
+    let format = string_arg("gmdate", &args[0])?.to_string_lossy();
+    let timestamp = args
+        .get(1)
+        .map(|value| int_arg("gmdate", value))
+        .transpose()?
+        .unwrap_or_else(datetime::current_timestamp);
+    Ok(Value::string(datetime::format_timestamp(
+        timestamp, "GMT", &format,
+    )))
+}
 pub(in crate::builtins::modules) fn builtin_time(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -64,6 +104,32 @@ pub(in crate::builtins::modules) fn builtin_time(
 ) -> BuiltinResult {
     expect_arity("time", &args, 0)?;
     Ok(Value::Int(datetime::current_timestamp()))
+}
+pub(in crate::builtins::modules) fn builtin_microtime(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("microtime", "zero or one argument(s)"));
+    }
+    let as_float = args
+        .first()
+        .map(to_bool)
+        .transpose()
+        .map_err(|message| conversion_error("microtime", message))?
+        .unwrap_or(false);
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| value_error("microtime", "system time is before UNIX epoch"))?;
+    let seconds = elapsed.as_secs();
+    let micros = elapsed.subsec_micros();
+    if as_float {
+        return Ok(Value::float(
+            seconds as f64 + f64::from(micros) / 1_000_000.0,
+        ));
+    }
+    Ok(Value::string(format!("0.{micros:06} {seconds}")))
 }
 pub(in crate::builtins::modules) fn builtin_hrtime(
     _context: &mut BuiltinContext<'_>,
@@ -112,6 +178,64 @@ pub(in crate::builtins::modules) fn builtin_strtotime(
         .transpose()?
         .unwrap_or_else(datetime::current_timestamp);
     Ok(datetime::parse_datetime_text(&text, base).map_or(Value::Bool(false), Value::Int))
+}
+pub(in crate::builtins::modules) fn builtin_date_format(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("date_format", &args, 2)?;
+    let Value::Object(object) = deref_value(&args[0]) else {
+        return Err(type_error("date_format", "DateTimeInterface", &args[0]));
+    };
+    let format = string_arg("date_format", &args[1])?.to_string_lossy();
+    let timestamp = datetime::object_timestamp(&object)
+        .ok_or_else(|| value_error("date_format", "object is not a DateTimeInterface MVP"))?;
+    let timezone = datetime::object_timezone(&object).unwrap_or_else(|| "UTC".to_string());
+    Ok(Value::string(datetime::format_timestamp(
+        timestamp, &timezone, &format,
+    )))
+}
+pub(in crate::builtins::modules) fn builtin_timezone_open(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("timezone_open", &args, 1)?;
+    let timezone = string_arg("timezone_open", &args[0])?.to_string_lossy();
+    Ok(datetime::datetimezone_object(&timezone).unwrap_or(Value::Bool(false)))
+}
+pub(in crate::builtins::modules) fn builtin_timezone_name_get(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("timezone_name_get", &args, 1)?;
+    let Value::Object(object) = deref_value(&args[0]) else {
+        return Err(type_error("timezone_name_get", "DateTimeZone", &args[0]));
+    };
+    Ok(datetime::object_timezone(&object).map_or(Value::Bool(false), Value::string))
+}
+pub(in crate::builtins::modules) fn builtin_date_interval_format(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("date_interval_format", &args, 2)?;
+    let Value::Object(object) = deref_value(&args[0]) else {
+        return Err(type_error("date_interval_format", "DateInterval", &args[0]));
+    };
+    let seconds = match object.get_property("__seconds") {
+        Some(Value::Int(value)) => value,
+        _ => {
+            return Err(value_error(
+                "date_interval_format",
+                "object is not a DateInterval MVP",
+            ));
+        }
+    };
+    let format = string_arg("date_interval_format", &args[1])?.to_string_lossy();
+    Ok(Value::string(datetime::format_interval(seconds, &format)))
 }
 pub(in crate::builtins::modules) fn builtin_date_default_timezone_set(
     context: &mut BuiltinContext<'_>,

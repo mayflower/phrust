@@ -42,10 +42,29 @@ pub fn datetime_immutable_object(timestamp: i64, timezone: &str) -> Value {
 pub fn dateinterval_object(seconds: i64) -> Value {
     let object =
         ObjectRef::new_with_display_name(&date_class("DateInterval", false), "DateInterval");
+    let parts = interval_parts(seconds);
     object.set_property("__seconds", Value::Int(seconds));
     object.set_property("invert", Value::Int(i64::from(seconds < 0)));
-    object.set_property("days", Value::Int(seconds.abs() / 86_400));
+    object.set_property("days", Value::Int(parts.total_days));
+    object.set_property("y", Value::Int(parts.years));
+    object.set_property("m", Value::Int(parts.months));
+    object.set_property("d", Value::Int(parts.days));
+    object.set_property("h", Value::Int(parts.hours));
+    object.set_property("i", Value::Int(parts.minutes));
+    object.set_property("s", Value::Int(parts.seconds));
     Value::Object(object)
+}
+
+/// Creates a `DateTimeZone` runtime object for a supported identifier.
+#[must_use]
+pub fn datetimezone_object(timezone: &str) -> Option<Value> {
+    if !is_valid_timezone(timezone) {
+        return None;
+    }
+    let object =
+        ObjectRef::new_with_display_name(&date_class("DateTimeZone", false), "DateTimeZone");
+    object.set_property("timezone", Value::string(timezone));
+    Some(Value::Object(object))
 }
 
 /// Parses an ISO/common package-facing date string to a UTC timestamp.
@@ -58,6 +77,27 @@ pub fn parse_datetime_text(text: &str, base_timestamp: i64) -> Option<i64> {
         return Some(base_timestamp.saturating_add(seconds));
     }
     parse_absolute_datetime(trimmed)
+}
+
+/// Parses DateTime constructor input using a default timezone for local absolute text.
+pub fn parse_datetime_text_in_timezone(
+    text: &str,
+    base_timestamp: i64,
+    timezone: &str,
+) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("now") {
+        return Some(base_timestamp);
+    }
+    if let Some(seconds) = parse_relative_modifier(trimmed) {
+        return Some(base_timestamp.saturating_add(seconds));
+    }
+    let timestamp = parse_absolute_datetime(trimmed)?;
+    if absolute_text_has_explicit_timezone(trimmed) {
+        Some(timestamp)
+    } else {
+        Some(timestamp.saturating_sub(timezone_offset_seconds(timezone)))
+    }
 }
 
 /// Parses a DateInterval MVP specification.
@@ -104,6 +144,49 @@ pub fn parse_interval_spec(spec: &str) -> Option<i64> {
         total = total.saturating_add(value.saturating_mul(multiplier));
     }
     Some(total)
+}
+
+/// Formats a DateInterval-like seconds payload with a small PHP interval format subset.
+#[must_use]
+pub fn format_interval(seconds: i64, format: &str) -> String {
+    let parts = interval_parts(seconds);
+    let mut output = String::new();
+    let mut percent = false;
+    for marker in format.chars() {
+        if percent {
+            match marker {
+                '%' => output.push('%'),
+                'R' => output.push(if seconds < 0 { '-' } else { '+' }),
+                'r' => {
+                    if seconds < 0 {
+                        output.push('-');
+                    }
+                }
+                'y' => output.push_str(&parts.years.to_string()),
+                'm' => output.push_str(&parts.months.to_string()),
+                'd' => output.push_str(&parts.days.to_string()),
+                'a' => output.push_str(&parts.total_days.to_string()),
+                'h' => output.push_str(&parts.hours.to_string()),
+                'i' => output.push_str(&parts.minutes.to_string()),
+                's' => output.push_str(&parts.seconds.to_string()),
+                other => {
+                    output.push('%');
+                    output.push(other);
+                }
+            }
+            percent = false;
+            continue;
+        }
+        if marker == '%' {
+            percent = true;
+        } else {
+            output.push(marker);
+        }
+    }
+    if percent {
+        output.push('%');
+    }
+    output
 }
 
 /// Returns the current Unix timestamp.
@@ -275,6 +358,9 @@ fn date_class(name: &str, is_interface: bool) -> ClassEntry {
 }
 
 fn parse_absolute_datetime(text: &str) -> Option<i64> {
+    if let Some(timestamp) = text.strip_prefix('@') {
+        return timestamp.parse::<i64>().ok();
+    }
     if let Ok(timestamp) = text.parse::<i64>() {
         return Some(timestamp);
     }
@@ -303,10 +389,25 @@ fn parse_absolute_datetime(text: &str) -> Option<i64> {
     Some(parts_to_timestamp(year, month, day, hour, minute, second))
 }
 
+fn absolute_text_has_explicit_timezone(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with('@') {
+        return true;
+    }
+    if trimmed.ends_with('Z') {
+        return true;
+    }
+    let Some((_, time)) = trimmed.split_once([' ', 'T']) else {
+        return false;
+    };
+    time.contains('+') || time.contains('-')
+}
+
 fn parse_relative_modifier(text: &str) -> Option<i64> {
     match text.to_ascii_lowercase().as_str() {
         "tomorrow" => return Some(86_400),
         "yesterday" => return Some(-86_400),
+        "next day" => return Some(86_400),
         _ => {}
     }
     let mut parts = text.split_whitespace();
@@ -336,6 +437,41 @@ fn parse_relative_modifier(text: &str) -> Option<i64> {
     Some(value.saturating_mul(multiplier))
 }
 
+#[derive(Clone, Copy)]
+struct IntervalParts {
+    total_days: i64,
+    years: i64,
+    months: i64,
+    days: i64,
+    hours: i64,
+    minutes: i64,
+    seconds: i64,
+}
+
+fn interval_parts(seconds: i64) -> IntervalParts {
+    let mut remaining = seconds.abs();
+    let total_days = remaining / 86_400;
+    let years = remaining / (365 * 86_400);
+    remaining %= 365 * 86_400;
+    let months = remaining / (30 * 86_400);
+    remaining %= 30 * 86_400;
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let seconds = remaining % 60;
+    IntervalParts {
+        total_days,
+        years,
+        months,
+        days,
+        hours,
+        minutes,
+        seconds,
+    }
+}
+
 fn object_timezone_or_utc(object: &ObjectRef) -> String {
     object_timezone(object).unwrap_or_else(|| DEFAULT_TIMEZONE.to_string())
 }
@@ -343,7 +479,7 @@ fn object_timezone_or_utc(object: &ObjectRef) -> String {
 fn timezone_offset_seconds(timezone: &str) -> i64 {
     match timezone {
         "Europe/Berlin" => 3_600,
-        "Europe/London" | "UTC" => 0,
+        "Europe/London" | "UTC" | "GMT" => 0,
         "Africa/Johannesburg" => 7_200,
         "America/New_York" => -18_000,
         "America/Chicago" => -21_600,
@@ -370,6 +506,7 @@ fn timezone_offset_text(offset: i64) -> &'static str {
 fn timezone_abbreviation(timezone: &str) -> &'static str {
     match timezone {
         "Europe/Berlin" => "CET",
+        "GMT" => "GMT",
         "Europe/London" | "UTC" => "UTC",
         "Africa/Johannesburg" => "SAST",
         "America/New_York" => "EST",
