@@ -243,6 +243,23 @@ impl OutputBuffer {
     pub fn flush_all_buffers(&mut self) {
         while self.pop_buffer_flush().is_some() {}
     }
+
+    /// Flushes active buffer bytes to root output while keeping buffer levels open.
+    pub fn flush_active_buffers_to_root(&mut self) {
+        if self.stack.is_empty() {
+            return;
+        }
+        let total = self.stack.iter().map(Vec::len).sum::<usize>();
+        if total == 0 {
+            return;
+        }
+        self.bytes.reserve(total);
+        for buffer in &mut self.stack {
+            self.bytes.extend_from_slice(buffer);
+            buffer.clear();
+        }
+        self.stats.flushes += 1;
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +289,28 @@ mod tests {
         assert_eq!(output.stats().flushes, 1);
         assert_eq!(output.stats().fast_appends, 0);
         assert!(output.stats().slow_appends_by_reason.is_empty());
+    }
+
+    #[test]
+    fn active_buffers_flush_to_root_without_closing_levels() {
+        let mut output = OutputBuffer::new();
+        output.write_test_str("root|");
+        output.start_buffer();
+        output.write_test_str("outer");
+        output.start_buffer();
+        output.write_test_str("inner");
+
+        output.flush_active_buffers_to_root();
+
+        assert_eq!(output.as_bytes(), b"root|outerinner");
+        assert_eq!(output.buffer_level(), 2);
+        assert_eq!(output.current_buffer_bytes(), Some(&b""[..]));
+        assert_eq!(output.stats().flushes, 1);
+
+        output.write_test_str("tail");
+        assert_eq!(output.pop_buffer_flush(), Some(()));
+        assert_eq!(output.pop_buffer_flush(), Some(()));
+        assert_eq!(output.as_bytes(), b"root|outerinnertail");
     }
 
     #[test]

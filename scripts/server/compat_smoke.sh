@@ -246,6 +246,13 @@ run_session() {
   printf '%s\n' '[ok] server compat session passed'
 }
 
+run_output_buffer() {
+  assert_body \
+    '/output-buffer.php' \
+    $'start\nclean=captured\nflush\nouterinnertail\nlevel=2'
+  printf '%s\n' '[ok] server compat output-buffer passed'
+}
+
 skip_section() {
   local name="$1"
   printf '[skip] server compat %s awaits its Wave 2 implementation prompt.\n' "$name"
@@ -268,7 +275,7 @@ case "$section" in
     run_session
     ;;
   output-buffer)
-    skip_section output-buffer
+    run_output_buffer
     ;;
   all)
     run_static
@@ -276,6 +283,6 @@ case "$section" in
     run_upload
     run_cookie
     run_session
-    skip_section output-buffer
+    run_output_buffer
     ;;
 esac

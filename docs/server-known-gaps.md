@@ -10,12 +10,15 @@ Known gaps:
 - Wave 2 compatibility fixtures and `server-compat-smoke` now exist as the
   incremental harness for closing these gaps. Prompt 00 made `static` strict,
   Prompt 01 made URL-encoded `input` strict, Prompt 02 made scalar multipart
-  `upload` strict, and future sections remain explicit skips until their owning
-  implementation prompts make them strict.
+  `upload` strict, Prompt 04 made `cookie` strict, Prompt 05 made `session`
+  strict, and Prompt 06 made `output-buffer` strict. Future sections remain
+  explicit skips until their owning implementation prompts make them strict.
 - Multipart form uploads populate `$_POST` fields and `$_FILES` metadata,
   including scalar fields and `files[]`-style arrays. Prompt 03 still owns
   `is_uploaded_file()` and `move_uploaded_file()`.
-- Advanced output flushing, buffering, and streaming semantics are not complete.
+- Output buffering covers common `ob_*` capture/clean/flush operations and
+  MVP `flush()` behavior, but callback output handlers and true HTTP chunk
+  streaming are not complete.
 - Header support covers common `header()`, `headers_list()`, `headers_sent()`,
   and `http_response_code()` behavior, but full PHP header edge cases are not
   complete.

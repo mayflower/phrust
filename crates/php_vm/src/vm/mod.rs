@@ -16799,6 +16799,7 @@ impl Vm {
                         "E_PHP_VM_OUTPUT_BUFFER_ARITY: flush expects no arguments",
                     );
                 }
+                output.flush_active_buffers_to_root();
                 VmResult::success(output.clone(), Some(Value::Null))
             }
             _ => self.runtime_error(
@@ -39773,6 +39774,39 @@ mod tests {
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.to_string_lossy(), "before|catch|");
+    }
+
+    #[test]
+    fn flush_pushes_active_buffers_to_root_without_closing_them() {
+        let result = execute_source(
+            "<?php
+            echo 'root|';
+            ob_start();
+            echo 'outer';
+            ob_start();
+            echo 'inner';
+            flush();
+            echo 'tail';
+            $level = ob_get_level();
+            ob_end_flush();
+            ob_end_flush();
+            echo '|level=', $level;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "root|outerinnertail|level=2"
+        );
+    }
+
+    #[test]
+    fn echo_writes_to_root_when_no_output_buffer_is_active() {
+        let result = execute_source("<?php echo 'plain'; flush(); echo '|tail';");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "plain|tail");
     }
 
     #[test]

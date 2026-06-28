@@ -15,7 +15,9 @@ VM-backed standard functions for Composer/framework-style output capture.
 - `ob_end_clean()` discards the active buffer and returns whether one existed.
 - `ob_end_flush()` flushes the active buffer into its parent or root output and
   returns whether one existed.
-- `flush()` is a deterministic no-op that returns `null`.
+- `flush()` pushes active buffer bytes to root output while keeping the output
+  buffer levels open, then returns `null`. The integrated server still emits a
+  single buffered HTTP response rather than streaming chunks to the client.
 - Open buffers are flushed to root output during VM finalization.
 - Caught exceptions do not corrupt the output buffer stack.
 
