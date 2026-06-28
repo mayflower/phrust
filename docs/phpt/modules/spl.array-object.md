@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.array-object.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -25,6 +25,7 @@
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.array-object/array-object-mvp.phpt`
+- `ext/spl/tests/spl_001.phpt`
 
 ## Target Gates
 
@@ -41,3 +42,5 @@
 
 The selected fixture covers array construction, count, `foreach`, direct
 offset operations, `append`, and replacing storage with `exchangeArray`.
+The upstream fixture adds helper coverage for `iterator_count()` and
+`iterator_to_array()` over `ArrayObject` storage.

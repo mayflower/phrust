@@ -1,1 +1,3 @@
 {"path":"tests/phpt/generated/reflection.parameters/internal-parameter-arginfo.phpt"}
+{"path":"ext/reflection/tests/ReflectionParameter_isVariadic_basic.phpt","module":"reflection.parameters","kind":"upstream","reason":"upstream ReflectionParameter variadic metadata coverage fits arginfo and IR parameter flags"}
+{"path":"ext/reflection/tests/ReflectionParameter_getPosition_basic.phpt","module":"reflection.parameters","kind":"upstream","reason":"upstream ReflectionParameter position coverage is backed by generated arginfo and IR parameter order"}

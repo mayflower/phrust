@@ -1,1 +1,5 @@
 {"path":"tests/phpt/generated/reflection.classes/class-basics.phpt"}
+{"path":"ext/reflection/tests/ReflectionClass_isEnum.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass enum flag coverage fits frontend class metadata"}
+{"path":"ext/reflection/tests/ReflectionClass_getNamespaceName.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass namespace-name coverage fits existing class-name metadata"}
+{"path":"ext/reflection/tests/ReflectionClass_isAbstract_basic.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass abstract flag coverage fits frontend class flags"}
+{"path":"ext/reflection/tests/ReflectionClass_getExtensionName_basic.phpt","module":"reflection.classes","kind":"upstream","reason":"upstream ReflectionClass extension-owner coverage fits stdlib registry metadata"}

@@ -1,13 +1,14 @@
 # reflection.parameters
 
 - Selected manifest: `tests/phpt/manifests/modules/reflection.parameters.selected.jsonl`
-- Current selected gate: 1 generated PHPT
+- Current selected gate: 3 PHPTs (1 generated, 2 upstream)
 
 ## Scope
 
-- `ReflectionParameter` names, required/optional state, variadic flag, by-reference flag, and simple type display
+- `ReflectionParameter` names, position, required/optional state, variadic flag, by-reference flag, and simple type display
 - Internal function parameters sourced from generated PHP 8.5 arginfo
 - Userland parameter metadata sourced from IR when covered by `ReflectionFunction`
+- Upstream coverage: `ReflectionParameter_isVariadic_basic.phpt`, `ReflectionParameter_getPosition_basic.phpt`
 
 ## Non-Scope
 

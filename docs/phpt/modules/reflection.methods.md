@@ -5,12 +5,12 @@
 
 ## Scope
 
-- `ReflectionMethod` name, declaring class, visibility, static, final, abstract, parameters, return type, and extension name where available
+- `ReflectionMethod` name, declaring class, visibility, static, final, abstract, modifier bits, parameters, return type, and extension name where available
 
 ## Non-Scope
 
 - Invoking methods through Reflection
-- Exact modifier bit parity outside selected fixtures
+- Upstream method PHPTs that were probed currently depend on unrelated string interpolation, object stringification, or invocation behavior
 
 ## Target Gates
 
@@ -20,3 +20,4 @@
 ## Known Gaps
 
 - Complete internal method surfaces depend on generated class-method metadata and registry coverage.
+- `ReflectionMethod_getModifiers_basic.phpt` is blocked by string interpolation of reflection object properties, not modifier bit metadata.

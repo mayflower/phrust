@@ -1,1 +1,4 @@
 {"path":"tests/phpt/generated/reflection.enums/enum-metadata.phpt"}
+{"path":"ext/reflection/tests/ReflectionEnum_getBackingType.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum backing type coverage fits frontend enum backing metadata"}
+{"path":"ext/reflection/tests/ReflectionEnum_isBacked.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum backed flag coverage fits frontend enum backing metadata"}
+{"path":"ext/reflection/tests/ReflectionEnum_hasCase.phpt","module":"reflection.enums","kind":"upstream","reason":"upstream ReflectionEnum case-existence coverage fits runtime enum case metadata"}

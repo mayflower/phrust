@@ -5668,7 +5668,7 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
+                        let dim_values = match self.read_dense_dim_values(compiled, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -5686,6 +5686,43 @@ impl Vm {
                         };
                         let local = LocalId::new(local);
                         let append = instruction.opcode == DenseOpcode::AppendDim;
+                        let dims = match dim_values_to_array_keys(&dim_values) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                if !append
+                                    && let Some(object) =
+                                        spl_object_storage_local_object(stack, local)
+                                    && dim_values.len() == 1
+                                {
+                                    let result = spl_container_offset_set(
+                                        &object,
+                                        dim_values[0].clone(),
+                                        value.clone(),
+                                    );
+                                    if let Err(message) = result {
+                                        let result =
+                                            self.runtime_error(output, compiled, stack, message);
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("bytecode frame was pushed")
+                                        .registers
+                                        .set(RegId::new(dst), value)
+                                    {
+                                        let result =
+                                            self.runtime_error(output, compiled, stack, message);
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                    continue;
+                                }
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
                         let result = if is_globals_local(ir_function, local) {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), append)
                         } else {
@@ -6143,6 +6180,17 @@ impl Vm {
             .collect()
     }
 
+    fn read_dense_dim_values(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+        dims: &[DenseOperand],
+    ) -> Result<Vec<Value>, String> {
+        dims.iter()
+            .map(|operand| self.read_dense_operand(compiled, stack, *operand))
+            .collect()
+    }
+
     fn read_dense_call_args(
         &self,
         dense: &DenseBytecodeUnit,
@@ -6223,9 +6271,15 @@ impl Vm {
         quiet: bool,
         span: IrSpan,
     ) -> Result<Value, VmResult> {
+        let base = effective_value(array);
+        if let Value::Object(object) = &base
+            && is_spl_container_runtime_class(&object.class_name())
+        {
+            return spl_container_offset_get(object, key_value)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message));
+        }
         let key = array_key_from_value(key_value)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
-        let base = effective_value(array);
         if let Value::String(string) = &base {
             return match string_offset_for_read(string, &key) {
                 StringOffsetRead::Byte(value) => Ok(value),
@@ -12026,157 +12080,187 @@ impl Vm {
                         let value = match value {
                             Some(value) => value,
                             None => {
-                                let key = match array_key_from_value(&key_value) {
-                                    Ok(key) => key,
-                                    Err(message) => {
-                                        match self.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut exception_handlers,
-                                            &mut pending_control,
-                                            instruction.span,
-                                            message,
-                                        ) {
-                                            RaiseOutcome::Caught(target) => {
-                                                block_id = target;
-                                                continue 'dispatch;
+                                let base = effective_value(&array);
+                                if let Value::Object(object) = &base
+                                    && is_spl_container_runtime_class(&object.class_name())
+                                {
+                                    match spl_container_offset_get(object, &key_value) {
+                                        Ok(value) => value,
+                                        Err(message) => {
+                                            match self.raise_runtime_error(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                instruction.span,
+                                                message,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
                                             }
-                                            RaiseOutcome::Done(result) => return *result,
                                         }
                                     }
-                                };
-                                let base = effective_value(&array);
-                                if let Value::String(string) = &base {
-                                    match string_offset_for_read(string, &key) {
-                                        StringOffsetRead::Byte(value) => value,
-                                        StringOffsetRead::Illegal { value, key_bytes } => {
-                                            if !*quiet {
-                                                let diagnostic = illegal_string_offset_warning(
-                                                    &key_bytes,
-                                                    runtime_source_span(compiled, instruction.span),
-                                                    stack_trace(compiled, stack),
-                                                );
-                                                match self.dispatch_error_handler(
-                                                    compiled,
-                                                    output,
-                                                    stack,
-                                                    state,
-                                                    php_runtime::PHP_E_WARNING,
-                                                    &diagnostic,
-                                                ) {
-                                                    Ok(false)
-                                                        if error_reporting_allows(
-                                                            state,
-                                                            php_runtime::PHP_E_WARNING,
-                                                        ) =>
-                                                    {
-                                                        emit_vm_diagnostic(
-                                                            output,
-                                                            state,
-                                                            &diagnostic,
-                                                            php_runtime::PhpDiagnosticChannel::Warning,
-                                                            php_runtime::PHP_E_WARNING,
-                                                        );
-                                                        diagnostics.push(diagnostic);
-                                                    }
-                                                    Ok(_) => {}
-                                                    Err(result) => return result,
+                                } else {
+                                    let key = match array_key_from_value(&key_value) {
+                                        Ok(key) => key,
+                                        Err(message) => {
+                                            match self.raise_runtime_error(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                instruction.span,
+                                                message,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
                                                 }
+                                                RaiseOutcome::Done(result) => return *result,
                                             }
-                                            value
                                         }
-                                        StringOffsetRead::OutOfRange(index) => {
-                                            if *quiet {
-                                                Value::Null
-                                            } else {
-                                                let diagnostic =
-                                                    uninitialized_string_offset_warning(
-                                                        index,
+                                    };
+                                    if let Value::String(string) = &base {
+                                        match string_offset_for_read(string, &key) {
+                                            StringOffsetRead::Byte(value) => value,
+                                            StringOffsetRead::Illegal { value, key_bytes } => {
+                                                if !*quiet {
+                                                    let diagnostic = illegal_string_offset_warning(
+                                                        &key_bytes,
                                                         runtime_source_span(
                                                             compiled,
                                                             instruction.span,
                                                         ),
                                                         stack_trace(compiled, stack),
                                                     );
-                                                match self.dispatch_error_handler(
-                                                    compiled,
-                                                    output,
-                                                    stack,
-                                                    state,
-                                                    php_runtime::PHP_E_WARNING,
-                                                    &diagnostic,
-                                                ) {
-                                                    Ok(false)
-                                                        if error_reporting_allows(
-                                                            state,
-                                                            php_runtime::PHP_E_WARNING,
-                                                        ) =>
-                                                    {
-                                                        emit_vm_diagnostic(
+                                                    match self.dispatch_error_handler(
+                                                        compiled,
+                                                        output,
+                                                        stack,
+                                                        state,
+                                                        php_runtime::PHP_E_WARNING,
+                                                        &diagnostic,
+                                                    ) {
+                                                        Ok(false)
+                                                            if error_reporting_allows(
+                                                                state,
+                                                                php_runtime::PHP_E_WARNING,
+                                                            ) =>
+                                                        {
+                                                            emit_vm_diagnostic(
                                                             output,
                                                             state,
                                                             &diagnostic,
                                                             php_runtime::PhpDiagnosticChannel::Warning,
                                                             php_runtime::PHP_E_WARNING,
                                                         );
-                                                        diagnostics.push(diagnostic);
+                                                            diagnostics.push(diagnostic);
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(result) => return result,
                                                     }
-                                                    Ok(_) => {}
-                                                    Err(result) => return result,
                                                 }
-                                                Value::string(Vec::new())
+                                                value
                                             }
-                                        }
-                                        StringOffsetRead::NonNumeric => {
-                                            if *quiet {
-                                                Value::Null
-                                            } else {
-                                                let result = self.runtime_error(
+                                            StringOffsetRead::OutOfRange(index) => {
+                                                if *quiet {
+                                                    Value::Null
+                                                } else {
+                                                    let diagnostic =
+                                                        uninitialized_string_offset_warning(
+                                                            index,
+                                                            runtime_source_span(
+                                                                compiled,
+                                                                instruction.span,
+                                                            ),
+                                                            stack_trace(compiled, stack),
+                                                        );
+                                                    match self.dispatch_error_handler(
+                                                        compiled,
+                                                        output,
+                                                        stack,
+                                                        state,
+                                                        php_runtime::PHP_E_WARNING,
+                                                        &diagnostic,
+                                                    ) {
+                                                        Ok(false)
+                                                            if error_reporting_allows(
+                                                                state,
+                                                                php_runtime::PHP_E_WARNING,
+                                                            ) =>
+                                                        {
+                                                            emit_vm_diagnostic(
+                                                            output,
+                                                            state,
+                                                            &diagnostic,
+                                                            php_runtime::PhpDiagnosticChannel::Warning,
+                                                            php_runtime::PHP_E_WARNING,
+                                                        );
+                                                            diagnostics.push(diagnostic);
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(result) => return result,
+                                                    }
+                                                    Value::string(Vec::new())
+                                                }
+                                            }
+                                            StringOffsetRead::NonNumeric => {
+                                                if *quiet {
+                                                    Value::Null
+                                                } else {
+                                                    let result = self.runtime_error(
                                                     output,
                                                     compiled,
                                                     stack,
                                                     "E_PHP_VM_STRING_OFFSET_TYPE: Cannot access offset of type string on string"
                                                         .to_owned(),
                                                 );
-                                                if let Some(throwable) = state
-                                                    .pending_throw
-                                                    .take()
-                                                    .or_else(|| runtime_error_throwable(&result))
-                                                {
-                                                    if let Some(target) = handle_throw(
-                                                        compiled,
-                                                        throwable.clone(),
-                                                        &mut exception_handlers,
-                                                        stack,
-                                                        &mut pending_control,
-                                                    ) {
-                                                        block_id = target;
-                                                        continue 'dispatch;
+                                                    if let Some(throwable) =
+                                                        state.pending_throw.take().or_else(|| {
+                                                            runtime_error_throwable(&result)
+                                                        })
+                                                    {
+                                                        if let Some(target) = handle_throw(
+                                                            compiled,
+                                                            throwable.clone(),
+                                                            &mut exception_handlers,
+                                                            stack,
+                                                            &mut pending_control,
+                                                        ) {
+                                                            block_id = target;
+                                                            continue 'dispatch;
+                                                        }
+                                                        return self.propagate_exception(
+                                                            output, stack, state, throwable,
+                                                        );
                                                     }
-                                                    return self.propagate_exception(
-                                                        output, stack, state, throwable,
-                                                    );
+                                                    return result;
                                                 }
-                                                return result;
                                             }
                                         }
-                                    }
-                                } else {
-                                    match fetch_dim_value(&array, &key) {
-                                        Ok(Some(value)) => value,
-                                        Ok(None) if *quiet => Value::Null,
-                                        Ok(None) => {
-                                            diagnostics.push(undefined_array_key_warning(
-                                                &key,
-                                                stack_trace(compiled, stack),
-                                            ));
-                                            Value::Null
-                                        }
-                                        Err(message) => {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
+                                    } else {
+                                        match fetch_dim_value(&array, &key) {
+                                            Ok(Some(value)) => value,
+                                            Ok(None) if *quiet => Value::Null,
+                                            Ok(None) => {
+                                                diagnostics.push(undefined_array_key_warning(
+                                                    &key,
+                                                    stack_trace(compiled, stack),
+                                                ));
+                                                Value::Null
+                                            }
+                                            Err(message) => {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -12197,7 +12281,7 @@ impl Vm {
                         dims,
                         value,
                     } => {
-                        let dims = match read_dim_operands(unit, stack, dims) {
+                        let dim_values = match read_dim_operand_values(unit, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -12206,6 +12290,35 @@ impl Vm {
                         let value = match read_operand(unit, stack, *value) {
                             Ok(value) => value,
                             Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match dim_values_to_array_keys(&dim_values) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                if let Some(object) = spl_object_storage_local_object(stack, *local)
+                                    && dim_values.len() == 1
+                                {
+                                    if let Err(message) = spl_container_offset_set(
+                                        &object,
+                                        dim_values[0].clone(),
+                                        value.clone(),
+                                    ) {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    self.record_lvalue_trace_event("array-write-dim", *local, &[]);
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
@@ -24330,6 +24443,7 @@ fn reflection_method_value(
             "isstatic" => Ok(reflection_bool_property(object, "is_static")),
             "isabstract" => Ok(reflection_bool_property(object, "is_abstract")),
             "isfinal" => Ok(reflection_bool_property(object, "is_final")),
+            "getmodifiers" => Ok(object.get_property("modifiers").unwrap_or(Value::Int(0))),
             "isclosure" => Ok(reflection_bool_property(object, "is_closure")),
             "getstaticvariables" => Ok(object
                 .get_property("static_variables")
@@ -24421,6 +24535,7 @@ fn reflection_method_value(
         },
         "reflectionparameter" => match method.as_str() {
             "getname" => Ok(object.get_property("name").unwrap_or(Value::Null)),
+            "getposition" => Ok(object.get_property("position").unwrap_or(Value::Int(0))),
             "getattributes" => Ok(object
                 .get_property("attributes")
                 .unwrap_or_else(empty_array_value)),
@@ -24619,12 +24734,13 @@ fn reflection_default_value(default: Option<&str>) -> Value {
 
 fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> Value {
     let mut array = PhpArray::new();
-    for param in params {
+    for (position, param) in params.iter().enumerate() {
         let has_default = param.optional && !param.variadic;
         array.append(Value::Object(reflection_object(
             "ReflectionParameter",
             vec![
                 ("name", reflection_string(param.name)),
+                ("position", Value::Int(position as i64)),
                 ("attributes", empty_array_value()),
                 (
                     "type",
@@ -24851,6 +24967,10 @@ fn reflection_internal_method_object(
             ("is_static", Value::Bool(method.is_static)),
             ("is_abstract", Value::Bool(false)),
             ("is_final", Value::Bool(false)),
+            (
+                "modifiers",
+                reflection_method_modifiers(false, false, method.is_static, false, false),
+            ),
             ("is_internal", Value::Bool(true)),
             ("extension", reflection_string(descriptor.extension())),
         ],
@@ -24871,8 +24991,19 @@ fn reflection_extension_object(extension: &str) -> Result<ObjectRef, String> {
     }
     Ok(reflection_object(
         "ReflectionExtension",
-        vec![("name", reflection_string(descriptor.name()))],
+        vec![(
+            "name",
+            reflection_string(reflection_extension_display_name(descriptor.name())),
+        )],
     ))
+}
+
+fn reflection_extension_display_name(extension: &str) -> &str {
+    if extension.eq_ignore_ascii_case("reflection") {
+        "Reflection"
+    } else {
+        extension
+    }
 }
 
 fn reflection_extension_functions_value(extension: &str) -> Result<Value, String> {
@@ -25106,6 +25237,33 @@ fn reflection_visibility_modifiers(
     Value::Int(modifiers)
 }
 
+fn reflection_method_modifiers(
+    is_private: bool,
+    is_protected: bool,
+    is_static: bool,
+    is_abstract: bool,
+    is_final: bool,
+) -> Value {
+    let mut modifiers = 0;
+    if is_private {
+        modifiers |= 4;
+    } else if is_protected {
+        modifiers |= 2;
+    } else {
+        modifiers |= 1;
+    }
+    if is_static {
+        modifiers |= 16;
+    }
+    if is_final {
+        modifiers |= 32;
+    }
+    if is_abstract {
+        modifiers |= 64;
+    }
+    Value::Int(modifiers)
+}
+
 fn reflection_property_hooks_value(hooks: &php_ir::module::ClassPropertyHooks) -> Value {
     let mut array = PhpArray::new();
     if hooks.get.is_some() {
@@ -25288,6 +25446,16 @@ fn reflection_method_object(
             ("is_static", Value::Bool(method.flags.is_static)),
             ("is_abstract", Value::Bool(method.flags.is_abstract)),
             ("is_final", Value::Bool(method.flags.is_final)),
+            (
+                "modifiers",
+                reflection_method_modifiers(
+                    method.flags.is_private,
+                    method.flags.is_protected,
+                    method.flags.is_static,
+                    method.flags.is_abstract,
+                    method.flags.is_final,
+                ),
+            ),
             ("is_internal", Value::Bool(false)),
             ("extension", Value::Bool(false)),
         ],
@@ -25539,12 +25707,13 @@ fn reflection_parameters_value(
     params: &[IrParam],
 ) -> Result<Value, String> {
     let mut array = PhpArray::new();
-    for param in params {
+    for (position, param) in params.iter().enumerate() {
         let default = param.default.as_ref().map(inline_constant_value);
         array.append(Value::Object(reflection_object(
             "ReflectionParameter",
             vec![
                 ("name", Value::String(PhpString::from_test_str(&param.name))),
+                ("position", Value::Int(position as i64)),
                 (
                     "attributes",
                     reflection_attributes_value(compiled, &param.attributes)?,
@@ -30556,7 +30725,13 @@ fn call_spl_container_method(
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(spl_container_current_entry(&object)
                 .map(|(key, _)| array_key_to_value(key))
-                .unwrap_or(Value::Null))
+                .unwrap_or_else(|| {
+                    if normalized_class == "spldoublylinkedlist" {
+                        Value::Int(0)
+                    } else {
+                        Value::Null
+                    }
+                }))
         }
         "next" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
@@ -30566,6 +30741,17 @@ fn call_spl_container_method(
         "count" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(Value::Int(spl_container_entries(&object).len() as i64))
+        }
+        "isempty" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            match normalized_class.as_str() {
+                "spldoublylinkedlist" | "splstack" | "splqueue" => {
+                    Ok(Value::Bool(spl_entries(&object).is_empty()))
+                }
+                _ => Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                )),
+            }
         }
         "getarraycopy" | "toarray" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
@@ -35313,11 +35499,29 @@ fn read_dim_operands(
     stack: &CallStack,
     dims: &[Operand],
 ) -> Result<Vec<ArrayKey>, String> {
+    let values = read_dim_operand_values(unit, stack, dims)?;
+    dim_values_to_array_keys(&values)
+}
+
+fn read_dim_operand_values(
+    unit: &IrUnit,
+    stack: &CallStack,
+    dims: &[Operand],
+) -> Result<Vec<Value>, String> {
     dims.iter()
-        .map(|operand| {
-            read_operand(unit, stack, *operand).and_then(|value| array_key_from_value(&value))
-        })
+        .map(|operand| read_operand(unit, stack, *operand))
         .collect()
+}
+
+fn dim_values_to_array_keys(values: &[Value]) -> Result<Vec<ArrayKey>, String> {
+    values.iter().map(array_key_from_value).collect()
+}
+
+fn spl_object_storage_local_object(stack: &CallStack, local: LocalId) -> Option<ObjectRef> {
+    let Value::Object(object) = effective_value(&read_local_value(stack, local)?) else {
+        return None;
+    };
+    (normalize_class_name(&object.class_name()) == "splobjectstorage").then_some(object)
 }
 
 fn read_local_value(stack: &CallStack, local: LocalId) -> Option<Value> {
@@ -45177,27 +45381,37 @@ echo perf_jit_unstable_types_debug(4), "\n";
     #[test]
     fn reflection_internal_functions_expose_stdlib_metadata() {
         let result = execute_source(
-            "<?php $fn = new ReflectionFunction('count'); echo $fn->getName(), '|'; echo $fn->isInternal() ? 'internal|' : 'user|'; echo $fn->getFileName() === false ? 'nofile|' : 'file|'; echo $fn->getNumberOfParameters(), ':', $fn->getNumberOfRequiredParameters(), '|'; $params = $fn->getParameters(); echo $params[0]->getName(), ':', ($params[0]->hasType() ? $params[0]->getType()->getName() : 'none'), '|'; echo $fn->getReturnType()->getName(), '|', $fn->getExtensionName();",
+            "<?php $fn = new ReflectionFunction('count'); echo $fn->getName(), '|'; echo $fn->isInternal() ? 'internal|' : 'user|'; echo $fn->getFileName() === false ? 'nofile|' : 'file|'; echo $fn->getNumberOfParameters(), ':', $fn->getNumberOfRequiredParameters(), '|'; $params = $fn->getParameters(); echo $params[0]->getName(), ':', $params[0]->getPosition(), ':', ($params[0]->hasType() ? $params[0]->getType()->getName() : 'none'), '|'; echo $params[1]->getPosition(), '|'; echo $fn->getReturnType()->getName(), '|', $fn->getExtensionName();",
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.as_bytes(),
-            b"count|internal|nofile|2:1|value:Countable|array|int|standard"
+            b"count|internal|nofile|2:1|value:0:Countable|array|1|int|standard"
         );
     }
 
     #[test]
     fn reflection_internal_classes_and_methods_expose_extension_and_locations() {
         let result = execute_source(
-            "<?php $class = new ReflectionClass('ArrayObject'); echo $class->getName(), '|', $class->getExtensionName(), '|'; echo $class->isInternal() ? 'internal|' : 'user|'; echo $class->getFileName() === false ? 'nofile|' : 'file|'; $method = $class->getMethod('count'); echo $method->getName(), '|', $method->getDeclaringClass()->getName(), '|'; echo $method->isInternal() ? 'internal|' : 'user|'; echo $method->getNumberOfParameters(), '|', $method->getExtensionName();",
+            "<?php $class = new ReflectionClass('ArrayObject'); echo $class->getName(), '|', $class->getExtensionName(), '|'; echo $class->isInternal() ? 'internal|' : 'user|'; echo $class->getFileName() === false ? 'nofile|' : 'file|'; $method = $class->getMethod('count'); echo $method->getName(), '|', $method->getDeclaringClass()->getName(), '|'; echo $method->isInternal() ? 'internal|' : 'user|'; echo $method->getNumberOfParameters(), '|', $method->getModifiers(), '|', $method->getExtensionName();",
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.as_bytes(),
-            b"ArrayObject|spl|internal|nofile|count|ArrayObject|internal|0|spl"
+            b"ArrayObject|spl|internal|nofile|count|ArrayObject|internal|0|1|spl"
         );
+    }
+
+    #[test]
+    fn reflection_user_parameters_and_method_modifiers_use_ir_metadata() {
+        let result = execute_source(
+            "<?php abstract class ReflectionMetaProbe { final public static function pub($a, $b = null, ...$rest): void {} abstract protected function prot(); private function priv() {} } $method = new ReflectionMethod(ReflectionMetaProbe::class, 'pub'); $params = $method->getParameters(); echo $method->getModifiers(), '|', $params[0]->getPosition(), ':', $params[1]->getPosition(), ':', $params[2]->getPosition(), '|'; echo (new ReflectionMethod(ReflectionMetaProbe::class, 'prot'))->getModifiers(), '|'; echo (new ReflectionMethod(ReflectionMetaProbe::class, 'priv'))->getModifiers();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"49|0:1:2|66|4");
     }
 
     #[test]
@@ -45216,11 +45430,14 @@ echo perf_jit_unstable_types_debug(4), "\n";
     #[test]
     fn reflection_extension_lists_enabled_symbols() {
         let result = execute_source(
-            "<?php $spl = new ReflectionExtension('spl'); echo $spl->getName(), '|'; $found = 'missing'; foreach ($spl->getClassNames() as $name) { if ($name === 'ArrayObject') { $found = 'arrayobject'; } } echo $found, '|'; $standard = new ReflectionExtension('standard'); $functions = $standard->getFunctions(); echo $functions['count']->getName(), '|', $functions['count']->getExtensionName();",
+            "<?php $spl = new ReflectionExtension('spl'); echo $spl->getName(), '|'; $found = 'missing'; foreach ($spl->getClassNames() as $name) { if ($name === 'ArrayObject') { $found = 'arrayobject'; } } echo $found, '|'; $standard = new ReflectionExtension('standard'); $functions = $standard->getFunctions(); echo $functions['count']->getName(), '|', $functions['count']->getExtensionName(), '|'; $reflection = new ReflectionExtension('reflection'); echo $reflection->getName();",
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.as_bytes(), b"spl|arrayobject|count|standard");
+        assert_eq!(
+            result.output.as_bytes(),
+            b"spl|arrayobject|count|standard|Reflection"
+        );
     }
 
     #[test]
@@ -45781,6 +45998,21 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"has-a|beta|2|0:box|1:box|1");
+    }
+
+    #[test]
+    fn spl_object_storage_array_access_accepts_object_keys() {
+        let result = execute_source(
+            r#"<?php
+            $storage = new SplObjectStorage();
+            $object = new stdClass();
+            $storage[$object] = "some_value";
+            echo $storage->offsetGet($object), "|", $storage[$object];
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"some_value|some_value");
     }
 
     #[test]

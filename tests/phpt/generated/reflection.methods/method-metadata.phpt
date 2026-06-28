@@ -19,10 +19,12 @@ echo $run->getName(), ":", $run->getDeclaringClass()->getName(), ":";
 echo $run->isPublic() ? "public:" : "notpublic:";
 echo $run->isFinal() ? "final:" : "notfinal:";
 echo $run->isStatic() ? "static:" : "instance:";
+printf("%08x:", $run->getModifiers());
 echo $run->getNumberOfParameters(), ":", $run->getReturnType()->getName(), "|";
 echo $make->getName(), ":";
 echo $make->isProtected() ? "protected:" : "notprotected:";
 echo $make->isStatic() ? "static" : "instance";
+printf(":%08x", $make->getModifiers());
 ?>
 --EXPECT--
-run:P21MethodTarget:public:final:instance:1:int|make:protected:static
+run:P21MethodTarget:public:final:instance:00000021:1:int|make:protected:static:00000012

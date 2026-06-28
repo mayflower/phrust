@@ -1,1 +1,6 @@
 {"path":"tests/phpt/generated/spl.doubly-linked-list/linear-containers-mvp.phpt","module":"spl.doubly-linked-list","kind":"contract","generated_timestamp":"20260628T000000Z","generator_version":"phpt-spl-v1","reason":"SplDoublyLinkedList, SplStack, and SplQueue MVP linear container behavior"}
+{"path":"ext/spl/tests/SplDoublyLinkedList_current.phpt","module":"spl.doubly-linked-list","kind":"upstream","reason":"upstream SplDoublyLinkedList current coverage"}
+{"path":"ext/spl/tests/SplDoublyLinkedList_key.phpt","module":"spl.doubly-linked-list","kind":"upstream","reason":"upstream SplDoublyLinkedList empty key behavior"}
+{"path":"ext/spl/tests/SplDoublyLinkedList_isEmpty_empty.phpt","module":"spl.doubly-linked-list","kind":"upstream","reason":"upstream SplDoublyLinkedList isEmpty true coverage"}
+{"path":"ext/spl/tests/SplDoublyLinkedList_isEmpty_not-empty.phpt","module":"spl.doubly-linked-list","kind":"upstream","reason":"upstream SplDoublyLinkedList isEmpty false coverage"}
+{"path":"ext/spl/tests/SplDoublyLinkedList_offsetExists_success.phpt","module":"spl.doubly-linked-list","kind":"upstream","reason":"upstream SplDoublyLinkedList offsetExists coverage"}

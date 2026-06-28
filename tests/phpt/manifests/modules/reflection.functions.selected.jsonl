@@ -1,1 +1,3 @@
 {"path":"tests/phpt/generated/reflection.functions/builtin-and-user-functions.phpt"}
+{"path":"ext/reflection/tests/ReflectionFunction_getExtensionName.phpt","module":"reflection.functions","kind":"upstream","reason":"upstream ReflectionFunction extension-owner metadata now matches generated arginfo registry behavior"}
+{"path":"ext/reflection/tests/ReflectionFunction_isClosure_basic.phpt","module":"reflection.functions","kind":"upstream","reason":"upstream ReflectionFunction closure flag coverage fits existing IR closure metadata"}

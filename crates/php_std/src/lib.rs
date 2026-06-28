@@ -1590,7 +1590,7 @@ impl ExtensionRegistry {
                     "spl",
                     ClassKind::Class,
                 )),
-            ExtensionDescriptor::new("reflection").enabled_by_default(false),
+            reflection_extension(),
             tokenizer_extension(),
             ExtensionDescriptor::new("test")
                 .enabled_by_default(false)
@@ -1713,6 +1713,30 @@ impl ExtensionRegistry {
             }
         }
         None
+    }
+}
+
+fn reflection_extension() -> ExtensionDescriptor {
+    let mut extension = ExtensionDescriptor::new("reflection");
+    for class in generated::arginfo::GENERATED_CLASSES
+        .iter()
+        .filter(|class| class.extension == "reflection")
+    {
+        extension = extension.with_class(ClassDescriptor::new(
+            class.name,
+            "reflection",
+            generated_class_kind(class.kind),
+        ));
+    }
+    extension
+}
+
+fn generated_class_kind(kind: &str) -> ClassKind {
+    match kind {
+        "interface" => ClassKind::Interface,
+        "trait" => ClassKind::Trait,
+        "enum" => ClassKind::Enum,
+        _ => ClassKind::Class,
     }
 }
 
@@ -2537,6 +2561,34 @@ mod tests {
                 Some(ClassKind::Class)
             ));
         }
+    }
+
+    #[test]
+    fn reflection_extension_tracks_generated_arginfo_classes() {
+        let registry = ExtensionRegistry::standard_library();
+
+        assert!(registry.is_extension_enabled("reflection"));
+        for name in [
+            "ReflectionAttribute",
+            "ReflectionClass",
+            "ReflectionEnum",
+            "ReflectionExtension",
+            "ReflectionFunction",
+            "ReflectionMethod",
+            "ReflectionParameter",
+            "ReflectionProperty",
+        ] {
+            assert!(matches!(
+                registry.enabled_class(name).map(ClassDescriptor::kind),
+                Some(ClassKind::Class)
+            ));
+        }
+        assert!(matches!(
+            registry
+                .enabled_class("Reflector")
+                .map(ClassDescriptor::kind),
+            Some(ClassKind::Interface)
+        ));
     }
 
     #[test]

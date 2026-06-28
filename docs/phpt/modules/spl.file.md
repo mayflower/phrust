@@ -2,7 +2,7 @@
 
 - Priority: 20
 - Selected manifest: `tests/phpt/manifests/modules/spl.file.selected.jsonl`
-- Current selected counts: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- Current selected counts: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -11,6 +11,7 @@
 - `SplTempFileObject`
 - `getPathname`
 - `getFilename`
+- `getExtension` for leading-dot basenames
 - `isFile` and `isDir`
 - `openFile` where covered by the runtime constructor path
 - `fgets`
@@ -28,6 +29,7 @@
 ## Selected PHPT Paths
 
 - `tests/phpt/generated/spl.file/file-classes-mvp.phpt`
+- `ext/spl/tests/spl_fileinfo_getextension_leadingdot.phpt`
 
 ## Target Gates
 
@@ -44,4 +46,5 @@
 
 The selected fixture uses the PHPT source file and directory as allowed local
 paths, verifies metadata methods, line reads, line iteration, and basic temp
-file object metadata.
+file object metadata. The upstream fixture pins PHP-compatible extension
+handling for basenames such as `.test`.
