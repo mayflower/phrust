@@ -103,6 +103,12 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_http_response_code,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("setcookie", builtin_setcookie, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "setrawcookie",
+        builtin_setrawcookie,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "gc_collect_cycles",
         builtin_gc_collect_cycles,
@@ -537,6 +543,226 @@ pub(in crate::builtins::modules) fn builtin_headers_sent(
         return Err(arity_error("headers_sent", "zero to two argument(s)"));
     }
     Ok(Value::Bool(context.http_response().headers_sent))
+}
+
+pub(in crate::builtins::modules) fn builtin_setcookie(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    builtin_cookie(context, args, span, false)
+}
+
+pub(in crate::builtins::modules) fn builtin_setrawcookie(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    builtin_cookie(context, args, span, true)
+}
+
+fn builtin_cookie(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+    raw: bool,
+) -> BuiltinResult {
+    let function = if raw { "setrawcookie" } else { "setcookie" };
+    if !(1..=7).contains(&args.len()) {
+        return Err(arity_error(function, "one to seven argument(s)"));
+    }
+    let name = string_arg(function, &args[0])?.to_string_lossy();
+    let value = args.get(1).map_or(Ok(String::new()), |value| {
+        string_arg(function, value).map(|value| value.to_string_lossy())
+    })?;
+    let options = parse_cookie_options(function, &args)?;
+    let Some(header_value) = build_cookie_header_value(&name, &value, &options, raw) else {
+        context.php_warning(
+            "E_PHP_RUNTIME_INVALID_COOKIE",
+            format!("{function}(): invalid cookie name or value"),
+            span,
+        );
+        return Ok(Value::Bool(false));
+    };
+    if let Err(message) = context.http_response_mut().add_header_line(
+        &format!("Set-Cookie: {header_value}"),
+        false,
+        None,
+    ) {
+        context.php_warning(
+            "E_PHP_RUNTIME_INVALID_COOKIE",
+            format!("{function}(): {message}"),
+            span,
+        );
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(true))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CookieOptions {
+    expires: i64,
+    path: String,
+    domain: String,
+    secure: bool,
+    httponly: bool,
+    samesite: String,
+}
+
+fn parse_cookie_options(function: &str, args: &[Value]) -> Result<CookieOptions, BuiltinError> {
+    let mut options = CookieOptions::default();
+    let Some(third) = args.get(2) else {
+        return Ok(options);
+    };
+    if let Value::Array(array) = deref_value(third) {
+        parse_cookie_options_array(function, &array, &mut options)?;
+        return Ok(options);
+    }
+    options.expires = to_int(third).map_err(|message| conversion_error(function, message))?;
+    options.path = args.get(3).map_or(Ok(String::new()), |value| {
+        string_arg(function, value).map(|value| value.to_string_lossy())
+    })?;
+    options.domain = args.get(4).map_or(Ok(String::new()), |value| {
+        string_arg(function, value).map(|value| value.to_string_lossy())
+    })?;
+    options.secure = args
+        .get(5)
+        .map_or(Ok(false), to_bool)
+        .map_err(|message| conversion_error(function, message))?;
+    options.httponly = args
+        .get(6)
+        .map_or(Ok(false), to_bool)
+        .map_err(|message| conversion_error(function, message))?;
+    Ok(options)
+}
+
+fn parse_cookie_options_array(
+    function: &str,
+    array: &PhpArray,
+    options: &mut CookieOptions,
+) -> Result<(), BuiltinError> {
+    for (key, value) in array.iter() {
+        let ArrayKey::String(key) = key else {
+            continue;
+        };
+        match key.to_string_lossy().to_ascii_lowercase().as_str() {
+            "expires" => {
+                options.expires =
+                    to_int(value).map_err(|message| conversion_error(function, message))?;
+            }
+            "path" => {
+                options.path = string_arg(function, value)?.to_string_lossy();
+            }
+            "domain" => {
+                options.domain = string_arg(function, value)?.to_string_lossy();
+            }
+            "secure" => {
+                options.secure =
+                    to_bool(value).map_err(|message| conversion_error(function, message))?;
+            }
+            "httponly" => {
+                options.httponly =
+                    to_bool(value).map_err(|message| conversion_error(function, message))?;
+            }
+            "samesite" => {
+                options.samesite = string_arg(function, value)?.to_string_lossy();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn build_cookie_header_value(
+    name: &str,
+    value: &str,
+    options: &CookieOptions,
+    raw: bool,
+) -> Option<String> {
+    if !valid_cookie_name(name)
+        || contains_response_splitting(value)
+        || contains_response_splitting(&options.path)
+        || contains_response_splitting(&options.domain)
+        || contains_response_splitting(&options.samesite)
+    {
+        return None;
+    }
+    let encoded_value = if raw {
+        if !valid_raw_cookie_value(value) {
+            return None;
+        }
+        value.to_owned()
+    } else {
+        encode_cookie_value(value)
+    };
+    let mut header = format!("{name}={encoded_value}");
+    if options.expires > 0 {
+        header.push_str("; Expires=");
+        header.push_str(&crate::datetime::format_timestamp(
+            options.expires,
+            "GMT",
+            "D, d M Y H:i:s \\G\\M\\T",
+        ));
+    }
+    append_cookie_attribute(&mut header, "Path", &options.path)?;
+    append_cookie_attribute(&mut header, "Domain", &options.domain)?;
+    if options.secure {
+        header.push_str("; Secure");
+    }
+    if options.httponly {
+        header.push_str("; HttpOnly");
+    }
+    append_cookie_attribute(&mut header, "SameSite", &options.samesite)?;
+    Some(header)
+}
+
+fn append_cookie_attribute(header: &mut String, name: &str, value: &str) -> Option<()> {
+    if value.is_empty() {
+        return Some(());
+    }
+    if !valid_cookie_attribute_value(value) {
+        return None;
+    }
+    header.push_str("; ");
+    header.push_str(name);
+    header.push('=');
+    header.push_str(value);
+    Some(())
+}
+
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
+}
+
+fn valid_raw_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
+}
+
+fn valid_cookie_attribute_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21..=0x3a | 0x3c..=0x7e))
+}
+
+fn contains_response_splitting(value: &str) -> bool {
+    value.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
+}
+
+fn encode_cookie_value(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.') {
+            output.push(char::from(byte));
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_http_response_code(
@@ -6279,8 +6505,8 @@ mod tests {
     };
     use crate::{
         ArrayKey, BuiltinRegistry, ClassEntry, ClassFlags, FilesystemCapabilities, ObjectRef,
-        OutputBuffer, PhpArray, PhpString, ReferenceCell, ResourceTable, StreamFlags,
-        StreamMetadata, StrtokState, Value, datetime, normalize_class_name, pcre,
+        OutputBuffer, PhpArray, PhpString, ReferenceCell, ResourceTable, RuntimeHttpResponseState,
+        StreamFlags, StreamMetadata, StrtokState, Value, datetime, normalize_class_name, pcre,
     };
     use std::path::PathBuf;
 
@@ -6445,6 +6671,18 @@ mod tests {
         (entry.function())(context, args, RuntimeSourceSpan::default()).expect("builtin ok")
     }
 
+    fn call_with_http_response(
+        name: &str,
+        args: Vec<Value>,
+        response: &mut RuntimeHttpResponseState,
+    ) -> Value {
+        let entry = BuiltinRegistry::new().get(name).expect("builtin exists");
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        context.set_http_response_state(response);
+        (entry.function())(&mut context, args, RuntimeSourceSpan::default()).expect("builtin ok")
+    }
+
     fn array_strings(value: Value) -> Vec<String> {
         let Value::Array(array) = value else {
             panic!("expected array");
@@ -6456,6 +6694,123 @@ mod tests {
                 other => panic!("expected string entry, got {other:?}"),
             })
             .collect()
+    }
+
+    fn array_value(entries: &[(&str, Value)]) -> Value {
+        let mut array = PhpArray::new();
+        for (key, value) in entries {
+            array.insert(
+                ArrayKey::String(PhpString::from_test_str(key)),
+                value.clone(),
+            );
+        }
+        Value::Array(array)
+    }
+
+    #[test]
+    fn setcookie_emits_encoded_set_cookie_header() {
+        let mut response = RuntimeHttpResponseState::default();
+
+        assert_eq!(
+            call_with_http_response(
+                "setcookie",
+                vec![
+                    Value::string("login"),
+                    Value::string("hello world"),
+                    Value::Int(0),
+                    Value::string("/"),
+                    Value::string("example.test"),
+                    Value::Bool(true),
+                    Value::Bool(true),
+                ],
+                &mut response,
+            ),
+            Value::Bool(true)
+        );
+
+        assert_eq!(
+            response.headers_list(),
+            vec!["Set-Cookie: login=hello%20world; Path=/; Domain=example.test; Secure; HttpOnly"]
+        );
+    }
+
+    #[test]
+    fn setrawcookie_preserves_safe_raw_value() {
+        let mut response = RuntimeHttpResponseState::default();
+
+        assert_eq!(
+            call_with_http_response(
+                "setrawcookie",
+                vec![
+                    Value::string("raw"),
+                    Value::string("a=b"),
+                    Value::Int(0),
+                    Value::string("/raw"),
+                ],
+                &mut response,
+            ),
+            Value::Bool(true)
+        );
+
+        assert_eq!(
+            response.headers_list(),
+            vec!["Set-Cookie: raw=a=b; Path=/raw"]
+        );
+    }
+
+    #[test]
+    fn setcookie_options_array_supports_expires_and_samesite() {
+        let mut response = RuntimeHttpResponseState::default();
+
+        assert_eq!(
+            call_with_http_response(
+                "setcookie",
+                vec![
+                    Value::string("prefs"),
+                    Value::string("dark"),
+                    array_value(&[
+                        ("expires", Value::Int(1_609_459_200)),
+                        ("path", Value::string("/app")),
+                        ("secure", Value::Bool(true)),
+                        ("httponly", Value::Bool(true)),
+                        ("samesite", Value::string("Strict")),
+                    ]),
+                ],
+                &mut response,
+            ),
+            Value::Bool(true)
+        );
+
+        assert_eq!(
+            response.headers_list(),
+            vec![
+                "Set-Cookie: prefs=dark; Expires=Fri, 01 Jan 2021 00:00:00 GMT; Path=/app; Secure; HttpOnly; SameSite=Strict"
+            ]
+        );
+    }
+
+    #[test]
+    fn setcookie_rejects_response_splitting_and_invalid_names() {
+        let mut response = RuntimeHttpResponseState::default();
+
+        assert_eq!(
+            call_with_http_response(
+                "setcookie",
+                vec![Value::string("bad\r\nname"), Value::string("ok")],
+                &mut response,
+            ),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call_with_http_response(
+                "setcookie",
+                vec![Value::string("good"), Value::string("bad\r\nvalue")],
+                &mut response,
+            ),
+            Value::Bool(false)
+        );
+
+        assert!(response.headers.is_empty());
     }
 
     #[test]

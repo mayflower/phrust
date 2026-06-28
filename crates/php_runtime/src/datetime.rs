@@ -218,8 +218,10 @@ pub fn format_timestamp(timestamp: i64, timezone: &str, format: &str) -> String 
         match marker {
             'Y' => output.push_str(&format!("{:04}", parts.year)),
             'y' => output.push_str(&format!("{:02}", parts.year.rem_euclid(100))),
+            'M' => output.push_str(short_month_name(parts.month)),
             'm' => output.push_str(&format!("{:02}", parts.month)),
             'n' => output.push_str(&parts.month.to_string()),
+            'D' => output.push_str(short_weekday_name(timestamp.saturating_add(offset))),
             'd' => output.push_str(&format!("{:02}", parts.day)),
             'j' => output.push_str(&parts.day.to_string()),
             'H' => output.push_str(&format!("{:02}", parts.hour)),
@@ -244,6 +246,37 @@ pub fn format_timestamp(timestamp: i64, timezone: &str, format: &str) -> String 
         }
     }
     output
+}
+
+fn short_month_name(month: u8) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
+    }
+}
+
+fn short_weekday_name(timestamp: i64) -> &'static str {
+    match timestamp.div_euclid(86_400).saturating_add(4).rem_euclid(7) {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        _ => "",
+    }
 }
 
 /// Reads a timestamp from a runtime DateTime-like object.

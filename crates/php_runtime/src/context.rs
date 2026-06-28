@@ -1138,6 +1138,22 @@ mod tests {
     }
 
     #[test]
+    fn cookie_header_parser_keeps_incoming_cookies_as_request_pairs() {
+        assert_eq!(
+            parse_cookie_header("sid=abc; theme=dark%20mode; empty=; flag; spaced = value "),
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("theme".to_string(), "dark%20mode".to_string()),
+                ("empty".to_string(), "".to_string()),
+                ("spaced".to_string(), "value".to_string()),
+            ]
+        );
+
+        let state = RuntimeHttpResponseState::default();
+        assert!(state.headers.is_empty());
+    }
+
+    #[test]
     fn http_response_state_accepts_status_lines_and_response_code() {
         let mut state = RuntimeHttpResponseState::default();
 

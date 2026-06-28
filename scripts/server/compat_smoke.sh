@@ -120,6 +120,49 @@ run_upload() {
   printf '%s\n' '[ok] server compat upload passed'
 }
 
+run_cookie() {
+  local headers_file
+  local body_file
+  local actual
+  headers_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-cookie-headers.XXXXXX")"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-cookie-body.XXXXXX")"
+  curl -g -fsS \
+    -D "$headers_file" \
+    -o "$body_file" \
+    -H 'Cookie: theme=dark' \
+    "http://$address/cookie.php"
+  actual="$(cat "$body_file")"
+  rm -f "$body_file"
+  local expected=$'theme=dark'
+  if [[ "$actual" != "$expected" ]]; then
+    printf '[fail] cookie expected %q got %q\n' "$expected" "$actual"
+    rm -f "$headers_file"
+    exit 1
+  fi
+  local normalized_headers
+  normalized_headers="$(tr -d '\r' <"$headers_file")"
+  if ! grep -Fiqx 'Set-Cookie: login=hello%20world; Path=/; Secure; HttpOnly; SameSite=Lax' <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] cookie response missing encoded login Set-Cookie header'
+    printf '%s\n' "$normalized_headers"
+    rm -f "$headers_file"
+    exit 1
+  fi
+  if ! grep -Fiqx 'Set-Cookie: raw=a=b; Path=/raw' <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] cookie response missing raw Set-Cookie header'
+    printf '%s\n' "$normalized_headers"
+    rm -f "$headers_file"
+    exit 1
+  fi
+  local cookie_count
+  cookie_count="$(grep -Fic 'Set-Cookie:' <<<"$normalized_headers")"
+  rm -f "$headers_file"
+  if [[ "$cookie_count" != "2" ]]; then
+    printf '[fail] cookie expected 2 Set-Cookie headers, got %s\n' "$cookie_count"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat cookie passed'
+}
+
 skip_section() {
   local name="$1"
   printf '[skip] server compat %s awaits its Wave 2 implementation prompt.\n' "$name"
@@ -136,7 +179,7 @@ case "$section" in
     run_upload
     ;;
   cookie)
-    skip_section cookie
+    run_cookie
     ;;
   session)
     skip_section session
@@ -148,7 +191,7 @@ case "$section" in
     run_static
     run_input
     run_upload
-    skip_section cookie
+    run_cookie
     skip_section session
     skip_section output-buffer
     ;;

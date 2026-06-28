@@ -199,6 +199,60 @@ fn server_exposes_headers_list_builtin() {
 }
 
 #[test]
+fn server_preserves_multiple_set_cookie_headers() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let mut child = start_server(&docroot, &[]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/cookie_builtin.php");
+
+    stop_child(child);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_response_contains_header(
+        &response,
+        "set-cookie",
+        "login=hello%20world; Path=/; Secure; HttpOnly; SameSite=Lax",
+    );
+    assert_response_contains_header(&response, "set-cookie", "raw=a=b; Path=/raw");
+    assert_eq!(
+        response_header_count(&response, "set-cookie"),
+        2,
+        "{response}"
+    );
+    assert_eq!(
+        response_body(&response),
+        "Set-Cookie: login=hello%20world; Path=/; Secure; HttpOnly; SameSite=Lax\nSet-Cookie: raw=a=b; Path=/raw\n",
+        "{response}"
+    );
+}
+
+#[test]
+fn incoming_cookie_header_seeds_cookie_without_response_cookie() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let mut child = start_server(&docroot, &[]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_headers(
+        &address,
+        "GET",
+        "/incoming_cookie.php",
+        &[("Cookie", "theme=dark")],
+        "",
+    );
+
+    stop_child(child);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "dark\n", "{response}");
+    assert_eq!(
+        response_header_count(&response, "set-cookie"),
+        0,
+        "{response}"
+    );
+}
+
+#[test]
 fn server_reports_headers_not_sent_during_php_execution() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);
@@ -708,6 +762,15 @@ fn response_headers(response: &str) -> impl Iterator<Item = &str> {
         .map_or(response, |(headers, _)| headers)
         .lines()
         .skip(1)
+}
+
+fn response_header_count(response: &str, expected_name: &str) -> usize {
+    response_headers(response)
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(expected_name))
+        })
+        .count()
 }
 
 fn response_body(response: &str) -> &str {

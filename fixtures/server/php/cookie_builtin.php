@@ -6,4 +6,6 @@ setcookie("login", "hello world", [
     "samesite" => "Lax",
 ]);
 setrawcookie("raw", "a=b", 0, "/raw");
-echo "theme=", $_COOKIE["theme"] ?? "", "\n";
+foreach (headers_list() as $header) {
+    echo $header, "\n";
+}
