@@ -5,6 +5,7 @@ use crate::{
     },
     response::{self, ResponseBody},
     routing::{ResolvedRoute, RouteConfig, resolve_route},
+    session_store::{SessionStore, generate_session_id, valid_session_id},
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -22,8 +23,8 @@ use php_executor::{
     PhpScriptCacheInput,
 };
 use php_runtime::api::{
-    RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, parse_cookie_header,
-    parse_form_urlencoded_body,
+    PHP_SESSION_ACTIVE, RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState,
+    SessionState, parse_cookie_header, parse_form_urlencoded_body,
 };
 use std::{
     convert::Infallible,
@@ -31,7 +32,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,8 +49,10 @@ struct AppState {
     in_flight: Arc<Semaphore>,
     max_in_flight: usize,
     metrics: Arc<ServerMetrics>,
-    executor: PhpExecutor,
     script_cache: Arc<CompiledScriptCache>,
+    session_config: SessionConfig,
+    session_store: Arc<SessionStore>,
+    session_lock: Arc<Mutex<()>>,
     local_addr: SocketAddr,
 }
 
@@ -58,8 +61,9 @@ impl AppState {
         &self,
         script_path: &Path,
     ) -> Result<CompiledScriptCacheLookup, PhpExecutionError> {
+        let executor = PhpExecutor::new();
         self.script_cache.get_or_compile_script(
-            &self.executor,
+            &executor,
             PhpScriptCacheInput {
                 path: script_path.to_path_buf(),
                 source_path: script_path.to_string_lossy().into_owned(),
@@ -67,6 +71,13 @@ impl AppState {
             },
         )
     }
+}
+
+#[derive(Clone, Debug)]
+struct SessionConfig {
+    enabled: bool,
+    cookie_name: String,
+    cookie_path: String,
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +178,12 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let docroot = config.validated_docroot()?;
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
+    let session_store = Arc::new(SessionStore::new(config.session_save_path));
+    if config.sessions_enabled {
+        session_store
+            .ensure_ready()
+            .map_err(std::io::Error::other)?;
+    }
     println!("listening http://{local_addr}");
     debug!(%local_addr, docroot=%docroot.display(), "starting phrust server");
     let state = Arc::new(AppState {
@@ -186,12 +203,18 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         in_flight: Arc::new(Semaphore::new(config.max_in_flight)),
         max_in_flight: config.max_in_flight,
         metrics: Arc::new(ServerMetrics::default()),
-        executor: PhpExecutor::new(),
         script_cache: Arc::new(if config.script_cache_enabled {
             CompiledScriptCache::new(config.script_cache_shards)
         } else {
             CompiledScriptCache::disabled()
         }),
+        session_config: SessionConfig {
+            enabled: config.sessions_enabled,
+            cookie_name: config.session_cookie_name,
+            cookie_path: config.session_cookie_path,
+        },
+        session_store,
+        session_lock: Arc::new(Mutex::new(())),
         local_addr,
     });
     serve_until_shutdown(listener, state).await;
@@ -402,17 +425,40 @@ async fn execute_php_request(
             Err(error) => return multipart_error_response(error, &state, peer),
         }
     }
+    let _session_guard = if state.session_config.enabled {
+        Some(state.session_lock.lock().expect("session lock poisoned"))
+    } else {
+        None
+    };
+    let session_state = match seed_session_state(&request_context, &state) {
+        Ok(session) => session,
+        Err(error) => {
+            warn!(%peer, error=%error, "session state preparation failed");
+            return response::text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session storage failed\n",
+            );
+        }
+    };
     let mut runtime_context = RuntimeContext::controlled_http(request_context)
         .with_cwd(state.route_config.docroot.clone())
-        .with_include_path(vec![state.route_config.docroot.clone()]);
+        .with_include_path(vec![state.route_config.docroot.clone()])
+        .with_session_state(session_state);
     runtime_context = runtime_context.with_stdin(body.clone());
     let is_head = parts.method == Method::HEAD;
     let script_log_path = script_path.clone();
     let result =
         execute_php_on_blocking_thread(Arc::clone(&state), script_path, runtime_context).await;
     match result {
-        Ok((lookup, output)) => {
+        Ok((lookup, mut output)) => {
             output.upload_registry.cleanup_unmoved();
+            if let Err(error) = finalize_session_state(&mut output, &state) {
+                warn!(%peer, error=%error, "session state finalization failed");
+                return response::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session storage failed\n",
+                );
+            }
             debug!(script=%script_log_path.display(), hit=lookup.hit, "compiled script cache lookup");
             php_output_response(output, is_head)
         }
@@ -449,6 +495,76 @@ async fn execute_php_on_blocking_thread(
     })
     .await
     .map_err(|error| PhpExecutionError::Engine(format!("php execution task failed: {error}")))?
+}
+
+fn seed_session_state(
+    request: &RuntimeHttpRequestContext,
+    state: &AppState,
+) -> Result<SessionState, String> {
+    if !state.session_config.enabled {
+        return Ok(SessionState::default());
+    }
+    let incoming_id = request
+        .parsed_cookie
+        .iter()
+        .rev()
+        .find(|(name, _)| name == &state.session_config.cookie_name)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| valid_session_id(value))
+        .unwrap_or("");
+    let data = if incoming_id.is_empty() {
+        php_runtime::PhpArray::new()
+    } else {
+        state
+            .session_store
+            .load(incoming_id)
+            .map_err(|error| error.to_string())?
+    };
+    let generated_id = generate_session_id().map_err(|error| error.to_string())?;
+    Ok(SessionState::seeded(
+        state.session_config.cookie_name.clone(),
+        incoming_id.to_string(),
+        data,
+        Some(generated_id),
+    ))
+}
+
+fn finalize_session_state(output: &mut PhpExecutionOutput, state: &AppState) -> Result<(), String> {
+    if !state.session_config.enabled {
+        return Ok(());
+    }
+    if output.session.destroyed() {
+        if let Some(id) = output.session.destroyed_id() {
+            state
+                .session_store
+                .delete(id)
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    if output.session.status() != PHP_SESSION_ACTIVE || output.session.id().is_empty() {
+        return Ok(());
+    }
+    state
+        .session_store
+        .save(output.session.id(), &output.session.data())
+        .map_err(|error| error.to_string())?;
+    if output.session.newly_created() {
+        output
+            .http_response
+            .add_header_line(
+                &format!(
+                    "Set-Cookie: {}={}; Path={}; HttpOnly",
+                    state.session_config.cookie_name,
+                    output.session.id(),
+                    state.session_config.cookie_path
+                ),
+                false,
+                None,
+            )
+            .map_err(|message| format!("session cookie header failed: {message}"))?;
+    }
+    Ok(())
 }
 
 fn multipart_error_response(
@@ -714,8 +830,14 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(1)),
             max_in_flight: 1,
             metrics: Arc::new(ServerMetrics::default()),
-            executor: PhpExecutor::new(),
             script_cache: Arc::clone(&cache),
+            session_config: SessionConfig {
+                enabled: false,
+                cookie_name: "PHPSESSID".to_string(),
+                cookie_path: "/".to_string(),
+            },
+            session_store: Arc::new(SessionStore::new(fixture.root.join("sessions"))),
+            session_lock: Arc::new(Mutex::new(())),
             local_addr: "127.0.0.1:8080".parse().expect("local addr"),
         };
 

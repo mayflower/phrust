@@ -128,7 +128,7 @@ fn session_context_error(function: &str) -> BuiltinError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OutputBuffer, ReferenceCell, SessionState};
+    use crate::{ArrayKey, OutputBuffer, PhpArray, PhpString, ReferenceCell, SessionState};
 
     fn context_with_session<'a>(
         output: &'a mut OutputBuffer,
@@ -144,7 +144,7 @@ mod tests {
     fn session_builtins_track_cli_state() {
         let mut output = OutputBuffer::new();
         let mut state = SessionState::default();
-        let global = ReferenceCell::new(Value::Array(crate::PhpArray::new()));
+        let global = ReferenceCell::new(Value::Array(PhpArray::new()));
         let mut context = context_with_session(&mut output, &mut state, global.clone());
 
         assert_eq!(
@@ -181,5 +181,44 @@ mod tests {
                 .expect("destroy"),
             Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn session_builtins_use_seeded_web_state() {
+        let mut seeded = PhpArray::new();
+        seeded.insert(ArrayKey::String(PhpString::from("n")), Value::Int(7));
+        let mut output = OutputBuffer::new();
+        let mut state = SessionState::seeded(
+            "APPSESSID".to_string(),
+            "incoming123".to_string(),
+            seeded.clone(),
+            Some("generated456".to_string()),
+        );
+        let global = ReferenceCell::new(Value::Array(seeded));
+        let mut context = context_with_session(&mut output, &mut state, global.clone());
+
+        assert_eq!(
+            builtin_session_name(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("name"),
+            Value::string("APPSESSID")
+        );
+        assert_eq!(
+            builtin_session_start(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("start"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            builtin_session_id(&mut context, Vec::new(), RuntimeSourceSpan::default()).expect("id"),
+            Value::string("incoming123")
+        );
+        assert_eq!(
+            global.get(),
+            Value::Array({
+                let mut array = PhpArray::new();
+                array.insert(ArrayKey::String(PhpString::from("n")), Value::Int(7));
+                array
+            })
+        );
+        assert!(!state.newly_created());
     }
 }

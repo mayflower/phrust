@@ -65,6 +65,27 @@ URL-encoded query and form data. Prompt 02 makes `upload` strict for bounded
 multipart fields and scalar `$_FILES` metadata. Later prompts make their
 corresponding sections strict as support lands.
 
+## Persistent Web Sessions
+
+The integrated server owns web session persistence. By default sessions are
+enabled with cookie name `PHPSESSID`, cookie path `/`, and save path
+`$TMPDIR/phrust-sessions`. Operators can override these with
+`--session-save-path`, `--session-cookie-name`, and `--session-cookie-path`, or
+disable the feature with `--disable-sessions`.
+
+Session files are stored as `sess_<id>` under the configured save path. Session
+ids are validated as bounded ASCII path segments before any file access, so ids
+cannot contain directory separators or traversal components. Payloads are a
+phrust-owned PHP-serialize-compatible encoding of the whole `$_SESSION` array,
+not PHP's historical `name|serialized-value` session module format. Writes use
+a temporary file followed by rename so a completed write replaces the previous
+payload atomically.
+
+The server holds a process-local session mutex while loading, executing, and
+finalizing a request. This prevents in-process concurrent request corruption.
+It is not a cross-process lock, so multiple server processes sharing the same
+session save path are outside the current guarantee.
+
 ## Expected Acceptance Commands
 
 Prompt 00 baseline:

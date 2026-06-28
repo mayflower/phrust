@@ -253,6 +253,84 @@ fn incoming_cookie_header_seeds_cookie_without_response_cookie() {
 }
 
 #[test]
+fn server_persists_web_sessions_across_requests() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+
+    let address = read_listening_address(&mut child);
+    let first = http_request(&address, "GET", "/session_counter.php");
+    assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+    let set_cookie = response_header_values(&first, "set-cookie");
+    assert_eq!(set_cookie.len(), 1, "{first}");
+    assert!(set_cookie[0].ends_with("; Path=/; HttpOnly"), "{first}");
+    let cookie_pair = set_cookie[0]
+        .split_once(';')
+        .map_or(set_cookie[0], |(pair, _)| pair)
+        .to_string();
+    let session_id = cookie_pair
+        .strip_prefix("PHPSESSID=")
+        .expect("session cookie name")
+        .to_string();
+    assert_eq!(
+        response_body(&first),
+        format!("id={session_id}\nn=1\nstatus=2\n")
+    );
+
+    let second = http_request_with_headers(
+        &address,
+        "GET",
+        "/session_counter.php",
+        &[("Cookie", &cookie_pair)],
+        "",
+    );
+    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+    assert_eq!(
+        response_body(&second),
+        format!("id={session_id}\nn=2\nstatus=2\n")
+    );
+    assert_eq!(response_header_count(&second, "set-cookie"), 0, "{second}");
+
+    let destroy = http_request_with_headers(
+        &address,
+        "GET",
+        "/session_destroy.php",
+        &[("Cookie", &cookie_pair)],
+        "",
+    );
+    assert!(destroy.starts_with("HTTP/1.1 200 OK"), "{destroy}");
+    assert_eq!(
+        response_body(&destroy),
+        format!("id={session_id}\ndestroyed=yes\n")
+    );
+    assert!(
+        !session_dir.join(format!("sess_{session_id}")).exists(),
+        "destroyed session file should be removed"
+    );
+
+    let after_destroy = http_request_with_headers(
+        &address,
+        "GET",
+        "/session_counter.php",
+        &[("Cookie", &cookie_pair)],
+        "",
+    );
+
+    stop_child(child);
+    fs::remove_dir_all(session_dir).expect("remove session temp dir");
+
+    assert!(
+        after_destroy.starts_with("HTTP/1.1 200 OK"),
+        "{after_destroy}"
+    );
+    assert_eq!(
+        response_body(&after_destroy),
+        format!("id={session_id}\nn=1\nstatus=2\n")
+    );
+}
+
+#[test]
 fn server_reports_headers_not_sent_during_php_execution() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);
@@ -771,6 +849,17 @@ fn response_header_count(response: &str, expected_name: &str) -> usize {
                 .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(expected_name))
         })
         .count()
+}
+
+fn response_header_values<'a>(response: &'a str, expected_name: &str) -> Vec<&'a str> {
+    response_headers(response)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(expected_name)
+                .then_some(value.trim())
+        })
+        .collect()
 }
 
 fn response_body(response: &str) -> &str {

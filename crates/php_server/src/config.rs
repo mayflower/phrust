@@ -10,6 +10,8 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_UPLOAD_FILES: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
+const DEFAULT_SESSION_COOKIE_NAME: &str = "PHPSESSID";
+const DEFAULT_SESSION_COOKIE_PATH: &str = "/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerConfig {
@@ -21,6 +23,10 @@ pub struct ServerConfig {
     pub upload_temp_dir: PathBuf,
     pub max_upload_files: usize,
     pub max_upload_file_bytes: usize,
+    pub session_save_path: PathBuf,
+    pub session_cookie_name: String,
+    pub session_cookie_path: String,
+    pub sessions_enabled: bool,
     pub max_in_flight: usize,
     pub request_timeout_ms: u64,
     pub metrics_endpoint_enabled: bool,
@@ -68,6 +74,10 @@ impl ServerConfig {
         let mut upload_temp_dir = std::env::temp_dir().join("phrust-uploads");
         let mut max_upload_files = DEFAULT_MAX_UPLOAD_FILES;
         let mut max_upload_file_bytes = None;
+        let mut session_save_path = std::env::temp_dir().join("phrust-sessions");
+        let mut session_cookie_name = DEFAULT_SESSION_COOKIE_NAME.to_string();
+        let mut session_cookie_path = DEFAULT_SESSION_COOKIE_PATH.to_string();
+        let mut sessions_enabled = true;
         let mut max_in_flight = default_max_in_flight();
         let mut request_timeout_ms = DEFAULT_REQUEST_TIMEOUT_MS;
         let mut metrics_endpoint_enabled = true;
@@ -107,6 +117,18 @@ impl ServerConfig {
                         &required_value(&arg, &mut args)?,
                     )?);
                 }
+                "--session-save-path" => {
+                    session_save_path = PathBuf::from(required_value(&arg, &mut args)?);
+                }
+                "--session-cookie-name" => {
+                    session_cookie_name = required_value(&arg, &mut args)?;
+                    validate_cookie_name("--session-cookie-name", &session_cookie_name)?;
+                }
+                "--session-cookie-path" => {
+                    session_cookie_path = required_value(&arg, &mut args)?;
+                    validate_cookie_path("--session-cookie-path", &session_cookie_path)?;
+                }
+                "--disable-sessions" => sessions_enabled = false,
                 "--max-in-flight" => {
                     max_in_flight = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
                 }
@@ -137,6 +159,10 @@ impl ServerConfig {
                 upload_temp_dir,
                 max_upload_files,
                 max_upload_file_bytes: max_upload_file_bytes.unwrap_or(max_body_bytes),
+                session_save_path,
+                session_cookie_name,
+                session_cookie_path,
+                sessions_enabled,
                 max_in_flight,
                 request_timeout_ms,
                 metrics_endpoint_enabled,
@@ -156,6 +182,10 @@ impl ServerConfig {
             upload_temp_dir,
             max_upload_files,
             max_upload_file_bytes: max_upload_file_bytes.unwrap_or(max_body_bytes),
+            session_save_path,
+            session_cookie_name,
+            session_cookie_path,
+            sessions_enabled,
             max_in_flight,
             request_timeout_ms,
             metrics_endpoint_enabled,
@@ -177,6 +207,10 @@ Options:\n\
   --upload-temp-dir <path>     upload temp directory (default: OS temp/phrust-uploads)\n\
   --max-upload-files <n>       maximum uploaded files per request (default: 32)\n\
   --max-upload-file-bytes <n>  maximum bytes per uploaded file (default: max body bytes)\n\
+  --session-save-path <path>   session storage directory (default: OS temp/phrust-sessions)\n\
+  --session-cookie-name <name> session cookie name (default: PHPSESSID)\n\
+  --session-cookie-path <path> session cookie path (default: /)\n\
+  --disable-sessions           disable persistent web sessions\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
@@ -247,6 +281,28 @@ fn validate_index(index: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_cookie_name(flag: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || !name.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
+    {
+        return Err(ConfigError::new(format!(
+            "{flag} must be a valid cookie name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cookie_path(flag: &str, path: &str) -> Result<(), ConfigError> {
+    if path.is_empty() || path.contains(['\r', '\n', ';']) {
+        return Err(ConfigError::new(format!(
+            "{flag} must be a non-empty cookie path without response separators"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_relative_path(flag: &str, path: &Path) -> Result<(), ConfigError> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(ConfigError::new(format!(
@@ -288,6 +344,13 @@ mod tests {
         );
         assert_eq!(config.max_upload_files, 32);
         assert_eq!(config.max_upload_file_bytes, 1_048_576);
+        assert_eq!(
+            config.session_save_path,
+            std::env::temp_dir().join("phrust-sessions")
+        );
+        assert_eq!(config.session_cookie_name, "PHPSESSID");
+        assert_eq!(config.session_cookie_path, "/");
+        assert!(config.sessions_enabled);
         assert_eq!(config.request_timeout_ms, 30_000);
         assert!(config.metrics_endpoint_enabled);
         assert!(config.script_cache_enabled);
@@ -316,6 +379,13 @@ mod tests {
             "4",
             "--max-upload-file-bytes",
             "32",
+            "--session-save-path",
+            "sessions",
+            "--session-cookie-name",
+            "APPSESSID",
+            "--session-cookie-path",
+            "/app",
+            "--disable-sessions",
             "--max-in-flight",
             "2",
             "--request-timeout-ms",
@@ -334,6 +404,10 @@ mod tests {
         assert_eq!(config.upload_temp_dir, PathBuf::from("uploads"));
         assert_eq!(config.max_upload_files, 4);
         assert_eq!(config.max_upload_file_bytes, 32);
+        assert_eq!(config.session_save_path, PathBuf::from("sessions"));
+        assert_eq!(config.session_cookie_name, "APPSESSID");
+        assert_eq!(config.session_cookie_path, "/app");
+        assert!(!config.sessions_enabled);
         assert_eq!(config.max_in_flight, 2);
         assert_eq!(config.request_timeout_ms, 250);
         assert!(!config.metrics_endpoint_enabled);
@@ -403,6 +477,25 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--request-timeout-ms must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_cookie_settings() {
+        let error =
+            ServerConfig::parse_from(["--docroot", "public", "--session-cookie-name", "bad name"])
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--session-cookie-name must be a valid cookie name"
+        );
+
+        let error =
+            ServerConfig::parse_from(["--docroot", "public", "--session-cookie-path", "/;\n"])
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--session-cookie-path must be a non-empty cookie path without response separators"
         );
     }
 }

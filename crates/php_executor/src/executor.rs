@@ -51,6 +51,7 @@ impl PhpExecutor {
                 runtime_diagnostics: Vec::new(),
                 http_response: RuntimeHttpResponseState::default(),
                 upload_registry: Default::default(),
+                session: Default::default(),
                 trace: Vec::new(),
                 counters: None,
                 tiering_stats: None,

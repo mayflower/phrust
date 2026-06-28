@@ -1,6 +1,7 @@
 use php_optimizer::OptimizationLevel;
 use php_runtime::api::{
-    ExitStatus, RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState, UploadRegistry,
+    ExitStatus, RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState, SessionState,
+    UploadRegistry,
 };
 use php_vm::{
     api::VmOptions,
@@ -64,6 +65,7 @@ pub struct PhpExecutionOutput {
     pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
     pub http_response: RuntimeHttpResponseState,
     pub upload_registry: UploadRegistry,
+    pub session: SessionState,
     pub trace: Vec<String>,
     pub counters: Option<VmCounters>,
     pub tiering_stats: Option<TieringStats>,
@@ -78,6 +80,7 @@ impl PhpExecutionOutput {
             runtime_diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
             trace: Vec::new(),
             counters: None,
             tiering_stats: None,

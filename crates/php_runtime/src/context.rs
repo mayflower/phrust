@@ -1,6 +1,8 @@
 //! Deterministic runtime configuration for CLI fixture execution.
 
-use crate::{ArrayKey, FilesystemCapabilities, IniRegistry, PhpArray, PhpString, Value};
+use crate::{
+    ArrayKey, FilesystemCapabilities, IniRegistry, PhpArray, PhpString, SessionState, Value,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -386,6 +388,8 @@ pub struct RuntimeContext {
     pub process: ProcessCapability,
     /// Request mode for deterministic superglobal seeding.
     pub request_mode: RuntimeRequestMode,
+    /// Request-local session state seed.
+    pub session: SessionState,
 }
 
 impl Default for RuntimeContext {
@@ -402,6 +406,7 @@ impl Default for RuntimeContext {
             filesystem: FilesystemCapabilities::none(),
             process: ProcessCapability::Disabled,
             request_mode: RuntimeRequestMode::Cli,
+            session: SessionState::default(),
         }
     }
 }
@@ -508,6 +513,13 @@ impl RuntimeContext {
         self
     }
 
+    /// Seeds request-local session state for web execution.
+    #[must_use]
+    pub fn with_session_state(mut self, session: SessionState) -> Self {
+        self.session = session;
+        self
+    }
+
     /// Sets deterministic HTTP request metadata.
     #[must_use]
     pub fn with_http_request(mut self, request: RuntimeHttpRequestContext) -> Self {
@@ -544,7 +556,8 @@ impl RuntimeContext {
             "_COOKIE" => Some(Value::Array(self.cookie_array())),
             "_REQUEST" => Some(Value::Array(self.request_array())),
             "_FILES" => Some(Value::Array(self.files_array())),
-            "_SESSION" | "GLOBALS" => Some(Value::Array(PhpArray::new())),
+            "_SESSION" => Some(self.session.data_value()),
+            "GLOBALS" => Some(Value::Array(PhpArray::new())),
             _ => None,
         }
     }

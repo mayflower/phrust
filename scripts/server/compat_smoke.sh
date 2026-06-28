@@ -24,6 +24,7 @@ cd "$repo_root"
 cargo build -p php_server --bin phrust-server
 
 log_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-compat-log.XXXXXX")"
+session_dir="$(mktemp -d "${TMPDIR:-/tmp}/phrust-server-compat-sessions.XXXXXX")"
 server_pid=""
 
 cleanup() {
@@ -32,6 +33,7 @@ cleanup() {
     wait "$server_pid" >/dev/null 2>&1 || true
   fi
   rm -f fixtures/server/apps/compat/public/moved-upload.txt
+  rm -rf "$session_dir"
   rm -f "$log_file"
 }
 trap cleanup EXIT
@@ -40,6 +42,7 @@ trap cleanup EXIT
   --listen 127.0.0.1:0 \
   --docroot fixtures/server/apps/compat/public \
   --front-controller fixtures/server/apps/compat/public/index.php \
+  --session-save-path "$session_dir" \
   >"$log_file" 2>&1 &
 server_pid="$!"
 
@@ -163,6 +166,86 @@ run_cookie() {
   printf '%s\n' '[ok] server compat cookie passed'
 }
 
+run_session() {
+  local headers_file
+  local body_file
+  headers_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-session-headers.XXXXXX")"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-session-body.XXXXXX")"
+  curl -g -fsS -D "$headers_file" -o "$body_file" "http://$address/session.php"
+  local first_body
+  first_body="$(cat "$body_file")"
+  local normalized_headers
+  normalized_headers="$(tr -d '\r' <"$headers_file")"
+  local cookie_pair
+  cookie_pair="$(
+    printf '%s\n' "$normalized_headers" |
+      awk '{ line=tolower($0); if (line ~ /^set-cookie: phpsessid=/) { sub(/^[^:]*: /, ""); sub(/;.*/, ""); print; exit } }'
+  )"
+  if [[ -z "$cookie_pair" ]]; then
+    printf '%s\n' '[fail] session response missing PHPSESSID Set-Cookie header'
+    printf '%s\n' "$normalized_headers"
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  if ! grep -Fiqx "Set-Cookie: $cookie_pair; Path=/; HttpOnly" <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] session Set-Cookie header has unexpected attributes'
+    printf '%s\n' "$normalized_headers"
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  local session_id="${cookie_pair#PHPSESSID=}"
+  local expected_first
+  expected_first=$(printf 'id=%s\nn=1\nstatus=2' "$session_id")
+  if [[ "$first_body" != "$expected_first" ]]; then
+    printf '[fail] session first request expected %q got %q\n' "$expected_first" "$first_body"
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  rm -f "$headers_file" "$body_file"
+
+  local second_body
+  second_body="$(
+    curl -g -fsS \
+      -H "Cookie: $cookie_pair" \
+      "http://$address/session.php"
+  )"
+  local expected_second
+  expected_second=$(printf 'id=%s\nn=2\nstatus=2' "$session_id")
+  if [[ "$second_body" != "$expected_second" ]]; then
+    printf '[fail] session second request expected %q got %q\n' "$expected_second" "$second_body"
+    exit 1
+  fi
+
+  local destroy_body
+  destroy_body="$(
+    curl -g -fsS \
+      -H "Cookie: $cookie_pair" \
+      "http://$address/session_destroy.php"
+  )"
+  local expected_destroy
+  expected_destroy=$(printf 'id=%s\ndestroyed=yes' "$session_id")
+  if [[ "$destroy_body" != "$expected_destroy" ]]; then
+    printf '[fail] session destroy expected %q got %q\n' "$expected_destroy" "$destroy_body"
+    exit 1
+  fi
+  if [[ -e "$session_dir/sess_$session_id" ]]; then
+    printf '[fail] session destroy left state file: %s\n' "$session_dir/sess_$session_id"
+    exit 1
+  fi
+
+  local after_destroy_body
+  after_destroy_body="$(
+    curl -g -fsS \
+      -H "Cookie: $cookie_pair" \
+      "http://$address/session.php"
+  )"
+  if [[ "$after_destroy_body" != "$expected_first" ]]; then
+    printf '[fail] session after destroy expected %q got %q\n' "$expected_first" "$after_destroy_body"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat session passed'
+}
+
 skip_section() {
   local name="$1"
   printf '[skip] server compat %s awaits its Wave 2 implementation prompt.\n' "$name"
@@ -182,7 +265,7 @@ case "$section" in
     run_cookie
     ;;
   session)
-    skip_section session
+    run_session
     ;;
   output-buffer)
     skip_section output-buffer
@@ -192,7 +275,7 @@ case "$section" in
     run_input
     run_upload
     run_cookie
-    skip_section session
+    run_session
     skip_section output-buffer
     ;;
 esac

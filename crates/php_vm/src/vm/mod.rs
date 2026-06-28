@@ -1668,6 +1668,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value,
             yielded: None,
             fiber_suspension: None,
@@ -1689,6 +1690,7 @@ impl VmResult {
             diagnostics,
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value,
             yielded: None,
             fiber_suspension: None,
@@ -1710,6 +1712,7 @@ impl VmResult {
             diagnostics: vec![diagnostic],
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value: None,
             yielded: None,
             fiber_suspension: None,
@@ -1727,6 +1730,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value: None,
             yielded: None,
             fiber_suspension: None,
@@ -1744,6 +1748,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value: None,
             yielded: None,
             fiber_suspension: None,
@@ -1767,6 +1772,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
+            session: php_runtime::SessionState::default(),
             return_value: None,
             yielded: None,
             fiber_suspension: None,
@@ -1880,6 +1886,7 @@ impl Vm {
             default_timezone: php_runtime::datetime::DEFAULT_TIMEZONE.to_owned(),
             env: self.options.runtime_context.env.clone(),
             upload_registry: self.options.runtime_context.upload_registry(),
+            session: self.options.runtime_context.session.clone(),
             ..ExecutionState::default()
         };
         state.stdin = Some(
@@ -1910,6 +1917,7 @@ impl Vm {
                             tiering_stats: None,
                             http_response: RuntimeHttpResponseState::default(),
                             upload_registry: UploadRegistry::default(),
+                            session: php_runtime::SessionState::default(),
                         }
                     } else {
                         self.record_counter_bytecode_unsupported_fallback();
@@ -1960,13 +1968,15 @@ impl Vm {
         if self.options.trace_runtime {
             self.record_gc_root_trace_event(&stack, &state);
         }
-        result.diagnostics.extend(state.diagnostics);
         output.flush_all_buffers();
         let output_len = output.len();
         let output_stats = output.stats();
+        sync_session_state_from_globals(&mut state);
+        result.diagnostics.extend(state.diagnostics);
         result.output = output.clone();
         result.http_response = state.http_response;
         result.upload_registry = state.upload_registry;
+        result.session = state.session;
         if self.options.trace || self.options.trace_runtime {
             result.trace = self.trace.borrow().clone();
         }
@@ -13394,6 +13404,7 @@ impl Vm {
                                 tiering_stats: None,
                                 http_response: RuntimeHttpResponseState::default(),
                                 upload_registry: UploadRegistry::default(),
+                                session: php_runtime::SessionState::default(),
                             };
                         };
                         foreach_iterators.insert(
@@ -15606,6 +15617,7 @@ impl Vm {
                             tiering_stats: None,
                             http_response: RuntimeHttpResponseState::default(),
                             upload_registry: UploadRegistry::default(),
+                            session: php_runtime::SessionState::default(),
                         };
                     }
                     InstructionKind::RuntimeError {
@@ -19779,6 +19791,7 @@ impl Vm {
                     tiering_stats: None,
                     http_response: RuntimeHttpResponseState::default(),
                     upload_registry: UploadRegistry::default(),
+                    session: php_runtime::SessionState::default(),
                 })
             }
         }
@@ -34126,6 +34139,13 @@ fn seed_runtime_globals(globals: &mut GlobalSymbolTable, context: &RuntimeContex
             globals.set(name, value);
         }
     }
+}
+
+fn sync_session_state_from_globals(state: &mut ExecutionState) {
+    let Some(Value::Array(array)) = state.globals.get("_SESSION") else {
+        return;
+    };
+    state.session.set_data(array);
 }
 
 fn env_entries_array(entries: &[(String, String)]) -> PhpArray {

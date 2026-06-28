@@ -11,3 +11,4 @@ mod multipart;
 pub mod response;
 pub mod routing;
 pub mod server;
+pub mod session_store;

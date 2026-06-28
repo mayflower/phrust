@@ -17,6 +17,11 @@ pub struct SessionState {
     id: String,
     data: PhpArray,
     next_id: u64,
+    pending_generated_id: Option<String>,
+    started: bool,
+    destroyed: bool,
+    newly_created: bool,
+    destroyed_id: Option<String>,
 }
 
 impl Default for SessionState {
@@ -27,6 +32,11 @@ impl Default for SessionState {
             id: String::new(),
             data: PhpArray::new(),
             next_id: 1,
+            pending_generated_id: None,
+            started: false,
+            destroyed: false,
+            newly_created: false,
+            destroyed_id: None,
         }
     }
 }
@@ -60,13 +70,61 @@ impl SessionState {
         std::mem::replace(&mut self.id, id.into())
     }
 
+    /// Seeds web-session state loaded by the transport layer.
+    #[must_use]
+    pub fn seeded(
+        name: impl Into<String>,
+        id: impl Into<String>,
+        data: PhpArray,
+        pending_generated_id: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            id: id.into(),
+            data,
+            pending_generated_id,
+            ..Self::default()
+        }
+    }
+
+    /// Returns true when session_start() was called in this request.
+    #[must_use]
+    pub const fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Returns true when session_destroy() destroyed an active session.
+    #[must_use]
+    pub const fn destroyed(&self) -> bool {
+        self.destroyed
+    }
+
+    /// Returns the session id destroyed during this request, if any.
+    #[must_use]
+    pub fn destroyed_id(&self) -> Option<&str> {
+        self.destroyed_id.as_deref()
+    }
+
+    /// Returns true when session_start() created a new session id.
+    #[must_use]
+    pub const fn newly_created(&self) -> bool {
+        self.newly_created
+    }
+
     /// Starts a deterministic CLI session.
     pub fn start(&mut self) {
         if self.id.is_empty() {
-            self.id = format!("phrustcli{:08}", self.next_id);
-            self.next_id = self.next_id.saturating_add(1);
+            self.id = self.pending_generated_id.take().unwrap_or_else(|| {
+                let id = format!("phrustcli{:08}", self.next_id);
+                self.next_id = self.next_id.saturating_add(1);
+                id
+            });
+            self.newly_created = true;
         }
         self.status = PHP_SESSION_ACTIVE;
+        self.started = true;
+        self.destroyed = false;
+        self.destroyed_id = None;
     }
 
     /// Destroys the current deterministic CLI session.
@@ -74,9 +132,11 @@ impl SessionState {
         if self.status != PHP_SESSION_ACTIVE {
             return false;
         }
+        self.destroyed_id = Some(self.id.clone());
         self.status = PHP_SESSION_NONE;
         self.id.clear();
         self.data = PhpArray::new();
+        self.destroyed = true;
         true
     }
 
@@ -113,10 +173,28 @@ mod tests {
         state.start();
         assert_eq!(state.status(), PHP_SESSION_ACTIVE);
         assert_eq!(state.id(), "phrustcli00000001");
+        assert!(state.started());
+        assert!(state.newly_created());
 
         assert!(state.destroy());
         assert_eq!(state.status(), PHP_SESSION_NONE);
         assert_eq!(state.id(), "");
+        assert!(state.destroyed());
         assert!(!state.destroy());
+    }
+
+    #[test]
+    fn session_state_can_be_seeded_for_web_requests() {
+        let mut state = SessionState::seeded(
+            "APPSESSID",
+            "",
+            crate::PhpArray::new(),
+            Some("generated".to_string()),
+        );
+
+        assert_eq!(state.name(), "APPSESSID");
+        state.start();
+        assert_eq!(state.id(), "generated");
+        assert!(state.newly_created());
     }
 }
