@@ -7923,6 +7923,14 @@ mod tests {
         assert_eq!(
             call_in_context(
                 &mut context,
+                "gmdate",
+                vec![Value::string("Y-m-d H:i:s T O P"), Value::Int(0)],
+            ),
+            Value::string("1970-01-01 00:00:00 GMT +0000 +00:00")
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
                 "strtotime",
                 vec![Value::string("2024-01-02 03:04:05")],
             ),

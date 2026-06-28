@@ -2,74 +2,58 @@
 
 - Priority: 21
 - Selected manifest: `tests/phpt/manifests/modules/reflection.selected.jsonl`
-- Current counts: 11 PASS, 1 SKIP, 292 FAIL, 0 BORK from 304 corpus candidates
+- Current selected gate: 8 generated PHPTs covering the Reflection MVP subareas
+- Baseline context: 304 upstream Reflection corpus candidates remain tracked in the full PHPT baseline
 
 ## Scope
 
-- Reflection metadata for functions, classes, methods, properties, attributes
+- Reflection metadata for functions, parameters, classes, methods, properties, attributes, enums, and extensions
+- Generated arginfo for internal functions and methods where available
+- Userland metadata from the existing frontend, IR, runtime class table, and VM source maps
+
+## Submodules
+
+| Submodule | Selected manifest | Fixture |
+| --- | --- | --- |
+| `reflection.functions` | `tests/phpt/manifests/modules/reflection.functions.selected.jsonl` | `tests/phpt/generated/reflection.functions/builtin-and-user-functions.phpt` |
+| `reflection.parameters` | `tests/phpt/manifests/modules/reflection.parameters.selected.jsonl` | `tests/phpt/generated/reflection.parameters/internal-parameter-arginfo.phpt` |
+| `reflection.classes` | `tests/phpt/manifests/modules/reflection.classes.selected.jsonl` | `tests/phpt/generated/reflection.classes/class-basics.phpt` |
+| `reflection.methods` | `tests/phpt/manifests/modules/reflection.methods.selected.jsonl` | `tests/phpt/generated/reflection.methods/method-metadata.phpt` |
+| `reflection.properties` | `tests/phpt/manifests/modules/reflection.properties.selected.jsonl` | `tests/phpt/generated/reflection.properties/property-metadata.phpt` |
+| `reflection.attributes` | `tests/phpt/manifests/modules/reflection.attributes.selected.jsonl` | `tests/phpt/generated/reflection.attributes/attribute-metadata.phpt` |
+| `reflection.enums` | `tests/phpt/manifests/modules/reflection.enums.selected.jsonl` | `tests/phpt/generated/reflection.enums/enum-metadata.phpt` |
+| `reflection.extensions` | `tests/phpt/manifests/modules/reflection.extensions.selected.jsonl` | `tests/phpt/generated/reflection.extensions/extension-symbols.phpt` |
 
 ## Non-Scope
 
-- fake metadata not backed by frontend/runtime/arginfo
-
-## Relevant PHPT Paths
-
-- `ext/uri/tests/015.phpt`
-- `ext/reflection/tests/types/union_types.phpt`
-- `ext/reflection/tests/types/pure_intersection_type_implicitly_nullable.phpt`
-- `ext/reflection/tests/types/mixed_type.phpt`
-- `ext/reflection/tests/types/intersection_types.phpt`
-- `ext/reflection/tests/types/dnf_types_with_null.phpt`
-- `ext/reflection/tests/types/dnf_types.phpt`
-- `ext/reflection/tests/types/bug80190.phpt`
-- `ext/reflection/tests/types/ReflectionType_002.phpt`
-- `ext/reflection/tests/types/ReflectionType_001.phpt`
-- `ext/reflection/tests/static_type.phpt`
-- `ext/reflection/tests/static_properties_002.phpt`
-- `ext/reflection/tests/request38992.phpt`
-- `ext/reflection/tests/readonly_properties.phpt`
-- `ext/reflection/tests/property_hooks/hook_guard.phpt`
-- `ext/reflection/tests/property_hooks/gh17713.phpt`
-- `ext/reflection/tests/property_hooks/gh15718.phpt`
-- `ext/reflection/tests/property_hooks/bug_001.phpt`
-- `ext/reflection/tests/property_hooks/basics.phpt`
-- `ext/reflection/tests/property_hooks/ReflectionProperty_isInitialized.phpt`
-- `ext/reflection/tests/property_hooks/ReflectionProperty_getSetValue.phpt`
-- `ext/reflection/tests/property_hooks/ReflectionProperty_getSetRawValue.phpt`
-- `ext/reflection/tests/property_hooks/ReflectionProperty_getHooks.phpt`
-- `ext/reflection/tests/property_hooks/ReflectionProperty_getHook_inheritance.phpt`
-- `ext/reflection/tests/property_exists.phpt`
-- `ext/reflection/tests/parameters_002.phpt`
-- `ext/reflection/tests/parameters_001.phpt`
-- `ext/reflection/tests/new_in_constexpr.phpt`
-- `ext/reflection/tests/new_in_attributes.phpt`
-- `ext/reflection/tests/iterable_Reflection.phpt`
-- `ext/reflection/tests/internal_static_property.phpt`
-- `ext/reflection/tests/internal_property_union_type.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/check_all.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/ReflectionParameter_toString_Internal.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/ReflectionParameter_isDefaultValueConstant_Internal.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/ReflectionParameter_isDefaultValueAvailable_Internal.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/ReflectionParameter_getDefaultValue_Internal.phpt`
-- `ext/reflection/tests/internal_parameter_default_value/ReflectionParameter_getDefaultValueConstantName_Internal.phpt`
-- `ext/reflection/tests/gh9470.phpt`
-- `ext/reflection/tests/gh9447.phpt`
-
-## Relevant php-src Source Areas
-
-- `ext/reflection/tests/`
+- Fake metadata not backed by frontend/runtime/arginfo
+- Reflection invocation APIs
+- Attribute instantiation
+- Complete upstream Reflection API and modifier bit parity
+- Zend ABI module internals
 
 ## Target Gates
 
-- `nix develop -c just phpt-module MODULE=reflection`
+- `nix develop -c just phpt-dev-module MODULE=reflection`
+- `nix develop -c just phpt-dev-module MODULE=reflection.functions`
+- `nix develop -c just phpt-dev-module MODULE=reflection.parameters`
+- `nix develop -c just phpt-dev-module MODULE=reflection.classes`
+- `nix develop -c just phpt-dev-module MODULE=reflection.methods`
+- `nix develop -c just phpt-dev-module MODULE=reflection.properties`
+- `nix develop -c just phpt-dev-module MODULE=reflection.attributes`
+- `nix develop -c just phpt-dev-module MODULE=reflection.enums`
+- `nix develop -c just phpt-dev-module MODULE=reflection.extensions`
+- `nix develop -c just diff-spl-reflection`
 
 ## Known Gaps
 
-- `runtime-error-or-diagnostic`: 152
-- `runtime-unsupported-feature`: 123
-- `runtime-output-mismatch`: 19
-- `runtime-timeout`: 1
+- Full generated arginfo parity for every internal symbol and exact default constants
+- Complete internal class, method, property, and class-constant surfaces
+- `ReflectionAttribute::newInstance()` and complete target/repeatability validation
+- Property hook Reflection object parity
+- Enum serialization and byte-perfect exception gaps
+- Extension versions, dependencies, INI entries, module globals, and Zend ABI metadata
 
 ## Next Step
 
-Expose generated arginfo and semantic metadata through Reflection APIs.
+Promote upstream `ext/reflection/tests` cases into the submodule manifests as their owning runtime, VM, arginfo, or metadata gaps close.

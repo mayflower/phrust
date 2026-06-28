@@ -801,6 +801,7 @@ struct ExecutionState {
     dynamic_classes: Vec<DynamicClassEntry>,
     user_constants: HashMap<String, Value>,
     ini: IniRegistry,
+    default_timezone: String,
     env: Vec<(String, String)>,
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
@@ -1484,6 +1485,7 @@ impl Vm {
         let mut state = ExecutionState {
             cwd: self.options.runtime_context.cwd.clone(),
             ini: self.options.runtime_context.ini_registry(),
+            default_timezone: php_runtime::datetime::DEFAULT_TIMEZONE.to_owned(),
             env: self.options.runtime_context.env.clone(),
             ..ExecutionState::default()
         };
@@ -6813,6 +6815,27 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_date_time_runtime_class(&class_name) {
+                            let object = match new_date_time_object(
+                                &class_name,
+                                values,
+                                &state.default_timezone,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let Some(class) = lookup_class_in_state(compiled, state, &class_name)
                         else {
                             return self.runtime_error(
@@ -7070,6 +7093,33 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_date_time_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_date_time_object(
+                                class_name,
+                                values,
+                                &state.default_timezone,
+                            ) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if is_instantiable_internal_throwable(class_name) {
                             let values = match read_call_args(unit, stack, args) {
                                 Ok(values) => values,
@@ -7207,6 +7257,36 @@ impl Vm {
                                         &std_class_entry(),
                                         "stdClass",
                                     );
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, Value::Object(object))
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                if is_date_time_runtime_class(class_name) {
+                                    let values = match read_call_args(unit, stack, args) {
+                                        Ok(values) => values,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    let object = match new_date_time_object(
+                                        class_name,
+                                        values,
+                                        &state.default_timezone,
+                                    ) {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
                                     if let Err(message) = stack
                                         .current_mut()
                                         .expect("frame was pushed")
@@ -7680,6 +7760,18 @@ impl Vm {
                             continue;
                         }
                         if is_std_class_runtime_class(&object.class_name()) {
+                            let value = object.get_property(property).unwrap_or(Value::Null);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_date_time_runtime_class(&object.class_name()) {
                             let value = object.get_property(property).unwrap_or(Value::Null);
                             if let Err(message) = stack
                                 .current_mut()
@@ -10724,6 +10816,23 @@ impl Vm {
                                 values,
                                 &self.options.runtime_context,
                             ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_date_time_runtime_class(&object.class_name()) {
+                            let value = match call_date_time_method(object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -18241,12 +18350,13 @@ impl Vm {
                     Ok(name) => normalize_function_name(&name.to_string_lossy()),
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
+                let registry = php_std::ExtensionRegistry::standard_library();
                 VmResult::success(
                     output.clone(),
                     Some(Value::Bool(
                         compiled.lookup_function(&function_name).is_some()
                             || dynamic_function_in_state(state, &function_name).is_some()
-                            || BuiltinRegistry::new().contains(&function_name),
+                            || php_std::introspection::function_exists(&registry, &function_name),
                     )),
                 )
             }
@@ -20554,10 +20664,33 @@ fn reflection_bool_property(object: &ObjectRef, property: &str) -> Value {
     object.get_property(property).unwrap_or(Value::Bool(false))
 }
 
+fn reflection_short_class_name(name: &str) -> &str {
+    name.rsplit_once('\\')
+        .map(|(_, short)| short)
+        .unwrap_or(name)
+}
+
+fn reflection_namespace_name(name: &str) -> &str {
+    name.rsplit_once('\\')
+        .map(|(namespace, _)| namespace)
+        .unwrap_or("")
+}
+
 fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<ObjectRef, String> {
     let Some(target) = compiled.lookup_class(class_name) else {
         return reflection_internal_class_object(class_name);
     };
+    let parent = target
+        .parent
+        .as_ref()
+        .map(|parent| {
+            compiled
+                .lookup_class(parent)
+                .map(|entry| entry.display_name.clone())
+                .unwrap_or_else(|| parent.clone())
+        })
+        .map(reflection_string)
+        .unwrap_or(Value::Bool(false));
     Ok(reflection_object(
         "ReflectionClass",
         vec![
@@ -20569,6 +20702,7 @@ fn reflection_class_object(compiled: &CompiledUnit, class_name: &str) -> Result<
                 "class",
                 Value::String(PhpString::from_test_str(&target.name)),
             ),
+            ("parent", parent),
             (
                 "attributes",
                 reflection_attributes_value(compiled, &target.attributes)?,
@@ -20767,6 +20901,18 @@ fn reflection_method_value(
         },
         "reflectionclass" => match method.as_str() {
             "getname" => Ok(object.get_property("name").unwrap_or(Value::Null)),
+            "getshortname" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(reflection_string(reflection_short_class_name(&name)))
+            }
+            "getnamespacename" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(reflection_string(reflection_namespace_name(&name)))
+            }
+            "innamespace" => {
+                let name = reflection_object_string_property(object, "name")?;
+                Ok(Value::Bool(!reflection_namespace_name(&name).is_empty()))
+            }
             "getattributes" => Ok(object
                 .get_property("attributes")
                 .unwrap_or_else(empty_array_value)),
@@ -20782,6 +20928,13 @@ fn reflection_method_value(
             "getinterfacenames" => Ok(object
                 .get_property("interfaces")
                 .unwrap_or_else(empty_array_value)),
+            "getparentclass" => match object.get_property("parent") {
+                Some(Value::String(parent)) => {
+                    let parent = parent.to_string_lossy();
+                    Ok(Value::Object(reflection_class_object(compiled, &parent)?))
+                }
+                _ => Ok(Value::Bool(false)),
+            },
             "getfilename" => Ok(object.get_property("file").unwrap_or(Value::Bool(false))),
             "getstartline" => Ok(object.get_property("start_line").unwrap_or(Value::Bool(false))),
             "getendline" => Ok(object.get_property("end_line").unwrap_or(Value::Bool(false))),
@@ -21123,7 +21276,7 @@ fn signature_from_params(
                 name: param.name,
                 type_name: reflection_type_name(param.type_decl),
                 allows_null: reflection_type_allows_null(param.type_decl),
-                optional: param.optional,
+                optional: param.optional || param.variadic,
                 default: reflection_default_value(param.default_value),
                 by_ref: param.by_ref,
                 variadic: param.variadic,
@@ -21166,7 +21319,7 @@ fn reflection_default_value(default: Option<&str>) -> Value {
 fn reflection_internal_parameters_value(params: &[InternalReflectionParam]) -> Value {
     let mut array = PhpArray::new();
     for param in params {
-        let has_default = param.optional;
+        let has_default = param.optional && !param.variadic;
         array.append(Value::Object(reflection_object(
             "ReflectionParameter",
             vec![
@@ -21257,6 +21410,12 @@ fn reflection_internal_class_object(class_name: &str) -> Result<ObjectRef, Strin
         vec![
             ("name", reflection_string(descriptor.name())),
             ("class", reflection_string(descriptor.name())),
+            (
+                "parent",
+                internal_throwable_parent(descriptor.name())
+                    .map(reflection_string)
+                    .unwrap_or(Value::Bool(false)),
+            ),
             ("attributes", empty_array_value()),
             ("is_interface", Value::Bool(is_interface)),
             ("is_trait", Value::Bool(is_trait)),
@@ -23324,6 +23483,9 @@ fn object_instanceof(
             if let Some(result) = internal_spl_file_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if let Some(result) = internal_date_time_instanceof(&object.class_name(), class_name) {
+                return Ok(result);
+            }
             class_is_or_implements(compiled, &object.class_name(), class_name)
         }
         _ => Ok(false),
@@ -24292,6 +24454,325 @@ fn php_token_class() -> RuntimeClassEntry {
         enum_backing_type: None,
         constructor_id: None,
         flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn is_date_time_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "datetime" | "datetimeimmutable" | "datetimezone" | "dateinterval"
+    )
+}
+
+fn internal_date_time_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_date_time_runtime_class(object_class) {
+        return None;
+    }
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match target_class.as_str() {
+        "datetimeinterface" => matches!(object_class.as_str(), "datetime" | "datetimeimmutable"),
+        "datetime" => object_class == "datetime",
+        "datetimeimmutable" => object_class == "datetimeimmutable",
+        "datetimezone" => object_class == "datetimezone",
+        "dateinterval" => object_class == "dateinterval",
+        _ => false,
+    })
+}
+
+fn new_date_time_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    default_timezone: &str,
+) -> Result<ObjectRef, String> {
+    let function = format!("{}::__construct", date_time_display_name(class_name));
+    let values = call_args_to_positional(&function, args)?;
+    match normalize_class_name(class_name).as_str() {
+        "datetime" | "datetimeimmutable" => {
+            validate_date_time_arg_count(&function, values.len(), 0, 2)?;
+            let text = values
+                .first()
+                .map(to_string)
+                .transpose()?
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_else(|| "now".to_owned());
+            let timezone = values
+                .get(1)
+                .map(date_time_timezone_name_from_value)
+                .transpose()?
+                .unwrap_or_else(|| default_timezone.to_owned());
+            let base = php_runtime::datetime::current_timestamp();
+            let timestamp =
+                php_runtime::datetime::parse_datetime_text_in_timezone(&text, base, &timezone)
+                    .ok_or_else(|| {
+                        format!("E_PHP_VM_DATETIME_PARSE: could not parse DateTime text {text:?}")
+                    })?;
+            let value = if normalize_class_name(class_name) == "datetimeimmutable" {
+                php_runtime::datetime::datetime_immutable_object(timestamp, &timezone)
+            } else {
+                php_runtime::datetime::datetime_object(timestamp, &timezone)
+            };
+            date_time_object_from_value(value)
+        }
+        "datetimezone" => {
+            validate_date_time_arg_count(&function, values.len(), 1, 1)?;
+            let timezone = to_string(&values[0])?.to_string_lossy();
+            php_runtime::datetime::datetimezone_object(&timezone)
+                .ok_or_else(|| {
+                    format!("E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported")
+                })
+                .and_then(date_time_object_from_value)
+        }
+        "dateinterval" => {
+            validate_date_time_arg_count(&function, values.len(), 1, 1)?;
+            let spec = to_string(&values[0])?.to_string_lossy();
+            let seconds = php_runtime::datetime::parse_interval_spec(&spec).ok_or_else(|| {
+                format!("E_PHP_VM_DATEINTERVAL_PARSE: interval spec {spec:?} is unsupported")
+            })?;
+            date_time_object_from_value(php_runtime::datetime::dateinterval_object(seconds))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        )),
+    }
+}
+
+fn call_date_time_method(
+    object: ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let function = format!("{}::{}", date_time_display_name(&class_name), method);
+    let values = call_args_to_positional(&function, args)?;
+    match normalize_class_name(&class_name).as_str() {
+        "datetime" | "datetimeimmutable" => {
+            let immutable = normalize_class_name(&class_name) == "datetimeimmutable";
+            call_date_time_like_method(object, method, values, immutable)
+        }
+        "datetimezone" => call_date_timezone_method(object, method, values),
+        "dateinterval" => call_date_interval_method(object, method, values),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn call_date_time_like_method(
+    object: ObjectRef,
+    method: &str,
+    values: Vec<Value>,
+    immutable: bool,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    match normalize_method_name(method).as_str() {
+        "format" => {
+            validate_date_time_arg_count(&format!("{class_name}::format"), values.len(), 1, 1)?;
+            let format = to_string(&values[0])?.to_string_lossy();
+            let timestamp = php_runtime::datetime::object_timestamp(&object).unwrap_or(0);
+            let timezone = php_runtime::datetime::object_timezone(&object)
+                .unwrap_or_else(|| php_runtime::datetime::DEFAULT_TIMEZONE.to_owned());
+            Ok(Value::string(php_runtime::datetime::format_timestamp(
+                timestamp, &timezone, &format,
+            )))
+        }
+        "gettimestamp" => {
+            validate_date_time_arg_count(
+                &format!("{class_name}::getTimestamp"),
+                values.len(),
+                0,
+                0,
+            )?;
+            Ok(Value::Int(
+                php_runtime::datetime::object_timestamp(&object).unwrap_or(0),
+            ))
+        }
+        "gettimezone" => {
+            validate_date_time_arg_count(
+                &format!("{class_name}::getTimezone"),
+                values.len(),
+                0,
+                0,
+            )?;
+            let timezone = php_runtime::datetime::object_timezone(&object)
+                .unwrap_or_else(|| php_runtime::datetime::DEFAULT_TIMEZONE.to_owned());
+            Ok(php_runtime::datetime::datetimezone_object(&timezone).unwrap_or(Value::Bool(false)))
+        }
+        "settimezone" => {
+            validate_date_time_arg_count(
+                &format!("{class_name}::setTimezone"),
+                values.len(),
+                1,
+                1,
+            )?;
+            let timezone = date_time_timezone_name_from_value(&values[0])?;
+            php_runtime::datetime::with_timezone(&object, &timezone, immutable).ok_or_else(|| {
+                format!("E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported")
+            })
+        }
+        "add" => {
+            validate_date_time_arg_count(&format!("{class_name}::add"), values.len(), 1, 1)?;
+            let seconds = date_interval_seconds_from_value(&values[0])?;
+            Ok(php_runtime::datetime::add_interval(
+                &object, seconds, immutable,
+            ))
+        }
+        "sub" => {
+            validate_date_time_arg_count(&format!("{class_name}::sub"), values.len(), 1, 1)?;
+            let seconds = date_interval_seconds_from_value(&values[0])?;
+            Ok(php_runtime::datetime::add_interval(
+                &object,
+                seconds.saturating_neg(),
+                immutable,
+            ))
+        }
+        "modify" => {
+            validate_date_time_arg_count(&format!("{class_name}::modify"), values.len(), 1, 1)?;
+            let modifier = to_string(&values[0])?.to_string_lossy();
+            Ok(
+                php_runtime::datetime::modify_object(&object, &modifier, immutable)
+                    .unwrap_or(Value::Bool(false)),
+            )
+        }
+        "diff" => {
+            validate_date_time_arg_count(&format!("{class_name}::diff"), values.len(), 1, 1)?;
+            let Value::Object(right) = effective_value(&values[0]) else {
+                return Err(format!(
+                    "E_PHP_VM_DATETIME_ARG_TYPE: {class_name}::diff expects DateTimeInterface, {} given",
+                    value_type_name(&values[0])
+                ));
+            };
+            if !matches!(
+                normalize_class_name(&right.class_name()).as_str(),
+                "datetime" | "datetimeimmutable"
+            ) {
+                return Err(format!(
+                    "E_PHP_VM_DATETIME_ARG_TYPE: {class_name}::diff expects DateTimeInterface, {} given",
+                    right.class_name()
+                ));
+            }
+            Ok(php_runtime::datetime::diff_objects(&object, &right))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn call_date_timezone_method(
+    object: ObjectRef,
+    method: &str,
+    values: Vec<Value>,
+) -> Result<Value, String> {
+    match normalize_method_name(method).as_str() {
+        "getname" => {
+            validate_date_time_arg_count("DateTimeZone::getName", values.len(), 0, 0)?;
+            Ok(php_runtime::datetime::object_timezone(&object)
+                .map_or(Value::Bool(false), Value::string))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+            object.class_name(),
+            method
+        )),
+    }
+}
+
+fn call_date_interval_method(
+    object: ObjectRef,
+    method: &str,
+    values: Vec<Value>,
+) -> Result<Value, String> {
+    match normalize_method_name(method).as_str() {
+        "format" => {
+            validate_date_time_arg_count("DateInterval::format", values.len(), 1, 1)?;
+            let format = to_string(&values[0])?.to_string_lossy();
+            let seconds = date_interval_seconds(&object)?;
+            Ok(Value::string(php_runtime::datetime::format_interval(
+                seconds, &format,
+            )))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+            object.class_name(),
+            method
+        )),
+    }
+}
+
+fn validate_date_time_arg_count(
+    name: &str,
+    given: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if given < min {
+        return Err(format!(
+            "E_PHP_VM_TOO_FEW_ARGS: {name} expects at least {min} argument(s), {given} given"
+        ));
+    }
+    if given > max {
+        return Err(format!(
+            "E_PHP_VM_TOO_MANY_ARGS: {name} expects at most {max} argument(s), {given} given"
+        ));
+    }
+    Ok(())
+}
+
+fn date_time_timezone_name_from_value(value: &Value) -> Result<String, String> {
+    let Value::Object(object) = effective_value(value) else {
+        return Err(format!(
+            "E_PHP_VM_DATETIMEZONE_ARG_TYPE: expected DateTimeZone, {} given",
+            value_type_name(value)
+        ));
+    };
+    if normalize_class_name(&object.class_name()) != "datetimezone" {
+        return Err(format!(
+            "E_PHP_VM_DATETIMEZONE_ARG_TYPE: expected DateTimeZone, {} given",
+            object.class_name()
+        ));
+    }
+    php_runtime::datetime::object_timezone(&object)
+        .ok_or_else(|| "E_PHP_VM_DATETIMEZONE_INVALID: DateTimeZone object has no name".to_owned())
+}
+
+fn date_interval_seconds_from_value(value: &Value) -> Result<i64, String> {
+    let Value::Object(object) = effective_value(value) else {
+        return Err(format!(
+            "E_PHP_VM_DATEINTERVAL_ARG_TYPE: expected DateInterval, {} given",
+            value_type_name(value)
+        ));
+    };
+    if normalize_class_name(&object.class_name()) != "dateinterval" {
+        return Err(format!(
+            "E_PHP_VM_DATEINTERVAL_ARG_TYPE: expected DateInterval, {} given",
+            object.class_name()
+        ));
+    }
+    date_interval_seconds(&object)
+}
+
+fn date_interval_seconds(object: &ObjectRef) -> Result<i64, String> {
+    match object.get_property("__seconds") {
+        Some(Value::Int(seconds)) => Ok(seconds),
+        _ => Err("E_PHP_VM_DATEINTERVAL_INVALID: DateInterval object has no seconds".to_owned()),
+    }
+}
+
+fn date_time_object_from_value(value: Value) -> Result<ObjectRef, String> {
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err("E_PHP_VM_DATETIME_OBJECT: helper did not create an object".to_owned()),
+    }
+}
+
+fn date_time_display_name(class_name: &str) -> &'static str {
+    match normalize_class_name(class_name).as_str() {
+        "datetime" => "DateTime",
+        "datetimeimmutable" => "DateTimeImmutable",
+        "datetimezone" => "DateTimeZone",
+        "dateinterval" => "DateInterval",
+        _ => "DateTime",
     }
 }
 
@@ -28099,6 +28580,11 @@ fn execute_builtin_entry(
     );
     context.set_include_path(include_path);
     context.set_ini_registry(state.ini.clone());
+    context.set_default_timezone(if state.default_timezone.is_empty() {
+        php_runtime::datetime::DEFAULT_TIMEZONE.to_owned()
+    } else {
+        state.default_timezone.clone()
+    });
     context.set_diagnostic_display(diagnostic_display);
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
@@ -28107,6 +28593,7 @@ fn execute_builtin_entry(
     let output = context.output().clone();
     state.cwd = context.cwd().to_path_buf();
     state.json_last_error = context.json_last_error().0;
+    state.default_timezone = context.default_timezone().to_owned();
     let mut diagnostics = context.take_diagnostics();
     match result {
         Ok(value) => VmResult::success_with_diagnostics(output, Some(value), diagnostics),
@@ -31759,6 +32246,30 @@ mod tests {
     }
 
     #[test]
+    fn symbol_introspection_hides_disabled_mbstring_stubs() {
+        let result = execute_source(
+            "<?php
+            echo extension_loaded('mbstring') ? 'loaded' : 'missing';
+            foreach ([
+                'mb_strlen',
+                'mb_substr',
+                'mb_strtolower',
+                'mb_strtoupper',
+                'mb_detect_encoding',
+            ] as $name) {
+                echo '|', $name, ':', function_exists($name) ? 'yes' : 'no';
+            }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "missing|mb_strlen:no|mb_substr:no|mb_strtolower:no|mb_strtoupper:no|mb_detect_encoding:no"
+        );
+    }
+
+    #[test]
     fn object_and_class_handling_functions_respect_visibility() {
         let result = execute_source(
             "<?php
@@ -31897,6 +32408,59 @@ mod tests {
         assert_eq!(
             result.output.to_string_lossy(),
             "UTF-8\nmissing\n128M\n64M\n128M\n1.75\n14\n2\n64M\n128M|64M|7\n"
+        );
+    }
+
+    #[test]
+    fn date_timezone_builtins_use_request_local_registry() {
+        let result = execute_source(
+            "<?php
+            echo date_default_timezone_get(), \"\\n\";
+            date_default_timezone_set('Europe/Berlin');
+            echo date_default_timezone_get(), \"\\n\";
+            echo date('Y-m-d H:i:s T', 0), \"\\n\";
+            echo gmdate('Y-m-d H:i:s T', 0), \"\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "UTC\nEurope/Berlin\n1970-01-01 01:00:00 CET\n1970-01-01 00:00:00 GMT\n"
+        );
+
+        let separate = execute_source("<?php echo date_default_timezone_get();");
+        assert!(separate.status.is_success(), "{:?}", separate.status);
+        assert_eq!(separate.output.as_bytes(), b"UTC");
+    }
+
+    #[test]
+    fn date_time_runtime_classes_dispatch_methods() {
+        let result = execute_source(
+            "<?php
+            $zone = new DateTimeZone('UTC');
+            echo $zone->getName(), \"\\n\";
+            $date = new DateTime('2024-01-02 03:04:05', $zone);
+            echo $date->format('Y-m-d H:i:s T U'), \"\\n\";
+            echo $date->getTimestamp(), \"\\n\";
+            echo $date->getTimezone()->getName(), \"\\n\";
+            date_default_timezone_set('Europe/Berlin');
+            $local = new DateTime('2024-01-02 03:04:05');
+            echo $local->format('Y-m-d H:i:s T U'), \"\\n\";
+            $interval = new DateInterval('P1DT2H');
+            echo $interval->d, '|', $interval->h, '|', $interval->format('%d %h %i %s'), \"\\n\";
+            echo $date->add($interval)->format('Y-m-d H:i:s'), \"\\n\";
+            $immutable = new DateTimeImmutable('2024-01-02 00:00:00', $zone);
+            $changed = $immutable->add(new DateInterval('P1D'));
+            echo $immutable->format('Y-m-d'), '|', $changed->format('Y-m-d'), \"\\n\";
+            echo strtotime('next day', 0), '|', strtotime('-1 day', 86400), \"\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "UTC\n2024-01-02 03:04:05 UTC 1704164645\n1704164645\nUTC\n2024-01-02 03:04:05 CET 1704161045\n1|2|1 2 0 0\n2024-01-03 05:04:05\n2024-01-02|2024-01-03\n86400|0\n"
         );
     }
 
@@ -32760,52 +33324,60 @@ mod tests {
 
     #[test]
     fn autoload_lookup_cache_invalidates_after_spl_autoload_register() {
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("crate should live under workspace/crates/php_vm")
-            .canonicalize()
-            .expect("canonical workspace");
-        let class_file =
-            workspace.join("tests/fixtures/performance/inline_cache/PerfRegisteredCache.php");
-        let source = "<?php
-            function perf_registered_exists() {
-                return class_exists('PerfRegisteredCache', true);
-            }
-            if (perf_registered_exists()) {
-                echo 'bad';
-            } else {
-                echo 'miss';
-            }
-            spl_autoload_register(function ($class) {
-                if (strtolower($class) === 'perfregisteredcache') {
-                    include '__CLASS_FILE__';
-                }
-            });
-            if (perf_registered_exists()) {
-                echo ':hit';
-            } else {
-                echo ':bad';
-            }
-            "
-        .replace("__CLASS_FILE__", &class_file.to_string_lossy());
-        let result = execute_source_with_options(
-            &source,
-            VmOptions {
-                include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
-                collect_counters: true,
-                inline_caches: InlineCacheMode::On,
-                ..VmOptions::default()
-            },
-        );
+        std::thread::Builder::new()
+            .name("autoload_lookup_cache_invalidates_after_spl_autoload_register".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("crate should live under workspace/crates/php_vm")
+                    .canonicalize()
+                    .expect("canonical workspace");
+                let class_file = workspace
+                    .join("tests/fixtures/performance/inline_cache/PerfRegisteredCache.php");
+                let source = "<?php
+                    function perf_registered_exists() {
+                        return class_exists('PerfRegisteredCache', true);
+                    }
+                    if (perf_registered_exists()) {
+                        echo 'bad';
+                    } else {
+                        echo 'miss';
+                    }
+                    spl_autoload_register(function ($class) {
+                        if (strtolower($class) === 'perfregisteredcache') {
+                            include '__CLASS_FILE__';
+                        }
+                    });
+                    if (perf_registered_exists()) {
+                        echo ':hit';
+                    } else {
+                        echo ':bad';
+                    }
+                    "
+                .replace("__CLASS_FILE__", &class_file.to_string_lossy());
+                let result = execute_source_with_options(
+                    &source,
+                    VmOptions {
+                        include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
+                        collect_counters: true,
+                        inline_caches: InlineCacheMode::On,
+                        ..VmOptions::default()
+                    },
+                );
 
-        assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "miss:hit");
-        let counters = result.counters.expect("counters");
-        assert!(
-            counters.autoload_class_lookup_ic_invalidations > 0,
-            "{counters:?}"
-        );
+                assert!(result.status.is_success(), "{:?}", result.status);
+                assert_eq!(result.output.to_string_lossy(), "miss:hit");
+                let counters = result.counters.expect("counters");
+                assert!(
+                    counters.autoload_class_lookup_ic_invalidations > 0,
+                    "{counters:?}"
+                );
+            })
+            .expect("autoload test thread should spawn")
+            .join()
+            .expect("autoload test thread should finish");
     }
 
     #[test]
@@ -37532,6 +38104,19 @@ echo perf_jit_unstable_types_debug(4), "\n";
         assert_eq!(
             result.output.as_bytes(),
             b"ArrayObject|spl|internal|nofile|count|ArrayObject|internal|0|spl"
+        );
+    }
+
+    #[test]
+    fn reflection_class_exposes_names_parent_interfaces_and_member_counts() {
+        let result = execute_source(
+            "<?php namespace P21\\Ns; class Base {} interface I {} abstract class Child extends Base implements I { public const C = 1; public string $name; public function run(): void {} } $class = new \\ReflectionClass(Child::class); echo $class->getName(), '|', $class->getShortName(), '|', $class->getNamespaceName(), '|', ($class->inNamespace() ? 'namespace' : 'global'), '|'; echo $class->isAbstract() ? 'abstract|' : 'concrete|'; echo $class->isInterface() ? 'iface|' : 'class|'; echo $class->isEnum() ? 'enum|' : 'notenum|'; echo $class->getParentClass()->getName(), '|', $class->getInterfaceNames()[0], '|'; echo count($class->getMethods()), ':', count($class->getProperties()), ':', count($class->getConstants());",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"P21\\Ns\\Child|Child|P21\\Ns|namespace|abstract|class|notenum|P21\\Ns\\Base|P21\\Ns\\I|1:1:1"
         );
     }
 

@@ -1,0 +1,16 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"reflection.attributes",
+  "priority":21,
+  "selected_manifest":"tests/phpt/manifests/modules/reflection.attributes.selected.jsonl",
+  "corpus_count":1,
+  "pass_count":1,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["ReflectionAttribute names, arguments, repeat metadata, and attached targets"],
+  "non_scope":["ReflectionAttribute::newInstance","complete target validation parity"],
+  "target_gates":["nix develop -c just phpt-dev-module MODULE=reflection.attributes"],
+  "next_step":"Add newInstance fixtures when normal object construction and autoload-sensitive resolution are ready."
+}
