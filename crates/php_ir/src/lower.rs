@@ -3630,11 +3630,10 @@ impl LoweringContext<'_> {
                 continue;
             };
             match statement.kind() {
-                HirStmtKind::Label { name } => {
-                    if let Some(name) = name {
-                        labels.push((name.clone(), *stmt));
-                    }
+                HirStmtKind::Label { name: Some(name) } => {
+                    labels.push((name.clone(), *stmt));
                 }
+                HirStmtKind::Label { name: None } => {}
                 HirStmtKind::Block { statements }
                 | HirStmtKind::While {
                     body: statements, ..
@@ -3931,6 +3930,7 @@ impl LoweringContext<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn terminate_condition_targets(
         &mut self,
         builder: &mut IrBuilder,
@@ -10226,6 +10226,7 @@ fn is_internal_throwable_class(normalized: &str) -> bool {
             | "argumentcounterror"
             | "fibererror"
             | "jsonexception"
+            | "pdoexception"
             | "logicexception"
             | "badfunctioncallexception"
             | "badmethodcallexception"

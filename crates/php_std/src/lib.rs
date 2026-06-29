@@ -1749,6 +1749,7 @@ impl ExtensionRegistry {
                     "mysqli",
                     ConstantValue::Int(1),
                 ))
+                .with_function(FunctionDescriptor::php("mysqli_affected_rows", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_close", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_connect", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_connect_errno", "mysqli"))
@@ -1761,6 +1762,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("mysqli_fetch_row", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_free_result", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_init", "mysqli"))
+                .with_function(FunctionDescriptor::php("mysqli_insert_id", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_num_fields", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_num_rows", "mysqli"))
                 .with_function(FunctionDescriptor::php("mysqli_prepare", "mysqli"))
@@ -1822,6 +1824,11 @@ impl ExtensionRegistry {
                     ConstantValue::Int(52),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
+                    "CURLOPT_HEADER",
+                    "curl",
+                    ConstantValue::Int(42),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
                     "CURLOPT_HTTPHEADER",
                     "curl",
                     ConstantValue::Int(10023),
@@ -1865,6 +1872,11 @@ impl ExtensionRegistry {
                     "CURLINFO_RESPONSE_CODE",
                     "curl",
                     ConstantValue::Int(2097154),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "CURLINFO_HEADER_SIZE",
+                    "curl",
+                    ConstantValue::Int(2097163),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "CURLINFO_TOTAL_TIME",
@@ -2016,7 +2028,10 @@ impl ExtensionRegistry {
                 )),
             ExtensionDescriptor::new("xml")
                 .enabled_by_default(true)
+                .with_function(FunctionDescriptor::php("xml_error_string", "xml"))
+                .with_function(FunctionDescriptor::php("xml_get_error_code", "xml"))
                 .with_function(FunctionDescriptor::php("xml_parser_create", "xml"))
+                .with_function(FunctionDescriptor::php("xml_parser_free", "xml"))
                 .with_function(FunctionDescriptor::php("xml_parse", "xml"))
                 .with_class(ClassDescriptor::new("XMLParser", "xml", ClassKind::Class)),
             ExtensionDescriptor::new("dom")
@@ -2027,6 +2042,7 @@ impl ExtensionRegistry {
                 .with_class(ClassDescriptor::new("DOMNodeList", "dom", ClassKind::Class)),
             ExtensionDescriptor::new("simplexml")
                 .enabled_by_default(true)
+                .with_function(FunctionDescriptor::php("simplexml_load_file", "simplexml"))
                 .with_function(FunctionDescriptor::php(
                     "simplexml_load_string",
                     "simplexml",
