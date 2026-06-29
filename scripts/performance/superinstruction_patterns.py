@@ -270,7 +270,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
             "## Correctness Policy",
             "",
             "`--superinstructions=off` remains the generic dense-bytecode baseline.",
-            "`--superinstructions=on` remains default-off and must match stdout,",
+            "`--superinstructions=on` is the managed fast runtime default and must match stdout,",
             "stderr/runtime diagnostics, and exit status for every smoke fixture.",
             "",
         ]

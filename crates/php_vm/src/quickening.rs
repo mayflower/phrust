@@ -49,6 +49,7 @@ pub enum QuickeningSpecialization {
 /// Result of observing one instruction dispatch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QuickeningObservation {
+    pub specialization: Option<QuickeningSpecialization>,
     pub attempt: bool,
     pub specialized: bool,
     pub guard_hit: bool,
@@ -239,9 +240,11 @@ impl QuickeningTable {
         let Some(entry) = self.entries.get_mut(&key) else {
             return QuickeningObservation::default();
         };
+        let specialization = entry.specialization;
         if hit {
             let event = entry.stats.record_guard_hit();
             return QuickeningObservation {
+                specialization,
                 guard_hit: event.guard_hit,
                 ..QuickeningObservation::default()
             };
@@ -261,6 +264,7 @@ impl QuickeningTable {
         }
 
         QuickeningObservation {
+            specialization,
             guard_miss: fallback.guard_miss,
             guard_failure: fallback.guard_failure,
             fallback_call: fallback.fallback_call,
@@ -384,6 +388,7 @@ impl QuickeningTable {
         if entry.state == QuickeningState::Specialized && entry.specialization.is_none() {
             entry.specialization = Some(specialization);
             return QuickeningObservation {
+                specialization: Some(specialization),
                 specialized: true,
                 ..QuickeningObservation::default()
             };

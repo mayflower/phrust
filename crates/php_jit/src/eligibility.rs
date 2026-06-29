@@ -1572,6 +1572,7 @@ fn check_instruction(
         }
         InstructionKind::NewArray { .. }
         | InstructionKind::ArrayInsert { .. }
+        | InstructionKind::ArraySpread { .. }
         | InstructionKind::FetchDim { .. }
         | InstructionKind::AssignDim { .. }
         | InstructionKind::AppendDim { .. }
@@ -1601,7 +1602,9 @@ fn check_instruction(
         | InstructionKind::EmptyProperty { .. }
         | InstructionKind::EmptyDynamicProperty { .. }
         | InstructionKind::IssetPropertyDim { .. }
+        | InstructionKind::IssetDynamicPropertyDim { .. }
         | InstructionKind::EmptyPropertyDim { .. }
+        | InstructionKind::EmptyDynamicPropertyDim { .. }
         | InstructionKind::UnsetProperty { .. }
         | InstructionKind::UnsetDynamicProperty { .. }
         | InstructionKind::FetchStaticProperty { .. }

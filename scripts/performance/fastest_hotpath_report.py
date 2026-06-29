@@ -165,7 +165,7 @@ AREAS = (
             "slow_path_calls_by_reason.include_autoload.stream_wrapper",
         ),
         "Include-path resolution, dependency graph hits, autoload lookup, and warning fallbacks.",
-        "Include/require warning order, stream-wrapper rejection, Composer autoload, and invalidation fixtures.",
+        "Include/require warning order, stream-wrapper rejection, generated autoload, and invalidation fixtures.",
     ),
     AreaSpec(
         "frontend_byte_scanning",

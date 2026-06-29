@@ -25,6 +25,8 @@ fixtures=(
   "fixtures/runtime/valid/functions/two-args.php"
   "fixtures/bytecode/literals/valid/echo-int.php"
   "fixtures/bytecode/literals/valid/echo-multiple.php"
+  "tests/fixtures/performance/superinstructions/binary-concat-echo.php"
+  "tests/fixtures/performance/superinstructions/store-discard.php"
 )
 
 json_escape() {
@@ -122,7 +124,7 @@ if total_emitted <= 0:
     raise SystemExit("[error] expected at least one emitted superinstruction")
 if total_executed <= 0:
     raise SystemExit("[error] expected at least one executed superinstruction")
-required = {"load_const_echo", "load_local_echo", "binary_concat_echo"}
+required = {"load_const_echo", "load_local_echo", "binary_concat_echo", "store_local_discard"}
 missing = sorted(required - kinds)
 if missing:
     raise SystemExit(f"[error] missing executed superinstruction kinds: {', '.join(missing)}")

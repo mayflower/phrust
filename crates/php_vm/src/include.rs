@@ -1,6 +1,7 @@
 //! Local include/require loader for the runtime VM MVP.
 
 use crate::compiled_unit::CompiledUnit;
+use php_optimizer::{OptimizationLevel, PassContext, PassPipeline};
 use php_runtime::{FilesystemCapabilities, phar};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -110,9 +111,10 @@ impl IncludeCache {
         &self,
         loader: &IncludeLoader,
         resolved: &ResolvedIncludePath,
+        optimization_level: OptimizationLevel,
     ) -> Result<Arc<CompiledUnit>, String> {
         loop {
-            let key = CompiledIncludeKey::new(resolved);
+            let key = CompiledIncludeKey::new(resolved, optimization_level);
             let shard_index = self.compile_shard_index(&key);
             {
                 let mut shard = self.compile_shards[shard_index]
@@ -146,7 +148,7 @@ impl IncludeCache {
             }
 
             self.stats.compile_misses.fetch_add(1, Ordering::Relaxed);
-            let compiled = match compile_include(loader, resolved) {
+            let compiled = match compile_include(loader, resolved, optimization_level) {
                 Ok(compiled) => {
                     let compiled = Arc::new(compiled);
                     let mut shard = self.compile_shards[shard_index]
@@ -550,10 +552,11 @@ struct CompiledIncludeKey {
     readonly: bool,
     compiler_version: &'static str,
     debug_assertions: bool,
+    optimization_level: &'static str,
 }
 
 impl CompiledIncludeKey {
-    fn new(resolved: &ResolvedIncludePath) -> Self {
+    fn new(resolved: &ResolvedIncludePath, optimization_level: OptimizationLevel) -> Self {
         Self {
             canonical_path: resolved.canonical_path.clone(),
             len: resolved.fingerprint.len,
@@ -561,6 +564,7 @@ impl CompiledIncludeKey {
             readonly: resolved.fingerprint.readonly,
             compiler_version: env!("CARGO_PKG_VERSION"),
             debug_assertions: cfg!(debug_assertions),
+            optimization_level: optimization_level.as_str(),
         }
     }
 }
@@ -577,8 +581,16 @@ fn remove_stale_compiled_include_entries(
 fn compile_include(
     loader: &IncludeLoader,
     resolved: &ResolvedIncludePath,
+    optimization_level: OptimizationLevel,
 ) -> Result<CompiledUnit, String> {
     let loaded = loader.load_resolved(resolved.canonical_path.clone())?;
+    compile_loaded_include(loaded, optimization_level)
+}
+
+fn compile_loaded_include(
+    loaded: LoadedInclude,
+    optimization_level: OptimizationLevel,
+) -> Result<CompiledUnit, String> {
     let frontend = php_semantics::analyze_source(&loaded.source);
     if frontend.has_errors() {
         return Err(format!(
@@ -586,7 +598,7 @@ fn compile_include(
             loaded.canonical_path.display()
         ));
     }
-    let lowering = php_ir::lower_frontend_result(
+    let mut lowering = php_ir::lower_frontend_result(
         &frontend,
         php_ir::LoweringOptions {
             source_path: loaded.canonical_path.to_string_lossy().into_owned(),
@@ -600,6 +612,16 @@ fn compile_include(
             loaded.canonical_path.display()
         ));
     }
+    if optimization_level.runs_pipeline() {
+        PassPipeline::performance()
+            .run(&mut lowering.unit, &PassContext::new(optimization_level))
+            .map_err(|error| {
+                format!(
+                    "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} optimizer failed: {error}",
+                    loaded.canonical_path.display()
+                )
+            })?;
+    }
     Ok(CompiledUnit::new(lowering.unit))
 }
 
@@ -610,6 +632,7 @@ fn default_include_cache_shards() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_ir::instruction::{BinaryOp, InstructionKind};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -642,19 +665,43 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("first resolve");
         let first = cache
-            .get_or_compile_include(&loader, &first_resolved)
+            .get_or_compile_include(&loader, &first_resolved, OptimizationLevel::O0)
             .expect("first compile");
         fixture.write("lib.php", "<?php echo 'two';\n");
         let second_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("second resolve");
         let second = cache
-            .get_or_compile_include(&loader, &second_resolved)
+            .get_or_compile_include(&loader, &second_resolved, OptimizationLevel::O0)
             .expect("second compile");
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(cache.cache_stats().compile_misses, 2);
         assert!(cache.cache_stats().stale_invalidations >= 1);
+    }
+
+    #[test]
+    fn include_cache_keys_compiled_units_by_optimization_level() {
+        let fixture = IncludeCacheFixture::new("compiled-optimization");
+        fixture.write("lib.php", "<?php echo 1 + 2;\n");
+        let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
+        let cache = IncludeCache::new(1);
+        let resolved = loader
+            .resolve_with_include_path(None, "lib.php", &[], Some(&fixture.root))
+            .expect("resolve include");
+
+        let baseline = cache
+            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .expect("baseline include compile");
+        let optimized = cache
+            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O2)
+            .expect("optimized include compile");
+        let stats = cache.cache_stats();
+
+        assert_eq!(stats.compile_misses, 2);
+        assert_eq!(stats.compile_hits, 0);
+        assert!(binary_add_count(&baseline) > 0);
+        assert_eq!(binary_add_count(&optimized), 0);
     }
 
     #[test]
@@ -739,5 +786,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn binary_add_count(compiled: &CompiledUnit) -> usize {
+        compiled
+            .unit()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.kind,
+                    InstructionKind::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+            .count()
     }
 }

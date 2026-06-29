@@ -240,7 +240,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.extend(
         [
             "- Router dispatch with regular expression matching.",
-            "- Composer/autoload-like class-map lookup without network access.",
+            "- Package-manager/autoload-like class-map lookup without network access.",
             "- Dependency-injection container/service lookup.",
             "- DTO hydration from array rows.",
             "- Template rendering and string/output writes.",

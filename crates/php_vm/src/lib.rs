@@ -68,9 +68,10 @@ pub mod experimental {
     pub use crate::deopt::{
         ControlStateMarker, DeoptMetadata, DeoptMetadataError, DeoptRegionMetadata,
         DeoptResumePoint, DeoptSideExitPoint, ExitId, GuardId, GuardKind, GuardRecord, GuardedTier,
-        LiveIdentityMarker, LiveStateSnapshot, LiveValueClass, LiveValueSlot, ResumePoint,
-        ResumeTable, ResumeTableError, SharedExit, SideExitPolicy, SnapshotEntry, SnapshotId,
-        SnapshotRecord, VmDeoptReason,
+        LiveIdentityMarker, LiveStateSnapshot, LiveValueClass, LiveValueSlot,
+        MaterializedLiveState, MaterializedResumeRecord, ResumePoint, ResumeTable,
+        ResumeTableError, SharedExit, SideExitPolicy, SnapshotEntry, SnapshotId, SnapshotRecord,
+        SnapshotRejection, SnapshotStateFamily, VmDeoptReason,
     };
     #[doc(hidden)]
     pub use crate::dependency_units::{
@@ -141,8 +142,10 @@ pub use counters::{JitCompileDescriptor, VmCounters};
 pub use deopt::{
     ControlStateMarker, DeoptMetadata, DeoptMetadataError, DeoptRegionMetadata, DeoptResumePoint,
     DeoptSideExitPoint, ExitId, GuardId, GuardKind, GuardRecord, GuardedTier, LiveIdentityMarker,
-    LiveStateSnapshot, LiveValueClass, LiveValueSlot, ResumePoint, ResumeTable, ResumeTableError,
-    SharedExit, SideExitPolicy, SnapshotEntry, SnapshotId, SnapshotRecord, VmDeoptReason,
+    LiveStateSnapshot, LiveValueClass, LiveValueSlot, MaterializedLiveState,
+    MaterializedResumeRecord, ResumePoint, ResumeTable, ResumeTableError, SharedExit,
+    SideExitPolicy, SnapshotEntry, SnapshotId, SnapshotRecord, SnapshotRejection,
+    SnapshotStateFamily, VmDeoptReason,
 };
 pub use exit_policy::{
     ExitCounterKey, ExitCounterSite, ExitCounterTable, ExitPolicyDecision, ExitPolicyState,

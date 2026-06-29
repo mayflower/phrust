@@ -1469,6 +1469,7 @@ version = "0.0.0"
 dependencies = [
  "php_ir",
  "php_jit",
+ "php_optimizer",
  "php_runtime",
  "php_semantics",
  "php_source",

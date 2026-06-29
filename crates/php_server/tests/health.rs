@@ -299,6 +299,24 @@ fn server_exposes_internal_metrics() {
         response.contains("phrust_server_include_compile_hits_total"),
         "{response}"
     );
+    assert!(
+        response.contains("phrust_server_persistent_engine_policy_reuses_total"),
+        "{response}"
+    );
+    assert!(
+        response.contains("phrust_server_persistent_engine_immutable_metadata_reuses_total"),
+        "{response}"
+    );
+    assert!(
+        response.contains("phrust_server_persistent_engine_request_local_resets_total"),
+        "{response}"
+    );
+    assert!(
+        response.contains(
+            "phrust_server_persistent_engine_rejected_persistence_total{reason=\"request_local_state\"}"
+        ),
+        "{response}"
+    );
 }
 
 #[test]
@@ -327,6 +345,20 @@ fn server_reuses_compiled_script_cache_for_repeated_php_requests() {
     );
     assert!(
         metrics.contains("phrust_server_script_cache_misses_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_persistent_engine_immutable_metadata_reuses_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_persistent_engine_request_local_resets_total 2\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "phrust_server_persistent_engine_rejected_persistence_total{reason=\"request_local_state\"} 2\n"
+        ),
         "{metrics}"
     );
 }
@@ -395,6 +427,41 @@ fn server_executes_php_script() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.ends_with("hello\n"), "{response}");
+}
+
+#[test]
+fn server_default_engine_profile_matches_baseline_output() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("profile.php"),
+        "<?php $value = 2 + 4; echo $value, \"\\n\";\n",
+    )
+    .expect("write profile fixture");
+
+    let mut default_child = start_server(&docroot, &["--engine-preset", "default"]);
+    let default_address = read_listening_address(&mut default_child);
+    let default_response = http_request(&default_address, "GET", "/profile.php");
+    stop_child(default_child);
+
+    let mut baseline_child = start_server(&docroot, &["--engine-preset", "baseline"]);
+    let baseline_address = read_listening_address(&mut baseline_child);
+    let baseline_response = http_request(&baseline_address, "GET", "/profile.php");
+    stop_child(baseline_child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(
+        default_response.starts_with("HTTP/1.1 200 OK"),
+        "{default_response}"
+    );
+    assert!(
+        baseline_response.starts_with("HTTP/1.1 200 OK"),
+        "{baseline_response}"
+    );
+    assert_eq!(
+        response_body(&default_response),
+        response_body(&baseline_response)
+    );
+    assert_eq!(response_body(&default_response), "6\n");
 }
 
 #[test]

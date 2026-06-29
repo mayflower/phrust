@@ -4,8 +4,8 @@ use php_bytecode_cache::{
     PHP_TARGET_VERSION,
 };
 use php_executor::{
-    PhpCompileInput, PhpExecutionError, PhpExecutionOutput, PhpExecutionStatus, PhpExecutor,
-    PhpExecutorOptions, PhpRequestExecutionInput,
+    EngineProfileName, PhpCompileInput, PhpExecutionError, PhpExecutionOutput, PhpExecutionStatus,
+    PhpExecutor, PhpExecutorOptions, PhpRequestExecutionInput,
 };
 use php_ir::{LoweringOptions, lower_frontend_result, module::IrUnit, verify_unit};
 use php_optimizer::{OptimizationLevel, OptimizationReport, PassContext, PassPipeline};
@@ -629,7 +629,10 @@ where
     if run_options.region_profile_json.is_none() {
         run_options.region_profile_json = region_profile_json_from_env();
     }
-    if run_options.jit.requires_cranelift() && !cfg!(feature = "jit-cranelift") {
+    if run_options.jit_explicit
+        && run_options.jit.requires_cranelift()
+        && !cfg!(feature = "jit-cranelift")
+    {
         writeln!(
             stderr,
             "run --jit=cranelift requires the jit-cranelift feature"
@@ -689,6 +692,7 @@ where
     let vm = Vm::with_options(VmOptions {
         include_loader,
         runtime_context,
+        include_optimization_level: run_options.opt_level,
         trace: run_options.trace,
         trace_runtime: run_options.trace_runtime,
         collect_counters: run_options.counters_json.is_some()
@@ -798,6 +802,7 @@ where
             trace: run_options.trace,
             trace_runtime: run_options.trace_runtime,
             collect_counters,
+            include_optimization_level: run_options.opt_level,
             execution_format: run_options.execution_format,
             superinstructions: run_options.superinstructions,
             bytecode_layout: run_options.bytecode_layout,
@@ -1637,6 +1642,7 @@ struct RunOptions<'a> {
     quickening: QuickeningMode,
     inline_caches: InlineCacheMode,
     jit: JitMode,
+    jit_explicit: bool,
     jit_threshold: u64,
     jit_blacklist: JitBlacklistMode,
     jit_dump_clif: Option<String>,
@@ -1644,70 +1650,6 @@ struct RunOptions<'a> {
     tiering: TieringOptions,
     tiering_stats_json: Option<String>,
     persistent_feedback: PersistentFeedbackOptions,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EnginePreset {
-    Baseline,
-    Fast,
-    ExperimentalJit,
-}
-
-impl EnginePreset {
-    fn config(self) -> EnginePresetConfig {
-        match self {
-            Self::Baseline => EnginePresetConfig {
-                bytecode_cache_mode: BytecodeCacheMode::Off,
-                opt_level: OptimizationLevel::O0,
-                execution_format: ExecutionFormat::Ir,
-                superinstructions: SuperinstructionMode::Off,
-                bytecode_layout: BytecodeLayoutMode::Source,
-                quickening: QuickeningMode::Off,
-                inline_caches: InlineCacheMode::Off,
-                jit: JitMode::Off,
-                jit_blacklist: JitBlacklistMode::On,
-                tiering: TieringOptions::default(),
-            },
-            Self::Fast => EnginePresetConfig {
-                bytecode_cache_mode: BytecodeCacheMode::Off,
-                opt_level: OptimizationLevel::O2,
-                execution_format: ExecutionFormat::Auto,
-                superinstructions: SuperinstructionMode::Off,
-                bytecode_layout: BytecodeLayoutMode::Source,
-                quickening: QuickeningMode::On,
-                inline_caches: InlineCacheMode::On,
-                jit: JitMode::Off,
-                jit_blacklist: JitBlacklistMode::On,
-                tiering: TieringOptions::default(),
-            },
-            Self::ExperimentalJit => EnginePresetConfig {
-                bytecode_cache_mode: BytecodeCacheMode::Off,
-                opt_level: OptimizationLevel::O2,
-                execution_format: ExecutionFormat::Auto,
-                superinstructions: SuperinstructionMode::Off,
-                bytecode_layout: BytecodeLayoutMode::Source,
-                quickening: QuickeningMode::On,
-                inline_caches: InlineCacheMode::On,
-                jit: JitMode::Cranelift,
-                jit_blacklist: JitBlacklistMode::On,
-                tiering: TieringOptions::default(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EnginePresetConfig {
-    bytecode_cache_mode: BytecodeCacheMode,
-    opt_level: OptimizationLevel,
-    execution_format: ExecutionFormat,
-    superinstructions: SuperinstructionMode,
-    bytecode_layout: BytecodeLayoutMode,
-    quickening: QuickeningMode,
-    inline_caches: InlineCacheMode,
-    jit: JitMode,
-    jit_blacklist: JitBlacklistMode,
-    tiering: TieringOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1958,6 +1900,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         return Err("run requires <path.php>".to_string());
     };
 
+    let default_options = PhpExecutorOptions::managed_fast_runtime();
     let mut path = None;
     let mut env = Vec::new();
     let mut trace = false;
@@ -1965,19 +1908,20 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let mut counters_json = None;
     let mut region_profile_json = None;
     let mut bytecode_cache = BytecodeCacheOptions::default();
-    let mut opt_level = OptimizationLevel::O0;
-    let mut execution_format = ExecutionFormat::Ir;
-    let mut superinstructions = SuperinstructionMode::Off;
-    let mut bytecode_layout = BytecodeLayoutMode::Source;
+    let mut opt_level = default_options.optimization_level;
+    let mut execution_format = default_options.vm_options.execution_format;
+    let mut superinstructions = default_options.vm_options.superinstructions;
+    let mut bytecode_layout = default_options.vm_options.bytecode_layout;
     let mut bytecode_layout_profile = None;
-    let mut quickening = QuickeningMode::Off;
-    let mut inline_caches = InlineCacheMode::Off;
-    let mut jit = JitMode::Off;
-    let mut jit_threshold = TieringOptions::default().function_entry_threshold;
-    let mut jit_blacklist = JitBlacklistMode::On;
+    let mut quickening = default_options.vm_options.quickening;
+    let mut inline_caches = default_options.vm_options.inline_caches;
+    let mut jit = default_options.vm_options.jit;
+    let mut jit_explicit = false;
+    let mut jit_threshold = default_options.vm_options.jit_threshold;
+    let mut jit_blacklist = default_options.vm_options.jit_blacklist;
     let mut jit_dump_clif = None;
     let mut jit_stats = JitStatsMode::Off;
-    let mut tiering = TieringOptions::default();
+    let mut tiering = default_options.vm_options.tiering;
     let mut tiering_stats_json = None;
     let mut persistent_feedback = PersistentFeedbackOptions::default();
     let mut tiering_function_threshold_explicit = false;
@@ -1989,38 +1933,38 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
             "--engine-preset" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return Err(
-                        "run --engine-preset requires baseline, fast, or experimental-jit"
-                            .to_string(),
-                    );
+                    return Err(format!(
+                        "run --engine-preset requires {}",
+                        EngineProfileName::accepted_values()
+                    ));
                 };
-                let config = parse_engine_preset(value)?.config();
-                bytecode_cache.mode = config.bytecode_cache_mode;
-                opt_level = config.opt_level;
-                execution_format = config.execution_format;
-                superinstructions = config.superinstructions;
-                bytecode_layout = config.bytecode_layout;
-                quickening = config.quickening;
-                inline_caches = config.inline_caches;
-                jit = config.jit;
-                jit_blacklist = config.jit_blacklist;
-                tiering = config.tiering;
-                jit_threshold = tiering.function_entry_threshold;
+                let profile_options = PhpExecutorOptions::for_profile(parse_engine_preset(value)?);
+                bytecode_cache.mode = BytecodeCacheMode::Off;
+                opt_level = profile_options.optimization_level;
+                execution_format = profile_options.vm_options.execution_format;
+                superinstructions = profile_options.vm_options.superinstructions;
+                bytecode_layout = profile_options.vm_options.bytecode_layout;
+                quickening = profile_options.vm_options.quickening;
+                inline_caches = profile_options.vm_options.inline_caches;
+                jit = profile_options.vm_options.jit;
+                jit_blacklist = profile_options.vm_options.jit_blacklist;
+                tiering = profile_options.vm_options.tiering;
+                jit_threshold = profile_options.vm_options.jit_threshold;
                 tiering_function_threshold_explicit = false;
             }
             arg if let Some(value) = arg.strip_prefix("--engine-preset=") => {
-                let config = parse_engine_preset(value)?.config();
-                bytecode_cache.mode = config.bytecode_cache_mode;
-                opt_level = config.opt_level;
-                execution_format = config.execution_format;
-                superinstructions = config.superinstructions;
-                bytecode_layout = config.bytecode_layout;
-                quickening = config.quickening;
-                inline_caches = config.inline_caches;
-                jit = config.jit;
-                jit_blacklist = config.jit_blacklist;
-                tiering = config.tiering;
-                jit_threshold = tiering.function_entry_threshold;
+                let profile_options = PhpExecutorOptions::for_profile(parse_engine_preset(value)?);
+                bytecode_cache.mode = BytecodeCacheMode::Off;
+                opt_level = profile_options.optimization_level;
+                execution_format = profile_options.vm_options.execution_format;
+                superinstructions = profile_options.vm_options.superinstructions;
+                bytecode_layout = profile_options.vm_options.bytecode_layout;
+                quickening = profile_options.vm_options.quickening;
+                inline_caches = profile_options.vm_options.inline_caches;
+                jit = profile_options.vm_options.jit;
+                jit_blacklist = profile_options.vm_options.jit_blacklist;
+                tiering = profile_options.vm_options.tiering;
+                jit_threshold = profile_options.vm_options.jit_threshold;
                 tiering_function_threshold_explicit = false;
             }
             "--bytecode-cache" => {
@@ -2123,9 +2067,11 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     return Err("run --jit requires off, noop, or cranelift".to_string());
                 };
                 jit = parse_jit_mode(value)?;
+                jit_explicit = true;
             }
             arg if let Some(value) = arg.strip_prefix("--jit=") => {
                 jit = parse_jit_mode(value)?;
+                jit_explicit = true;
             }
             "--jit-threshold" => {
                 index += 1;
@@ -2345,6 +2291,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     quickening,
                     inline_caches,
                     jit,
+                    jit_explicit,
                     jit_threshold,
                     jit_blacklist,
                     jit_dump_clif,
@@ -2383,6 +2330,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         quickening,
         inline_caches,
         jit,
+        jit_explicit,
         jit_threshold,
         jit_blacklist,
         jit_dump_clif,
@@ -2403,15 +2351,8 @@ fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {
     }
 }
 
-fn parse_engine_preset(value: &str) -> Result<EnginePreset, String> {
-    match value {
-        "baseline" => Ok(EnginePreset::Baseline),
-        "fast" => Ok(EnginePreset::Fast),
-        "experimental-jit" => Ok(EnginePreset::ExperimentalJit),
-        _ => Err(format!(
-            "unsupported engine preset `{value}`; expected baseline, fast, or experimental-jit"
-        )),
-    }
+fn parse_engine_preset(value: &str) -> Result<EngineProfileName, String> {
+    EngineProfileName::parse(value).map_err(|error| error.to_string())
 }
 
 fn parse_jit_blacklist_mode(value: &str) -> Result<JitBlacklistMode, String> {
@@ -3176,7 +3117,7 @@ fn region_profile_json_from_env() -> Option<String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-rule-selection <file> [--json]\n  php-vm dump-dependency-units <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--bytecode-layout source|profiled] [--bytecode-layout-profile <path>] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] [--counters-json <path>] [--region-profile-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>"
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-rule-selection <file> [--json]\n  php-vm dump-dependency-units <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--engine-preset baseline|default|fast|experimental-jit] [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [developer engine flags] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nEngine presets:\n  default          managed fast runtime with guarded native tier where available; also accepted as fast\n  baseline         compatibility/debug oracle with adaptive VM features off\n  experimental-jit developer native diagnostics profile using the same guarded tier\n\nAdvanced engine flags (developer diagnostics):\n  --opt-level 0|1|2 --exec-format ir|auto|bytecode --superinstructions off|on --bytecode-layout source|profiled --bytecode-layout-profile <path> --quickening off|on --inline-caches off|on --jit off|noop|cranelift --jit-threshold N --jit-max-compile-us N --jit-max-functions N --jit-eager --jit-blacklist off|on --jit-dump-clif PATH --jit-stats json --tiering off|on --tiering-function-threshold N --tiering-loop-threshold N --tiering-ic-stability-threshold N --tiering-guard-failure-threshold N --tiering-stats-json <path> --persistent-feedback-read <path> --persistent-feedback-stats-json <path> --counters-json <path> --region-profile-json <path>"
     )
     .map_err(|error| error.to_string())
 }
@@ -3295,6 +3236,7 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
         | DenseOpcode::Move
         | DenseOpcode::LoadLocal
         | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::LoadConstEcho
         | DenseOpcode::LoadLocalEcho
         | DenseOpcode::Echo
@@ -3348,12 +3290,21 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
             code_size_bytes_estimate: 16,
             unsupported_reason: None,
         },
-        DenseOpcode::CallFunction => BaselineStencilClass {
+        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
+            BaselineStencilClass {
+                helper_calls: 1,
+                deopt_slots: 1,
+                compile_cost_units: 5,
+                code_size_bytes_estimate: 0,
+                unsupported_reason: Some("call_frame_and_userland_side_effect_state"),
+            }
+        }
+        DenseOpcode::FetchProperty | DenseOpcode::AssignProperty => BaselineStencilClass {
             helper_calls: 1,
             deopt_slots: 1,
             compile_cost_units: 5,
             code_size_bytes_estimate: 0,
-            unsupported_reason: Some("call_frame_and_userland_side_effect_state"),
+            unsupported_reason: None,
         },
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
@@ -3442,7 +3393,7 @@ fn collect_copy_patch_stencils(
         .functions
         .iter()
         .flat_map(|function| &function.instructions)
-        .any(|instruction| matches!(instruction.opcode, DenseOpcode::FetchDim))
+        .any(|instruction| matches!(instruction.opcode, DenseOpcode::FetchProperty))
     {
         report
             .unsupported_by_reason
@@ -3522,6 +3473,57 @@ fn classify_copy_patch_stencil_instruction(
             compile_cost_units: 5,
             unsupported_reason: None,
         },
+        DenseOpcode::FetchProperty => CopyPatchStencilClass {
+            kind: "guarded_property_fetch",
+            patch_sites: &[
+                "object_register",
+                "property_name",
+                "destination_register",
+                "shape_guard_exit",
+            ],
+            guard_dependencies: &[
+                "receiver_class_epoch",
+                "property_layout_epoch",
+                "visibility_scope",
+            ],
+            helper_calls: &["php_jit_property_fetch_slow"],
+            live_state_requirements: &[
+                "object_value",
+                "destination_register",
+                "diagnostic_order",
+                "resume_instruction",
+            ],
+            side_exit_target: "interpreter_property_fetch_exit",
+            code_size_bytes_estimate: 48,
+            compile_cost_units: 5,
+            unsupported_reason: None,
+        },
+        DenseOpcode::AssignProperty => CopyPatchStencilClass {
+            kind: "guarded_property_assignment",
+            patch_sites: &[
+                "object_register",
+                "value_register",
+                "property_name",
+                "shape_guard_exit",
+            ],
+            guard_dependencies: &[
+                "receiver_class_epoch",
+                "property_layout_epoch",
+                "visibility_scope",
+                "property_type",
+            ],
+            helper_calls: &["php_jit_property_assign_slow"],
+            live_state_requirements: &[
+                "object_value",
+                "assigned_value",
+                "diagnostic_order",
+                "resume_instruction",
+            ],
+            side_exit_target: "interpreter_property_assign_exit",
+            code_size_bytes_estimate: 56,
+            compile_cost_units: 6,
+            unsupported_reason: None,
+        },
         DenseOpcode::CallFunction if is_known_builtin_copy_patch_call(dense, operands) => {
             CopyPatchStencilClass {
                 kind: "known_builtin_call",
@@ -3571,6 +3573,7 @@ fn classify_copy_patch_stencil_instruction(
         DenseOpcode::LoadConst
         | DenseOpcode::Move
         | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::LoadConstEcho
         | DenseOpcode::Echo
         | DenseOpcode::Discard
@@ -3596,7 +3599,7 @@ fn classify_copy_patch_stencil_instruction(
             compile_cost_units: 1,
             unsupported_reason: None,
         },
-        DenseOpcode::CallFunction => {
+        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
             unsupported_copy_patch_class("dynamic_or_userland_call_requires_frame_and_symbol_state")
         }
         DenseOpcode::NewArray
@@ -3784,6 +3787,27 @@ fn classify_mid_tier_instruction(
             push_unique(&mut plan.required_helpers, "php_jit_array_fetch_int_slow");
             plan.deopt_points += 1;
         }
+        DenseOpcode::FetchProperty => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "property_shape_guard_specialization",
+            );
+            push_unique(&mut plan.expected_guards, "receiver_class_epoch");
+            push_unique(&mut plan.expected_guards, "property_layout_epoch");
+            push_unique(&mut plan.required_helpers, "php_jit_property_fetch_slow");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::AssignProperty => {
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "property_assignment_guard_specialization",
+            );
+            push_unique(&mut plan.expected_guards, "receiver_class_epoch");
+            push_unique(&mut plan.expected_guards, "property_layout_epoch");
+            push_unique(&mut plan.expected_guards, "property_type");
+            push_unique(&mut plan.required_helpers, "php_jit_property_assign_slow");
+            plan.deopt_points += 1;
+        }
         DenseOpcode::CallFunction if is_known_builtin_copy_patch_call(dense, operands) => {
             push_unique(
                 &mut plan.candidate_optimizations,
@@ -3794,7 +3818,7 @@ fn classify_mid_tier_instruction(
             push_unique(&mut plan.required_helpers, "known_builtin_helper");
             plan.deopt_points += 1;
         }
-        DenseOpcode::CallFunction => {
+        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
             push_unique(&mut plan.rejection_reasons, "magic_hooks_or_dynamic_calls");
             plan.deopt_points += 1;
         }
@@ -3838,6 +3862,7 @@ fn classify_mid_tier_instruction(
         | DenseOpcode::Move
         | DenseOpcode::LoadLocal
         | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::LoadConstEcho
         | DenseOpcode::LoadLocalEcho
         | DenseOpcode::Jump
@@ -4802,7 +4827,64 @@ mod tests {
     }
 
     #[test]
-    fn run_args_accept_fast_engine_preset() {
+    fn run_args_default_to_shared_default_engine_profile() {
+        let args = vec!["fixtures/runtime/valid/hello.php".to_string()];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
+        assert_eq!(options.opt_level, OptimizationLevel::O2);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.superinstructions, SuperinstructionMode::On);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
+        assert_eq!(options.bytecode_layout_profile, None);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::Cranelift);
+        assert_eq!(options.jit_blacklist, JitBlacklistMode::On);
+        assert!(options.tiering.enabled);
+        assert_eq!(
+            options.jit_threshold,
+            options.tiering.function_entry_threshold
+        );
+    }
+
+    #[test]
+    fn run_args_accept_default_engine_preset() {
+        let args = vec![
+            "--engine-preset=default".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.opt_level, OptimizationLevel::O2);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::Cranelift);
+        assert!(options.tiering.enabled);
+    }
+
+    #[test]
+    fn run_args_accept_baseline_engine_preset() {
+        let args = vec![
+            "--engine-preset=baseline".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let options = parse_run_args(&args).expect("run args should parse");
+
+        assert_eq!(options.opt_level, OptimizationLevel::O0);
+        assert_eq!(options.execution_format, ExecutionFormat::Ir);
+        assert_eq!(options.quickening, QuickeningMode::Off);
+        assert_eq!(options.inline_caches, InlineCacheMode::Off);
+        assert_eq!(options.jit, JitMode::Off);
+        assert!(!options.tiering.enabled);
+    }
+
+    #[test]
+    fn run_args_accept_fast_engine_preset_alias() {
         let args = vec![
             "--engine-preset=fast".to_string(),
             "fixtures/runtime/valid/hello.php".to_string(),
@@ -4813,12 +4895,12 @@ mod tests {
         assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
         assert_eq!(options.opt_level, OptimizationLevel::O2);
         assert_eq!(options.execution_format, ExecutionFormat::Auto);
-        assert_eq!(options.superinstructions, SuperinstructionMode::Off);
+        assert_eq!(options.superinstructions, SuperinstructionMode::On);
         assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
         assert_eq!(options.bytecode_layout_profile, None);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
-        assert_eq!(options.jit, JitMode::Off);
+        assert_eq!(options.jit, JitMode::Cranelift);
         assert_eq!(options.jit_blacklist, JitBlacklistMode::On);
         assert!(options.tiering.enabled);
         assert_eq!(
@@ -4878,7 +4960,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("expected baseline, fast, or experimental-jit"));
+        assert!(error.contains("expected baseline, default, fast, or experimental-jit"));
     }
 
     #[test]
@@ -5019,10 +5101,59 @@ mod tests {
         let json = std::fs::read_to_string(&path).expect("counter JSON should be written");
         let _ = std::fs::remove_file(&path);
         assert!(json.contains("\"instructions_executed\""));
-        assert!(json.contains("\"jit_mode\": \"off\""));
+        assert!(json.contains("\"jit_mode\": \"cranelift\""));
         assert!(json.contains("\"jit_threshold\": 8"));
-        assert!(json.contains("\"echo\": 1"));
+        assert!(json.contains("\"output_bytes\": 14"));
         assert!(json.contains("\"guard_failures\": 0"));
+    }
+
+    #[test]
+    fn run_default_collects_managed_fast_path_counters() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-default-counters-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create CLI counter fixture root");
+        let script = root.join("index.php");
+        let counters_path = root.join("counters.json");
+        fs::write(&script, managed_fast_counter_source()).expect("write CLI counter fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--counters-json".to_string(),
+                counters_path.display().to_string(),
+                script.display().to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"123512351235");
+        assert!(stderr.is_empty());
+        let json = fs::read_to_string(&counters_path).expect("counter JSON should be written");
+        let _ = fs::remove_dir_all(&root);
+        let counters = parse_json_text(&json);
+        assert_eq!(counters["jit_mode"], "cranelift");
+        assert_eq!(counters["native_executions"], counters["jit_executed"]);
+        assert!(
+            counters["bytecode_lower_attempts"].as_u64().unwrap() > 0,
+            "{json}"
+        );
+        assert!(
+            counters["quickening_attempts"].as_u64().unwrap() > 0,
+            "{json}"
+        );
+        assert!(
+            counters["inline_cache_observations"].as_u64().unwrap() > 0,
+            "{json}"
+        );
     }
 
     #[test]
@@ -5213,8 +5344,8 @@ mod tests {
     fn run_args_accept_controlled_environment_entries() {
         let args = vec![
             "--env".to_string(),
-            "COMPOSER_HOME=/tmp/composer".to_string(),
-            "--env=COMPOSER_CACHE_DIR=/tmp/cache".to_string(),
+            "PHP_APP_HOME=/tmp/app".to_string(),
+            "--env=PHP_APP_CACHE_DIR=/tmp/cache".to_string(),
             "fixtures/runtime/valid/hello.php".to_string(),
             "--".to_string(),
             "script-arg".to_string(),
@@ -5226,14 +5357,14 @@ mod tests {
         assert_eq!(options.script_args, vec!["script-arg"]);
         assert_eq!(options.counters_json, None);
         assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Off);
-        assert_eq!(options.opt_level, OptimizationLevel::O0);
-        assert_eq!(options.execution_format, ExecutionFormat::Ir);
-        assert_eq!(options.superinstructions, SuperinstructionMode::Off);
+        assert_eq!(options.opt_level, OptimizationLevel::O2);
+        assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.superinstructions, SuperinstructionMode::On);
         assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
         assert_eq!(options.bytecode_layout_profile, None);
-        assert_eq!(options.quickening, QuickeningMode::Off);
-        assert_eq!(options.inline_caches, InlineCacheMode::Off);
-        assert_eq!(options.jit, JitMode::Off);
+        assert_eq!(options.quickening, QuickeningMode::On);
+        assert_eq!(options.inline_caches, InlineCacheMode::On);
+        assert_eq!(options.jit, JitMode::Cranelift);
         assert_eq!(options.jit_blacklist, JitBlacklistMode::On);
         assert!(options.tiering.enabled);
         assert!(!options.tiering.collect_stats);
@@ -5245,8 +5376,8 @@ mod tests {
         assert_eq!(
             options.env,
             vec![
-                ("COMPOSER_HOME".to_string(), "/tmp/composer".to_string()),
-                ("COMPOSER_CACHE_DIR".to_string(), "/tmp/cache".to_string())
+                ("PHP_APP_HOME".to_string(), "/tmp/app".to_string()),
+                ("PHP_APP_CACHE_DIR".to_string(), "/tmp/cache".to_string())
             ]
         );
     }
@@ -5875,6 +6006,20 @@ mod tests {
         }
         fixtures.sort();
         fixtures
+    }
+
+    fn managed_fast_counter_source() -> &'static str {
+        "<?php\n\
+         function ic_f() { return 1; }\n\
+         class ICSlotSmoke {\n\
+             public $x = 3;\n\
+             public function m() { return 2; }\n\
+         }\n\
+         $object = new ICSlotSmoke();\n\
+         $items = [4, 5];\n\
+         for ($i = 0; $i < 3; $i = $i + 1) {\n\
+             echo ic_f(), $object->m(), $object->x, $items[1];\n\
+         }\n"
     }
 
     fn fixture(path: &str) -> String {

@@ -14,8 +14,9 @@ pub use result::{VmControlFlow, VmResult};
 
 use crate::aliasing::{AliasState, slot_alias_state};
 use crate::bytecode::{
-    DenseBytecodeUnit, DenseCallArg, DenseFunction, DenseInstruction, DenseOpcode, DenseOperand,
-    DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
+    DenseBytecodeUnit, DenseCallArg, DenseExecutionPlan, DenseFunction, DenseFunctionPlan,
+    DenseInstruction, DenseOpcode, DenseOperand, DenseOperandKind, DenseOperands,
+    SuperinstructionSelectionReport,
 };
 use crate::compiled_unit::CompiledUnit;
 #[cfg(feature = "jit-cranelift")]
@@ -24,7 +25,7 @@ use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservat
 #[cfg(feature = "jit-cranelift")]
 use crate::deopt::GuardKind;
 use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument};
-use crate::include::{LoadedInclude, include_path_file_fingerprint};
+use crate::include::{IncludeCacheStats, LoadedInclude, include_path_file_fingerprint};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
     AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
@@ -670,6 +671,150 @@ fn jit_leaf_call_shape_is_supported(
 }
 
 #[cfg(feature = "jit-cranelift")]
+fn native_leaf_rejection_reason(
+    function: &IrFunction,
+    call_shape_supported: bool,
+    args: &[PreparedArg],
+) -> &'static str {
+    if !call_shape_supported {
+        return "call_shape";
+    }
+    if function.flags.is_top_level {
+        return "top_level_function";
+    }
+    if function.flags.is_closure {
+        return "closure";
+    }
+    if function.flags.is_method {
+        return "method";
+    }
+    if function.flags.is_generator {
+        return "generator";
+    }
+    if function.returns_by_ref {
+        return "by_reference_return";
+    }
+    if !matches!(
+        function.return_type.as_ref(),
+        None | Some(IrReturnType::Int | IrReturnType::String)
+    ) {
+        return "return_type";
+    }
+    if !function.captures.is_empty() {
+        return "captured_variables";
+    }
+    if function.params.iter().any(|param| param.by_ref) {
+        return "by_reference_param";
+    }
+    if function.params.iter().any(|param| param.variadic) {
+        return "variadic_param";
+    }
+    if function.params.iter().any(|param| param.default.is_some()) {
+        return "default_param";
+    }
+    if function.params.iter().any(|param| {
+        !matches!(
+            param.type_.as_ref(),
+            None | Some(
+                IrReturnType::Int
+                    | IrReturnType::String
+                    | IrReturnType::Array
+                    | IrReturnType::Class { .. }
+            )
+        )
+    }) {
+        return "param_type";
+    }
+    if args.iter().any(|arg| arg.reference.is_some()) {
+        return "reference_arg";
+    }
+    "unsupported_leaf_shape"
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn execute_jit_int_leaf(
+    unit: &IrUnit,
+    function: &IrFunction,
+    args: &[PreparedArg],
+) -> Result<Value, ()> {
+    if function.blocks.len() != 1 || function.params.len() != args.len() {
+        return Err(());
+    }
+    let mut locals = vec![None; function.local_count as usize];
+    let mut registers = vec![None; function.register_count as usize];
+    for (param, arg) in function.params.iter().zip(args) {
+        locals[param.local.index()] = Some(value_as_jit_int(&arg.value)?);
+    }
+
+    let block = &function.blocks[0];
+    for instruction in &block.instructions {
+        match &instruction.kind {
+            InstructionKind::Nop => {}
+            InstructionKind::LoadConst { dst, constant } => {
+                registers[dst.index()] = Some(constant_as_jit_int(unit, *constant)?);
+            }
+            InstructionKind::Move { dst, src } => {
+                registers[dst.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
+            }
+            InstructionKind::LoadLocal { dst, local } => {
+                registers[dst.index()] =
+                    Some(locals.get(local.index()).copied().flatten().ok_or(())?);
+            }
+            InstructionKind::StoreLocal { local, src } => {
+                locals[local.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
+            }
+            InstructionKind::Binary { dst, op, lhs, rhs } => {
+                let lhs = operand_as_jit_int(unit, &registers, &locals, lhs)?;
+                let rhs = operand_as_jit_int(unit, &registers, &locals, rhs)?;
+                let value = match op {
+                    BinaryOp::Add => lhs.checked_add(rhs).ok_or(())?,
+                    BinaryOp::Sub => lhs.checked_sub(rhs).ok_or(())?,
+                    BinaryOp::Mul => lhs.checked_mul(rhs).ok_or(())?,
+                    _ => return Err(()),
+                };
+                registers[dst.index()] = Some(value);
+            }
+            _ => return Err(()),
+        }
+    }
+
+    match &block.terminator {
+        Some(terminator) => match &terminator.kind {
+            TerminatorKind::Return {
+                value: Some(value),
+                by_ref_local: None,
+            } => Ok(Value::Int(operand_as_jit_int(
+                unit, &registers, &locals, value,
+            )?)),
+            _ => Err(()),
+        },
+        None => Err(()),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn operand_as_jit_int(
+    unit: &IrUnit,
+    registers: &[Option<i64>],
+    locals: &[Option<i64>],
+    operand: &Operand,
+) -> Result<i64, ()> {
+    match operand {
+        Operand::Register(register) => registers.get(register.index()).copied().flatten().ok_or(()),
+        Operand::Local(local) => locals.get(local.index()).copied().flatten().ok_or(()),
+        Operand::Constant(constant) => constant_as_jit_int(unit, *constant),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
+fn constant_as_jit_int(unit: &IrUnit, constant: ConstId) -> Result<i64, ()> {
+    match unit.constants.get(constant.index()) {
+        Some(IrConstant::Int(value)) => Ok(*value),
+        _ => Err(()),
+    }
+}
+
+#[cfg(feature = "jit-cranelift")]
 fn value_as_jit_int(value: &Value) -> Result<i64, ()> {
     match value {
         Value::Int(value) => Ok(*value),
@@ -685,6 +830,11 @@ enum PropertyFetchCacheRead {
 enum PropertyAssignCacheWrite {
     Written(Value),
     Fallback,
+}
+
+enum SemanticHelperResult {
+    FastHit,
+    Fallback(&'static str),
 }
 
 enum BytecodeEntryAttempt {
@@ -1686,6 +1836,12 @@ fn method_call_shape(args: &[CallArgument]) -> MethodCallShape {
     }
 }
 
+fn dense_call_has_by_ref_argument(args: &[CallArgument]) -> bool {
+    args.iter().any(|arg| {
+        arg.by_ref_local.is_some() || arg.by_ref_dim.is_some() || arg.by_ref_property.is_some()
+    })
+}
+
 fn function_call_builtin_metadata(
     target: &FunctionCallCacheTarget,
 ) -> Option<FunctionCallBuiltinMetadata> {
@@ -2084,6 +2240,127 @@ impl Vm {
         }
     }
 
+    fn record_counter_dense_execution_plan(&self, plan: &DenseExecutionPlan) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_execution_plan(
+                plan.dense_function_count(),
+                plan.rich_fallback_function_count(),
+            );
+        }
+    }
+
+    fn record_counter_dense_function_executed(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_function_executed();
+        }
+    }
+
+    fn record_counter_dense_property_fetch_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_property_fetch_hit();
+        }
+    }
+
+    fn record_counter_dense_property_assignment_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_property_assignment_hit();
+        }
+    }
+
+    fn record_counter_dense_property_ic_reuse(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_property_ic_reuse();
+        }
+    }
+
+    fn record_counter_dense_property_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_property_fallback(reason);
+        }
+    }
+
+    fn record_counter_dense_direct_call_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_direct_call_hit();
+        }
+    }
+
+    fn record_counter_dense_method_call_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_method_call_hit();
+        }
+    }
+
+    fn record_counter_dense_static_call_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_static_call_hit();
+        }
+    }
+
+    fn record_counter_dense_call_ic_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_call_ic_hit();
+        }
+    }
+
+    fn record_counter_dense_call_ic_miss(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_call_ic_miss();
+        }
+    }
+
+    fn record_counter_dense_call_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_call_fallback(reason);
+        }
+    }
+
+    fn record_counter_rich_fallback_function_executed(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters
+                .record_rich_fallback_function_executed(dense_bytecode_unsupported_reason(reason));
+        }
+    }
+
     fn record_counter_bytecode_unsupported_fallback(&self) {
         if !self.options.collect_counters {
             return;
@@ -2191,6 +2468,33 @@ impl Vm {
         }
     }
 
+    fn record_counter_include_compile_miss(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_include_compile_miss();
+        }
+    }
+
+    fn record_counter_include_once_skip(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_include_once_skip();
+        }
+    }
+
+    fn record_counter_include_stale_invalidation_by_reason(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_include_stale_invalidation_by_reason(reason);
+        }
+    }
+
     fn record_counter_negative_lookup_hit(&self) {
         if !self.options.collect_counters {
             return;
@@ -2215,6 +2519,40 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_fallback_by_path_semantics(reason);
+            counters.record_include_fallback_by_reason(reason);
+        }
+    }
+
+    fn record_include_cache_stats_delta(
+        &self,
+        before: IncludeCacheStats,
+        after: IncludeCacheStats,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for _ in 0..after.resolution_hits.saturating_sub(before.resolution_hits) {
+                counters.record_include_resolution_hit();
+            }
+            for _ in 0..after
+                .resolution_misses
+                .saturating_sub(before.resolution_misses)
+            {
+                counters.record_include_resolution_miss();
+            }
+            for _ in 0..after.compile_hits.saturating_sub(before.compile_hits) {
+                counters.record_include_compile_hit();
+            }
+            for _ in 0..after.compile_misses.saturating_sub(before.compile_misses) {
+                counters.record_include_compile_miss();
+            }
+            for _ in 0..after
+                .stale_invalidations
+                .saturating_sub(before.stale_invalidations)
+            {
+                counters.record_include_stale_invalidation_by_reason("file_fingerprint_changed");
+            }
         }
     }
 
@@ -2629,6 +2967,36 @@ impl Vm {
         }
     }
 
+    #[cfg_attr(feature = "jit-cranelift", allow(dead_code))]
+    fn record_counter_native_candidate(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_candidate();
+        }
+    }
+
+    #[cfg_attr(feature = "jit-cranelift", allow(dead_code))]
+    fn record_counter_native_platform_unavailable(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_platform_unavailable();
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    fn record_counter_native_eligibility_rejection(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_eligibility_rejection(reason);
+        }
+    }
+
     #[cfg(feature = "jit-cranelift")]
     fn record_counter_jit_tiering_blacklist_rejection(&self) {
         self.tiering.borrow_mut().record_jit_blacklist_rejection();
@@ -2996,10 +3364,7 @@ impl Vm {
         instruction_id: php_ir::ids::InstrId,
         kind: &InstructionKind,
     ) {
-        if !self.options.tiering.enabled
-            || (!self.options.inline_caches.enabled()
-                && !self.cranelift_method_direct_call_path_enabled(kind))
-        {
+        if !self.options.tiering.enabled || !self.options.inline_caches.enabled() {
             return;
         }
         let Some(cache_kind) = crate::inline_cache::inline_cache_kind_for_instruction(kind) else {
@@ -3015,13 +3380,50 @@ impl Vm {
         self.record_counter_inline_cache_site(function_id, instruction_id.raw(), observation);
     }
 
-    fn cranelift_method_direct_call_path_enabled(&self, kind: &InstructionKind) -> bool {
-        matches!(self.options.jit, JitMode::Cranelift)
-            && matches!(kind, InstructionKind::CallMethod { .. })
+    fn observe_dense_property_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        kind: InlineCacheKind,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self.inline_caches.borrow_mut().observe_slot(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            kind,
+        );
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
+    }
+
+    fn observe_dense_call_inline_cache(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: php_ir::ids::InstrId,
+        kind: InlineCacheKind,
+    ) {
+        if !self.options.inline_caches.enabled() {
+            return;
+        }
+        let observation = self.inline_caches.borrow_mut().observe_slot(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            kind,
+        );
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
     }
 
     fn method_call_inline_cache_enabled(&self) -> bool {
-        self.options.inline_caches.enabled() || matches!(self.options.jit, JitMode::Cranelift)
+        self.options.inline_caches.enabled()
     }
 
     fn lookup_function_call_inline_cache(
@@ -4972,10 +5374,14 @@ impl Vm {
         _state: &ExecutionState,
         _function_id: FunctionId,
         _function: &IrFunction,
-        _tier: ExecutionTier,
+        tier: ExecutionTier,
         _call_shape_supported: bool,
         _args: &[PreparedArg],
     ) -> Option<Value> {
+        if tier == ExecutionTier::Jit && matches!(self.options.jit, JitMode::Cranelift) {
+            self.record_counter_native_candidate();
+            self.record_counter_native_platform_unavailable();
+        }
         None
     }
 
@@ -4990,13 +5396,16 @@ impl Vm {
         call_shape_supported: bool,
         args: &[PreparedArg],
     ) -> Option<Value> {
-        if tier != ExecutionTier::Jit
-            || !self.options.tiering.enabled
-            || !jit_leaf_call_shape_is_supported(function, call_shape_supported, args)
-        {
+        if tier != ExecutionTier::Jit || !self.options.tiering.enabled {
             return None;
         }
         if self.options.jit != JitMode::Cranelift {
+            return None;
+        }
+        self.record_counter_native_candidate();
+        if !jit_leaf_call_shape_is_supported(function, call_shape_supported, args) {
+            let reason = native_leaf_rejection_reason(function, call_shape_supported, args);
+            self.record_counter_native_eligibility_rejection(reason);
             return None;
         }
 
@@ -5452,6 +5861,82 @@ impl Vm {
             );
         }
         self.record_counter_bytecode_lower_attempt();
+        if !self.options.execution_format.is_strict_bytecode() {
+            let mut plan = DenseBytecodeUnit::mixed_plan_from_ir(compiled.unit());
+            self.record_counter_dense_execution_plan(&plan);
+            if let Err(errors) = plan.unit.verify() {
+                return BytecodeEntryAttempt::Unsupported(format!(
+                    "E_PHP_VM_DENSE_BYTECODE_VERIFY: mixed dense bytecode verifier rejected unit with {} error(s)",
+                    errors.len()
+                ));
+            }
+            if self.options.superinstructions.is_enabled() {
+                let report = plan.unit.select_superinstructions();
+                self.record_counter_superinstruction_selection(&report);
+                if let Err(errors) = plan.unit.verify() {
+                    return BytecodeEntryAttempt::Unsupported(format!(
+                        "E_PHP_VM_DENSE_SUPERINSTRUCTION_VERIFY: selected mixed dense bytecode failed verification with {} error(s)",
+                        errors.len()
+                    ));
+                }
+            }
+            if self.options.bytecode_layout.is_profiled() {
+                let _report = plan
+                    .unit
+                    .apply_profiled_layout(self.options.bytecode_layout_profile.as_ref());
+                if let Err(errors) = plan.unit.verify() {
+                    return BytecodeEntryAttempt::Unsupported(format!(
+                        "E_PHP_VM_DENSE_LAYOUT_VERIFY: profiled mixed dense bytecode layout failed verification with {} error(s)",
+                        errors.len()
+                    ));
+                }
+            }
+            self.record_counter_bytecode_lowered_families(&plan.unit);
+            self.record_counter_bytecode_lower_success();
+            let entry = compiled.unit().entry;
+            let Some(ir_function) = compiled.unit().functions.get(entry.index()) else {
+                return BytecodeEntryAttempt::Unsupported(
+                    "E_PHP_VM_DENSE_BYTECODE_ENTRY: IR entry function is missing".to_string(),
+                );
+            };
+            return match plan.function_plan(entry.index()) {
+                Some(DenseFunctionPlan::Dense) => {
+                    let Some(dense_function) = plan.unit.functions.get(entry.index()) else {
+                        return BytecodeEntryAttempt::Unsupported(
+                            "E_PHP_VM_DENSE_BYTECODE_ENTRY: dense bytecode entry function is missing"
+                                .to_string(),
+                        );
+                    };
+                    BytecodeEntryAttempt::Executed(Box::new(self.execute_bytecode_function(
+                        compiled,
+                        &plan.unit,
+                        Some(&plan),
+                        dense_function,
+                        ir_function,
+                        entry,
+                        FunctionCall::new(Vec::new(), Vec::new()),
+                        output,
+                        stack,
+                        state,
+                    )))
+                }
+                Some(DenseFunctionPlan::RichFallback { reason }) => {
+                    self.record_counter_rich_fallback_function_executed(reason);
+                    BytecodeEntryAttempt::Executed(Box::new(self.execute_function(
+                        compiled,
+                        entry,
+                        FunctionCall::new(Vec::new(), Vec::new()),
+                        output,
+                        stack,
+                        state,
+                    )))
+                }
+                None => BytecodeEntryAttempt::Unsupported(
+                    "E_PHP_VM_DENSE_BYTECODE_ENTRY: dense execution plan entry is missing"
+                        .to_string(),
+                ),
+            };
+        }
         let mut dense = match DenseBytecodeUnit::lower_from_ir(compiled.unit()) {
             Ok(dense) => dense,
             Err(error) => {
@@ -5504,9 +5989,11 @@ impl Vm {
         BytecodeEntryAttempt::Executed(Box::new(self.execute_bytecode_function(
             compiled,
             &dense,
+            None,
             dense_function,
             ir_function,
             entry,
+            FunctionCall::new(Vec::new(), Vec::new()),
             output,
             stack,
             state,
@@ -5518,26 +6005,166 @@ impl Vm {
         &self,
         compiled: &CompiledUnit,
         dense: &DenseBytecodeUnit,
+        plan: Option<&DenseExecutionPlan>,
         dense_function: &DenseFunction,
         ir_function: &IrFunction,
         function_id: FunctionId,
+        mut call: FunctionCall<'_>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        self.record_counter_dense_function_executed();
+        if call.resume_continuation.is_some()
+            || call.resume_fiber_continuation.is_some()
+            || call.running_generator.is_some()
+            || call.running_fiber.is_some()
+        {
+            return VmResult::unsupported(
+                output.clone(),
+                "E_PHP_VM_DENSE_BYTECODE_CALL_SHAPE_UNSUPPORTED: dense bytecode function calls do not support generator or fiber continuations yet",
+            );
+        }
+        let mut diagnostics = Vec::new();
+        let frame_layout = call_frame_layout_class(ir_function, &call);
+        let prepared = match arguments::prepare_arguments(
+            compiled,
+            ir_function,
+            call.args,
+            stack,
+            state,
+            self.typecheck_fast_path_context(),
+            call.allow_by_ref_value_warnings,
+            call.call_span,
+            call.by_ref_warning_callable_name.as_deref(),
+        ) {
+            Ok(args) => args,
+            Err(message) => {
+                let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
+                let error_span = call.call_span.unwrap_or(ir_function.span);
+                let result = self.runtime_error(output, error_compiled, stack, message);
+                if let Some(throwable) = runtime_error_throwable(&result) {
+                    tag_throwable_location(&throwable, error_compiled, error_span);
+                    state.pending_trace = Some(capture_backtrace_string_with_failed_call(
+                        error_compiled,
+                        stack,
+                        ir_function,
+                        error_span,
+                    ));
+                    state.pending_throw = Some(throwable);
+                    return VmResult::propagating_exception(output.clone());
+                }
+                return result;
+            }
+        };
+        self.record_counter_call_frame_layout(frame_layout);
+        let activation_context = FrameActivationContext {
+            scope_class: call.scope_class.take(),
+            called_class: call.called_class.take(),
+            declaring_class: call.declaring_class.take(),
+            call_span: call.call_span,
+        };
         let reused_frame = stack.push_reusable_frame(
             function_id,
             dense_function.register_count,
             dense_function.local_count,
-            FrameActivationContext::default(),
+            activation_context,
         );
         self.record_counter_frame_activation(
             reused_frame,
             dense_function.register_count,
             dense_function.local_count,
         );
-        if ir_function.flags.is_top_level {
+        let args = prepared.args;
+        let trace_args = prepared.trace_args;
+        for diagnostic in prepared.diagnostics {
+            let handled = match self.dispatch_error_handler(
+                compiled,
+                output,
+                stack,
+                state,
+                php_runtime::PHP_E_WARNING,
+                &diagnostic,
+            ) {
+                Ok(handled) => handled,
+                Err(result) => {
+                    stack.pop_recycle();
+                    return result;
+                }
+            };
+            if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+                emit_vm_diagnostic(
+                    output,
+                    state,
+                    &diagnostic,
+                    php_runtime::PhpDiagnosticChannel::Warning,
+                    php_runtime::PHP_E_WARNING,
+                );
+                diagnostics.push(diagnostic);
+            }
+        }
+        {
+            let frame = stack.current_mut().expect("bytecode frame was pushed");
+            frame.arguments = args.iter().map(|arg| arg.value.clone()).collect();
+            frame.trace_arguments = trace_args;
+        }
+        if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
+            let result = self.runtime_error(output, compiled, stack, message);
+            stack.pop_recycle();
+            return result;
+        }
+        if let Some(this_value) = call.this_value
+            && let Err(message) = initialize_this(ir_function, this_value, stack)
+        {
+            let result = self.runtime_error(output, compiled, stack, message);
+            stack.pop_recycle();
+            return result;
+        }
+        if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
+            import_shared_locals(ir_function, stack, shared);
+        } else if ir_function.flags.is_top_level {
             bind_top_level_global_locals(ir_function, stack, state);
+        }
+        for (arg_index, (param, mut arg)) in ir_function.params.iter().zip(args).enumerate() {
+            if let Err(message) = coerce_or_check_param_type(
+                compiled,
+                compiled.unit(),
+                state,
+                ir_function,
+                param,
+                arg_index,
+                &mut arg.value,
+                arg.reference.is_some(),
+                self.typecheck_fast_path_context(),
+                call.call_span,
+            ) {
+                let result = self.runtime_error(output, compiled, stack, message);
+                if let Some(throwable) = runtime_error_throwable(&result) {
+                    tag_throwable_location(&throwable, compiled, ir_function.span);
+                    state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                    return self.propagate_exception(output, stack, state, throwable);
+                }
+                stack.pop_recycle();
+                return result;
+            }
+            let locals = &mut stack
+                .current_mut()
+                .expect("bytecode frame was pushed")
+                .locals;
+            let result = if param.by_ref {
+                if let Some(reference) = arg.reference {
+                    locals.bind_reference_cell(param.local, reference)
+                } else {
+                    locals.set(param.local, arg.value)
+                }
+            } else {
+                locals.set(param.local, arg.value)
+            };
+            if let Err(message) = result {
+                let result = self.runtime_error(output, compiled, stack, message);
+                stack.pop_recycle();
+                return result;
+            }
         }
         let unit_id = compiled.unit().id;
         let mut foreach_iterators: HashMap<RegId, ForeachIterator> = HashMap::new();
@@ -5678,7 +6305,7 @@ impl Vm {
                             return result;
                         }
                     }
-                    DenseOpcode::Move | DenseOpcode::LoadLocal => {
+                    DenseOpcode::Move => {
                         let DenseOperands::RegOperand { dst, src } = instruction.operands else {
                             let result = self.invalid_bytecode_operand_shape(
                                 output,
@@ -5708,6 +6335,60 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::LoadLocal => {
+                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        if src.kind != DenseOperandKind::Local {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = match self.load_local_value(
+                            compiled,
+                            ir_function,
+                            output,
+                            stack,
+                            state,
+                            &mut diagnostics,
+                            LocalId::new(src.index),
+                            span,
+                            false,
+                        ) {
+                            Ok(value) => value,
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::LoadLocalEcho => {
                         let DenseOperands::RegOperand { dst, src } = instruction.operands else {
                             let result = self.invalid_bytecode_operand_shape(
@@ -5719,10 +6400,34 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let value = match self.read_dense_operand(compiled, stack, src) {
+                        if src.kind != DenseOperandKind::Local {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = match self.load_local_value(
+                            compiled,
+                            ir_function,
+                            output,
+                            stack,
+                            state,
+                            &mut diagnostics,
+                            LocalId::new(src.index),
+                            span,
+                            false,
+                        ) {
                             Ok(value) => value,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
+                            Err(result) => {
                                 stack.pop_recycle();
                                 return result;
                             }
@@ -5743,7 +6448,7 @@ impl Vm {
                             return result;
                         }
                     }
-                    DenseOpcode::StoreLocal => {
+                    DenseOpcode::StoreLocal | DenseOpcode::StoreLocalDiscard => {
                         let DenseOperands::LocalOperand { local, src } = instruction.operands
                         else {
                             let result = self.invalid_bytecode_operand_shape(
@@ -5772,6 +6477,45 @@ impl Vm {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
                             return result;
+                        }
+                        if instruction.opcode == DenseOpcode::StoreLocalDiscard {
+                            let value = match self.read_dense_operand(compiled, stack, src) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            };
+                            let mut exception_handlers = Vec::new();
+                            let mut pending_control = None;
+                            if let Some(outcome) = self.run_destructors_for_unreferenced_value(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                &value,
+                            ) {
+                                match outcome {
+                                    RaiseOutcome::Done(result) => {
+                                        stack.pop_recycle();
+                                        return *result;
+                                    }
+                                    RaiseOutcome::Caught(_) => {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode store/discard cannot route a caught destructor exception",
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                }
+                            }
                         }
                     }
                     DenseOpcode::BinaryConcatEcho => {
@@ -6076,33 +6820,336 @@ impl Vm {
                             }
                         };
                         let lowered_name = normalize_function_name(name);
-                        let Some(target) =
-                            self.resolve_function_call_target(compiled, state, &lowered_name)
-                        else {
-                            let diagnostic = undefined_function(
-                                name,
-                                RuntimeSourceSpan::default(),
-                                stack_trace(compiled, stack),
-                            );
-                            let result = VmResult::runtime_error_with_diagnostic(
-                                output.clone(),
-                                diagnostic.message().to_owned(),
-                                diagnostic,
-                            );
-                            stack.pop_recycle();
-                            return result;
-                        };
-                        let result = self.execute_function_call_target(
-                            compiled, target, values, None, None, output, stack, state, &None,
+                        let epoch = state.lookup_epoch();
+                        let call_shape = function_call_shape(&values);
+                        self.observe_dense_call_inline_cache(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            InlineCacheKind::FunctionCall,
                         );
+                        let cached_target = self.lookup_function_call_inline_cache(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            &lowered_name,
+                            epoch,
+                            &call_shape,
+                        );
+                        let target = if let Some(target) = cached_target {
+                            self.record_counter_dense_call_ic_hit();
+                            target
+                        } else {
+                            self.record_counter_dense_call_ic_miss();
+                            let Some(resolved) =
+                                self.resolve_function_call_target(compiled, state, &lowered_name)
+                            else {
+                                self.record_counter_dense_call_fallback("unknown_function");
+                                let diagnostic = undefined_function(
+                                    name,
+                                    RuntimeSourceSpan::default(),
+                                    stack_trace(compiled, stack),
+                                );
+                                let result = VmResult::runtime_error_with_diagnostic(
+                                    output.clone(),
+                                    diagnostic.message().to_owned(),
+                                    diagnostic,
+                                );
+                                stack.pop_recycle();
+                                return result;
+                            };
+                            self.install_function_call_inline_cache(
+                                compiled,
+                                function_id,
+                                BlockId::new(block_index),
+                                InstrId::new(dense_instruction_index),
+                                &lowered_name,
+                                epoch,
+                                call_shape,
+                                resolved.clone(),
+                            );
+                            resolved
+                        };
+                        self.record_counter_dense_direct_call_hit();
+                        let result = if let Some(plan) = plan
+                            && let FunctionCallCacheTarget::CurrentUnit { function } =
+                                target.clone()
+                        {
+                            match plan.function_plan(function.index()) {
+                                Some(DenseFunctionPlan::Dense) => {
+                                    let Some(dense_function) =
+                                        plan.unit.functions.get(function.index())
+                                    else {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            format!(
+                                                "E_PHP_VM_DENSE_BYTECODE_CALL_MISSING: dense function {} is missing",
+                                                function.raw()
+                                            ),
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    };
+                                    let Some(ir_function) =
+                                        compiled.unit().functions.get(function.index())
+                                    else {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            format!(
+                                                "E_PHP_VM_DENSE_BYTECODE_CALL_MISSING: IR function {} is missing",
+                                                function.raw()
+                                            ),
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    };
+                                    self.execute_bytecode_function(
+                                        compiled,
+                                        &plan.unit,
+                                        Some(plan),
+                                        dense_function,
+                                        ir_function,
+                                        function,
+                                        FunctionCall::new(values, Vec::new())
+                                            .with_optional_call_span(
+                                                plan.unit
+                                                    .spans
+                                                    .get(instruction.span.index())
+                                                    .copied(),
+                                            ),
+                                        output,
+                                        stack,
+                                        state,
+                                    )
+                                }
+                                Some(DenseFunctionPlan::RichFallback { reason }) => {
+                                    self.record_counter_dense_call_fallback(reason);
+                                    self.record_counter_rich_fallback_function_executed(reason);
+                                    self.execute_function(
+                                        compiled,
+                                        function,
+                                        FunctionCall::new(values, Vec::new())
+                                            .with_optional_call_span(
+                                                plan.unit
+                                                    .spans
+                                                    .get(instruction.span.index())
+                                                    .copied(),
+                                            ),
+                                        output,
+                                        stack,
+                                        state,
+                                    )
+                                }
+                                None => self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_DENSE_BYTECODE_PLAN_MISSING: function {} is missing from dense execution plan",
+                                        function.raw()
+                                    ),
+                                ),
+                            }
+                        } else {
+                            self.execute_function_call_target(
+                                compiled,
+                                target,
+                                values,
+                                Some((
+                                    compiled_unit_cache_key(compiled),
+                                    function_id,
+                                    BlockId::new(block_index),
+                                    InstrId::new(dense_instruction_index),
+                                )),
+                                dense.spans.get(instruction.span.index()).copied(),
+                                output,
+                                stack,
+                                state,
+                                &None,
+                            )
+                        };
                         if !result.status.is_success() {
+                            self.record_counter_dense_call_fallback("dispatch_error");
                             stack.pop_recycle();
                             return result;
                         }
                         if result.fiber_suspension.is_some() {
+                            self.record_counter_dense_call_fallback("fiber_suspension");
                             let result = VmResult::unsupported(
                                 output.clone(),
                                 "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode direct calls do not support fiber suspension yet",
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        let return_value = result.return_value.unwrap_or(Value::Null);
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode caller frame is active")
+                            .registers
+                            .set(RegId::new(dst), return_value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::CallMethod => {
+                        let DenseOperands::MethodCall {
+                            dst,
+                            object,
+                            method,
+                            ref args,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let object = match self.read_dense_operand(compiled, stack, object) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let Some(method) = dense.names.get(method as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode method name n{method}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
+                            Ok(values) => values,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let result = self.execute_dense_method_call(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            object,
+                            method,
+                            values,
+                            dense.spans.get(instruction.span.index()).copied(),
+                            output,
+                            stack,
+                            state,
+                        );
+                        if !result.status.is_success() {
+                            self.record_counter_dense_call_fallback("dispatch_error");
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if result.fiber_suspension.is_some() {
+                            self.record_counter_dense_call_fallback("fiber_suspension");
+                            let result = VmResult::unsupported(
+                                output.clone(),
+                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode method calls do not support fiber suspension yet",
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        let return_value = result.return_value.unwrap_or(Value::Null);
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode caller frame is active")
+                            .registers
+                            .set(RegId::new(dst), return_value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::CallStaticMethod => {
+                        let DenseOperands::StaticCall {
+                            dst,
+                            class_name,
+                            method,
+                            ref args,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(class_name) = dense.names.get(class_name as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode class name n{class_name}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(method) = dense.names.get(method as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode method name n{method}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
+                            Ok(values) => values,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let result = self.execute_dense_static_method_call(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            class_name,
+                            method,
+                            values,
+                            dense.spans.get(instruction.span.index()).copied(),
+                            output,
+                            stack,
+                            state,
+                        );
+                        if !result.status.is_success() {
+                            self.record_counter_dense_call_fallback("dispatch_error");
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if result.fiber_suspension.is_some() {
+                            self.record_counter_dense_call_fallback("fiber_suspension");
+                            let result = VmResult::unsupported(
+                                output.clone(),
+                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode static calls do not support fiber suspension yet",
                             );
                             stack.pop_recycle();
                             return result;
@@ -6274,6 +7321,7 @@ impl Vm {
                                 output,
                                 stack,
                                 state,
+                                &mut diagnostics,
                                 &array,
                                 &key_value,
                                 quiet,
@@ -6538,6 +7586,153 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::FetchProperty => {
+                        let DenseOperands::FetchProperty {
+                            dst,
+                            object,
+                            property,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(property) = dense.names.get(property as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode property name n{property}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let object = match self.read_dense_operand(compiled, stack, object) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = match self.dense_fetch_property_value(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            &mut diagnostics,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            property,
+                            object,
+                            span,
+                        ) {
+                            Ok(value) => value,
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::AssignProperty => {
+                        let DenseOperands::AssignProperty {
+                            dst,
+                            object,
+                            property,
+                            value,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(property) = dense.names.get(property as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode property name n{property}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let object = match self.read_dense_operand(compiled, stack, object) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let value = match self.dense_assign_property_value(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            property,
+                            object,
+                            value,
+                            span,
+                        ) {
+                            Ok(value) => value,
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::Echo => {
                         let DenseOperands::Operand { src } = instruction.operands else {
                             let result = self.invalid_bytecode_operand_shape(
@@ -6783,7 +7978,11 @@ impl Vm {
                             }
                         };
                         stack.pop_recycle();
-                        return VmResult::success(output.clone(), value);
+                        return VmResult::success_with_diagnostics(
+                            output.clone(),
+                            value,
+                            diagnostics,
+                        );
                     }
                 }
                 instruction_offset = next_instruction_offset;
@@ -6797,6 +7996,710 @@ impl Vm {
             stack.pop_recycle();
             return result;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_local_value(
+        &self,
+        compiled: &CompiledUnit,
+        function: &IrFunction,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
+        local: LocalId,
+        span: IrSpan,
+        pre_call_by_ref_out_param: bool,
+    ) -> Result<Value, VmResult> {
+        if is_globals_local(function, local) {
+            self.record_counter_local_slot_fast_path(false);
+            return Ok(Value::Array(state.globals.globals_array()));
+        }
+        self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(stack, local));
+        let local_value = stack.current().expect("frame was pushed").locals.get(local);
+        match local_value {
+            Some(Value::Uninitialized) if is_this_local(function, local) => {
+                let result = self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_THIS_OUTSIDE_METHOD: Using $this when not in object context"
+                        .to_owned(),
+                );
+                if let Some(throwable) = runtime_error_throwable(&result) {
+                    tag_throwable_location(&throwable, compiled, span);
+                    state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                    state.pending_throw = Some(throwable);
+                    Err(VmResult::propagating_exception(output.clone()))
+                } else {
+                    Err(result)
+                }
+            }
+            Some(Value::Uninitialized) if pre_call_by_ref_out_param => Ok(Value::Null),
+            Some(Value::Uninitialized) => {
+                let local_name = function
+                    .locals
+                    .get(local.index())
+                    .cloned()
+                    .unwrap_or_else(|| format!("local:{}", local.raw()));
+                let diagnostic = undefined_variable_warning(
+                    local_name,
+                    runtime_source_span(compiled, span),
+                    stack_trace(compiled, stack),
+                );
+                let handled = self.dispatch_error_handler(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    php_runtime::PHP_E_WARNING,
+                    &diagnostic,
+                )?;
+                if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+                    emit_vm_diagnostic(
+                        output,
+                        state,
+                        &diagnostic,
+                        php_runtime::PhpDiagnosticChannel::Warning,
+                        php_runtime::PHP_E_WARNING,
+                    );
+                    diagnostics.push(diagnostic);
+                }
+                Ok(Value::Null)
+            }
+            Some(value) => Ok(value),
+            None => Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("invalid local local:{}", local.raw()),
+            )),
+        }
+    }
+
+    fn dense_runtime_error(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &CallStack,
+        state: &mut ExecutionState,
+        span: IrSpan,
+        message: String,
+    ) -> VmResult {
+        let result = self.runtime_error(output, compiled, stack, message);
+        if let Some(throwable) = runtime_error_throwable(&result) {
+            tag_throwable_location(&throwable, compiled, span);
+            state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+            state.pending_throw = Some(throwable);
+            VmResult::propagating_exception(output.clone())
+        } else {
+            result
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_fetch_property_value(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        property: &str,
+        object_value: Value,
+        span: IrSpan,
+    ) -> Result<Value, VmResult> {
+        let object = match object_value {
+            Value::Object(object) => object,
+            Value::Reference(cell) => match cell.get() {
+                Value::Object(object) => object,
+                other => {
+                    self.record_counter_dense_property_fallback("non_object");
+                    return Err(self.dense_runtime_error(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        span,
+                        format!(
+                            "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot fetch property {property} from {}",
+                            value_type_name(&other)
+                        ),
+                    ));
+                }
+            },
+            other => {
+                self.record_counter_dense_property_fallback("non_object");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!(
+                        "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot fetch property {property} from {}",
+                        value_type_name(&other)
+                    ),
+                ));
+            }
+        };
+
+        if internal_throwable_instanceof(&object.class_name(), "throwable").is_some()
+            || is_php_token_runtime_class(&object.class_name())
+            || is_std_class_runtime_class(&object.class_name())
+            || is_date_time_runtime_class(&object.class_name())
+            || is_pdo_runtime_class(&object.class_name())
+        {
+            self.record_counter_dense_property_fallback("internal_runtime_object");
+            return Ok(object.get_property(property).unwrap_or(Value::Null));
+        }
+
+        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
+            Some(class) => class,
+            None => {
+                self.record_counter_dense_property_fallback("receiver_class_missing");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!(
+                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                        object.class_name()
+                    ),
+                ));
+            }
+        };
+        let scope = current_scope_class(compiled, stack);
+        let normalized_scope = scope.as_deref().map(normalize_class_name);
+        let receiver_class = normalize_class_name(&object.class_name());
+        let lookup_epoch = state.lookup_epoch();
+        let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
+
+        self.observe_dense_property_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            InlineCacheKind::PropertyFetch,
+        );
+        if let Some(target) = self.lookup_property_fetch_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            &receiver_class,
+            normalized_scope.as_deref(),
+            lookup_epoch,
+        ) {
+            match self.read_property_fetch_target(compiled, target, &object, stack, state) {
+                Ok(PropertyFetchCacheRead::Value(value)) => {
+                    self.record_counter_dense_property_ic_reuse();
+                    self.record_counter_dense_property_fetch_hit();
+                    return Ok(value);
+                }
+                Ok(PropertyFetchCacheRead::Fallback) => {
+                    self.record_counter_dense_property_fallback("inline_cache_guard");
+                }
+                Err(message) => {
+                    return Err(
+                        self.dense_runtime_error(compiled, output, stack, state, span, message)
+                    );
+                }
+            }
+        }
+
+        let resolved =
+            match lookup_property_in_hierarchy(compiled, &class, property, scope.as_deref()) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => {
+                    self.record_counter_dense_property_fallback("dynamic_property");
+                    if let Some(value) = object.get_property(property) {
+                        return Ok(value);
+                    }
+                    match self.call_magic_property_method(
+                        compiled,
+                        object.clone(),
+                        "__get",
+                        property,
+                        vec![CallArgument::positional(Value::String(
+                            PhpString::from_test_str(property),
+                        ))],
+                        output,
+                        stack,
+                        state,
+                    ) {
+                        Ok(Some(value)) => {
+                            self.record_counter_dense_property_fallback("magic_get");
+                            return Ok(value);
+                        }
+                        Ok(None) => {}
+                        Err(result) => return Err(result),
+                    }
+                    self.emit_undefined_property_warning(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        diagnostics,
+                        &object.class_name(),
+                        property,
+                        span,
+                    )?;
+                    return Ok(Value::Null);
+                }
+                Err(message) => {
+                    return Err(
+                        self.dense_runtime_error(compiled, output, stack, state, span, message)
+                    );
+                }
+            };
+
+        if let Err(access_error) =
+            validate_property_access(compiled, stack, resolved.class, resolved.property)
+        {
+            self.record_counter_dense_property_fallback("visibility_mismatch");
+            match self.call_magic_property_method(
+                compiled,
+                object.clone(),
+                "__get",
+                property,
+                vec![CallArgument::positional(Value::String(
+                    PhpString::from_test_str(property),
+                ))],
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(value)) => {
+                    self.record_counter_dense_property_fallback("magic_get");
+                    return Ok(value);
+                }
+                Ok(None) => {
+                    return Err(self.dense_runtime_error(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        span,
+                        access_error,
+                    ));
+                }
+                Err(result) => return Err(result),
+            }
+        }
+
+        if resolved.property.flags.is_static {
+            self.record_counter_dense_property_fallback("static_property");
+            emit_static_property_as_non_static_notice(
+                compiled,
+                output,
+                stack,
+                state,
+                resolved.class,
+                resolved.property,
+                span,
+            );
+        }
+
+        if !property_hook_is_active(state, &object, resolved.class, resolved.property)
+            && let Some(function) = resolved.property.hooks.get
+        {
+            self.record_counter_dense_property_fallback("property_hook");
+            return self.call_property_hook(
+                compiled,
+                object,
+                resolved.class,
+                resolved.property,
+                function,
+                Vec::new(),
+                output,
+                stack,
+                state,
+            );
+        }
+
+        let storage_name = property_storage_name(resolved.class, resolved.property);
+        let Some(value) = object.get_property(&storage_name) else {
+            self.record_counter_dense_property_fallback("storage_missing");
+            match self.call_magic_property_method(
+                compiled,
+                object.clone(),
+                "__get",
+                property,
+                vec![CallArgument::positional(Value::String(
+                    PhpString::from_test_str(property),
+                ))],
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(value)) => {
+                    self.record_counter_dense_property_fallback("magic_get");
+                    return Ok(value);
+                }
+                Ok(None) => {}
+                Err(result) => return Err(result),
+            }
+            self.emit_undefined_property_warning(
+                compiled,
+                output,
+                stack,
+                state,
+                diagnostics,
+                &object.class_name(),
+                property,
+                span,
+            )?;
+            return Ok(Value::Null);
+        };
+        if matches!(value, Value::Uninitialized) {
+            self.record_counter_dense_property_fallback("typed_property_uninitialized");
+            return Err(self.dense_runtime_error(
+                compiled,
+                output,
+                stack,
+                state,
+                span,
+                format!(
+                    "E_PHP_VM_UNINITIALIZED_PROPERTY: typed property {}::${property} must not be accessed before initialization",
+                    resolved.class.display_name
+                ),
+            ));
+        }
+        self.maybe_install_property_fetch_inline_cache_target(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            &receiver_class,
+            &class,
+            resolved.class,
+            resolved.property,
+            &storage_name,
+            normalized_scope.as_deref(),
+            lookup_epoch,
+            receiver_has_magic_get,
+            state,
+            &object,
+        );
+        self.record_counter_dense_property_fetch_hit();
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_assign_property_value(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        property: &str,
+        object_value: Value,
+        value: Value,
+        span: IrSpan,
+    ) -> Result<Value, VmResult> {
+        let object = match object_value {
+            Value::Object(object) => object,
+            Value::Reference(cell) => match cell.get() {
+                Value::Object(object) => object,
+                other => {
+                    self.record_counter_dense_property_fallback("non_object");
+                    return Err(self.dense_runtime_error(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        span,
+                        format!(
+                            "E_PHP_VM_PROPERTY_ASSIGN_NON_OBJECT: cannot assign property {property} on {}",
+                            value_type_name(&other)
+                        ),
+                    ));
+                }
+            },
+            Value::Callable(_) => {
+                self.record_counter_dense_property_fallback("dynamic_property");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!(
+                        "E_PHP_VM_DYNAMIC_PROPERTY_ERROR: Cannot create dynamic property Closure::${property}"
+                    ),
+                ));
+            }
+            other => {
+                self.record_counter_dense_property_fallback("non_object");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!(
+                        "E_PHP_VM_PROPERTY_ASSIGN_NON_OBJECT: cannot assign property {property} on {}",
+                        value_type_name(&other)
+                    ),
+                ));
+            }
+        };
+
+        if is_std_class_runtime_class(&object.class_name()) {
+            self.record_counter_dense_property_fallback("dynamic_property");
+            object.set_property(property, value.clone());
+            return Ok(value);
+        }
+
+        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
+            Some(class) => class,
+            None => {
+                self.record_counter_dense_property_fallback("receiver_class_missing");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!(
+                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                        object.class_name()
+                    ),
+                ));
+            }
+        };
+        let scope = current_scope_class(compiled, stack);
+        let normalized_scope = scope.as_deref().map(normalize_class_name);
+        let receiver_class = normalize_class_name(&object.class_name());
+        let lookup_epoch = state.lookup_epoch();
+        let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
+
+        self.observe_dense_property_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            InlineCacheKind::PropertyAssign,
+        );
+        if let Some(target) = self.lookup_property_assign_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            &receiver_class,
+            normalized_scope.as_deref(),
+            lookup_epoch,
+        ) {
+            match self.write_property_assign_target(
+                compiled,
+                target,
+                &object,
+                value.clone(),
+                stack,
+                state,
+            ) {
+                Ok(PropertyAssignCacheWrite::Written(value)) => {
+                    self.record_counter_dense_property_ic_reuse();
+                    self.record_counter_dense_property_assignment_hit();
+                    return Ok(value);
+                }
+                Ok(PropertyAssignCacheWrite::Fallback) => {
+                    self.record_counter_dense_property_fallback("inline_cache_guard");
+                }
+                Err(message) => {
+                    return Err(
+                        self.dense_runtime_error(compiled, output, stack, state, span, message)
+                    );
+                }
+            }
+        }
+
+        let resolved = match lookup_property_in_hierarchy(
+            compiled,
+            &class,
+            property,
+            scope.as_deref(),
+        ) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                self.record_counter_dense_property_fallback("dynamic_property");
+                match self.call_magic_property_method(
+                    compiled,
+                    object.clone(),
+                    "__set",
+                    property,
+                    vec![
+                        CallArgument::positional(Value::String(PhpString::from_test_str(property))),
+                        CallArgument::positional(value.clone()),
+                    ],
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(_)) => {
+                        self.record_counter_dense_property_fallback("magic_set");
+                        return Ok(value);
+                    }
+                    Ok(None) => {}
+                    Err(result) => return Err(result),
+                }
+                state.diagnostics.push(RuntimeDiagnostic::new(
+                    "E_PHP_VM_DYNAMIC_PROPERTY_DEPRECATED",
+                    RuntimeSeverity::Deprecation,
+                    format!(
+                        "E_PHP_VM_DYNAMIC_PROPERTY_DEPRECATED: creating dynamic property {}::${property}",
+                        object.class_name()
+                    ),
+                    RuntimeSourceSpan::default(),
+                    stack_trace(compiled, stack),
+                    None,
+                ));
+                object.set_property(property, value.clone());
+                return Ok(value);
+            }
+            Err(message) => {
+                return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+            }
+        };
+
+        if resolved.property.flags.is_static {
+            self.record_counter_dense_property_fallback("static_property");
+            emit_static_property_as_non_static_notice(
+                compiled,
+                output,
+                stack,
+                state,
+                resolved.class,
+                resolved.property,
+                span,
+            );
+        }
+
+        if let Err(message) =
+            validate_property_access(compiled, stack, resolved.class, resolved.property).and_then(
+                |()| {
+                    validate_property_set_access(compiled, stack, resolved.class, resolved.property)
+                },
+            )
+        {
+            self.record_counter_dense_property_fallback("visibility_mismatch");
+            match self.call_magic_property_method(
+                compiled,
+                object.clone(),
+                "__set",
+                property,
+                vec![
+                    CallArgument::positional(Value::String(PhpString::from_test_str(property))),
+                    CallArgument::positional(value.clone()),
+                ],
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(_)) => {
+                    self.record_counter_dense_property_fallback("magic_set");
+                    return Ok(value);
+                }
+                Ok(None) => {
+                    return Err(
+                        self.dense_runtime_error(compiled, output, stack, state, span, message)
+                    );
+                }
+                Err(result) => return Err(result),
+            }
+        }
+
+        let property_type = ir_runtime_type(resolved.property.type_.as_ref());
+        if let Err(message) = check_property_type(
+            compiled,
+            resolved.class.display_name.as_str(),
+            property,
+            &property_type,
+            &value,
+            self.typecheck_fast_path_context(),
+        ) {
+            self.record_counter_dense_property_fallback("typed_property_validation");
+            return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+        }
+        if let Err(message) =
+            validate_property_write(resolved.class, resolved.property, &object, stack, compiled)
+        {
+            self.record_counter_dense_property_fallback("readonly_or_init_only");
+            return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+        }
+        if !property_hook_is_active(state, &object, resolved.class, resolved.property)
+            && let Some(function) = resolved.property.hooks.set
+        {
+            self.record_counter_dense_property_fallback("property_hook");
+            self.call_property_hook(
+                compiled,
+                object.clone(),
+                resolved.class,
+                resolved.property,
+                function,
+                vec![CallArgument::positional(value.clone())],
+                output,
+                stack,
+                state,
+            )?;
+            return Ok(value);
+        }
+        if !resolved.property.hooks.backed
+            && (resolved.property.hooks.get.is_some() || resolved.property.hooks.set.is_some())
+        {
+            self.record_counter_dense_property_fallback("property_hook");
+            return Err(self.dense_runtime_error(
+                compiled,
+                output,
+                stack,
+                state,
+                span,
+                format!(
+                    "E_PHP_VM_VIRTUAL_PROPERTY_WRITE: property {}::${} has no backing storage",
+                    resolved.class.name, resolved.property.name
+                ),
+            ));
+        }
+
+        let storage_name = property_storage_name(resolved.class, resolved.property);
+        if matches!(
+            object.get_property(&storage_name),
+            Some(Value::Reference(_))
+        ) {
+            self.record_counter_dense_property_fallback("reference_slot");
+        }
+        object.set_property(&storage_name, value.clone());
+        self.maybe_install_property_assign_inline_cache_target(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            property,
+            &receiver_class,
+            &class,
+            resolved.class,
+            resolved.property,
+            &storage_name,
+            normalized_scope.as_deref(),
+            lookup_epoch,
+            receiver_has_magic_set,
+            state,
+            &object,
+        );
+        self.record_counter_dense_property_assignment_hit();
+        Ok(value)
     }
 
     fn read_dense_operand(
@@ -6927,12 +8830,545 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn execute_dense_method_call(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        object: Value,
+        method: &str,
+        args: Vec<CallArgument>,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let object = match callable_resolve_reference(object) {
+            Value::Object(object) => object,
+            other => {
+                self.record_counter_dense_call_fallback("non_object_method_receiver");
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_METHOD_CALL_NON_OBJECT: Call to a member function {method}() on {}",
+                        value_type_name(&other)
+                    ),
+                );
+            }
+        };
+
+        let receiver_class = object.class_name();
+        if is_spl_iterator_runtime_class(&receiver_class)
+            || is_spl_container_runtime_class(&receiver_class)
+            || is_spl_file_runtime_class(&receiver_class)
+            || internal_throwable_instanceof(&receiver_class, "throwable").is_some()
+            || is_zip_runtime_class(&receiver_class)
+            || is_xml_runtime_class(&receiver_class)
+        {
+            self.record_counter_dense_call_fallback("runtime_method_receiver");
+            return self.call_object_method_callable(
+                compiled, object, method, args, call_span, output, stack, state,
+            );
+        }
+
+        let Some(class) = lookup_class_in_state(compiled, state, &receiver_class) else {
+            self.record_counter_dense_call_fallback("unknown_class");
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_UNKNOWN_CLASS: class {receiver_class} is not defined"),
+            );
+        };
+        let class = class.clone();
+        let scope = current_scope_class(compiled, stack);
+        let lowered_method = normalize_method_name(method);
+        let epoch = state.lookup_epoch();
+        let has_magic_call =
+            match class_has_public_magic_call_in_state(compiled, state, &receiver_class) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            };
+
+        self.observe_dense_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            InlineCacheKind::MethodCall,
+        );
+        let (cached_target, observation) = self.lookup_method_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            &lowered_method,
+            &receiver_class,
+            scope.as_deref(),
+            epoch,
+        );
+        if let Some(target) = cached_target {
+            self.record_counter_dense_call_ic_hit();
+            self.record_counter_dense_method_call_hit();
+            return self.execute_method_call_target(
+                compiled, target, object, args, call_span, output, stack, state, &None,
+            );
+        }
+        if observation.is_some() {
+            self.record_counter_dense_call_ic_miss();
+        }
+
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &receiver_class,
+            method,
+            scope.as_deref(),
+        ) {
+            Ok(Some(method)) => method,
+            Ok(None) => {
+                self.record_counter_dense_call_fallback("magic_call");
+                return match self.call_magic_instance_method(
+                    compiled,
+                    object.clone(),
+                    "__call",
+                    method,
+                    args,
+                    call_span,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                            object.class_name(),
+                            method
+                        ),
+                    ),
+                    Err(result) => result,
+                };
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+
+        let method_entry = &resolved.method;
+        let declaring_class = &resolved.class;
+        if (method_entry.flags.is_private || method_entry.flags.is_protected)
+            && let Err(message) = validate_method_callable_in_state_scope(
+                compiled,
+                state,
+                scope.as_deref(),
+                declaring_class,
+                method_entry,
+            )
+        {
+            self.record_counter_dense_call_fallback("visibility");
+            return match self.call_magic_instance_method(
+                compiled,
+                object.clone(),
+                "__call",
+                method,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => self.runtime_error(output, compiled, stack, message),
+                Err(result) => result,
+            };
+        }
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            scope.as_deref(),
+            declaring_class,
+            method_entry,
+        ) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+
+        let has_by_ref_argument = dense_call_has_by_ref_argument(&args);
+        let method_guard = method_call_guard_metadata(
+            &args,
+            &class,
+            declaring_class,
+            method_entry,
+            scope.as_deref(),
+            epoch,
+            has_magic_call,
+            has_by_ref_argument,
+        );
+        let method_target = Box::new(MethodCallResolvedTarget {
+            receiver_class: receiver_class.clone(),
+            declaring_class: declaring_class.name.clone(),
+            function: method_entry.function,
+            guard: method_guard,
+        });
+        let declaring_dynamic_owner_index =
+            dynamic_class_owner_index_in_state(state, &declaring_class.name);
+        let target = match declaring_dynamic_owner_index {
+            Some(unit_index) => MethodCallCacheTarget::DynamicUnit {
+                unit_index,
+                target: method_target,
+            },
+            None => MethodCallCacheTarget::CurrentUnit {
+                target: method_target,
+            },
+        };
+        self.install_method_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            &lowered_method,
+            &receiver_class,
+            scope.as_deref(),
+            epoch,
+            target,
+        );
+        self.record_counter_dense_method_call_hit();
+        let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
+        self.execute_function(
+            &class_owner,
+            method_entry.function,
+            FunctionCall::new(args, Vec::new())
+                .with_optional_call_span(call_span)
+                .with_this(object.clone())
+                .with_class_context(
+                    declaring_class.name.clone(),
+                    object.class_name(),
+                    declaring_class.name.clone(),
+                ),
+            output,
+            stack,
+            state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_dense_static_method_call(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        class_name: &str,
+        method: &str,
+        args: Vec<CallArgument>,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if is_closure_runtime_class(class_name)
+            || is_php_token_runtime_class(class_name)
+            || normalize_class_name(class_name) == "normalizer"
+        {
+            self.record_counter_dense_call_fallback("runtime_static_method_receiver");
+            return self.call_static_method_callable(
+                compiled, class_name, method, args, call_span, output, stack, state,
+            );
+        }
+
+        let class = match resolve_static_class_name(compiled, state, stack, class_name) {
+            Ok(class) => class,
+            Err(message) => {
+                self.record_counter_dense_call_fallback("unknown_static_class");
+                return self.runtime_error(output, compiled, stack, message);
+            }
+        };
+        let scope = method_lookup_scope_for_static_call(compiled, stack, class_name);
+        let lowered_method = normalize_method_name(method);
+        let epoch = state.lookup_epoch();
+        let receiver_class = class.name.clone();
+        let called_class = called_class_for_static_call(compiled, stack, class_name, &class);
+
+        self.observe_dense_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            InlineCacheKind::MethodCall,
+        );
+        let (cached_target, observation) = self.lookup_method_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            &lowered_method,
+            &receiver_class,
+            scope.as_deref(),
+            epoch,
+        );
+        if let Some(target) = cached_target {
+            self.record_counter_dense_call_ic_hit();
+            self.record_counter_dense_static_call_hit();
+            return self.execute_static_method_call_target(
+                compiled,
+                target,
+                called_class,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if observation.is_some() {
+            self.record_counter_dense_call_ic_miss();
+        }
+
+        let resolved = match lookup_method_in_hierarchy(compiled, &class, method, scope.as_deref())
+        {
+            Ok(Some(method)) => method,
+            Ok(None) => {
+                self.record_counter_dense_call_fallback("magic_static_call");
+                return match self.call_magic_static_method(
+                    compiled,
+                    &class,
+                    "__callStatic",
+                    method,
+                    args,
+                    called_class,
+                    call_span,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                            class.name, method
+                        ),
+                    ),
+                    Err(result) => result,
+                };
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let method_entry = resolved.method;
+        let declaring_class = resolved.class;
+        if !method_entry.flags.is_static {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_NON_STATIC_METHOD_CALL: method {}::{} is not static",
+                    declaring_class.name, method_entry.name
+                ),
+            );
+        }
+        if method_entry.flags.is_private || method_entry.flags.is_protected {
+            self.record_counter_dense_call_fallback("visibility");
+            return match self.call_magic_static_method(
+                compiled,
+                &class,
+                "__callStatic",
+                method,
+                args,
+                called_class,
+                call_span,
+                output,
+                stack,
+                state,
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => {
+                    if let Err(message) =
+                        validate_method_callable(compiled, stack, declaring_class, method_entry)
+                    {
+                        self.runtime_error(output, compiled, stack, message)
+                    } else {
+                        self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_VM_METHOD_VISIBILITY: inaccessible static method passed validation",
+                        )
+                    }
+                }
+                Err(result) => result,
+            };
+        }
+        if let Err(message) =
+            validate_method_callable(compiled, stack, declaring_class, method_entry)
+        {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+
+        let has_magic_call =
+            match class_has_public_magic_call_static_in_state(compiled, state, &class.name) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            };
+        let method_guard = method_call_guard_metadata(
+            &args,
+            &class,
+            declaring_class,
+            method_entry,
+            scope.as_deref(),
+            epoch,
+            has_magic_call,
+            dense_call_has_by_ref_argument(&args),
+        );
+        let method_target = Box::new(MethodCallResolvedTarget {
+            receiver_class: receiver_class.clone(),
+            declaring_class: declaring_class.name.clone(),
+            function: method_entry.function,
+            guard: method_guard,
+        });
+        let declaring_dynamic_owner_index =
+            dynamic_class_owner_index_in_state(state, &declaring_class.name);
+        let target = match declaring_dynamic_owner_index {
+            Some(unit_index) => MethodCallCacheTarget::DynamicUnit {
+                unit_index,
+                target: method_target,
+            },
+            None => MethodCallCacheTarget::CurrentUnit {
+                target: method_target,
+            },
+        };
+        self.install_method_call_inline_cache(
+            compiled,
+            function_id,
+            block_id,
+            instruction_id,
+            &lowered_method,
+            &receiver_class,
+            scope.as_deref(),
+            epoch,
+            target,
+        );
+        self.record_counter_dense_static_call_hit();
+        let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
+        self.execute_function(
+            &class_owner,
+            method_entry.function,
+            FunctionCall::new(args, Vec::new())
+                .with_class_context(
+                    declaring_class.name.clone(),
+                    called_class,
+                    declaring_class.name.clone(),
+                )
+                .with_optional_call_span(call_span),
+            output,
+            stack,
+            state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_static_method_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: MethodCallCacheTarget,
+        called_class: String,
+        args: Vec<CallArgument>,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        let declaring_class_name = target.resolved_target().declaring_class.clone();
+        let function = target.resolved_target().function;
+        let owner = match target {
+            MethodCallCacheTarget::CurrentUnit { .. } => compiled.clone(),
+            MethodCallCacheTarget::DynamicUnit { unit_index, .. } => {
+                let Some(owner) = state.dynamic_units.get(unit_index).cloned() else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_INLINE_CACHE_STALE_DYNAMIC_UNIT: dynamic unit {unit_index} is unavailable"
+                        ),
+                    );
+                };
+                owner
+            }
+        };
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name).cloned() else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_INLINE_CACHE_STALE_METHOD_CLASS: class {declaring_class_name} is unavailable"
+                ),
+            );
+        };
+        let Some(method_entry) = declaring_class
+            .methods
+            .iter()
+            .find(|method| method.function == function)
+            .cloned()
+        else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_INLINE_CACHE_STALE_METHOD: method target {}#{} is unavailable",
+                    declaring_class.name,
+                    function.index()
+                ),
+            );
+        };
+        if !method_entry.flags.is_static {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_NON_STATIC_METHOD_CALL: method {}::{} is not static",
+                    declaring_class.name, method_entry.name
+                ),
+            );
+        }
+        if let Err(message) =
+            validate_method_callable(&owner, stack, &declaring_class, &method_entry)
+        {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        self.execute_function(
+            &owner,
+            method_entry.function,
+            FunctionCall::new(args, Vec::new())
+                .with_optional_call_span(call_span)
+                .with_class_context(
+                    declaring_class.name.clone(),
+                    called_class,
+                    declaring_class.name,
+                ),
+            output,
+            stack,
+            state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fetch_dim_value(
         &self,
         compiled: &CompiledUnit,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
         array: &Value,
         key_value: &Value,
         quiet: bool,
@@ -7036,16 +9472,10 @@ impl Vm {
             Ok(Some(value)) => Ok(value),
             Ok(None) if quiet => Ok(Value::Null),
             Ok(None) => {
-                let diagnostic = undefined_array_key_warning(&key, stack_trace(compiled, stack));
-                if error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
-                    emit_vm_diagnostic(
-                        output,
-                        state,
-                        &diagnostic,
-                        php_runtime::PhpDiagnosticChannel::Warning,
-                        php_runtime::PHP_E_WARNING,
-                    );
-                }
+                diagnostics.push(undefined_array_key_warning(
+                    &key,
+                    stack_trace(compiled, stack),
+                ));
                 Ok(Value::Null)
             }
             Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
@@ -22382,43 +24812,47 @@ impl Vm {
         state: &mut ExecutionState,
         value: &Value,
     ) -> Result<(), VmResult> {
-        match value {
-            Value::String(value) => {
-                output.write_fast_php_string(value);
+        match Self::echo_append_semantic_helper(value) {
+            SemanticHelperResult::FastHit => {
+                match value {
+                    Value::String(value) => output.write_fast_php_string(value),
+                    Value::Null | Value::Bool(false) => {}
+                    Value::Bool(true) => output.write_fast_bytes(b"1"),
+                    Value::Int(value) => output.write_fast_bytes(value.to_string().as_bytes()),
+                    Value::Reference(_) => unreachable!("reference is a fallback"),
+                    _ => unreachable!("non-scalar echo is a fallback"),
+                }
                 Ok(())
             }
-            Value::Null | Value::Bool(false) => Ok(()),
-            Value::Bool(true) => {
-                output.write_fast_bytes(b"1");
-                Ok(())
-            }
-            Value::Int(value) => {
-                output.write_fast_bytes(value.to_string().as_bytes());
-                Ok(())
-            }
-            Value::Reference(cell) => {
-                output.record_slow_append_reason("reference_deref");
-                self.write_echo(compiled, output, stack, state, &cell.get())
-            }
-            _ => {
-                output.record_slow_append_reason(match value {
-                    Value::Float(_) => "float_conversion",
-                    Value::Array(_) => "array_conversion_warning",
-                    Value::Object(_) => "object_to_string",
-                    Value::Resource(_) => "resource_conversion",
-                    Value::Fiber(_) => "object_to_string",
-                    Value::Generator(_) => "object_to_string",
-                    Value::Callable(_) => "callable_conversion_error",
-                    Value::Uninitialized => "uninitialized_conversion_error",
-                    Value::Null
-                    | Value::Bool(_)
-                    | Value::Int(_)
-                    | Value::String(_)
-                    | Value::Reference(_) => "generic_conversion",
-                });
+            SemanticHelperResult::Fallback(reason) => {
+                output.record_slow_append_reason(reason);
+                if let Value::Reference(cell) = value {
+                    return self.write_echo(compiled, output, stack, state, &cell.get());
+                }
                 let string = self.value_to_string(compiled, value, output, stack, state)?;
                 output.write_php_string(&string);
                 Ok(())
+            }
+        }
+    }
+
+    fn echo_append_semantic_helper(value: &Value) -> SemanticHelperResult {
+        match value {
+            Value::String(_)
+            | Value::Null
+            | Value::Bool(false)
+            | Value::Bool(true)
+            | Value::Int(_) => SemanticHelperResult::FastHit,
+            Value::Reference(_) => SemanticHelperResult::Fallback("reference_deref"),
+            Value::Float(_) => SemanticHelperResult::Fallback("float_conversion"),
+            Value::Array(_) => SemanticHelperResult::Fallback("array_conversion_warning"),
+            Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => {
+                SemanticHelperResult::Fallback("object_to_string")
+            }
+            Value::Resource(_) => SemanticHelperResult::Fallback("resource_conversion"),
+            Value::Callable(_) => SemanticHelperResult::Fallback("callable_conversion_error"),
+            Value::Uninitialized => {
+                SemanticHelperResult::Fallback("uninitialized_conversion_error")
             }
         }
     }
@@ -22955,6 +25389,7 @@ impl Vm {
                 );
             };
             if let Some(cache) = &self.options.include_cache {
+                let before_resolve = cache.cache_stats();
                 let resolved = match cache.resolve_with_include_path(
                     loader,
                     including_file.as_deref(),
@@ -22964,6 +25399,7 @@ impl Vm {
                 ) {
                     Ok(resolved) => resolved,
                     Err(message) => {
+                        self.record_include_cache_stats_delta(before_resolve, cache.cache_stats());
                         self.record_include_graph_resolution_fallback(&path, &message);
                         return include_failure(
                             output,
@@ -22976,16 +25412,24 @@ impl Vm {
                         );
                     }
                 };
+                self.record_include_cache_stats_delta(before_resolve, cache.cache_stats());
                 if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
                     if state.included_once.contains(&resolved.canonical_path) {
+                        self.record_counter_include_once_skip();
                         return VmResult::success(output.clone(), Some(Value::Bool(true)));
                     }
                     state.included_once.push(resolved.canonical_path.clone());
                     once_tracked = true;
                 }
-                let included = match cache.get_or_compile_include(loader, &resolved) {
+                let before_compile = cache.cache_stats();
+                let included = match cache.get_or_compile_include(
+                    loader,
+                    &resolved,
+                    self.options.include_optimization_level,
+                ) {
                     Ok(included) => included,
                     Err(message) => {
+                        self.record_include_cache_stats_delta(before_compile, cache.cache_stats());
                         return include_failure(
                             output,
                             compiled,
@@ -22997,6 +25441,7 @@ impl Vm {
                         );
                     }
                 };
+                self.record_include_cache_stats_delta(before_compile, cache.cache_stats());
                 compiled_include = Some(included.as_ref().clone());
                 LoadedInclude {
                     canonical_path: resolved.canonical_path,
@@ -23043,6 +25488,9 @@ impl Vm {
                                 instruction_id,
                             );
                             self.record_counter_invalidation_by_reason("file_fingerprint_changed");
+                            self.record_counter_include_stale_invalidation_by_reason(
+                                "file_fingerprint_changed",
+                            );
                             match loader.resolve_with_include_path(
                                 including_file.as_deref(),
                                 &path,
@@ -23147,6 +25595,7 @@ impl Vm {
         };
         if !once_tracked && matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if state.included_once.contains(&loaded.canonical_path) {
+                self.record_counter_include_once_skip();
                 return VmResult::success(output.clone(), Some(Value::Bool(true)));
             }
             state.included_once.push(loaded.canonical_path.clone());
@@ -23154,8 +25603,11 @@ impl Vm {
 
         let included = match compiled_include {
             Some(included) => included,
-            None => match compile_loaded_include(loaded) {
-                Ok(included) => included,
+            None => match compile_loaded_include(loaded, self.options.include_optimization_level) {
+                Ok(included) => {
+                    self.record_counter_include_compile_miss();
+                    included
+                }
                 Err(message) => {
                     return include_failure(
                         output,
@@ -34782,7 +37234,10 @@ fn load_phar_include(
     })
 }
 
-fn compile_loaded_include(loaded: LoadedInclude) -> Result<CompiledUnit, String> {
+fn compile_loaded_include(
+    loaded: LoadedInclude,
+    optimization_level: php_optimizer::OptimizationLevel,
+) -> Result<CompiledUnit, String> {
     let frontend = php_semantics::analyze_source(&loaded.source);
     if frontend.has_errors() {
         return Err(format!(
@@ -34790,7 +37245,7 @@ fn compile_loaded_include(loaded: LoadedInclude) -> Result<CompiledUnit, String>
             loaded.canonical_path.display()
         ));
     }
-    let lowering = php_ir::lower_frontend_result(
+    let mut lowering = php_ir::lower_frontend_result(
         &frontend,
         php_ir::LoweringOptions {
             source_path: loaded.canonical_path.to_string_lossy().into_owned(),
@@ -34803,6 +37258,19 @@ fn compile_loaded_include(loaded: LoadedInclude) -> Result<CompiledUnit, String>
             "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} failed IR lowering",
             loaded.canonical_path.display()
         ));
+    }
+    if optimization_level.runs_pipeline() {
+        php_optimizer::PassPipeline::performance()
+            .run(
+                &mut lowering.unit,
+                &php_optimizer::PassContext::new(optimization_level),
+            )
+            .map_err(|error| {
+                format!(
+                    "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} optimizer failed: {error}",
+                    loaded.canonical_path.display()
+                )
+            })?;
     }
     Ok(CompiledUnit::new(lowering.unit))
 }
@@ -37484,70 +39952,281 @@ fn internal_function_dispatch_cacheable(name: &str) -> bool {
         )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinIntrinsicKind {
+    ArrayKeyExists,
+    CountArray,
+    IsArray,
+    IsInt,
+    IsString,
+    StrContains,
+    StrEndsWith,
+    StrLen,
+    StrStartsWith,
+    StrToLower,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuiltinIntrinsicParam {
+    name: &'static str,
+    type_decl: &'static str,
+    optional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuiltinIntrinsicSpec {
+    name: &'static str,
+    return_type: &'static str,
+    params: &'static [BuiltinIntrinsicParam],
+    exact_arity: usize,
+    kind: BuiltinIntrinsicKind,
+}
+
+const INTRINSIC_VALUE_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
+    name: "value",
+    type_decl: "mixed",
+    optional: false,
+}];
+const INTRINSIC_STRING_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
+    name: "string",
+    type_decl: "string",
+    optional: false,
+}];
+const INTRINSIC_COUNT_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "value",
+        type_decl: "Countable|array",
+        optional: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "mode",
+        type_decl: "int",
+        optional: true,
+    },
+];
+const INTRINSIC_STRING_PAIR_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "haystack",
+        type_decl: "string",
+        optional: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "needle",
+        type_decl: "string",
+        optional: false,
+    },
+];
+const INTRINSIC_ARRAY_KEY_EXISTS_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "key",
+        type_decl: "mixed",
+        optional: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "array",
+        type_decl: "array",
+        optional: false,
+    },
+];
+const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
+    BuiltinIntrinsicSpec {
+        name: "array_key_exists",
+        return_type: "bool",
+        params: INTRINSIC_ARRAY_KEY_EXISTS_PARAMS,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::ArrayKeyExists,
+    },
+    BuiltinIntrinsicSpec {
+        name: "count",
+        return_type: "int",
+        params: INTRINSIC_COUNT_PARAMS,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::CountArray,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_array",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsArray,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_int",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsInt,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_string",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsString,
+    },
+    BuiltinIntrinsicSpec {
+        name: "strlen",
+        return_type: "int",
+        params: INTRINSIC_STRING_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrLen,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_contains",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrContains,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_ends_with",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrEndsWith,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_starts_with",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrStartsWith,
+    },
+    BuiltinIntrinsicSpec {
+        name: "strtolower",
+        return_type: "string",
+        params: INTRINSIC_STRING_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrToLower,
+    },
+];
+
 fn fast_builtin_stub_supported(name: &str) -> bool {
-    matches!(
-        name,
-        "strlen"
-            | "count"
-            | "is_int"
-            | "is_string"
-            | "is_array"
-            | "str_contains"
-            | "str_starts_with"
-            | "str_ends_with"
-            | "strtolower"
-    )
+    builtin_intrinsic_spec(name).is_some()
 }
 
 fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
-    if values.len() != fast_builtin_stub_expected_arity(name)
-        || values
-            .iter()
-            .any(|value| matches!(value, Value::Reference(_)))
-    {
+    let spec = builtin_intrinsic_spec(name)?;
+    if fast_builtin_stub_fallback_reason_for_spec(spec, values).is_some() {
         return None;
     }
-    match (name, values) {
-        ("strlen", [Value::String(string)]) => Some(Value::Int(string.len() as i64)),
-        ("count", [Value::Array(array)]) => Some(Value::Int(array.len() as i64)),
-        ("is_int", [value]) => Some(Value::Bool(matches!(value, Value::Int(_)))),
-        ("is_string", [value]) => Some(Value::Bool(matches!(value, Value::String(_)))),
-        ("is_array", [value]) => Some(Value::Bool(matches!(value, Value::Array(_)))),
-        ("str_contains", [Value::String(haystack), Value::String(needle)]) => Some(Value::Bool(
-            byte_slice_contains(haystack.as_bytes(), needle.as_bytes()),
-        )),
-        ("str_starts_with", [Value::String(haystack), Value::String(needle)]) => Some(Value::Bool(
-            haystack.as_bytes().starts_with(needle.as_bytes()),
-        )),
-        ("str_ends_with", [Value::String(haystack), Value::String(needle)]) => Some(Value::Bool(
-            haystack.as_bytes().ends_with(needle.as_bytes()),
-        )),
-        ("strtolower", [Value::String(string)]) => Some(Value::string(
+    match (spec.kind, values) {
+        (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(array)]) => {
+            let key = ArrayKey::from_value_mvp(key)?;
+            Some(Value::Bool(array.get(&key).is_some()))
+        }
+        (BuiltinIntrinsicKind::CountArray, [Value::Array(array)]) => {
+            Some(Value::Int(array.len() as i64))
+        }
+        (BuiltinIntrinsicKind::IsArray, [value]) => {
+            Some(Value::Bool(matches!(value, Value::Array(_))))
+        }
+        (BuiltinIntrinsicKind::IsInt, [value]) => Some(Value::Bool(matches!(value, Value::Int(_)))),
+        (BuiltinIntrinsicKind::IsString, [value]) => {
+            Some(Value::Bool(matches!(value, Value::String(_))))
+        }
+        (BuiltinIntrinsicKind::StrLen, [Value::String(string)]) => {
+            Some(Value::Int(string.len() as i64))
+        }
+        (BuiltinIntrinsicKind::StrContains, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(byte_slice_contains(
+                haystack.as_bytes(),
+                needle.as_bytes(),
+            )))
+        }
+        (BuiltinIntrinsicKind::StrStartsWith, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(
+                haystack.as_bytes().starts_with(needle.as_bytes()),
+            ))
+        }
+        (BuiltinIntrinsicKind::StrEndsWith, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(
+                haystack.as_bytes().ends_with(needle.as_bytes()),
+            ))
+        }
+        (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::string(
             php_source::byte_kernel::ascii_lowercase_copy(string.as_bytes()),
         )),
         _ => None,
     }
 }
 
-fn fast_builtin_stub_expected_arity(name: &str) -> usize {
-    match name {
-        "str_contains" | "str_starts_with" | "str_ends_with" => 2,
-        _ => 1,
-    }
-}
-
 #[cold]
 fn fast_builtin_stub_fallback_reason(name: &str, values: &[Value]) -> &'static str {
-    if values.len() != fast_builtin_stub_expected_arity(name) {
-        return "arity";
+    let Some(spec) = builtin_intrinsic_spec(name) else {
+        return "unsupported";
+    };
+    fast_builtin_stub_fallback_reason_for_spec(spec, values).unwrap_or("type")
+}
+
+fn builtin_intrinsic_spec(name: &str) -> Option<&'static BuiltinIntrinsicSpec> {
+    BUILTIN_INTRINSICS.iter().find(|spec| spec.name == name)
+}
+
+fn fast_builtin_stub_fallback_reason_for_spec(
+    spec: &BuiltinIntrinsicSpec,
+    values: &[Value],
+) -> Option<&'static str> {
+    if !builtin_intrinsic_metadata_matches(spec) {
+        return Some("metadata");
+    }
+    if values.len() != spec.exact_arity {
+        return Some("arity");
     }
     if values
         .iter()
         .any(|value| matches!(value, Value::Reference(_)))
     {
-        return "by_ref";
+        return Some("by_ref");
     }
-    "type"
+    if builtin_intrinsic_type_match(spec.kind, values) {
+        return None;
+    }
+    Some("type")
+}
+
+fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
+    let Some(metadata) = php_std::generated::arginfo::function_metadata(spec.name) else {
+        return false;
+    };
+    if metadata.return_type != spec.return_type || metadata.params.len() != spec.params.len() {
+        return false;
+    }
+    metadata
+        .params
+        .iter()
+        .zip(spec.params.iter())
+        .all(|(actual, expected)| {
+            actual.name == expected.name
+                && actual.type_decl == expected.type_decl
+                && actual.optional == expected.optional
+                && !actual.by_ref
+                && !actual.variadic
+        })
+}
+
+fn builtin_intrinsic_type_match(kind: BuiltinIntrinsicKind, values: &[Value]) -> bool {
+    match (kind, values) {
+        (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(_)]) => {
+            ArrayKey::from_value_mvp(key).is_some()
+        }
+        (BuiltinIntrinsicKind::CountArray, [Value::Array(_)])
+        | (BuiltinIntrinsicKind::StrLen, [Value::String(_)])
+        | (BuiltinIntrinsicKind::StrToLower, [Value::String(_)]) => true,
+        (
+            BuiltinIntrinsicKind::StrContains
+            | BuiltinIntrinsicKind::StrStartsWith
+            | BuiltinIntrinsicKind::StrEndsWith,
+            [Value::String(_), Value::String(_)],
+        ) => true,
+        (
+            BuiltinIntrinsicKind::IsArray
+            | BuiltinIntrinsicKind::IsInt
+            | BuiltinIntrinsicKind::IsString,
+            [_],
+        ) => true,
+        _ => false,
+    }
 }
 
 fn byte_slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -40095,7 +42774,17 @@ fn call_builtin_args_to_positional(
 fn internal_builtin_generated_named_args_supported(function: &str) -> bool {
     matches!(
         function,
-        "round" | "strlen" | "str_contains" | "str_starts_with" | "str_ends_with" | "strtolower"
+        "array_key_exists"
+            | "count"
+            | "is_array"
+            | "is_int"
+            | "is_string"
+            | "round"
+            | "strlen"
+            | "str_contains"
+            | "str_starts_with"
+            | "str_ends_with"
+            | "strtolower"
     )
 }
 
@@ -40799,7 +43488,8 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         DenseOpcode::Move
         | DenseOpcode::LoadLocal
         | DenseOpcode::LoadLocalEcho
-        | DenseOpcode::StoreLocal => "locals",
+        | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard => "locals",
         DenseOpcode::BinaryAdd
         | DenseOpcode::BinarySub
         | DenseOpcode::BinaryMul
@@ -40826,12 +43516,15 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         | DenseOpcode::UnaryMinus
         | DenseOpcode::UnaryNot
         | DenseOpcode::UnaryBitNot => "unary_ops",
-        DenseOpcode::CallFunction => "function_calls",
+        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
+            "function_calls"
+        }
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::FetchDim
         | DenseOpcode::AssignDim
         | DenseOpcode::AppendDim => "arrays",
+        DenseOpcode::FetchProperty | DenseOpcode::AssignProperty => "properties",
         DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => "foreach",
         DenseOpcode::Echo => "output",
         DenseOpcode::Jump
@@ -40844,7 +43537,9 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
 }
 
 fn dense_bytecode_unsupported_reason(message: &str) -> &'static str {
-    if message.contains("FetchProperty") {
+    if message.contains("NewObject") {
+        "object_instantiation"
+    } else if message.contains("FetchProperty") {
         "property_fetch"
     } else if message.contains("AssignProperty") {
         "property_assignment"
@@ -42204,6 +44899,123 @@ mod tests {
     }
 
     #[test]
+    fn semantic_helpers_echo_fast_hit_shared_by_rich_and_dense() {
+        let source = "<?php echo 'a', 1, true, null, false;";
+        let rich = execute_source_with_options(
+            source,
+            VmOptions {
+                execution_format: ExecutionFormat::Ir,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        let dense = execute_source_with_options(
+            source,
+            VmOptions {
+                execution_format: ExecutionFormat::Bytecode,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(rich.status.is_success(), "{:?}", rich.status);
+        assert!(dense.status.is_success(), "{:?}", dense.status);
+        assert_eq!(rich.output.as_bytes(), b"a11");
+        assert_eq!(dense.output.as_bytes(), rich.output.as_bytes());
+
+        let rich_counters = rich.counters.expect("rich counters should be collected");
+        assert!(rich_counters.output_fast_appends >= 1, "{rich_counters:?}");
+        assert!(
+            rich_counters.output_slow_appends_by_reason.is_empty(),
+            "{rich_counters:?}"
+        );
+
+        let dense_counters = dense.counters.expect("dense counters should be collected");
+        assert!(
+            dense_counters.dense_functions_executed >= 1,
+            "{dense_counters:?}"
+        );
+        assert!(
+            dense_counters
+                .dense_instruction_families_executed
+                .get("output")
+                .copied()
+                .unwrap_or_default()
+                >= 1,
+            "{dense_counters:?}"
+        );
+        assert!(
+            dense_counters.output_fast_appends >= 1,
+            "{dense_counters:?}"
+        );
+        assert!(
+            dense_counters.output_slow_appends_by_reason.is_empty(),
+            "{dense_counters:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_helpers_echo_fallback_reason_shared_by_rich_and_dense() {
+        let source = "<?php echo [1], \"\\n\";";
+        let rich = execute_source_with_options(
+            source,
+            VmOptions {
+                execution_format: ExecutionFormat::Ir,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+        let dense = execute_source_with_options(
+            source,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(rich.status.is_success(), "{:?}", rich.status);
+        assert!(dense.status.is_success(), "{:?}", dense.status);
+        let rich_output = rich.output.to_string_lossy();
+        let dense_output = dense.output.to_string_lossy();
+        assert_eq!(dense_output, rich_output);
+        assert!(rich_output.contains("Array\n"), "{rich_output}");
+
+        let rich_counters = rich.counters.expect("rich counters should be collected");
+        assert_eq!(
+            rich_counters
+                .output_slow_appends_by_reason
+                .get("array_conversion_warning"),
+            Some(&1),
+            "{rich_counters:?}"
+        );
+
+        let dense_counters = dense.counters.expect("dense counters should be collected");
+        assert!(
+            dense_counters.dense_functions_executed >= 1,
+            "{dense_counters:?}"
+        );
+        assert!(
+            dense_counters
+                .dense_instruction_families_executed
+                .get("output")
+                .copied()
+                .unwrap_or_default()
+                >= 1,
+            "{dense_counters:?}"
+        );
+        assert_eq!(
+            dense_counters
+                .output_slow_appends_by_reason
+                .get("array_conversion_warning"),
+            Some(&1),
+            "{dense_counters:?}"
+        );
+    }
+
+    #[test]
     fn output_fast_paths_preserve_to_string_fallback_and_conversion_errors() {
         let object = execute_source_with_options(
             "<?php
@@ -42521,18 +45333,18 @@ good"
     fn environment_builtins_use_controlled_request_context() {
         let result = execute_source_with_options(
             "<?php
-            echo getenv('COMPOSER_HOME'), \"\\n\";
-            echo $_ENV['COMPOSER_CACHE_DIR'], \"\\n\";
+            echo getenv('PHP_APP_HOME'), \"\\n\";
+            echo $_ENV['PHP_APP_CACHE_DIR'], \"\\n\";
             echo isset($_SERVER['argv']) ? 'argv' : 'missing', \"\\n\";
             echo $_SERVER['SCRIPT_NAME'], \"\\n\";
             echo php_sapi_name(), \"\\n\";
             echo php_uname('s'), '|', php_uname('n'), '|', php_uname('r'), \"\\n\";
             echo php_uname(), \"\\n\";
             echo get_current_user(), \"\\n\";
-            putenv('COMPOSER_HOME=/changed');
-            echo getenv('COMPOSER_HOME'), \"\\n\";
-            putenv('COMPOSER_HOME');
-            echo getenv('COMPOSER_HOME') === false ? 'unset' : 'bad', \"\\n\";
+            putenv('PHP_APP_HOME=/changed');
+            echo getenv('PHP_APP_HOME'), \"\\n\";
+            putenv('PHP_APP_HOME');
+            echo getenv('PHP_APP_HOME') === false ? 'unset' : 'bad', \"\\n\";
             ",
             VmOptions {
                 runtime_context: RuntimeContext::controlled_cli(
@@ -42540,10 +45352,10 @@ good"
                     vec!["arg".to_string()],
                 )
                 .with_env(vec![
-                    ("COMPOSER_HOME".to_string(), "/tmp/composer".to_string()),
+                    ("PHP_APP_HOME".to_string(), "/tmp/php-app".to_string()),
                     (
-                        "COMPOSER_CACHE_DIR".to_string(),
-                        "/tmp/composer-cache".to_string(),
+                        "PHP_APP_CACHE_DIR".to_string(),
+                        "/tmp/php-app-cache".to_string(),
                     ),
                 ]),
                 ..VmOptions::default()
@@ -42554,7 +45366,7 @@ good"
         assert_eq!(
             result.output.to_string_lossy(),
             format!(
-                "/tmp/composer\n/tmp/composer-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Stdlib generic\nphrust\n/changed\nunset\n",
+                "/tmp/php-app\n/tmp/php-app-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Stdlib generic\nphrust\n/changed\nunset\n",
                 php_source::reference_php_version(),
                 php_source::reference_php_version()
             )
@@ -42700,6 +45512,7 @@ good"
             "fixtures/runtime/valid/includes/include-once.php",
             VmOptions {
                 include_cache: Some(Arc::clone(&cache)),
+                collect_counters: true,
                 ..VmOptions::default()
             },
         );
@@ -42708,6 +45521,10 @@ good"
         assert_eq!(result.output.as_bytes(), b"1\n");
         assert_eq!(cache.cache_stats().compile_misses, 1);
         assert!(cache.cache_stats().resolution_hits >= 2);
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.include_resolution_hits >= 2, "{counters:?}");
+        assert_eq!(counters.include_compile_misses, 1, "{counters:?}");
+        assert_eq!(counters.include_once_skips, 2, "{counters:?}");
     }
 
     #[test]
@@ -42745,6 +45562,11 @@ good"
             Some(&1),
             "{counters:?}"
         );
+        assert_eq!(
+            counters.include_fallback_by_reason.get("missing_path"),
+            Some(&1),
+            "{counters:?}"
+        );
 
         let require = execute_fixture_file_with_options(
             "fixtures/runtime/invalid/includes/require-missing.php",
@@ -42777,6 +45599,11 @@ good"
             counters
                 .slow_path_calls_by_reason
                 .get("include_autoload.missing_path"),
+            Some(&1),
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.include_fallback_by_reason.get("missing_path"),
             Some(&1),
             "{counters:?}"
         );
@@ -44873,6 +47700,38 @@ good"
         assert_eq!(stats.tier2_jit_candidates, 0, "{stats:?}");
     }
 
+    #[cfg(not(feature = "jit-cranelift"))]
+    #[test]
+    fn managed_native_platform_unavailable_keeps_interpreter_fast_paths() {
+        let source = "<?php function native_default_leaf(int $a, int $b): int { return $a + $b; } for ($i = 0; $i < 12; $i = $i + 1) { echo native_default_leaf($i, 2); }";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Ir,
+                quickening: QuickeningMode::On,
+                inline_caches: InlineCacheMode::On,
+                jit: JitMode::Cranelift,
+                tiering: TieringOptions {
+                    function_entry_threshold: 1,
+                    ..TieringOptions::default()
+                },
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2345678910111213");
+        let counters = result.counters.expect("counters");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert!(counters.native_candidates > 0, "{counters:?}");
+        assert!(counters.native_platform_unavailable > 0, "{counters:?}");
+        assert_eq!(counters.native_compiled_regions, 0, "{counters:?}");
+        assert_eq!(counters.native_executions, 0, "{counters:?}");
+        assert!(counters.quickening_attempts > 0, "{counters:?}");
+        assert!(counters.inline_cache_observations > 0, "{counters:?}");
+    }
+
     #[cfg(feature = "jit-cranelift")]
     #[test]
     fn jit_int_leaf_hot_loop_executes_after_warmup() {
@@ -46083,6 +48942,18 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let counters = on.counters.expect("on counters");
         assert!(counters.method_ic_misses > 0, "{counters:?}");
         assert!(counters.method_ic_guard_failures > 0, "{counters:?}");
+        assert!(
+            counters.optimized_exit_snapshots_created >= counters.method_ic_guard_failures,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.optimized_exit_snapshots_created,
+            counters.optimized_exit_snapshots_materialized
+        );
+        assert!(
+            counters.fallback_resume_successes >= counters.method_ic_guard_failures,
+            "{counters:?}"
+        );
         assert!(counters.method_ic_polymorphic_hits > 0, "{counters:?}");
         assert!(
             counters.method_direct_dispatch_fallbacks > 0,
@@ -46691,6 +49562,18 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
         let counters = on.counters.expect("on counters");
         assert!(counters.property_ic_misses > 0, "{counters:?}");
         assert!(counters.property_ic_guard_failures > 0, "{counters:?}");
+        assert!(
+            counters.optimized_exit_snapshots_created >= counters.property_ic_guard_failures,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.optimized_exit_snapshots_created,
+            counters.optimized_exit_snapshots_materialized
+        );
+        assert!(
+            counters.fallback_resume_successes >= counters.property_ic_guard_failures,
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -47127,6 +50010,18 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
         assert!(counters.quickening_fallback_calls >= 2, "{counters:?}");
         assert!(counters.quickening_dequickens > 0, "{counters:?}");
         assert!(counters.quickening_megamorphic > 0, "{counters:?}");
+        assert!(
+            counters.optimized_exit_snapshots_created >= counters.quickening_guard_failures,
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.optimized_exit_snapshots_created,
+            counters.optimized_exit_snapshots_materialized
+        );
+        assert!(
+            counters.fallback_resume_successes >= counters.quickening_guard_failures,
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -47459,6 +50354,34 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             on_counters.packed_dim_fast_path_misses > 0,
             "{on_counters:?}"
         );
+    }
+
+    #[test]
+    fn dense_auto_fetch_dim_keeps_unrendered_warning_structured() {
+        let source = "<?php $items = []; echo $items['missing']; echo \"x\\n\";";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Auto,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"x\n");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_RUNTIME_UNDEFINED_ARRAY_KEY_WARNING"),
+            "{:?}",
+            result.diagnostics
+        );
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
+        assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+        assert!(counters.bytecode_instructions_executed > 0, "{counters:?}");
     }
 
     #[test]
@@ -49365,6 +52288,11 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             echo '|', str_ends_with(\"abcdef\", \"def\") ? 'end' : 'bad';
             echo '|', strtolower(\"A\\0Z!\");
             echo '|', str_contains(\"abc\", 2) ? 'coerced' : 'not';
+            echo '|', str_contains(needle: 'z', haystack: 'abc') ? 'bad' : 'named';
+            $shape = ['answer' => 42, 3 => 'three'];
+            echo '|', array_key_exists('answer', $shape) ? 'ake-hit' : 'bad';
+            echo '|', array_key_exists('missing', $shape) ? 'bad' : 'ake-miss';
+            try { array_key_exists([], $shape); } catch (TypeError $e) { echo '|ake-type'; }
         ";
         let off = execute_source_with_options(
             source,
@@ -49386,7 +52314,10 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         assert!(off.status.is_success(), "{:?}", off.status);
         assert!(on.status.is_success(), "{:?}", on.status);
         assert_eq!(on.output, off.output);
-        assert_eq!(on.output.as_bytes(), b"contains|empty|start|end|a\0z!|not");
+        assert_eq!(
+            on.output.as_bytes(),
+            b"contains|empty|start|end|a\0z!|not|named|ake-hit|ake-miss|ake-type"
+        );
         let off_counters = off.counters.expect("off counters");
         let on_counters = on.counters.expect("on counters");
         assert_eq!(off_counters.builtin_intrinsic_candidates, 0);
@@ -49396,6 +52327,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             "str_starts_with",
             "str_ends_with",
             "strtolower",
+            "array_key_exists",
         ] {
             assert!(
                 on_counters.intrinsic_hits.get(name).copied().unwrap_or(0) > 0,
@@ -49408,13 +52340,19 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 .get("str_contains.type"),
             Some(&1)
         );
+        assert_eq!(
+            on_counters
+                .intrinsic_fallback_by_reason
+                .get("array_key_exists.type"),
+            Some(&1)
+        );
     }
 
     #[test]
     fn internal_function_dispatch_cache_preserves_error_paths() {
         let cases = [
             (
-                "<?php is_int(value: 1);",
+                "<?php strlen(bytes: 'abc');",
                 ExitStatus::RuntimeError,
                 b"".as_slice(),
             ),
@@ -51227,6 +54165,313 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 .is_some_and(|message| message.contains("maximum execution time exceeded")),
             "{:?}",
             result.status
+        );
+    }
+
+    #[test]
+    fn dense_bytecode_auto_mixes_dense_functions_and_rich_fallback_functions() {
+        let result = execute_source_with_options(
+            r#"<?php
+class LocalBox {
+    public $value = 7;
+}
+function dense_supported($seed) {
+    $items = [1, 2, $seed];
+    return $items[2] + 3;
+}
+function rich_fallback() {
+    $box = new LocalBox();
+    return $box->value;
+}
+echo dense_supported(4), "\n", rich_fallback(), "\n";
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "7\n7\n");
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.bytecode_lower_attempts, 1, "{counters:?}");
+        assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
+        assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+        assert!(counters.dense_functions_planned >= 2, "{counters:?}");
+        assert!(counters.dense_functions_executed >= 2, "{counters:?}");
+        assert!(
+            counters.rich_fallback_functions_planned >= 1,
+            "{counters:?}"
+        );
+        assert_eq!(counters.rich_fallback_functions_executed, 1, "{counters:?}");
+        assert_eq!(
+            counters
+                .dense_function_fallback_by_reason
+                .get("object_instantiation"),
+            Some(&1),
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .dense_instruction_families_executed
+                .get("function_calls")
+                .copied()
+                .unwrap_or_default()
+                >= 2,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_bytecode_executes_declared_property_fetch_and_assignment() {
+        let result = execute_source_with_options(
+            r#"<?php
+class DensePropertyDto {
+    public int $value = 1;
+}
+function dense_property_make_dto() {
+    return new DensePropertyDto();
+}
+function dense_property_read($object) {
+    return $object->value;
+}
+function dense_property_write($object, $value) {
+    $object->value = $value;
+    return $object->value;
+}
+$object = dense_property_make_dto();
+for ($i = 0; $i < 4; $i++) {
+    echo dense_property_read($object), ':', dense_property_write($object, $i), ';';
+}
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "1:0;0:1;1:2;2:3;");
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.dense_property_fetch_hits >= 4, "{counters:?}");
+        assert!(counters.dense_property_assignment_hits >= 4, "{counters:?}");
+        assert!(counters.dense_property_ic_reuse > 0, "{counters:?}");
+        assert!(
+            counters
+                .dense_instruction_families_executed
+                .get("properties")
+                .copied()
+                .unwrap_or_default()
+                >= 8,
+            "{counters:?}"
+        );
+        assert!(
+            !counters
+                .dense_function_fallback_by_reason
+                .contains_key("property_fetch"),
+            "{counters:?}"
+        );
+        assert!(
+            !counters
+                .dense_function_fallback_by_reason
+                .contains_key("property_assignment"),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_property_semantic_fallbacks_remain_local() {
+        let result = execute_source_with_options(
+            r#"<?php
+class DensePropertyDynamic {
+}
+class DensePropertyMagic {
+    public function __get($name) { return 'magic:' . $name; }
+    public function __set($name, $value): void { echo 'set:' . $name . ':' . $value . ';'; }
+}
+class DensePropertyHook {
+    public string $name { get { return 'hook'; } set { $this->name = strtoupper($value); } }
+}
+class DensePropertyTyped {
+    public int $value = 0;
+}
+function dense_property_make_dynamic() {
+    $object = new DensePropertyDynamic();
+    $object->missing = 'dynamic';
+    return $object;
+}
+function dense_property_make_magic() {
+    return new DensePropertyMagic();
+}
+function dense_property_make_hook() {
+    return new DensePropertyHook();
+}
+function dense_property_read_missing($object) {
+    return $object->missing;
+}
+function dense_property_read_name($object) {
+    return $object->name;
+}
+function dense_property_write_value($object, $value) {
+    $object->value = $value;
+    return $object->value;
+}
+$dynamic = dense_property_make_dynamic();
+echo dense_property_read_missing($dynamic), ';';
+$magic = dense_property_make_magic();
+echo dense_property_read_missing($magic), ';';
+dense_property_write_value($magic, 'x');
+$hook = dense_property_make_hook();
+echo dense_property_read_name($hook), ';';
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "dynamic;magic:missing;set:value:x;hook;"
+        );
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.dense_functions_executed > 0, "{counters:?}");
+        for reason in [
+            "dynamic_property",
+            "magic_get",
+            "magic_set",
+            "property_hook",
+        ] {
+            assert!(
+                counters
+                    .dense_property_fallback_by_reason
+                    .contains_key(reason),
+                "missing {reason}: {counters:?}"
+            );
+        }
+        assert!(
+            !counters
+                .dense_function_fallback_by_reason
+                .contains_key("property_fetch"),
+            "{counters:?}"
+        );
+        assert!(
+            !counters
+                .dense_function_fallback_by_reason
+                .contains_key("property_assignment"),
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_bytecode_executes_method_and_static_calls() {
+        let result = execute_source_with_options(
+            r#"<?php
+class DenseCallService {
+    public function inc($value) { return $value + 1; }
+    public static function twice($value) { return $value * 2; }
+}
+class DenseCallMagic {
+    public function __call($name, $args) { return $name . count($args); }
+}
+function dense_call_make_service() {
+    return new DenseCallService();
+}
+function dense_call_make_magic() {
+    return new DenseCallMagic();
+}
+function dense_call_method($service, $value) {
+    return $service->inc($value);
+}
+function dense_call_static($value) {
+    return DenseCallService::twice($value);
+}
+function dense_call_magic($object) {
+    return $object->missing(1, 2);
+}
+$service = dense_call_make_service();
+for ($i = 0; $i < 4; $i++) {
+    echo dense_call_method($service, $i), ':', dense_call_static($i), ';';
+}
+$magic = dense_call_make_magic();
+echo dense_call_magic($magic);
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "1:0;2:2;3:4;4:6;missing2");
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.dense_method_call_hits >= 4, "{counters:?}");
+        assert!(counters.dense_static_call_hits >= 4, "{counters:?}");
+        assert!(counters.dense_call_ic_hits > 0, "{counters:?}");
+        assert!(counters.dense_call_ic_misses > 0, "{counters:?}");
+        assert!(
+            counters
+                .dense_call_fallback_by_reason
+                .contains_key("magic_call"),
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .dense_instruction_families_executed
+                .get("function_calls")
+                .copied()
+                .unwrap_or_default()
+                >= 8,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_property_assignment_type_error_is_local_fallback() {
+        let result = execute_source_with_options(
+            r#"<?php
+class DensePropertyTypedFailure {
+    public int $value = 0;
+}
+function dense_property_make_typed_failure() {
+    return new DensePropertyTypedFailure();
+}
+function dense_property_write_typed_failure($object, $value) {
+    $object->value = $value;
+    return $object->value;
+}
+$typed = dense_property_make_typed_failure();
+dense_property_write_typed_failure($typed, 'bad');
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let counters = result.counters.expect("counters should be collected");
+        assert!(counters.dense_functions_executed > 0, "{counters:?}");
+        assert!(
+            counters
+                .dense_property_fallback_by_reason
+                .contains_key("typed_property_validation"),
+            "{counters:?}"
+        );
+        assert!(
+            !counters
+                .dense_function_fallback_by_reason
+                .contains_key("property_assignment"),
+            "{counters:?}"
         );
     }
 

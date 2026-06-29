@@ -514,6 +514,7 @@ mod tests {
         });
 
         state.record_quickening(QuickeningObservation {
+            specialization: None,
             attempt: true,
             specialized: false,
             guard_hit: false,

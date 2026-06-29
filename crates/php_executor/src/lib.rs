@@ -16,6 +16,7 @@ mod engine_compat;
 mod executor;
 mod input;
 mod pipeline;
+mod profile;
 mod request;
 
 pub use cache::{
@@ -30,3 +31,4 @@ pub use input::{
 pub use php_optimizer::OptimizationLevel;
 pub use php_vm::api::VmOptions;
 pub use php_vm::include::{IncludeCache, IncludeCacheStats};
+pub use profile::{EngineProfile, EngineProfileName, ParseEngineProfileError};

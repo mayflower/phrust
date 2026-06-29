@@ -361,7 +361,7 @@ def build_inventory(report: dict[str, Any], report_path: Path) -> dict[str, Any]
     gaps.append(
         {
             "id": "PERF-GAP-HOTPATH-CORPUS-REPRESENTATIVENESS",
-            "description": "The current smoke corpus and optional framework micro-smokes are deterministic but too small to represent real Composer/framework workloads.",
+            "description": "The current smoke corpus and optional framework micro-smokes are deterministic but too small to represent real application workloads.",
         }
     )
 
@@ -385,7 +385,7 @@ def build_inventory(report: dict[str, Any], report_path: Path) -> dict[str, Any]
         "counter_gaps": gaps,
         "non_representative_notes": [
             "The smoke corpus uses tiny deterministic loops so instruction counts are useful for ranking within the corpus, not for real-world throughput claims.",
-            "No fixture exercises real Composer autoload trees, large arrays, I/O-heavy includes, closures with captures, generators, fibers, or exception-heavy paths at framework scale.",
+            "No fixture exercises real package-manager autoload trees, large arrays, I/O-heavy includes, closures with captures, generators, fibers, or exception-heavy paths at application scale.",
             "Wall-clock timings are intentionally excluded from the hot-path priority calculation.",
         ],
         "no_go_areas": [

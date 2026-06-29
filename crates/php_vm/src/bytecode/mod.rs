@@ -102,6 +102,16 @@ pub enum DenseOpcode {
     ForeachInit = 46,
     /// Advance a by-value foreach iterator.
     ForeachNext = 47,
+    /// `rN = object->property`.
+    FetchProperty = 48,
+    /// `object->property = value`.
+    AssignProperty = 49,
+    /// `rN = object->method(args...)`.
+    CallMethod = 50,
+    /// `rN = Class::method(args...)`.
+    CallStaticMethod = 51,
+    /// `local[N] = operand; discard operand`.
+    StoreLocalDiscard = 52,
     /// Emit one operand to output.
     Echo = 7,
     /// Jump to a dense block index.
@@ -172,6 +182,11 @@ impl DenseOpcode {
             Self::AppendDim => "append_dim",
             Self::ForeachInit => "foreach_init",
             Self::ForeachNext => "foreach_next",
+            Self::FetchProperty => "fetch_property",
+            Self::AssignProperty => "assign_property",
+            Self::CallMethod => "call_method",
+            Self::CallStaticMethod => "call_static_method",
+            Self::StoreLocalDiscard => "store_local_discard",
             Self::Echo => "echo",
             Self::Jump => "jump",
             Self::JumpIfFalse => "jump_if_false",
@@ -187,7 +202,10 @@ impl DenseOpcode {
     pub const fn is_superinstruction(self) -> bool {
         matches!(
             self,
-            Self::LoadConstEcho | Self::LoadLocalEcho | Self::BinaryConcatEcho
+            Self::LoadConstEcho
+                | Self::LoadLocalEcho
+                | Self::BinaryConcatEcho
+                | Self::StoreLocalDiscard
         )
     }
 }
@@ -288,6 +306,20 @@ pub enum DenseOperands {
         name: u32,
         args: Vec<DenseCallArg>,
     },
+    /// Instance method call.
+    MethodCall {
+        dst: u32,
+        object: DenseOperand,
+        method: u32,
+        args: Vec<DenseCallArg>,
+    },
+    /// Static method call.
+    StaticCall {
+        dst: u32,
+        class_name: u32,
+        method: u32,
+        args: Vec<DenseCallArg>,
+    },
     /// Register destination only.
     Dst { dst: u32 },
     /// Array insert/append operands.
@@ -319,6 +351,19 @@ pub enum DenseOperands {
         iterator: u32,
         key: Option<u32>,
         value: u32,
+    },
+    /// Declared property fetch operands.
+    FetchProperty {
+        dst: u32,
+        object: DenseOperand,
+        property: u32,
+    },
+    /// Declared property assignment operands.
+    AssignProperty {
+        dst: u32,
+        object: DenseOperand,
+        property: u32,
+        value: DenseOperand,
     },
     /// One generic operand.
     Operand { src: DenseOperand },
@@ -464,6 +509,50 @@ pub struct DenseBytecodeUnit {
     pub source_map: Vec<DenseSourceMapEntry>,
 }
 
+/// Per-function dense execution decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DenseFunctionPlan {
+    /// Function can execute as dense bytecode.
+    Dense,
+    /// Function must execute through the rich IR interpreter.
+    RichFallback { reason: String },
+}
+
+/// Mixed dense/rich execution plan for one IR unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseExecutionPlan {
+    /// Dense unit with function indexes aligned to the original IR unit.
+    pub unit: DenseBytecodeUnit,
+    /// Per-function execution decision.
+    pub functions: Vec<DenseFunctionPlan>,
+}
+
+impl DenseExecutionPlan {
+    /// Count functions planned for dense execution.
+    #[must_use]
+    pub fn dense_function_count(&self) -> u64 {
+        self.functions
+            .iter()
+            .filter(|plan| matches!(plan, DenseFunctionPlan::Dense))
+            .count() as u64
+    }
+
+    /// Count functions planned for rich-IR fallback.
+    #[must_use]
+    pub fn rich_fallback_function_count(&self) -> u64 {
+        self.functions
+            .iter()
+            .filter(|plan| matches!(plan, DenseFunctionPlan::RichFallback { .. }))
+            .count() as u64
+    }
+
+    /// Return the dense decision for a function.
+    #[must_use]
+    pub fn function_plan(&self, function: usize) -> Option<&DenseFunctionPlan> {
+        self.functions.get(function)
+    }
+}
+
 /// Superinstruction selection summary for counters and smoke tests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SuperinstructionSelectionReport {
@@ -585,6 +674,12 @@ impl DenseBytecodeUnit {
         lower_unit(unit)
     }
 
+    /// Lower supported functions independently and preserve fallback metadata
+    /// for unsupported functions.
+    pub fn mixed_plan_from_ir(unit: &IrUnit) -> DenseExecutionPlan {
+        lower_mixed_plan(unit)
+    }
+
     /// Verify dense bytecode invariants.
     pub fn verify(&self) -> Result<(), Vec<DenseVerifyError>> {
         verify_dense_unit(self)
@@ -652,6 +747,90 @@ impl DenseBytecodeUnit {
     #[must_use]
     pub fn to_snapshot_text(&self) -> String {
         render_snapshot(self)
+    }
+}
+
+fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
+    let mut dense = DenseBytecodeUnit {
+        version: DENSE_BYTECODE_VERSION,
+        constant_count: unit.constants.len() as u32,
+        file_count: unit.files.len() as u32,
+        functions: Vec::with_capacity(unit.functions.len()),
+        spans: Vec::new(),
+        names: Vec::new(),
+        cache_slots: Vec::new(),
+        source_map: Vec::new(),
+    };
+    let mut functions = Vec::with_capacity(unit.functions.len());
+    for function in &unit.functions {
+        match lower_function(function, &mut dense.spans, &mut dense.names) {
+            Ok(function) => {
+                dense.functions.push(function);
+                functions.push(DenseFunctionPlan::Dense);
+            }
+            Err(error) => {
+                let span = push_span(&mut dense.spans, IrSpan::default());
+                dense
+                    .functions
+                    .push(fallback_dense_function(function, span));
+                functions.push(DenseFunctionPlan::RichFallback {
+                    reason: error.message,
+                });
+            }
+        }
+    }
+    for entry in unit.source_map.entries() {
+        let span = push_span(&mut dense.spans, entry.span);
+        dense.source_map.push(DenseSourceMapEntry {
+            target: lower_mixed_source_map_target(&entry.target, &functions),
+            origin: entry.origin.clone(),
+            span,
+        });
+    }
+    DenseExecutionPlan {
+        unit: dense,
+        functions,
+    }
+}
+
+fn lower_mixed_source_map_target(
+    target: &IrSourceMapTarget,
+    functions: &[DenseFunctionPlan],
+) -> DenseSourceMapTarget {
+    let function = match target {
+        IrSourceMapTarget::Function { function }
+        | IrSourceMapTarget::Block { function, .. }
+        | IrSourceMapTarget::Instruction { function, .. }
+        | IrSourceMapTarget::Terminator { function, .. } => *function,
+    };
+    if matches!(
+        functions.get(function.index()),
+        Some(DenseFunctionPlan::RichFallback { .. })
+    ) {
+        return DenseSourceMapTarget::Function {
+            function: function.raw(),
+        };
+    }
+    lower_source_map_target(target)
+}
+
+fn fallback_dense_function(function: &IrFunction, span: DenseSpanId) -> DenseFunction {
+    DenseFunction {
+        name: function.name.clone(),
+        register_count: function.register_count.max(1),
+        local_count: function.local_count,
+        blocks: vec![DenseBlock {
+            id: 0,
+            first_instruction: 0,
+            instruction_len: 1,
+            terminator: 0,
+        }],
+        instructions: vec![DenseInstruction {
+            opcode: DenseOpcode::Return,
+            operands: DenseOperands::Return { value: None },
+            span,
+            cache_slot: None,
+        }],
     }
 }
 
@@ -885,20 +1064,15 @@ fn select_function_superinstructions(
         };
         let mut index = first;
         while index + 1 < terminator {
-            let next_operands = function.instructions[index + 1].operands.clone();
-            if function.instructions[index + 1].opcode != DenseOpcode::Echo {
-                index += 1;
-                continue;
-            }
-            let DenseOperands::Operand { src: echo_src } = next_operands else {
-                report.record_skipped("echo_operand_shape");
-                index += 1;
-                continue;
-            };
             let opcode = function.instructions[index].opcode;
             let operands = function.instructions[index].operands.clone();
-            let Some(fused) = select_echo_fusion(opcode, &operands, echo_src) else {
-                report.record_skipped("unsupported_producer_echo_pair");
+            let next_opcode = function.instructions[index + 1].opcode;
+            let next_operands = function.instructions[index + 1].operands.clone();
+            let Some(fused) = select_pair_fusion(opcode, &operands, next_opcode, &next_operands)
+            else {
+                if next_opcode == DenseOpcode::Echo {
+                    report.record_skipped("unsupported_producer_echo_pair");
+                }
                 index += 1;
                 continue;
             };
@@ -909,6 +1083,24 @@ fn select_function_superinstructions(
             report.record_emitted(fused);
             index += 2;
         }
+    }
+}
+
+fn select_pair_fusion(
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    next_opcode: DenseOpcode,
+    next_operands: &DenseOperands,
+) -> Option<DenseOpcode> {
+    match next_opcode {
+        DenseOpcode::Echo => {
+            let DenseOperands::Operand { src: echo_src } = next_operands else {
+                return None;
+            };
+            select_echo_fusion(opcode, operands, *echo_src)
+        }
+        DenseOpcode::Discard => select_discard_fusion(opcode, operands, next_operands),
+        _ => None,
     }
 }
 
@@ -939,6 +1131,21 @@ fn select_echo_fusion(
         }
         _ => None,
     }
+}
+
+fn select_discard_fusion(
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    next_operands: &DenseOperands,
+) -> Option<DenseOpcode> {
+    let (DenseOpcode::StoreLocal, DenseOperands::LocalOperand { src, .. }) = (opcode, operands)
+    else {
+        return None;
+    };
+    let DenseOperands::Operand { src: discard_src } = next_operands else {
+        return None;
+    };
+    (src == discard_src).then_some(DenseOpcode::StoreLocalDiscard)
 }
 
 fn select_dense_function_rules(function: &DenseFunction, report: &mut RuleSelectionReport) {
@@ -1019,9 +1226,10 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
     match instruction.opcode {
         DenseOpcode::Nop => Some(RuleKind::NoRule),
         DenseOpcode::LoadConst => Some(RuleKind::Const),
-        DenseOpcode::Move | DenseOpcode::LoadLocal | DenseOpcode::StoreLocal => {
-            Some(RuleKind::Move)
-        }
+        DenseOpcode::Move
+        | DenseOpcode::LoadLocal
+        | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard => Some(RuleKind::Move),
         DenseOpcode::BinaryAdd
         | DenseOpcode::BinarySub
         | DenseOpcode::BinaryMul
@@ -1069,8 +1277,12 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::Echo
         | DenseOpcode::Discard => Some(RuleKind::NoRule),
         DenseOpcode::CallFunction
+        | DenseOpcode::CallMethod
+        | DenseOpcode::CallStaticMethod
         | DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
+        | DenseOpcode::FetchProperty
+        | DenseOpcode::AssignProperty
         | DenseOpcode::AssignDim
         | DenseOpcode::AppendDim
         | DenseOpcode::ForeachInit
@@ -1113,6 +1325,8 @@ fn compare_result_feeds_branch(compare: &DenseOperands, branch: &DenseOperands) 
 fn dense_skip_reason(opcode: DenseOpcode) -> &'static str {
     match opcode {
         DenseOpcode::CallFunction => "effectful_call",
+        DenseOpcode::CallMethod => "effectful_method_call",
+        DenseOpcode::CallStaticMethod => "effectful_static_method_call",
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::AssignDim
@@ -1320,6 +1534,34 @@ fn lower_instruction(
                 args: lower_call_args(instruction, names, args)?,
             },
         ),
+        InstructionKind::CallMethod {
+            dst,
+            object,
+            method,
+            args,
+        } => (
+            DenseOpcode::CallMethod,
+            DenseOperands::MethodCall {
+                dst: dst.raw(),
+                object: lower_operand(*object),
+                method: push_name(names, method).index() as u32,
+                args: lower_call_args(instruction, names, args)?,
+            },
+        ),
+        InstructionKind::CallStaticMethod {
+            dst,
+            class_name,
+            method,
+            args,
+        } => (
+            DenseOpcode::CallStaticMethod,
+            DenseOperands::StaticCall {
+                dst: dst.raw(),
+                class_name: push_name(names, class_name).index() as u32,
+                method: push_name(names, method).index() as u32,
+                args: lower_call_args(instruction, names, args)?,
+            },
+        ),
         InstructionKind::NewArray { dst } => {
             (DenseOpcode::NewArray, DenseOperands::Dst { dst: dst.raw() })
         }
@@ -1401,6 +1643,32 @@ fn lower_instruction(
                 iterator: iterator.raw(),
                 key: key.map(RegId::raw),
                 value: value.raw(),
+            },
+        ),
+        InstructionKind::FetchProperty {
+            dst,
+            object,
+            property,
+        } => (
+            DenseOpcode::FetchProperty,
+            DenseOperands::FetchProperty {
+                dst: dst.raw(),
+                object: lower_operand(*object),
+                property: push_name(names, property).index() as u32,
+            },
+        ),
+        InstructionKind::AssignProperty {
+            dst,
+            object,
+            property,
+            value,
+        } => (
+            DenseOpcode::AssignProperty,
+            DenseOperands::AssignProperty {
+                dst: dst.raw(),
+                object: lower_operand(*object),
+                property: push_name(names, property).index() as u32,
+                value: lower_operand(*value),
             },
         ),
         InstructionKind::Echo { src } => (
@@ -1761,7 +2029,10 @@ fn verify_instruction(
                 ));
             }
         }
-        (DenseOpcode::StoreLocal, DenseOperands::LocalOperand { local, src }) => {
+        (
+            DenseOpcode::StoreLocal | DenseOpcode::StoreLocalDiscard,
+            DenseOperands::LocalOperand { local, src },
+        ) => {
             verify_local(*local, function, errors);
             verify_operand(*src, unit, function, errors);
         }
@@ -1807,6 +2078,38 @@ fn verify_instruction(
         (DenseOpcode::CallFunction, DenseOperands::Call { dst, name, args }) => {
             verify_register(*dst, function, errors);
             verify_name(*name, unit, errors);
+            for arg in args {
+                verify_call_arg(arg, unit, function, errors);
+            }
+        }
+        (
+            DenseOpcode::CallMethod,
+            DenseOperands::MethodCall {
+                dst,
+                object,
+                method,
+                args,
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*object, unit, function, errors);
+            verify_name(*method, unit, errors);
+            for arg in args {
+                verify_call_arg(arg, unit, function, errors);
+            }
+        }
+        (
+            DenseOpcode::CallStaticMethod,
+            DenseOperands::StaticCall {
+                dst,
+                class_name,
+                method,
+                args,
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_name(*class_name, unit, errors);
+            verify_name(*method, unit, errors);
             for arg in args {
                 verify_call_arg(arg, unit, function, errors);
             }
@@ -1877,6 +2180,32 @@ fn verify_instruction(
                 verify_register(*key, function, errors);
             }
             verify_register(*value, function, errors);
+        }
+        (
+            DenseOpcode::FetchProperty,
+            DenseOperands::FetchProperty {
+                dst,
+                object,
+                property,
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*object, unit, function, errors);
+            verify_name(*property, unit, errors);
+        }
+        (
+            DenseOpcode::AssignProperty,
+            DenseOperands::AssignProperty {
+                dst,
+                object,
+                property,
+                value,
+            },
+        ) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*object, unit, function, errors);
+            verify_name(*property, unit, errors);
+            verify_operand(*value, unit, function, errors);
         }
         (DenseOpcode::Echo, DenseOperands::Operand { src }) => {
             verify_operand(*src, unit, function, errors);
@@ -2169,6 +2498,31 @@ fn render_operands(operands: &DenseOperands) -> String {
             let rendered_args: Vec<_> = args.iter().map(render_call_arg).collect();
             format!("r{dst} n{name} ({})", rendered_args.join(", "))
         }
+        DenseOperands::MethodCall {
+            dst,
+            object,
+            method,
+            args,
+        } => {
+            let rendered_args: Vec<_> = args.iter().map(render_call_arg).collect();
+            format!(
+                "r{dst} {}->n{method} ({})",
+                render_operand(*object),
+                rendered_args.join(", ")
+            )
+        }
+        DenseOperands::StaticCall {
+            dst,
+            class_name,
+            method,
+            args,
+        } => {
+            let rendered_args: Vec<_> = args.iter().map(render_call_arg).collect();
+            format!(
+                "r{dst} n{class_name}::n{method} ({})",
+                rendered_args.join(", ")
+            )
+        }
         DenseOperands::Dst { dst } => format!("r{dst}"),
         DenseOperands::ArrayInsert {
             array,
@@ -2215,6 +2569,21 @@ fn render_operands(operands: &DenseOperands) -> String {
             let key = key.map_or_else(|| "-".to_string(), |key| format!("r{key}"));
             format!("r{has_value} r{iterator} key={key} value=r{value}")
         }
+        DenseOperands::FetchProperty {
+            dst,
+            object,
+            property,
+        } => format!("r{dst} {} n{property}", render_operand(*object)),
+        DenseOperands::AssignProperty {
+            dst,
+            object,
+            property,
+            value,
+        } => format!(
+            "r{dst} {} n{property} {}",
+            render_operand(*object),
+            render_operand(*value)
+        ),
         DenseOperands::Operand { src } => render_operand(*src),
         DenseOperands::Jump { target } => format!("b{target}"),
         DenseOperands::JumpIf { condition, target } => {
@@ -2477,6 +2846,46 @@ echo "a" . "b";
                 .instructions
                 .iter()
                 .any(|item| item.opcode == DenseOpcode::Nop)
+        );
+    }
+
+    #[test]
+    fn superinstruction_selection_fuses_store_discard_pairs() {
+        let frontend = analyze_source(
+            r#"<?php
+$name = "world";
+$other = $name;
+echo $other;
+"#,
+        );
+        let result = php_ir::lower_frontend_result(
+            &frontend,
+            php_ir::LoweringOptions {
+                source_path: "fixtures/performance/superinstructions/store-discard.php".to_string(),
+                ..php_ir::LoweringOptions::default()
+            },
+        );
+        result
+            .verification
+            .expect("superinstruction source IR verifies before dense lowering");
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let mut dense = DenseBytecodeUnit::lower_from_ir(&result.unit)
+            .expect("store/discard source lowers to dense bytecode");
+
+        let report = dense.select_superinstructions();
+
+        dense.verify().expect("selected bytecode still verifies");
+        assert_eq!(
+            report
+                .emitted_by_kind
+                .get(DenseOpcode::StoreLocalDiscard.as_str()),
+            Some(&2)
+        );
+        assert!(
+            dense.functions[0]
+                .instructions
+                .iter()
+                .any(|item| item.opcode == DenseOpcode::StoreLocalDiscard)
         );
     }
 

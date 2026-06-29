@@ -19,9 +19,10 @@ use hyper::{
 };
 use hyper_util::{rt::TokioExecutor, rt::TokioIo, server::conn::auto::Builder};
 use php_executor::{
-    CompiledScriptCache, CompiledScriptCacheLookup, IncludeCache, IncludeCacheStats,
-    OptimizationLevel, PhpExecutionError, PhpExecutionOutput, PhpExecutionStatus, PhpExecutor,
-    PhpExecutorOptions, PhpRequestExecutionInput, PhpScriptCacheInput, VmOptions,
+    CompiledScriptCache, CompiledScriptCacheLookup, EngineProfileName, IncludeCache,
+    IncludeCacheStats, OptimizationLevel, PhpExecutionError, PhpExecutionOutput,
+    PhpExecutionStatus, PhpExecutor, PhpExecutorOptions, PhpRequestExecutionInput,
+    PhpScriptCacheInput,
 };
 use php_runtime::api::{
     PHP_SESSION_ACTIVE, RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState,
@@ -69,8 +70,7 @@ struct AppState {
     in_flight: Arc<Semaphore>,
     max_in_flight: usize,
     metrics: Arc<ServerMetrics>,
-    script_cache: Arc<CompiledScriptCache>,
-    include_cache: Arc<IncludeCache>,
+    engine: Arc<ServerEngineState>,
     metrics_token: Option<String>,
     access_log: Option<Arc<AccessLogger>>,
     session_config: SessionConfig,
@@ -142,20 +142,82 @@ struct AccessLogEntry<'a> {
     cache_hit: Option<bool>,
 }
 
-impl AppState {
+#[derive(Clone, Debug)]
+struct ServerEngineState {
+    engine_profile: EngineProfileName,
+    script_cache: Arc<CompiledScriptCache>,
+    include_cache: Arc<IncludeCache>,
+    compile_optimization_level: OptimizationLevel,
+}
+
+impl ServerEngineState {
+    fn new(
+        engine_profile: EngineProfileName,
+        script_cache: Arc<CompiledScriptCache>,
+        include_cache: Arc<IncludeCache>,
+    ) -> Self {
+        let base_options = if engine_profile == EngineProfileName::Default {
+            PhpExecutorOptions::managed_fast_runtime()
+        } else {
+            PhpExecutorOptions::for_profile(engine_profile)
+        };
+        Self {
+            engine_profile,
+            script_cache,
+            include_cache,
+            compile_optimization_level: base_options.optimization_level,
+        }
+    }
+
+    fn executor_options(&self) -> PhpExecutorOptions {
+        if self.engine_profile == EngineProfileName::Default {
+            PhpExecutorOptions::managed_fast_runtime()
+        } else {
+            PhpExecutorOptions::for_profile(self.engine_profile)
+        }
+    }
+
+    fn executor_options_with_include_cache(&self) -> PhpExecutorOptions {
+        let mut options = self.executor_options();
+        options.vm_options.include_cache = Some(Arc::clone(&self.include_cache));
+        options
+    }
+
     fn compile_script(
         &self,
         script_path: &Path,
     ) -> Result<CompiledScriptCacheLookup, PhpExecutionError> {
-        let executor = PhpExecutor::new();
+        let executor = PhpExecutor::with_options(self.executor_options());
         self.script_cache.get_or_compile_script(
             &executor,
             PhpScriptCacheInput {
                 path: script_path.to_path_buf(),
                 source_path: script_path.to_string_lossy().into_owned(),
-                optimization_level: OptimizationLevel::O0,
+                optimization_level: self.compile_optimization_level,
             },
         )
+    }
+}
+
+impl AppState {
+    fn compile_script(
+        &self,
+        script_path: &Path,
+    ) -> Result<CompiledScriptCacheLookup, PhpExecutionError> {
+        let lookup = self.engine.compile_script(script_path)?;
+        self.metrics
+            .persistent_engine_policy_reuses
+            .fetch_add(1, Ordering::Relaxed);
+        if lookup.hit {
+            self.metrics
+                .persistent_engine_immutable_metadata_reuses
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics
+                .persistent_engine_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(lookup)
     }
 }
 
@@ -187,6 +249,11 @@ struct ServerMetrics {
     static_precompressed_hits: AtomicU64,
     script_cache_preload_successes: AtomicU64,
     script_cache_preload_failures: AtomicU64,
+    persistent_engine_policy_reuses: AtomicU64,
+    persistent_engine_immutable_metadata_reuses: AtomicU64,
+    persistent_engine_misses: AtomicU64,
+    persistent_engine_request_local_resets: AtomicU64,
+    persistent_engine_request_local_rejections: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -247,7 +314,12 @@ phrust_server_include_resolution_misses_total {}\n\
 phrust_server_include_compile_hits_total {}\n\
 phrust_server_include_compile_misses_total {}\n\
 phrust_server_include_stale_invalidations_total {}\n\
-phrust_server_include_compile_errors_total {}\n",
+phrust_server_include_compile_errors_total {}\n\
+phrust_server_persistent_engine_policy_reuses_total {}\n\
+phrust_server_persistent_engine_immutable_metadata_reuses_total {}\n\
+phrust_server_persistent_engine_misses_total {}\n\
+phrust_server_persistent_engine_request_local_resets_total {}\n\
+phrust_server_persistent_engine_rejected_persistence_total{{reason=\"request_local_state\"}} {}\n",
             self.requests_total.load(Ordering::Relaxed),
             self.static_responses.load(Ordering::Relaxed),
             self.php_responses.load(Ordering::Relaxed),
@@ -282,6 +354,14 @@ phrust_server_include_compile_errors_total {}\n",
             include_cache.compile_misses,
             include_cache.stale_invalidations,
             include_cache.compile_errors,
+            self.persistent_engine_policy_reuses.load(Ordering::Relaxed),
+            self.persistent_engine_immutable_metadata_reuses
+                .load(Ordering::Relaxed),
+            self.persistent_engine_misses.load(Ordering::Relaxed),
+            self.persistent_engine_request_local_resets
+                .load(Ordering::Relaxed),
+            self.persistent_engine_request_local_rejections
+                .load(Ordering::Relaxed),
         )
     }
 }
@@ -335,6 +415,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_metrics_token_enabled = config.metrics_token.is_some();
     let startup_access_log = config.access_log.clone();
     let startup_tls_enabled = config.tls_cert.is_some();
+    let engine_profile = config.engine_preset;
     let tls_acceptor = build_tls_acceptor(config.tls_cert.as_deref(), config.tls_key.as_deref())?;
     let access_log = config
         .access_log
@@ -351,11 +432,12 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
     println!("listening {startup_scheme}://{local_addr}");
     eprintln!(
-        "startup docroot={} front_controller={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} tls={} tls_alpn={}",
+        "startup docroot={} front_controller={} engine_preset={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} tls={} tls_alpn={}",
         docroot.display(),
         startup_front_controller
             .as_ref()
             .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
+        engine_profile,
         startup_script_cache_enabled,
         startup_script_cache_shards,
         startup_script_cache_max_entries,
@@ -368,6 +450,21 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         if startup_tls_enabled { "http/1.1" } else { "-" },
     );
     debug!(%local_addr, docroot=%docroot.display(), "starting phrust server");
+    let script_cache = Arc::new(if config.script_cache_enabled {
+        CompiledScriptCache::new_with_limits(
+            config.script_cache_shards,
+            config.script_cache_max_entries,
+            Duration::from_millis(config.script_cache_check_interval_ms),
+        )
+    } else {
+        CompiledScriptCache::disabled()
+    });
+    let include_cache = Arc::new(IncludeCache::new(config.script_cache_shards));
+    let engine = Arc::new(ServerEngineState::new(
+        engine_profile,
+        script_cache,
+        include_cache,
+    ));
     let state = Arc::new(AppState {
         route_config: RouteConfig {
             docroot,
@@ -389,16 +486,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         in_flight: Arc::new(Semaphore::new(config.max_in_flight)),
         max_in_flight: config.max_in_flight,
         metrics: Arc::new(ServerMetrics::default()),
-        script_cache: Arc::new(if config.script_cache_enabled {
-            CompiledScriptCache::new_with_limits(
-                config.script_cache_shards,
-                config.script_cache_max_entries,
-                Duration::from_millis(config.script_cache_check_interval_ms),
-            )
-        } else {
-            CompiledScriptCache::disabled()
-        }),
-        include_cache: Arc::new(IncludeCache::new(config.script_cache_shards)),
+        engine,
         metrics_token: config.metrics_token,
         access_log,
         session_config: SessionConfig {
@@ -739,8 +827,8 @@ fn metrics_response(state: &AppState, parts: &Parts) -> Response<ResponseBody> {
             state
                 .max_in_flight
                 .saturating_sub(state.in_flight.available_permits()) as u64,
-            state.script_cache.cache_stats(),
-            state.include_cache.cache_stats(),
+            state.engine.script_cache.cache_stats(),
+            state.engine.include_cache.cache_stats(),
         ),
         "text/plain; charset=UTF-8",
     )
@@ -1143,8 +1231,8 @@ fn clear_cache_response(state: &AppState, peer: SocketAddr) -> Response<Response
     if !peer.ip().is_loopback() {
         return response::text(StatusCode::FORBIDDEN, "forbidden\n");
     }
-    state.script_cache.clear();
-    state.include_cache.clear();
+    state.engine.script_cache.clear();
+    state.engine.include_cache.clear();
     response::text(StatusCode::OK, "cache cleared\n")
 }
 
@@ -1339,25 +1427,41 @@ fn execute_compiled_php_in_blocking_region(
     runtime_context: RuntimeContext,
 ) -> Result<PhpExecutionOutput, PhpExecutionError> {
     task::block_in_place(move || {
-        let executor = PhpExecutor::with_options(PhpExecutorOptions {
-            vm_options: VmOptions {
-                include_cache: Some(Arc::clone(&state.include_cache)),
-                ..VmOptions::default()
-            },
-            ..PhpExecutorOptions::default()
-        });
-        let output = executor.execute_compiled(
-            &lookup.compiled,
-            PhpRequestExecutionInput {
-                real_path: Some(script_path),
-                cwd: state.route_config.docroot.clone(),
-                include_roots: include_roots_for_docroot(&state.route_config.docroot),
-                runtime_context,
-                collect_counters: false,
-            },
-        );
-        Ok(output)
+        execute_compiled_php_with_state(&state, lookup, script_path, runtime_context, false)
     })
+}
+
+fn execute_compiled_php_with_state(
+    state: &AppState,
+    lookup: CompiledScriptCacheLookup,
+    script_path: PathBuf,
+    runtime_context: RuntimeContext,
+    collect_counters: bool,
+) -> Result<PhpExecutionOutput, PhpExecutionError> {
+    state
+        .metrics
+        .persistent_engine_request_local_resets
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .persistent_engine_request_local_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .persistent_engine_policy_reuses
+        .fetch_add(1, Ordering::Relaxed);
+    let executor = PhpExecutor::with_options(state.engine.executor_options_with_include_cache());
+    let output = executor.execute_compiled(
+        &lookup.compiled,
+        PhpRequestExecutionInput {
+            real_path: Some(script_path),
+            cwd: state.route_config.docroot.clone(),
+            include_roots: include_roots_for_docroot(&state.route_config.docroot),
+            runtime_context,
+            collect_counters,
+        },
+    );
+    Ok(output)
 }
 
 fn seed_session_state(
@@ -1710,6 +1814,8 @@ fn content_type_for(path: &std::path::Path) -> &'static str {
 mod tests {
     use super::*;
 
+    static SERVER_CACHE_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn parses_single_byte_ranges() {
         assert_eq!(
@@ -1795,6 +1901,133 @@ mod tests {
         assert!(second.hit);
         assert_eq!(cache.cache_stats().hits, 1);
         assert_eq!(cache.cache_stats().misses, 1);
+    }
+
+    #[test]
+    fn app_state_default_engine_runs_managed_fast_paths_with_counters() {
+        let fixture = ServerCacheFixture::new();
+        fixture.write(managed_fast_counter_source());
+        let cache = Arc::new(CompiledScriptCache::new(1));
+        let state = test_state(&fixture, cache, false);
+        let lookup = state
+            .compile_script(&fixture.path)
+            .expect("server compile should use managed defaults");
+        let request = RuntimeHttpRequestContext::new(
+            "GET",
+            "localhost",
+            "/index.php",
+            "/index.php",
+            fixture.path.to_string_lossy().into_owned(),
+            fixture.root.to_string_lossy().into_owned(),
+        );
+        let runtime_context = RuntimeContext::controlled_http(request)
+            .with_cwd(state.route_config.docroot.clone())
+            .with_include_path(vec![state.route_config.docroot.clone()]);
+
+        let output = execute_compiled_php_with_state(
+            &state,
+            lookup,
+            fixture.path.clone(),
+            runtime_context,
+            true,
+        )
+        .expect("server execution should succeed");
+
+        assert_eq!(output.status, PhpExecutionStatus::Success);
+        assert_eq!(output.stdout, b"123512351235");
+        let counters = output.counters.expect("counters should be collected");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.native_executions, counters.jit_executed);
+        assert!(counters.bytecode_lower_attempts > 0, "{counters:?}");
+        assert!(counters.quickening_attempts > 0, "{counters:?}");
+        assert!(counters.inline_cache_observations > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn persistent_engine_shares_immutable_artifacts_without_request_state() {
+        let fixture = ServerCacheFixture::new();
+        fixture.write(request_isolation_source());
+        let cache = Arc::new(CompiledScriptCache::new_with_limits(2, 8, Duration::ZERO));
+        let state = Arc::new(test_state(&fixture, Arc::clone(&cache), false));
+        let initial = state
+            .compile_script(&fixture.path)
+            .expect("initial compile");
+        assert!(!initial.hit);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for id in ["one", "two"] {
+            let state = Arc::clone(&state);
+            let fixture_path = fixture.path.clone();
+            let fixture_root = fixture.root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let lookup = state.compile_script(&fixture_path).expect("cached compile");
+                assert!(lookup.hit);
+                barrier.wait();
+                let request = RuntimeHttpRequestContext::new(
+                    "GET",
+                    "localhost",
+                    format!("/index.php?id={id}"),
+                    "/index.php",
+                    fixture_path.to_string_lossy().into_owned(),
+                    fixture_root.to_string_lossy().into_owned(),
+                );
+                let runtime_context = RuntimeContext::controlled_http(request)
+                    .with_cwd(fixture_root.clone())
+                    .with_include_path(vec![fixture_root]);
+                let output = execute_compiled_php_with_state(
+                    &state,
+                    lookup,
+                    fixture_path,
+                    runtime_context,
+                    false,
+                )
+                .expect("request execution");
+                assert_eq!(output.status, PhpExecutionStatus::Success);
+                let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+                let isolated_header = output.http_response.headers.iter().any(|header| {
+                    header.name.eq_ignore_ascii_case("x-isolated") && header.value == id
+                });
+                (id.to_string(), stdout, isolated_header)
+            }));
+        }
+
+        for handle in handles {
+            let (id, stdout, isolated_header) = handle.join().expect("request thread");
+            assert!(
+                stdout.contains(&format!("id={id}|global=1|buf=buffer|cow=1:2|ref=2")),
+                "{stdout}"
+            );
+            assert!(stdout.contains("|destruct"), "{stdout}");
+            assert!(isolated_header);
+        }
+
+        let stats = cache.cache_stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(
+            state
+                .metrics
+                .persistent_engine_request_local_resets
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            state
+                .metrics
+                .persistent_engine_request_local_rejections
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            state
+                .metrics
+                .persistent_engine_immutable_metadata_reuses
+                .load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
@@ -1899,8 +2132,11 @@ mod tests {
             in_flight: Arc::new(Semaphore::new(1)),
             max_in_flight: 1,
             metrics: Arc::new(ServerMetrics::default()),
-            script_cache: cache,
-            include_cache: Arc::new(IncludeCache::new(1)),
+            engine: Arc::new(ServerEngineState::new(
+                EngineProfileName::Default,
+                cache,
+                Arc::new(IncludeCache::new(1)),
+            )),
             metrics_token: None,
             access_log: None,
             session_config: SessionConfig {
@@ -1914,6 +2150,40 @@ mod tests {
         }
     }
 
+    fn managed_fast_counter_source() -> &'static str {
+        "<?php\n\
+         function ic_f() { return 1; }\n\
+         class ICSlotSmoke {\n\
+             public $x = 3;\n\
+             public function m() { return 2; }\n\
+         }\n\
+         $object = new ICSlotSmoke();\n\
+         $items = [4, 5];\n\
+         for ($i = 0; $i < 3; $i = $i + 1) {\n\
+             echo ic_f(), $object->m(), $object->x, $items[1];\n\
+         }\n"
+    }
+
+    fn request_isolation_source() -> &'static str {
+        "<?php\n\
+         $GLOBALS['counter'] = ($GLOBALS['counter'] ?? 0) + 1;\n\
+         header('X-Isolated: ' . $_GET['id']);\n\
+         ob_start();\n\
+         echo 'buffer';\n\
+         $buffer = ob_get_clean();\n\
+         $items = [1];\n\
+         $copy = $items;\n\
+         $copy[] = 2;\n\
+         $ref = 1;\n\
+         $alias =& $ref;\n\
+         $alias = $alias + 1;\n\
+         class ServerIsolationDestructor {\n\
+             public function __destruct() { echo '|destruct'; }\n\
+         }\n\
+         $object = new ServerIsolationDestructor();\n\
+         echo 'id=', $_GET['id'], '|global=', $GLOBALS['counter'], '|buf=', $buffer, '|cow=', count($items), ':', count($copy), '|ref=', $ref;\n"
+    }
+
     struct ServerCacheFixture {
         root: PathBuf,
         path: PathBuf,
@@ -1921,14 +2191,16 @@ mod tests {
 
     impl ServerCacheFixture {
         fn new() -> Self {
-            let unique = SystemTime::now()
+            let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time")
                 .as_nanos();
+            let unique = SERVER_CACHE_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "phrust-server-cache-{}-{unique}",
-                std::process::id()
+                "phrust-server-cache-{}-{timestamp}-{unique}",
+                std::process::id(),
             ));
+            let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir(&root).expect("create server cache fixture");
             let path = root.join("index.php");
             Self { root, path }

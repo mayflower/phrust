@@ -245,7 +245,7 @@ if (
     or off_method_override_misses
 ):
     raise SystemExit("[fail] inline-caches=off recorded class-relation/method-override cache counters")
-for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
+for builtin in ["strlen", "count", "is_int", "is_string", "is_array", "array_key_exists"]:
     if total_map(off, "builtin_fast_stub_hits", builtin) or total_map(off, "builtin_fast_stub_misses", builtin):
         raise SystemExit(f"[fail] inline-caches=off recorded builtin fast-stub counters for {builtin}")
 if any(sample.get("builtin_fast_stub_fallback_by_reason", {}) for sample in off):
@@ -284,10 +284,10 @@ if on_builtin_call_hits <= 0:
     raise SystemExit("[fail] builtin-call IC counter recorded no hits")
 if on_builtin_call_misses <= 0:
     raise SystemExit("[fail] builtin-call IC counter recorded no misses")
-for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
+for builtin in ["strlen", "count", "is_int", "is_string", "is_array", "array_key_exists"]:
     if total_map(on, "builtin_fast_stub_hits", builtin) <= 0:
         raise SystemExit(f"[fail] builtin fast stub recorded no hits for {builtin}")
-for intrinsic in ["strtolower", "str_contains", "str_starts_with", "str_ends_with"]:
+for intrinsic in ["strtolower", "str_contains", "str_starts_with", "str_ends_with", "array_key_exists"]:
     if total_map(on, "intrinsic_hits", intrinsic) <= 0:
         raise SystemExit(f"[fail] builtin intrinsic recorded no hits for {intrinsic}")
 if total(on, "builtin_intrinsic_candidates") <= 0:
@@ -310,6 +310,10 @@ if total_map(on, "builtin_fast_stub_misses", "strlen") <= 0:
     raise SystemExit("[fail] builtin fast stub recorded no strlen misses")
 if total_map(on, "builtin_fast_stub_fallback_by_reason", "strlen.type") <= 0:
     raise SystemExit("[fail] builtin fast stub recorded no strlen type fallback reason")
+if total_map(on, "builtin_fast_stub_misses", "array_key_exists") <= 0:
+    raise SystemExit("[fail] builtin fast stub recorded no array_key_exists misses")
+if total_map(on, "builtin_fast_stub_fallback_by_reason", "array_key_exists.type") <= 0:
+    raise SystemExit("[fail] builtin fast stub recorded no array_key_exists type fallback reason")
 if on_method_hits <= 0:
     raise SystemExit("[fail] method-call inline cache recorded no hits")
 if on_method_misses <= 0:

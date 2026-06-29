@@ -78,6 +78,44 @@ impl VmDeoptReason {
     }
 }
 
+/// Stable state-family names used for snapshot rejection counters.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SnapshotStateFamily {
+    InitializedLocals,
+    Temporaries,
+    ReferenceAliases,
+    CowArrays,
+    ObjectHandles,
+    ForeachIterators,
+    CallFrames,
+    OutputBuffers,
+    PendingDiagnostics,
+    ExceptionFinally,
+    IncludeStack,
+    SourceTrace,
+}
+
+impl SnapshotStateFamily {
+    /// Stable counter spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitializedLocals => "initialized_locals",
+            Self::Temporaries => "temporaries",
+            Self::ReferenceAliases => "reference_aliases",
+            Self::CowArrays => "cow_arrays",
+            Self::ObjectHandles => "object_handles",
+            Self::ForeachIterators => "foreach_iterators",
+            Self::CallFrames => "call_frames",
+            Self::OutputBuffers => "output_buffers",
+            Self::PendingDiagnostics => "pending_diagnostics",
+            Self::ExceptionFinally => "exception_finally",
+            Self::IncludeStack => "include_stack",
+            Self::SourceTrace => "source_trace",
+        }
+    }
+}
+
 /// One interpreter resume target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeoptResumePoint {
@@ -158,6 +196,149 @@ pub struct LiveStateSnapshot {
     pub output_buffer: ControlStateMarker,
     /// Call frame identity marker.
     pub call_frame_identity: ControlStateMarker,
+    /// Include stack marker.
+    pub include_stack: ControlStateMarker,
+    /// Pending diagnostics marker.
+    pub pending_diagnostics: ControlStateMarker,
+    /// Source/trace metadata marker.
+    pub source_trace: ControlStateMarker,
+}
+
+impl LiveStateSnapshot {
+    /// Materializes this optimized-exit snapshot into the generic VM resume
+    /// contract. Current dense and quickened interpreter tiers already keep
+    /// values in canonical frames, so materialization verifies exact state
+    /// availability before resuming the generic helper path.
+    pub fn materialize_for_generic_resume(
+        &self,
+    ) -> Result<MaterializedLiveState, SnapshotRejection> {
+        if let Some(family) = self.rejected_state_family() {
+            return Err(SnapshotRejection { family });
+        }
+
+        Ok(MaterializedLiveState {
+            resume: self.resume,
+            span: self.span,
+            register_count: self.registers.len(),
+            local_count: self.locals.len(),
+            operand_stack_count: self.operand_stack.len(),
+            represented: self.represented_state_families(),
+        })
+    }
+
+    /// Returns the first state family that cannot be represented exactly.
+    #[must_use]
+    pub fn rejected_state_family(&self) -> Option<SnapshotStateFamily> {
+        if self
+            .locals
+            .iter()
+            .any(|slot| slot.initialized == Some(false))
+        {
+            return Some(SnapshotStateFamily::InitializedLocals);
+        }
+        if self
+            .registers
+            .iter()
+            .any(|slot| slot.initialized == Some(false))
+        {
+            return Some(SnapshotStateFamily::Temporaries);
+        }
+        if self
+            .registers
+            .iter()
+            .chain(self.locals.iter())
+            .chain(self.operand_stack.iter())
+            .any(|slot| slot.identity == LiveIdentityMarker::MaybeReferenceOrCow)
+            && self.reference_cow == ControlStateMarker::Rejected
+        {
+            return Some(SnapshotStateFamily::ReferenceAliases);
+        }
+        if self.foreach_iterator == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::ForeachIterators);
+        }
+        if self.pending_exception == ControlStateMarker::Rejected
+            || self.pending_finally == ControlStateMarker::Rejected
+        {
+            return Some(SnapshotStateFamily::ExceptionFinally);
+        }
+        if self.output_buffer == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::OutputBuffers);
+        }
+        if self.call_frame_identity == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::CallFrames);
+        }
+        if self.include_stack == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::IncludeStack);
+        }
+        if self.pending_diagnostics == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::PendingDiagnostics);
+        }
+        if self.source_trace == ControlStateMarker::Rejected {
+            return Some(SnapshotStateFamily::SourceTrace);
+        }
+        None
+    }
+
+    fn represented_state_families(&self) -> Vec<SnapshotStateFamily> {
+        let mut families = vec![
+            SnapshotStateFamily::InitializedLocals,
+            SnapshotStateFamily::Temporaries,
+            SnapshotStateFamily::CallFrames,
+            SnapshotStateFamily::IncludeStack,
+            SnapshotStateFamily::PendingDiagnostics,
+            SnapshotStateFamily::SourceTrace,
+        ];
+        if self
+            .registers
+            .iter()
+            .chain(self.locals.iter())
+            .chain(self.operand_stack.iter())
+            .any(|slot| slot.identity == LiveIdentityMarker::MaybeReferenceOrCow)
+            || self.reference_cow == ControlStateMarker::Represented
+        {
+            families.push(SnapshotStateFamily::ReferenceAliases);
+            families.push(SnapshotStateFamily::CowArrays);
+            families.push(SnapshotStateFamily::ObjectHandles);
+        }
+        if self.foreach_iterator == ControlStateMarker::Represented {
+            families.push(SnapshotStateFamily::ForeachIterators);
+        }
+        if self.output_buffer == ControlStateMarker::Represented {
+            families.push(SnapshotStateFamily::OutputBuffers);
+        }
+        if self.pending_exception == ControlStateMarker::Represented
+            || self.pending_finally == ControlStateMarker::Represented
+        {
+            families.push(SnapshotStateFamily::ExceptionFinally);
+        }
+        families.sort();
+        families.dedup();
+        families
+    }
+}
+
+/// Generic VM state restored from an optimized-exit snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedLiveState {
+    /// Interpreter resume location.
+    pub resume: DeoptResumePoint,
+    /// Source span used by diagnostics and trace metadata.
+    pub span: IrSpan,
+    /// Number of live registers represented.
+    pub register_count: usize,
+    /// Number of local slots represented.
+    pub local_count: usize,
+    /// Operand stack slots represented; zero for the current register VM.
+    pub operand_stack_count: usize,
+    /// Exact state families represented by the snapshot.
+    pub represented: Vec<SnapshotStateFamily>,
+}
+
+/// Local snapshot rejection with one counted missing state family.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotRejection {
+    /// Missing state family.
+    pub family: SnapshotStateFamily,
 }
 
 /// One side-exit point from an optimized region back to the interpreter.
@@ -496,6 +677,19 @@ impl ResumeTable {
         id
     }
 
+    /// Materializes a snapshot by id for generic fallback resume.
+    pub fn materialize_snapshot(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<MaterializedResumeRecord, SnapshotRejection> {
+        let Some(record) = self.snapshots.get(snapshot.index()) else {
+            return Err(SnapshotRejection {
+                family: SnapshotStateFamily::SourceTrace,
+            });
+        };
+        record.materialize_for_generic_resume()
+    }
+
     /// Validates snapshot references and unsupported PHP state markers.
     pub fn validate(&self) -> Result<(), Vec<ResumeTableError>> {
         let mut errors = Vec::new();
@@ -577,6 +771,56 @@ impl ResumeTable {
         json.push_str("]}");
         json
     }
+}
+
+impl SnapshotRecord {
+    /// Materializes this v2 snapshot record into a generic-resume summary.
+    pub fn materialize_for_generic_resume(
+        &self,
+    ) -> Result<MaterializedResumeRecord, SnapshotRejection> {
+        if self.reference_cow_poisoned {
+            return Err(SnapshotRejection {
+                family: SnapshotStateFamily::ReferenceAliases,
+            });
+        }
+        if self.foreach_state == ControlStateMarker::Rejected {
+            return Err(SnapshotRejection {
+                family: SnapshotStateFamily::ForeachIterators,
+            });
+        }
+        if self.exception_or_finally_state == ControlStateMarker::Rejected {
+            return Err(SnapshotRejection {
+                family: SnapshotStateFamily::ExceptionFinally,
+            });
+        }
+        if self.output_buffer_state == ControlStateMarker::Rejected {
+            return Err(SnapshotRejection {
+                family: SnapshotStateFamily::OutputBuffers,
+            });
+        }
+        Ok(MaterializedResumeRecord {
+            snapshot: self.id,
+            entry_count: self.entries.len(),
+            foreach_state: self.foreach_state,
+            exception_or_finally_state: self.exception_or_finally_state,
+            output_buffer_state: self.output_buffer_state,
+        })
+    }
+}
+
+/// Materialized v2 resume-table snapshot summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedResumeRecord {
+    /// Snapshot id.
+    pub snapshot: SnapshotId,
+    /// Number of live entries restored.
+    pub entry_count: usize,
+    /// Foreach iterator materialization state.
+    pub foreach_state: ControlStateMarker,
+    /// Exception/finally materialization state.
+    pub exception_or_finally_state: ControlStateMarker,
+    /// Output-buffer materialization state.
+    pub output_buffer_state: ControlStateMarker,
 }
 
 fn validate_snapshot_ref(
@@ -846,6 +1090,9 @@ fn snapshot_for_instruction(
         reference_cow: marker_for(reason, VmDeoptReason::ReferenceCowIdentity),
         output_buffer: marker_for(reason, VmDeoptReason::OutputBufferState),
         call_frame_identity: marker_for(reason, VmDeoptReason::CallFrameBoundary),
+        include_stack: ControlStateMarker::Represented,
+        pending_diagnostics: ControlStateMarker::Represented,
+        source_trace: ControlStateMarker::Represented,
     }
 }
 
@@ -863,6 +1110,7 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         | DenseOpcode::LoadConst
         | DenseOpcode::Move
         | DenseOpcode::StoreLocal
+        | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::Jump
         | DenseOpcode::Return
         | DenseOpcode::Discard => Vec::new(),
@@ -899,7 +1147,9 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
             VmDeoptReason::Overflow,
             VmDeoptReason::HelperStatus,
         ],
-        DenseOpcode::CallFunction => vec![VmDeoptReason::CallFrameBoundary],
+        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
+            vec![VmDeoptReason::CallFrameBoundary]
+        }
         DenseOpcode::LoadConstEcho | DenseOpcode::Echo => {
             vec![VmDeoptReason::OutputBufferState]
         }
@@ -908,6 +1158,11 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         | DenseOpcode::FetchDim
         | DenseOpcode::AssignDim
         | DenseOpcode::AppendDim => vec![VmDeoptReason::ReferenceCowIdentity],
+        DenseOpcode::FetchProperty | DenseOpcode::AssignProperty => vec![
+            VmDeoptReason::GuardFailed,
+            VmDeoptReason::HelperStatus,
+            VmDeoptReason::ReferenceCowIdentity,
+        ],
         DenseOpcode::ForeachInit | DenseOpcode::ForeachNext => {
             vec![VmDeoptReason::ForeachIteratorState]
         }
@@ -1077,6 +1332,21 @@ mod tests {
                 .flat_map(|region| &region.side_exits)
                 .all(|exit| exit.snapshot.operand_stack.is_empty())
         );
+        let materialized = metadata
+            .regions
+            .iter()
+            .flat_map(|region| &region.side_exits)
+            .next()
+            .expect("straight-line metadata has at least one side exit")
+            .snapshot
+            .materialize_for_generic_resume()
+            .expect("straight-line snapshot materializes");
+        assert!(materialized.register_count > 0);
+        assert!(
+            materialized
+                .represented
+                .contains(&SnapshotStateFamily::InitializedLocals)
+        );
     }
 
     #[test]
@@ -1185,10 +1455,112 @@ mod tests {
         );
 
         table.validate().expect("int-add guard table verifies");
+        table
+            .materialize_snapshot(snapshot)
+            .expect("int-add guard snapshot materializes");
         let json = table.to_json();
         assert!(json.contains("\"schema_version\":2"));
         assert!(json.contains("\"kind\":\"int_add\""));
         assert!(json.contains("\"tier\":\"quickening\""));
+    }
+
+    #[test]
+    fn live_state_snapshot_materializes_exact_runtime_families() {
+        let snapshot = LiveStateSnapshot {
+            resume: DeoptResumePoint {
+                function: 0,
+                block: 0,
+                instruction: 4,
+            },
+            span: IrSpan::default(),
+            registers: vec![LiveValueSlot {
+                class: LiveValueClass::Register,
+                index: 0,
+                initialized: Some(true),
+                identity: LiveIdentityMarker::MaybeReferenceOrCow,
+            }],
+            locals: vec![LiveValueSlot {
+                class: LiveValueClass::Local,
+                index: 0,
+                initialized: Some(true),
+                identity: LiveIdentityMarker::MaybeReferenceOrCow,
+            }],
+            operand_stack: Vec::new(),
+            pending_exception: ControlStateMarker::Represented,
+            pending_finally: ControlStateMarker::Represented,
+            foreach_iterator: ControlStateMarker::Represented,
+            reference_cow: ControlStateMarker::Represented,
+            output_buffer: ControlStateMarker::Represented,
+            call_frame_identity: ControlStateMarker::Represented,
+            include_stack: ControlStateMarker::Represented,
+            pending_diagnostics: ControlStateMarker::Represented,
+            source_trace: ControlStateMarker::Represented,
+        };
+
+        let materialized = snapshot
+            .materialize_for_generic_resume()
+            .expect("all runtime families are represented");
+        assert_eq!(materialized.register_count, 1);
+        assert_eq!(materialized.local_count, 1);
+        assert!(
+            materialized
+                .represented
+                .contains(&SnapshotStateFamily::ReferenceAliases)
+        );
+        assert!(
+            materialized
+                .represented
+                .contains(&SnapshotStateFamily::ForeachIterators)
+        );
+        assert!(
+            materialized
+                .represented
+                .contains(&SnapshotStateFamily::OutputBuffers)
+        );
+        assert!(
+            materialized
+                .represented
+                .contains(&SnapshotStateFamily::ExceptionFinally)
+        );
+    }
+
+    #[test]
+    fn live_state_snapshot_rejects_only_missing_state_family() {
+        let snapshot = LiveStateSnapshot {
+            resume: DeoptResumePoint {
+                function: 0,
+                block: 0,
+                instruction: 4,
+            },
+            span: IrSpan::default(),
+            registers: vec![LiveValueSlot {
+                class: LiveValueClass::Register,
+                index: 0,
+                initialized: Some(true),
+                identity: LiveIdentityMarker::Plain,
+            }],
+            locals: vec![LiveValueSlot {
+                class: LiveValueClass::Local,
+                index: 0,
+                initialized: Some(true),
+                identity: LiveIdentityMarker::Plain,
+            }],
+            operand_stack: Vec::new(),
+            pending_exception: ControlStateMarker::None,
+            pending_finally: ControlStateMarker::None,
+            foreach_iterator: ControlStateMarker::Rejected,
+            reference_cow: ControlStateMarker::None,
+            output_buffer: ControlStateMarker::None,
+            call_frame_identity: ControlStateMarker::Represented,
+            include_stack: ControlStateMarker::Represented,
+            pending_diagnostics: ControlStateMarker::Represented,
+            source_trace: ControlStateMarker::Represented,
+        };
+
+        let rejection = snapshot
+            .materialize_for_generic_resume()
+            .expect_err("foreach state is the exact missing family");
+        assert_eq!(rejection.family, SnapshotStateFamily::ForeachIterators);
     }
 
     #[test]

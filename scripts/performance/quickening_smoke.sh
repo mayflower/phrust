@@ -134,8 +134,13 @@ for sample in off + on:
     if "quickening_guard_hits" not in sample or "quickening_guard_misses" not in sample:
         raise SystemExit("[fail] quickening guard hit/miss counters missing from sample")
     for field in [
+        "quickening_candidates_by_family",
+        "quickening_applied_by_family",
+        "quickened_executions_by_family",
+        "quickening_guard_failures_by_family",
         "quickening_fallback_calls",
         "quickening_dequickens",
+        "quickening_dequickened_by_reason",
         "quickening_megamorphic",
         "quickening_disabled",
     ]:
@@ -165,6 +170,15 @@ on_attempts = sum(sample.get("quickening_attempts", 0) for sample in on)
 on_specialized = sum(sample.get("quickening_specialized", 0) for sample in on)
 on_guard_hits = sum(sample.get("quickening_guard_hits", 0) for sample in on)
 on_guard_misses = sum(sample.get("quickening_guard_misses", 0) for sample in on)
+on_quickening_candidates = sum(
+    sum(sample.get("quickening_candidates_by_family", {}).values()) for sample in on
+)
+on_quickening_applied = sum(
+    sum(sample.get("quickening_applied_by_family", {}).values()) for sample in on
+)
+on_quickened_executions = sum(
+    sum(sample.get("quickened_executions_by_family", {}).values()) for sample in on
+)
 on_concat_hits = sum(sample.get("string_concat_fast_path_hits", 0) for sample in on)
 on_packed_hits = sum(sample.get("packed_dim_fast_path_hits", 0) for sample in on)
 on_packed_fetch_hits = sum(sample.get("packed_fetch_fast_hits", 0) for sample in on)
@@ -179,8 +193,14 @@ on_numeric_string_key_fallbacks = sum(
     for sample in on
 )
 on_guard_failures = sum(sample.get("quickening_guard_failures", 0) for sample in on)
+on_guard_failures_by_family = sum(
+    sum(sample.get("quickening_guard_failures_by_family", {}).values()) for sample in on
+)
 on_fallback_calls = sum(sample.get("quickening_fallback_calls", 0) for sample in on)
 on_dequickens = sum(sample.get("quickening_dequickens", 0) for sample in on)
+on_dequickened_by_reason = sum(
+    sum(sample.get("quickening_dequickened_by_reason", {}).values()) for sample in on
+)
 on_megamorphic = sum(sample.get("quickening_megamorphic", 0) for sample in on)
 on_disabled = sum(sample.get("quickening_disabled", 0) for sample in on)
 dense_on = [sample for path, sample in ((path, json.loads(path.read_text(encoding="utf-8"))) for path in sorted(out_dir.glob("dense_*.on.counters.json")))]
@@ -195,8 +215,14 @@ if on_attempts <= 0:
     raise SystemExit("[fail] quickening=on recorded no attempts")
 if on_specialized <= 0:
     raise SystemExit("[fail] quickening=on recorded no metadata specializations")
+if on_quickening_candidates <= 0:
+    raise SystemExit("[fail] quickening=on recorded no quickening candidates by family")
+if on_quickening_applied <= 0:
+    raise SystemExit("[fail] quickening=on recorded no quickening applications by family")
 if on_guard_hits <= 0:
     raise SystemExit("[fail] quickening=on recorded no ADD_INT_INT guard hits")
+if on_quickened_executions <= 0:
+    raise SystemExit("[fail] quickening=on recorded no quickened executions by family")
 if on_concat_hits <= 0:
     raise SystemExit("[fail] quickening=on recorded no CONCAT_STRING_STRING fast-path hits")
 if on_packed_hits <= 0:
@@ -215,10 +241,16 @@ if on_guard_failures != on_numeric_string_key_fallbacks:
     raise SystemExit(
         f"[fail] quickening guard failures {on_guard_failures} != numeric-string key fallbacks {on_numeric_string_key_fallbacks}"
     )
+if on_guard_failures_by_family != on_guard_failures:
+    raise SystemExit(
+        f"[fail] quickening family guard failures {on_guard_failures_by_family} != guard failures {on_guard_failures}"
+    )
 if on_fallback_calls != on_guard_misses:
     raise SystemExit(f"[fail] quickening fallback calls {on_fallback_calls} != guard misses {on_guard_misses}")
 if on_dequickens != 0:
     raise SystemExit(f"[fail] inert quickening recorded dequickens: {on_dequickens}")
+if on_dequickened_by_reason != 0:
+    raise SystemExit(f"[fail] inert quickening recorded dequickened reasons: {on_dequickened_by_reason}")
 if on_megamorphic != 0:
     raise SystemExit(f"[fail] inert quickening recorded megamorphic transitions: {on_megamorphic}")
 if on_disabled != 0:

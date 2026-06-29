@@ -129,3 +129,127 @@ impl CompiledPhpScript {
         &self.pipeline.lowering.unit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PhpExecutionStatus, PhpExecutorOptions};
+    use php_optimizer::OptimizationLevel;
+    use php_runtime::api::RuntimeContext;
+    use php_vm::{
+        api::{ExecutionFormat, JitMode, SuperinstructionMode},
+        experimental::{InlineCacheMode, QuickeningMode},
+    };
+
+    #[test]
+    fn new_uses_managed_fast_runtime() {
+        let executor = PhpExecutor::new();
+        let expected = PhpExecutorOptions::managed_fast_runtime();
+
+        assert_eq!(executor.options.optimization_level, OptimizationLevel::O2);
+        assert_eq!(
+            executor.options.optimization_level,
+            expected.optimization_level
+        );
+        assert_eq!(
+            executor.options.vm_options.include_optimization_level,
+            OptimizationLevel::O2
+        );
+        assert_eq!(
+            executor.options.vm_options.execution_format,
+            ExecutionFormat::Auto
+        );
+        assert_eq!(
+            executor.options.vm_options.superinstructions,
+            SuperinstructionMode::On
+        );
+        assert_eq!(executor.options.vm_options.quickening, QuickeningMode::On);
+        assert_eq!(
+            executor.options.vm_options.inline_caches,
+            InlineCacheMode::On
+        );
+        assert_eq!(executor.options.vm_options.jit, JitMode::Cranelift);
+    }
+
+    #[test]
+    fn execute_source_default_uses_fast_path_counters_with_native_tier() {
+        let executor = PhpExecutor::new();
+        let output = executor.execute_source(PhpExecutionInput {
+            source: managed_fast_counter_source().to_string(),
+            source_path: "managed-fast-counter.php".to_string(),
+            real_path: None,
+            cwd: std::env::current_dir().expect("current directory"),
+            include_roots: Vec::new(),
+            runtime_context: RuntimeContext::controlled_cli("managed-fast-counter.php", Vec::new()),
+            optimization_level: None,
+            collect_counters: true,
+        });
+
+        assert_eq!(output.status, PhpExecutionStatus::Success);
+        assert_eq!(output.stdout, b"123512351235");
+        let counters = output.counters.expect("counters should be collected");
+        assert_eq!(counters.jit_mode, "cranelift");
+        assert_eq!(counters.native_executions, counters.jit_executed);
+        assert!(counters.bytecode_lower_attempts > 0, "{counters:?}");
+        assert!(counters.quickening_attempts > 0, "{counters:?}");
+        assert!(counters.inline_cache_observations > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn execute_source_default_executes_superinstructions() {
+        let executor = PhpExecutor::new();
+        let output = executor.execute_source(PhpExecutionInput {
+            source: default_superinstruction_source().to_string(),
+            source_path: "default-superinstructions.php".to_string(),
+            real_path: None,
+            cwd: std::env::current_dir().expect("current directory"),
+            include_roots: Vec::new(),
+            runtime_context: RuntimeContext::controlled_cli(
+                "default-superinstructions.php",
+                Vec::new(),
+            ),
+            optimization_level: None,
+            collect_counters: true,
+        });
+
+        assert_eq!(output.status, PhpExecutionStatus::Success);
+        assert_eq!(output.stdout, b"hello worldab");
+        let counters = output.counters.expect("counters should be collected");
+        assert!(counters.bytecode_lower_attempts > 0, "{counters:?}");
+        assert!(counters.bytecode_lower_successes > 0, "{counters:?}");
+        assert!(counters.superinstruction_candidates > 0, "{counters:?}");
+        assert!(counters.superinstructions_emitted > 0, "{counters:?}");
+        assert!(
+            counters.superinstructions_executed.values().sum::<u64>() > 0,
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .superinstructions_executed
+                .contains_key("load_const_echo"),
+            "{counters:?}"
+        );
+    }
+
+    fn managed_fast_counter_source() -> &'static str {
+        "<?php\n\
+         function ic_f() { return 1; }\n\
+         class ICSlotSmoke {\n\
+             public $x = 3;\n\
+             public function m() { return 2; }\n\
+         }\n\
+         $object = new ICSlotSmoke();\n\
+         $items = [4, 5];\n\
+         for ($i = 0; $i < 3; $i = $i + 1) {\n\
+             echo ic_f(), $object->m(), $object->x, $items[1];\n\
+         }\n"
+    }
+
+    fn default_superinstruction_source() -> &'static str {
+        "<?php\n\
+         $name = \"world\";\n\
+         echo \"hello \";\n\
+         echo $name;\n\
+         echo \"a\" . \"b\";\n"
+    }
+}

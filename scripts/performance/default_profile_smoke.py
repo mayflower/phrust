@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the explicit fast engine preset against the CLI baseline."""
+"""Compare the product default engine profile against the baseline profile."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from normalize_perf_output import normalize
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENGINE = ROOT / "target/debug/php-vm"
-DEFAULT_OUT_DIR = ROOT / "target/performance/fast-preset"
+DEFAULT_OUT_DIR = ROOT / "target/performance/default-profile"
 
 RUNTIME_FIXTURES = (
     "fixtures/runtime/valid/hello.php",
@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine", type=Path, default=DEFAULT_ENGINE)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
 
@@ -119,19 +120,20 @@ def fixture_cases(out_dir: Path) -> list[Case]:
         for fixture in fixtures:
             path = ROOT / fixture
             if not path.is_file():
-                raise SystemExit(f"missing {category} fast-preset fixture: {fixture}")
+                raise SystemExit(f"missing {category} default-profile fixture: {fixture}")
             cases.append(Case(category, fixture, path, "fixture"))
     for phpt in PHPT_FIXTURES:
         path = ROOT / phpt
         if not path.is_file():
-            raise SystemExit(f"missing phpt fast-preset fixture: {phpt}")
-        generated = materialize_phpt_file(path, generated_phpt_dir)
-        cases.append(Case("phpt", phpt, generated, "phpt-file-section"))
+            raise SystemExit(f"missing phpt default-profile fixture: {phpt}")
+        cases.append(
+            Case("phpt", phpt, materialize_phpt_file(path, generated_phpt_dir), "phpt-file-section")
+        )
     return cases
 
 
-def normalized_env(out_dir: Path, case: Case, preset: str) -> dict[str, str]:
-    tmp_dir = out_dir / "tmp" / preset / safe_name(case.label)
+def normalized_env(out_dir: Path, case: Case, profile: str) -> dict[str, str]:
+    tmp_dir = out_dir / "tmp" / profile / safe_name(case.label)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update(
@@ -142,21 +144,21 @@ def normalized_env(out_dir: Path, case: Case, preset: str) -> dict[str, str]:
             "TMPDIR": str(tmp_dir),
             "TMP": str(tmp_dir),
             "TEMP": str(tmp_dir),
-            "PHRUST_RANDOM_SEED": "performance-fast-preset-smoke",
-            "RUST_TEST_SEED": "performance-fast-preset-smoke",
+            "PHRUST_RANDOM_SEED": "performance-default-profile-smoke",
+            "RUST_TEST_SEED": "performance-default-profile-smoke",
         }
     )
     return env
 
 
-def run_case(engine: Path, case: Case, preset: str, out_dir: Path, timeout: float) -> RunResult:
-    run_dir = out_dir / "runs" / safe_name(case.label) / preset
+def run_case(engine: Path, case: Case, profile: str, out_dir: Path, timeout: float) -> RunResult:
+    run_dir = out_dir / "runs" / safe_name(case.label) / profile
     run_dir.mkdir(parents=True, exist_ok=True)
     counters_path = run_dir / "counters.json"
     command = [
         str(engine),
         "run",
-        f"--engine-preset={preset}",
+        f"--engine-preset={profile}",
         "--counters-json",
         str(counters_path),
         rel(case.path),
@@ -165,7 +167,7 @@ def run_case(engine: Path, case: Case, preset: str, out_dir: Path, timeout: floa
     completed = subprocess.run(
         command,
         cwd=ROOT,
-        env=normalized_env(out_dir, case, preset),
+        env=normalized_env(out_dir, case, profile),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -199,16 +201,34 @@ def collect_fallback_deopt_counters(counters: dict[str, Any]) -> dict[str, int]:
     return {key: value for key, value in sorted(selected.items()) if value != 0}
 
 
-def compare_case(case: Case, baseline: RunResult, fast: RunResult) -> list[str]:
+def default_counter_sanity(counters: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    if counters.get("jit_mode") != "cranelift":
+        failures.append(f"jit_mode={counters.get('jit_mode')!r}; expected cranelift")
+    native_compiled = counters.get("native_compiled_regions", 0)
+    native_executions = counters.get("native_executions", 0)
+    native_unavailable = counters.get("native_platform_unavailable", 0)
+    if isinstance(native_compiled, int) and native_compiled > 0:
+        if not isinstance(native_executions, int) or native_executions <= 0:
+            failures.append(
+                "native_compiled_regions is nonzero but native_executions did not increase"
+            )
+    elif not isinstance(native_unavailable, int):
+        failures.append("native_platform_unavailable counter is missing or not numeric")
+    return failures
+
+
+def compare_case(case: Case, baseline: RunResult, default: RunResult) -> list[str]:
     differences: list[str] = []
-    if fast.returncode != baseline.returncode:
+    if default.returncode != baseline.returncode:
         differences.append(
-            f"exit status baseline={baseline.returncode} fast={fast.returncode}"
+            f"exit status baseline={baseline.returncode} default={default.returncode}"
         )
-    if fast.stdout != baseline.stdout:
+    if default.stdout != baseline.stdout:
         differences.append("stdout differs")
-    if fast.stderr != baseline.stderr:
+    if default.stderr != baseline.stderr:
         differences.append("stderr/runtime diagnostics differ")
+    differences.extend(default_counter_sanity(default.counters))
     if differences:
         return [f"{case.label}: " + "; ".join(differences)]
     return []
@@ -221,11 +241,11 @@ def verdict(rows: list[dict[str, Any]], failures: list[str]) -> tuple[str, list[
     required = {"runtime", "stdlib", "performance", "framework", "phpt"}
     if categories >= required:
         return (
-            "alias-backed",
+            "gate-backed",
             [
-                "fast is a compatibility alias for the shared default profile",
-                "fast/default enables interpreter superinstructions and excludes Cranelift",
-                "bytecode cache remains explicit because it reads and writes local artifacts",
+                "baseline and default profiles matched for selected CLI fixtures",
+                "default profile requests the guarded native tier automatically",
+                "dense bytecode auto mode may fall back to IR without failing correctness",
             ],
         )
     return (
@@ -236,38 +256,38 @@ def verdict(rows: list[dict[str, Any]], failures: list[str]) -> tuple[str, list[
 
 def render_markdown(summary: dict[str, Any]) -> str:
     lines = [
-        "# Fast Engine Preset Smoke",
+        "# Default Engine Profile Smoke",
         "",
-        "Generated by `nix develop -c just fast-preset-smoke`.",
+        "Generated by `nix develop -c just default-profile-smoke`.",
         "Raw stdout, stderr, status, and counter artifacts are local-only under",
-        "`target/performance/fast-preset/` and must not be committed.",
+        "`target/performance/default-profile/` and must not be committed.",
         "",
         "## Summary",
         "",
         "| Field | Value |",
         "| --- | --- |",
         f"| Status | `{summary['status']}` |",
-        f"| Alias verdict | `{summary['default_on_verdict']}` |",
+        f"| Default verdict | `{summary['default_verdict']}` |",
         f"| Cases | {summary['case_count']} |",
         f"| Failures | {len(summary['failures'])} |",
         "",
-        "## Default-On Notes",
+        "## Notes",
         "",
     ]
-    for reason in summary["default_on_reasons"]:
+    for reason in summary["default_reasons"]:
         lines.append(f"- {reason}")
     lines.extend(
         [
             "",
             "## Cases",
             "",
-            "| Category | Fixture | Correctness | Fast fallback/deopt counters |",
+            "| Category | Fixture | Correctness | Default fallback/deopt counters |",
             "| --- | --- | --- | --- |",
         ]
     )
     for row in summary["rows"]:
         fallback = ", ".join(
-            f"{key}={value}" for key, value in row["fast_fallback_deopt_counters"].items()
+            f"{key}={value}" for key, value in row["default_fallback_deopt_counters"].items()
         )
         lines.append(
             f"| `{row['category']}` | `{row['fixture']}` | `{row['correctness']}` | "
@@ -276,8 +296,45 @@ def render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def run_self_test() -> int:
+    rows = [
+        {
+            "category": category,
+            "fixture": f"{category}.php",
+            "source": "self-test",
+            "baseline": {"returncode": 0, "elapsed_ms": 1.0},
+            "default": {"returncode": 0, "elapsed_ms": 1.0},
+            "correctness": "pass",
+            "default_fallback_deopt_counters": {},
+        }
+        for category in ("runtime", "stdlib", "performance", "framework", "phpt")
+    ]
+    default_verdict, default_reasons = verdict(rows, [])
+    summary = {
+        "status": "pass",
+        "gate": "default-profile-smoke",
+        "engine": "self-test",
+        "baseline_profile": "baseline",
+        "default_profile": "default",
+        "case_count": len(rows),
+        "rows": rows,
+        "failures": [],
+        "default_verdict": default_verdict,
+        "default_reasons": default_reasons,
+    }
+    rendered = render_markdown(summary)
+    if default_verdict != "gate-backed" or "Default Engine Profile Smoke" not in rendered:
+        raise SystemExit("default-profile-smoke self-test failed")
+    if default_counter_sanity({"jit_mode": "cranelift"}) == []:
+        raise SystemExit("default-profile-smoke self-test failed to catch JIT mode")
+    print("[pass] default_profile_smoke self-test")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.self_test:
+        return run_self_test()
     engine = args.engine if args.engine.is_absolute() else ROOT / args.engine
     if not engine.is_file() or not os.access(engine, os.X_OK):
         raise SystemExit(f"engine is not executable: {engine}")
@@ -288,8 +345,8 @@ def main() -> int:
     failures: list[str] = []
     for case in fixture_cases(out_dir):
         baseline = run_case(engine, case, "baseline", out_dir, args.timeout)
-        fast = run_case(engine, case, "fast", out_dir, args.timeout)
-        case_failures = compare_case(case, baseline, fast)
+        default = run_case(engine, case, "default", out_dir, args.timeout)
+        case_failures = compare_case(case, baseline, default)
         failures.extend(case_failures)
         rows.append(
             {
@@ -300,29 +357,29 @@ def main() -> int:
                     "returncode": baseline.returncode,
                     "elapsed_ms": baseline.elapsed_ms,
                 },
-                "fast": {
-                    "returncode": fast.returncode,
-                    "elapsed_ms": fast.elapsed_ms,
+                "default": {
+                    "returncode": default.returncode,
+                    "elapsed_ms": default.elapsed_ms,
                 },
                 "correctness": "pass" if not case_failures else "fail",
-                "fast_fallback_deopt_counters": collect_fallback_deopt_counters(
-                    fast.counters
+                "default_fallback_deopt_counters": collect_fallback_deopt_counters(
+                    default.counters
                 ),
             }
         )
 
-    default_on_verdict, default_on_reasons = verdict(rows, failures)
+    default_verdict, default_reasons = verdict(rows, failures)
     summary: dict[str, Any] = {
         "status": "pass" if not failures else "fail",
-        "gate": "fast-preset-smoke",
+        "gate": "default-profile-smoke",
         "engine": rel(engine),
-        "baseline_preset": "baseline",
-        "fast_preset": "fast",
+        "baseline_profile": "baseline",
+        "default_profile": "default",
         "case_count": len(rows),
         "rows": rows,
         "failures": failures,
-        "default_on_verdict": default_on_verdict,
-        "default_on_reasons": default_on_reasons,
+        "default_verdict": default_verdict,
+        "default_reasons": default_reasons,
     }
     json_path = out_dir / "summary.json"
     markdown_path = out_dir / "summary.md"
@@ -333,9 +390,8 @@ def main() -> int:
             print(f"[fail] {failure}", file=sys.stderr)
         return 1
     print(
-        "[pass] fast preset alias matched baseline across "
-        f"{len(rows)} case(s); alias verdict={default_on_verdict}; "
-        f"wrote {rel(json_path)}"
+        "[pass] default profile matched baseline across "
+        f"{len(rows)} case(s); default verdict={default_verdict}; wrote {rel(json_path)}"
     )
     return 0
 

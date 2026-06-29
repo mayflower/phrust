@@ -18,10 +18,7 @@ pub struct PhpExecutorOptions {
 
 impl Default for PhpExecutorOptions {
     fn default() -> Self {
-        Self {
-            optimization_level: OptimizationLevel::O0,
-            vm_options: VmOptions::default(),
-        }
+        Self::managed_fast_runtime()
     }
 }
 

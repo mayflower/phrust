@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use php_executor::EngineProfileName;
+
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_INDEX: &str = "index.php";
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
@@ -35,6 +37,7 @@ pub struct ServerConfig {
     pub request_timeout_ms: u64,
     pub max_execution_ms: u64,
     pub execution_deadline_enabled: bool,
+    pub engine_preset: EngineProfileName,
     pub metrics_endpoint_enabled: bool,
     pub metrics_token: Option<String>,
     pub tls_cert: Option<PathBuf>,
@@ -133,6 +136,11 @@ impl ServerConfig {
         let mut execution_deadline_enabled = file_config
             .bool("execution_deadline_enabled")?
             .unwrap_or(true);
+        let mut engine_preset = file_config
+            .string("engine_preset")
+            .map(|value| parse_engine_preset("engine_preset", &value))
+            .transpose()?
+            .unwrap_or_default();
         let mut metrics_endpoint_enabled = file_config
             .bool("metrics_endpoint_enabled")?
             .unwrap_or(true);
@@ -215,6 +223,9 @@ impl ServerConfig {
                     max_execution_ms = parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
                 }
                 "--disable-execution-deadline" => execution_deadline_enabled = false,
+                "--engine-preset" => {
+                    engine_preset = parse_engine_preset(&arg, &required_value(&arg, &mut args)?)?;
+                }
                 "--disable-metrics-endpoint" => metrics_endpoint_enabled = false,
                 "--metrics-token" => {
                     metrics_token = Some(required_value(&arg, &mut args)?);
@@ -277,6 +288,7 @@ impl ServerConfig {
                 request_timeout_ms,
                 max_execution_ms,
                 execution_deadline_enabled,
+                engine_preset,
                 metrics_endpoint_enabled,
                 metrics_token,
                 tls_cert,
@@ -311,6 +323,7 @@ impl ServerConfig {
             request_timeout_ms,
             max_execution_ms,
             execution_deadline_enabled,
+            engine_preset,
             metrics_endpoint_enabled,
             metrics_token,
             tls_cert,
@@ -348,6 +361,7 @@ Options:\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
+  --engine-preset <name>       default managed-fast, baseline oracle, fast alias, or experimental-jit diagnostics\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
   --metrics-token <token>      require Authorization: Bearer token for metrics\n\
   --tls-cert <path>            PEM certificate chain for HTTPS\n\
@@ -525,6 +539,11 @@ fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
         .map_err(|error| ConfigError::new(format!("invalid --listen `{value}`: {error}")))
 }
 
+fn parse_engine_preset(flag: &str, value: &str) -> Result<EngineProfileName, ConfigError> {
+    EngineProfileName::parse(value)
+        .map_err(|error| ConfigError::new(format!("invalid {flag}: {error}")))
+}
+
 fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, ConfigError> {
     let parsed = value
         .parse::<usize>()
@@ -606,6 +625,7 @@ fn default_max_in_flight() -> usize {
 #[cfg(test)]
 mod tests {
     use super::ServerConfig;
+    use php_executor::EngineProfileName;
     use std::{
         fs,
         net::SocketAddr,
@@ -642,6 +662,7 @@ mod tests {
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.max_execution_ms, 30_000);
         assert!(config.execution_deadline_enabled);
+        assert_eq!(config.engine_preset, EngineProfileName::Default);
         assert!(config.metrics_endpoint_enabled);
         assert_eq!(config.metrics_token, None);
         assert_eq!(config.tls_cert, None);
@@ -692,6 +713,8 @@ mod tests {
             "--max-execution-ms",
             "125",
             "--disable-execution-deadline",
+            "--engine-preset",
+            "experimental-jit",
             "--disable-metrics-endpoint",
             "--metrics-token",
             "secret",
@@ -730,6 +753,7 @@ mod tests {
         assert_eq!(config.request_timeout_ms, 250);
         assert_eq!(config.max_execution_ms, 125);
         assert!(!config.execution_deadline_enabled);
+        assert_eq!(config.engine_preset, EngineProfileName::ExperimentalJit);
         assert!(!config.metrics_endpoint_enabled);
         assert_eq!(config.metrics_token, Some("secret".to_string()));
         assert_eq!(config.tls_cert, Some(PathBuf::from("tls/cert.pem")));
@@ -768,6 +792,7 @@ tls_cert = "cert.pem"
 tls_key = "key.pem"
 script_cache_max_entries = 12
 strict_preload = true
+engine_preset = "baseline"
 "#,
         );
 
@@ -780,6 +805,8 @@ strict_preload = true
             "128",
             "--metrics-token",
             "from-cli-token",
+            "--engine-preset",
+            "fast",
         ])
         .unwrap();
 
@@ -798,6 +825,7 @@ strict_preload = true
         assert_eq!(config.tls_key, Some(PathBuf::from("key.pem")));
         assert_eq!(config.script_cache_max_entries, 12);
         assert!(config.strict_preload);
+        assert_eq!(config.engine_preset, EngineProfileName::Default);
     }
 
     #[test]
@@ -830,6 +858,17 @@ index = "../bad.php"
         let error = ServerConfig::parse_from(["--docroot", "public", "--wat"]).unwrap_err();
 
         assert_eq!(error.to_string(), "unknown flag `--wat`");
+    }
+
+    #[test]
+    fn rejects_invalid_engine_preset() {
+        let error = ServerConfig::parse_from(["--docroot", "public", "--engine-preset", "turbo"])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid --engine-preset: unsupported engine preset `turbo`; expected baseline, default, fast, or experimental-jit"
+        );
     }
 
     #[test]

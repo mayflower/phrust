@@ -101,9 +101,9 @@ packed fetch, append, foreach, reduction, COW/reference, bounds, layout, and
 numeric-string-key behavior. The current packed-int reduction helper is guarded
 for packed all-int, non-shared, non-reference arrays and exact overflow
 behavior; broader builtin `array_sum`/`min`/`max` specialization remains
-deferred until each shape has differential fixtures. Cranelift remains
-default-off and may only consume this proven metadata through guarded helper
-paths; it is not the owner of packed-array semantics.
+deferred until each shape has differential fixtures. The guarded native tier may
+consume this proven metadata through VM-owned helper paths; it is not the owner
+of packed-array semantics.
 
 Output and string fast paths stay byte-exact. The VM may coalesce adjacent
 exact-output IR `Echo` operations and immediate `LoadConst`/`Echo` producer
@@ -121,35 +121,44 @@ their existing order.
 
 Tiering is request-local and advisory. The current policy tracks function entry
 count, loop backedge count, inline-cache stability score, and guard-failure
-score. Tier 0 is the baseline interpreter, Tier 1 is the quickened interpreter,
-and Tier 2 is the default-off experimental JIT when the `jit-cranelift` feature
-and `--jit=on` are both enabled. `--tiering=off` disables adaptive quickening
-observations and JIT attempts for the request. `--tiering-stats-json <path>`
-writes stats outside PHP stdout.
+score. Tier 0 is the generic interpreter, Tier 1 is the dense/quickened
+interpreter with guarded inline caches, and Tier 2 is the guarded native
+hot-region tier when the backend and platform support it. The default managed
+runtime requests Tier 2 automatically for eligible regions; unsupported
+platforms and rejected shapes record counters and keep running Tier 0/Tier 1
+paths. `--tiering=off` is a developer diagnostic switch that disables adaptive
+quickening observations and native-tier decisions for the request.
+`--tiering-stats-json <path>` writes stats outside PHP stdout.
 
-### Experimental JIT
+### Guarded Native Tier
 
-JIT work is default-off and feature-gated. The initial scope is a tiny safe
-subset such as pure integer leaf functions. The interpreter remains the source
-of truth, JIT eligibility must reject unsupported code, and fallback must be
-available for every failure mode. See
+The native tier is part of the managed runtime, not a user-facing tuning mode.
+It is limited to narrow regions such as counted integer loops, packed all-int
+foreach reductions, exact scalar leaf functions, exact builtin intrinsic
+regions, and simple scalar branches. Live-state snapshots are the only
+optimized-exit mechanism. Code cache keys include helper ABI/version hashes,
+runtime configuration hashes, invalidation epochs, and internal compile-budget
+state. Side exits materialize the live snapshot and resume generic execution for
+guard failure, overflow, type change, reference/COW, shape or epoch
+invalidation, output/diagnostic boundaries, and exception boundaries. See
 `docs/adr/0076-cranelift-jit-experiment.md` and
-`docs/performance-jit-experiment.md` for the Performance decision, scope, ABI boundary,
+`docs/performance-jit-experiment.md` for the compiler scope, ABI boundary,
 guard/deopt policy, code-cache lifecycle, platform limits, and abort criteria.
 
 ## Correctness Contract
 
 - `--opt-level=0` is the baseline when optimization flags exist.
 - `--quickening=off`, `--inline-caches=off`, `--bytecode-cache=off`,
-  `--exec-format=ir`, `--superinstructions=off`, and `--jit=off` are required
-  once the respective layers exist.
-- `--tiering=off` must keep adaptive quickening and JIT tier decisions inactive.
+  `--exec-format=ir`, `--superinstructions=off`, and `--jit=off` remain
+  developer diagnostics and baseline rollback controls.
+- `--tiering=off` must keep adaptive quickening and native-tier decisions inactive.
 - Optimized and baseline runs must match output, stderr, exit status,
   diagnostics, exception classes, warning text where modeled, and
   timing-independent side effects.
 - Guard failure falls back to the generic path.
 - Cache miss, cache corruption, stale fingerprint, unsupported IR, and
-  unsupported JIT platform must degrade to safe baseline behavior.
+  unsupported native backend/platform must degrade to safe managed interpreter
+  behavior.
 - Any known deviation is documented in `docs/performance-known-gaps.md`.
 
 ## Current Performance Surfaces
@@ -201,14 +210,16 @@ inline-cache, JIT, safety, matrix, and reporting gates.
 
 | Command | Current behavior |
 | --- | --- |
-| `verify-performance` | Runs `performance-tests`, `performance-regression`, cache/optimizer/superinstruction/quickening/inline-cache/JIT/safety gates, benchmark smoke, framework smoke, release benchmark smoke, acceleration matrix, fast-preset smoke, hot-path inventory, and `perf-report`. |
+| `verify-performance` | Runs `performance-tests`, `performance-regression`, cache/optimizer/superinstruction/quickening/inline-cache/native/safety gates, benchmark smoke, framework smoke, release benchmark smoke, acceleration matrix, default-profile smoke, managed-fast coverage, fast-preset smoke, hot-path inventory, and `perf-report`. |
 | `performance-tests` | Runs `cargo test --workspace` with deterministic `RUST_MIN_STACK` defaulting to `8388608`, plus Performance script self-tests. |
 | `performance-regression` | Runs `scripts/performance_regression_smoke.sh`, then `scripts/performance/regression_smoke.sh` across opt levels 0/1/2, quickening off/on, and inline caches off/on for the performance stress fixtures, followed by `perf-flag-matrix`. |
-| `perf-flag-matrix` | Compares baseline output/exit/stderr against opt 1, opt 2, superinstructions-on-with-IR, quickening, quickening with `--exec-format=auto`, inline caches, bytecode-cache read/write, and all-non-JIT-on combinations across Performance regressions and selected Runtime semantics fixtures. JIT is opt-in with `PHRUST_PERF_MATRIX_JIT=1` when feature/platform support is available. |
+| `perf-flag-matrix` | Compares baseline output/exit/stderr against opt 1, opt 2, superinstructions-on-with-IR, quickening, quickening with `--exec-format=auto`, inline caches, bytecode-cache read/write, and all-non-JIT-on combinations across Performance regressions and selected Runtime semantics fixtures. Low-level JIT rows are opt-in with `PHRUST_PERF_MATRIX_JIT=1` when feature/platform support is available. |
 | `benchmark-smoke` | Builds the VM, runs deterministic Performance smoke fixtures, checks expected output, and writes `target/performance/benchmark-smoke.json`. |
 | `framework-smoke` | Builds the VM, compares opt-off and opt-on runs over deterministic framework-like fixtures, checks output parity, writes `target/performance/framework-smoke/summary.json`, and regenerates `docs/performance-framework-corpus.md`. |
 | `acceleration-matrix` | Builds the VM, compares `baseline-ir` against dense-bytecode auto/strict subset, superinstructions, optimizer levels 1/2, quickening, inline caches, all-non-JIT, release, and optional Cranelift rows. It checks stdout, stderr/runtime diagnostics, exit status, and counter sanity before writing local JSON/Markdown under `target/performance/acceleration/`. |
-| `fast-preset-smoke` | Builds the VM, compares `--engine-preset=baseline` against `--engine-preset=fast` across selected runtime, stdlib, performance, framework, and local PHPT smoke cases, records fallback/deopt counters, writes local JSON/Markdown under `target/performance/fast-preset/`, and keeps default-on promotion deferred until broader evidence approves it. |
+| `default-profile-smoke` | Builds the VM, compares `--engine-preset=baseline` against `--engine-preset=default` across selected runtime, stdlib, performance, framework, and local PHPT smoke cases, records fallback/deopt counters, checks managed fast-path and native availability/execution counters, and writes local JSON/Markdown under `target/performance/default-profile/`. |
+| `managed-fast-coverage` | Builds the VM, runs curated default-profile fixtures, asserts dense bytecode, superinstructions, quickening, inline caches, array shapes, builtin intrinsics, string/output batching, include/cache reuse, native-tier policy, and bounded fallback counters, and writes local JSON/Markdown under `target/performance/managed-fast/`. |
+| `fast-preset-smoke` | Builds the VM, compares `--engine-preset=baseline` against `--engine-preset=fast` across selected runtime, stdlib, performance, framework, and local PHPT smoke cases, records fallback/deopt counters, and writes local JSON/Markdown under `target/performance/fast-preset/` for compatibility-alias coverage. |
 | `bytecode-exec-smoke` | Builds the VM, compares `--exec-format=ir` and strict `--exec-format=bytecode` for the supported dense-bytecode subset including scalar expressions, comparisons, direct user/builtin calls, packed-array dim/append loops, and framework-like mixed-array foreach traversal, verifies `--exec-format=auto` fallback on an unsupported fixture, and writes `target/performance/bytecode-exec-smoke/summary.json`. |
 | `superinstruction-smoke` | Builds the VM, compares strict dense bytecode with `--superinstructions=off` and `--superinstructions=on` across supported fixtures, asserts fused opcode/candidate/skip counters, refreshes `docs/performance-superinstructions.md`, and writes `target/performance/superinstruction-smoke/summary.json`. |
 | `superinstruction-patterns` | Mines adjacent opcode pairs/triples from strict dense-bytecode lowering, writes local reports under `target/performance/superinstructions/`, and refreshes the concise committed summary in `docs/performance-superinstructions.md`. |
@@ -225,7 +236,7 @@ inline-cache, JIT, safety, matrix, and reporting gates.
 | `optimizer-diff` | Verifies IR invariants, compares opt levels 0, 1, and 2 across optimizer fixtures with output, exit, and diagnostic diffs, and archives per-fixture optimizer pass reports under `target/performance/optimizer-diff/optimizer-reports/`. |
 | `quickening-smoke` | Builds the VM, compares `--quickening=off` and `--quickening=on` across Performance smoke fixtures plus generated strict dense-bytecode fixtures for int arithmetic, string concat, and bool branches, and asserts quickening and bytecode counters. |
 | `inline-cache-smoke` | Builds the VM, compares `--inline-caches=off` and `--inline-caches=on` across Performance smoke fixtures, and asserts IC slots, guarded function-call and builtin-call hits/misses, capped polymorphic dynamic function-call entries with megamorphic fallback, builtin fast-stub hit/miss/fallback-reason attribution, method-call hits/misses/polymorphic hits/guard failures/direct dispatch/tiny-inline metadata, property-fetch hits/misses and shape guard failures, property-assignment hits/misses plus visibility/type/readonly/hook-magic/dynamic fallback reasons, class/static hits/misses, and include/eval/autoload epoch invalidation counters. |
-| `jit-smoke` | Runs default-off `php_jit` API, eligibility, ABI, optional Cranelift lowering tests, feature-on VM JIT tests, and a CLI A/B smoke comparing `--jit=off` and `--jit=on`; asserts compile/execution/fallback counters while keeping native machine-code execution disabled. |
+| `jit-smoke` | Runs low-level `php_jit` API, eligibility, ABI, optional Cranelift lowering tests, feature-on VM native-tier tests, and CLI A/B diagnostics; asserts compile/execution/fallback counters and explicit platform skips. |
 | `safety-audit-smoke` | Scans the Performance cache/JIT/adaptive runtime surface for Rust `unsafe`, runs bytecode-cache negative tests, and runs a small Miri cache test when the active toolchain supports it. |
 | `perf-report` | Renders `target/performance/perf-report.md` and JSON from benchmark measurements, VM counters, comparison artifact presence, and known gaps. |
 
@@ -239,3 +250,10 @@ Tiering flags available to `php-vm run`:
 --tiering-guard-failure-threshold N
 --tiering-stats-json target/performance/tiering.json
 ```
+
+## Contributor Fast-Path Rules
+
+New fast paths must reuse shared semantic helpers instead of duplicating PHP
+behavior, keep local fallback to the generic interpreter, expose specific
+fallback counters, and add focused fast-hit assertions before joining
+`managed-fast-coverage` or the default profile.

@@ -25,27 +25,27 @@ supported_fixtures=(
   "fixtures/bytecode/lower/valid/echo.php"
   "fixtures/bytecode/literals/valid/echo-int.php"
   "fixtures/bytecode/literals/valid/echo-multiple.php"
+  "fixtures/bytecode/fallback/property-read-unsupported.php"
+  "fixtures/bytecode/fallback/property-write-unsupported.php"
+  "fixtures/bytecode/fallback/method-call-unsupported.php"
+  "fixtures/bytecode/fallback/static-method-unsupported.php"
+  "fixtures/bytecode/fallback/static-method-auto.php"
   "tests/fixtures/performance/perf_smoke/arrays_packed.php"
   "tests/fixtures/performance/framework_smoke/packed_mixed_array_traversal.php"
 )
 
 strict_unsupported_fixtures=(
-  "fixtures/bytecode/fallback/property-read-unsupported.php:property_fetch"
-  "fixtures/bytecode/fallback/property-write-unsupported.php:property_assignment"
-  "fixtures/bytecode/fallback/method-call-unsupported.php:method_call"
-  "fixtures/bytecode/fallback/static-method-unsupported.php:static_method_call"
   "fixtures/bytecode/fallback/include-unsupported.php:include"
 )
 
 auto_fallback_fixtures=(
-  "fixtures/bytecode/fallback/object-property-read-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/object-property-write-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/method-dispatch-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/static-method-auto.php:static_method_call"
-  "fixtures/bytecode/fallback/magic-get-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/dynamic-property-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/typed-property-auto.php:instruction_subset"
-  "fixtures/bytecode/fallback/property-hook-auto.php:instruction_subset"
+  "fixtures/bytecode/fallback/object-property-read-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/object-property-write-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/method-dispatch-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/magic-get-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/dynamic-property-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/typed-property-auto.php:object_instantiation"
+  "fixtures/bytecode/fallback/property-hook-auto.php:object_instantiation"
   "tests/fixtures/performance/inline_cache/include-path-cache.php:include"
 )
 
@@ -82,6 +82,22 @@ data = json.loads(open(path, encoding="utf-8").read())
 value = data.get(map_key, {}).get(reason, 0)
 if value <= 0:
     raise SystemExit(f"[error] {path}: expected {map_key}[{reason!r}] > 0, got {value}")
+PY
+}
+
+check_counter_at_least() {
+  local path="$1"
+  local key="$2"
+  local minimum="$3"
+  python3 - "$path" "$key" "$minimum" <<'PY'
+import json
+import sys
+
+path, key, minimum = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = json.loads(open(path, encoding="utf-8").read())
+actual = data.get(key, 0)
+if actual < minimum:
+    raise SystemExit(f"[error] {path}: expected {key}>={minimum}, got {actual}")
 PY
 }
 
@@ -130,9 +146,10 @@ strict_stderr="${OUT_DIR}/fallback.strict.stderr"
 cmp "${fallback_ir_stdout}" "${fallback_auto_stdout}"
 cmp "${fallback_ir_stderr}" "${fallback_auto_stderr}"
 check_counter "${fallback_counters}" bytecode_lower_attempts 1
-check_counter "${fallback_counters}" bytecode_lower_successes 0
-check_counter "${fallback_counters}" bytecode_unsupported_fallbacks 1
+check_counter "${fallback_counters}" bytecode_lower_successes 1
+check_counter "${fallback_counters}" bytecode_unsupported_fallbacks 0
 check_counter "${fallback_counters}" bytecode_instructions_executed 0
+check_counter_at_least "${fallback_counters}" rich_fallback_functions_executed 1
 
 set +e
 "${ENGINE}" run --exec-format=bytecode "${fallback_fixture}" >"${strict_stdout}" 2>"${strict_stderr}"
@@ -186,11 +203,33 @@ for entry in "${auto_fallback_fixtures[@]}"; do
   cmp "${ir_stdout}" "${auto_stdout}"
   cmp "${ir_stderr}" "${auto_stderr}"
   check_counter "${auto_counters}" bytecode_lower_attempts 1
-  check_counter "${auto_counters}" bytecode_lower_successes 0
-  check_counter "${auto_counters}" bytecode_unsupported_fallbacks 1
-  check_counter_map_key "${auto_counters}" bytecode_auto_fallback_reasons "${reason}"
+  check_counter "${auto_counters}" bytecode_lower_successes 1
+  check_counter "${auto_counters}" bytecode_unsupported_fallbacks 0
+  check_counter_at_least "${auto_counters}" rich_fallback_functions_executed 1
+  check_counter_map_key "${auto_counters}" dense_function_fallback_by_reason "${reason}"
   auto_fallback_rows+=("$(json_escape "${fixture}")")
 done
+
+mixed_fixture="tests/fixtures/performance/bytecode_exec/mixed_dense_rich.php"
+mixed_ir_stdout="${OUT_DIR}/mixed.ir.stdout"
+mixed_ir_stderr="${OUT_DIR}/mixed.ir.stderr"
+mixed_auto_stdout="${OUT_DIR}/mixed.auto.stdout"
+mixed_auto_stderr="${OUT_DIR}/mixed.auto.stderr"
+mixed_counters="${OUT_DIR}/mixed.auto.counters.json"
+
+"${ENGINE}" run --exec-format=ir "${mixed_fixture}" >"${mixed_ir_stdout}" 2>"${mixed_ir_stderr}"
+"${ENGINE}" run --exec-format=auto --counters-json="${mixed_counters}" "${mixed_fixture}" >"${mixed_auto_stdout}" 2>"${mixed_auto_stderr}"
+cmp "${mixed_ir_stdout}" "${mixed_auto_stdout}"
+cmp "${mixed_ir_stderr}" "${mixed_auto_stderr}"
+check_counter "${mixed_counters}" bytecode_lower_attempts 1
+check_counter "${mixed_counters}" bytecode_lower_successes 1
+check_counter "${mixed_counters}" bytecode_unsupported_fallbacks 0
+check_counter_at_least "${mixed_counters}" dense_functions_planned 2
+check_counter_at_least "${mixed_counters}" dense_functions_executed 2
+check_counter_at_least "${mixed_counters}" rich_fallback_functions_planned 1
+check_counter_at_least "${mixed_counters}" rich_fallback_functions_executed 1
+check_counter_map_key "${mixed_counters}" dense_function_fallback_by_reason "object_instantiation"
+check_counter_map_key "${mixed_counters}" dense_instruction_families_executed "function_calls"
 
 summary="${OUT_DIR}/summary.json"
 {
@@ -226,8 +265,9 @@ summary="${OUT_DIR}/summary.json"
     fi
     printf '%s' "${auto_fallback_rows[$index]}"
   done
-  printf ']\n'
+  printf '],\n'
+  printf '  "mixed_mode_fixture": %s\n' "$(json_escape "${mixed_fixture}")"
   printf '}\n'
 } >"${summary}"
 
-printf '[pass] bytecode exec smoke compared %s supported fixture(s), verified %s strict unsupported fixture(s), %s auto fallback fixture(s), and wrote %s\n' "${#supported_fixtures[@]}" "${#strict_unsupported_fixtures[@]}" "${#auto_fallback_fixtures[@]}" "${summary}"
+printf '[pass] bytecode exec smoke compared %s supported fixture(s), verified %s strict unsupported fixture(s), %s auto fallback fixture(s), verified mixed dense/rich execution, and wrote %s\n' "${#supported_fixtures[@]}" "${#strict_unsupported_fixtures[@]}" "${#auto_fallback_fixtures[@]}" "${summary}"

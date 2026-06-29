@@ -429,6 +429,27 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
                 }
             }
         }
+        DenseOperands::MethodCall {
+            dst, object, args, ..
+        } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            collect_operand_slot(*object, slots);
+            for arg in args {
+                collect_operand_slot(arg.value, slots);
+                if let Some(local) = arg.by_ref_local {
+                    slots.insert(OsrVmSlot::Local(local));
+                }
+            }
+        }
+        DenseOperands::StaticCall { dst, args, .. } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            for arg in args {
+                collect_operand_slot(arg.value, slots);
+                if let Some(local) = arg.by_ref_local {
+                    slots.insert(OsrVmSlot::Local(local));
+                }
+            }
+        }
         DenseOperands::ArrayInsert {
             array,
             key,
@@ -480,6 +501,24 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
                 slots.insert(OsrVmSlot::Register(*key));
             }
             slots.insert(OsrVmSlot::Register(*value));
+        }
+        DenseOperands::FetchProperty {
+            dst,
+            object,
+            property: _,
+        } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            collect_operand_slot(*object, slots);
+        }
+        DenseOperands::AssignProperty {
+            dst,
+            object,
+            property: _,
+            value,
+        } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            collect_operand_slot(*object, slots);
+            collect_operand_slot(*value, slots);
         }
         DenseOperands::Operand { src } => {
             collect_operand_slot(*src, slots);

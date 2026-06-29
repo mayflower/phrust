@@ -65,7 +65,7 @@ help:
       '  just diff-streams         Run streams differential gate' \
       '  just diff-json-pcre-date  Run JSON/PCRE/Date differential gate' \
       '  just diff-spl-reflection  Run SPL/Reflection differential gate' \
-      '  just composer-smoke       Run Composer compatibility smoke gate' \
+      '  just composer-smoke       Run package-manager compatibility smoke gate' \
       '' \
       'Performance:' \
       '  just perf-flag-matrix     Run performance flag A/B matrix' \
@@ -311,6 +311,8 @@ verify-performance:
     @just release-benchmark-smoke
     @just acceleration-matrix
     @just fastest-engine-matrix
+    @just default-profile-smoke
+    @just managed-fast-coverage
     @just fast-preset-smoke
     @just app-flow-smoke
     @just baseline-native-stencil-smoke
@@ -623,7 +625,7 @@ superinstruction-patterns:
     scripts/performance/superinstruction_patterns.py --summary-doc docs/performance-superinstructions.md
 
 vm-smoke:
-    cargo build -p php_vm_cli
+    cargo build -p php_vm_cli --bin php-vm
     @tmp_dir="$PWD/target/vm-smoke"; \
     mkdir -p "$tmp_dir"; \
     ${CARGO_TARGET_DIR:-target}/debug/php-vm compile fixtures/runtime/valid/hello.php --json > "$tmp_dir/hello.json"; \
@@ -850,7 +852,7 @@ regression-fixtures:
 
 local-composer-smoke *paths:
     @if [ -z "{{paths}}" ]; then \
-        printf '%s\n' '[skip] provide one or more local Composer project paths: just local-composer-smoke path/to/project'; \
+        printf '%s\n' '[skip] provide one or more local package-manager project paths.'; \
         exit 0; \
     fi; \
     cargo build -p php_vm_cli; \
@@ -887,6 +889,14 @@ performance-regression:
 
 perf-flag-matrix:
     scripts/performance/perf_flag_matrix.py
+
+default-profile-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/default_profile_smoke.py
+
+managed-fast-coverage:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/managed_fast_coverage.py
 
 fast-preset-smoke:
     cargo build -p php_vm_cli --bin php-vm

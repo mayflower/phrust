@@ -51,8 +51,11 @@ non-baseline variants, for 108 behavior comparisons:
 - `bytecode-cache-read-write`
 - `all-non-jit-on`
 
-JIT matrix coverage is opt-in with `PHRUST_PERF_MATRIX_JIT=1` because native
-JIT support remains platform/feature constrained and default-off.
+Low-level JIT matrix rows are opt-in with `PHRUST_PERF_MATRIX_JIT=1` because
+native compiler diagnostics remain platform/feature constrained. The default
+managed runtime records native availability and execution counters where
+backend support exists, but speed claims still require feature/platform
+evidence.
 
 ## Relative Wall-Clock Changes
 
@@ -98,11 +101,13 @@ default benchmark smoke:
 | `array_count_fast_path_hits` | 17 |
 | `internal_count_array_direct_fast_path_hits` | 17 |
 
-The default benchmark command does not pass quickening, inline-cache, bytecode
-cache, or JIT flags, so those counters are expected to be zero in
-`perf-report`. Their correctness and counter evidence comes from dedicated gates
-such as `quickening-smoke`, `inline-cache-smoke`, `cache-roundtrip`,
-`jit-smoke`, and `perf-flag-matrix`.
+The default benchmark command now runs the managed fast profile, so dense
+bytecode, quickening, inline-cache, tiering, and native availability counters
+may be nonzero when the fixtures exercise those paths. Bytecode cache remains
+explicit because cache lifecycle is a deployment choice. Dedicated gates such
+as `managed-fast-coverage`, `quickening-smoke`, `inline-cache-smoke`,
+`cache-roundtrip`, `jit-smoke`, and `perf-flag-matrix` provide narrower counter
+evidence and fallback attribution.
 
 ## Budgets
 
@@ -117,9 +122,10 @@ Performance budgets are intentionally conservative:
   runs on a supported Linux host, a massive stable instruction-count regression
   should block promotion. On the current Darwin snapshot it skips cleanly.
 - Counter activity must be interpreted by layer. Local-slot, output, literal,
-  array, and internal-dispatch counters show active infrastructure in the
-  default smoke; quickening, IC, cache, and JIT require their dedicated gates or
-  an explicit optimized benchmark run.
+  array, internal-dispatch, dense, quickening, IC, tiering, and native
+  availability counters show active managed-runtime infrastructure in the
+  default smoke when fixtures hit those paths; cache and low-level compiler
+  diagnostics require their dedicated gates or explicit benchmark rows.
 
 ## Optimization Readout
 
@@ -131,6 +137,9 @@ Evidence from this snapshot:
 - Bytecode cache, optimizer, quickening, inline caches, tiering, and JIT have
   correctness gates and behavior-matrix coverage, but the default wall-clock
   smoke does not isolate their speed contribution.
+- `managed-fast-coverage` asserts the default profile continues to hit the
+  expected dense, quickening, superinstruction, IC, array-shape, intrinsic,
+  output/string, include/cache reuse, native-policy, and fallback counters.
 - No optimization layer should claim a production speedup from this snapshot
   alone. The current value is regression protection and instrumentation.
 

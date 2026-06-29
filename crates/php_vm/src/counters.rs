@@ -111,6 +111,22 @@ pub struct VmCounters {
     pub bytecode_lowered_by_family: BTreeMap<String, u64>,
     pub bytecode_executed_by_family: BTreeMap<String, u64>,
     pub bytecode_instructions_executed: u64,
+    pub dense_functions_planned: u64,
+    pub dense_functions_executed: u64,
+    pub rich_fallback_functions_planned: u64,
+    pub rich_fallback_functions_executed: u64,
+    pub dense_function_fallback_by_reason: BTreeMap<String, u64>,
+    pub dense_instruction_families_executed: BTreeMap<String, u64>,
+    pub dense_property_fetch_hits: u64,
+    pub dense_property_assignment_hits: u64,
+    pub dense_property_fallback_by_reason: BTreeMap<String, u64>,
+    pub dense_property_ic_reuse: u64,
+    pub dense_direct_call_hits: u64,
+    pub dense_method_call_hits: u64,
+    pub dense_static_call_hits: u64,
+    pub dense_call_ic_hits: u64,
+    pub dense_call_ic_misses: u64,
+    pub dense_call_fallback_by_reason: BTreeMap<String, u64>,
     pub dense_branch_executions: u64,
     pub dense_branch_true: u64,
     pub dense_branch_false: u64,
@@ -126,6 +142,11 @@ pub struct VmCounters {
     pub superinstruction_deopt_or_fallbacks: u64,
     pub superinstruction_deopt_or_fallback_by_reason: BTreeMap<String, u64>,
     pub superinstruction_skipped_by_reason: BTreeMap<String, u64>,
+    pub optimized_exit_snapshots_created: u64,
+    pub optimized_exit_snapshots_materialized: u64,
+    pub optimized_exits_by_reason: BTreeMap<String, u64>,
+    pub snapshot_rejection_by_missing_state_family: BTreeMap<String, u64>,
+    pub fallback_resume_successes: u64,
     pub opcodes: BTreeMap<String, u64>,
     pub function_calls: u64,
     pub method_calls: u64,
@@ -222,6 +243,13 @@ pub struct VmCounters {
     pub type_checks: u64,
     pub includes: u64,
     pub autoloads: u64,
+    pub include_resolution_hits: u64,
+    pub include_resolution_misses: u64,
+    pub include_compile_hits: u64,
+    pub include_compile_misses: u64,
+    pub include_once_skips: u64,
+    pub include_fallback_by_reason: BTreeMap<String, u64>,
+    pub include_stale_invalidation_by_reason: BTreeMap<String, u64>,
     pub include_graph_hits: u64,
     pub include_graph_misses: u64,
     pub autoload_graph_hits: u64,
@@ -240,14 +268,27 @@ pub struct VmCounters {
     pub literal_intern_hits: u64,
     pub literal_intern_misses: u64,
     pub quickening_attempts: u64,
+    pub quickening_candidates_by_family: BTreeMap<String, u64>,
     pub quickening_specialized: u64,
+    pub quickening_applied_by_family: BTreeMap<String, u64>,
+    pub quickened_executions_by_family: BTreeMap<String, u64>,
     pub quickening_guard_hits: u64,
     pub quickening_guard_misses: u64,
     pub quickening_guard_failures: u64,
+    pub quickening_guard_failures_by_family: BTreeMap<String, u64>,
     pub quickening_fallback_calls: u64,
     pub quickening_dequickens: u64,
+    pub quickening_dequickened_by_reason: BTreeMap<String, u64>,
     pub quickening_megamorphic: u64,
     pub quickening_disabled: u64,
+    pub native_candidates: u64,
+    pub native_compiled_regions: u64,
+    pub native_executions: u64,
+    pub native_compile_budget_rejections: u64,
+    pub native_eligibility_rejections_by_reason: BTreeMap<String, u64>,
+    pub native_side_exits_by_reason: BTreeMap<String, u64>,
+    pub native_blacklist_suppression_by_unstable_region: BTreeMap<String, u64>,
+    pub native_platform_unavailable: u64,
     pub jit_compile_attempts: u64,
     pub jit_compiled: u64,
     pub jit_executed: u64,
@@ -429,6 +470,40 @@ impl VmCounters {
 
     pub(crate) fn record_autoload(&mut self) {
         self.autoloads += 1;
+    }
+
+    pub(crate) fn record_include_resolution_hit(&mut self) {
+        self.include_resolution_hits += 1;
+    }
+
+    pub(crate) fn record_include_resolution_miss(&mut self) {
+        self.include_resolution_misses += 1;
+    }
+
+    pub(crate) fn record_include_compile_hit(&mut self) {
+        self.include_compile_hits += 1;
+    }
+
+    pub(crate) fn record_include_compile_miss(&mut self) {
+        self.include_compile_misses += 1;
+    }
+
+    pub(crate) fn record_include_once_skip(&mut self) {
+        self.include_once_skips += 1;
+    }
+
+    pub(crate) fn record_include_fallback_by_reason(&mut self, reason: &str) {
+        *self
+            .include_fallback_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_include_stale_invalidation_by_reason(&mut self, reason: &str) {
+        *self
+            .include_stale_invalidation_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
     }
 
     pub(crate) fn record_include_graph_hit(&mut self) {
@@ -650,15 +725,87 @@ impl VmCounters {
             .or_default() += 1;
     }
 
+    pub(crate) fn record_dense_execution_plan(
+        &mut self,
+        dense_functions: u64,
+        rich_fallback_functions: u64,
+    ) {
+        self.dense_functions_planned += dense_functions;
+        self.rich_fallback_functions_planned += rich_fallback_functions;
+    }
+
+    pub(crate) fn record_dense_function_executed(&mut self) {
+        self.dense_functions_executed += 1;
+    }
+
+    pub(crate) fn record_dense_property_fetch_hit(&mut self) {
+        self.dense_property_fetch_hits += 1;
+    }
+
+    pub(crate) fn record_dense_property_assignment_hit(&mut self) {
+        self.dense_property_assignment_hits += 1;
+    }
+
+    pub(crate) fn record_dense_property_ic_reuse(&mut self) {
+        self.dense_property_ic_reuse += 1;
+    }
+
+    pub(crate) fn record_dense_property_fallback(&mut self, reason: &str) {
+        *self
+            .dense_property_fallback_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_dense_direct_call_hit(&mut self) {
+        self.dense_direct_call_hits += 1;
+    }
+
+    pub(crate) fn record_dense_method_call_hit(&mut self) {
+        self.dense_method_call_hits += 1;
+    }
+
+    pub(crate) fn record_dense_static_call_hit(&mut self) {
+        self.dense_static_call_hits += 1;
+    }
+
+    pub(crate) fn record_dense_call_ic_hit(&mut self) {
+        self.dense_call_ic_hits += 1;
+    }
+
+    pub(crate) fn record_dense_call_ic_miss(&mut self) {
+        self.dense_call_ic_misses += 1;
+    }
+
+    pub(crate) fn record_dense_call_fallback(&mut self, reason: &str) {
+        *self
+            .dense_call_fallback_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_rich_fallback_function_executed(&mut self, reason: &str) {
+        self.rich_fallback_functions_executed += 1;
+        *self
+            .dense_function_fallback_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
     pub(crate) fn record_bytecode_instruction(&mut self, opcode: &str) {
         self.bytecode_instructions_executed += 1;
+        let family = bytecode_opcode_family(opcode).to_owned();
         *self
             .opcodes
             .entry(format!("bytecode_{opcode}"))
             .or_default() += 1;
         *self
             .bytecode_executed_by_family
-            .entry(bytecode_opcode_family(opcode).to_owned())
+            .entry(family.clone())
+            .or_default() += 1;
+        *self
+            .dense_instruction_families_executed
+            .entry(family)
             .or_default() += 1;
     }
 
@@ -731,6 +878,29 @@ impl VmCounters {
             .superinstructions_executed
             .entry(kind.to_string())
             .or_default() += 1;
+    }
+
+    pub(crate) fn record_optimized_exit_snapshot(&mut self, tier: &str, reason: &str) {
+        self.optimized_exit_snapshots_created += 1;
+        *self
+            .optimized_exits_by_reason
+            .entry(format!("{tier}.{reason}"))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_optimized_exit_materialized(&mut self) {
+        self.optimized_exit_snapshots_materialized += 1;
+    }
+
+    pub fn record_snapshot_rejection_by_missing_state_family(&mut self, family: &str) {
+        *self
+            .snapshot_rejection_by_missing_state_family
+            .entry(family.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_fallback_resume_success(&mut self) {
+        self.fallback_resume_successes += 1;
     }
 
     pub(crate) fn record_literal_intern(&mut self, hit: bool) {
@@ -1083,26 +1253,64 @@ impl VmCounters {
     }
 
     pub(crate) fn record_quickening(&mut self, observation: crate::QuickeningObservation) {
+        let family = observation
+            .specialization
+            .map(quickening_specialization_family);
         if observation.attempt {
             self.quickening_attempts += 1;
         }
+        if (observation.attempt || observation.specialized)
+            && let Some(family) = family
+        {
+            *self
+                .quickening_candidates_by_family
+                .entry(family.to_owned())
+                .or_default() += 1;
+        }
         if observation.specialized {
             self.quickening_specialized += 1;
+            if let Some(family) = family {
+                *self
+                    .quickening_applied_by_family
+                    .entry(family.to_owned())
+                    .or_default() += 1;
+            }
         }
         if observation.guard_hit {
             self.quickening_guard_hits += 1;
+            if let Some(family) = family {
+                *self
+                    .quickened_executions_by_family
+                    .entry(family.to_owned())
+                    .or_default() += 1;
+            }
         }
         if observation.guard_miss {
             self.quickening_guard_misses += 1;
         }
         if observation.guard_failure {
             self.quickening_guard_failures += 1;
+            if let Some(family) = family {
+                *self
+                    .quickening_guard_failures_by_family
+                    .entry(family.to_owned())
+                    .or_default() += 1;
+                self.record_optimized_exit_snapshot("quickening", family);
+            } else {
+                self.record_optimized_exit_snapshot("quickening", "guard_failure");
+            }
+            self.record_optimized_exit_materialized();
+            self.record_fallback_resume_success();
         }
         if observation.fallback_call {
             self.quickening_fallback_calls += 1;
         }
         if observation.dequickened {
             self.quickening_dequickens += 1;
+            *self
+                .quickening_dequickened_by_reason
+                .entry("guard_failure_threshold".to_owned())
+                .or_default() += 1;
         }
         if observation.megamorphic {
             self.quickening_megamorphic += 1;
@@ -1120,6 +1328,7 @@ impl VmCounters {
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_compiled(&mut self) {
         self.jit_compiled += 1;
+        self.native_compiled_regions += 1;
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -1136,6 +1345,7 @@ impl VmCounters {
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_executed(&mut self) {
         self.jit_executed += 1;
+        self.native_executions += 1;
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -1150,6 +1360,7 @@ impl VmCounters {
             .jit_side_exit_reasons
             .entry(reason.to_owned())
             .or_default() += 1;
+        self.record_native_side_exit(reason);
     }
 
     // Reserved by 07.CL.04; later guard work start calling it.
@@ -1163,6 +1374,10 @@ impl VmCounters {
         self.jit_blacklisted_regions += 1;
         *self
             .jit_blacklist_reasons
+            .entry(reason.to_owned())
+            .or_default() += 1;
+        *self
+            .native_blacklist_suppression_by_unstable_region
             .entry(reason.to_owned())
             .or_default() += 1;
     }
@@ -1187,6 +1402,29 @@ impl VmCounters {
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_tiering_budget_rejection(&mut self) {
         self.jit_tiering_budget_rejections += 1;
+        self.native_compile_budget_rejections += 1;
+    }
+
+    pub(crate) fn record_native_candidate(&mut self) {
+        self.native_candidates += 1;
+    }
+
+    pub(crate) fn record_native_platform_unavailable(&mut self) {
+        self.native_platform_unavailable += 1;
+    }
+
+    pub(crate) fn record_native_eligibility_rejection(&mut self, reason: &str) {
+        *self
+            .native_eligibility_rejections_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_native_side_exit(&mut self, reason: &str) {
+        *self
+            .native_side_exits_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
     }
 
     // Reserved by 07.CL.04; later helper-call work start calling it.
@@ -1283,6 +1521,7 @@ impl VmCounters {
             }
             if observation.kind == Some(InlineCacheKind::IncludePath) {
                 self.include_path_ic_hits += 1;
+                self.record_include_resolution_hit();
                 self.record_include_graph_hit();
             }
             if observation.kind == Some(InlineCacheKind::AutoloadClassLookup) {
@@ -1309,6 +1548,7 @@ impl VmCounters {
             }
             if observation.kind == Some(InlineCacheKind::IncludePath) {
                 self.include_path_ic_misses += 1;
+                self.record_include_resolution_miss();
                 self.record_include_graph_miss();
             }
             if observation.kind == Some(InlineCacheKind::AutoloadClassLookup) {
@@ -1333,6 +1573,15 @@ impl VmCounters {
         }
         if observation.guard_failure {
             self.inline_cache_guard_failures += 1;
+            self.record_optimized_exit_snapshot(
+                "inline_cache",
+                observation
+                    .kind
+                    .map(InlineCacheKind::counter_name)
+                    .unwrap_or("guard_failure"),
+            );
+            self.record_optimized_exit_materialized();
+            self.record_fallback_resume_success();
             if observation.kind == Some(InlineCacheKind::MethodCall) {
                 self.method_ic_guard_failures += 1;
             }
@@ -1648,6 +1897,102 @@ impl VmCounters {
         );
         push_field(
             &mut json,
+            "dense_functions_planned",
+            self.dense_functions_planned,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_functions_executed",
+            self.dense_functions_executed,
+            true,
+        );
+        push_field(
+            &mut json,
+            "rich_fallback_functions_planned",
+            self.rich_fallback_functions_planned,
+            true,
+        );
+        push_field(
+            &mut json,
+            "rich_fallback_functions_executed",
+            self.rich_fallback_functions_executed,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_function_fallback_by_reason",
+            &self.dense_function_fallback_by_reason,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_instruction_families_executed",
+            &self.dense_instruction_families_executed,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_property_fetch_hits",
+            self.dense_property_fetch_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_property_assignment_hits",
+            self.dense_property_assignment_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_property_fallback_by_reason",
+            &self.dense_property_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_property_ic_reuse",
+            self.dense_property_ic_reuse,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_direct_call_hits",
+            self.dense_direct_call_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_method_call_hits",
+            self.dense_method_call_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_static_call_hits",
+            self.dense_static_call_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_call_ic_hits",
+            self.dense_call_ic_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_call_ic_misses",
+            self.dense_call_ic_misses,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_call_fallback_by_reason",
+            &self.dense_call_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
             "dense_branch_executions",
             self.dense_branch_executions,
             true,
@@ -1729,6 +2074,36 @@ impl VmCounters {
             &mut json,
             "superinstruction_skipped_by_reason",
             &self.superinstruction_skipped_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "optimized_exit_snapshots_created",
+            self.optimized_exit_snapshots_created,
+            true,
+        );
+        push_field(
+            &mut json,
+            "optimized_exit_snapshots_materialized",
+            self.optimized_exit_snapshots_materialized,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "optimized_exits_by_reason",
+            &self.optimized_exits_by_reason,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "snapshot_rejection_by_missing_state_family",
+            &self.snapshot_rejection_by_missing_state_family,
+            true,
+        );
+        push_field(
+            &mut json,
+            "fallback_resume_successes",
+            self.fallback_resume_successes,
             true,
         );
         json.push_str("  \"opcodes\": {");
@@ -2217,6 +2592,48 @@ impl VmCounters {
         push_field(&mut json, "autoloads", self.autoloads, true);
         push_field(
             &mut json,
+            "include_resolution_hits",
+            self.include_resolution_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "include_resolution_misses",
+            self.include_resolution_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "include_compile_hits",
+            self.include_compile_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "include_compile_misses",
+            self.include_compile_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "include_once_skips",
+            self.include_once_skips,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "include_fallback_by_reason",
+            &self.include_fallback_by_reason,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "include_stale_invalidation_by_reason",
+            &self.include_stale_invalidation_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
             "include_graph_hits",
             self.include_graph_hits,
             true,
@@ -2303,10 +2720,28 @@ impl VmCounters {
             self.quickening_attempts,
             true,
         );
+        push_string_u64_map_field(
+            &mut json,
+            "quickening_candidates_by_family",
+            &self.quickening_candidates_by_family,
+            true,
+        );
         push_field(
             &mut json,
             "quickening_specialized",
             self.quickening_specialized,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "quickening_applied_by_family",
+            &self.quickening_applied_by_family,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "quickened_executions_by_family",
+            &self.quickened_executions_by_family,
             true,
         );
         push_field(
@@ -2327,6 +2762,12 @@ impl VmCounters {
             self.quickening_guard_failures,
             true,
         );
+        push_string_u64_map_field(
+            &mut json,
+            "quickening_guard_failures_by_family",
+            &self.quickening_guard_failures_by_family,
+            true,
+        );
         push_field(
             &mut json,
             "quickening_fallback_calls",
@@ -2339,6 +2780,12 @@ impl VmCounters {
             self.quickening_dequickens,
             true,
         );
+        push_string_u64_map_field(
+            &mut json,
+            "quickening_dequickened_by_reason",
+            &self.quickening_dequickened_by_reason,
+            true,
+        );
         push_field(
             &mut json,
             "quickening_megamorphic",
@@ -2349,6 +2796,67 @@ impl VmCounters {
             &mut json,
             "quickening_disabled",
             self.quickening_disabled,
+            true,
+        );
+        push_field(&mut json, "native_candidates", self.native_candidates, true);
+        push_field(
+            &mut json,
+            "native_compiled_regions",
+            self.native_compiled_regions,
+            true,
+        );
+        push_field(&mut json, "native_executions", self.native_executions, true);
+        push_field(
+            &mut json,
+            "native_compile_budget_rejections",
+            self.native_compile_budget_rejections,
+            true,
+        );
+        json.push_str("  \"native_eligibility_rejections_by_reason\": {");
+        for (index, (reason, count)) in self
+            .native_eligibility_rejections_by_reason
+            .iter()
+            .enumerate()
+        {
+            if index > 0 {
+                json.push_str(", ");
+            }
+            json.push('"');
+            json.push_str(&escape_json(reason));
+            json.push_str("\": ");
+            json.push_str(&count.to_string());
+        }
+        json.push_str("},\n");
+        json.push_str("  \"native_side_exits_by_reason\": {");
+        for (index, (reason, count)) in self.native_side_exits_by_reason.iter().enumerate() {
+            if index > 0 {
+                json.push_str(", ");
+            }
+            json.push('"');
+            json.push_str(&escape_json(reason));
+            json.push_str("\": ");
+            json.push_str(&count.to_string());
+        }
+        json.push_str("},\n");
+        json.push_str("  \"native_blacklist_suppression_by_unstable_region\": {");
+        for (index, (reason, count)) in self
+            .native_blacklist_suppression_by_unstable_region
+            .iter()
+            .enumerate()
+        {
+            if index > 0 {
+                json.push_str(", ");
+            }
+            json.push('"');
+            json.push_str(&escape_json(reason));
+            json.push_str("\": ");
+            json.push_str(&count.to_string());
+        }
+        json.push_str("},\n");
+        push_field(
+            &mut json,
+            "native_platform_unavailable",
+            self.native_platform_unavailable,
             true,
         );
         push_field(
@@ -2960,6 +3468,19 @@ fn alias_sensitive_reason(reason: &str) -> bool {
     reason.contains("reference") || reason.contains("by_ref") || reason.contains("cow")
 }
 
+fn quickening_specialization_family(
+    specialization: crate::QuickeningSpecialization,
+) -> &'static str {
+    match specialization {
+        crate::QuickeningSpecialization::AddIntInt
+        | crate::QuickeningSpecialization::SubIntInt
+        | crate::QuickeningSpecialization::MulIntInt => "integer_arithmetic",
+        crate::QuickeningSpecialization::ConcatStringString => "string_concat",
+        crate::QuickeningSpecialization::PackedArrayIntKey => "packed_array_dim_fetch",
+        crate::QuickeningSpecialization::BoolBranchCondition => "scalar_branch",
+    }
+}
+
 fn push_method_call_profiles(json: &mut String, profiles: &BTreeMap<String, MethodCallProfile>) {
     json.push_str("  \"method_call_profiles\": [");
     if !profiles.is_empty() {
@@ -3506,6 +4027,7 @@ fn bytecode_opcode_family(opcode: &str) -> &'static str {
         "unary_plus" | "unary_minus" | "unary_not" | "unary_bit_not" => "unary_ops",
         "call_function" => "function_calls",
         "new_array" | "array_insert" | "fetch_dim" | "assign_dim" | "append_dim" => "arrays",
+        "fetch_property" | "assign_property" => "properties",
         "foreach_init" | "foreach_next" => "foreach",
         "echo" => "output",
         "jump" | "jump_if_false" | "jump_if_true" | "jump_if" => "control_flow",
@@ -3679,6 +4201,7 @@ mod tests {
         counters.record_local_slot_fast_path(false);
         counters.record_local_slot_fast_path(true);
         counters.record_quickening(QuickeningObservation {
+            specialization: Some(crate::QuickeningSpecialization::ConcatStringString),
             attempt: true,
             specialized: true,
             guard_hit: true,
@@ -3689,6 +4212,9 @@ mod tests {
             megamorphic: true,
             disabled: true,
         });
+        counters.record_native_candidate();
+        counters.record_native_platform_unavailable();
+        counters.record_native_eligibility_rejection("reference_arg");
         counters.record_jit_compile_attempt();
         counters.record_jit_compiled();
         counters.record_jit_compile_metadata(64, 1_500);
@@ -4017,29 +4543,75 @@ mod tests {
         assert_eq!(counters.literal_intern_hits, 1);
         assert_eq!(counters.literal_intern_misses, 1);
         assert_eq!(counters.quickening_attempts, 1);
+        assert_eq!(
+            counters
+                .quickening_candidates_by_family
+                .get("string_concat"),
+            Some(&1)
+        );
         assert_eq!(counters.quickening_specialized, 1);
+        assert_eq!(
+            counters.quickening_applied_by_family.get("string_concat"),
+            Some(&1)
+        );
+        assert_eq!(
+            counters.quickened_executions_by_family.get("string_concat"),
+            Some(&1)
+        );
         assert_eq!(counters.quickening_guard_hits, 1);
         assert_eq!(counters.quickening_guard_misses, 1);
         assert_eq!(counters.quickening_guard_failures, 1);
+        assert_eq!(
+            counters
+                .quickening_guard_failures_by_family
+                .get("string_concat"),
+            Some(&1)
+        );
         assert_eq!(counters.quickening_fallback_calls, 1);
         assert_eq!(counters.quickening_dequickens, 1);
+        assert_eq!(
+            counters
+                .quickening_dequickened_by_reason
+                .get("guard_failure_threshold"),
+            Some(&1)
+        );
         assert_eq!(counters.quickening_megamorphic, 1);
         assert_eq!(counters.quickening_disabled, 1);
+        assert_eq!(counters.native_candidates, 1);
+        assert_eq!(counters.native_platform_unavailable, 1);
+        assert_eq!(
+            counters
+                .native_eligibility_rejections_by_reason
+                .get("reference_arg"),
+            Some(&1)
+        );
         assert_eq!(counters.jit_compile_attempts, 1);
         assert_eq!(counters.jit_compiled, 1);
+        assert_eq!(counters.native_compiled_regions, 1);
         assert_eq!(counters.jit_code_bytes, 64);
         assert_eq!(counters.jit_compile_time_nanos, 1_500);
         assert_eq!(counters.jit_executed, 1);
+        assert_eq!(counters.native_executions, 1);
         assert_eq!(counters.jit_bailouts, 1);
         assert_eq!(counters.jit_side_exits, 1);
         assert_eq!(
             counters.jit_side_exit_reasons.get("helper_status"),
             Some(&1)
         );
+        assert_eq!(
+            counters.native_side_exits_by_reason.get("helper_status"),
+            Some(&1)
+        );
         assert_eq!(counters.jit_guard_failures, 1);
         assert_eq!(counters.jit_blacklisted_regions, 1);
         assert_eq!(
             counters.jit_blacklist_reasons.get("too_many_side_exits"),
+            Some(&1)
+        );
+        assert_eq!(
+            counters
+                .native_blacklist_suppression_by_unstable_region
+                .get("too_many_side_exits"),
             Some(&1)
         );
         assert_eq!(counters.jit_helper_calls, 1);
@@ -4231,6 +4803,10 @@ mod tests {
         skipped.insert("unsupported_producer_echo_pair".to_string(), 1);
         counters.record_superinstruction_selection(1, &candidates, &emitted, &skipped);
         counters.record_superinstruction_executed("load_const_echo");
+        counters.record_optimized_exit_snapshot("quickening", "int_add");
+        counters.record_optimized_exit_materialized();
+        counters.record_snapshot_rejection_by_missing_state_family("foreach_iterators");
+        counters.record_fallback_resume_success();
 
         let json = counters.to_json();
 
@@ -4244,6 +4820,13 @@ mod tests {
         assert!(json.contains("\"superinstruction_deopt_or_fallbacks\": 0"));
         assert!(json.contains("\"superinstruction_deopt_or_fallback_by_reason\": {}"));
         assert!(json.contains("\"superinstruction_skipped_by_reason\": {"));
+        assert!(json.contains("\"optimized_exit_snapshots_created\": 1"));
+        assert!(json.contains("\"optimized_exit_snapshots_materialized\": 1"));
+        assert!(json.contains("\"optimized_exits_by_reason\": {"));
+        assert!(json.contains("\"quickening.int_add\": 1"));
+        assert!(json.contains("\"snapshot_rejection_by_missing_state_family\": {"));
+        assert!(json.contains("\"foreach_iterators\": 1"));
+        assert!(json.contains("\"fallback_resume_successes\": 1"));
         assert!(json.contains("\"guard_failures\": 0"));
         assert!(json.contains("\"frame_allocations\": 0"));
         assert!(json.contains("\"frame_reuses\": 0"));
@@ -4339,14 +4922,27 @@ mod tests {
         assert!(json.contains("\"concat_prealloc_hits\": 0"));
         assert!(json.contains("\"concat_fallback_by_reason\": {}"));
         assert!(json.contains("\"quickening_attempts\": 0"));
+        assert!(json.contains("\"quickening_candidates_by_family\": {}"));
         assert!(json.contains("\"quickening_specialized\": 0"));
+        assert!(json.contains("\"quickening_applied_by_family\": {}"));
+        assert!(json.contains("\"quickened_executions_by_family\": {}"));
         assert!(json.contains("\"quickening_guard_hits\": 0"));
         assert!(json.contains("\"quickening_guard_misses\": 0"));
         assert!(json.contains("\"quickening_guard_failures\": 0"));
+        assert!(json.contains("\"quickening_guard_failures_by_family\": {}"));
         assert!(json.contains("\"quickening_fallback_calls\": 0"));
         assert!(json.contains("\"quickening_dequickens\": 0"));
+        assert!(json.contains("\"quickening_dequickened_by_reason\": {}"));
         assert!(json.contains("\"quickening_megamorphic\": 0"));
         assert!(json.contains("\"quickening_disabled\": 0"));
+        assert!(json.contains("\"native_candidates\": 0"));
+        assert!(json.contains("\"native_compiled_regions\": 0"));
+        assert!(json.contains("\"native_executions\": 0"));
+        assert!(json.contains("\"native_compile_budget_rejections\": 0"));
+        assert!(json.contains("\"native_eligibility_rejections_by_reason\": {}"));
+        assert!(json.contains("\"native_side_exits_by_reason\": {}"));
+        assert!(json.contains("\"native_blacklist_suppression_by_unstable_region\": {}"));
+        assert!(json.contains("\"native_platform_unavailable\": 0"));
         assert!(json.contains("\"jit_compile_attempts\": 0"));
         assert!(json.contains("\"jit_compiled\": 0"));
         assert!(json.contains("\"jit_executed\": 0"));
@@ -4411,6 +5007,13 @@ mod tests {
         assert!(json.contains("\"inline_cache_disabled\": 0"));
         assert!(json.contains("\"include_graph_hits\": 0"));
         assert!(json.contains("\"include_graph_misses\": 0"));
+        assert!(json.contains("\"include_resolution_hits\": 0"));
+        assert!(json.contains("\"include_resolution_misses\": 0"));
+        assert!(json.contains("\"include_compile_hits\": 0"));
+        assert!(json.contains("\"include_compile_misses\": 0"));
+        assert!(json.contains("\"include_once_skips\": 0"));
+        assert!(json.contains("\"include_fallback_by_reason\": {}"));
+        assert!(json.contains("\"include_stale_invalidation_by_reason\": {}"));
         assert!(json.contains("\"autoload_graph_hits\": 0"));
         assert!(json.contains("\"autoload_graph_misses\": 0"));
         assert!(json.contains("\"negative_lookup_hits\": 0"));
