@@ -9,14 +9,39 @@ use crate::{PHP_SESSION_NONE, Value};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
+        "session_cache_expire",
+        builtin_session_cache_expire,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "session_cache_limiter",
+        builtin_session_cache_limiter,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "session_commit",
+        builtin_session_write_close,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "session_destroy",
         builtin_session_destroy,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("session_id", builtin_session_id, BuiltinCompatibility::Php),
     BuiltinEntry::new(
+        "session_module_name",
+        builtin_session_module_name,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "session_name",
         builtin_session_name,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "session_save_path",
+        builtin_session_save_path,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -29,7 +54,58 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_session_status,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "session_write_close",
+        builtin_session_write_close,
+        BuiltinCompatibility::Php,
+    ),
 ];
+
+pub(in crate::builtins::modules) fn builtin_session_cache_expire(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error(
+            "session_cache_expire",
+            "zero or one argument(s)",
+        ));
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_cache_expire"));
+    };
+    let previous = state.cache_expire();
+    if let Some(value) = args.first()
+        && !matches!(deref_value(value), Value::Null)
+    {
+        state.replace_cache_expire(int_arg("session_cache_expire", value)?);
+    }
+    Ok(Value::Int(previous))
+}
+
+pub(in crate::builtins::modules) fn builtin_session_cache_limiter(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error(
+            "session_cache_limiter",
+            "zero or one argument(s)",
+        ));
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_cache_limiter"));
+    };
+    let previous = state.cache_limiter().to_owned();
+    if let Some(value) = args.first()
+        && !matches!(deref_value(value), Value::Null)
+    {
+        state.replace_cache_limiter(string_arg("session_cache_limiter", value)?.to_string_lossy());
+    }
+    Ok(Value::string(previous))
+}
 
 pub(in crate::builtins::modules) fn builtin_session_status(
     context: &mut BuiltinContext<'_>,
@@ -59,6 +135,49 @@ pub(in crate::builtins::modules) fn builtin_session_name(
         && !matches!(deref_value(name), Value::Null)
     {
         state.replace_name(string_arg("session_name", name)?.to_string_lossy());
+    }
+    Ok(Value::string(previous))
+}
+
+pub(in crate::builtins::modules) fn builtin_session_module_name(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error(
+            "session_module_name",
+            "zero or one argument(s)",
+        ));
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_module_name"));
+    };
+    let previous = state.module_name().to_owned();
+    if let Some(name) = args.first()
+        && !matches!(deref_value(name), Value::Null)
+    {
+        state.replace_module_name(string_arg("session_module_name", name)?.to_string_lossy());
+    }
+    Ok(Value::string(previous))
+}
+
+pub(in crate::builtins::modules) fn builtin_session_save_path(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("session_save_path", "zero or one argument(s)"));
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_save_path"));
+    };
+    let previous = state.save_path().to_owned();
+    if let Some(path) = args.first()
+        && !matches!(deref_value(path), Value::Null)
+    {
+        state.replace_save_path(string_arg("session_save_path", path)?.to_string_lossy());
     }
     Ok(Value::string(previous))
 }
@@ -120,6 +239,18 @@ pub(in crate::builtins::modules) fn builtin_session_destroy(
     Ok(Value::Bool(destroyed))
 }
 
+pub(in crate::builtins::modules) fn builtin_session_write_close(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("session_write_close", &args, 0)?;
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_write_close"));
+    };
+    Ok(Value::Bool(state.write_close()))
+}
+
 fn session_context_error(function: &str) -> BuiltinError {
     BuiltinError::new(
         "E_PHP_RUNTIME_SESSION_CONTEXT_REQUIRED",
@@ -160,6 +291,26 @@ mod tests {
             Value::string("PHPSESSID")
         );
         assert_eq!(
+            builtin_session_cache_expire(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("cache expire"),
+            Value::Int(180)
+        );
+        assert_eq!(
+            builtin_session_cache_limiter(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("cache limiter"),
+            Value::string("nocache")
+        );
+        assert_eq!(
+            builtin_session_module_name(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("module name"),
+            Value::string("files")
+        );
+        assert_eq!(
+            builtin_session_save_path(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("save path"),
+            Value::string("")
+        );
+        assert_eq!(
             builtin_session_id(
                 &mut context,
                 vec![Value::string("local")],
@@ -175,8 +326,23 @@ mod tests {
         );
         assert_eq!(global.get(), Value::Array(crate::PhpArray::new()));
         assert_eq!(
+            builtin_session_write_close(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("write close"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            builtin_session_status(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("status after write close"),
+            Value::Int(PHP_SESSION_NONE)
+        );
+        assert_eq!(
             builtin_session_id(&mut context, Vec::new(), RuntimeSourceSpan::default()).expect("id"),
             Value::string("local")
+        );
+        assert_eq!(
+            builtin_session_start(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("restart"),
+            Value::Bool(true)
         );
         assert_eq!(
             builtin_session_destroy(&mut context, Vec::new(), RuntimeSourceSpan::default())

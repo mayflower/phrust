@@ -8,6 +8,7 @@ use crate::{Value, datetime, to_bool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new("checkdate", builtin_checkdate, BuiltinCompatibility::Php),
     BuiltinEntry::new("date", builtin_date, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "date_format",
@@ -51,6 +52,18 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
 ];
 
+pub(in crate::builtins::modules) fn builtin_checkdate(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("checkdate", &args, 3)?;
+    let month = int_arg("checkdate", &args[0])?;
+    let day = int_arg("checkdate", &args[1])?;
+    let year = int_arg("checkdate", &args[2])?;
+    Ok(Value::Bool(is_valid_gregorian_date(month, day, year)))
+}
+
 pub(in crate::builtins::modules) fn builtin_date_default_timezone_get(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -58,6 +71,27 @@ pub(in crate::builtins::modules) fn builtin_date_default_timezone_get(
 ) -> BuiltinResult {
     expect_arity("date_default_timezone_get", &args, 0)?;
     Ok(Value::string(context.default_timezone()))
+}
+
+fn is_valid_gregorian_date(month: i64, day: i64, year: i64) -> bool {
+    if !(1..=32767).contains(&year) || !(1..=12).contains(&month) {
+        return false;
+    }
+    (1..=days_in_month(month, year)).contains(&day)
+}
+
+fn days_in_month(month: i64, year: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 pub(in crate::builtins::modules) fn builtin_date(
     context: &mut BuiltinContext<'_>,

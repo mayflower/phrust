@@ -53,6 +53,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "mysqli_get_client_info",
+        builtin_mysqli_get_client_info,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "mysqli_get_client_version",
+        builtin_mysqli_get_client_version,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "mysqli_escape_string",
         builtin_mysqli_real_escape_string,
         BuiltinCompatibility::Php,
@@ -139,6 +149,9 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
 ];
 
+const MYSQLND_CLIENT_INFO: &str = "mysqlnd 8.5.7";
+const MYSQLND_CLIENT_VERSION: i64 = 80507;
+
 pub(in crate::builtins::modules) fn builtin_mysqli_connect(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -155,6 +168,24 @@ pub(in crate::builtins::modules) fn builtin_mysqli_init(
 ) -> BuiltinResult {
     expect_arity("mysqli_init", &args, 0)?;
     Ok(Value::Object(mysqli_object(None)))
+}
+
+pub(in crate::builtins::modules) fn builtin_mysqli_get_client_info(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_mysqli_arity("mysqli_get_client_info", args.len(), 0, 1)?;
+    Ok(Value::string(MYSQLND_CLIENT_INFO))
+}
+
+pub(in crate::builtins::modules) fn builtin_mysqli_get_client_version(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("mysqli_get_client_version", &args, 0)?;
+    Ok(Value::Int(MYSQLND_CLIENT_VERSION))
 }
 
 pub(in crate::builtins::modules) fn builtin_mysqli_real_connect(

@@ -3,6 +3,7 @@
 - Strategy: SQLite-backed core MVP
 - Classification: real implementation for SQLite infrastructure
 - Selected manifest: `tests/phpt/manifests/modules/pdo.selected.jsonl`
+- Selected gate: 4 PASS
 - Fixture: `tests/phpt/generated/pdo/platform-checks.phpt`
 
 ## Implemented Scope
@@ -12,7 +13,8 @@ under it.
 
 Implemented behavior:
 
-- `extension_loaded("pdo")`, `pdo_drivers`, and PDO class visibility.
+- `extension_loaded("pdo")`, `pdo_drivers`, `PDO::getAvailableDrivers`, and
+  PDO class visibility.
 - `PDO`, `PDOException`, `PDOStatement`, and `PDORow` platform probes.
 - Core PDO constants used by the MVP fetch/error-mode surface.
 - SQLite DSN construction through `new PDO("sqlite:...")`.

@@ -3,17 +3,21 @@
 - Strategy: bounded parser MVP
 - Classification: optional, enabled for the local WordPress XML slice
 - Selected manifest: `tests/phpt/manifests/modules/xml.selected.jsonl`
-- Selected gate: 3 generated PHPTs covering platform visibility, strict
-  parse/reject behavior, and parser error helpers
+- Selected gate: 5 PASS covering platform visibility, strict parse/reject
+  behavior, parser error helpers, and selected parser options.
 
 ## Runtime Contract
 
 - `extension_loaded("xml")` returns `true`.
 - `xml_parser_create()` returns a bounded `XMLParser` object.
+- `xml_parser_create_ns()` returns the same bounded parser resource for the
+  selected namespace-aware construction probes.
 - `xml_parse(XMLParser $parser, string $data, bool $is_final = false)` returns
   `1` for a strict single-root XML document and `0` for malformed XML.
 - `xml_get_error_code()` and `xml_error_string()` expose deterministic parser
   error state for the selected malformed-input slice.
+- `xml_parser_get_option()` and `xml_parser_set_option()` retain selected
+  parser options: case folding, target encoding, skip-tag-start, and skip-white.
 - Built-in XML entities are decoded. Unresolved entities, DTDs, processing
   instructions beyond the XML declaration, and trailing content are rejected.
 - The PHP SAX parser API remains unsupported.
@@ -28,7 +32,7 @@
 
 | Stable ID | Reference behavior summary | Current phrust behavior | Fixture path | Next owner layer |
 | --- | --- | --- | --- | --- |
-| `XML-DOM-INTL-XML-SAX-CALLBACKS` | PHP `ext/xml` exposes parser callbacks, parser options, and position constants. | `XMLParser`, `xml_parser_create`, strict `xml_parse`, and selected error helpers are implemented; SAX callbacks are absent. | `tests/phpt/generated/xml/platform-checks.phpt` | future XML parser resource layer |
+| `XML-DOM-INTL-XML-SAX-CALLBACKS` | PHP `ext/xml` exposes parser callbacks, parser options, and position constants. | `XMLParser`, `xml_parser_create`, `xml_parser_create_ns`, strict `xml_parse`, selected parser options, and selected error helpers are implemented; SAX callbacks are absent. | `tests/phpt/generated/xml/platform-checks.phpt` | future XML parser resource layer |
 | `XML-DOM-INTL-LIBXML-ERROR-STATE` | libxml reports structured parse diagnostics and global error state. | Parse failures expose a deterministic selected error code/string, but no full libxml error buffer is modeled. | `tests/phpt/generated/xml/parser-error-state.phpt` | future libxml compatibility layer |
 
 ## Target Gates

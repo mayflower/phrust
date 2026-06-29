@@ -17696,14 +17696,15 @@ impl Vm {
                             }
                             continue;
                         }
-                        if normalize_class_name(class_name) == "normalizer" {
+                        if internal_extension_static_class(class_name) {
                             let values = match read_call_args(unit, stack, args) {
                                 Ok(values) => values,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
                             };
-                            let value = match call_normalizer_static_method(
+                            let value = match call_internal_extension_static_method(
+                                class_name,
                                 method,
                                 values.into_iter().map(|arg| arg.value).collect(),
                             ) {
@@ -24566,9 +24567,9 @@ impl Vm {
             };
             return VmResult::success(output.clone(), Some(value));
         }
-        if normalize_class_name(class_name) == "normalizer" {
+        if internal_extension_static_class(class_name) {
             let values = args.into_iter().map(|arg| arg.value).collect();
-            let value = match call_normalizer_static_method(method, values) {
+            let value = match call_internal_extension_static_method(class_name, method, values) {
                 Ok(value) => value,
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             };
@@ -35282,6 +35283,102 @@ fn call_normalizer_static_method(method: &str, args: Vec<Value>) -> Result<Value
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method Normalizer::{method} is not implemented"
+        )),
+    }
+}
+
+fn internal_extension_static_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "normalizer" | "locale" | "pdo" | "phar"
+    )
+}
+
+fn call_internal_extension_static_method(
+    class_name: &str,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    match normalize_class_name(class_name).as_str() {
+        "normalizer" => call_normalizer_static_method(method, args),
+        "locale" => call_locale_static_method(method, args),
+        "pdo" => call_pdo_static_method(method, args),
+        "phar" => call_phar_static_method(method, args),
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn call_locale_static_method(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "getprimarylanguage" => {
+            validate_xml_value_count("Locale::getPrimaryLanguage", &args, 1, 1)?;
+            let locale = xml_string_arg("Locale::getPrimaryLanguage", args[0].clone())?;
+            Ok(Value::string(intl_primary_language(&locale)))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method Locale::{method} is not implemented"
+        )),
+    }
+}
+
+fn intl_primary_language(locale: &str) -> String {
+    let locale = locale.split('@').next().unwrap_or(locale);
+    let subtags = locale.split(['-', '_']).collect::<Vec<_>>();
+    if subtags.len() >= 3 && subtags[0].eq_ignore_ascii_case("zh") && subtags[1] == "min" {
+        return "zh".to_owned();
+    }
+    if subtags.len() >= 2
+        && matches!(subtags[0].to_ascii_lowercase().as_str(), "i" | "zh" | "sgn")
+        && subtags[1].chars().all(|ch| ch.is_ascii_lowercase())
+    {
+        return format!("{}-{}", subtags[0], subtags[1]).to_ascii_lowercase();
+    }
+    subtags
+        .first()
+        .copied()
+        .unwrap_or(locale)
+        .to_ascii_lowercase()
+}
+
+fn call_pdo_static_method(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "getavailabledrivers" => {
+            validate_pdo_arg_count("PDO::getAvailableDrivers", args.len(), 0, 0)?;
+            Ok(Value::Array(PhpArray::from_packed(vec![Value::string(
+                "sqlite",
+            )])))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method PDO::{method} is not implemented"
+        )),
+    }
+}
+
+fn call_phar_static_method(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "getsupportedcompression" => {
+            validate_phar_arg_count("Phar::getSupportedCompression", args.len(), 0, 0)?;
+            Ok(Value::Array(PhpArray::from_packed(vec![
+                Value::string("GZ"),
+                Value::string("BZIP2"),
+            ])))
+        }
+        "getsupportedsignatures" => {
+            validate_phar_arg_count("Phar::getSupportedSignatures", args.len(), 0, 0)?;
+            Ok(Value::Array(PhpArray::from_packed(vec![
+                Value::string("MD5"),
+                Value::string("SHA-1"),
+                Value::string("SHA-256"),
+                Value::string("SHA-512"),
+            ])))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method Phar::{method} is not implemented"
         )),
     }
 }

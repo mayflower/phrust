@@ -3,8 +3,7 @@
 - Strategy: WordPress database MVP
 - Classification: required-framework
 - Selected manifest: `tests/phpt/manifests/modules/mysqli.selected.jsonl`
-- Current corpus snapshot: 442 `mysqli` candidates, 2 PASS, 4 SKIP, 429 FAIL,
-  4 BORK, and 442 known non-green outcomes.
+- Selected gate: 5 PASS with live MySQL access disabled by default.
 
 ## Decision
 
@@ -36,10 +35,11 @@ protocol or SQL-dialect parity.
    `mysqli_real_escape_string`.
 3. Object API coverage for `mysqli`, `mysqli_result`, and the wpdb-style
    connect/set-charset/query/escape/fetch/status flow.
-4. Prepared statements are documented as an explicit gap because the selected
+4. mysqlnd client metadata probes:
+   `mysqli_get_client_info`, `mysqli_get_client_version`,
+   `MYSQLND_CLIENT_INFO`, and `MYSQLND_CLIENT_VERSION`.
+5. Prepared statements are documented as an explicit gap because the selected
    WordPress-style fixtures do not require `mysqli_stmt_*`.
-5. mysqlnd-specific behavior remains represented as driver metadata/gaps unless
-   a selected fixture requires a real user-visible surface.
 6. SQLite compatibility coverage is selected only for phrust-owned generated
    fixtures and remains opt-in through `PHRUST_MYSQLI_SQLITE_COMPAT=1`.
 

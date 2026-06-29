@@ -1390,10 +1390,16 @@ pub(super) fn standard_library_session_extension() -> ExtensionDescriptor {
             ConstantValue::Int(2),
         ))
         .with_function(FunctionDescriptor::php("session_destroy", "session"))
+        .with_function(FunctionDescriptor::php("session_cache_expire", "session"))
+        .with_function(FunctionDescriptor::php("session_cache_limiter", "session"))
+        .with_function(FunctionDescriptor::php("session_commit", "session"))
         .with_function(FunctionDescriptor::php("session_id", "session"))
+        .with_function(FunctionDescriptor::php("session_module_name", "session"))
         .with_function(FunctionDescriptor::php("session_name", "session"))
+        .with_function(FunctionDescriptor::php("session_save_path", "session"))
         .with_function(FunctionDescriptor::php("session_start", "session"))
         .with_function(FunctionDescriptor::php("session_status", "session"))
+        .with_function(FunctionDescriptor::php("session_write_close", "session"))
 }
 
 pub(super) fn standard_library_pdo_extension() -> ExtensionDescriptor {
@@ -1459,6 +1465,11 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mysqli_connect_error", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_errno", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_error", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_get_client_info", "mysqli"))
+        .with_function(FunctionDescriptor::php(
+            "mysqli_get_client_version",
+            "mysqli",
+        ))
         .with_function(FunctionDescriptor::php("mysqli_get_server_info", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_escape_string", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_fetch_array", "mysqli"))
@@ -1504,6 +1515,16 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
 
 pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("curl")
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLM_OK",
+            "curl",
+            ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLM_BAD_HANDLE",
+            "curl",
+            ConstantValue::Int(1),
+        ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_URL",
             "curl",
@@ -1592,10 +1613,13 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("curl_close", "curl"))
         .with_function(FunctionDescriptor::php("curl_errno", "curl"))
         .with_function(FunctionDescriptor::php("curl_error", "curl"))
+        .with_function(FunctionDescriptor::php("curl_escape", "curl"))
         .with_function(FunctionDescriptor::php("curl_exec", "curl"))
         .with_function(FunctionDescriptor::php("curl_getinfo", "curl"))
         .with_function(FunctionDescriptor::php("curl_init", "curl"))
+        .with_function(FunctionDescriptor::php("curl_multi_strerror", "curl"))
         .with_function(FunctionDescriptor::php("curl_setopt", "curl"))
+        .with_function(FunctionDescriptor::php("curl_unescape", "curl"))
         .with_function(FunctionDescriptor::php("curl_version", "curl"))
         .with_class(ClassDescriptor::new("CurlHandle", "curl", ClassKind::Class))
 }
@@ -1613,6 +1637,14 @@ pub(super) fn standard_library_openssl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(7),
         ))
         .with_function(FunctionDescriptor::php("openssl_digest", "openssl"))
+        .with_function(FunctionDescriptor::php(
+            "openssl_cipher_iv_length",
+            "openssl",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "openssl_get_cipher_methods",
+            "openssl",
+        ))
         .with_function(FunctionDescriptor::php("openssl_get_md_methods", "openssl"))
         .with_function(FunctionDescriptor::php(
             "openssl_random_pseudo_bytes",
@@ -1729,9 +1761,24 @@ pub(super) fn standard_library_mbstring_extension() -> ExtensionDescriptor {
 pub(super) fn standard_library_intl_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("intl")
         .enabled_by_default(true)
+        .with_constant(ConstantDescriptor::with_value(
+            "INTL_ICU_DATA_VERSION",
+            "intl",
+            ConstantValue::String("76.1"),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "INTL_ICU_VERSION",
+            "intl",
+            ConstantValue::String("76.1"),
+        ))
         .with_function(FunctionDescriptor::php("grapheme_substr", "intl"))
         .with_function(FunctionDescriptor::php("grapheme_strlen", "intl"))
         .with_function(FunctionDescriptor::php("intl_get_error_code", "intl"))
+        .with_function(FunctionDescriptor::php("intl_get_error_message", "intl"))
+        .with_function(FunctionDescriptor::php(
+            "locale_get_primary_language",
+            "intl",
+        ))
         .with_function(FunctionDescriptor::php("normalizer_is_normalized", "intl"))
         .with_function(FunctionDescriptor::php("normalizer_normalize", "intl"))
         .with_function(FunctionDescriptor::php(
@@ -1752,7 +1799,30 @@ pub(super) fn standard_library_intl_extension() -> ExtensionDescriptor {
 pub(super) fn standard_library_xml_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("xml")
         .enabled_by_default(true)
+        .with_constant(ConstantDescriptor::with_value(
+            "XML_OPTION_CASE_FOLDING",
+            "xml",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "XML_OPTION_TARGET_ENCODING",
+            "xml",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "XML_OPTION_SKIP_TAGSTART",
+            "xml",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "XML_OPTION_SKIP_WHITE",
+            "xml",
+            ConstantValue::Int(4),
+        ))
         .with_function(FunctionDescriptor::php("xml_parser_create", "xml"))
+        .with_function(FunctionDescriptor::php("xml_parser_create_ns", "xml"))
+        .with_function(FunctionDescriptor::php("xml_parser_get_option", "xml"))
+        .with_function(FunctionDescriptor::php("xml_parser_set_option", "xml"))
         .with_function(FunctionDescriptor::php("xml_parse", "xml"))
         .with_class(ClassDescriptor::new("XMLParser", "xml", ClassKind::Class))
 }
@@ -1769,6 +1839,7 @@ pub(super) fn standard_library_dom_extension() -> ExtensionDescriptor {
 pub(super) fn standard_library_simplexml_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("simplexml")
         .enabled_by_default(true)
+        .with_function(FunctionDescriptor::php("simplexml_load_file", "simplexml"))
         .with_function(FunctionDescriptor::php(
             "simplexml_load_string",
             "simplexml",
@@ -2229,6 +2300,7 @@ pub(super) fn standard_library_date_extension() -> ExtensionDescriptor {
             "date",
             ConstantValue::String(constants::DATE_ATOM),
         ))
+        .with_function(FunctionDescriptor::php("checkdate", "date"))
         .with_function(FunctionDescriptor::php("date", "date"))
         .with_function(FunctionDescriptor::php("date_default_timezone_get", "date"))
         .with_function(FunctionDescriptor::php("date_default_timezone_set", "date"))

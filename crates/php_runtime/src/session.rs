@@ -16,6 +16,10 @@ pub struct SessionState {
     name: String,
     id: String,
     data: PhpArray,
+    cache_expire: i64,
+    cache_limiter: String,
+    module_name: String,
+    save_path: String,
     next_id: u64,
     pending_generated_id: Option<String>,
     started: bool,
@@ -31,6 +35,10 @@ impl Default for SessionState {
             name: "PHPSESSID".to_owned(),
             id: String::new(),
             data: PhpArray::new(),
+            cache_expire: 180,
+            cache_limiter: "nocache".to_owned(),
+            module_name: "files".to_owned(),
+            save_path: String::new(),
             next_id: 1,
             pending_generated_id: None,
             started: false,
@@ -68,6 +76,50 @@ impl SessionState {
     /// Replaces the session id and returns the previous value.
     pub fn replace_id(&mut self, id: impl Into<String>) -> String {
         std::mem::replace(&mut self.id, id.into())
+    }
+
+    /// Returns the current cache expiry in minutes.
+    #[must_use]
+    pub const fn cache_expire(&self) -> i64 {
+        self.cache_expire
+    }
+
+    /// Replaces the cache expiry and returns the previous value.
+    pub fn replace_cache_expire(&mut self, minutes: i64) -> i64 {
+        std::mem::replace(&mut self.cache_expire, minutes)
+    }
+
+    /// Returns the current cache limiter.
+    #[must_use]
+    pub fn cache_limiter(&self) -> &str {
+        &self.cache_limiter
+    }
+
+    /// Replaces the cache limiter and returns the previous value.
+    pub fn replace_cache_limiter(&mut self, limiter: impl Into<String>) -> String {
+        std::mem::replace(&mut self.cache_limiter, limiter.into())
+    }
+
+    /// Returns the current session module name.
+    #[must_use]
+    pub fn module_name(&self) -> &str {
+        &self.module_name
+    }
+
+    /// Replaces the session module name and returns the previous value.
+    pub fn replace_module_name(&mut self, module_name: impl Into<String>) -> String {
+        std::mem::replace(&mut self.module_name, module_name.into())
+    }
+
+    /// Returns the current session save path.
+    #[must_use]
+    pub fn save_path(&self) -> &str {
+        &self.save_path
+    }
+
+    /// Replaces the session save path and returns the previous value.
+    pub fn replace_save_path(&mut self, save_path: impl Into<String>) -> String {
+        std::mem::replace(&mut self.save_path, save_path.into())
     }
 
     /// Seeds web-session state loaded by the transport layer.
@@ -142,6 +194,14 @@ impl SessionState {
         self.id.clear();
         self.data = PhpArray::new();
         self.destroyed = true;
+        true
+    }
+
+    /// Writes and closes the active deterministic CLI session.
+    pub fn write_close(&mut self) -> bool {
+        if self.status == PHP_SESSION_ACTIVE {
+            self.status = PHP_SESSION_NONE;
+        }
         true
     }
 

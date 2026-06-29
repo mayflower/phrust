@@ -19,6 +19,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("curl_close", builtin_curl_close, BuiltinCompatibility::Php),
     BuiltinEntry::new("curl_errno", builtin_curl_errno, BuiltinCompatibility::Php),
     BuiltinEntry::new("curl_error", builtin_curl_error, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "curl_escape",
+        builtin_curl_escape,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("curl_exec", builtin_curl_exec, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "curl_getinfo",
@@ -29,6 +34,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
         "curl_setopt",
         builtin_curl_setopt,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "curl_multi_strerror",
+        builtin_curl_multi_strerror,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "curl_unescape",
+        builtin_curl_unescape,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -57,6 +72,8 @@ const CURLINFO_EFFECTIVE_URL: i64 = 1048577;
 const CURLINFO_RESPONSE_CODE: i64 = 2097154;
 const CURLINFO_HEADER_SIZE: i64 = 2097163;
 const CURLINFO_TOTAL_TIME: i64 = 3145731;
+const CURLM_OK: i64 = 0;
+const CURLM_BAD_HANDLE: i64 = 1;
 
 type CurlTransportError = (i64, String);
 type CurlPostBody = (Vec<u8>, Option<&'static str>);
@@ -69,11 +86,29 @@ pub(in crate::builtins::modules) fn builtin_curl_version(
     expect_arity("curl_version", &args, 0)?;
     let mut out = PhpArray::new();
     out.insert(
+        ArrayKey::String(PhpString::from("version_number")),
+        Value::Int(0x080507),
+    );
+    out.insert(ArrayKey::String(PhpString::from("age")), Value::Int(0));
+    out.insert(ArrayKey::String(PhpString::from("features")), Value::Int(0));
+    out.insert(
+        ArrayKey::String(PhpString::from("ssl_version_number")),
+        Value::Int(0),
+    );
+    out.insert(
         ArrayKey::String(PhpString::from("version")),
         Value::String(PhpString::from("phrust-curl-mvp")),
     );
     out.insert(
+        ArrayKey::String(PhpString::from("host")),
+        Value::String(PhpString::from("phrust")),
+    );
+    out.insert(
         ArrayKey::String(PhpString::from("ssl_version")),
+        Value::String(PhpString::from("none")),
+    );
+    out.insert(
+        ArrayKey::String(PhpString::from("libz_version")),
         Value::String(PhpString::from("none")),
     );
     out.insert(
@@ -81,6 +116,47 @@ pub(in crate::builtins::modules) fn builtin_curl_version(
         Value::packed_array(vec![Value::String(PhpString::from("http"))]),
     );
     Ok(Value::Array(out))
+}
+
+pub(in crate::builtins::modules) fn builtin_curl_escape(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("curl_escape", &args, 2)?;
+    let _ = curl_handle_arg("curl_escape", args.first())?;
+    let input = string_arg("curl_escape", &args[1])?;
+    Ok(Value::string(percent_encode_uri_component(
+        input.as_bytes(),
+    )))
+}
+
+pub(in crate::builtins::modules) fn builtin_curl_unescape(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("curl_unescape", &args, 2)?;
+    let _ = curl_handle_arg("curl_unescape", args.first())?;
+    let input = string_arg("curl_unescape", &args[1])?;
+    Ok(Value::string(percent_decode_uri_component(
+        input.as_bytes(),
+    )))
+}
+
+pub(in crate::builtins::modules) fn builtin_curl_multi_strerror(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("curl_multi_strerror", &args, 1)?;
+    let code = int_arg("curl_multi_strerror", &args[0])?;
+    let message = match code {
+        CURLM_OK => "No error",
+        CURLM_BAD_HANDLE => "Invalid multi handle",
+        _ => "Unknown error",
+    };
+    Ok(Value::string(message))
 }
 
 pub(in crate::builtins::modules) fn builtin_curl_init(
@@ -502,6 +578,44 @@ fn percent_encode_form(value: &str) -> String {
         }
     }
     out
+}
+
+fn percent_encode_uri_component(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte),
+            _ => out.extend_from_slice(format!("%{byte:02X}").as_bytes()),
+        }
+    }
+    out
+}
+
+fn percent_decode_uri_component(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(&hi), Some(&lo)) = (bytes.get(index + 1), bytes.get(index + 2))
+            && let (Some(hi), Some(lo)) = (hex_value(hi), hex_value(lo))
+        {
+            out.push((hi << 4) | lo);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn curl_timeout(handle: &ObjectRef) -> Duration {

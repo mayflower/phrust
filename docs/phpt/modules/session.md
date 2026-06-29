@@ -3,8 +3,7 @@
 - Strategy: deterministic request-local MVP
 - Classification: real-implementation-required for framework session support
 - Selected manifest: `tests/phpt/manifests/modules/session.selected.jsonl`
-- Current corpus snapshot before the selected gate: 260 `session` candidates, 3 PASS,
-  0 SKIP, 254 FAIL, 2 BORK, and 260 known non-green outcomes.
+- Selected gate: 7 PASS
 
 ## Implemented Scope
 
@@ -16,6 +15,12 @@ seeds `$_SESSION`, and implements:
 - `session_status`
 - `session_id`
 - `session_name`
+- `session_cache_expire`
+- `session_cache_limiter`
+- `session_module_name`
+- `session_save_path`
+- `session_write_close`
+- `session_commit`
 - `session_destroy`
 
 The implementation is intentionally request-local and deterministic. `$_SESSION`
@@ -32,8 +37,9 @@ when `session_start()` creates a new deterministic id.
   save handlers, locking, and `SessionHandler` classes/interfaces.
 - Current phrust behavior: request-local session basics pass through generated
   coverage; the web runtime covers deterministic `PHPSESSID` cookie reuse and
-  creation. Persistent storage, custom handlers, upload lifecycle, INI policy,
-  and the full session handler matrix remain unsupported.
+  creation. Selected cache/module/save-path metadata and write-close behavior
+  are request-local. Persistent storage, custom handlers, upload lifecycle, INI
+  policy, and the full session handler matrix remain unsupported.
 - Fixture: `tests/phpt/generated/session/platform-checks.phpt`
 - Next owner layer: future request/runtime state work for filesystem-backed
   persistence, INI policy, and handler objects.

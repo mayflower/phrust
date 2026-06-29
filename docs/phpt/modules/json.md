@@ -2,7 +2,7 @@
 
 - Priority: 17.6 closed
 - Selected manifest: `tests/phpt/manifests/modules/json.selected.jsonl`
-- the selected close gate: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK from 10 selected fixtures
+- the selected close gate: 15 PASS, 0 SKIP, 0 FAIL, 0 BORK from 15 selected fixtures
 
 ## Scope
 
@@ -32,6 +32,11 @@
 - `ext/json/tests/json_last_error_error.phpt`
 - `ext/json/tests/json_last_error_msg_error.phpt`
 - `ext/json/tests/json_encode_unescaped_slashes.phpt`
+- `ext/json/tests/json_encode_pretty_print.phpt`
+- `ext/json/tests/json_encode_numeric.phpt`
+- `ext/json/tests/pass002.phpt`
+- `ext/json/tests/pass003.phpt`
+- `ext/json/tests/json_encode_pretty_print2.phpt`
 
 ## Relevant Source Areas
 
@@ -50,14 +55,14 @@
 - Replaced the broad 88-test selected manifest with a focused 10-test harness.
 - Added generated oracle fixtures for encode basics, encode common flags, decode
   basics, last-error state transitions, and `JSON_THROW_ON_ERROR`.
-- Latest focused target run: 10 PASS, 0 FAIL.
-- Latest focused reference run: 10 PASS.
+- Latest focused target run: 15 PASS, 0 FAIL.
+- Latest focused reference run: 15 PASS.
 
 ## Known Gaps
 
 - Request-local JSON last-error state now persists across VM builtin calls.
 - `json_encode` now matches the selected scalar/list/map/simple-object, common
-  flag, slash escaping, pretty-print, and insertion-order PHPTs.
+  flag, slash escaping, pretty-print, numeric-check, and insertion-order PHPTs.
 - `JSON_THROW_ON_ERROR` decode failures now route to catchable `JsonException`
   through the existing VM throwable path.
 - `JsonSerializable` is deliberately left as `STDLIB-GAP-JSONSERIALIZABLE-DISPATCH`:

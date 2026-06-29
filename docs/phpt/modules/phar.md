@@ -3,6 +3,8 @@
 - Strategy: read-only local PHAR MVP
 - Classification: real-implementation-required for Composer PHAR mode
 - Selected manifest: `tests/phpt/manifests/modules/phar.selected.jsonl`
+- Selected gate: 2 PASS and 4 SKIP. The skipped upstream rows are optional
+  compression/signature capability probes.
 
 ## Implemented Scope
 
@@ -16,6 +18,8 @@
   `stream_get_contents`, and `include` for uncompressed file entries.
 - `include_once` / `require_once` tracking uses stable synthetic `phar://`
   paths.
+- `Phar::getSupportedCompression()` and `Phar::getSupportedSignatures()` expose
+  selected static metadata for upstream capability probes.
 
 ## Fixture
 
@@ -27,9 +31,9 @@
 ## Remaining Gaps
 
 - PHAR archive writing and mutation APIs are not implemented.
-- Signature validation/enforcement, compression, tar/zip `PharData`, archive
-  iteration, metadata APIs, and `PharFileInfo` object creation remain known
-  gaps.
+- Signature validation/enforcement, compressed archive reads/writes, tar/zip
+  `PharData`, archive iteration, metadata APIs, and `PharFileInfo` object
+  creation remain known gaps.
 - `phar://` metadata/stat functions are intentionally narrower than full PHP
   stream-wrapper parity.
 

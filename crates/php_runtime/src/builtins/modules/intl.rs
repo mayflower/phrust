@@ -19,6 +19,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "intl_get_error_message",
+        builtin_intl_get_error_message,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "locale_get_primary_language",
+        builtin_locale_get_primary_language,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "normalizer_normalize",
         builtin_normalizer_normalize,
         BuiltinCompatibility::Php,
@@ -48,6 +58,44 @@ fn builtin_grapheme_strlen(
     expect_arity("grapheme_strlen", &args, 1)?;
     let input = utf8_string_arg("grapheme_strlen", &args[0])?;
     Ok(Value::Int(input.chars().count() as i64))
+}
+
+fn builtin_intl_get_error_message(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("intl_get_error_message", &args, 0)?;
+    Ok(Value::string("U_ZERO_ERROR"))
+}
+
+pub fn primary_language(locale: &str) -> String {
+    let locale = locale.split('@').next().unwrap_or(locale);
+    let subtags = locale.split(['-', '_']).collect::<Vec<_>>();
+    if subtags.len() >= 3 && subtags[0].eq_ignore_ascii_case("zh") && subtags[1] == "min" {
+        return "zh".to_owned();
+    }
+    if subtags.len() >= 2
+        && matches!(subtags[0].to_ascii_lowercase().as_str(), "i" | "zh" | "sgn")
+        && subtags[1].chars().all(|ch| ch.is_ascii_lowercase())
+    {
+        return format!("{}-{}", subtags[0], subtags[1]).to_ascii_lowercase();
+    }
+    subtags
+        .first()
+        .copied()
+        .unwrap_or(locale)
+        .to_ascii_lowercase()
+}
+
+fn builtin_locale_get_primary_language(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("locale_get_primary_language", &args, 1)?;
+    let locale = utf8_string_arg("locale_get_primary_language", &args[0])?;
+    Ok(Value::string(primary_language(&locale)))
 }
 
 fn builtin_intl_get_error_code(
