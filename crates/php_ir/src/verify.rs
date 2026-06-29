@@ -7,7 +7,12 @@ use crate::instruction::{Instruction, InstructionKind, IrCallArg, Terminator, Te
 use crate::module::{IR_VERSION, IrUnit};
 use crate::operand::Operand;
 use crate::source_map::IrSpan;
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticLocation, DiagnosticPhase, DiagnosticSeverity,
+    DiagnosticSpan,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Stable verifier error code.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,6 +95,62 @@ impl VerificationError {
     pub const fn diagnostic_id(&self) -> &'static str {
         self.code.diagnostic_id()
     }
+
+    /// Converts this verifier error to the shared diagnostic envelope.
+    #[must_use]
+    pub fn to_diagnostic_envelope(
+        &self,
+        context: &VerificationDiagnosticContext,
+    ) -> DiagnosticEnvelope {
+        let mut metadata = BTreeMap::new();
+        if let Some(function) = context.function {
+            metadata.insert("function_id".to_string(), function.raw().to_string());
+        }
+        if let Some(block) = context.block {
+            metadata.insert("block_id".to_string(), block.raw().to_string());
+        }
+        if let Some(instruction) = context.instruction {
+            metadata.insert("instruction_id".to_string(), instruction.raw().to_string());
+        }
+        if let Some(span) = context.source_span {
+            metadata.insert("file_id".to_string(), span.file.raw().to_string());
+        }
+
+        let envelope = DiagnosticEnvelope::new(
+            self.diagnostic_id(),
+            DiagnosticLayer::ir(),
+            DiagnosticPhase::new("verify"),
+            DiagnosticSeverity::Error,
+            self.message.clone(),
+        );
+        let envelope = if let Some(span) = context.source_span {
+            envelope.with_location(DiagnosticLocation::new(
+                context.source_path.as_deref(),
+                context.source_id.as_deref(),
+                Some(DiagnosticSpan::new(span.start as usize, span.end as usize)),
+            ))
+        } else {
+            envelope
+        };
+        envelope.with_context(metadata)
+    }
+}
+
+/// Optional source-map context for an IR verifier error.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VerificationDiagnosticContext {
+    /// Source path, when a verifier error can be mapped back to a file.
+    pub source_path: Option<String>,
+    /// Stable source ID, when available.
+    pub source_id: Option<String>,
+    /// Function that owns the failing IR.
+    pub function: Option<crate::ids::FunctionId>,
+    /// Basic block that owns the failing IR.
+    pub block: Option<BlockId>,
+    /// Instruction associated with the failure.
+    pub instruction: Option<InstrId>,
+    /// Source span associated with the failure.
+    pub source_span: Option<IrSpan>,
 }
 
 /// Verifies basic IR invariants.
@@ -1694,6 +1755,34 @@ mod tests {
             },
         });
         assert_has_error(&unit, VerificationErrorCode::InvalidCallArgMetadata);
+    }
+
+    #[test]
+    fn verifier_failure_has_shared_envelope_context() {
+        let error = VerificationError {
+            code: VerificationErrorCode::MissingTerminator,
+            message: "block 2 is missing a terminator".to_string(),
+        };
+        let context = VerificationDiagnosticContext {
+            source_path: Some("verify.php".to_string()),
+            source_id: Some("file:0".to_string()),
+            function: Some(crate::ids::FunctionId::new(1)),
+            block: Some(BlockId::new(2)),
+            instruction: Some(InstrId::new(3)),
+            source_span: Some(IrSpan::new(FileId::new(0), 20, 24)),
+        };
+
+        let envelope = error.to_diagnostic_envelope(&context);
+        let json: serde_json::Value =
+            serde_json::from_str(&envelope.compact_json().expect("json")).expect("parse json");
+
+        assert_eq!(json["code"], "E_PHP_IR_VERIFY_MISSING_TERMINATOR");
+        assert_eq!(json["layer"], "ir");
+        assert_eq!(json["phase"], "verify");
+        assert_eq!(json["location"]["path"], "verify.php");
+        assert_eq!(json["context"]["function_id"], "1");
+        assert_eq!(json["context"]["block_id"], "2");
+        assert_eq!(json["context"]["instruction_id"], "3");
     }
 
     fn assert_has_error(unit: &IrUnit, code: VerificationErrorCode) {

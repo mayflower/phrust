@@ -68,6 +68,20 @@ impl Parse {
         &self.diagnostics
     }
 
+    /// Returns parser diagnostics as structured diagnostic envelopes.
+    #[must_use]
+    pub fn diagnostic_envelopes(
+        &self,
+        source: Option<&SourceText>,
+        path: Option<&str>,
+    ) -> Vec<php_diagnostics::DiagnosticEnvelope> {
+        let source_id = self.source_id().map(SourceId::as_str);
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.to_diagnostic_envelope(source, source_id, path))
+            .collect()
+    }
+
     /// Returns the parser context metadata carried by this result.
     #[must_use]
     pub const fn context(&self) -> &ParseContext {
@@ -218,6 +232,8 @@ fn push_reconstructed_text(out: &mut String, node: &SyntaxNode) {
 mod tests {
     use super::{ParseContext, SourceId, parse_source_file, parse_source_file_with_context};
     use crate::ParseDiagnosticId;
+    use php_source::SourceText;
+    use serde_json::Value;
 
     #[test]
     fn stub_parser_roundtrips_valid_source() {
@@ -421,6 +437,57 @@ mod tests {
                 diagnostic.expected
             );
         }
+    }
+
+    #[test]
+    fn parser_unexpected_token_diagnostic_has_structured_envelope() {
+        let source = SourceText::new("<?php function () {}");
+        let parse = parse_source_file_with_context(
+            source.as_str(),
+            ParseContext::new().with_source_id(SourceId::new("unit-test-source")),
+        );
+        let diagnostic = parse
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.id == ParseDiagnosticId::ExpectedIdentifier)
+            .expect("expected identifier diagnostic");
+        let envelope = diagnostic.to_diagnostic_envelope(
+            Some(&source),
+            parse.source_id().map(SourceId::as_str),
+            Some("parse.php"),
+        );
+        let json = envelope.compact_json().expect("diagnostic json renders");
+        let decoded: Value = serde_json::from_str(&json).expect("valid diagnostic json");
+
+        assert_eq!(decoded["code"], "E_PHP_PARSE_EXPECTED_IDENTIFIER");
+        assert_eq!(decoded["legacy_id"], "expected_identifier");
+        assert_eq!(decoded["layer"], "parser");
+        assert_eq!(decoded["phase"], "parse");
+        assert_eq!(decoded["location"]["path"], "parse.php");
+        assert_eq!(decoded["location"]["source_id"], "unit-test-source");
+        assert_eq!(decoded["context"]["expected"], "T_STRING");
+        assert_eq!(decoded["suggestion"], "insert a valid identifier or name");
+    }
+
+    #[test]
+    fn parse_result_exports_diagnostic_envelopes_with_source_id() {
+        let source = SourceText::new("<?php echo ;");
+        let parse = parse_source_file_with_context(
+            source.as_str(),
+            ParseContext::new().with_source_id(SourceId::new("envelope-source")),
+        );
+        let envelopes = parse.diagnostic_envelopes(Some(&source), Some("echo.php"));
+
+        assert_eq!(envelopes.len(), parse.diagnostics().len());
+        assert_eq!(envelopes[0].code, "E_PHP_PARSE_EXPECTED_EXPRESSION");
+        assert_eq!(
+            envelopes[0]
+                .location
+                .as_ref()
+                .and_then(|location| location.source_id.as_deref()),
+            Some("envelope-source")
+        );
+        assert!(envelopes[0].text_line().contains("expected=expression"));
     }
 
     #[test]

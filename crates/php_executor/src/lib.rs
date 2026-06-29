@@ -22,6 +22,7 @@ mod request;
 pub use cache::{
     CompiledScriptCache, CompiledScriptCacheLookup, CompiledScriptCacheStats, PhpScriptCacheInput,
 };
+pub use diagnostics::{render_diagnostic_envelope, usage_diagnostic, write_diagnostic_envelope};
 pub use engine_compat::{CliIniOptions, EngineInput, execute_php, read_script};
 pub use executor::{CompiledPhpScript, PhpExecutor};
 pub use input::{

@@ -1,6 +1,9 @@
 //! Local include/require loader for the runtime VM MVP.
 
 use crate::compiled_unit::CompiledUnit;
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity, DiagnosticSuggestion,
+};
 use php_optimizer::{OptimizationLevel, PassContext, PassPipeline};
 use php_runtime::{FilesystemCapabilities, phar};
 use std::collections::{HashMap, HashSet};
@@ -323,6 +326,66 @@ impl IncludeLoader {
         &self.allowed_roots
     }
 
+    /// Converts an include/require error string to the shared diagnostic envelope.
+    #[must_use]
+    pub fn include_failure_diagnostic(
+        &self,
+        error: &str,
+        path: &str,
+        including_file: Option<&Path>,
+        include_path: &[PathBuf],
+        cwd: Option<&Path>,
+        cache_used: bool,
+    ) -> DiagnosticEnvelope {
+        let code = error
+            .split_once(':')
+            .map_or("E_PHP_VM_INCLUDE_ERROR", |(code, _)| code);
+        let mut context = HashMap::new();
+        context.insert("path".to_string(), path.to_string());
+        context.insert("cache_used".to_string(), cache_used.to_string());
+        if let Some(including_file) = including_file {
+            context.insert(
+                "including_file".to_string(),
+                including_file.display().to_string(),
+            );
+        }
+        if let Some(cwd) = cwd {
+            context.insert("cwd".to_string(), cwd.display().to_string());
+        }
+        if !include_path.is_empty() {
+            context.insert(
+                "include_path".to_string(),
+                include_path
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+        }
+        if !self.allowed_roots.is_empty() {
+            context.insert(
+                "allowed_roots".to_string(),
+                self.allowed_roots
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+        }
+
+        let mut envelope = DiagnosticEnvelope::new(
+            code,
+            DiagnosticLayer::vm(),
+            DiagnosticPhase::new("include"),
+            DiagnosticSeverity::FatalError,
+            error.to_string(),
+        )
+        .with_context(context.into_iter().collect());
+        envelope.suggestion = Some(DiagnosticSuggestion::new(include_error_suggestion(code)));
+        envelope.php_visible = true;
+        envelope
+    }
+
     /// Loads a file after resolving it against the including file directory and
     /// checking that the canonical path remains within an allowed root.
     pub fn load(&self, including_file: Option<&Path>, path: &str) -> Result<LoadedInclude, String> {
@@ -478,6 +541,27 @@ impl IncludeLoader {
             canonical_path: PathBuf::from(path),
             source,
         })
+    }
+}
+
+fn include_error_suggestion(code: &str) -> &'static str {
+    match code {
+        "E_PHP_VM_INCLUDE_DISABLED" => {
+            "configure an allowed include root before executing include or require"
+        }
+        "E_PHP_VM_INCLUDE_UNSUPPORTED_SCHEME" => {
+            "use a local path or phar URI supported by the include loader"
+        }
+        "E_PHP_VM_INCLUDE_MISSING" => {
+            "check the requested path, current working directory, and include_path entries"
+        }
+        "E_PHP_VM_INCLUDE_OUTSIDE_ROOT" => {
+            "add the canonical parent directory to the allowed include roots"
+        }
+        "E_PHP_VM_INCLUDE_COMPILE_ERROR" => {
+            "inspect the included file compile diagnostic and source span"
+        }
+        _ => "inspect the include path and loader configuration",
     }
 }
 
@@ -702,6 +786,39 @@ mod tests {
         assert_eq!(stats.compile_hits, 0);
         assert!(binary_add_count(&baseline) > 0);
         assert_eq!(binary_add_count(&optimized), 0);
+    }
+
+    #[test]
+    fn include_failure_has_shared_envelope_context() {
+        let fixture = IncludeCacheFixture::new("include-diagnostic");
+        let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
+        let error = loader
+            .resolve_with_include_path(None, "missing.php", &[], Some(&fixture.root))
+            .expect_err("missing include");
+
+        let envelope = loader.include_failure_diagnostic(
+            &error,
+            "missing.php",
+            None,
+            &[],
+            Some(&fixture.root),
+            true,
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&envelope.compact_json().expect("json")).expect("parse json");
+
+        assert_eq!(json["code"], "E_PHP_VM_INCLUDE_MISSING");
+        assert_eq!(json["layer"], "vm");
+        assert_eq!(json["phase"], "include");
+        assert_eq!(json["context"]["path"], "missing.php");
+        assert_eq!(json["context"]["cache_used"], "true");
+        assert!(
+            json["context"]["allowed_roots"]
+                .as_str()
+                .unwrap()
+                .contains("include-diagnostic")
+        );
+        assert_eq!(json["php_visible"], true);
     }
 
     #[test]

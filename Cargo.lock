@@ -1293,9 +1293,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "php_diagnostics"
+version = "0.0.0"
+dependencies = [
+ "php_source",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "php_executor"
 version = "0.0.0"
 dependencies = [
+ "php_diagnostics",
  "php_ir",
  "php_optimizer",
  "php_runtime",
@@ -1315,6 +1325,7 @@ dependencies = [
 name = "php_ir"
 version = "0.0.0"
 dependencies = [
+ "php_diagnostics",
  "php_semantics",
  "php_source",
  "php_std",
@@ -1339,7 +1350,9 @@ dependencies = [
 name = "php_lexer"
 version = "0.1.0"
 dependencies = [
+ "php_diagnostics",
  "php_source",
+ "serde_json",
 ]
 
 [[package]]
@@ -1353,7 +1366,9 @@ dependencies = [
 name = "php_optimizer"
 version = "0.0.0"
 dependencies = [
+ "php_diagnostics",
  "php_ir",
+ "serde_json",
 ]
 
 [[package]]
@@ -1396,6 +1411,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pcre2",
+ "php_diagnostics",
  "php_lexer",
  "php_testkit",
  "rusqlite",
@@ -1409,8 +1425,10 @@ name = "php_semantics"
 version = "0.1.0"
 dependencies = [
  "php_ast",
+ "php_diagnostics",
  "php_source",
  "php_syntax",
+ "serde_json",
 ]
 
 [[package]]
@@ -1423,9 +1441,11 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "php_diagnostics",
  "php_executor",
  "php_runtime",
  "rustls-pki-types",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -1452,8 +1472,10 @@ dependencies = [
 name = "php_syntax"
 version = "0.1.0"
 dependencies = [
+ "php_diagnostics",
  "php_lexer",
  "php_source",
+ "serde_json",
 ]
 
 [[package]]
@@ -1468,6 +1490,7 @@ dependencies = [
 name = "php_vm"
 version = "0.0.0"
 dependencies = [
+ "php_diagnostics",
  "php_ir",
  "php_jit",
  "php_optimizer",
@@ -1476,6 +1499,7 @@ dependencies = [
  "php_source",
  "php_std",
  "php_testkit",
+ "serde_json",
  "zip",
 ]
 
@@ -1484,6 +1508,7 @@ name = "php_vm_cli"
 version = "0.0.0"
 dependencies = [
  "php_bytecode_cache",
+ "php_diagnostics",
  "php_executor",
  "php_ir",
  "php_jit",

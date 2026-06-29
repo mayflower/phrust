@@ -164,6 +164,9 @@ pub(super) struct RunOptions<'a> {
     pub(super) path: &'a str,
     pub(super) script_args: Vec<String>,
     pub(super) env: Vec<(String, String)>,
+    pub(super) debug: bool,
+    pub(super) debug_log: Option<String>,
+    pub(super) error_format: DiagnosticOutputFormat,
     pub(super) trace: bool,
     pub(super) trace_runtime: bool,
     pub(super) trace_includes: bool,
@@ -441,6 +444,11 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
     let default_options = PhpExecutorOptions::managed_fast_runtime();
     let mut path = None;
     let mut env = Vec::new();
+    let mut debug = debug_enabled_from_env("PHRUST_DEBUG");
+    let mut debug_log = std::env::var("PHRUST_DEBUG_LOG")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut error_format = error_format_from_env("PHRUST_ERROR_FORMAT");
     let mut trace = false;
     let mut trace_runtime = false;
     let mut counters_json = None;
@@ -466,6 +474,27 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--debug" => debug = true,
+            "--debug-log" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --debug-log requires <path>".to_string());
+                };
+                debug_log = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--debug-log=") => {
+                debug_log = Some(value.to_owned());
+            }
+            "--error-format" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --error-format requires text or json".to_string());
+                };
+                error_format = parse_diagnostic_output_format(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--error-format=") => {
+                error_format = parse_diagnostic_output_format(value)?;
+            }
             "--trace" => trace = true,
             "--trace-runtime" => trace_runtime = true,
             "--engine-preset" => {
@@ -817,6 +846,9 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
                     path,
                     script_args: args[index + 1..].to_vec(),
                     env,
+                    debug,
+                    debug_log,
+                    error_format,
                     trace,
                     trace_runtime,
                     trace_includes,
@@ -858,6 +890,9 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
         path,
         script_args: Vec::new(),
         env,
+        debug,
+        debug_log,
+        error_format,
         trace,
         trace_runtime,
         trace_includes,

@@ -43,7 +43,9 @@ pub use rule_selection::{
     RuleId, RuleKind, RuleOperandConstraint, RuleSelection, RuleSelectionReport,
 };
 pub use source_map::{IrSourceMap, IrSourceMapEntry, IrSourceMapTarget, IrSpan};
-pub use verify::{VerificationError, VerificationErrorCode, verify_unit};
+pub use verify::{
+    VerificationDiagnosticContext, VerificationError, VerificationErrorCode, verify_unit,
+};
 
 #[cfg(test)]
 mod tests {

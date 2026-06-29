@@ -1,4 +1,6 @@
-use crate::diagnostics::{execution_output_from_vm, render_frontend_diagnostics};
+use crate::diagnostics::{
+    execution_output_from_vm, frontend_diagnostic_envelopes, render_frontend_diagnostics,
+};
 use crate::input::{
     PhpCompileInput, PhpExecutionError, PhpExecutionInput, PhpExecutionOutput, PhpExecutionStatus,
     PhpExecutorOptions, PhpRequestExecutionInput,
@@ -47,6 +49,7 @@ impl PhpExecutor {
             return Err(PhpExecutionError::Compile(Box::new(PhpExecutionOutput {
                 stdout: Vec::new(),
                 diagnostics_text,
+                diagnostics: frontend_diagnostic_envelopes(&pipeline),
                 status: PhpExecutionStatus::CompileError,
                 runtime_diagnostics: Vec::new(),
                 http_response: RuntimeHttpResponseState::default(),

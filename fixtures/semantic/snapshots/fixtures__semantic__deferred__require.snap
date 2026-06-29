@@ -5,7 +5,7 @@ diagnostics:
   - id: N_PHP_RUNTIME_CHECK_DEFERRED
     severity: note
     phase: hir_lowering
-    span: 6..22
+    span: 6..50
 symbols:
   - function deferred_after_require
 hir_summary:

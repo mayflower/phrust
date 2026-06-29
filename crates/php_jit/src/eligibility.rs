@@ -1667,6 +1667,15 @@ fn check_terminator(
                 check_operand(*value, block, u32::MAX, constants, rejected, unknown);
             }
         }
+        TerminatorKind::Exit { value } => {
+            rejected.push(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_EXIT_TERMINATOR",
+                "exit terminator changes request control flow and is outside the JIT subset",
+            ));
+            if let Some(value) = value {
+                check_operand(*value, block, u32::MAX, constants, rejected, unknown);
+            }
+        }
     }
 }
 

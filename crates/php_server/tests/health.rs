@@ -416,6 +416,90 @@ fn server_writes_compact_access_log_line() {
 }
 
 #[test]
+fn server_debug_log_records_request_timeline_and_redacts_secrets() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let debug_dir = temp_docroot();
+    let debug_log = debug_dir.join("server-debug.jsonl");
+    let debug_log_arg = debug_log.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--debug",
+            "--error-format",
+            "json",
+            "--debug-log",
+            &debug_log_arg,
+        ],
+    );
+
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_headers(
+        &address,
+        "GET",
+        "/hello.php?token=secret-token",
+        &[
+            ("Authorization", "Bearer secret-token"),
+            ("Cookie", "PHPSESSID=session-secret"),
+        ],
+        "",
+    );
+
+    stop_child(child);
+    let log = fs::read_to_string(&debug_log).expect("read debug log");
+    fs::remove_dir_all(debug_dir).expect("remove debug temp dir");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(log.contains("\"request_id\":\"req-00000001\""), "{log}");
+    assert!(log.contains("D_PHRUST_SERVER_REQUEST_ACCEPTED"), "{log}");
+    assert!(log.contains("D_PHRUST_SERVER_ROUTE_RESOLVED"), "{log}");
+    assert!(log.contains("D_PHRUST_SERVER_SCRIPT_CACHE_END"), "{log}");
+    assert!(log.contains("D_PHRUST_SERVER_EXECUTE_END"), "{log}");
+    assert!(log.contains("D_PHRUST_SERVER_RESPONSE"), "{log}");
+    assert!(log.contains("\"cache_hit\":\"false\""), "{log}");
+    assert!(log.contains("\"status\":\"200\""), "{log}");
+    assert!(!log.contains("Bearer secret-token"), "{log}");
+    assert!(!log.contains("session-secret"), "{log}");
+    assert!(!log.contains("secret-token"), "{log}");
+
+    for line in log.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).expect("debug JSON line");
+        for key in [
+            "kind",
+            "schema_version",
+            "code",
+            "layer",
+            "phase",
+            "message",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key} in {line}");
+        }
+        assert_eq!(value["kind"], "debug_event");
+    }
+}
+
+#[test]
+fn server_debug_off_does_not_emit_request_timeline() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let debug_dir = temp_docroot();
+    let debug_log = debug_dir.join("server-debug.jsonl");
+    let debug_log_arg = debug_log.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--debug-log", &debug_log_arg]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/hello.php");
+
+    stop_child(child);
+    let log_exists = debug_log.exists();
+    fs::remove_dir_all(debug_dir).expect("remove debug temp dir");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        !log_exists,
+        "debug log should not be written unless --debug is set"
+    );
+}
+
+#[test]
 fn server_executes_php_script() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);

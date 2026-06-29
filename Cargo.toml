@@ -4,6 +4,7 @@ exclude = ["crates/php_bench"]
 members = [
     "crates/php_ast",
     "crates/php_bytecode_cache",
+    "crates/php_diagnostics",
     "crates/php_executor",
     "crates/php_frontend_cli",
     "crates/php_ir",

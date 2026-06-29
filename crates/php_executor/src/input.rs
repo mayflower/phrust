@@ -1,3 +1,4 @@
+use php_diagnostics::DiagnosticEnvelope;
 use php_optimizer::OptimizationLevel;
 use php_runtime::UploadRegistry;
 use php_runtime::api::{
@@ -58,6 +59,7 @@ pub struct PhpRequestExecutionInput {
 pub struct PhpExecutionOutput {
     pub stdout: Vec<u8>,
     pub diagnostics_text: String,
+    pub diagnostics: Vec<DiagnosticEnvelope>,
     pub status: PhpExecutionStatus,
     pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
     pub http_response: RuntimeHttpResponseState,
@@ -73,6 +75,7 @@ impl PhpExecutionOutput {
         Self {
             stdout: Vec::new(),
             diagnostics_text: error,
+            diagnostics: Vec::new(),
             status: PhpExecutionStatus::Fatal,
             runtime_diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),

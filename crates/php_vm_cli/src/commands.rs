@@ -3,11 +3,18 @@ use php_bytecode_cache::{
     CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
     PHP_TARGET_VERSION,
 };
+use php_diagnostics::{
+    DebugEvent, DiagnosticEnvelope, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase,
+};
 use php_executor::{
     EngineProfileName, PhpCompileInput, PhpExecutionError, PhpExecutionOutput, PhpExecutionStatus,
-    PhpExecutor, PhpExecutorOptions, PhpRequestExecutionInput,
+    PhpExecutor, PhpExecutorOptions, PhpRequestExecutionInput, usage_diagnostic,
+    write_diagnostic_envelope,
 };
-use php_ir::{LoweringOptions, lower_frontend_result, module::IrUnit, verify_unit};
+use php_ir::{
+    LoweringOptions, VerificationDiagnosticContext, lower::LoweringDiagnosticContext,
+    lower_frontend_result, module::IrUnit, verify_unit,
+};
 use php_optimizer::{OptimizationLevel, OptimizationReport, PassContext, PassPipeline};
 use php_runtime::api::{
     ExitStatus, FilesystemCapabilities, RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload,
@@ -31,6 +38,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -56,7 +64,9 @@ where
     match run_inner(args, stdout, stderr) {
         Ok(code) => code,
         Err(error) => {
-            let _ = writeln!(stderr, "{error}");
+            let format = error_format_from_env("PHRUST_ERROR_FORMAT");
+            let diagnostic = cli_usage_diagnostic_from_message(&error);
+            let _ = write_diagnostic_envelope(stderr, &diagnostic, format);
             EXIT_USAGE
         }
     }
@@ -626,6 +636,30 @@ where
     E: Write,
 {
     let mut run_options = parse_run_args(args)?;
+    if run_options.debug {
+        run_options.trace = true;
+        run_options.trace_runtime = true;
+        run_options.trace_includes = true;
+        emit_debug_event(
+            stderr,
+            &run_options,
+            "D_PHRUST_CLI_PARSE_START",
+            "parse",
+            "CLI parse started",
+            BTreeMap::from([("command".to_string(), "run".to_string())]),
+        )?;
+        emit_debug_event(
+            stderr,
+            &run_options,
+            "D_PHRUST_CLI_PARSE_END",
+            "parse",
+            "CLI parse completed",
+            BTreeMap::from([
+                ("command".to_string(), "run".to_string()),
+                ("path".to_string(), run_options.path.to_string()),
+            ]),
+        )?;
+    }
     if run_options.region_profile_json.is_none() {
         run_options.region_profile_json = region_profile_json_from_env();
     }
@@ -668,9 +702,32 @@ where
             if run_options.bytecode_cache.stats {
                 write_cache_stats_json(stderr, &cache_stats)?;
             }
-            write_frontend_diagnostics(stderr, &pipeline)?;
+            write_frontend_diagnostics_formatted(stderr, &pipeline, run_options.error_format)?;
             return Ok(EXIT_COMPILE_ERROR);
         }
+        emit_debug_event(
+            stderr,
+            &run_options,
+            "D_PHRUST_IR_LOWER_END",
+            "lower",
+            "IR lowering completed",
+            BTreeMap::from([
+                (
+                    "lowering_diagnostic_count".to_string(),
+                    pipeline.lowering.diagnostics.len().to_string(),
+                ),
+                (
+                    "verification_error_count".to_string(),
+                    pipeline
+                        .lowering
+                        .verification
+                        .as_ref()
+                        .err()
+                        .map_or(0, Vec::len)
+                        .to_string(),
+                ),
+            ]),
+        )?;
         if let Some(context) = cache_context.as_ref()
             && run_options.bytecode_cache.mode.can_write()
         {
@@ -716,13 +773,35 @@ where
         .region_profile_json
         .as_ref()
         .map(|_| unit.clone());
+    emit_debug_event(
+        stderr,
+        &run_options,
+        "D_PHRUST_VM_EXECUTE_START",
+        "execute",
+        "VM execution started",
+        BTreeMap::from([("path".to_string(), path.to_string())]),
+    )?;
     let result = vm.execute(unit);
+    emit_debug_event(
+        stderr,
+        &run_options,
+        "D_PHRUST_VM_EXECUTE_END",
+        "execute",
+        "VM execution completed",
+        BTreeMap::from([
+            ("status".to_string(), result.status.to_string()),
+            (
+                "runtime_diagnostic_count".to_string(),
+                result.diagnostics.len().to_string(),
+            ),
+        ]),
+    )?;
     stdout
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
-    write_runtime_diagnostics(stderr, path, &result)?;
+    write_runtime_diagnostics(stderr, path, &result, run_options.error_format)?;
     if run_options.trace || run_options.trace_runtime || run_options.trace_includes {
-        write_trace(stderr, &result.trace)?;
+        write_trace(stderr, &result.trace, &run_options)?;
     }
     if let Some(path) = &run_options.counters_json {
         let Some(counters) = &result.counters else {
@@ -796,7 +875,26 @@ where
         || run_options.jit_stats.is_json()
         || run_options.region_profile_json.is_some();
     let bytecode_layout_profile = load_bytecode_layout_profile(run_options)?;
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_SOURCE_READ_START",
+        "source_read",
+        "source read started",
+        BTreeMap::from([("path".to_string(), path.to_string())]),
+    )?;
     let (source, real_path, source_path) = php_executor::read_script(Path::new(path))?;
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_SOURCE_READ_END",
+        "source_read",
+        "source read completed",
+        BTreeMap::from([
+            ("path".to_string(), source_path.clone()),
+            ("bytes".to_string(), source.len().to_string()),
+        ]),
+    )?;
     let executor = PhpExecutor::with_options(PhpExecutorOptions {
         optimization_level: run_options.opt_level,
         vm_options: VmOptions {
@@ -819,6 +917,14 @@ where
             ..VmOptions::default()
         },
     });
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_FRONTEND_ANALYZE_START",
+        "frontend",
+        "frontend analysis started",
+        BTreeMap::from([("path".to_string(), source_path.clone())]),
+    )?;
     let compiled = match executor.compile_source(PhpCompileInput {
         source,
         source_path,
@@ -829,17 +935,42 @@ where
             if run_options.bytecode_cache.stats {
                 write_cache_stats_json(stderr, &cache_stats)?;
             }
-            stderr
-                .write_all(output.diagnostics_text.as_bytes())
-                .map_err(|error| error.to_string())?;
+            write_execution_output_diagnostics(stderr, path, &output, run_options.error_format)?;
             return Ok(EXIT_COMPILE_ERROR);
         }
         Err(PhpExecutionError::Engine(error)) => return Err(error),
     };
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_FRONTEND_ANALYZE_END",
+        "frontend",
+        "frontend analysis completed",
+        BTreeMap::from([("status".to_string(), "ok".to_string())]),
+    )?;
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_OPTIMIZER_END",
+        "optimize",
+        "optimization completed",
+        BTreeMap::from([(
+            "optimization_level".to_string(),
+            run_options.opt_level.as_str().to_string(),
+        )]),
+    )?;
     let jit_eligibility_json = build_jit_eligibility_json(compiled.ir_unit(), run_options.jit);
     let persistent_feedback = load_persistent_feedback(run_options, path, compiled.ir_unit())?;
     let runtime_context = RuntimeContext::controlled_cli(path, run_options.script_args.clone())
         .with_env(run_options.env.clone());
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_VM_EXECUTE_START",
+        "execute",
+        "VM execution started",
+        BTreeMap::from([("path".to_string(), path.to_string())]),
+    )?;
     let output = executor.execute_compiled(
         &compiled,
         PhpRequestExecutionInput {
@@ -850,18 +981,38 @@ where
             collect_counters,
         },
     );
+    emit_debug_event(
+        stderr,
+        run_options,
+        "D_PHRUST_VM_EXECUTE_END",
+        "execute",
+        "VM execution completed",
+        BTreeMap::from([
+            ("status".to_string(), format!("{:?}", output.status)),
+            (
+                "runtime_diagnostic_count".to_string(),
+                output.runtime_diagnostics.len().to_string(),
+            ),
+        ]),
+    )?;
     stdout
         .write_all(&output.stdout)
         .map_err(|error| error.to_string())?;
     if output.status == PhpExecutionStatus::Success {
-        write_executor_success_runtime_diagnostics(stderr, path, &output)?;
-    } else if !output.diagnostics_text.is_empty() {
-        stderr
-            .write_all(output.diagnostics_text.as_bytes())
-            .map_err(|error| error.to_string())?;
+        write_executor_success_runtime_diagnostics(
+            stderr,
+            path,
+            &output,
+            run_options.error_format,
+        )?;
+    } else if !output.diagnostics_text.is_empty()
+        || !output.diagnostics.is_empty()
+        || !output.runtime_diagnostics.is_empty()
+    {
+        write_execution_output_diagnostics(stderr, path, &output, run_options.error_format)?;
     }
     if run_options.trace || run_options.trace_runtime || run_options.trace_includes {
-        write_trace(stderr, &output.trace)?;
+        write_trace(stderr, &output.trace, run_options)?;
     }
     if let Some(path) = &run_options.counters_json {
         let Some(counters) = &output.counters else {
@@ -906,18 +1057,26 @@ fn write_executor_success_runtime_diagnostics<W: Write>(
     stderr: &mut W,
     path: &str,
     output: &PhpExecutionOutput,
+    format: DiagnosticOutputFormat,
 ) -> Result<(), String> {
     let php_output = String::from_utf8_lossy(&output.stdout);
     for diagnostic in &output.runtime_diagnostics {
         if php_output.contains(diagnostic.message()) {
             continue;
         }
-        writeln!(
-            stderr,
-            "{path}: runtime-diagnostic: {}",
-            diagnostic.to_json()
-        )
-        .map_err(|error| error.to_string())?;
+        match format {
+            DiagnosticOutputFormat::Text => {
+                writeln!(
+                    stderr,
+                    "{path}: runtime-diagnostic: {}",
+                    diagnostic.to_json()
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            DiagnosticOutputFormat::Json => {
+                write_diagnostic_envelope(stderr, &diagnostic.to_diagnostic_envelope(), format)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1133,7 +1292,7 @@ fn compile_pipeline_with_optimization(
     path: &str,
     opt_level: OptimizationLevel,
 ) -> Result<Pipeline, String> {
-    let source = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+    let source = read_source_to_string(path)?;
     let frontend = analyze_source(&source);
     let source_path = fs::canonicalize(path)
         .map(|path| path.to_string_lossy().into_owned())
@@ -1177,8 +1336,26 @@ fn compile_pipeline(path: &str) -> Result<Pipeline, String> {
     compile_pipeline_with_optimization(path, OptimizationLevel::O0)
 }
 
+fn read_source_to_string(path: &str) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|error| source_io_error("read source file", path, &error))
+}
+
+fn read_source_bytes(path: &str) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|error| source_io_error("read source bytes", path, &error))
+}
+
+fn source_io_error(operation: &str, path: &str, error: &std::io::Error) -> String {
+    let cwd = env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|cwd_error| format!("<unavailable: {cwd_error}>"));
+    format!(
+        "{operation} failed for path `{path}` from cwd `{cwd}`: {error}; suggestion: check that the file exists and is readable"
+    )
+}
+
 fn include_loader_for(path: &str) -> Result<IncludeLoader, String> {
-    let path = fs::canonicalize(path).map_err(|error| format!("{path}: {error}"))?;
+    let path = fs::canonicalize(path)
+        .map_err(|error| source_io_error("canonicalize source path", path, &error))?;
     let root = path
         .parent()
         .ok_or_else(|| format!("{}: missing parent directory", path.display()))?;
@@ -1371,28 +1548,133 @@ fn write_runtime_diagnostics<W: Write>(
     stderr: &mut W,
     path: &str,
     result: &VmResult,
+    format: DiagnosticOutputFormat,
 ) -> Result<(), String> {
     let php_output = result.output.to_string_lossy();
     for diagnostic in &result.diagnostics {
         if result.status.is_success() && php_output.contains(diagnostic.message()) {
             continue;
         }
-        writeln!(
-            stderr,
-            "{path}: runtime-diagnostic: {}",
-            diagnostic.to_json()
-        )
-        .map_err(|error| error.to_string())?;
+        match format {
+            DiagnosticOutputFormat::Text => {
+                writeln!(
+                    stderr,
+                    "{path}: runtime-diagnostic: {}",
+                    diagnostic.to_json()
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            DiagnosticOutputFormat::Json => {
+                write_diagnostic_envelope(stderr, &diagnostic.to_diagnostic_envelope(), format)?;
+            }
+        }
     }
     Ok(())
 }
 
-fn write_trace<W: Write>(stderr: &mut W, trace: &[String]) -> Result<(), String> {
+fn write_trace<W: Write>(
+    stderr: &mut W,
+    trace: &[String],
+    options: &RunOptions<'_>,
+) -> Result<(), String> {
+    if options.debug {
+        for (index, line) in trace.iter().enumerate() {
+            emit_debug_event(
+                stderr,
+                options,
+                "D_PHRUST_VM_TRACE",
+                "execute",
+                "VM trace event",
+                BTreeMap::from([
+                    ("index".to_string(), index.to_string()),
+                    ("trace".to_string(), line.clone()),
+                ]),
+            )?;
+        }
+        return Ok(());
+    }
     writeln!(stderr, "vm-trace:").map_err(|error| error.to_string())?;
     for line in trace {
         writeln!(stderr, "  {line}").map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn frontend_diagnostic_envelopes(pipeline: &Pipeline) -> Vec<DiagnosticEnvelope> {
+    let source = SourceText::new(&pipeline.source);
+    let mut diagnostics = Vec::new();
+    for diagnostic in pipeline.frontend.parser_diagnostics() {
+        diagnostics.push(diagnostic.to_diagnostic_envelope(
+            Some(&source),
+            None,
+            Some(&pipeline.path),
+        ));
+    }
+    for diagnostic in pipeline.frontend.semantic_diagnostics() {
+        if diagnostic.severity() == Severity::Error {
+            diagnostics.push(diagnostic.to_diagnostic_envelope(
+                Some(&source),
+                None,
+                Some(&pipeline.path),
+            ));
+        }
+    }
+    for diagnostic in &pipeline.lowering.diagnostics {
+        diagnostics.push(
+            diagnostic.to_diagnostic_envelope(
+                Some(&pipeline.path),
+                &LoweringDiagnosticContext::default(),
+            ),
+        );
+    }
+    if let Err(errors) = &pipeline.lowering.verification {
+        let context = VerificationDiagnosticContext {
+            source_path: Some(pipeline.path.clone()),
+            ..VerificationDiagnosticContext::default()
+        };
+        for error in errors {
+            diagnostics.push(error.to_diagnostic_envelope(&context));
+        }
+    }
+    diagnostics
+}
+
+fn write_frontend_diagnostics_formatted<W: Write>(
+    stderr: &mut W,
+    pipeline: &Pipeline,
+    format: DiagnosticOutputFormat,
+) -> Result<(), String> {
+    match format {
+        DiagnosticOutputFormat::Text => write_frontend_diagnostics(stderr, pipeline),
+        DiagnosticOutputFormat::Json => {
+            for diagnostic in frontend_diagnostic_envelopes(pipeline) {
+                write_diagnostic_envelope(stderr, &diagnostic, format)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn write_execution_output_diagnostics<W: Write>(
+    stderr: &mut W,
+    path: &str,
+    output: &PhpExecutionOutput,
+    format: DiagnosticOutputFormat,
+) -> Result<(), String> {
+    match format {
+        DiagnosticOutputFormat::Text => stderr
+            .write_all(output.diagnostics_text.as_bytes())
+            .map_err(|error| error.to_string()),
+        DiagnosticOutputFormat::Json => {
+            if !output.diagnostics.is_empty() {
+                for diagnostic in &output.diagnostics {
+                    write_diagnostic_envelope(stderr, diagnostic, format)?;
+                }
+                return Ok(());
+            }
+            write_executor_success_runtime_diagnostics(stderr, path, output, format)
+        }
+    }
 }
 
 fn write_php_parse_error_line<W: Write>(
@@ -1473,6 +1755,111 @@ fn semantic_diagnostic_is_immediate_php_fatal(id: DiagnosticId) -> bool {
         id,
         DiagnosticId::ThisParameter | DiagnosticId::ThisReassignment
     )
+}
+
+fn debug_enabled_from_env(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn error_format_from_env(name: &str) -> DiagnosticOutputFormat {
+    env::var(name)
+        .ok()
+        .and_then(|value| parse_diagnostic_output_format(&value).ok())
+        .unwrap_or(DiagnosticOutputFormat::Text)
+}
+
+fn parse_diagnostic_output_format(value: &str) -> Result<DiagnosticOutputFormat, String> {
+    match value {
+        "text" => Ok(DiagnosticOutputFormat::Text),
+        "json" | "jsonl" => Ok(DiagnosticOutputFormat::Json),
+        _ => Err(format!(
+            "run --error-format requires text or json; got `{value}`"
+        )),
+    }
+}
+
+fn cli_usage_diagnostic_from_message(message: &str) -> php_diagnostics::DiagnosticEnvelope {
+    let (command, argument, accepted_values, suggestion) = if let Some(command) = message
+        .strip_prefix("unknown php-vm command `")
+        .and_then(|rest| rest.strip_suffix('`'))
+    {
+        (
+            Some("php-vm"),
+            Some(command),
+            Some(
+                "compile, dump-ir, dump-bytecode-patterns, dump-rule-selection, dump-dependency-units, dump-baseline-native-stencil, dump-copy-patch-stencils, dump-mid-tier-plan, dump-cranelift-clif, run, report, compare",
+            ),
+            "run php-vm --help",
+        )
+    } else if message.starts_with("run ") {
+        (
+            Some("php-vm run"),
+            message
+                .split_whitespace()
+                .nth(1)
+                .filter(|value| value.starts_with("--") || *value == "requires"),
+            Some("php-vm run [options] <path.php> [-- args...]"),
+            "run php-vm run --help",
+        )
+    } else {
+        (Some("php-vm"), None, None, "run php-vm --help")
+    };
+
+    usage_diagnostic(message, command, argument, accepted_values, suggestion)
+}
+
+fn emit_debug_event<W: Write>(
+    stderr: &mut W,
+    options: &RunOptions<'_>,
+    code: &str,
+    phase: &str,
+    message: &str,
+    context: BTreeMap<String, String>,
+) -> Result<(), String> {
+    if !options.debug {
+        return Ok(());
+    }
+    let event = DebugEvent::new(
+        code,
+        debug_layer_for_phase(phase),
+        DiagnosticPhase::new(phase),
+        message,
+    )
+    .with_context(context);
+    let rendered = match options.error_format {
+        DiagnosticOutputFormat::Text => {
+            let mut line = event.text_line();
+            line.push('\n');
+            line
+        }
+        DiagnosticOutputFormat::Json => event.json_line().map_err(|error| error.to_string())?,
+    };
+    if let Some(path) = options.debug_log.as_deref() {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("{path}: {error}"))?;
+        file.write_all(rendered.as_bytes())
+            .map_err(|error| format!("{path}: {error}"))
+    } else {
+        stderr
+            .write_all(rendered.as_bytes())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn debug_layer_for_phase(phase: &str) -> DiagnosticLayer {
+    match phase {
+        "parse" => DiagnosticLayer::cli(),
+        "source_read" | "frontend" => DiagnosticLayer::executor(),
+        "lower" => DiagnosticLayer::ir(),
+        "optimize" => DiagnosticLayer::optimizer(),
+        "execute" => DiagnosticLayer::vm(),
+        _ => DiagnosticLayer::executor(),
+    }
 }
 
 mod args;
@@ -1564,7 +1951,7 @@ fn persistent_feedback_context(
     run_options: &RunOptions<'_>,
     unit: &IrUnit,
 ) -> Result<PersistentFeedbackContext, String> {
-    let source = fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+    let source = read_source_bytes(path)?;
     let source_path = fs::canonicalize(path)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
@@ -3266,9 +3653,9 @@ fn diagnostics_text(pipeline: &Pipeline) -> String {
     }
     for diagnostic in pipeline.frontend.semantic_diagnostics() {
         lines.push(format!(
-            "{} {:?} {}",
+            "{} {} {}",
             diagnostic.id().as_str(),
-            diagnostic.severity(),
+            diagnostic.severity().as_str(),
             diagnostic.message()
         ));
     }
@@ -3444,8 +3831,8 @@ fn workspace_relative_path(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, JitStatsMode,
-        OptimizationLevel, PersistentFeedbackOptions, QuickeningMode, cache_file_for,
+        BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, EXIT_USAGE,
+        JitStatsMode, OptimizationLevel, PersistentFeedbackOptions, QuickeningMode, cache_file_for,
         compile_pipeline_with_optimization, parse_dump_dependency_units_args,
         parse_dump_rule_selection_args, parse_run_args, run,
     };
@@ -3458,8 +3845,11 @@ mod tests {
         experimental::InlineCacheMode,
     };
     use serde_json::Value;
-    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::{env, fs};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn parse_json_bytes(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).expect("valid JSON output")
@@ -3477,6 +3867,16 @@ mod tests {
         parse_json_text(line)["bytecode_cache"].clone()
     }
 
+    fn restore_env(name: &str, previous: Option<String>) {
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+    }
+
     #[test]
     fn help_is_available() {
         let mut stdout = Vec::new();
@@ -3486,6 +3886,86 @@ mod tests {
         assert_eq!(code, EXIT_SUCCESS);
         assert!(stderr.is_empty());
         assert!(String::from_utf8(stdout).unwrap().contains("dump-ir"));
+    }
+
+    #[test]
+    fn unknown_command_writes_json_usage_diagnostic_from_env() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var("PHRUST_ERROR_FORMAT").ok();
+        unsafe {
+            env::set_var("PHRUST_ERROR_FORMAT", "json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run(["wat".to_string()], &mut stdout, &mut stderr);
+
+        restore_env("PHRUST_ERROR_FORMAT", previous);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(stdout.is_empty());
+        let json = parse_json_bytes(&stderr);
+        assert_eq!(json["code"], "E_PHRUST_CLI_USAGE");
+        assert_eq!(json["layer"], "cli");
+        assert_eq!(json["context"]["command"], "php-vm");
+        assert_eq!(json["context"]["argument"], "wat");
+    }
+
+    #[test]
+    fn missing_run_path_writes_text_usage_diagnostic() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run(["run".to_string()], &mut stdout, &mut stderr);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("E_PHRUST_CLI_USAGE"));
+        assert!(stderr.contains("run requires <path.php>"));
+        assert!(stderr.contains("php-vm run"));
+    }
+
+    #[test]
+    fn run_debug_writes_timeline_to_stderr_without_changing_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--debug".to_string(),
+                fixture("fixtures/runtime/valid/hello.php"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(String::from_utf8(stdout).unwrap(), "hello runtime\n");
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("D_PHRUST_CLI_PARSE_START"));
+        assert!(stderr.contains("D_PHRUST_SOURCE_READ_START"));
+        assert!(stderr.contains("D_PHRUST_VM_EXECUTE_END"));
+        assert!(stderr.contains("D_PHRUST_VM_TRACE"));
+    }
+
+    #[test]
+    fn run_uses_error_format_env_for_usage_diagnostics() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var("PHRUST_ERROR_FORMAT").ok();
+        unsafe {
+            env::set_var("PHRUST_ERROR_FORMAT", "json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run(["run".to_string()], &mut stdout, &mut stderr);
+
+        restore_env("PHRUST_ERROR_FORMAT", previous);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(stdout.is_empty());
+        let json = parse_json_bytes(&stderr);
+        assert_eq!(json["code"], "E_PHRUST_CLI_USAGE");
+        assert_eq!(json["context"]["command"], "php-vm run");
     }
 
     #[cfg(feature = "jit-cranelift")]

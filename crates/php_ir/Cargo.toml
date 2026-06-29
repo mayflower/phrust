@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
 php_semantics = { path = "../php_semantics", version = "0.1.0" }
 php_source = { path = "../php_source", version = "0.0.0" }
 php_std = { path = "../php_std", version = "0.0.0" }

@@ -5,6 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase,
+    DiagnosticSeverity, DiagnosticSuggestion,
+};
 use php_executor::EngineProfileName;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
@@ -23,6 +27,9 @@ const DEFAULT_SESSION_COOKIE_PATH: &str = "/";
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub docroot: PathBuf,
+    pub debug: bool,
+    pub error_format: DiagnosticOutputFormat,
+    pub debug_log: Option<PathBuf>,
     pub index: String,
     pub front_controller: Option<PathBuf>,
     pub max_body_bytes: usize,
@@ -56,13 +63,30 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigError {
     message: String,
+    diagnostic: Box<DiagnosticEnvelope>,
 }
 
 impl ConfigError {
     fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let mut diagnostic = DiagnosticEnvelope::new(
+            "E_PHRUST_SERVER_CONFIG",
+            DiagnosticLayer::server(),
+            DiagnosticPhase::new("config"),
+            DiagnosticSeverity::Error,
+            message.clone(),
+        );
+        diagnostic.suggestion = Some(DiagnosticSuggestion::new(
+            "run phrust-server --help and check the configured flag or path",
+        ));
         Self {
-            message: message.into(),
+            message,
+            diagnostic: Box::new(diagnostic),
         }
+    }
+
+    pub fn diagnostic(&self) -> &DiagnosticEnvelope {
+        self.diagnostic.as_ref()
     }
 }
 
@@ -83,6 +107,15 @@ impl ServerConfig {
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
+    {
+        Self::parse_from_with_env(args, |name| env::var(name).ok())
+    }
+
+    fn parse_from_with_env<I, S, F>(args: I, env_value: F) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        F: Fn(&str) -> Option<String>,
     {
         let raw_args = args.into_iter().map(Into::into).collect::<Vec<_>>();
         let help_requested = raw_args
@@ -163,6 +196,11 @@ impl ServerConfig {
             .bool("cache_clear_endpoint_enabled")?
             .unwrap_or(false);
         let mut access_log = file_config.string("access_log");
+        let mut debug = env_bool(&env_value, "PHRUST_SERVER_DEBUG");
+        let mut error_format = env_output_format(&env_value, "PHRUST_SERVER_ERROR_FORMAT")?;
+        let mut debug_log = env_value("PHRUST_SERVER_DEBUG_LOG")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let mut help = false;
         let mut args = raw_args.into_iter();
 
@@ -251,8 +289,15 @@ impl ServerConfig {
                 "--strict-preload" => strict_preload = true,
                 "--enable-cache-clear-endpoint" => cache_clear_endpoint_enabled = true,
                 "--access-log" => access_log = Some(required_value(&arg, &mut args)?),
+                "--debug" => debug = true,
+                "--error-format" => {
+                    error_format = parse_output_format(&required_value(&arg, &mut args)?)?;
+                }
+                "--debug-log" => debug_log = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 _ if arg.starts_with('-') => {
-                    return Err(ConfigError::new(format!("unknown flag `{arg}`")));
+                    return Err(ConfigError::new(format!(
+                        "unknown flag `{arg}`; accepted flags include --docroot, --listen, --debug, --error-format, and --help"
+                    )));
                 }
                 _ => return Err(ConfigError::new(format!("unexpected argument `{arg}`"))),
             }
@@ -266,7 +311,7 @@ impl ServerConfig {
         validate_cookie_path("session_cookie_path", &session_cookie_path)?;
         if tls_cert.is_some() != tls_key.is_some() {
             return Err(ConfigError::new(
-                "--tls-cert and --tls-key must be provided together",
+                "TLS configuration requires both --tls-cert <path> and --tls-key <path>; provide both flags or neither",
             ));
         }
 
@@ -274,6 +319,9 @@ impl ServerConfig {
             return Ok(Self {
                 listen,
                 docroot: docroot.unwrap_or_default(),
+                debug,
+                error_format,
+                debug_log,
                 index,
                 front_controller,
                 max_body_bytes,
@@ -305,10 +353,15 @@ impl ServerConfig {
             });
         }
 
-        let docroot = docroot.ok_or_else(|| ConfigError::new("--docroot is required"))?;
+        let docroot = docroot.ok_or_else(|| {
+            ConfigError::new("--docroot is required; example: phrust-server --docroot public")
+        })?;
         Ok(Self {
             listen,
             docroot,
+            debug,
+            error_format,
+            debug_log,
             index,
             front_controller,
             max_body_bytes,
@@ -367,6 +420,9 @@ Options:\n\
   --tls-cert <path>            PEM certificate chain for HTTPS\n\
   --tls-key <path>             PEM private key for HTTPS\n\
   --access-log <path|->        write compact access logs to file or stdout\n\
+  --debug                      emit structured server debug events to stderr\n\
+  --error-format <text|json>   render server diagnostics/debug events as text or JSON\n\
+  --debug-log <path>           append server debug events to a file instead of stderr\n\
   --no-script-cache            disable process-local compiled script cache\n\
   --script-cache-shards <n>    compiled script cache shard count (default: 16)\n\
   --script-cache-max-entries <n> maximum compiled script cache entries (default: 4096)\n\
@@ -398,8 +454,11 @@ fn required_value(
     flag: &str,
     args: &mut impl Iterator<Item = String>,
 ) -> Result<String, ConfigError> {
-    args.next()
-        .ok_or_else(|| ConfigError::new(format!("{flag} requires a value")))
+    args.next().ok_or_else(|| {
+        ConfigError::new(format!(
+            "{flag} requires a value placeholder, for example {flag} <value>"
+        ))
+    })
 }
 
 fn config_path_from_args(args: &[String]) -> Result<Option<PathBuf>, ConfigError> {
@@ -407,7 +466,9 @@ fn config_path_from_args(args: &[String]) -> Result<Option<PathBuf>, ConfigError
     while let Some(arg) = iter.next() {
         if arg == "--config" {
             let Some(path) = iter.next() else {
-                return Err(ConfigError::new("--config requires a value"));
+                return Err(ConfigError::new(
+                    "--config requires a value placeholder, for example --config <path>",
+                ));
             };
             return Ok(Some(PathBuf::from(path)));
         }
@@ -534,9 +595,36 @@ fn parse_config_value(value: &str) -> Result<String, &'static str> {
 }
 
 fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
-    value
-        .parse()
-        .map_err(|error| ConfigError::new(format!("invalid --listen `{value}`: {error}")))
+    value.parse().map_err(|error| {
+        ConfigError::new(format!(
+            "invalid --listen `{value}`: {error}; expected host:port such as 127.0.0.1:8080"
+        ))
+    })
+}
+
+fn env_bool(env_value: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+    env_value(name)
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn env_output_format(
+    env_value: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<DiagnosticOutputFormat, ConfigError> {
+    env_value(name)
+        .map(|value| parse_output_format(&value))
+        .transpose()
+        .map(|value| value.unwrap_or(DiagnosticOutputFormat::Text))
+}
+
+fn parse_output_format(value: &str) -> Result<DiagnosticOutputFormat, ConfigError> {
+    match value {
+        "text" => Ok(DiagnosticOutputFormat::Text),
+        "json" | "jsonl" => Ok(DiagnosticOutputFormat::Json),
+        _ => Err(ConfigError::new(format!(
+            "invalid error format `{value}`; expected text or json"
+        ))),
+    }
 }
 
 fn parse_engine_preset(flag: &str, value: &str) -> Result<EngineProfileName, ConfigError> {
@@ -576,7 +664,9 @@ fn parse_nonnegative_u64(flag: &str, value: &str) -> Result<u64, ConfigError> {
 
 fn validate_index(index: &str) -> Result<(), ConfigError> {
     if index.is_empty() || index.contains('/') || index.contains('\\') || index.contains('\0') {
-        return Err(ConfigError::new("--index must be a file name"));
+        return Err(ConfigError::new(
+            "--index must be a single file name relative to each directory, not an absolute path or nested path",
+        ));
     }
     Ok(())
 }
@@ -606,14 +696,16 @@ fn validate_cookie_path(flag: &str, path: &str) -> Result<(), ConfigError> {
 fn validate_relative_path(flag: &str, path: &Path) -> Result<(), ConfigError> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(ConfigError::new(format!(
-            "{flag} must be relative to docroot"
+            "{flag} must be a non-empty relative path inside docroot, not an absolute path"
         )));
     }
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return Err(ConfigError::new(format!("{flag} must not contain `..`")));
+        return Err(ConfigError::new(format!(
+            "{flag} must stay inside docroot and must not contain `..`"
+        )));
     }
     Ok(())
 }
@@ -625,8 +717,10 @@ fn default_max_in_flight() -> usize {
 #[cfg(test)]
 mod tests {
     use super::ServerConfig;
+    use php_diagnostics::DiagnosticOutputFormat;
     use php_executor::EngineProfileName;
     use std::{
+        collections::HashMap,
         fs,
         net::SocketAddr,
         path::PathBuf,
@@ -644,6 +738,9 @@ mod tests {
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(config.docroot, PathBuf::from("public"));
+        assert!(!config.debug);
+        assert_eq!(config.error_format, DiagnosticOutputFormat::Text);
+        assert_eq!(config.debug_log, None);
         assert_eq!(config.index, "index.php");
         assert_eq!(config.max_body_bytes, 1_048_576);
         assert_eq!(
@@ -724,6 +821,11 @@ mod tests {
             "tls/key.pem",
             "--access-log",
             "-",
+            "--debug",
+            "--error-format",
+            "json",
+            "--debug-log",
+            "debug.log",
             "--no-script-cache",
             "--script-cache-shards",
             "3",
@@ -759,6 +861,9 @@ mod tests {
         assert_eq!(config.tls_cert, Some(PathBuf::from("tls/cert.pem")));
         assert_eq!(config.tls_key, Some(PathBuf::from("tls/key.pem")));
         assert_eq!(config.access_log, Some("-".to_string()));
+        assert!(config.debug);
+        assert_eq!(config.error_format, DiagnosticOutputFormat::Json);
+        assert_eq!(config.debug_log, Some(PathBuf::from("debug.log")));
         assert!(!config.script_cache_enabled);
         assert_eq!(config.script_cache_shards, 3);
         assert_eq!(config.script_cache_max_entries, 64);
@@ -850,14 +955,81 @@ index = "../bad.php"
     fn rejects_missing_docroot_without_help() {
         let error = ServerConfig::parse_from(["--listen", "127.0.0.1:0"]).unwrap_err();
 
-        assert_eq!(error.to_string(), "--docroot is required");
+        assert_eq!(
+            error.to_string(),
+            "--docroot is required; example: phrust-server --docroot public"
+        );
+        assert_eq!(error.diagnostic().code, "E_PHRUST_SERVER_CONFIG");
+    }
+
+    #[test]
+    fn rejects_invalid_listen_address_with_expected_format() {
+        let error =
+            ServerConfig::parse_from(["--listen", "no-port", "--docroot", "public"]).unwrap_err();
+
+        assert!(error.to_string().contains("invalid --listen `no-port`"));
+        assert!(error.to_string().contains("expected host:port"));
     }
 
     #[test]
     fn rejects_unknown_flag() {
         let error = ServerConfig::parse_from(["--docroot", "public", "--wat"]).unwrap_err();
 
-        assert_eq!(error.to_string(), "unknown flag `--wat`");
+        assert!(error.to_string().contains("unknown flag `--wat`"));
+        assert!(error.to_string().contains("accepted flags"));
+    }
+
+    #[test]
+    fn parses_debug_env_vars() {
+        let env = HashMap::from([
+            ("PHRUST_SERVER_DEBUG", "1"),
+            ("PHRUST_SERVER_ERROR_FORMAT", "json"),
+            ("PHRUST_SERVER_DEBUG_LOG", "server-debug.log"),
+        ]);
+        let config = ServerConfig::parse_from_with_env(["--docroot", "public"], |name| {
+            env.get(name).map(|value| (*value).to_string())
+        })
+        .unwrap();
+
+        assert!(config.debug);
+        assert_eq!(config.error_format, DiagnosticOutputFormat::Json);
+        assert_eq!(config.debug_log, Some(PathBuf::from("server-debug.log")));
+    }
+
+    #[test]
+    fn cli_debug_flags_override_env_vars() {
+        let env = HashMap::from([
+            ("PHRUST_SERVER_DEBUG", "1"),
+            ("PHRUST_SERVER_ERROR_FORMAT", "text"),
+            ("PHRUST_SERVER_DEBUG_LOG", "env-debug.log"),
+        ]);
+        let config = ServerConfig::parse_from_with_env(
+            [
+                "--docroot",
+                "public",
+                "--error-format",
+                "json",
+                "--debug-log",
+                "cli-debug.log",
+            ],
+            |name| env.get(name).map(|value| (*value).to_string()),
+        )
+        .unwrap();
+
+        assert!(config.debug);
+        assert_eq!(config.error_format, DiagnosticOutputFormat::Json);
+        assert_eq!(config.debug_log, Some(PathBuf::from("cli-debug.log")));
+    }
+
+    #[test]
+    fn rejects_invalid_error_format() {
+        let error = ServerConfig::parse_from(["--docroot", "public", "--error-format", "yaml"])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid error format `yaml`; expected text or json"
+        );
     }
 
     #[test]
@@ -966,7 +1138,7 @@ index = "../bad.php"
 
         assert_eq!(
             error.to_string(),
-            "--tls-cert and --tls-key must be provided together"
+            "TLS configuration requires both --tls-cert <path> and --tls-key <path>; provide both flags or neither"
         );
     }
 

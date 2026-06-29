@@ -1,4 +1,5 @@
 use crate::engine::{CliIniOptions, EngineInput, execute_php, read_script};
+use php_diagnostics::DiagnosticOutputFormat;
 use std::env;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -75,6 +76,12 @@ where
 {
     let parsed = ParsedCli::parse(&args)?;
     let _no_ini = parsed.no_ini;
+    let debug = debug_enabled_from_env();
+    let debug_log = env::var("PHRUST_DEBUG_LOG")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let debug_format = error_format_from_env();
     match parsed.action {
         CliAction::Help => {
             print_usage(stdout)?;
@@ -101,6 +108,9 @@ where
                 env: collect_env(),
                 ini: ini_options(&parsed.defines),
                 stdin: read_stdin_if_piped(stdin, stdin_is_terminal)?,
+                debug,
+                debug_log,
+                debug_format,
             };
             execute_php(input, stdout, stderr)
         }
@@ -116,6 +126,9 @@ where
                 env: collect_env(),
                 ini: ini_options(&parsed.defines),
                 stdin: read_stdin_if_piped(stdin, stdin_is_terminal)?,
+                debug,
+                debug_log,
+                debug_format,
             };
             execute_php(input, stdout, stderr)
         }
@@ -134,6 +147,9 @@ where
                 env: collect_env(),
                 ini: ini_options(&parsed.defines),
                 stdin: Vec::new(),
+                debug,
+                debug_log,
+                debug_format,
             };
             execute_php(input, stdout, stderr)
         }
@@ -327,6 +343,19 @@ where
     Ok(bytes)
 }
 
+fn debug_enabled_from_env() -> bool {
+    env::var("PHRUST_DEBUG")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn error_format_from_env() -> DiagnosticOutputFormat {
+    match env::var("PHRUST_ERROR_FORMAT").ok().as_deref() {
+        Some("json" | "jsonl") => DiagnosticOutputFormat::Json,
+        _ => DiagnosticOutputFormat::Text,
+    }
+}
+
 fn current_dir() -> Result<PathBuf, String> {
     env::current_dir().map_err(|error| format!("current directory: {error}"))
 }
@@ -354,9 +383,13 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestInput(Cursor<Vec<u8>>);
 
@@ -439,6 +472,7 @@ mod tests {
 
     #[test]
     fn run_code_prints_php_version() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let mut stdin = TestInput(Cursor::new(Vec::new()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -459,6 +493,7 @@ mod tests {
 
     #[test]
     fn run_file_seeds_argv_and_argc() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let root = temp_root("argv");
         fs::create_dir_all(&root).expect("mkdir");
         let script = root.join("fixture.php");
@@ -493,6 +528,7 @@ mod tests {
 
     #[test]
     fn run_code_exposes_stdin_resource() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let mut stdin = TestInput(Cursor::new(b"payload".to_vec()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -513,6 +549,7 @@ mod tests {
 
     #[test]
     fn successful_warning_output_does_not_emit_internal_stderr_diagnostics() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let mut stdin = TestInput(Cursor::new(Vec::new()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -538,7 +575,38 @@ mod tests {
     }
 
     #[test]
+    fn env_debug_writes_timeline_without_changing_stdout() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_debug = env::var("PHRUST_DEBUG").ok();
+        let previous_format = env::var("PHRUST_ERROR_FORMAT").ok();
+        unsafe {
+            env::set_var("PHRUST_DEBUG", "1");
+            env::remove_var("PHRUST_ERROR_FORMAT");
+        }
+        let mut stdin = TestInput(Cursor::new(Vec::new()));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run(
+            ["-r".to_string(), "echo 'ok';".to_string()],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        restore_env("PHRUST_DEBUG", previous_debug);
+        restore_env("PHRUST_ERROR_FORMAT", previous_format);
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(String::from_utf8(stdout).expect("utf8"), "ok");
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("D_PHRUST_FRONTEND_ANALYZE_START"));
+        assert!(stderr.contains("D_PHRUST_VM_EXECUTE_END"));
+        assert!(stderr.contains("D_PHRUST_VM_TRACE"));
+    }
+
+    #[test]
     fn include_path_define_affects_include_resolution() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let root = temp_root("include-path");
         let lib = root.join("lib");
         fs::create_dir_all(&lib).expect("mkdir");
@@ -572,5 +640,15 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    fn restore_env(name: &str, previous: Option<String>) {
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
     }
 }
