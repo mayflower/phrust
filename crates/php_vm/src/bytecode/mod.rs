@@ -126,6 +126,8 @@ pub enum DenseOpcode {
     Return = 12,
     /// Drop an unused operand value.
     Discard = 13,
+    /// Terminate the current script/request.
+    Exit = 53,
 }
 
 impl DenseOpcode {
@@ -133,7 +135,12 @@ impl DenseOpcode {
     const fn is_terminator(self) -> bool {
         matches!(
             self,
-            Self::Jump | Self::JumpIfFalse | Self::JumpIfTrue | Self::JumpIf | Self::Return
+            Self::Jump
+                | Self::JumpIfFalse
+                | Self::JumpIfTrue
+                | Self::JumpIf
+                | Self::Return
+                | Self::Exit
         )
     }
 
@@ -194,6 +201,7 @@ impl DenseOpcode {
             Self::JumpIf => "jump_if",
             Self::Return => "return",
             Self::Discard => "discard",
+            Self::Exit => "exit",
         }
     }
 
@@ -382,6 +390,8 @@ pub enum DenseOperands {
     },
     /// Optional return operand.
     Return { value: Option<DenseOperand> },
+    /// Optional script-exit operand.
+    Exit { value: Option<DenseOperand> },
 }
 
 /// One dense function-call argument with call-shape metadata preserved.
@@ -1274,6 +1284,7 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::JumpIfFalse
         | DenseOpcode::JumpIfTrue
         | DenseOpcode::JumpIf
+        | DenseOpcode::Exit
         | DenseOpcode::Echo
         | DenseOpcode::Discard => Some(RuleKind::NoRule),
         DenseOpcode::CallFunction
@@ -1749,6 +1760,12 @@ fn lower_terminator(
                 },
             )
         }
+        TerminatorKind::Exit { value } => (
+            DenseOpcode::Exit,
+            DenseOperands::Exit {
+                value: value.map(lower_operand),
+            },
+        ),
     };
     Ok(DenseInstruction {
         opcode,
@@ -2240,6 +2257,11 @@ fn verify_instruction(
                 verify_operand(*value, unit, function, errors);
             }
         }
+        (DenseOpcode::Exit, DenseOperands::Exit { value }) => {
+            if let Some(value) = value {
+                verify_operand(*value, unit, function, errors);
+            }
+        }
         _ => errors.push(error(
             DenseVerifyErrorCode::InvalidOperandShape,
             format!(
@@ -2595,6 +2617,7 @@ fn render_operands(operands: &DenseOperands) -> String {
             if_false,
         } => format!("{} b{if_true} b{if_false}", render_operand(*condition)),
         DenseOperands::Return { value } => value.map_or_else(|| "-".to_string(), render_operand),
+        DenseOperands::Exit { value } => value.map_or_else(|| "-".to_string(), render_operand),
     }
 }
 

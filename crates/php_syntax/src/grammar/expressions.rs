@@ -373,7 +373,12 @@ fn parse_construct_expression(parser: &mut Parser<'_>) {
         if !at_expression_stop(parser) {
             let _has_argument = parse_expression_bp(parser, PREFIX_RIGHT_BP);
         }
-    } else if token == named(TokenName::Print) {
+    } else if token == named(TokenName::Print)
+        || token == named(TokenName::Include)
+        || token == named(TokenName::IncludeOnce)
+        || token == named(TokenName::Require)
+        || token == named(TokenName::RequireOnce)
+    {
         if !parse_expression_bp(parser, PRINT_RIGHT_BP) {
             parser.error_expected("expected construct expression argument", &["expression"]);
         }

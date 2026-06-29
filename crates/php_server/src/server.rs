@@ -1360,18 +1360,19 @@ async fn execute_php_request(
             );
         }
     };
-    let mut runtime_context = RuntimeContext::controlled_http(request_context)
-        .with_cwd(state.route_config.docroot.clone())
-        .with_include_path(vec![state.route_config.docroot.clone()])
-        .with_session_state(session_state)
-        .with_execution_time_limit(state.execution_time_limit);
+    let runtime_context = php_runtime_context_for_http(
+        &state,
+        request_context,
+        session_state,
+        body.clone(),
+        std::env::vars().collect(),
+    );
     if state.execution_time_limit.is_none() {
         state
             .metrics
             .execution_deadline_disabled
             .fetch_add(1, Ordering::Relaxed);
     }
-    runtime_context = runtime_context.with_stdin(body.clone());
     let is_head = parts.method == Method::HEAD;
     let script_log_path = script_path.clone();
     let result = execute_compiled_php_in_blocking_region(
@@ -1722,6 +1723,22 @@ fn http_runtime_context(
         context.parsed_cookie = parse_cookie_header(&cookie);
     }
     context
+}
+
+fn php_runtime_context_for_http(
+    state: &AppState,
+    request_context: RuntimeHttpRequestContext,
+    session_state: SessionState,
+    body: Vec<u8>,
+    env: Vec<(String, String)>,
+) -> RuntimeContext {
+    RuntimeContext::controlled_http(request_context)
+        .with_cwd(state.route_config.docroot.clone())
+        .with_include_path(vec![state.route_config.docroot.clone()])
+        .with_session_state(session_state)
+        .with_execution_time_limit(state.execution_time_limit)
+        .with_env(env)
+        .with_stdin(body)
 }
 
 fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -2092,6 +2109,44 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn http_php_runtime_context_includes_server_process_env() {
+        let fixture = ServerCacheFixture::new();
+        let state = test_state(&fixture, Arc::new(CompiledScriptCache::new(1)), false);
+        let request_context = RuntimeHttpRequestContext::new(
+            "GET",
+            "example.test",
+            "/index.php",
+            "/index.php",
+            fixture.path.to_string_lossy().into_owned(),
+            fixture.root.to_string_lossy().into_owned(),
+        );
+
+        let context = php_runtime_context_for_http(
+            &state,
+            request_context,
+            SessionState::default(),
+            b"request-body".to_vec(),
+            vec![
+                (
+                    "PHRUST_MYSQL_TEST_DSN".to_string(),
+                    "mysql://wordpress:secret@mariadb:3306/wordpress".to_string(),
+                ),
+                ("WORDPRESS_DB_HOST".to_string(), "mariadb:3306".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            context
+                .env
+                .iter()
+                .find(|(key, _)| key == "PHRUST_MYSQL_TEST_DSN")
+                .map(|(_, value)| value.as_str()),
+            Some("mysql://wordpress:secret@mariadb:3306/wordpress")
+        );
+        assert_eq!(context.stdin, b"request-body");
     }
 
     #[test]

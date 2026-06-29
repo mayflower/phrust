@@ -608,11 +608,15 @@ impl HirLowerer<'_> {
             },
             "isset" | "empty" => HirExprKind::BuiltinCall {
                 name: keyword,
-                args: vec![HirCallArg {
-                    name: None,
-                    value: self.construct_operand_expr(node),
-                    unpack: false,
-                }],
+                args: self
+                    .construct_operand_exprs(node)
+                    .into_iter()
+                    .map(|value| HirCallArg {
+                        name: None,
+                        value,
+                        unpack: false,
+                    })
+                    .collect(),
             },
             _ => HirExprKind::Unlowered {
                 syntax_kind: node.kind().name(),
@@ -1025,9 +1029,35 @@ impl HirLowerer<'_> {
             .strip_prefix("exit")
             .or_else(|| source.strip_prefix("die"))
             .unwrap_or(&source)
+            .trim_end_matches(';')
             .trim();
         if rest.is_empty() || rest == "()" {
             None
+        } else if let Some(inner) = rest
+            .strip_prefix('(')
+            .and_then(|text| text.strip_suffix(')'))
+        {
+            let inner = inner.trim();
+            if inner.is_empty() {
+                None
+            } else if is_quoted_construct_operand(inner) {
+                Some(self.alloc_expr(
+                    HirExprKind::Literal {
+                        text: inner.to_owned(),
+                    },
+                    node.text_range(),
+                ))
+            } else if inner.bytes().all(|byte| byte.is_ascii_digit()) {
+                Some(self.alloc_expr(
+                    HirExprKind::Literal {
+                        text: inner.to_owned(),
+                    },
+                    node.text_range(),
+                ))
+            } else {
+                self.simple_construct_operand_source(inner, node.text_range())
+                    .or_else(|| Some(self.construct_operand_expr(node)))
+            }
         } else {
             Some(self.construct_operand_expr(node))
         }
@@ -1054,8 +1084,23 @@ impl HirLowerer<'_> {
         mut rest: &str,
         range: TextRange,
     ) -> Option<ExprId> {
+        let mut leading_cast = None;
+        if let Some((kind, after_cast)) = split_leading_construct_cast(rest) {
+            leading_cast = Some(kind.to_owned());
+            rest = after_cast.trim();
+        }
         if let Some(expr) = self.simple_static_property_construct_operand_source(rest, range) {
-            return Some(expr);
+            return Some(if let Some(kind) = leading_cast {
+                self.alloc_expr(
+                    HirExprKind::Cast {
+                        kind,
+                        expr: Some(expr),
+                    },
+                    range,
+                )
+            } else {
+                expr
+            });
         }
         if !rest.starts_with('$') {
             return None;
@@ -1140,7 +1185,20 @@ impl HirLowerer<'_> {
             }
             break;
         }
-        rest.is_empty().then_some(current)
+        if !rest.is_empty() {
+            return None;
+        }
+        Some(if let Some(kind) = leading_cast {
+            self.alloc_expr(
+                HirExprKind::Cast {
+                    kind,
+                    expr: Some(current),
+                },
+                range,
+            )
+        } else {
+            current
+        })
     }
 
     fn simple_static_property_construct_operand_source(
@@ -1988,6 +2046,31 @@ fn is_operator_token(token: &SyntaxToken) -> bool {
         || token.kind().name() == "T_INSTANCEOF"
 }
 
+fn split_leading_construct_cast(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    let after_open = text.strip_prefix('(')?;
+    let close = after_open.find(')')?;
+    let kind = after_open[..close].trim();
+    if !matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "bool"
+            | "boolean"
+            | "int"
+            | "integer"
+            | "float"
+            | "double"
+            | "real"
+            | "string"
+            | "array"
+            | "object"
+            | "unset"
+            | "void"
+    ) {
+        return None;
+    }
+    Some((kind, &after_open[close + 1..]))
+}
+
 fn has_descendant_token_text(node: &SyntaxNode, text: &str) -> bool {
     descendant_tokens::<TokenView<'_>>(node).any(|token| token.text() == text)
 }
@@ -2205,6 +2288,52 @@ mod tests {
     }
 
     #[test]
+    fn lowers_require_concat_as_include_operand() {
+        let source = "<?php require __DIR__ . '/wp-blog-header.php';\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let include_operand = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Include {
+                    kind,
+                    expr: Some(expr),
+                    ..
+                } if kind == "require" => Some(*expr),
+                _ => None,
+            })
+            .expect("require expression");
+
+        assert!(
+            matches!(
+                module.expressions()[include_operand].kind(),
+                HirExprKind::Binary { operator, .. } if operator == "."
+            ),
+            "require operand should preserve the concatenated path"
+        );
+        assert!(
+            reporter
+                .into_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.id() != DiagnosticId::HirMissingChild)
+        );
+    }
+
+    #[test]
     fn diagnoses_this_reassignment() {
         let source = "<?php class C { function m($other) { $result = $this = $other; } }\n";
         let parse = parse_source_file(source);
@@ -2346,6 +2475,77 @@ mod tests {
                 HirExprKind::Missing
             ),
             "exit operand should not lower to missing"
+        );
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_zero_arg_die_without_placeholder_operand() {
+        let source = "<?php function stop_now() { die(); }\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let exit_expr = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Exit { expr } => Some(expr),
+                _ => None,
+            })
+            .expect("exit expression");
+
+        assert_eq!(*exit_expr, None);
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_die_cast_variable_operand() {
+        let source = "<?php function stop_now($message) { die( (string) $message ); }\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let exit_operand = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Exit { expr: Some(expr) } => Some(*expr),
+                _ => None,
+            })
+            .expect("exit operand");
+
+        assert!(
+            matches!(
+                module.expressions()[exit_operand].kind(),
+                HirExprKind::Cast {
+                    kind,
+                    expr: Some(_)
+                } if kind == "string"
+            ),
+            "exit operand should preserve string cast"
         );
         assert!(reporter.into_diagnostics().is_empty());
     }

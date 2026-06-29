@@ -283,6 +283,20 @@ impl IrBuilder {
         });
     }
 
+    /// Sets a script-exit terminator.
+    pub fn terminate_exit(
+        &mut self,
+        function: FunctionId,
+        block: BlockId,
+        value: Option<Operand>,
+        span: IrSpan,
+    ) {
+        self.block_mut(function, block).terminator = Some(Terminator {
+            span,
+            kind: TerminatorKind::Exit { value },
+        });
+    }
+
     /// Sets an unconditional jump terminator.
     pub fn terminate_jump(
         &mut self,

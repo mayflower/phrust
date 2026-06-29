@@ -731,6 +731,11 @@ fn verify_terminator(
                 }
             }
         }
+        TerminatorKind::Exit { value } => {
+            if let Some(value) = value {
+                verify_operand(value, function, unit, errors);
+            }
+        }
     }
 }
 
@@ -954,7 +959,9 @@ fn is_false_successor(kind: &TerminatorKind, target: BlockId) -> bool {
         } => *false_target == target,
         TerminatorKind::JumpIfTrue { .. } => false,
         TerminatorKind::JumpIf { if_false, .. } => *if_false == target,
-        TerminatorKind::Jump { .. } | TerminatorKind::Return { .. } => false,
+        TerminatorKind::Jump { .. }
+        | TerminatorKind::Return { .. }
+        | TerminatorKind::Exit { .. } => false,
     }
 }
 
@@ -1338,6 +1345,11 @@ fn terminator_register_uses(kind: &TerminatorKind, uses: &mut Vec<RegId>) {
                 operand_register_uses(value, uses);
             }
         }
+        TerminatorKind::Exit { value } => {
+            if let Some(value) = value {
+                operand_register_uses(value, uses);
+            }
+        }
     }
 }
 
@@ -1352,7 +1364,7 @@ fn terminator_targets(kind: &TerminatorKind, targets: &mut Vec<BlockId>) {
             targets.push(*if_true);
             targets.push(*if_false);
         }
-        TerminatorKind::Return { .. } => {}
+        TerminatorKind::Return { .. } | TerminatorKind::Exit { .. } => {}
     }
 }
 

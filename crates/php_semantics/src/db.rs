@@ -1,5 +1,7 @@
 //! Semantic frontend database and source maps.
 
+use std::collections::HashMap;
+
 use crate::hir::{Arena, HirModule, ModuleId};
 use crate::hir::{
     AttributeId, ClassLikeId, ConstExprId, ConstId, DeclId, EnumCaseId, ExprId, FunctionId,
@@ -9,7 +11,7 @@ use crate::hir::{
 use php_source::TextRange;
 
 /// A typed HIR or semantic ID that can be mapped back to source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SourceMappedId {
     /// Module ID.
     Module(ModuleId),
@@ -169,22 +171,21 @@ impl From<NameId> for SourceMappedId {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceMap {
     spans: Vec<(SourceMappedId, TextRange)>,
+    latest: HashMap<SourceMappedId, TextRange>,
 }
 
 impl SourceMap {
     /// Records a source span for an ID.
     pub fn insert(&mut self, id: impl Into<SourceMappedId>, range: TextRange) {
-        self.spans.push((id.into(), range));
+        let id = id.into();
+        self.spans.push((id, range));
+        self.latest.insert(id, range);
     }
 
     /// Returns the latest span recorded for an ID.
     #[must_use]
     pub fn span(&self, id: impl Into<SourceMappedId>) -> Option<TextRange> {
-        let id = id.into();
-        self.spans
-            .iter()
-            .rev()
-            .find_map(|(candidate, range)| (*candidate == id).then_some(*range))
+        self.latest.get(&id.into()).copied()
     }
 
     /// Returns true when no spans are recorded.

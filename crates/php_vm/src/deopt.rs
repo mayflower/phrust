@@ -1113,6 +1113,7 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::Jump
         | DenseOpcode::Return
+        | DenseOpcode::Exit
         | DenseOpcode::Discard => Vec::new(),
         DenseOpcode::LoadLocal | DenseOpcode::LoadLocalEcho => {
             vec![VmDeoptReason::UnsupportedValue]

@@ -12,7 +12,12 @@ pub(crate) fn parse_statement_list_contents(parser: &mut Parser<'_>) {
         if parser.current().is_trivia() {
             parser.bump();
         } else {
+            let before = parser.position();
             parse_statement(parser);
+            if !parser.is_eof() && parser.position() == before {
+                parser.error_expected("expected statement parser to make progress", &["statement"]);
+                parser.bump();
+            }
         }
     }
 }
@@ -147,6 +152,7 @@ fn parse_if_statement(parser: &mut Parser<'_>) {
         }
         if parser.at(named(TokenName::Else)) {
             parser.bump();
+            bump_trivia(parser);
             if parser.at(symbol(b':')) {
                 parser.bump();
             } else {
@@ -386,9 +392,11 @@ fn parse_label_statement(parser: &mut Parser<'_>) {
 }
 
 fn parse_switch_body(parser: &mut Parser<'_>, at_end: impl Fn(&Parser<'_>) -> bool + Copy) {
-    while !parser.is_eof() && !at_end(parser) && !parser.at(named(TokenName::CloseTag)) {
+    while !parser.is_eof() && !at_end(parser) {
         if parser.current().is_trivia() || parser.at(symbol(b';')) {
             parser.bump();
+        } else if at_nested_php_mode_boundary(parser) {
+            parse_nested_php_mode_boundary(parser);
         } else if parser.at(named(TokenName::Case)) || parser.at(named(TokenName::Default)) {
             parse_switch_label(parser);
             parse_statements_until(parser, |parser| {
@@ -457,9 +465,11 @@ fn parse_expression_statement(parser: &mut Parser<'_>) {
 pub(crate) fn parse_block_statement(parser: &mut Parser<'_>) {
     let statement = parser.start();
     parser.bump();
-    while !parser.is_eof() && !parser.at(symbol(b'}')) && !parser.at(named(TokenName::CloseTag)) {
+    while !parser.is_eof() && !parser.at(symbol(b'}')) {
         if parser.current().is_trivia() {
             parser.bump();
+        } else if at_nested_php_mode_boundary(parser) {
+            parse_nested_php_mode_boundary(parser);
         } else {
             parse_statement(parser);
         }
@@ -488,8 +498,16 @@ fn parse_control_body(parser: &mut Parser<'_>) {
             parser.bump();
         }
     }
-    if parser.is_eof() || parser.at(named(TokenName::CloseTag)) {
+    if parser.is_eof() {
         parser.error_expected("expected control-flow body", &["statement"]);
+    } else if at_nested_php_mode_boundary(parser) {
+        let statement = parser.start();
+        parse_nested_statement_list_contents(parser, |parser| {
+            parser.at(named(TokenName::ElseIf))
+                || parser.at(named(TokenName::Else))
+                || parser.at(symbol(b'}'))
+        });
+        let _completed = statement.complete(parser, SyntaxKind::Node(SyntaxNodeKind::BlockStmt));
     } else {
         parse_statement(parser);
     }
@@ -688,12 +706,54 @@ fn recover_parenthesized_header(parser: &mut Parser<'_>) {
 }
 
 fn parse_statements_until(parser: &mut Parser<'_>, at_end: impl Fn(&Parser<'_>) -> bool + Copy) {
-    while !parser.is_eof() && !parser.at(named(TokenName::CloseTag)) && !at_end(parser) {
+    parse_nested_statement_list_contents(parser, at_end);
+}
+
+fn parse_nested_statement_list_contents(
+    parser: &mut Parser<'_>,
+    at_end: impl Fn(&Parser<'_>) -> bool + Copy,
+) {
+    while !parser.is_eof() && !at_end(parser) {
         if parser.current().is_trivia() {
             parser.bump();
+        } else if at_nested_php_mode_boundary(parser) {
+            parse_nested_php_mode_boundary(parser);
         } else {
+            let before = parser.position();
             parse_statement(parser);
+            if !parser.is_eof() && parser.position() == before {
+                parser.error_expected("expected statement parser to make progress", &["statement"]);
+                parser.bump();
+            }
         }
+    }
+}
+
+fn at_nested_php_mode_boundary(parser: &Parser<'_>) -> bool {
+    parser.at(named(TokenName::CloseTag))
+        || parser.at(named(TokenName::InlineHtml))
+        || parser.at(named(TokenName::OpenTag))
+        || parser.at(named(TokenName::OpenTagWithEcho))
+}
+
+fn parse_nested_php_mode_boundary(parser: &mut Parser<'_>) {
+    if parser.at(named(TokenName::CloseTag)) {
+        parser.bump();
+    }
+
+    if parser.at(named(TokenName::InlineHtml)) {
+        let inline_html = parser.start();
+        while parser.at(named(TokenName::InlineHtml)) {
+            parser.bump();
+        }
+        let _completed = inline_html.complete(parser, SyntaxKind::Node(SyntaxNodeKind::InlineHtml));
+    }
+
+    if parser.at(named(TokenName::OpenTagWithEcho)) {
+        parser.bump();
+        parse_short_echo_statement(parser);
+    } else if parser.at(named(TokenName::OpenTag)) {
+        parser.bump();
     }
 }
 
@@ -782,5 +842,15 @@ mod tests {
 
         assert_eq!(parse.reconstructed_text(), source);
         assert!(parse.debug_tree().contains("ECHO_STMT"));
+    }
+
+    #[test]
+    fn alternative_if_allows_trivia_between_else_and_colon() {
+        let source = "<?php if (true): if (false): echo 'a'; else : echo 'b'; endif; endif;";
+        let parse = parse_source_file(source);
+
+        assert_eq!(parse.reconstructed_text(), source);
+        assert!(!parse.has_errors(), "{:#?}", parse.diagnostics());
+        assert!(parse.debug_tree().contains("IF_STMT"));
     }
 }

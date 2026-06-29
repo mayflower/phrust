@@ -3241,6 +3241,7 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
         | DenseOpcode::LoadLocalEcho
         | DenseOpcode::Echo
         | DenseOpcode::Return
+        | DenseOpcode::Exit
         | DenseOpcode::Discard => BaselineStencilClass {
             helper_calls: 0,
             deopt_slots: 1,
@@ -3570,6 +3571,7 @@ fn classify_copy_patch_stencil_instruction(
             compile_cost_units: 2,
             unsupported_reason: None,
         },
+        DenseOpcode::Exit => unsupported_copy_patch_class("script_exit_requires_request_state"),
         DenseOpcode::LoadConst
         | DenseOpcode::Move
         | DenseOpcode::StoreLocal
@@ -3856,6 +3858,10 @@ fn classify_mid_tier_instruction(
                 &mut plan.expected_guards,
                 "destructor_sensitive_value_state",
             );
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::Exit => {
+            push_unique(&mut plan.rejection_reasons, "script_exit_control_flow");
             plan.deopt_points += 1;
         }
         DenseOpcode::LoadConst

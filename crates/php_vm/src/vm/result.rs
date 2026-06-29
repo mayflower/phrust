@@ -22,6 +22,8 @@ pub struct VmResult {
     pub session: SessionState,
     /// Return value when execution returned successfully.
     pub return_value: Option<Value>,
+    /// Process exit code when PHP `exit`/`die` terminated the script.
+    pub process_exit_code: Option<i32>,
     pub(super) yielded: Option<super::GeneratorYield>,
     pub(super) fiber_suspension: Option<super::FiberSuspension>,
     pub(super) return_ref: Option<ReferenceCell>,

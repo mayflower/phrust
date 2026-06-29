@@ -1298,6 +1298,9 @@ fn remap_terminator_constants(kind: &mut TerminatorKind, remap: &[ConstId]) {
         TerminatorKind::Return { value, .. } => {
             remap_optional_operand_constants(value, remap);
         }
+        TerminatorKind::Exit { value } => {
+            remap_optional_operand_constants(value, remap);
+        }
     }
 }
 
@@ -1562,6 +1565,9 @@ fn rewrite_terminator_register_operands(
             rewrite_operand_registers(condition, aliases);
         }
         TerminatorKind::Return { value, .. } => {
+            rewrite_optional_operand_registers(value, aliases);
+        }
+        TerminatorKind::Exit { value } => {
             rewrite_optional_operand_registers(value, aliases);
         }
     }
@@ -1976,7 +1982,7 @@ fn block_successors(function: &IrFunction, block_index: usize) -> Vec<BlockId> {
         TerminatorKind::JumpIf {
             if_true, if_false, ..
         } => vec![if_true, if_false],
-        TerminatorKind::Return { .. } => Vec::new(),
+        TerminatorKind::Return { .. } | TerminatorKind::Exit { .. } => Vec::new(),
     }
 }
 
@@ -1988,7 +1994,7 @@ fn terminator_explicit_targets(kind: &TerminatorKind) -> Vec<BlockId> {
         TerminatorKind::JumpIf {
             if_true, if_false, ..
         } => vec![*if_true, *if_false],
-        TerminatorKind::Return { .. } => Vec::new(),
+        TerminatorKind::Return { .. } | TerminatorKind::Exit { .. } => Vec::new(),
     }
 }
 
@@ -2004,7 +2010,11 @@ fn constant_branch_target(
         | TerminatorKind::JumpIf { condition, .. } => {
             condition_bool_value(function, block_index, *condition, constants)?
         }
-        TerminatorKind::Jump { .. } | TerminatorKind::Return { .. } => return None,
+        TerminatorKind::Jump { .. }
+        | TerminatorKind::Return { .. }
+        | TerminatorKind::Exit { .. } => {
+            return None;
+        }
     };
     match kind {
         TerminatorKind::JumpIfFalse { target, .. } => {
@@ -2024,7 +2034,9 @@ fn constant_branch_target(
         TerminatorKind::JumpIf {
             if_true, if_false, ..
         } => Some(if bool_value { *if_true } else { *if_false }),
-        TerminatorKind::Jump { .. } | TerminatorKind::Return { .. } => None,
+        TerminatorKind::Jump { .. }
+        | TerminatorKind::Return { .. }
+        | TerminatorKind::Exit { .. } => None,
     }
 }
 
@@ -2084,7 +2096,7 @@ fn replace_terminator_target(kind: &mut TerminatorKind, old_target: BlockId, new
                 *if_false = new_target;
             }
         }
-        TerminatorKind::Return { .. } => {}
+        TerminatorKind::Return { .. } | TerminatorKind::Exit { .. } => {}
     }
 }
 

@@ -2155,7 +2155,9 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticId, FrontendDatabase, TARGET_PHP_VERSION, analyze_source, hir};
+    use super::{
+        DiagnosticId, FrontendDatabase, SourceMap, TARGET_PHP_VERSION, analyze_source, hir,
+    };
     use php_source::TextRange;
 
     #[test]
@@ -2238,6 +2240,19 @@ mod tests {
         database.source_map_mut().insert(expr_id, range);
 
         assert_eq!(database.source_map().span(expr_id), Some(range));
+    }
+
+    #[test]
+    fn source_map_returns_latest_span_for_reinserted_id() {
+        let mut source_map = SourceMap::default();
+        let expr_id = hir::ExprId::from_raw(0);
+        let first = TextRange::new(1, 2);
+        let second = TextRange::new(3, 5);
+
+        source_map.insert(expr_id, first);
+        source_map.insert(expr_id, second);
+
+        assert_eq!(source_map.span(expr_id), Some(second));
     }
 
     #[test]

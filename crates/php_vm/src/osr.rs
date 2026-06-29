@@ -535,6 +535,11 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
                 collect_operand_slot(*value, slots);
             }
         }
+        DenseOperands::Exit { value } => {
+            if let Some(value) = value {
+                collect_operand_slot(*value, slots);
+            }
+        }
     }
 }
 

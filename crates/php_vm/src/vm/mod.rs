@@ -938,6 +938,7 @@ struct ExecutionState {
     diagnostics: Vec<RuntimeDiagnostic>,
     execution_deadline_at: Option<Instant>,
     execution_deadline_mutable: bool,
+    process_exit_code: Option<i32>,
     /// Throwable propagating up the call stack toward an enclosing handler.
     ///
     /// Set when a frame cannot handle a throw locally; each caller frame gets a
@@ -1868,6 +1869,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -1890,6 +1892,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -1897,6 +1900,12 @@ impl VmResult {
             counters: None,
             tiering_stats: None,
         }
+    }
+
+    fn script_exit(output: OutputBuffer, code: i32) -> Self {
+        let mut result = Self::success(output, None);
+        result.process_exit_code = Some(code);
+        result
     }
 
     pub(crate) fn runtime_error_with_diagnostic(
@@ -1912,6 +1921,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value: None,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -1930,6 +1940,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value: None,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -1948,6 +1959,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value: None,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -1972,6 +1984,7 @@ impl VmResult {
             upload_registry: UploadRegistry::default(),
             session: php_runtime::SessionState::default(),
             return_value: None,
+            process_exit_code: None,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -2067,6 +2080,7 @@ impl Vm {
                     upload_registry: UploadRegistry::default(),
                     session: php_runtime::SessionState::default(),
                     return_value: None,
+                    process_exit_code: None,
                     yielded: None,
                     fiber_suspension: None,
                     return_ref: None,
@@ -2115,6 +2129,7 @@ impl Vm {
                             output: output.clone(),
                             diagnostics: Vec::new(),
                             return_value: None,
+                            process_exit_code: None,
                             yielded: None,
                             fiber_suspension: None,
                             return_ref: None,
@@ -6171,6 +6186,10 @@ impl Vm {
         let mut block_index = 0_u32;
         let mut steps = 0_usize;
         'dispatch: loop {
+            if let Some(code) = state.process_exit_code {
+                stack.pop_recycle();
+                return VmResult::script_exit(output.clone(), code);
+            }
             steps += 1;
             if steps.is_multiple_of(EXECUTION_DEADLINE_CHECK_INTERVAL)
                 && state.execution_deadline_expired()
@@ -7984,6 +8003,45 @@ impl Vm {
                             diagnostics,
                         );
                     }
+                    DenseOpcode::Exit => {
+                        let DenseOperands::Exit { value } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match value {
+                            Some(value) => match self.read_dense_operand(compiled, stack, value) {
+                                Ok(value) => Some(value),
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            },
+                            None => None,
+                        };
+                        let code =
+                            match self.resolve_exit_value(compiled, output, stack, state, value) {
+                                Ok(code) => code,
+                                Err(result) => {
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            };
+                        state.process_exit_code = Some(code);
+                        stack.pop_recycle();
+                        return VmResult::script_exit(output.clone(), code);
+                    }
+                }
+                if let Some(code) = state.process_exit_code {
+                    stack.pop_recycle();
+                    return VmResult::script_exit(output.clone(), code);
                 }
                 instruction_offset = next_instruction_offset;
             }
@@ -10019,6 +10077,10 @@ impl Vm {
         }
 
         'dispatch: loop {
+            if let Some(code) = state.process_exit_code {
+                stack.pop_recycle();
+                return VmResult::script_exit(output.clone(), code);
+            }
             steps += 1;
             if steps.is_multiple_of(EXECUTION_DEADLINE_CHECK_INTERVAL)
                 && state.execution_deadline_expired()
@@ -16407,6 +16469,7 @@ impl Vm {
                                 output: output.clone(),
                                 diagnostics: vec![diagnostic],
                                 return_value: None,
+                                process_exit_code: None,
                                 yielded: None,
                                 fiber_suspension: None,
                                 return_ref: None,
@@ -18709,6 +18772,7 @@ impl Vm {
                             output: output.clone(),
                             diagnostics: vec![diagnostic],
                             return_value: None,
+                            process_exit_code: None,
                             yielded: None,
                             fiber_suspension: None,
                             return_ref: None,
@@ -18732,12 +18796,35 @@ impl Vm {
                         );
                     }
                 }
+                if let Some(code) = state.process_exit_code {
+                    stack.pop_recycle();
+                    return VmResult::script_exit(output.clone(), code);
+                }
             }
 
             let Some(terminator) = &block.terminator else {
                 return self.runtime_error(output, compiled, stack, "block has no terminator");
             };
             match &terminator.kind {
+                TerminatorKind::Exit { value } => {
+                    let value = match value {
+                        Some(value) => match read_operand(unit, stack, *value) {
+                            Ok(value) => Some(value),
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        },
+                        None => None,
+                    };
+                    let code = match self.resolve_exit_value(compiled, output, stack, state, value)
+                    {
+                        Ok(code) => code,
+                        Err(result) => return result,
+                    };
+                    state.process_exit_code = Some(code);
+                    stack.pop_recycle();
+                    return VmResult::script_exit(output.clone(), code);
+                }
                 TerminatorKind::Return {
                     value,
                     by_ref_local,
@@ -23098,6 +23185,7 @@ impl Vm {
                     output: output.clone(),
                     diagnostics: vec![diagnostic],
                     return_value: None,
+                    process_exit_code: None,
                     yielded: None,
                     fiber_suspension: None,
                     return_ref: None,
@@ -24854,6 +24942,24 @@ impl Vm {
             Value::Uninitialized => {
                 SemanticHelperResult::Fallback("uninitialized_conversion_error")
             }
+        }
+    }
+
+    fn resolve_exit_value(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        value: Option<Value>,
+    ) -> Result<i32, VmResult> {
+        match value {
+            Some(Value::Int(code)) => Ok(normalize_exit_code(code)),
+            Some(value) => {
+                self.write_echo(compiled, output, stack, state, &value)?;
+                Ok(0)
+            }
+            None => Ok(0),
         }
     }
 
@@ -28002,6 +28108,10 @@ fn is_reflection_runtime_class(name: &str) -> bool {
 
 fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+fn normalize_exit_code(code: i64) -> i32 {
+    code.clamp(0, 255) as i32
 }
 
 fn compiled_unit_cache_key(compiled: &CompiledUnit) -> u64 {
@@ -43530,7 +43640,8 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         DenseOpcode::Jump
         | DenseOpcode::JumpIfFalse
         | DenseOpcode::JumpIfTrue
-        | DenseOpcode::JumpIf => "control_flow",
+        | DenseOpcode::JumpIf
+        | DenseOpcode::Exit => "control_flow",
         DenseOpcode::Return => "returns",
         DenseOpcode::Discard | DenseOpcode::Nop => "bookkeeping",
     }
@@ -51690,6 +51801,31 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn exit_inside_function_terminates_script() {
+        let message_exit = execute_source(
+            "<?php function stop_now() { echo \"before|\"; exit(\"halt\"); echo \"bad\"; } echo \"start|\"; stop_now(); echo \"bad\";",
+        );
+
+        assert!(
+            message_exit.status.is_success(),
+            "{:?}",
+            message_exit.status
+        );
+        assert_eq!(message_exit.output.as_bytes(), b"start|before|halt");
+        assert_eq!(message_exit.process_exit_code, Some(0));
+        assert_eq!(message_exit.return_value, None);
+
+        let code_exit = execute_source(
+            "<?php function stop_with_code() { echo \"before|\"; exit(3); echo \"bad\"; } echo \"start|\"; stop_with_code(); echo \"bad\";",
+        );
+
+        assert!(code_exit.status.is_success(), "{:?}", code_exit.status);
+        assert_eq!(code_exit.output.as_bytes(), b"start|before|");
+        assert_eq!(code_exit.process_exit_code, Some(3));
+        assert_eq!(code_exit.return_value, None);
+    }
+
+    #[test]
     fn control_flow_executes_while_do_and_for_loops() {
         let result = execute_source(
             "<?php $i = 0; while ($i < 3) { echo $i; $i++; } do { echo \"d\"; $i--; } while ($i > 2); for ($j = 0; $j < 3; $j++) { echo $j; }",
@@ -51717,6 +51853,16 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"ok0|ok0");
+    }
+
+    #[test]
+    fn short_circuit_coalesce_condition_uses_explicit_false_target() {
+        let result = execute_source(
+            "<?php $dsn = \"mysql://u:p@127.0.0.1:13306/db\"; if ($dsn === false || $dsn === \"\") { echo \"empty\"; exit; } $parts = parse_url($dsn); if ($parts === false || ($parts[\"scheme\"] ?? \"\") !== \"mysql\") { echo \"invalid\"; exit; } echo \"ok\";",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"ok");
     }
 
     #[test]

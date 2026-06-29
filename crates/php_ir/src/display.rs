@@ -1156,6 +1156,10 @@ fn format_terminator(kind: &TerminatorKind) -> String {
             (None, Some(local)) => format!("return_ref local:{}", local.raw()),
             (None, None) => "return".to_string(),
         },
+        TerminatorKind::Exit { value } => match value {
+            Some(value) => format!("exit {}", format_operand(value)),
+            None => "exit".to_string(),
+        },
     }
 }
 

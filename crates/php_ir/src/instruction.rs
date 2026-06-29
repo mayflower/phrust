@@ -623,6 +623,8 @@ pub enum TerminatorKind {
         value: Option<Operand>,
         by_ref_local: Option<LocalId>,
     },
+    /// Terminate the current script/request.
+    Exit { value: Option<Operand> },
 }
 
 /// A terminator plus source span.

@@ -334,6 +334,44 @@ mod tests {
     }
 
     #[test]
+    fn require_construct_keeps_concat_operand() {
+        let source = "<?php require __DIR__ . '/wp-blog-header.php';";
+        let parse = parse_source_file(source);
+        let debug = parse.debug_tree();
+
+        assert!(
+            !parse.has_errors(),
+            "unexpected parser diagnostics: {:?}",
+            parse.diagnostics()
+        );
+        assert!(debug.contains("CONSTRUCT_EXPR"));
+        assert!(debug.contains("BINARY_EXPR"));
+        assert!(debug.contains("T_REQUIRE"));
+        assert!(debug.contains("T_DIR"));
+        assert!(debug.contains("T_CONSTANT_ENCAPSED_STRING"));
+        assert_eq!(parse.reconstructed_text(), source);
+    }
+
+    #[test]
+    fn nested_statement_lists_accept_inline_html_segments() {
+        let source = "<?php if (false) { ?>\n<p>install check</p><?php echo 1; ?>\n<?php }";
+        let parse = parse_source_file(source);
+        let debug = parse.debug_tree();
+
+        assert!(
+            !parse.has_errors(),
+            "unexpected parser diagnostics: {:?}",
+            parse.diagnostics()
+        );
+        assert_eq!(parse.reconstructed_text(), source);
+        assert!(debug.contains("IF_STMT"));
+        assert!(debug.contains("BLOCK_STMT"));
+        assert!(debug.contains("INLINE_HTML"));
+        assert!(debug.contains("ECHO_STMT"));
+        assert_eq!(debug.matches("PHP_BLOCK").count(), 1);
+    }
+
+    #[test]
     fn source_file_grammar_models_php_and_html_segments() {
         let source = "<p>A</p><?php echo 1; ?><?= $b ?><p>C</p>";
         let parse = parse_source_file(source);
