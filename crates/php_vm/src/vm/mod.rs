@@ -1036,7 +1036,7 @@ struct DynamicClassEntry {
 
 enum ClassDependencyValidationFailure {
     Throwable(Value),
-    Result(VmResult),
+    Result(Box<VmResult>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10977,8 +10977,8 @@ impl Vm {
                         if let Err(message) = validate_property_access(
                             compiled,
                             stack,
-                            &resolved.class,
-                            &resolved.property,
+                            resolved.class,
+                            resolved.property,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -11020,15 +11020,15 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        let key = static_property_key(&resolved.class, &resolved.property);
+                        let key = static_property_key(resolved.class, resolved.property);
                         let current = if let Some(value) = state.static_properties.get(&key) {
                             value.clone()
                         } else {
                             match static_property_default(
                                 compiled,
                                 state,
-                                &resolved.class,
-                                &resolved.property,
+                                resolved.class,
+                                resolved.property,
                             ) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -11039,8 +11039,8 @@ impl Vm {
                         if let Err(message) = validate_static_property_write(
                             compiled,
                             stack,
-                            &resolved.class,
-                            &resolved.property,
+                            resolved.class,
+                            resolved.property,
                             &current,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
@@ -11208,7 +11208,7 @@ impl Vm {
                                         state,
                                         &mut exception_handlers,
                                         &mut pending_control,
-                                        result,
+                                        *result,
                                     ) {
                                         RaiseOutcome::Caught(target) => {
                                             block_id = target;
@@ -17737,7 +17737,7 @@ impl Vm {
                         }
                     }
                     InstructionKind::CallFunction { dst, name, args } => {
-                        let values = match read_call_args(unit, stack, args) {
+                        let values = match read_call_args_for_function(unit, stack, name, args) {
                             Ok(values) => values,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -28280,7 +28280,7 @@ impl Vm {
                 state.pending_trace = Some(capture_backtrace_string(compiled, stack));
                 Some(self.handle_uncaught_exception(compiled, output, stack, state, throwable))
             }
-            ClassDependencyValidationFailure::Result(result) => Some(result),
+            ClassDependencyValidationFailure::Result(result) => Some(*result),
         }
     }
 
@@ -28360,11 +28360,15 @@ impl Vm {
                                 Ok(throwable) => {
                                     ClassDependencyValidationFailure::Throwable(throwable)
                                 }
-                                Err(result) => ClassDependencyValidationFailure::Result(result),
+                                Err(result) => {
+                                    ClassDependencyValidationFailure::Result(Box::new(result))
+                                }
                             },
                         );
                     }
-                    Err(result) => return Some(ClassDependencyValidationFailure::Result(result)),
+                    Err(result) => {
+                        return Some(ClassDependencyValidationFailure::Result(Box::new(result)));
+                    }
                 }
             }
 
@@ -28372,14 +28376,14 @@ impl Vm {
                 if normalize_class_name(interface) == "datetimeinterface"
                     && !class_extends_datetime_implementation(declared_unit, class)
                 {
-                    return Some(ClassDependencyValidationFailure::Result(
+                    return Some(ClassDependencyValidationFailure::Result(Box::new(
                         self.datetime_interface_user_implementation_fatal(
                             declared_unit,
                             class,
                             output,
                             stack,
                         ),
-                    ));
+                    )));
                 }
                 let display = class_dependency_display_name(declared_unit, class, interface);
                 match self.class_like_exists_with_autoload_cache(
@@ -28405,11 +28409,15 @@ impl Vm {
                                 Ok(throwable) => {
                                     ClassDependencyValidationFailure::Throwable(throwable)
                                 }
-                                Err(result) => ClassDependencyValidationFailure::Result(result),
+                                Err(result) => {
+                                    ClassDependencyValidationFailure::Result(Box::new(result))
+                                }
                             },
                         );
                     }
-                    Err(result) => return Some(ClassDependencyValidationFailure::Result(result)),
+                    Err(result) => {
+                        return Some(ClassDependencyValidationFailure::Result(Box::new(result)));
+                    }
                 }
             }
         }
@@ -28503,10 +28511,19 @@ impl Vm {
         let Some(class_name) = values.first().and_then(reflection_value_string) else {
             return Ok(());
         };
+        let kind = match reflection_class.as_str() {
+            "reflectionclass" | "reflectionmethod" | "reflectionclassconstant" => {
+                AutoloadClassLookupKind::ClassLike
+            }
+            "reflectionenum" | "reflectionenumunitcase" | "reflectionenumbackedcase" => {
+                AutoloadClassLookupKind::Enum
+            }
+            _ => AutoloadClassLookupKind::Class,
+        };
         let exists = self.class_like_exists_with_autoload_cache(
             compiled,
             &class_name,
-            AutoloadClassLookupKind::Class,
+            kind,
             true,
             None,
             output,
@@ -40829,6 +40846,7 @@ fn class_like_exists_direct(
     kind: AutoloadClassLookupKind,
 ) -> bool {
     lookup_class_in_state(compiled, state, class_name).is_some_and(|class| match kind {
+        AutoloadClassLookupKind::ClassLike => true,
         AutoloadClassLookupKind::Interface => class.flags.is_interface,
         AutoloadClassLookupKind::Enum => class.flags.is_enum,
         AutoloadClassLookupKind::Trait => class.flags.is_trait,
@@ -40836,6 +40854,7 @@ fn class_like_exists_direct(
     }) || php_std::ExtensionRegistry::standard_library()
         .enabled_class(class_name)
         .is_some_and(|class| match kind {
+            AutoloadClassLookupKind::ClassLike => true,
             AutoloadClassLookupKind::Interface => {
                 matches!(class.kind(), php_std::ClassKind::Interface)
             }
@@ -45435,14 +45454,38 @@ fn dense_instruction_call_args(instruction: &DenseInstruction) -> Option<&[Dense
     }
 }
 
+fn read_call_args_for_function(
+    unit: &IrUnit,
+    stack: &CallStack,
+    function: &str,
+    args: &[IrCallArg],
+) -> Result<Vec<CallArgument>, String> {
+    read_call_args_with_value_policy(unit, stack, args, |index, arg| {
+        is_quiet_by_ref_internal_builtin_arg(function, index, arg)
+    })
+}
+
 fn read_call_args(
     unit: &IrUnit,
     stack: &CallStack,
     args: &[IrCallArg],
 ) -> Result<Vec<CallArgument>, String> {
+    read_call_args_with_value_policy(unit, stack, args, |_, _| false)
+}
+
+fn read_call_args_with_value_policy(
+    unit: &IrUnit,
+    stack: &CallStack,
+    args: &[IrCallArg],
+    mut use_null_placeholder: impl FnMut(usize, &IrCallArg) -> bool,
+) -> Result<Vec<CallArgument>, String> {
     let mut out = Vec::new();
-    for arg in args {
-        let value = read_operand(unit, stack, arg.value)?;
+    for (index, arg) in args.iter().enumerate() {
+        let value = if use_null_placeholder(index, arg) {
+            Value::Null
+        } else {
+            read_operand(unit, stack, arg.value)?
+        };
         if arg.unpack {
             if arg.name.is_some() {
                 return Err(
@@ -45507,6 +45550,13 @@ fn read_call_args(
         });
     }
     Ok(out)
+}
+
+fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &IrCallArg) -> bool {
+    arg.by_ref_local.is_some()
+        && !arg.unpack
+        && normalize_function_name(function) == "is_callable"
+        && (index == 2 || arg.name.as_deref() == Some("callable_name"))
 }
 
 fn call_args_to_positional(function: &str, args: Vec<CallArgument>) -> Result<Vec<Value>, String> {
@@ -53199,6 +53249,19 @@ echo perf_jit_unstable_types_debug(4), "\n";
     }
 
     #[test]
+    fn is_callable_named_out_parameter_does_not_warn_for_undefined_local() {
+        let result = execute_source(
+            "<?php function callable_name_helper() {} is_callable(callable_name_helper(...), callable_name: $name); var_dump($name);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"string(20) \"callable_name_helper\"\n"
+        );
+    }
+
+    #[test]
     fn function_calls_prefer_namespaced_user_function_over_context_builtin_fallback() {
         let result = execute_source(
             "<?php namespace Sodium; function is_callable($value) { return 'local'; } echo is_callable('strlen');",
@@ -56995,6 +57058,19 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         assert_eq!(
             result.output.as_bytes(),
             b"P21\\Ns\\Child|Child|P21\\Ns|namespace|abstract|class|notenum|P21\\Ns\\Base|P21\\Ns\\I|1:1:1"
+        );
+    }
+
+    #[test]
+    fn reflection_class_accepts_interface_targets() {
+        let result = execute_source(
+            "<?php interface ReflectionInterfaceMetadata { public function execute(string $value): string; } $class = new ReflectionClass(ReflectionInterfaceMetadata::class); echo $class->getName(), '|'; echo $class->isInterface() ? 'interface|' : 'class|'; echo $class->isInstantiable() ? 'instantiable|' : 'not-instantiable|'; echo $class->getMethods()[0]->getName();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"ReflectionInterfaceMetadata|interface|not-instantiable|execute"
         );
     }
 

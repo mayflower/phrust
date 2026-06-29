@@ -420,6 +420,7 @@ pub struct IncludePathCacheTarget {
 /// Class-like lookup flavor cached by autoload lookup IC slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoloadClassLookupKind {
+    ClassLike,
     Class,
     Interface,
     Trait,

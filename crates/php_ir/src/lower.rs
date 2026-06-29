@@ -495,6 +495,15 @@ struct MethodFunctionInput<'a> {
     main_function: FunctionId,
 }
 
+struct DeferredConstExprLoweringInput<'a> {
+    module: &'a HirModule,
+    named_constants: &'a HashMap<String, IrConstant>,
+    current_class: Option<&'a str>,
+    class_constants: &'a ClassConstantInitializerMap,
+    class_parents: &'a ClassParentMap,
+    visiting_class_constants: &'a mut Vec<(String, String)>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LoweredExpr {
     register: crate::ids::RegId,
@@ -2393,44 +2402,40 @@ impl LoweringContext<'_> {
             return None;
         }
         let named_constants = self.global_constant_initializer_map();
-        self.lower_deferred_const_expr(
+        let mut visiting_class_constants = Vec::new();
+        let mut input = DeferredConstExprLoweringInput {
             module,
-            const_expr.expr_id(),
-            &named_constants,
+            named_constants: &named_constants,
             current_class,
             class_constants,
             class_parents,
-            &mut Vec::new(),
-        )
+            visiting_class_constants: &mut visiting_class_constants,
+        };
+        self.lower_deferred_const_expr(&mut input, const_expr.expr_id())
     }
 
     fn lower_deferred_const_expr(
         &self,
-        module: &HirModule,
+        input: &mut DeferredConstExprLoweringInput<'_>,
         expr_id: ExprId,
-        named_constants: &HashMap<String, IrConstant>,
-        current_class: Option<&str>,
-        class_constants: &ClassConstantInitializerMap,
-        class_parents: &ClassParentMap,
-        visiting_class_constants: &mut Vec<(String, String)>,
     ) -> Option<DeferredConstExpr> {
         if let Some(value) = constant_from_expr_with_class_constants(
-            module,
+            input.module,
             expr_id,
-            named_constants,
-            current_class,
-            class_constants,
-            class_parents,
-            visiting_class_constants,
+            input.named_constants,
+            input.current_class,
+            input.class_constants,
+            input.class_parents,
+            input.visiting_class_constants,
         ) {
             return Some(DeferredConstExpr::Literal(value));
         }
 
-        let expr = module.expressions().get(expr_id)?;
+        let expr = input.module.expressions().get(expr_id)?;
         match expr.kind() {
             HirExprKind::Literal { text } => literal_constant(text).map(DeferredConstExpr::Literal),
             HirExprKind::Name { resolution } => language_constant(resolution.source())
-                .or_else(|| named_constant_value(named_constants, resolution))
+                .or_else(|| named_constant_value(input.named_constants, resolution))
                 .map(DeferredConstExpr::Literal)
                 .or_else(|| {
                     named_constant_reference_from_resolution(resolution)
@@ -2438,17 +2443,17 @@ impl LoweringContext<'_> {
                 }),
             HirExprKind::StaticAccess { target, member } => self
                 .lower_deferred_class_constant_reference(
-                    module,
+                    input.module,
                     *target,
                     *member,
-                    current_class,
-                    class_parents,
+                    input.current_class,
+                    input.class_parents,
                 )
                 .map(DeferredConstExpr::ClassConstant),
             HirExprKind::Array { elements } => {
                 let mut entries = Vec::with_capacity(elements.len());
                 for element_id in elements {
-                    let element = module.expressions().get(*element_id)?;
+                    let element = input.module.expressions().get(*element_id)?;
                     match element.kind() {
                         HirExprKind::ArrayPair {
                             key,
@@ -2460,38 +2465,14 @@ impl LoweringContext<'_> {
                                 return None;
                             }
                             let key = match key {
-                                Some(key) => Some(self.lower_deferred_const_expr(
-                                    module,
-                                    *key,
-                                    named_constants,
-                                    current_class,
-                                    class_constants,
-                                    class_parents,
-                                    visiting_class_constants,
-                                )?),
+                                Some(key) => Some(self.lower_deferred_const_expr(input, *key)?),
                                 None => None,
                             };
-                            let value = self.lower_deferred_const_expr(
-                                module,
-                                (*value)?,
-                                named_constants,
-                                current_class,
-                                class_constants,
-                                class_parents,
-                                visiting_class_constants,
-                            )?;
+                            let value = self.lower_deferred_const_expr(input, (*value)?)?;
                             entries.push(DeferredConstArrayEntry { key, value });
                         }
                         _ => {
-                            let value = self.lower_deferred_const_expr(
-                                module,
-                                *element_id,
-                                named_constants,
-                                current_class,
-                                class_constants,
-                                class_parents,
-                                visiting_class_constants,
-                            )?;
+                            let value = self.lower_deferred_const_expr(input, *element_id)?;
                             entries.push(DeferredConstArrayEntry { key: None, value });
                         }
                     }
@@ -5859,9 +5840,34 @@ impl LoweringContext<'_> {
         site: LowerSite,
         args: &[HirCallArg],
     ) -> Option<(Vec<IrCallArg>, BlockId)> {
+        self.lower_call_args_with_value_policy(builder, site, args, |_, _| false)
+    }
+
+    fn lower_call_args_for_function(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        function: &str,
+        args: &[HirCallArg],
+    ) -> Option<(Vec<IrCallArg>, BlockId)> {
+        self.lower_call_args_with_value_policy(builder, site, args, |index, arg| {
+            is_quiet_by_ref_internal_builtin_arg(function, index, arg)
+        })
+    }
+
+    fn lower_call_args_with_value_policy(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        args: &[HirCallArg],
+        mut use_null_placeholder: impl FnMut(usize, &HirCallArg) -> bool,
+    ) -> Option<(Vec<IrCallArg>, BlockId)> {
         let mut current = site.block;
         let mut operands = Vec::with_capacity(args.len());
-        for arg in args {
+        for (index, arg) in args.iter().enumerate() {
+            let by_ref_local = (!arg.unpack)
+                .then(|| self.variable_local(builder, site.function, arg.value))
+                .flatten();
             let dim_target = (!arg.unpack)
                 .then(|| self.dim_assignment_target(builder, site.function, arg.value))
                 .flatten()
@@ -5869,7 +5875,15 @@ impl LoweringContext<'_> {
             let property_target = (!arg.unpack)
                 .then(|| self.property_assignment_target(arg.value))
                 .flatten();
-            let (value, by_ref_dim, by_ref_property) = if let Some(target) = dim_target {
+            let (value, by_ref_dim, by_ref_property) = if by_ref_local.is_some()
+                && use_null_placeholder(index, arg)
+            {
+                (
+                    Operand::Constant(builder.intern_constant(IrConstant::Null)),
+                    None,
+                    None,
+                )
+            } else if let Some(target) = dim_target {
                 let mut dims = Vec::with_capacity(target.dims.len());
                 for dim in &target.dims {
                     let dim_value =
@@ -5904,10 +5918,7 @@ impl LoweringContext<'_> {
                     last = Some(dst);
                 }
                 (
-                    LoweredExpr {
-                        register: last.expect("dimension target has at least one dimension"),
-                        block: current,
-                    },
+                    Operand::Register(last.expect("dimension target has at least one dimension")),
                     Some(IrCallDimTarget {
                         local: target.local,
                         dims,
@@ -5938,10 +5949,7 @@ impl LoweringContext<'_> {
                     site.span,
                 );
                 (
-                    LoweredExpr {
-                        register: dst,
-                        block: current,
-                    },
+                    Operand::Register(dst),
                     None,
                     Some(IrCallPropertyTarget {
                         object: Operand::Register(object.register),
@@ -5952,16 +5960,14 @@ impl LoweringContext<'_> {
                 let value =
                     self.lower_expr_to_register(builder, site.function, current, arg.value)?;
                 current = value.block;
-                (value, None, None)
+                (Operand::Register(value.register), None, None)
             };
             operands.push(IrCallArg {
                 name: arg.name.clone(),
-                value: Operand::Register(value.register),
+                value,
                 unpack: arg.unpack,
                 value_kind: self.call_arg_value_kind(arg.value),
-                by_ref_local: (!arg.unpack)
-                    .then(|| self.variable_local(builder, site.function, arg.value))
-                    .flatten(),
+                by_ref_local,
                 by_ref_dim,
                 by_ref_property,
             });
@@ -6016,24 +6022,33 @@ impl LoweringContext<'_> {
             let target = self.static_method_call_target(callee)?;
             return self.lower_static_method_call_to_register(builder, site, target, args);
         }
-        let (operands, mut current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
-        let kind =
+        let (kind, current) =
             if let Some(name) = callee.and_then(|callee| self.static_function_call_name(callee)) {
-                InstructionKind::CallFunction {
-                    dst,
-                    name: normalize_function_name(&name),
-                    args: operands,
-                }
+                let normalized_name = normalize_function_name(&name);
+                let (operands, current) =
+                    self.lower_call_args_for_function(builder, site, &normalized_name, &args)?;
+                (
+                    InstructionKind::CallFunction {
+                        dst,
+                        name: normalized_name,
+                        args: operands,
+                    },
+                    current,
+                )
             } else if let Some(callee) = callee {
+                let (operands, mut current) = self.lower_call_args(builder, site, &args)?;
                 let callee_value =
                     self.lower_expr_to_register(builder, site.function, current, callee)?;
                 current = callee_value.block;
-                InstructionKind::CallCallable {
-                    dst,
-                    callee: Operand::Register(callee_value.register),
-                    args: operands,
-                }
+                (
+                    InstructionKind::CallCallable {
+                        dst,
+                        callee: Operand::Register(callee_value.register),
+                        args: operands,
+                    },
+                    current,
+                )
             } else {
                 self.unsupported(
                     UnsupportedFeature::DynamicFunctionCall,
@@ -12241,6 +12256,12 @@ fn named_constant_reference_from_resolution(
         display_name: resolution.source().trim_start_matches('\\').to_owned(),
         names,
     })
+}
+
+fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &HirCallArg) -> bool {
+    normalize_function_name(function) == "is_callable"
+        && !arg.unpack
+        && (index == 2 || arg.name.as_deref() == Some("callable_name"))
 }
 
 fn predefined_constant_initializer_map() -> HashMap<String, IrConstant> {
