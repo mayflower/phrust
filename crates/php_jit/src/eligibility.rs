@@ -1623,6 +1623,7 @@ fn check_instruction(
             ))
         }
         InstructionKind::FetchConst { .. }
+        | InstructionKind::RegisterConstant { .. }
         | InstructionKind::InitStaticLocal { .. }
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::Echo { .. }
@@ -1665,6 +1666,12 @@ fn check_terminator(
                 check_operand(*value, block, u32::MAX, constants, rejected, unknown);
             }
         }
+        TerminatorKind::Exit { .. } => rejected.push(JitEligibilityReason::instruction(
+            "JIT_ELIGIBILITY_REJECT_EXIT_TERMINATOR",
+            "exit/die terminates the VM and is outside the JIT subset",
+            block,
+            u32::MAX,
+        )),
     }
 }
 

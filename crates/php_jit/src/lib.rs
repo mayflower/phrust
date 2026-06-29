@@ -1250,6 +1250,17 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_rejects_register_constant_and_exit() {
+        let (unit, function) = register_constant_and_exit_fixture();
+        let report = analyze_jit_eligibility(&unit, function);
+
+        assert_eq!(report.eligibility.as_str(), "rejected");
+        let codes: Vec<_> = report.reasons.iter().map(|reason| reason.code).collect();
+        assert!(codes.contains(&"JIT_ELIGIBILITY_REJECT_OBSERVABLE_OPCODE"));
+        assert!(codes.contains(&"JIT_ELIGIBILITY_REJECT_EXIT_TERMINATOR"));
+    }
+
+    #[test]
     fn eligibility_rejects_untyped_parameters_without_profile() {
         let (unit, function) = untyped_param_fixture();
         let report = analyze_jit_eligibility(&unit, function);
@@ -1488,6 +1499,28 @@ mod tests {
         );
         builder.emit(function, block, InstructionKind::NewArray { dst: r0 }, span);
         builder.terminate_return(function, block, Some(Operand::Register(r1)), span);
+        (builder.finish(), function)
+    }
+
+    fn register_constant_and_exit_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/jit/register-constant-exit.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function =
+            builder.start_function("register_constant_and_exit", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        let block = builder.append_block(function);
+        let value = builder.add_constant(IrConstant::Int(1));
+        builder.emit(
+            function,
+            block,
+            InstructionKind::RegisterConstant {
+                name: "MY_CONST".to_owned(),
+                value: Operand::Constant(value),
+            },
+            span,
+        );
+        builder.terminate_exit(function, block, None, span);
         (builder.finish(), function)
     }
 }
