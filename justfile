@@ -31,6 +31,8 @@ help:
       '  just quality-docs         Treat rustdoc warnings and doctests as failures' \
       '  just quality-api          Check public API semver against a git baseline' \
       '  just quality-lints        Report pedantic/nursery Clippy findings' \
+      '  just sonar-coverage       Generate LCOV coverage for SonarQube' \
+      '  just sonar-scan           Run SonarQube scanner with Rust coverage' \
       '  just bootstrap-ref        Clone/pin the PHP reference checkout' \
       '  just verify-ref           Verify PHP reference checkout against lockfile' \
       '' \
@@ -209,6 +211,13 @@ quality-coverage:
     else \
       cargo llvm-cov --workspace --summary-only; \
     fi
+
+sonar-coverage:
+    mkdir -p target/sonar
+    cargo llvm-cov --workspace --lcov --output-path target/sonar/lcov.info
+
+sonar-scan *ARGS:
+    scripts/sonar/scan.sh {{ARGS}}
 
 quality-mutants:
     @if [[ "${PHRUST_RUN_MUTANTS:-0}" != "1" ]]; then \

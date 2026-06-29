@@ -52223,16 +52223,39 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
-    fn references_reject_unsupported_property_category_with_stable_id() {
+    fn references_lower_property_bindings_to_reference_ir() {
         let object_ref = php_ir::lower_frontend_result(
             &php_semantics::analyze_source(
                 "<?php class Box { public $p = 1; } $box = new Box(); $alias =& $box->p;",
             ),
             php_ir::LoweringOptions::default(),
         );
-        assert_eq!(
-            object_ref.diagnostics[0].id,
-            "E_PHP_IR_UNSUPPORTED_PROPERTY_REFERENCE"
+        assert!(
+            object_ref.diagnostics.is_empty(),
+            "{:?}",
+            object_ref.diagnostics
+        );
+        assert!(
+            object_ref.verification.is_ok(),
+            "{:?}",
+            object_ref.verification
+        );
+
+        let has_property_reference = object_ref.unit.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        InstructionKind::BindReferenceProperty { .. }
+                            | InstructionKind::BindReferencePropertyDim { .. }
+                            | InstructionKind::BindReferenceDimFromProperty { .. }
+                    )
+                })
+            })
+        });
+        assert!(
+            has_property_reference,
+            "expected property reference binding in lowered IR"
         );
     }
 

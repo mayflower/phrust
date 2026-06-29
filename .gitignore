@@ -7,6 +7,7 @@ coverage/
 coverage-*/
 tarpaulin-report.html
 lcov.info
+.scannerwork/
 
 # Cargo/local tool state
 .cargo/.package-cache

@@ -43,6 +43,7 @@
                 cargo-mutants
                 cargo-fuzz
                 cargo-semver-checks
+                sonar-scanner-cli
                 python3
               ];
               PHP_REF_SERIES = "8.5";
@@ -108,6 +109,7 @@
             cargo-mutants
             cargo-fuzz
             cargo-semver-checks
+            sonar-scanner-cli
 
             python3
           ];

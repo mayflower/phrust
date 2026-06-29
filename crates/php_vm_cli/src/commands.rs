@@ -5326,6 +5326,11 @@ mod tests {
 
     #[test]
     fn syntax_error_returns_compile_error_with_path_and_span() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var("PHRUST_ERROR_FORMAT").ok();
+        unsafe {
+            env::remove_var("PHRUST_ERROR_FORMAT");
+        }
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run(
@@ -5336,6 +5341,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
         );
+        restore_env("PHRUST_ERROR_FORMAT", previous);
 
         assert_eq!(code, EXIT_COMPILE_ERROR);
         assert!(stdout.is_empty());

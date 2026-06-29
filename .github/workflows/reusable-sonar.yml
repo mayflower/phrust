@@ -1,0 +1,68 @@
+name: reusable sonar
+
+on:
+  workflow_call:
+    inputs:
+      run_coverage:
+        description: "Whether the SonarQube scan should generate Rust LCOV coverage"
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: sonar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarqube:
+    name: sonarqube scan
+    runs-on: mayflower-k8s-runners
+    steps:
+      - name: Check SonarQube secrets availability
+        id: sonar_secrets
+        run: |
+          if [ -z "${{ secrets.SONAR_TOKEN }}" ] || [ -z "${{ secrets.SONAR_HOST_URL }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "SonarQube secrets are not configured; skipping SonarQube scan."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: ${{ steps.sonar_secrets.outputs.skip != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        if: ${{ steps.sonar_secrets.outputs.skip != 'true' }}
+        uses: DeterminateSystems/nix-installer-action@v17
+
+      - name: Enable Nix cache
+        if: ${{ steps.sonar_secrets.outputs.skip != 'true' }}
+        uses: DeterminateSystems/magic-nix-cache-action@v10
+
+      - name: Cache SonarQube scanner
+        if: ${{ steps.sonar_secrets.outputs.skip != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: sonar-${{ runner.os }}-${{ hashFiles('sonar-project.properties') }}
+          restore-keys: sonar-${{ runner.os }}-
+
+      - name: SonarQube Scan
+        if: ${{ steps.sonar_secrets.outputs.skip != 'true' }}
+        env:
+          PHRUST_SONAR_COVERAGE: ${{ inputs.run_coverage && '1' || '0' }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: nix develop -c just sonar-scan

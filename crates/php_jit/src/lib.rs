@@ -1250,6 +1250,20 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_rejects_property_reference_opcodes() {
+        let (unit, function) = rejected_property_references_fixture();
+        let report = analyze_jit_eligibility(&unit, function);
+
+        assert_eq!(report.eligibility.as_str(), "rejected");
+        let reference_rejections = report
+            .reasons
+            .iter()
+            .filter(|reason| reason.code == "JIT_ELIGIBILITY_REJECT_REFERENCE_OPCODE")
+            .count();
+        assert_eq!(reference_rejections, 3);
+    }
+
+    #[test]
     fn eligibility_rejects_untyped_parameters_without_profile() {
         let (unit, function) = untyped_param_fixture();
         let report = analyze_jit_eligibility(&unit, function);
@@ -1488,6 +1502,57 @@ mod tests {
         );
         builder.emit(function, block, InstructionKind::NewArray { dst: r0 }, span);
         builder.terminate_return(function, block, Some(Operand::Register(r1)), span);
+        (builder.finish(), function)
+    }
+
+    fn rejected_property_references_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/jit/rejected-property-ref.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function =
+            builder.start_function("rejected_property_ref", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        let block = builder.append_block(function);
+        let source = builder.intern_local(function, "source");
+        let target = builder.intern_local(function, "target");
+        let object = builder.alloc_register(function);
+        let offset = builder.add_constant(IrConstant::Int(0));
+
+        builder.emit(
+            function,
+            block,
+            InstructionKind::BindReferenceProperty {
+                object: Operand::Register(object),
+                property: "value".to_owned(),
+                source,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::BindReferencePropertyDim {
+                object: Operand::Register(object),
+                property: "value".to_owned(),
+                dims: vec![Operand::Constant(offset)],
+                append: false,
+                source,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::BindReferenceDimFromProperty {
+                local: target,
+                dims: vec![Operand::Constant(offset)],
+                append: false,
+                object: Operand::Register(object),
+                property: "value".to_owned(),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, None, span);
         (builder.finish(), function)
     }
 }

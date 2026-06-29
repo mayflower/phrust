@@ -1519,6 +1519,9 @@ fn check_instruction(
         InstructionKind::BindReference { .. }
         | InstructionKind::BindGlobal { .. }
         | InstructionKind::BindReferenceDim { .. }
+        | InstructionKind::BindReferenceProperty { .. }
+        | InstructionKind::BindReferencePropertyDim { .. }
+        | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromCall { .. } => {
             rejected.push(JitEligibilityReason::instruction(

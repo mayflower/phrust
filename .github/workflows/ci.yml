@@ -134,6 +134,19 @@ jobs:
           if-no-files-found: ignore
           path: target/phpt-work/ci/**
 
+  sonarqube:
+    name: sonarqube
+    needs:
+      - rust
+      - quality-fast
+      - domain-gates
+      - phpt-smoke
+    if: ${{ always() }}
+    uses: ./.github/workflows/reusable-sonar.yml
+    with:
+      run_coverage: true
+    secrets: inherit
+
   quality:
     name: rust quality
     runs-on: mayflower-k8s-runners

@@ -756,13 +756,13 @@ fn raw_parameter_attribute_ranges(tokens: &[TypeToken]) -> Vec<TextRange> {
             "[" => attribute_depth += 1,
             "]" => {
                 attribute_depth = attribute_depth.saturating_sub(1);
-                if attribute_depth == 0 {
-                    if let Some(start) = start.take() {
-                        ranges.push(TextRange::new(
-                            start.start().to_usize(),
-                            token.range.end().to_usize(),
-                        ));
-                    }
+                if attribute_depth == 0
+                    && let Some(start) = start.take()
+                {
+                    ranges.push(TextRange::new(
+                        start.start().to_usize(),
+                        token.range.end().to_usize(),
+                    ));
                 }
             }
             _ => {}
