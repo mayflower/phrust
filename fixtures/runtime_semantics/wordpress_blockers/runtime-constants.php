@@ -97,3 +97,9 @@ $names = [
 foreach ($names as $name) {
     echo $name, "=", defined($name) ? "yes" : "no", "\n";
 }
+
+$tmp = tempnam(sys_get_temp_dir(), "wpb");
+file_put_contents($tmp, "alpha");
+file_put_contents($tmp, "+beta", FILE_APPEND | LOCK_EX);
+echo "append-lock=", file_get_contents($tmp), "\n";
+unlink($tmp);

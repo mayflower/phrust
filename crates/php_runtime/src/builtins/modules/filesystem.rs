@@ -8,6 +8,8 @@ use crate::{StreamWrapperRegistry, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const FILE_APPEND_FLAG: i64 = 8;
+
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("basename", builtin_basename, BuiltinCompatibility::Php),
     BuiltinEntry::new("chdir", builtin_chdir, BuiltinCompatibility::Php),
@@ -497,11 +499,26 @@ pub(in crate::builtins::modules) fn builtin_file_put_contents(
     let bytes = string_arg("file_put_contents", &args[1])?
         .as_bytes()
         .to_vec();
+    let flags = args
+        .get(2)
+        .map(|value| int_arg("file_put_contents", value))
+        .transpose()?
+        .unwrap_or(0);
     let resolved = resolve_runtime_path(context, &path);
     if !context.filesystem_capabilities().allows_path(&resolved) {
         return Ok(Value::Bool(false));
     }
-    Ok(fs::write(&resolved, &bytes).map_or(Value::Bool(false), |_| Value::Int(bytes.len() as i64)))
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    if flags & FILE_APPEND_FLAG != 0 {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    Ok(options
+        .open(&resolved)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
+        .map_or(Value::Bool(false), |_| Value::Int(bytes.len() as i64)))
 }
 
 pub(in crate::builtins::modules) fn builtin_readfile(

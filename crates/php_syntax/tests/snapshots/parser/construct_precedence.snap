@@ -2,10 +2,10 @@ fixture: valid/construct_precedence.php
 roundtrip_ok: true
 diagnostics: 0
 
-SOURCE_FILE @0..199
-  PHP_BLOCK @0..199
+SOURCE_FILE @0..331
+  PHP_BLOCK @0..331
     T_OPEN_TAG @0..6 line=1 text="<?php\n"
-    STATEMENT_LIST @6..199
+    STATEMENT_LIST @6..331
       EXPR_STMT @6..43
         EXPR @6..42
           CONSTRUCT_EXPR @6..42
@@ -70,19 +70,71 @@ SOURCE_FILE @0..199
                   T_CONSTANT_ENCAPSED_STRING @150..176 line=5 text="\"/_data/required-once.php\""
         ; @176..177 line=5 text=";"
       T_WHITESPACE @177..178 line=5 text="\n"
-      EXPR_STMT @178..198
-        EXPR @178..197
-          CONSTRUCT_EXPR @178..197
-            T_PRINT @178..183 line=6 text="print"
-            T_WHITESPACE @183..184 line=6 text=" "
-            BINARY_EXPR @184..197
-              STRING @184..190
-                T_CONSTANT_ENCAPSED_STRING @184..190 line=6 text="\"done\""
-              T_WHITESPACE @190..191 line=6 text=" "
-              . @191..192 line=6 text="."
-              EXPR @192..197
-                T_WHITESPACE @192..193 line=6 text=" "
-                STRING @193..197
-                  T_CONSTANT_ENCAPSED_STRING @193..197 line=6 text="\"\\n\""
-        ; @197..198 line=6 text=";"
-      T_WHITESPACE @198..199 line=6 text="\n"
+      EXPR_STMT @178..240
+        ASSIGN_EXPR @178..239
+          VARIABLE @178..185
+            T_VARIABLE @178..185 line=6 text="$loaded"
+          T_WHITESPACE @185..186 line=6 text=" "
+          = @186..187 line=6 text="="
+          EXPR @187..239
+            T_WHITESPACE @187..188 line=6 text=" "
+            CONSTRUCT_EXPR @188..239
+              T_INCLUDE_ONCE @188..200 line=6 text="include_once"
+              T_WHITESPACE @200..201 line=6 text=" "
+              EXPR @201..239
+                PARENTHESIZED_EXPR @201..239
+                  ( @201..202 line=6 text="("
+                  BINARY_EXPR @202..238
+                    LITERAL @202..209
+                      T_DIR @202..209 line=6 text="__DIR__"
+                    T_WHITESPACE @209..210 line=6 text=" "
+                    . @210..211 line=6 text="."
+                    EXPR @211..238
+                      T_WHITESPACE @211..212 line=6 text=" "
+                      STRING @212..238
+                        T_CONSTANT_ENCAPSED_STRING @212..238 line=6 text="\"/_data/assigned-once.php\""
+                  ) @238..239 line=6 text=")"
+        ; @239..240 line=6 text=";"
+      T_WHITESPACE @240..241 line=6 text="\n"
+      EXPR_STMT @241..309
+        ASSIGN_EXPR @241..308
+          VARIABLE @241..250
+            T_VARIABLE @241..250 line=7 text="$required"
+          T_WHITESPACE @250..251 line=7 text=" "
+          = @251..252 line=7 text="="
+          EXPR @252..308
+            T_WHITESPACE @252..253 line=7 text=" "
+            CONSTRUCT_EXPR @253..308
+              T_REQUIRE @253..260 line=7 text="require"
+              T_WHITESPACE @260..261 line=7 text=" "
+              EXPR @261..308
+                PARENTHESIZED_EXPR @261..308
+                  ( @261..262 line=7 text="("
+                  BINARY_EXPR @262..307
+                    LITERAL @262..269
+                      T_DIR @262..269 line=7 text="__DIR__"
+                    T_WHITESPACE @269..270 line=7 text=" "
+                    . @270..271 line=7 text="."
+                    EXPR @271..307
+                      T_WHITESPACE @271..272 line=7 text=" "
+                      STRING @272..307
+                        T_CONSTANT_ENCAPSED_STRING @272..307 line=7 text="\"/_data/required-parenthesized.php\""
+                  ) @307..308 line=7 text=")"
+        ; @308..309 line=7 text=";"
+      T_WHITESPACE @309..310 line=7 text="\n"
+      EXPR_STMT @310..330
+        EXPR @310..329
+          CONSTRUCT_EXPR @310..329
+            T_PRINT @310..315 line=8 text="print"
+            T_WHITESPACE @315..316 line=8 text=" "
+            BINARY_EXPR @316..329
+              STRING @316..322
+                T_CONSTANT_ENCAPSED_STRING @316..322 line=8 text="\"done\""
+              T_WHITESPACE @322..323 line=8 text=" "
+              . @323..324 line=8 text="."
+              EXPR @324..329
+                T_WHITESPACE @324..325 line=8 text=" "
+                STRING @325..329
+                  T_CONSTANT_ENCAPSED_STRING @325..329 line=8 text="\"\\n\""
+        ; @329..330 line=8 text=";"
+      T_WHITESPACE @330..331 line=8 text="\n"

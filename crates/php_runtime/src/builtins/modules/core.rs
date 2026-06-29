@@ -8067,6 +8067,30 @@ mod tests {
             ),
             Value::string("onetwo")
         );
+        assert_eq!(
+            call_with_fs(
+                "file_put_contents",
+                vec![
+                    Value::string("append.txt"),
+                    Value::string("three"),
+                    Value::Int(10)
+                ],
+                &mut output,
+                root.clone(),
+                capabilities.clone(),
+            ),
+            Value::Int(5)
+        );
+        assert_eq!(
+            call_with_fs(
+                "file_get_contents",
+                vec![Value::string("append.txt")],
+                &mut output,
+                root.clone(),
+                capabilities.clone(),
+            ),
+            Value::string("onetwothree")
+        );
 
         assert_eq!(
             call_with_fs_resources(
