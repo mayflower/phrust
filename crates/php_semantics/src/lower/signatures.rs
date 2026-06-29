@@ -205,7 +205,14 @@ impl SignatureLowerer<'_> {
     }
 
     fn structured_param_type(&mut self, param: Param<'_>) -> Option<TypeId> {
+        let attribute_ranges = parameter_attribute_ranges(param.syntax());
         for child in syntax_child_nodes(param.syntax()) {
+            if attribute_ranges
+                .iter()
+                .any(|range| range_contains(*range, child.text_range()))
+            {
+                continue;
+            }
             if let Some(type_view) = TypeView::cast(child) {
                 return lower_type(
                     type_view,
@@ -282,12 +289,15 @@ impl SignatureLowerer<'_> {
     }
 
     fn lower_raw_param(&mut self, tokens: &[TypeToken]) -> Option<Parameter> {
-        let variable = tokens.iter().find(|token| token.kind == "T_VARIABLE")?;
-        let variable_index = tokens
+        let signature_tokens = raw_tokens_without_attributes(tokens);
+        let variable = signature_tokens
+            .iter()
+            .find(|token| token.kind == "T_VARIABLE")?;
+        let variable_index = signature_tokens
             .iter()
             .position(|token| token.kind == "T_VARIABLE")
             .expect("variable found above");
-        let type_tokens = raw_param_type_tokens(&tokens[..variable_index]);
+        let type_tokens = raw_param_type_tokens(&signature_tokens[..variable_index]);
         let type_id = type_tokens.and_then(|type_tokens| {
             lower_type_tokens(
                 &type_tokens,
@@ -299,19 +309,22 @@ impl SignatureLowerer<'_> {
                 self.in_class_like_context(),
             )
         });
-        let default = raw_default_value_ref(tokens, true);
-        let promoted_property = promoted_property_info_from_tokens(&tokens[..variable_index]);
-        let attributes = token_range(tokens)
-            .map(ParameterAttribute::new)
+        let default = raw_default_value_ref(&signature_tokens, true);
+        let promoted_property =
+            promoted_property_info_from_tokens(&signature_tokens[..variable_index]);
+        let attributes = raw_parameter_attribute_ranges(tokens)
             .into_iter()
+            .map(ParameterAttribute::new)
             .collect();
         let span = token_range(tokens).unwrap_or(variable.range);
         Some(Parameter::new(
             variable.text.clone(),
             type_id,
             ParameterFlags::new(
-                tokens[..variable_index].iter().any(is_ampersand_type_token),
-                tokens[..variable_index]
+                signature_tokens[..variable_index]
+                    .iter()
+                    .any(is_ampersand_type_token),
+                signature_tokens[..variable_index]
                     .iter()
                     .any(|token| token.kind == "T_ELLIPSIS" || token.text == "..."),
                 promoted_property,
@@ -545,12 +558,29 @@ fn by_ref_return(node: &SyntaxNode) -> bool {
 }
 
 fn parameter_type_tokens(param: &SyntaxNode) -> Option<Vec<TypeToken>> {
+    let attribute_ranges = parameter_attribute_ranges(param);
     let tokens: Vec<TypeToken> = syntax_child_tokens(param)
         .filter(|token| !token.kind().is_trivia())
+        .filter(|token| {
+            !attribute_ranges
+                .iter()
+                .any(|range| range_contains(*range, token.text_range()))
+        })
         .take_while(|token| token.kind().name() != "T_VARIABLE")
         .map(type_token_from_syntax_token)
         .collect();
     non_empty_type_tokens(tokens)
+}
+
+fn parameter_attribute_ranges(param: &SyntaxNode) -> Vec<TextRange> {
+    syntax_child_nodes(param)
+        .filter_map(AttributeGroup::cast)
+        .map(|attribute| attribute.syntax().text_range())
+        .collect()
+}
+
+fn range_contains(outer: TextRange, inner: TextRange) -> bool {
+    outer.start() <= inner.start() && inner.end() <= outer.end()
 }
 
 fn default_value_ref(param: &SyntaxNode, const_expr_candidate: bool) -> Option<DefaultValueRef> {
@@ -686,6 +716,63 @@ fn raw_method_parameter_tokens(tokens: &[TypeToken]) -> Vec<Vec<TypeToken>> {
         }
     }
     out
+}
+
+fn raw_tokens_without_attributes(tokens: &[TypeToken]) -> Vec<TypeToken> {
+    let mut out = Vec::new();
+    let mut attribute_depth = 0usize;
+    for token in tokens {
+        if attribute_depth > 0 {
+            match token.text.as_str() {
+                "[" => attribute_depth += 1,
+                "]" => attribute_depth = attribute_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+        if is_attribute_start_token(token) {
+            attribute_depth = 1;
+            continue;
+        }
+        out.push(token.clone());
+    }
+    out
+}
+
+fn raw_parameter_attribute_ranges(tokens: &[TypeToken]) -> Vec<TextRange> {
+    let mut ranges = Vec::new();
+    let mut start: Option<TextRange> = None;
+    let mut attribute_depth = 0usize;
+    for token in tokens {
+        if attribute_depth == 0 {
+            if is_attribute_start_token(token) {
+                start = Some(token.range);
+                attribute_depth = 1;
+            }
+            continue;
+        }
+
+        match token.text.as_str() {
+            "[" => attribute_depth += 1,
+            "]" => {
+                attribute_depth = attribute_depth.saturating_sub(1);
+                if attribute_depth == 0 {
+                    if let Some(start) = start.take() {
+                        ranges.push(TextRange::new(
+                            start.start().to_usize(),
+                            token.range.end().to_usize(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+fn is_attribute_start_token(token: &TypeToken) -> bool {
+    token.kind == "T_ATTRIBUTE" || token.text == "#["
 }
 
 fn raw_return_type_tokens(tokens: &[TypeToken]) -> Option<Vec<TypeToken>> {
@@ -897,6 +984,38 @@ mod tests {
         assert_eq!(signature.parameters().len(), 3);
         assert!(signature.parameters()[1].flags().is_by_ref());
         assert!(signature.parameters()[2].flags().is_variadic());
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn parameter_attributes_do_not_become_fallback_types() {
+        let parse = parse_source_file(
+            "<?php
+            function f(#[\\SensitiveParameter] $password, #[Attr] string $name): void {}
+            class C {
+                public function m(#[\\SensitiveParameter] $password, #[Attr] string $name): void {}
+            }",
+        );
+        let root = source_file(parse.root()).expect("source");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", 0));
+        let mut reporter = DiagnosticReporter::new();
+        collect_signatures_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        for signature in module.signatures() {
+            assert_eq!(signature.parameters().len(), 2);
+            assert!(signature.parameters()[0].type_id().is_none());
+            assert!(signature.parameters()[1].type_id().is_some());
+            assert_eq!(signature.parameters()[0].attributes().len(), 1);
+            assert_eq!(signature.parameters()[1].attributes().len(), 1);
+        }
         assert!(reporter.into_diagnostics().is_empty());
     }
 

@@ -1046,7 +1046,9 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::BindReference { .. }
         | InstructionKind::BindGlobal { .. }
         | InstructionKind::BindReferenceDim { .. }
+        | InstructionKind::BindReferenceProperty { .. }
         | InstructionKind::BindReferencePropertyDim { .. }
+        | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromCall { .. }
         | InstructionKind::InitStaticLocal { .. }
@@ -1310,6 +1312,13 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
         InstructionKind::IssetPropertyDim { object, dims, .. }
         | InstructionKind::EmptyPropertyDim { object, dims, .. }
         | InstructionKind::BindReferencePropertyDim { object, dims, .. } => {
+            remap_operand_constants(object, remap);
+            remap_operands_constants(dims, remap);
+        }
+        InstructionKind::BindReferenceProperty { object, .. } => {
+            remap_operand_constants(object, remap);
+        }
+        InstructionKind::BindReferenceDimFromProperty { object, dims, .. } => {
             remap_operand_constants(object, remap);
             remap_operands_constants(dims, remap);
         }
@@ -1591,6 +1600,13 @@ fn rewrite_instruction_register_operands(
         InstructionKind::IssetPropertyDim { object, dims, .. }
         | InstructionKind::EmptyPropertyDim { object, dims, .. }
         | InstructionKind::BindReferencePropertyDim { object, dims, .. } => {
+            rewrite_operand_registers(object, aliases);
+            rewrite_operands_registers(dims, aliases);
+        }
+        InstructionKind::BindReferenceProperty { object, .. } => {
+            rewrite_operand_registers(object, aliases);
+        }
+        InstructionKind::BindReferenceDimFromProperty { object, dims, .. } => {
             rewrite_operand_registers(object, aliases);
             rewrite_operands_registers(dims, aliases);
         }

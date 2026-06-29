@@ -48,6 +48,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "mysqli_get_server_info",
+        builtin_mysqli_get_server_info,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "mysqli_escape_string",
         builtin_mysqli_real_escape_string,
         BuiltinCompatibility::Php,
@@ -157,7 +162,7 @@ pub(in crate::builtins::modules) fn builtin_mysqli_real_connect(
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    expect_mysqli_arity("mysqli_real_connect", args.len(), 1, 7)?;
+    expect_mysqli_arity("mysqli_real_connect", args.len(), 1, 8)?;
     let object = mysqli_object_arg("mysqli_real_connect", args.first())?;
     let connection = connect_from_test_dsn(context)?;
     let Value::Object(connected) = connection else {
@@ -328,6 +333,22 @@ pub(in crate::builtins::modules) fn builtin_mysqli_error(
         },
     );
     Ok(Value::String(PhpString::from(error.into_bytes())))
+}
+
+pub(in crate::builtins::modules) fn builtin_mysqli_get_server_info(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("mysqli_get_server_info", &args, 1)?;
+    let object = mysqli_object_arg("mysqli_get_server_info", args.first())?;
+    let Some(id) = mysqli_connection_id(&object) else {
+        return Ok(Value::String(PhpString::from("")));
+    };
+    let info = context
+        .mysql_state()
+        .map_or_else(String::new, |state| state.server_info(id));
+    Ok(Value::String(PhpString::from(info.into_bytes())))
 }
 
 pub(in crate::builtins::modules) fn builtin_mysqli_affected_rows(
@@ -638,4 +659,47 @@ fn expect_mysqli_arity(
         "E_PHP_RUNTIME_BUILTIN_ARITY",
         format!("builtin {name} expects {expected}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OutputBuffer;
+
+    #[test]
+    fn mysqli_real_connect_accepts_php_flags_argument() {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        let result = builtin_mysqli_real_connect(
+            &mut context,
+            vec![
+                Value::Object(mysqli_object(None)),
+                Value::string("127.0.0.1"),
+                Value::string("wordpress"),
+                Value::string("secret"),
+                Value::string("wordpress"),
+                Value::Int(3306),
+                Value::Null,
+                Value::Int(0),
+            ],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("eight-argument mysqli_real_connect should pass arity");
+
+        assert!(matches!(result, Value::Bool(false)));
+    }
+
+    #[test]
+    fn mysqli_get_server_info_is_available_for_capability_checks() {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        let result = builtin_mysqli_get_server_info(
+            &mut context,
+            vec![Value::Object(mysqli_object(None))],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("mysqli_get_server_info should be available");
+
+        assert!(matches!(result, Value::String(_)));
+    }
 }

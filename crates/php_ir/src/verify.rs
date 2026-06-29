@@ -355,6 +355,10 @@ fn verify_instruction(
                 verify_operand(dim, function, unit, errors);
             }
         }
+        InstructionKind::BindReferenceProperty { object, source, .. } => {
+            verify_operand(object, function, unit, errors);
+            verify_local(*source, function.local_count, errors);
+        }
         InstructionKind::BindReferencePropertyDim {
             object,
             dims,
@@ -363,6 +367,18 @@ fn verify_instruction(
         } => {
             verify_operand(object, function, unit, errors);
             verify_local(*source, function.local_count, errors);
+            for dim in dims {
+                verify_operand(dim, function, unit, errors);
+            }
+        }
+        InstructionKind::BindReferenceDimFromProperty {
+            local,
+            dims,
+            object,
+            ..
+        } => {
+            verify_local(*local, function.local_count, errors);
+            verify_operand(object, function, unit, errors);
             for dim in dims {
                 verify_operand(dim, function, unit, errors);
             }
@@ -1225,6 +1241,15 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
                 operand_register_uses(dim, uses);
             }
         }
+        InstructionKind::BindReferenceProperty { object, .. } => {
+            operand_register_uses(object, uses);
+        }
+        InstructionKind::BindReferenceDimFromProperty { dims, object, .. } => {
+            operand_register_uses(object, uses);
+            for dim in dims {
+                operand_register_uses(dim, uses);
+            }
+        }
         InstructionKind::Binary { lhs, rhs, .. }
         | InstructionKind::Compare { lhs, rhs, .. }
         | InstructionKind::ArrayGet {
@@ -1436,7 +1461,9 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::BindReference { .. }
         | InstructionKind::BindGlobal { .. }
         | InstructionKind::BindReferenceDim { .. }
+        | InstructionKind::BindReferenceProperty { .. }
         | InstructionKind::BindReferencePropertyDim { .. }
+        | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromCall { .. }
         | InstructionKind::InitStaticLocal { .. }

@@ -8766,7 +8766,7 @@ impl Vm {
         ) {
             self.record_counter_dense_property_fallback("reference_slot");
         }
-        object.set_property(&storage_name, value.clone());
+        write_property_storage_value(&object, &storage_name, value.clone());
         self.maybe_install_property_assign_inline_cache_target(
             compiled,
             function_id,
@@ -10271,6 +10271,52 @@ impl Vm {
                             &dims,
                         );
                     }
+                    InstructionKind::BindReferenceProperty {
+                        object,
+                        property,
+                        source,
+                    } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_REF_NON_OBJECT: cannot bind property on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let cell = match stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .locals
+                            .ensure_reference_cell(*source)
+                        {
+                            Ok(cell) => cell,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) = bind_property_to_reference_cell(
+                            compiled, state, stack, &object, property, cell,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
                     InstructionKind::BindReferencePropertyDim {
                         object,
                         property,
@@ -10322,6 +10368,57 @@ impl Vm {
                         if let Err(message) = bind_property_dim_to_reference_cell(
                             compiled, state, stack, &object, property, &dims, *append, cell,
                         ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
+                    InstructionKind::BindReferenceDimFromProperty {
+                        local,
+                        dims,
+                        append,
+                        object,
+                        property,
+                    } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_REF_DIM_SOURCE_NON_OBJECT: cannot reference property on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match read_dim_operands(unit, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let cell = match ensure_property_reference_cell(
+                            compiled, stack, &object, property,
+                        ) {
+                            Ok(cell) => cell,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) =
+                            bind_dim_local_to_reference_cell(stack, *local, &dims, *append, cell)
+                        {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }
@@ -14563,7 +14660,7 @@ impl Vm {
                         ) {
                             self.record_counter_property_assign_ic_fallback("reference_slot");
                         }
-                        object.set_property(&storage_name, value.clone());
+                        write_property_storage_value(&object, &storage_name, value.clone());
                         self.maybe_install_property_assign_inline_cache_target(
                             compiled,
                             function_id,
@@ -43398,6 +43495,20 @@ fn bind_dim_value_to_reference_cell(
     bind_dim_value_to_reference_cell(child, rest, append, cell)
 }
 
+fn bind_property_to_reference_cell(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    object: &ObjectRef,
+    property: &str,
+    cell: ReferenceCell,
+) -> Result<(), String> {
+    let storage_name =
+        property_dimension_storage_name(compiled, state, stack, object, property, true)?;
+    object.set_property(storage_name, Value::Reference(cell));
+    Ok(())
+}
+
 fn bind_property_dim_to_reference_cell(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -43482,6 +43593,13 @@ fn ensure_value_reference_cell(value: &mut Value) -> ReferenceCell {
             *value = Value::Reference(cell.clone());
             cell
         }
+    }
+}
+
+fn write_property_storage_value(object: &ObjectRef, storage_name: &str, value: Value) {
+    match object.get_property(storage_name) {
+        Some(Value::Reference(cell)) => cell.set(value),
+        _ => object.set_property(storage_name, value),
     }
 }
 
@@ -52143,6 +52261,31 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn lvalue_property_references_bind_selected_cells() {
+        let property_target = execute_source(
+            "<?php class C { public $p; } $c = new C(); $v = 1; $c->p =& $v; $v = 3; echo $c->p; $c->p = 5; echo '|', $v;",
+        );
+
+        assert!(
+            property_target.status.is_success(),
+            "{:?}",
+            property_target.status
+        );
+        assert_eq!(property_target.output.as_bytes(), b"3|5");
+
+        let property_source = execute_source(
+            "<?php class C { public $p = 1; } $c = new C(); $a = []; $a['p'] =& $c->p; $c->p = 4; echo $a['p']; $a['p'] = 7; echo '|', $c->p;",
+        );
+
+        assert!(
+            property_source.status.is_success(),
+            "{:?}",
+            property_source.status
+        );
+        assert_eq!(property_source.output.as_bytes(), b"4|7");
+    }
+
+    #[test]
     fn lvalue_array_append_by_reference_binds_new_element() {
         let result = execute_source("<?php $a = []; $b = 2; $a[] =& $b; $b = 5; echo $a[0];");
 
@@ -54663,6 +54806,15 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         );
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"4|4");
+    }
+
+    #[test]
+    fn call_by_ref_method_return_executes() {
+        let result = execute_source(
+            "<?php class C { public function &counter() { static $x = 0; return $x; } } $c = new C(); echo $c->counter();",
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"0");
     }
 
     #[test]

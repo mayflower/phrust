@@ -220,6 +220,16 @@ impl MysqlState {
         )
     }
 
+    /// Returns server information for capability checks.
+    #[must_use]
+    pub fn server_info(&self, id: i64) -> String {
+        self.connections
+            .get(&id)
+            .map_or_else(String::new, |connection| {
+                connection.connection.server_info()
+            })
+    }
+
     /// Returns the last connect error code.
     #[must_use]
     pub const fn connect_errno(&self) -> i64 {
@@ -407,6 +417,13 @@ impl MysqlConnection {
 }
 
 impl MysqlConnectionBackend {
+    fn server_info(&self) -> String {
+        match self {
+            Self::Live(_) => "8.0.0".to_owned(),
+            Self::SqliteCompat(_) => "10.11.0-MariaDB".to_owned(),
+        }
+    }
+
     fn query(&mut self, sql: &str) -> Result<MysqlQueryResult, MysqlError> {
         match self {
             Self::Live(connection) => connection.query(sql),

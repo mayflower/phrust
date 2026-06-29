@@ -29,11 +29,12 @@ use php_diagnostics::{
 };
 use php_semantics::hir::{
     AttributeId, AttributeTarget, BuiltinType, ClassLikeId, ClassLikeKind, ClassLikeMemberId,
-    ConstExprContext, ConstExprId, ConstValue, DeclareValue, ExprId, FunctionSignature, HirCallArg,
-    HirCatchClause, HirClassLike, HirExprKind, HirIfBranch, HirMatchArm, HirModule,
-    HirNameResolution, HirProperty, HirPropertyHookBody, HirStmtKind, HirSwitchCase,
-    HirTraitAdaptationKind, HirTypeKind, MagicMethodKind, ModifierSet, NameKind, Parameter,
-    ParameterAttribute, ReturnType, SignatureKind, StmtId, TopLevelItemKind, TypeId, Visibility,
+    ConstExprContext, ConstExprId, ConstValue, DeclareValue, DefaultValueRef, ExprId,
+    FunctionSignature, HirCallArg, HirCatchClause, HirClassLike, HirExprKind, HirIfBranch,
+    HirMatchArm, HirModule, HirNameResolution, HirProperty, HirPropertyHookBody, HirStmtKind,
+    HirSwitchCase, HirTraitAdaptationKind, HirTypeKind, MagicMethodKind, ModifierSet, NameKind,
+    Parameter, ParameterAttribute, ReturnType, SignatureKind, StmtId, TopLevelItemKind, TypeId,
+    Visibility,
 };
 use php_semantics::scopes::CaptureMode;
 use php_semantics::symbols::declarations::DeclarationKind;
@@ -1072,14 +1073,6 @@ impl LoweringContext<'_> {
                             );
                             continue;
                         }
-                        if signature.by_ref_return() {
-                            self.unsupported(
-                                UnsupportedFeature::ByReferenceReturn,
-                                signature.span(),
-                                "by-reference method returns are not executable in the object-runtime object MVP",
-                            );
-                            continue;
-                        }
                         let function = self.lower_method_function(
                             builder,
                             MethodFunctionInput {
@@ -1371,6 +1364,7 @@ impl LoweringContext<'_> {
             function,
             self.lower_return_type(input.signature.return_type()),
         );
+        builder.set_returns_by_ref(function, input.signature.by_ref_return());
         builder.intern_local(function, "this");
         builder.add_source_map(
             IrSourceMapTarget::Function { function },
@@ -1985,6 +1979,10 @@ impl LoweringContext<'_> {
         {
             map.insert(name, value);
         }
+        map.extend(define_constant_initializers_from_source(
+            self.source_text.as_str(),
+            &map,
+        ));
         map
     }
 
@@ -2171,6 +2169,17 @@ impl LoweringContext<'_> {
                 )
             })
             .or_else(|| {
+                constant_from_overlapping_default_expr(
+                    self.frontend,
+                    module,
+                    default,
+                    &named_constants,
+                    current_class,
+                    class_constants,
+                    class_parents,
+                )
+            })
+            .or_else(|| {
                 self.source_text
                     .as_str()
                     .get(default.span().start().to_usize()..default.span().end().to_usize())
@@ -2186,7 +2195,9 @@ impl LoweringContext<'_> {
                                     class_parents,
                                 )
                             })
-                            .or_else(|| literal_constant(source))
+                            .or_else(|| {
+                                source_constant_from_default_source(source, &named_constants)
+                            })
                     })
             })
     }
@@ -8821,6 +8832,18 @@ impl LoweringContext<'_> {
             return self
                 .lower_property_dim_reference_assign_to_register(builder, site, target, right);
         }
+        if let Some(left) = left
+            && let Some(target) = self.property_assignment_target(left)
+        {
+            return self.lower_property_reference_assign_to_register(builder, site, target, right);
+        }
+        if let Some(left) = left
+            && let Some(target) = self.dim_assignment_target(builder, site.function, left)
+            && let Some(source) = right.and_then(|right| self.property_assignment_target(right))
+        {
+            return self
+                .lower_dim_reference_from_property_to_register(builder, site, target, source);
+        }
         if left.is_some_and(|left| self.contains_property_fetch_expr(left))
             || right.is_some_and(|right| self.contains_property_fetch_expr(right))
         {
@@ -9047,6 +9070,64 @@ impl LoweringContext<'_> {
         })
     }
 
+    fn lower_property_reference_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: PropertyAssignmentTarget,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(source) =
+            right.and_then(|right| self.variable_local(builder, site.function, right))
+        else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "property by-reference assignment source must be a simple local variable",
+            );
+            return None;
+        };
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+        let bind = builder.emit(
+            site.function,
+            object.block,
+            InstructionKind::BindReferenceProperty {
+                object: Operand::Register(object.register),
+                property: target.property,
+                source,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            object.block,
+            bind,
+            site.expr,
+            site.span,
+        );
+        let dst = builder.alloc_register(site.function);
+        let load = builder.emit(
+            site.function,
+            object.block,
+            InstructionKind::LoadLocal { dst, local: source },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            object.block,
+            load,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: object.block,
+        })
+    }
+
     fn lower_property_dim_reference_assign_to_register(
         &mut self,
         builder: &mut IrBuilder,
@@ -9091,6 +9172,52 @@ impl LoweringContext<'_> {
             site.function,
             current,
             InstructionKind::LoadLocal { dst, local: source },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, load, site.expr, site.span);
+        Some(LoweredExpr {
+            register: dst,
+            block: current,
+        })
+    }
+
+    fn lower_dim_reference_from_property_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: DimAssignmentTarget,
+        source: PropertyAssignmentTarget,
+    ) -> Option<LoweredExpr> {
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, source.receiver)?;
+        let mut current = object.block;
+        let mut dims = Vec::with_capacity(target.dims.len());
+        for dim in target.dims {
+            let dim_value = self.lower_expr_to_register(builder, site.function, current, dim)?;
+            current = dim_value.block;
+            dims.push(Operand::Register(dim_value.register));
+        }
+        let bind = builder.emit(
+            site.function,
+            current,
+            InstructionKind::BindReferenceDimFromProperty {
+                local: target.local,
+                dims,
+                append: target.append,
+                object: Operand::Register(object.register),
+                property: source.property,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, bind, site.expr, site.span);
+        let dst = builder.alloc_register(site.function);
+        let load = builder.emit(
+            site.function,
+            current,
+            InstructionKind::LoadLocal {
+                dst,
+                local: target.local,
+            },
             site.span,
         );
         self.add_expr_source_map(builder, site.function, current, load, site.expr, site.span);
@@ -11067,6 +11194,183 @@ fn named_constant_from_default_source(
     named_constants.get(value).cloned()
 }
 
+fn source_constant_from_default_source(
+    source: &str,
+    named_constants: &HashMap<String, IrConstant>,
+) -> Option<IrConstant> {
+    let value = source
+        .split_once('=')
+        .map_or(source, |(_, value)| value)
+        .trim();
+    legacy_array_constant_from_source(value, named_constants)
+        .or_else(|| named_constants.get(value).cloned())
+        .or_else(|| literal_constant(value))
+}
+
+fn define_constant_initializers_from_source(
+    source: &str,
+    named_constants: &HashMap<String, IrConstant>,
+) -> HashMap<String, IrConstant> {
+    let mut map = HashMap::new();
+    for line in source.lines().map(str::trim_start) {
+        let line = line.strip_prefix("<?php").map_or(line, str::trim_start);
+        let Some(rest) = line.strip_prefix("define") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('(') else {
+            continue;
+        };
+        let Some(end) = matching_top_level_close_paren(rest) else {
+            continue;
+        };
+        let args = &rest[..end];
+        let Some(args) = split_top_level_commas(args) else {
+            continue;
+        };
+        let [name, value, ..] = args.as_slice() else {
+            continue;
+        };
+        let Some(name) = source_constant_from_default_source(name, named_constants) else {
+            continue;
+        };
+        let IrConstant::String(name) = name else {
+            continue;
+        };
+        let Some(value) = source_constant_from_default_source(value, named_constants) else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
+}
+
+fn matching_top_level_close_paren(source: &str) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in source.char_indices() {
+        if let Some(quoted) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth = depth.checked_add(1)?,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn legacy_array_constant_from_source(
+    source: &str,
+    named_constants: &HashMap<String, IrConstant>,
+) -> Option<IrConstant> {
+    let source = source.trim();
+    let (head, tail) = source.split_at(source.len().min(5));
+    if !head.eq_ignore_ascii_case("array") {
+        return None;
+    }
+    let tail = tail.trim_start();
+    let inner = tail.strip_prefix('(')?.strip_suffix(')')?;
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Some(IrConstant::Array(Vec::new()));
+    }
+    let mut entries = Vec::new();
+    for entry in split_top_level_commas(inner)? {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (key, value) = split_top_level_arrow(entry).map_or((None, entry), |(key, value)| {
+            (Some(key.trim()), value.trim())
+        });
+        let key = match key {
+            Some(key) => Some(source_constant_from_default_source(key, named_constants)?),
+            None => None,
+        };
+        entries.push(IrConstantArrayEntry {
+            key,
+            value: source_constant_from_default_source(value, named_constants)?,
+        });
+    }
+    Some(IrConstant::Array(entries))
+}
+
+fn split_top_level_commas(source: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in source.char_indices() {
+        if let Some(quoted) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' => depth = depth.checked_add(1)?,
+            ')' | ']' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                parts.push(&source[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return None;
+    }
+    parts.push(&source[start..]);
+    Some(parts)
+}
+
+fn split_top_level_arrow(source: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut iter = source.char_indices().peekable();
+    while let Some((index, ch)) = iter.next() {
+        if let Some(quoted) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' => depth = depth.checked_add(1)?,
+            ')' | ']' => depth = depth.checked_sub(1)?,
+            '=' if depth == 0 && iter.peek().is_some_and(|(_, next)| *next == '>') => {
+                return Some((&source[..index], &source[index + 2..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn class_constant_from_default_source(
     module: &HirModule,
     source: &str,
@@ -11119,6 +11423,46 @@ fn constant_from_expr_with_names(
         &HashMap::new(),
         &mut Vec::new(),
     )
+}
+
+fn constant_from_overlapping_default_expr(
+    frontend: &FrontendResult,
+    module: &HirModule,
+    default: &DefaultValueRef,
+    named_constants: &HashMap<String, IrConstant>,
+    current_class: Option<&str>,
+    class_constants: &ClassConstantInitializerMap,
+    class_parents: &ClassParentMap,
+) -> Option<IrConstant> {
+    module
+        .expressions()
+        .iter()
+        .filter_map(|(expr_id, _)| {
+            let span = frontend.database().source_map().span(expr_id)?;
+            if !ranges_overlap(default.span(), span) {
+                return None;
+            }
+            Some((span, expr_id))
+        })
+        .max_by_key(|(span, _)| {
+            (
+                range_overlap_len(default.span(), *span),
+                span.end()
+                    .to_usize()
+                    .saturating_sub(span.start().to_usize()),
+            )
+        })
+        .and_then(|(_, expr_id)| {
+            constant_from_expr_with_class_constants(
+                module,
+                expr_id,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                &mut Vec::new(),
+            )
+        })
 }
 
 fn constant_from_expr_with_class_constants(
@@ -11782,6 +12126,31 @@ mod tests {
     }
 
     #[test]
+    fn by_ref_method_returns_lower_to_reference_ir() {
+        let frontend = analyze_source(
+            "<?php class C { public function &counter() { static $x = 0; return $x; } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let method = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "C::counter")
+            .expect("method function");
+        assert!(method.returns_by_ref);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("function \"C::counter\""), "{snapshot}");
+        assert!(snapshot.contains("return_ref local:"), "{snapshot}");
+        assert!(
+            !snapshot.contains("E_PHP_IR_UNSUPPORTED_BY_REF_RETURN"),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
     fn class_constant_doc_comments_lower_to_ir_metadata() {
         let source = "<?php class C { /** label */ const LABEL = 'items'; const PLAIN = 1; }";
         let frontend = analyze_source(source);
@@ -11840,6 +12209,70 @@ mod tests {
                 key: None,
                 value: IrConstant::Int(25),
             }]))
+        );
+    }
+
+    #[test]
+    fn conditional_method_array_parameter_defaults_lower_to_ir_constants() {
+        let source = "<?php if (!class_exists('Test', false)) : class Test { static function f3($ar = array()) {} static function f4($ar = array(25)) {} } endif;";
+        let frontend = analyze_source(source);
+        let result = lower_frontend_result(
+            &frontend,
+            LoweringOptions {
+                source_text: Some(source.to_owned()),
+                ..LoweringOptions::default()
+            },
+        );
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let f3 = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "Test::f3")
+            .expect("Test::f3 function");
+        let f4 = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "Test::f4")
+            .expect("Test::f4 function");
+
+        assert_eq!(f3.params[0].default, Some(IrConstant::Array(Vec::new())));
+        assert_eq!(
+            f4.params[0].default,
+            Some(IrConstant::Array(vec![IrConstantArrayEntry {
+                key: None,
+                value: IrConstant::Int(25),
+            }]))
+        );
+    }
+
+    #[test]
+    fn source_define_parameter_defaults_lower_to_ir_constants() {
+        let source = "<?php define('OBJECT', 'OBJECT'); class Test { public function get($output = OBJECT) {} }";
+        let frontend = analyze_source(source);
+        let result = lower_frontend_result(
+            &frontend,
+            LoweringOptions {
+                source_text: Some(source.to_owned()),
+                ..LoweringOptions::default()
+            },
+        );
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let method = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "Test::get")
+            .expect("Test::get function");
+
+        assert_eq!(
+            method.params[0].default,
+            Some(IrConstant::String("OBJECT".to_owned()))
         );
     }
 
@@ -12044,6 +12477,27 @@ mod tests {
         assert!(snapshot.contains("append_property_dim r"), "{snapshot}");
         assert!(snapshot.contains("unset_property_dim r"), "{snapshot}");
         assert!(snapshot.contains("$callbacks"), "{snapshot}");
+    }
+
+    #[test]
+    fn property_reference_assignments_lower_to_reference_ir() {
+        let frontend = analyze_source(
+            "<?php class C { public $extra; public function bind(&$value, $key, $source) { $this->extra = & $value; $GLOBALS[$key] = & $source->extra; } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("bind_reference_property r"), "{snapshot}");
+        assert!(
+            snapshot.contains("bind_reference_dim_from_property"),
+            "{snapshot}"
+        );
+        assert!(
+            !snapshot.contains("E_PHP_IR_UNSUPPORTED_PROPERTY_REFERENCE"),
+            "{snapshot}"
+        );
     }
 
     #[test]

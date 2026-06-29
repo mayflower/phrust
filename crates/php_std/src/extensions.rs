@@ -1459,6 +1459,7 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mysqli_connect_error", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_errno", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_error", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_get_server_info", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_escape_string", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_fetch_array", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_fetch_assoc", "mysqli"))
