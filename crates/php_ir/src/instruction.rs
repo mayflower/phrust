@@ -231,6 +231,14 @@ pub enum InstructionKind {
         append: bool,
         source: LocalId,
     },
+    /// `object->property[dims...] =& source` or `object->property[dims...][] =& source`.
+    BindReferencePropertyDim {
+        object: Operand,
+        property: String,
+        dims: Vec<Operand>,
+        append: bool,
+        source: LocalId,
+    },
     /// `target =& local[dims...]`.
     BindReferenceFromDim {
         target: LocalId,

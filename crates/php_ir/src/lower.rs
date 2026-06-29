@@ -8118,6 +8118,14 @@ impl LoweringContext<'_> {
         {
             return self.lower_property_assign_to_register(builder, site, target, right);
         }
+        if operator != "="
+            && let Some(left) = left
+            && let Some(target) = self.property_assignment_target(left)
+        {
+            return self.lower_property_compound_assign_to_register(
+                builder, site, target, operator, right,
+            );
+        }
         if operator == "="
             && let Some(left) = left
             && let Some(target) = self.property_dim_target(left)
@@ -8310,6 +8318,98 @@ impl LoweringContext<'_> {
         Some(LoweredExpr {
             register: dst,
             block: value.block,
+        })
+    }
+
+    fn lower_property_compound_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: PropertyAssignmentTarget,
+        operator: &str,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(binary) = assignment_binary_op(operator) else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                format!("assignment operator `{operator}` is not lowered to IR yet"),
+            );
+            return None;
+        };
+        let Some(right) = right else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "property compound assignment is missing its right operand",
+            );
+            return None;
+        };
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+        let old = builder.alloc_register(site.function);
+        let fetch = builder.emit(
+            site.function,
+            object.block,
+            InstructionKind::FetchProperty {
+                dst: old,
+                object: Operand::Register(object.register),
+                property: target.property.clone(),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            object.block,
+            fetch,
+            site.expr,
+            site.span,
+        );
+        let rhs = self.lower_expr_to_register(builder, site.function, object.block, right)?;
+        let value = builder.alloc_register(site.function);
+        let arithmetic = builder.emit(
+            site.function,
+            rhs.block,
+            InstructionKind::Binary {
+                dst: value,
+                op: binary,
+                lhs: Operand::Register(old),
+                rhs: Operand::Register(rhs.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            rhs.block,
+            arithmetic,
+            site.expr,
+            site.span,
+        );
+        let assign_result = builder.alloc_register(site.function);
+        let assign = builder.emit(
+            site.function,
+            rhs.block,
+            InstructionKind::AssignProperty {
+                dst: assign_result,
+                object: Operand::Register(object.register),
+                property: target.property,
+                value: Operand::Register(value),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            rhs.block,
+            assign,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: value,
+            block: rhs.block,
         })
     }
 
@@ -8715,6 +8815,12 @@ impl LoweringContext<'_> {
         left: Option<ExprId>,
         right: Option<ExprId>,
     ) -> Option<LoweredExpr> {
+        if let Some(left) = left
+            && let Some(target) = self.property_dim_target(left)
+        {
+            return self
+                .lower_property_dim_reference_assign_to_register(builder, site, target, right);
+        }
         if left.is_some_and(|left| self.contains_property_fetch_expr(left))
             || right.is_some_and(|right| self.contains_property_fetch_expr(right))
         {
@@ -8938,6 +9044,59 @@ impl LoweringContext<'_> {
         Some(LoweredExpr {
             register: dst,
             block: site.block,
+        })
+    }
+
+    fn lower_property_dim_reference_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: PropertyDimTarget,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(source) =
+            right.and_then(|right| self.variable_local(builder, site.function, right))
+        else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "property-dimension by-reference assignment source must be a simple local variable",
+            );
+            return None;
+        };
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+        let mut current = object.block;
+        let mut dims = Vec::with_capacity(target.dims.len());
+        for dim in target.dims {
+            let dim_value = self.lower_expr_to_register(builder, site.function, current, dim)?;
+            current = dim_value.block;
+            dims.push(Operand::Register(dim_value.register));
+        }
+        let bind = builder.emit(
+            site.function,
+            current,
+            InstructionKind::BindReferencePropertyDim {
+                object: Operand::Register(object.register),
+                property: target.property,
+                dims,
+                append: target.append,
+                source,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, bind, site.expr, site.span);
+        let dst = builder.alloc_register(site.function);
+        let load = builder.emit(
+            site.function,
+            current,
+            InstructionKind::LoadLocal { dst, local: source },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, load, site.expr, site.span);
+        Some(LoweredExpr {
+            register: dst,
+            block: current,
         })
     }
 
@@ -10077,14 +10236,17 @@ impl LoweringContext<'_> {
         let range = self.span_for(SourceMappedId::from(expr));
         self.source_text
             .slice(range)
-            .is_some_and(|source| source.contains("->$"))
+            .is_some_and(|source| source.contains("->$") || source.contains("->{"))
     }
 
     fn method_call_uses_dynamic_member(&self, expr: ExprId) -> bool {
         let range = self.span_for(SourceMappedId::from(expr));
-        self.source_text
-            .slice(range)
-            .is_some_and(|source| source.contains("->$") || source.contains("?->$"))
+        self.source_text.slice(range).is_some_and(|source| {
+            source.contains("->$")
+                || source.contains("->{")
+                || source.contains("?->$")
+                || source.contains("?->{")
+        })
     }
 
     fn static_access_uses_dynamic_member(&self, expr: ExprId) -> bool {
@@ -11740,6 +11902,35 @@ mod tests {
     }
 
     #[test]
+    fn construct_isset_braced_dynamic_property_lowers_to_dynamic_property_instruction() {
+        let frontend = analyze_source(
+            "<?php function matches($obj, $m_key) { return isset($obj->{$m_key}); }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("isset_dynamic_property r"), "{snapshot}");
+        assert!(!snapshot.contains("E_PHP_IR_UNSUPPORTED"), "{snapshot}");
+    }
+
+    #[test]
+    fn construct_isset_concat_dim_key_lowers_to_isset_dim_instruction() {
+        let frontend = analyze_source(
+            "<?php function cookie_exists($user_id) { return isset($_COOKIE['wp-settings-' . $user_id]); }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+        assert!(snapshot.contains("isset_dim r"), "{snapshot}");
+        assert!(!snapshot.contains("E_PHP_IR_UNSUPPORTED"), "{snapshot}");
+    }
+
+    #[test]
     fn construct_isset_interpolated_dim_lowers_to_isset_dim_instruction() {
         let frontend = analyze_source(
             r#"<?php function plugin($plugins, $extension) { if (isset($plugins["{$extension['slug']}/{$extension['slug']}.php"])) { return $plugins["{$extension['slug']}/{$extension['slug']}.php"]; } }"#,
@@ -11822,6 +12013,21 @@ mod tests {
             "{snapshot}"
         );
         assert!(snapshot.contains("binary r"), "{snapshot}");
+    }
+
+    #[test]
+    fn property_compound_assign_lowers_through_fetch_binary_and_assign_property() {
+        let frontend =
+            analyze_source("<?php class C { public $s = ''; } $c = new C; $c->s .= 'x';");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("fetch_property r"), "{snapshot}");
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+        assert!(snapshot.contains("assign_property r"), "{snapshot}");
+        assert!(snapshot.contains("$s"), "{snapshot}");
     }
 
     #[test]

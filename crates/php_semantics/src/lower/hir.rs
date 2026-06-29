@@ -1106,6 +1106,38 @@ impl HirLowerer<'_> {
                 expr
             });
         }
+        if let Some(expr) = self.simple_construct_binary_operand_source(rest, range) {
+            return Some(if let Some(kind) = leading_cast {
+                self.alloc_expr(
+                    HirExprKind::Cast {
+                        kind,
+                        expr: Some(expr),
+                    },
+                    range,
+                )
+            } else {
+                expr
+            });
+        }
+        if is_quoted_construct_operand(rest) {
+            let expr = self.alloc_expr(
+                HirExprKind::Literal {
+                    text: rest.to_owned(),
+                },
+                range,
+            );
+            return Some(if let Some(kind) = leading_cast {
+                self.alloc_expr(
+                    HirExprKind::Cast {
+                        kind,
+                        expr: Some(expr),
+                    },
+                    range,
+                )
+            } else {
+                expr
+            });
+        }
         if !rest.starts_with('$') {
             return None;
         }
@@ -1163,22 +1195,57 @@ impl HirLowerer<'_> {
                 continue;
             }
             if let Some(after_arrow) = rest.strip_prefix("->") {
-                let property_len = after_arrow
-                    .char_indices()
-                    .find_map(|(index, ch)| {
-                        (index > 0 && !(ch == '_' || ch.is_ascii_alphanumeric())).then_some(index)
-                    })
-                    .unwrap_or(after_arrow.len());
-                let property = after_arrow[..property_len].trim();
-                if property.is_empty() {
-                    return None;
-                }
-                let property = self.alloc_expr(
-                    HirExprKind::Literal {
-                        text: property.to_owned(),
-                    },
-                    range,
-                );
+                let (property, consumed) = if let Some(after_open) = after_arrow.strip_prefix('{') {
+                    let close = find_construct_brace_close(after_open)?;
+                    let property_text = after_open[..close].trim();
+                    if property_text.is_empty() {
+                        return None;
+                    }
+                    let property = self.simple_construct_operand_source(property_text, range)?;
+                    (property, close + 2)
+                } else if after_arrow.starts_with('$') {
+                    let property_len = after_arrow
+                        .char_indices()
+                        .find_map(|(index, ch)| {
+                            (index > 0 && !(ch == '_' || ch.is_ascii_alphanumeric()))
+                                .then_some(index)
+                        })
+                        .unwrap_or(after_arrow.len());
+                    let property = after_arrow[..property_len].trim();
+                    if property.is_empty() {
+                        return None;
+                    }
+                    (
+                        self.alloc_expr(
+                            HirExprKind::Variable {
+                                name: property.to_owned(),
+                            },
+                            range,
+                        ),
+                        property_len,
+                    )
+                } else {
+                    let property_len = after_arrow
+                        .char_indices()
+                        .find_map(|(index, ch)| {
+                            (index > 0 && !(ch == '_' || ch.is_ascii_alphanumeric()))
+                                .then_some(index)
+                        })
+                        .unwrap_or(after_arrow.len());
+                    let property = after_arrow[..property_len].trim();
+                    if property.is_empty() {
+                        return None;
+                    }
+                    (
+                        self.alloc_expr(
+                            HirExprKind::Literal {
+                                text: property.to_owned(),
+                            },
+                            range,
+                        ),
+                        property_len,
+                    )
+                };
                 current = self.alloc_expr(
                     HirExprKind::PropertyFetch {
                         receiver: Some(current),
@@ -1187,7 +1254,7 @@ impl HirLowerer<'_> {
                     },
                     range,
                 );
-                rest = after_arrow[property_len..].trim();
+                rest = after_arrow[consumed..].trim();
                 if let Some(after_open) = rest.strip_prefix('(')
                     && let Some(after_close) = after_open.strip_prefix(')')
                 {
@@ -1220,6 +1287,29 @@ impl HirLowerer<'_> {
         } else {
             current
         })
+    }
+
+    fn simple_construct_binary_operand_source(
+        &mut self,
+        rest: &str,
+        range: TextRange,
+    ) -> Option<ExprId> {
+        let parts = split_construct_concat_parts(rest)?;
+        let mut iter = parts.into_iter();
+        let first = iter.next()?;
+        let mut current = self.simple_construct_operand_source(first, range)?;
+        for part in iter {
+            let right = self.simple_construct_operand_source(part, range)?;
+            current = self.alloc_expr(
+                HirExprKind::Binary {
+                    operator: ".".to_owned(),
+                    left: Some(current),
+                    right: Some(right),
+                },
+                range,
+            );
+        }
+        Some(current)
     }
 
     fn simple_static_property_construct_operand_source(
@@ -2135,6 +2225,7 @@ fn split_construct_args(source: &str) -> Vec<&str> {
     let mut args = Vec::new();
     let mut start = 0usize;
     let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
     let mut paren_depth = 0usize;
     let mut quote = None::<u8>;
     let mut escaped = false;
@@ -2157,9 +2248,11 @@ fn split_construct_args(source: &str) -> Vec<&str> {
             b'\'' | b'"' => quote = Some(byte),
             b'[' => bracket_depth = bracket_depth.saturating_add(1),
             b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth = brace_depth.saturating_add(1),
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
             b'(' => paren_depth = paren_depth.saturating_add(1),
             b')' => paren_depth = paren_depth.saturating_sub(1),
-            b',' if bracket_depth == 0 && paren_depth == 0 => {
+            b',' if bracket_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
                 args.push(source[start..index].trim());
                 start = index + 1;
             }
@@ -2168,6 +2261,59 @@ fn split_construct_args(source: &str) -> Vec<&str> {
     }
     args.push(source[start..].trim());
     args
+}
+
+fn split_construct_concat_parts(source: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut quote = None::<u8>;
+    let mut escaped = false;
+    for (index, byte) in source.bytes().enumerate() {
+        if let Some(quoted) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if byte == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth = brace_depth.saturating_add(1),
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'(' => paren_depth = paren_depth.saturating_add(1),
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'.' if bracket_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
+                let part = source[start..index].trim();
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(part);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let tail = source[start..].trim();
+    if tail.is_empty() {
+        return None;
+    }
+    parts.push(tail);
+    Some(parts)
 }
 
 fn find_construct_dimension_close(source: &str) -> Option<usize> {
@@ -2194,6 +2340,44 @@ fn find_construct_dimension_close(source: &str) -> Option<usize> {
             b'[' => bracket_depth = bracket_depth.saturating_add(1),
             b']' if bracket_depth == 0 => return Some(index),
             b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_construct_brace_close(source: &str) -> Option<usize> {
+    let mut quote = None::<u8>;
+    let mut escaped = false;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
+    for (index, byte) in source.bytes().enumerate() {
+        if let Some(quoted) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if byte == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' => brace_depth = brace_depth.saturating_add(1),
+            b'}' if bracket_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
+                return Some(index);
+            }
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'(' => paren_depth = paren_depth.saturating_add(1),
+            b')' => paren_depth = paren_depth.saturating_sub(1),
             _ => {}
         }
     }

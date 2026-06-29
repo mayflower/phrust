@@ -10271,6 +10271,60 @@ impl Vm {
                             &dims,
                         );
                     }
+                    InstructionKind::BindReferencePropertyDim {
+                        object,
+                        property,
+                        dims,
+                        append,
+                        source,
+                    } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_REF_DIM_NON_OBJECT: cannot bind property dimension on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match read_dim_operands(unit, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let cell = match stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .locals
+                            .ensure_reference_cell(*source)
+                        {
+                            Ok(cell) => cell,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) = bind_property_dim_to_reference_cell(
+                            compiled, state, stack, &object, property, &dims, *append, cell,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
                     InstructionKind::BindReferenceFromDim {
                         target,
                         local,
@@ -43344,6 +43398,30 @@ fn bind_dim_value_to_reference_cell(
     bind_dim_value_to_reference_cell(child, rest, append, cell)
 }
 
+fn bind_property_dim_to_reference_cell(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    object: &ObjectRef,
+    property: &str,
+    dims: &[ArrayKey],
+    append: bool,
+    cell: ReferenceCell,
+) -> Result<(), String> {
+    let storage_name =
+        property_dimension_storage_name(compiled, state, stack, object, property, true)?;
+    let mut current = object
+        .get_property(&storage_name)
+        .or_else(|| object.get_property(property))
+        .unwrap_or(Value::Null);
+    if matches!(current, Value::Uninitialized | Value::Null) {
+        current = Value::Array(PhpArray::new());
+    }
+    bind_dim_value_to_reference_cell(&mut current, dims, append, cell)?;
+    object.set_property(storage_name, current);
+    Ok(())
+}
+
 fn ensure_dim_reference_cell(
     stack: &mut CallStack,
     local: LocalId,
@@ -48001,6 +48079,16 @@ good"
     }
 
     #[test]
+    fn braced_dynamic_property_isset_executes() {
+        let result = execute_source(
+            "<?php class C { public $x = 1; public $y = null; } $c = new C(); $name = 'x'; $null = 'y'; $missing = 'z'; echo isset($c->{$name}) ? 'yes' : 'no'; echo '|', isset($c->{$null}) ? 'bad' : 'null'; echo '|', isset($c->{$missing}) ? 'bad' : 'missing';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"yes|null|missing");
+    }
+
+    #[test]
     fn methods_report_visibility_errors() {
         let private = execute_source(
             "<?php class Secret { private function hidden() { return 1; } } (new Secret())->hidden();",
@@ -51804,6 +51892,16 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"3x");
+    }
+
+    #[test]
+    fn properties_execute_compound_assignment_through_binary_ops() {
+        let result = execute_source(
+            "<?php class C { public $s = 'a'; public $n = 1; } $c = new C(); $c->s .= 'b'; $c->n += 2; echo $c->s, '|', $c->n;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"ab|3");
     }
 
     #[test]

@@ -455,6 +455,27 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 source.raw()
             )
         }
+        InstructionKind::BindReferencePropertyDim {
+            object,
+            property,
+            dims,
+            append,
+            source,
+        } => {
+            let dims = dims
+                .iter()
+                .map(format_operand)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "bind_reference_property_dim {} ${} [{}] append:{} local:{}",
+                format_operand(object),
+                property,
+                dims,
+                append,
+                source.raw()
+            )
+        }
         InstructionKind::BindReferenceFromDim {
             target,
             local,

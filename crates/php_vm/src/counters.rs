@@ -3929,6 +3929,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::BindReference { .. } => "bind_reference",
         InstructionKind::BindGlobal { .. } => "bind_global",
         InstructionKind::BindReferenceDim { .. } => "bind_reference_dim",
+        InstructionKind::BindReferencePropertyDim { .. } => "bind_reference_property_dim",
         InstructionKind::BindReferenceFromDim { .. } => "bind_reference_from_dim",
         InstructionKind::BindReferenceFromCall { .. } => "bind_reference_from_call",
         InstructionKind::InitStaticLocal { .. } => "init_static_local",
