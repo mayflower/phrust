@@ -10687,8 +10687,9 @@ impl Vm {
                                 }
                             };
                         let scope = current_scope_class(compiled, stack);
-                        let resolved = match lookup_property_in_hierarchy(
+                        let resolved = match lookup_resolved_property_in_state(
                             compiled,
+                            state,
                             &class,
                             property,
                             scope.as_deref(),
@@ -10750,15 +10751,15 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let entry = resolved.property;
+                        let entry = &resolved.property;
                         if entry.flags.is_static {
                             if let Err(message) =
-                                validate_property_access(compiled, stack, resolved.class, entry)
+                                validate_property_access(compiled, stack, &resolved.class, entry)
                                     .and_then(|()| {
                                         validate_property_set_access(
                                             compiled,
                                             stack,
-                                            resolved.class,
+                                            &resolved.class,
                                             entry,
                                         )
                                     })
@@ -10796,7 +10797,7 @@ impl Vm {
                                 output,
                                 stack,
                                 state,
-                                resolved.class,
+                                &resolved.class,
                                 entry,
                                 instruction.span,
                             );
@@ -10805,12 +10806,12 @@ impl Vm {
                             continue;
                         }
                         if let Err(message) =
-                            validate_property_access(compiled, stack, resolved.class, entry)
+                            validate_property_access(compiled, stack, &resolved.class, entry)
                                 .and_then(|()| {
                                     validate_property_set_access(
                                         compiled,
                                         stack,
-                                        resolved.class,
+                                        &resolved.class,
                                         entry,
                                     )
                                 })
@@ -10881,12 +10882,16 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        if let Err(message) =
-                            validate_property_write(resolved.class, entry, &object, stack, compiled)
-                        {
+                        if let Err(message) = validate_property_write(
+                            &resolved.class,
+                            entry,
+                            &object,
+                            stack,
+                            compiled,
+                        ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        let storage_name = property_storage_name(resolved.class, entry);
+                        let storage_name = property_storage_name(&resolved.class, entry);
                         object.set_property(storage_name, reference);
                         self.record_counter_alias_state(local_alias_state(stack, *source));
                     }
@@ -10972,8 +10977,8 @@ impl Vm {
                         if let Err(message) = validate_property_access(
                             compiled,
                             stack,
-                            resolved.class,
-                            resolved.property,
+                            &resolved.class,
+                            &resolved.property,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -11015,15 +11020,15 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        let key = static_property_key(resolved.class, resolved.property);
+                        let key = static_property_key(&resolved.class, &resolved.property);
                         let current = if let Some(value) = state.static_properties.get(&key) {
                             value.clone()
                         } else {
                             match static_property_default(
                                 compiled,
                                 state,
-                                resolved.class,
-                                resolved.property,
+                                &resolved.class,
+                                &resolved.property,
                             ) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -11034,8 +11039,8 @@ impl Vm {
                         if let Err(message) = validate_static_property_write(
                             compiled,
                             stack,
-                            resolved.class,
-                            resolved.property,
+                            &resolved.class,
+                            &resolved.property,
                             &current,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
@@ -13586,8 +13591,9 @@ impl Vm {
                                 }
                             }
                         }
-                        let resolved = match lookup_property_in_hierarchy(
+                        let resolved = match lookup_resolved_property_in_state(
                             compiled,
+                            state,
                             &class,
                             property,
                             scope.as_deref(),
@@ -13633,18 +13639,18 @@ impl Vm {
                         if let Err(message) = validate_property_access(
                             compiled,
                             stack,
-                            resolved.class,
-                            resolved.property,
+                            &resolved.class,
+                            &resolved.property,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        let key = static_property_key(resolved.class, resolved.property);
+                        let key = static_property_key(&resolved.class, &resolved.property);
                         if !state.static_properties.contains_key(&key) {
                             let default = match static_property_default(
                                 compiled,
                                 state,
-                                resolved.class,
-                                resolved.property,
+                                &resolved.class,
+                                &resolved.property,
                             ) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -13946,44 +13952,47 @@ impl Vm {
                                 }
                                 continue;
                             }
-                            let resolved = match lookup_constant_in_hierarchy(
-                                compiled,
-                                &class,
-                                constant,
-                                scope.as_deref(),
-                            ) {
-                                Ok(Some(resolved)) => resolved,
-                                Ok(None) => {
-                                    let message = format!(
-                                        "E_PHP_VM_UNKNOWN_CLASS_CONSTANT: Undefined constant {}::{constant}",
-                                        class.display_name
-                                    );
-                                    match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
+                            let (resolved_class_entry, resolved_constant_entry) =
+                                match lookup_class_constant_in_state(
+                                    compiled,
+                                    state,
+                                    &class.name,
+                                    &class.display_name,
+                                    constant,
+                                ) {
+                                    Ok(Some(resolved)) => resolved,
+                                    Ok(None) => {
+                                        let message = format!(
+                                            "E_PHP_VM_UNKNOWN_CLASS_CONSTANT: Undefined constant {}::{constant}",
+                                            class.display_name
+                                        );
+                                        match self.raise_runtime_error(
+                                            compiled,
+                                            output,
+                                            stack,
+                                            state,
+                                            &mut exception_handlers,
+                                            &mut pending_control,
+                                            instruction.span,
+                                            message,
+                                        ) {
+                                            RaiseOutcome::Caught(target) => {
+                                                block_id = target;
+                                                continue 'dispatch;
+                                            }
+                                            RaiseOutcome::Done(result) => return *result,
                                         }
-                                        RaiseOutcome::Done(result) => return *result,
                                     }
-                                }
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                            };
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
                             if let Err(message) = validate_constant_access(
                                 compiled,
                                 stack,
-                                resolved.class,
-                                resolved.constant,
+                                &resolved_class_entry,
+                                &resolved_constant_entry,
                             ) {
                                 match self.raise_runtime_error(
                                     compiled,
@@ -14002,8 +14011,8 @@ impl Vm {
                                     RaiseOutcome::Done(result) => return *result,
                                 }
                             }
-                            let cache_scope = if resolved.constant.flags.is_private
-                                || resolved.constant.flags.is_protected
+                            let cache_scope = if resolved_constant_entry.flags.is_private
+                                || resolved_constant_entry.flags.is_protected
                             {
                                 normalized_scope.clone()
                             } else {
@@ -14011,26 +14020,27 @@ impl Vm {
                             };
                             let target = match dynamic_class_owner_index_in_state(
                                 state,
-                                &resolved.class.name,
+                                &resolved_class_entry.name,
                             ) {
                                 Some(unit_index) => {
                                     ClassConstantStaticPropertyCacheTarget::DynamicUnit {
                                         unit_index,
                                         kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
                                         resolved_class: resolved_class.clone(),
-                                        declaring_class: resolved.class.name.clone(),
-                                        member: resolved.constant.name.clone(),
+                                        declaring_class: resolved_class_entry.name.clone(),
+                                        member: resolved_constant_entry.name.clone(),
                                     }
                                 }
                                 None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
                                     kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
                                     resolved_class: resolved_class.clone(),
-                                    declaring_class: resolved.class.name.clone(),
-                                    member: resolved.constant.name.clone(),
+                                    declaring_class: resolved_class_entry.name.clone(),
+                                    member: resolved_constant_entry.name.clone(),
                                 },
                             };
-                            let owner = class_owner_in_state(compiled, state, &resolved.class.name);
-                            let value = match resolved.constant.value {
+                            let owner =
+                                class_owner_in_state(compiled, state, &resolved_class_entry.name);
+                            let value = match resolved_constant_entry.value {
                                 Some(value) => match constant_value(owner.unit(), value) {
                                     Ok(value) => value,
                                     Err(message) => {
@@ -14039,7 +14049,8 @@ impl Vm {
                                     }
                                 },
                                 None => {
-                                    if let Some(reference) = &resolved.constant.value_class_constant
+                                    if let Some(reference) =
+                                        &resolved_constant_entry.value_class_constant
                                     {
                                         match class_constant_reference_value(
                                             compiled, state, reference,
@@ -14052,7 +14063,7 @@ impl Vm {
                                             }
                                         }
                                     } else if let Some(reference) =
-                                        &resolved.constant.value_named_constant
+                                        &resolved_constant_entry.value_named_constant
                                     {
                                         match named_constant_reference_value(
                                             compiled, state, reference,
@@ -16258,8 +16269,9 @@ impl Vm {
                                 }
                             };
                         let scope = current_scope_class(compiled, stack);
-                        let resolved = match lookup_property_in_hierarchy(
+                        let resolved = match lookup_resolved_property_in_state(
                             compiled,
+                            state,
                             &class,
                             property,
                             scope.as_deref(),
@@ -16305,8 +16317,8 @@ impl Vm {
                         if let Err(message) = validate_property_access(
                             compiled,
                             stack,
-                            resolved.class,
-                            resolved.property,
+                            &resolved.class,
+                            &resolved.property,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -16342,15 +16354,15 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        let key = static_property_key(resolved.class, resolved.property);
+                        let key = static_property_key(&resolved.class, &resolved.property);
                         let current = if let Some(value) = state.static_properties.get(&key) {
                             value.clone()
                         } else {
                             match static_property_default(
                                 compiled,
                                 state,
-                                resolved.class,
-                                resolved.property,
+                                &resolved.class,
+                                &resolved.property,
                             ) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -16361,8 +16373,8 @@ impl Vm {
                         if let Err(message) = validate_static_property_write(
                             compiled,
                             stack,
-                            resolved.class,
-                            resolved.property,
+                            &resolved.class,
+                            &resolved.property,
                             &current,
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
@@ -28683,12 +28695,8 @@ impl Vm {
             .function_table
             .iter()
             .any(|entry| entry.function != evaluated.unit().entry);
-        let has_source_class_declarations = evaluated
-            .unit()
-            .classes
-            .iter()
-            .any(|class| class.span != php_ir::source_map::IrSpan::default());
-        if has_named_function_declarations || has_source_class_declarations {
+        let has_class_declarations = !evaluated.unit().classes.is_empty();
+        if has_named_function_declarations {
             return eval_failure(
                 output,
                 "E_PHP_VM_EVAL_DECLARATION_GAP: eval declarations are not merged into the active runtime unit",
@@ -28700,7 +28708,9 @@ impl Vm {
             .functions
             .iter()
             .any(|function| function.flags.is_closure);
-        if has_closures {
+        if has_class_declarations {
+            register_dynamic_eval_unit(state, evaluated.clone());
+        } else if has_closures {
             retain_dynamic_closure_unit(state, evaluated.clone());
         }
 
@@ -28734,6 +28744,13 @@ impl Vm {
             state,
         );
         state.eval_depth -= 1;
+        if result.status.is_success()
+            && has_class_declarations
+            && let Some(error) =
+                self.validate_runtime_class_dependencies(compiled, &evaluated, output, stack, state)
+        {
+            return error;
+        }
         if result.status.is_success() {
             write_shared_locals_to_current_frame(compiled, stack, &shared);
         }
@@ -33340,6 +33357,12 @@ struct ResolvedMethodOwned {
 struct ResolvedProperty<'a> {
     class: &'a php_ir::module::ClassEntry,
     property: &'a php_ir::module::ClassPropertyEntry,
+}
+
+#[derive(Clone)]
+struct ResolvedPropertyOwned {
+    class: php_ir::module::ClassEntry,
+    property: php_ir::module::ClassPropertyEntry,
 }
 
 #[derive(Clone, Copy)]
@@ -40452,6 +40475,29 @@ fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) {
     state.bump_class_table_epoch();
 }
 
+fn register_dynamic_eval_unit(state: &mut ExecutionState, unit: CompiledUnit) {
+    let unit_index = state.dynamic_units.len();
+    for class in &unit.unit().classes {
+        let normalized = normalize_class_name(&class.name);
+        if class.span == IrSpan::default() && runtime_or_std_class_exists(&normalized) {
+            continue;
+        }
+        if state
+            .dynamic_classes
+            .iter()
+            .any(|existing| normalize_class_name(&existing.class.name) == normalized)
+        {
+            continue;
+        }
+        state.dynamic_classes.push(DynamicClassEntry {
+            class: class.clone(),
+            unit_index,
+        });
+    }
+    state.dynamic_units.push(unit);
+    state.bump_class_table_epoch();
+}
+
 fn retain_dynamic_closure_unit(state: &mut ExecutionState, unit: CompiledUnit) -> usize {
     let unit_index = state.dynamic_units.len();
     state.dynamic_units.push(unit);
@@ -40884,19 +40930,23 @@ fn class_constant_value_by_name(
         })?;
         return Ok(Some(Value::Object(object)));
     }
-    let caller_scope = current_scope_class(compiled, stack);
-    let Some(resolved) =
-        lookup_constant_in_hierarchy(compiled, &class, constant_name, caller_scope.as_deref())?
+    let Some((resolved_class, resolved_constant)) = lookup_class_constant_in_state(
+        compiled,
+        state,
+        &class.name,
+        &class.display_name,
+        constant_name,
+    )?
     else {
         return Ok(None);
     };
-    validate_constant_access(compiled, stack, resolved.class, resolved.constant)?;
-    if let Some(value) = resolved.constant.value {
-        let owner = class_owner_in_state(compiled, state, &resolved.class.name);
+    validate_constant_access(compiled, stack, &resolved_class, &resolved_constant)?;
+    if let Some(value) = resolved_constant.value {
+        let owner = class_owner_in_state(compiled, state, &resolved_class.name);
         constant_value(owner.unit(), value).map(Some)
-    } else if let Some(reference) = &resolved.constant.value_class_constant {
+    } else if let Some(reference) = &resolved_constant.value_class_constant {
         class_constant_reference_value(compiled, state, reference).map(Some)
-    } else if let Some(reference) = &resolved.constant.value_named_constant {
+    } else if let Some(reference) = &resolved_constant.value_named_constant {
         named_constant_reference_value(compiled, state, reference).map(Some)
     } else {
         Ok(Some(Value::Null))
@@ -41691,6 +41741,133 @@ fn lookup_property_in_state(
     lookup_property_in_state_inner(compiled, state, &class, property, &mut Vec::new())
 }
 
+fn lookup_resolved_property_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    property: &str,
+    caller_scope: Option<&str>,
+) -> Result<Option<ResolvedPropertyOwned>, String> {
+    if let Some(resolved) = lookup_private_property_in_state_caller_scope(
+        compiled,
+        state,
+        class,
+        property,
+        caller_scope,
+    )? {
+        return Ok(Some(resolved));
+    }
+    lookup_resolved_property_in_state_inner(
+        compiled,
+        state,
+        class.clone(),
+        property,
+        caller_scope,
+        &mut Vec::new(),
+    )
+}
+
+fn lookup_private_property_in_state_caller_scope(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+    property: &str,
+    caller_scope: Option<&str>,
+) -> Result<Option<ResolvedPropertyOwned>, String> {
+    let Some(scope) = caller_scope else {
+        return Ok(None);
+    };
+    if !class_is_subclass_of_in_state(compiled, state, &class.name, scope)?
+        && normalize_class_name(&class.name) != normalize_class_name(scope)
+    {
+        return Ok(None);
+    }
+    let Some(scope_class) = lookup_class_in_state(compiled, state, scope) else {
+        return Ok(None);
+    };
+    let Some(scope_property) = scope_class
+        .properties
+        .iter()
+        .find(|entry| entry.flags.is_private && entry.name == property)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedPropertyOwned {
+        class: scope_class,
+        property: scope_property,
+    }))
+}
+
+fn lookup_resolved_property_in_state_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: php_ir::module::ClassEntry,
+    property: &str,
+    caller_scope: Option<&str>,
+    seen: &mut Vec<String>,
+) -> Result<Option<ResolvedPropertyOwned>, String> {
+    let class_name = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &class_name) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(class_name.clone());
+    if let Some(entry) = class
+        .properties
+        .iter()
+        .find(|entry| entry.name == property)
+        .cloned()
+    {
+        if entry.flags.is_private
+            && caller_scope.is_some_and(|scope| normalize_class_name(scope) != class_name)
+            && class.parent.is_some()
+            && let Some(parent) = class
+                .parent
+                .as_deref()
+                .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+            && let Some(parent_property) = lookup_resolved_property_in_state_inner(
+                compiled,
+                state,
+                parent,
+                entry.name.as_str(),
+                caller_scope,
+                seen,
+            )?
+        {
+            seen.pop();
+            return Ok(Some(parent_property));
+        }
+        seen.pop();
+        return Ok(Some(ResolvedPropertyOwned {
+            class,
+            property: entry,
+        }));
+    }
+    if let Some(parent_name) = class.parent.as_deref() {
+        let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
+            return Err(format!(
+                "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
+                class.name, parent_name
+            ));
+        };
+        let resolved = lookup_resolved_property_in_state_inner(
+            compiled,
+            state,
+            parent,
+            property,
+            caller_scope,
+            seen,
+        )?;
+        seen.pop();
+        return Ok(resolved);
+    }
+    seen.pop();
+    Ok(None)
+}
+
 fn lookup_property_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -41768,6 +41945,12 @@ fn builtin_class_exists(class_name: &str) -> bool {
     php_std::ExtensionRegistry::standard_library()
         .enabled_class(class_name)
         .is_some()
+}
+
+fn runtime_or_std_class_exists(class_name: &str) -> bool {
+    builtin_class_exists(class_name)
+        || internal_runtime_class_entry(class_name).is_some()
+        || internal_enum_class_entry(class_name).is_some()
 }
 
 fn class_extends_in_state(
@@ -57707,6 +57890,19 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:#?}", result);
         assert_eq!(result.output.as_bytes(), b"1|2");
+    }
+
+    #[test]
+    fn eval_class_declarations_merge_into_runtime_unit() {
+        let result = execute_source(
+            "<?php class C { const X = E::A; public static $a = array(K => D::V, E::A => K); } eval('class D extends C { const V = \"test\"; }'); class E extends D { const A = \"hello\"; } define('K', 'nasty'); var_dump(C::X, C::$a, D::X, D::$a, E::X, E::$a);",
+        );
+
+        assert!(result.status.is_success(), "{:#?}", result);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"string(5) \"hello\"\narray(2) {\n  [\"nasty\"]=>\n  string(4) \"test\"\n  [\"hello\"]=>\n  string(5) \"nasty\"\n}\nstring(5) \"hello\"\narray(2) {\n  [\"nasty\"]=>\n  string(4) \"test\"\n  [\"hello\"]=>\n  string(5) \"nasty\"\n}\nstring(5) \"hello\"\narray(2) {\n  [\"nasty\"]=>\n  string(4) \"test\"\n  [\"hello\"]=>\n  string(5) \"nasty\"\n}\n"
+        );
     }
 
     #[test]
