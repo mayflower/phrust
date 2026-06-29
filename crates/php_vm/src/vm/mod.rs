@@ -670,89 +670,6 @@ fn jit_leaf_call_shape_is_supported(
 }
 
 #[cfg(feature = "jit-cranelift")]
-fn execute_jit_int_leaf(
-    unit: &IrUnit,
-    function: &IrFunction,
-    args: &[PreparedArg],
-) -> Result<Value, ()> {
-    if function.blocks.len() != 1 || function.params.len() != args.len() {
-        return Err(());
-    }
-    let mut locals = vec![None; function.local_count as usize];
-    let mut registers = vec![None; function.register_count as usize];
-    for (param, arg) in function.params.iter().zip(args) {
-        locals[param.local.index()] = Some(value_as_jit_int(&arg.value)?);
-    }
-
-    let block = &function.blocks[0];
-    for instruction in &block.instructions {
-        match &instruction.kind {
-            InstructionKind::Nop => {}
-            InstructionKind::LoadConst { dst, constant } => {
-                registers[dst.index()] = Some(constant_as_jit_int(unit, *constant)?);
-            }
-            InstructionKind::Move { dst, src } => {
-                registers[dst.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
-            }
-            InstructionKind::LoadLocal { dst, local } => {
-                registers[dst.index()] =
-                    Some(locals.get(local.index()).copied().flatten().ok_or(())?);
-            }
-            InstructionKind::StoreLocal { local, src } => {
-                locals[local.index()] = Some(operand_as_jit_int(unit, &registers, &locals, src)?);
-            }
-            InstructionKind::Binary { dst, op, lhs, rhs } => {
-                let lhs = operand_as_jit_int(unit, &registers, &locals, lhs)?;
-                let rhs = operand_as_jit_int(unit, &registers, &locals, rhs)?;
-                let value = match op {
-                    BinaryOp::Add => lhs.checked_add(rhs).ok_or(())?,
-                    BinaryOp::Sub => lhs.checked_sub(rhs).ok_or(())?,
-                    BinaryOp::Mul => lhs.checked_mul(rhs).ok_or(())?,
-                    _ => return Err(()),
-                };
-                registers[dst.index()] = Some(value);
-            }
-            _ => return Err(()),
-        }
-    }
-
-    match &block.terminator {
-        Some(terminator) => match &terminator.kind {
-            TerminatorKind::Return {
-                value: Some(value),
-                by_ref_local: None,
-            } => Ok(Value::Int(operand_as_jit_int(
-                unit, &registers, &locals, value,
-            )?)),
-            _ => Err(()),
-        },
-        None => Err(()),
-    }
-}
-
-#[cfg(feature = "jit-cranelift")]
-fn operand_as_jit_int(
-    unit: &IrUnit,
-    registers: &[Option<i64>],
-    locals: &[Option<i64>],
-    operand: &Operand,
-) -> Result<i64, ()> {
-    match operand {
-        Operand::Register(register) => registers.get(register.index()).copied().flatten().ok_or(()),
-        Operand::Local(local) => locals.get(local.index()).copied().flatten().ok_or(()),
-        Operand::Constant(constant) => constant_as_jit_int(unit, *constant),
-    }
-}
-
-#[cfg(feature = "jit-cranelift")]
-fn constant_as_jit_int(unit: &IrUnit, constant: ConstId) -> Result<i64, ()> {
-    match unit.constants.get(constant.index()) {
-        Some(IrConstant::Int(value)) => Ok(*value),
-        _ => Err(()),
-    }
-}
-
-#[cfg(feature = "jit-cranelift")]
 fn value_as_jit_int(value: &Value) -> Result<i64, ()> {
     match value {
         Value::Int(value) => Ok(*value),
@@ -32366,7 +32283,7 @@ fn call_normalizer_static_method(method: &str, args: Vec<Value>) -> Result<Value
             let _ = xml_string_arg("Normalizer::normalize", args[0].clone())?;
             let form = args
                 .get(1)
-                .map(|value| to_int(value))
+                .map(to_int)
                 .transpose()?
                 .unwrap_or(NORMALIZER_FORM_C);
             if form != NORMALIZER_FORM_C {
@@ -32382,7 +32299,7 @@ fn call_normalizer_static_method(method: &str, args: Vec<Value>) -> Result<Value
             let _ = xml_string_arg("Normalizer::isNormalized", args[0].clone())?;
             let form = args
                 .get(1)
-                .map(|value| to_int(value))
+                .map(to_int)
                 .transpose()?
                 .unwrap_or(NORMALIZER_FORM_C);
             if form != NORMALIZER_FORM_C {
@@ -38396,15 +38313,15 @@ fn object_property_iteration_entries(
         };
         return Ok(entries
             .iter()
-            .filter_map(|(key, _)| match key {
-                ArrayKey::Int(index) => Some(ObjectPropertyIterationEntry {
+            .map(|(key, _)| match key {
+                ArrayKey::Int(index) => ObjectPropertyIterationEntry {
                     key: index.to_string(),
                     storage_name: index.to_string(),
-                }),
-                ArrayKey::String(key) => Some(ObjectPropertyIterationEntry {
+                },
+                ArrayKey::String(key) => ObjectPropertyIterationEntry {
                     key: key.to_string_lossy(),
                     storage_name: key.to_string_lossy(),
-                }),
+                },
             })
             .collect());
     }

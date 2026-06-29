@@ -294,7 +294,6 @@ Scope checked: `crates/php_runtime`, `crates/php_vm`, `crates/php_vm_cli`,
 
 | Class | Current occurrences | Classification |
 | --- | --- | --- |
-| `todo_runtime` modules | skeleton status exports in runtime, VM, CLI | informational markers retained for layer status APIs, not unimplemented execution paths |
 | `expect("frame was pushed")`, `expect("caller frame is active")` in `php_vm/src/vm.rs` | repeated dispatch invariants after frame setup | internal VM invariant; should become controlled diagnostics only if a reachable malformed-state fixture appears |
 | `expect("target bounds checked")` in `php_vm/src/frame.rs` | frame target mutation after prior bounds check | internal invariant guarded by VM code |
 | Builtin `expect("checked arity")` | builtin implementations after registry arity validation | internal invariant; arity errors are surfaced before this point |

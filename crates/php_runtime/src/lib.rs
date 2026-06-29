@@ -8,10 +8,6 @@
 //! The root re-exports remain as compatibility aliases while internal crates are
 //! migrated. New downstream imports should use the explicit facades instead of
 //! relying on the full crate root.
-//!
-//! The `todo_runtime` module and `runtime_skeleton_status()` export are
-//! historical wiring-test compatibility markers. They are not the current
-//! runtime architecture and should not be used to infer feature support.
 
 pub mod array;
 pub mod autoload;
@@ -42,7 +38,6 @@ pub mod session;
 pub mod sqlite;
 pub mod status;
 pub mod string;
-pub mod todo_runtime;
 pub mod tokenizer;
 pub mod types;
 pub mod value;
@@ -132,7 +127,6 @@ pub mod api {
     };
     pub use crate::status::{ExecutionStatus, ExitStatus};
     pub use crate::string::PhpString;
-    pub use crate::todo_runtime::{RuntimeTodo, runtime_skeleton_status};
     pub use crate::tokenizer;
     pub use crate::types::{runtime_type_name, value_matches_runtime_type, value_type_name};
     pub use crate::value::{FloatValue, Value};
@@ -262,27 +256,12 @@ pub use sqlite::{
 };
 pub use status::{ExecutionStatus, ExitStatus};
 pub use string::PhpString;
-pub use todo_runtime::{RuntimeTodo, runtime_skeleton_status};
 pub use types::{runtime_type_name, value_matches_runtime_type, value_type_name};
 pub use value::{FloatValue, Value};
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CallableValue, ExecutionStatus, ExitStatus, OutputBuffer, PhpString, RuntimeTodo, Value,
-        runtime_skeleton_status,
-    };
-
-    #[test]
-    fn exposes_runtime_skeleton() {
-        let todo = RuntimeTodo::new("values, diagnostics, output, and context");
-        assert_eq!(todo.area(), "values, diagnostics, output, and context");
-        assert_eq!(runtime_skeleton_status(), "runtime-skeleton");
-        assert_eq!(
-            php_testkit::reference_checkout_path(),
-            "third_party/php-src"
-        );
-    }
+    use super::{CallableValue, ExecutionStatus, ExitStatus, OutputBuffer, PhpString, Value};
 
     #[test]
     fn value_clone_preserves_scalar_payloads() {

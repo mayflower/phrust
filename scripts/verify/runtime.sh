@@ -89,17 +89,14 @@ require_file crates/php_runtime/src/output.rs
 require_file crates/php_runtime/src/reference.rs
 require_file crates/php_runtime/src/status.rs
 require_file crates/php_runtime/src/string.rs
-require_file crates/php_runtime/src/todo_runtime.rs
 require_file crates/php_runtime/src/value.rs
 require_file crates/php_vm/Cargo.toml
 require_file crates/php_vm/src/compiled_unit.rs
 require_file crates/php_vm/src/frame.rs
 require_file crates/php_vm/src/lib.rs
-require_file crates/php_vm/src/todo_runtime.rs
 require_file crates/php_vm/src/vm.rs
 require_file crates/php_vm_cli/Cargo.toml
 require_file crates/php_vm_cli/src/main.rs
-require_file crates/php_vm_cli/src/todo_runtime.rs
 require_file tools/bench_vm_smoke.rs
 require_file tools/fuzz_vm_smoke.rs
 require_file fixtures/runtime/README.md

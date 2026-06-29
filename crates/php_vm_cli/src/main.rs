@@ -4,7 +4,6 @@
 //! library entrypoints live in `php_vm_cli`.
 
 mod commands;
-mod todo_cli;
 
 fn main() {
     commands::main_entry();

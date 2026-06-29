@@ -261,7 +261,7 @@ request-local lookup epoch, and, for private properties, the exact normalized
 visibility scope. Public property entries use no scope guard because their
 visibility is scope-independent.
 
-Phase 09.10 makes the cached target carry explicit object/class layout metadata:
+The cached target carries explicit object/class layout metadata:
 receiver class id, layout epoch, declared property slot index, visibility
 context, typed-property initialized state, property-hook presence, magic
 `__get` presence, and dynamic-property fallback state. Cache hits rehydrate the

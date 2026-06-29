@@ -144,6 +144,6 @@ Fixture proof: `fixtures/runtime/valid/functions/closure-use.php`,
 
 Runtime values favor deterministic structured diagnostics over PHP CLI wording
 compatibility. `RuntimeDiagnostic` IDs are the stable contract; reference text
-matching is constrained to fixtures where the subset is intentionally green.
+matching is constrained to fixtures with explicit reference coverage.
 Known deviations are tracked in `docs/runtime-known-gaps.md` and
 `docs/runtime-reference-diff.md`.

@@ -152,43 +152,24 @@ guard/deopt policy, code-cache lifecycle, platform limits, and abort criteria.
   unsupported JIT platform must degrade to safe baseline behavior.
 - Any known deviation is documented in `docs/performance-known-gaps.md`.
 
-## Roadmap
+## Current Performance Surfaces
 
-The current staged acceleration program is coordinated by
-`docs/performance-acceleration-plan.md` and its gap catalog
-`docs/performance-acceleration-known-gaps.md`.
+The current performance documentation is organized around stable contracts,
+current command behavior, generated summaries, and known gaps:
 
-The next current-state fastest-engine work is coordinated by
-`docs/performance-fastest-engine-plan.md` and
-`docs/performance-fastest-engine-known-gaps.md`. Those docs start from the
-already-landed acceleration surface, keep `--exec-format=ir` as the correctness
-baseline, and require correctness-first evidence before any new speed claim.
+- `docs/performance-methodology.md`: measurement and reporting policy.
+- `docs/performance-runtime.md`: runtime and VM optimization contracts.
+- `docs/performance-bytecode-cache.md`: CLI bytecode cache behavior.
+- `docs/performance-results.md`: committed local benchmark summary.
+- `docs/performance-framework-corpus.md`: generated framework-smoke summary.
+- `docs/performance-fastest-engine-results.md`: generated fastest-engine matrix
+  summary.
+- `docs/performance-known-gaps.md` and
+  `docs/known_gaps/performance.jsonl`: human and machine-readable gap catalogs.
 
-- `07.00`: preflight and initial known-gap catalog.
-- `07.01`: scope ADR and performance principles.
-- `07.02` to `07.03`: Nix/tooling and Performance justfile gates.
-- `07.04` to `07.09`: metrics crate, benchmark corpus, runner, counters,
-  baseline/compare tooling, and hot-path inventory.
-- `07.10`: IR/bytecode verifier hardening.
-- `07.11` to `07.16`: bytecode-cache design, crate, fingerprinting,
-  roundtrip, CLI integration, and lifecycle documentation.
-- `07.17` to `07.22`: optimizer framework, differential harness, constant
-  folding, peepholes, CFG cleanup, and literal pool/string interning.
-- `07.23` to `07.27`: quickening model, framework, and selected
-  specializations for integer add, string concat, and packed array dim fetch.
-- `07.28` to `07.35`: inline-cache design, slots, stats, and caches for
-  functions, methods, properties, class constants, static properties, includes,
-  and Composer/autoload lookup.
-- `07.36` to `07.43`: runtime fast paths and a unified deopt/fallback protocol.
-- `07.44` to `07.47`: stress regressions, optional callgrind smoke, Criterion
-  hot-path benchmarks, and performance report generation.
-- `07.48` to `07.55`: experimental Cranelift JIT ADR, crate, eligibility, ABI,
-  lowering, execution smoke, tiering, and safety audit.
-- `07.56` to `07.60`: A/B flag matrix, performance result consolidation,
-  developer docs, CI/Nix hardening, final audit, and future runtime follow-up.
-- `07.A` to `07.F`: optional profiling workflow, optional LTO/PGO plan,
-  shared-cache research, polymorphic inline caches, framework-like smokes, and
-  optional W^X/mprotect JIT memory prototype.
+Generated raw performance artifacts stay under `target/performance/` and are
+not committed. Current `just` recipes are the source of truth for command names
+and gate membership.
 
 ## Reference Links
 
@@ -202,27 +183,27 @@ baseline, and require correctness-first evidence before any new speed claim.
 
 ## Validation Policy
 
-Documentation-only work items use the strongest available docs or smoke gate. If no
-dedicated docs gate exists, the current fallback is:
+Documentation-only performance changes use the strongest available docs or
+smoke gate. If no dedicated docs gate exists, the current fallback is:
 
 ```bash
 nix develop -c just verify-stdlib
 ```
 
-Code-changing Performance work items must add or update a narrower Performance gate and
-then include that gate in `verify-performance` once the gate exists.
+Code-changing performance changes must add or update a narrower Performance
+gate and then include that gate in `verify-performance` once the gate exists.
 
 ## Command Surface
 
-Work item introduced the Performance recipes below. Later work items replaced the
-initial scaffolding with concrete cache, optimizer, quickening, inline-cache,
-JIT, safety, matrix, and reporting gates.
+The performance recipes below are the current command surface. Earlier
+scaffolding has been replaced with concrete cache, optimizer, quickening,
+inline-cache, JIT, safety, matrix, and reporting gates.
 
 | Command | Current behavior |
 | --- | --- |
 | `verify-performance` | Runs `performance-tests`, `performance-regression`, cache/optimizer/superinstruction/quickening/inline-cache/JIT/safety gates, benchmark smoke, framework smoke, release benchmark smoke, acceleration matrix, fast-preset smoke, hot-path inventory, and `perf-report`. |
 | `performance-tests` | Runs `cargo test --workspace` with deterministic `RUST_MIN_STACK` defaulting to `8388608`, plus Performance script self-tests. |
-| `performance-regression` | Runs `scripts/performance_regression_smoke.sh`, then `scripts/performance/regression_smoke.sh` across opt levels 0/1/2, quickening off/on, and inline caches off/on for the Work item stress fixtures, followed by `perf-flag-matrix`. |
+| `performance-regression` | Runs `scripts/performance_regression_smoke.sh`, then `scripts/performance/regression_smoke.sh` across opt levels 0/1/2, quickening off/on, and inline caches off/on for the performance stress fixtures, followed by `perf-flag-matrix`. |
 | `perf-flag-matrix` | Compares baseline output/exit/stderr against opt 1, opt 2, superinstructions-on-with-IR, quickening, quickening with `--exec-format=auto`, inline caches, bytecode-cache read/write, and all-non-JIT-on combinations across Performance regressions and selected Runtime semantics fixtures. JIT is opt-in with `PHRUST_PERF_MATRIX_JIT=1` when feature/platform support is available. |
 | `benchmark-smoke` | Builds the VM, runs deterministic Performance smoke fixtures, checks expected output, and writes `target/performance/benchmark-smoke.json`. |
 | `framework-smoke` | Builds the VM, compares opt-off and opt-on runs over deterministic framework-like fixtures, checks output parity, writes `target/performance/framework-smoke/summary.json`, and regenerates `docs/performance-framework-corpus.md`. |

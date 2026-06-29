@@ -21,8 +21,10 @@ extensions, or provide a php-src-compatible SAPI or extension ABI.
 internals — match observable behavior instead.
 
 See also `AGENTS.md` (scope/layer boundaries), `README.md` (layout), `docs/adr/`
-(decisions), and `docs/phpt/` (PHPT workflow). The active work order is in
-`prompts.md`, but organize artifacts by module/function, not by prompt number.
+(decisions), and `docs/phpt/` (PHPT workflow). Repository docs describe current
+architecture, contracts, commands, and compatibility status. Active
+implementation tasks belong in issues, PR descriptions, or external task notes;
+committed docs should be organized by layer, module, or function.
 
 ## Development environment
 
