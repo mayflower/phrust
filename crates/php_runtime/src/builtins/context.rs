@@ -19,6 +19,7 @@ pub(in crate::builtins) const JSON_HEX_TAG: i64 = 1;
 pub(in crate::builtins) const JSON_HEX_AMP: i64 = 2;
 pub(in crate::builtins) const JSON_HEX_APOS: i64 = 4;
 pub(in crate::builtins) const JSON_HEX_QUOT: i64 = 8;
+pub(in crate::builtins) const JSON_NUMERIC_CHECK: i64 = 32;
 pub(in crate::builtins) const JSON_PRETTY_PRINT: i64 = 128;
 pub(in crate::builtins) const JSON_UNESCAPED_SLASHES: i64 = 64;
 pub(in crate::builtins) const JSON_UNESCAPED_UNICODE: i64 = 256;

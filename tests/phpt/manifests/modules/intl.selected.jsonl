@@ -1,3 +1,5 @@
 {"path":"tests/phpt/generated/intl/platform-checks.phpt"}
 {"path":"tests/phpt/generated/intl/guarded-common-symbols.phpt"}
 {"path":"tests/phpt/generated/intl/framework-fallback.phpt"}
+{"path":"ext/intl/tests/intl_icu_data_version_constant.phpt"}
+{"path":"ext/intl/tests/intl_icu_version_constant.phpt"}

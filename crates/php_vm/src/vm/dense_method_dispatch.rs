@@ -267,7 +267,7 @@ impl Vm {
     ) -> VmResult {
         if is_closure_runtime_class(class_name)
             || is_php_token_runtime_class(class_name)
-            || normalize_class_name(class_name) == "normalizer"
+            || internal_extension_static_class(class_name)
         {
             self.record_counter_dense_call_fallback("runtime_static_method_receiver");
             return self.call_static_method_callable(

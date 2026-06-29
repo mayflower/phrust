@@ -1,2 +1,5 @@
 {"path":"tests/phpt/generated/mysqli/platform-checks.phpt"}
 {"path":"tests/phpt/generated/mysqli/sqlite-compat-query.phpt"}
+{"path":"ext/mysqli/tests/mysqli_get_client_info.phpt"}
+{"path":"ext/mysqli/tests/functions/mysqli_get_client_info.phpt"}
+{"path":"ext/mysqli/tests/mysqli_get_client_version.phpt"}

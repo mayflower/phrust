@@ -2,7 +2,7 @@
 
 - Strategy: deterministic crypto helper MVP
 - Selected manifest: `tests/phpt/manifests/modules/openssl.selected.jsonl`
-- Selected gate: 2 generated PHPTs shared with `wp.db-network`
+- Selected gate: 4 PASS
 
 ## Implemented Surface
 
@@ -12,11 +12,14 @@ application update, hashing, and security probes:
 - `openssl_random_pseudo_bytes`
 - `openssl_digest`
 - `openssl_get_md_methods`
+- `openssl_get_cipher_methods`
+- `openssl_cipher_iv_length`
 - `openssl_verify`
 - `OPENSSL_ALGO_SHA256`
 
 Digest support is implemented for the selected hash families backed by Rust
 digest crates. `openssl_random_pseudo_bytes()` uses OS randomness.
+Cipher metadata is limited to the selected AES-CBC probes.
 `openssl_verify()` intentionally returns the explicit unsupported verification
 result covered by the selected fixture; it does not fake signature validation.
 

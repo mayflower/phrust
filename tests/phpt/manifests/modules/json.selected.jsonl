@@ -8,3 +8,8 @@
 {"path":"ext/json/tests/json_last_error_error.phpt"}
 {"path":"ext/json/tests/json_last_error_msg_error.phpt"}
 {"path":"ext/json/tests/json_encode_unescaped_slashes.phpt"}
+{"path":"ext/json/tests/json_encode_pretty_print.phpt"}
+{"path":"ext/json/tests/json_encode_numeric.phpt"}
+{"path":"ext/json/tests/pass002.phpt"}
+{"path":"ext/json/tests/pass003.phpt"}
+{"path":"ext/json/tests/json_encode_pretty_print2.phpt"}

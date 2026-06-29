@@ -2,7 +2,7 @@
 
 - Priority: 18.6 focused harness
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- the selected close gate: 5 PASS, 0 SKIP, 0 FAIL, 0 BORK from 5 selected fixtures
+- the selected close gate: 11 PASS, 0 SKIP, 0 FAIL, 0 BORK from 11 selected fixtures
 - Upstream corpus snapshot before the selected gate: 41 PASS, 5 SKIP, 117 FAIL, 0 BORK
   from 165 corpus candidates
 
@@ -35,6 +35,12 @@
 - `tests/phpt/generated/pcre/preg-replace-split-grep-quote.phpt`
 - `tests/phpt/generated/pcre/preg-replace-callback.phpt`
 - `tests/phpt/generated/pcre/preg-replace-callback-invalid.phpt`
+- `ext/pcre/tests/preg_match_basic.phpt`
+- `ext/pcre/tests/preg_quote_basic.phpt`
+- `ext/pcre/tests/preg_split_basic.phpt`
+- `ext/pcre/tests/preg_grep_basic.phpt`
+- `ext/pcre/tests/001.phpt`
+- `ext/pcre/tests/grep.phpt`
 
 ## Relevant Source Areas
 
@@ -65,6 +71,9 @@
   bridge.
 - `preg_replace_callback` uses real VM callable dispatch for named functions and
   closures.
+- The selected upstream PCRE promotion now covers basic `preg_match`,
+  `preg_quote`, `preg_split`, `preg_grep`, and legacy `preg_match_all`-free
+  regex cases that fit the existing runtime surface.
 
 ## Known Gaps
 

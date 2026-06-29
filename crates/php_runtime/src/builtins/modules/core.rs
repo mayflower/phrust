@@ -2,8 +2,8 @@
 
 use super::super::context::{
     JSON_ERROR_SYNTAX, JSON_ERROR_UTF8, JSON_HEX_AMP, JSON_HEX_APOS, JSON_HEX_QUOT, JSON_HEX_TAG,
-    JSON_PRESERVE_ZERO_FRACTION, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR, JSON_UNESCAPED_SLASHES,
-    JSON_UNESCAPED_UNICODE, json_error_message,
+    JSON_NUMERIC_CHECK, JSON_PRESERVE_ZERO_FRACTION, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
+    JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, json_error_message,
 };
 use super::super::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
@@ -1826,9 +1826,34 @@ pub(in crate::builtins::modules) fn php_value_to_json(
                     .ok_or(JSON_ERROR_SYNTAX)
             }
         }
-        Value::String(value) => std::str::from_utf8(value.as_bytes())
-            .map(|text| JsonValue::String(text.to_string()))
-            .map_err(|_| JSON_ERROR_UTF8),
+        Value::String(value) => {
+            if flags & JSON_NUMERIC_CHECK != 0 {
+                match classify_php_string(&value) {
+                    classified
+                        if matches!(classified.kind, NumericStringKind::IntString)
+                            && matches!(classified.value, Some(NumericStringValue::Int(_))) =>
+                    {
+                        if let Some(NumericStringValue::Int(value)) = classified.value {
+                            return Ok(JsonValue::Number(JsonNumber::from(value)));
+                        }
+                    }
+                    classified
+                        if matches!(classified.kind, NumericStringKind::FloatString)
+                            && matches!(classified.value, Some(NumericStringValue::Float(_))) =>
+                    {
+                        if let Some(NumericStringValue::Float(value)) = classified.value {
+                            return JsonNumber::from_f64(value)
+                                .map(JsonValue::Number)
+                                .ok_or(JSON_ERROR_SYNTAX);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            std::str::from_utf8(value.as_bytes())
+                .map(|text| JsonValue::String(text.to_string()))
+                .map_err(|_| JSON_ERROR_UTF8)
+        }
         Value::Array(array) => {
             if let Some(elements) = array.packed_elements() {
                 elements
@@ -5420,7 +5445,7 @@ mod tests {
     };
     use crate::builtins::context::{
         JSON_ERROR_NONE, JSON_HEX_AMP, JSON_HEX_APOS, JSON_HEX_QUOT, JSON_HEX_TAG,
-        JSON_OBJECT_AS_ARRAY, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
+        JSON_NUMERIC_CHECK, JSON_OBJECT_AS_ARRAY, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
     };
     use crate::{
         ArrayKey, BuiltinRegistry, ClassEntry, ClassFlags, FilesystemCapabilities, ObjectRef,
@@ -5469,6 +5494,35 @@ mod tests {
         );
         assert_eq!(
             call("is_numeric", vec![Value::Bool(true)], &mut output),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn checkdate_matches_gregorian_bounds() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call(
+                "checkdate",
+                vec![Value::Int(2), Value::Int(29), Value::Int(2006)],
+                &mut output
+            ),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call(
+                "checkdate",
+                vec![Value::Int(2), Value::Int(29), Value::Int(2000)],
+                &mut output
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call(
+                "checkdate",
+                vec![Value::Int(1), Value::Int(1), Value::Int(32768)],
+                &mut output
+            ),
             Value::Bool(false)
         );
     }
@@ -7756,6 +7810,25 @@ mod tests {
                 vec![Value::string("<tag>&'\""), Value::Int(hex_flags)]
             ),
             Value::string(r#""\u003Ctag\u003E\u0026\u0027\u0022""#)
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "json_encode",
+                vec![Value::string("9.4324"), Value::Int(JSON_NUMERIC_CHECK)]
+            ),
+            Value::string("9.4324")
+        );
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "json_encode",
+                vec![
+                    Value::packed_array(vec![Value::string("122321"), Value::string("plain")]),
+                    Value::Int(JSON_NUMERIC_CHECK)
+                ]
+            ),
+            Value::string(r#"[122321,"plain"]"#)
         );
         assert_eq!(
             call_in_context(&mut context, "json_encode", vec![Value::float(42.0)]),

@@ -9,12 +9,12 @@ Current focused target run:
 
 | Outcome | Count |
 | --- | ---: |
-| PASS | 10 |
+| PASS | 15 |
 | FAIL | 0 |
 | SKIP | 0 |
 | BORK | 0 |
 
-The focused reference run is green for all 10 selected PHPTs.
+The focused reference run is green for all 15 selected PHPTs.
 
 ## Passing Fixtures
 
@@ -28,10 +28,15 @@ The focused reference run is green for all 10 selected PHPTs.
 - `ext/json/tests/json_last_error_error.phpt`
 - `ext/json/tests/json_last_error_msg_error.phpt`
 - `ext/json/tests/json_encode_unescaped_slashes.phpt`
+- `ext/json/tests/json_encode_pretty_print.phpt`
+- `ext/json/tests/json_encode_numeric.phpt`
+- `ext/json/tests/pass002.phpt`
+- `ext/json/tests/pass003.phpt`
+- `ext/json/tests/json_encode_pretty_print2.phpt`
 
 ## Blockers
 
-No blockers remain in the selected 10-test JSON PHPT harness.
+No blockers remain in the selected 15-test JSON PHPT harness.
 
 ## Close
 
@@ -39,16 +44,16 @@ Close gates passed:
 
 - `nix develop -c just diff-json-pcre-date`: PASS, total 3, pass 3,
   fail 0, skip 0, known_gap 0.
-- `nix develop -c cargo test -p php_vm`: PASS, 345 tests.
+- `nix develop -c cargo test -p php_vm`: PASS, 483 tests.
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=json`:
-  PASS, reference 10/10 and target 10/10.
-- `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php nix develop -c just verify-stdlib`:
+  PASS, reference 15/15 and target 15/15.
+- `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHP_SRC_DIR=$PWD/third_party/php-src nix develop -c just verify-stdlib`:
   PASS. The stdlib diff gates remained green, including
   `diff-json-pcre-date`.
-- `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHPT_RUN_FULL=1 nix develop -c just phpt-full-regression`:
-  PASS against the accepted baseline. The full run covered 21,548 tests with
-  BORK 140, FAIL 9,680, PASS 2,654, SKIP 9,070, and XFAIL 4. The run
-  directory was `target/phpt-work/full-runs/20260628T011951Z`.
+- `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHP_SRC_DIR=$PWD/third_party/php-src nix develop -c just verify-phpt`:
+  PASS against the accepted PHPT baseline. The run validated 21,548 corpus
+  entries, 20,428 known non-green fingerprints, and source integrity for 24,475
+  php-src manifest entries with 0 skipped host-generated entries.
 
 The broad non-green full-regression counts match the accepted PHPT baseline and
 do not leave a JSON-module blocker.
@@ -97,7 +102,7 @@ The selected manifest is intentionally narrow and covers:
 - encode scalar/list/map/simple-object basics
 - decode associative array and `stdClass` basics
 - last-error code and message helpers
-- common encode flags
+- common encode flags, pretty-print, numeric-check, and legacy JSON pass cases
 - `JSON_THROW_ON_ERROR` failure routing
 
 `JsonSerializable` remains deferred until the runtime builtin layer can call

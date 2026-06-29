@@ -12,6 +12,16 @@ use sha2::{Sha224, Sha256, Sha384, Sha512};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
+        "openssl_cipher_iv_length",
+        builtin_openssl_cipher_iv_length,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "openssl_get_cipher_methods",
+        builtin_openssl_get_cipher_methods,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "openssl_digest",
         builtin_openssl_digest,
         BuiltinCompatibility::Php,
@@ -34,6 +44,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 ];
 
 const OPENSSL_MD_METHODS: &[&str] = &["md5", "sha1", "sha224", "sha256", "sha384", "sha512"];
+const OPENSSL_CIPHER_METHODS: &[&str] = &["aes-128-cbc", "aes-256-cbc"];
 
 pub(in crate::builtins::modules) fn builtin_openssl_random_pseudo_bytes(
     _context: &mut BuiltinContext<'_>,
@@ -92,6 +103,34 @@ pub(in crate::builtins::modules) fn builtin_openssl_digest(
     })
 }
 
+pub(in crate::builtins::modules) fn builtin_openssl_get_cipher_methods(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(BuiltinError::new(
+            "E_PHP_RUNTIME_BUILTIN_ARITY",
+            "builtin openssl_get_cipher_methods expects zero or one argument(s)",
+        ));
+    }
+    Ok(string_list(OPENSSL_CIPHER_METHODS))
+}
+
+pub(in crate::builtins::modules) fn builtin_openssl_cipher_iv_length(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("openssl_cipher_iv_length", &args, 1)?;
+    let method = string_arg("openssl_cipher_iv_length", &args[0])?.to_string_lossy();
+    let length = match method.to_ascii_lowercase().as_str() {
+        "aes-128-cbc" | "aes-256-cbc" => 16,
+        _ => return Ok(Value::Bool(false)),
+    };
+    Ok(Value::Int(length))
+}
+
 pub(in crate::builtins::modules) fn builtin_openssl_get_md_methods(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -106,6 +145,17 @@ pub(in crate::builtins::modules) fn builtin_openssl_get_md_methods(
         );
     }
     Ok(Value::Array(array))
+}
+
+fn string_list(values: &[&str]) -> Value {
+    let mut array = PhpArray::new();
+    for (index, value) in values.iter().enumerate() {
+        array.insert(
+            ArrayKey::Int(index as i64),
+            Value::String(PhpString::from(*value)),
+        );
+    }
+    Value::Array(array)
 }
 
 pub(in crate::builtins::modules) fn builtin_openssl_verify(

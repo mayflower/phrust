@@ -1,1 +1,7 @@
 {"path":"tests/phpt/generated/session/platform-checks.phpt"}
+{"path":"ext/session/tests/session_cache_expire_basic.phpt"}
+{"path":"ext/session/tests/session_cache_limiter_basic.phpt"}
+{"path":"ext/session/tests/session_module_name_basic.phpt"}
+{"path":"ext/session/tests/session_name_basic.phpt"}
+{"path":"ext/session/tests/session_save_path_basic.phpt"}
+{"path":"ext/session/tests/session_write_close_basic.phpt"}

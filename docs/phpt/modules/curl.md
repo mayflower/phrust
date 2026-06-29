@@ -2,8 +2,8 @@
 
 - Strategy: deterministic HTTP client MVP
 - Selected manifest: `tests/phpt/manifests/modules/curl.selected.jsonl`
-- Selected gate: 4 generated PHPTs shared with `wp.db-network` and the
-  closure cURL transport slice
+- Selected gate: 5 PASS and 2 SKIP. The skipped rows require explicit live
+  network configuration.
 
 ## Implemented Surface
 
@@ -17,6 +17,9 @@ client helpers:
 - `curl_getinfo`
 - `curl_errno`
 - `curl_error`
+- `curl_escape`
+- `curl_unescape`
+- `curl_multi_strerror`
 - `curl_close`
 
 Network execution is disabled by default. `curl_exec()` returns `false` and sets
@@ -32,13 +35,16 @@ The local HTTP transport also supports selected application options:
 - `CURLOPT_HEADER` and `CURLINFO_HEADER_SIZE` for response-header inclusion.
 - `CURLINFO_RESPONSE_CODE`, `CURLINFO_EFFECTIVE_URL`, and
   `CURLINFO_TOTAL_TIME`.
+- `curl_version()` metadata for selected libcurl compatibility probes,
+  including version, host, features, SSL version number, and zlib version keys.
 
 ## Gaps
 
 HTTPS/TLS transport remains unsupported in `php_runtime` until a TLS stack is
-selected for that crate. `curl_multi_*`, proxy behavior, authentication, upload
-streaming, multipart file upload parity, and the full libcurl option matrix
-remain unsupported. Public internet endpoints are not part of the default gate.
+selected for that crate. Full `curl_multi_*` handles, proxy behavior,
+authentication, upload streaming, multipart file upload parity, and the full
+libcurl option matrix remain unsupported. Public internet endpoints are not part
+of the default gate.
 
 ## Source References
 
