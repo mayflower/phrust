@@ -18,6 +18,8 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 
 const FILTER_DEFAULT: i64 = 516;
 const FILTER_VALIDATE_BOOL: i64 = 258;
+const FILTER_VALIDATE_INT: i64 = 257;
+const FILTER_VALIDATE_FLOAT: i64 = 259;
 const FILTER_VALIDATE_URL: i64 = 273;
 const FILTER_VALIDATE_EMAIL: i64 = 274;
 const FILTER_VALIDATE_IP: i64 = 275;
@@ -56,6 +58,8 @@ fn builtin_filter_var(
     match filter {
         FILTER_DEFAULT => Ok(args[0].clone()),
         FILTER_VALIDATE_EMAIL => validate_email(&args[0], failure),
+        FILTER_VALIDATE_INT => validate_int(&args[0], failure),
+        FILTER_VALIDATE_FLOAT => validate_float(&args[0], failure),
         FILTER_VALIDATE_URL => validate_url(&args[0], flags, failure),
         FILTER_VALIDATE_IP => validate_ip(&args[0], flags, failure),
         FILTER_VALIDATE_BOOL => validate_bool(&args[0], flags, failure),
@@ -64,6 +68,31 @@ fn builtin_filter_var(
         FILTER_SANITIZE_NUMBER_INT => sanitize(&args[0], |byte| {
             byte.is_ascii_digit() || byte == b'+' || byte == b'-'
         }),
+        _ => Ok(failure),
+    }
+}
+
+fn validate_int(value: &Value, failure: Value) -> BuiltinResult {
+    let input = string_arg("filter_var", value)?;
+    let text = input.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.parse::<i64>().is_ok()
+        && trimmed.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_digit() || (index == 0 && matches!(byte, b'+' | b'-'))
+        })
+    {
+        Ok(Value::Int(trimmed.parse::<i64>().unwrap_or_default()))
+    } else {
+        Ok(failure)
+    }
+}
+
+fn validate_float(value: &Value, failure: Value) -> BuiltinResult {
+    let input = string_arg("filter_var", value)?;
+    let text = input.to_string_lossy();
+    let trimmed = text.trim();
+    match trimmed.parse::<f64>() {
+        Ok(number) if number.is_finite() => Ok(Value::float(number)),
         _ => Ok(failure),
     }
 }

@@ -82,19 +82,25 @@ mod tests {
         assert_eq!(
             get_loaded_extensions(&registry),
             [
+                "apcu",
+                "bcmath",
                 "core",
+                "ctype",
                 "curl",
                 "date",
                 "dom",
                 "exif",
                 "fileinfo",
                 "filter",
+                "ftp",
                 "gd",
+                "gmp",
                 "hash",
                 "iconv",
                 "intl",
                 "json",
                 "mbstring",
+                "memcached",
                 "mysqli",
                 "openssl",
                 "pcre",
@@ -102,9 +108,12 @@ mod tests {
                 "pdo_sqlite",
                 "phar",
                 "random",
+                "redis",
                 "reflection",
                 "session",
                 "simplexml",
+                "sockets",
+                "sodium",
                 "spl",
                 "sqlite3",
                 "standard",
@@ -119,7 +128,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(&registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 32);
+        assert_eq!(array.len(), 41);
     }
 
     #[test]

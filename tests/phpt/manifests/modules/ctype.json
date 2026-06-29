@@ -1,0 +1,17 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "ctype",
+  "priority": "ASCII classification MVP",
+  "selected_manifest": "tests/phpt/manifests/modules/ctype.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": ["ASCII C-locale ctype predicates used by dependency probes"],
+  "non_scope": ["Locale-sensitive classification"],
+  "target_gates": ["just phpt-dev-module MODULE=ctype"],
+  "next_step": "Expand corpus coverage after broader ctype compatibility work."
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "sockets",
+  "priority": "Default-disabled sockets surface",
+  "selected_manifest": "tests/phpt/manifests/modules/sockets.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": ["Socket constants and deterministic false creation"],
+  "non_scope": ["Network socket creation, connect, read, write, or select"],
+  "target_gates": ["just phpt-dev-module MODULE=sockets"],
+  "next_step": "Keep socket creation disabled unless host capabilities are explicitly introduced."
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "ftp",
+  "priority": "Default-disabled FTP surface",
+  "selected_manifest": "tests/phpt/manifests/modules/ftp.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": ["Deterministic false returns for connection attempts"],
+  "non_scope": ["FTP networking or command protocol support"],
+  "target_gates": ["just phpt-dev-module MODULE=ftp"],
+  "next_step": "Keep external FTP disabled unless a future prompt enables a capability gate."
+}

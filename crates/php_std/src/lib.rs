@@ -1643,6 +1643,18 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("hash_algos", "hash"))
                 .with_function(FunctionDescriptor::php("hash_equals", "hash"))
                 .with_function(FunctionDescriptor::php("hash_hmac", "hash")),
+            ExtensionDescriptor::new("ctype")
+                .with_function(FunctionDescriptor::php("ctype_alnum", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_alpha", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_cntrl", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_digit", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_graph", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_lower", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_print", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_punct", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_space", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_upper", "ctype"))
+                .with_function(FunctionDescriptor::php("ctype_xdigit", "ctype")),
             ExtensionDescriptor::new("filter")
                 .with_function(FunctionDescriptor::php("filter_input", "filter"))
                 .with_function(FunctionDescriptor::php("filter_var", "filter"))
@@ -1685,6 +1697,16 @@ impl ExtensionRegistry {
                     "FILTER_VALIDATE_BOOLEAN",
                     "filter",
                     ConstantValue::Int(258),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_INT",
+                    "filter",
+                    ConstantValue::Int(257),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILTER_VALIDATE_FLOAT",
+                    "filter",
+                    ConstantValue::Int(259),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "FILTER_VALIDATE_URL",
@@ -1743,6 +1765,8 @@ impl ExtensionRegistry {
                 )),
             ExtensionDescriptor::new("iconv")
                 .with_function(FunctionDescriptor::php("iconv", "iconv"))
+                .with_function(FunctionDescriptor::php("iconv_get_encoding", "iconv"))
+                .with_function(FunctionDescriptor::php("iconv_set_encoding", "iconv"))
                 .with_function(FunctionDescriptor::php("iconv_strlen", "iconv"))
                 .with_function(FunctionDescriptor::php("iconv_strpos", "iconv"))
                 .with_function(FunctionDescriptor::php("iconv_substr", "iconv"))
@@ -1754,7 +1778,146 @@ impl ExtensionRegistry {
                 .with_constant(ConstantDescriptor::with_value(
                     "ICONV_VERSION",
                     "iconv",
-                    ConstantValue::String("bounded-utf8-ascii"),
+                    ConstantValue::String("bounded-utf8-ascii-latin1"),
+                )),
+            ExtensionDescriptor::new("sodium")
+                .with_function(FunctionDescriptor::php("sodium_base642bin", "sodium"))
+                .with_function(FunctionDescriptor::php("sodium_bin2base64", "sodium"))
+                .with_function(FunctionDescriptor::php("sodium_bin2hex", "sodium"))
+                .with_function(FunctionDescriptor::php(
+                    "sodium_crypto_generichash",
+                    "sodium",
+                ))
+                .with_function(FunctionDescriptor::php(
+                    "sodium_crypto_generichash_keygen",
+                    "sodium",
+                ))
+                .with_function(FunctionDescriptor::php(
+                    "sodium_crypto_sign_detached",
+                    "sodium",
+                ))
+                .with_function(FunctionDescriptor::php(
+                    "sodium_crypto_sign_verify_detached",
+                    "sodium",
+                ))
+                .with_function(FunctionDescriptor::php("sodium_hex2bin", "sodium"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_BASE64_VARIANT_ORIGINAL",
+                    "sodium",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_BASE64_VARIANT_ORIGINAL_NO_PADDING",
+                    "sodium",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_BASE64_VARIANT_URLSAFE",
+                    "sodium",
+                    ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING",
+                    "sodium",
+                    ConstantValue::Int(7),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_GENERICHASH_BYTES",
+                    "sodium",
+                    ConstantValue::Int(32),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_GENERICHASH_BYTES_MIN",
+                    "sodium",
+                    ConstantValue::Int(16),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_GENERICHASH_BYTES_MAX",
+                    "sodium",
+                    ConstantValue::Int(64),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_SIGN_BYTES",
+                    "sodium",
+                    ConstantValue::Int(64),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES",
+                    "sodium",
+                    ConstantValue::Int(32),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES",
+                    "sodium",
+                    ConstantValue::Int(64),
+                )),
+            ExtensionDescriptor::new("bcmath")
+                .with_function(FunctionDescriptor::php("bcadd", "bcmath"))
+                .with_function(FunctionDescriptor::php("bccomp", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcdiv", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcmod", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcmul", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcpow", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcscale", "bcmath"))
+                .with_function(FunctionDescriptor::php("bcsub", "bcmath")),
+            ExtensionDescriptor::new("gmp")
+                .with_class(ClassDescriptor::new("GMP", "gmp", ClassKind::Class))
+                .with_function(FunctionDescriptor::php("gmp_abs", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_add", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_cmp", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_div_q", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_init", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_intval", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_mod", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_mul", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_neg", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_pow", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_strval", "gmp"))
+                .with_function(FunctionDescriptor::php("gmp_sub", "gmp")),
+            ExtensionDescriptor::new("apcu")
+                .with_function(FunctionDescriptor::php("apcu_add", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_clear_cache", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_delete", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_enabled", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_exists", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_fetch", "apcu"))
+                .with_function(FunctionDescriptor::php("apcu_store", "apcu")),
+            ExtensionDescriptor::new("redis").with_class(ClassDescriptor::new(
+                "Redis",
+                "redis",
+                ClassKind::Class,
+            )),
+            ExtensionDescriptor::new("memcached").with_class(ClassDescriptor::new(
+                "Memcached",
+                "memcached",
+                ClassKind::Class,
+            )),
+            ExtensionDescriptor::new("ftp")
+                .with_function(FunctionDescriptor::php("ftp_connect", "ftp"))
+                .with_function(FunctionDescriptor::php("ftp_ssl_connect", "ftp"))
+                .with_class(ClassDescriptor::new(
+                    "FTP\\Connection",
+                    "ftp",
+                    ClassKind::Class,
+                )),
+            ExtensionDescriptor::new("sockets")
+                .with_function(FunctionDescriptor::php("socket_create", "sockets"))
+                .with_function(FunctionDescriptor::php("socket_last_error", "sockets"))
+                .with_function(FunctionDescriptor::php("socket_strerror", "sockets"))
+                .with_constant(ConstantDescriptor::with_value(
+                    "AF_INET",
+                    "sockets",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SOCK_STREAM",
+                    "sockets",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SOL_TCP",
+                    "sockets",
+                    ConstantValue::Int(6),
                 )),
             ExtensionDescriptor::new("zlib")
                 .with_function(FunctionDescriptor::php("gzdeflate", "zlib"))
@@ -3060,8 +3223,17 @@ mod tests {
 
         assert_eq!(
             missing,
-            ["print"],
-            "`print` is a PHP language construct; visible function descriptors should otherwise have generated php-src arginfo"
+            [
+                "apcu_add",
+                "apcu_clear_cache",
+                "apcu_delete",
+                "apcu_enabled",
+                "apcu_exists",
+                "apcu_fetch",
+                "apcu_store",
+                "print"
+            ],
+            "`print` is a PHP language construct; APCu is a PECL-style surface; visible function descriptors should otherwise have generated php-src arginfo"
         );
     }
 
@@ -3078,8 +3250,17 @@ mod tests {
 
         assert_eq!(
             missing,
-            ["print"],
-            "`print` is a PHP language construct; all function builtins should have generated php-src arginfo"
+            [
+                "apcu_add",
+                "apcu_clear_cache",
+                "apcu_delete",
+                "apcu_enabled",
+                "apcu_exists",
+                "apcu_fetch",
+                "apcu_store",
+                "print"
+            ],
+            "`print` is a PHP language construct; APCu is a PECL-style surface; all function builtins should otherwise have generated php-src arginfo"
         );
     }
 

@@ -1,13 +1,23 @@
 //! Bounded iconv UTF-8/ASCII MVP.
 
 use super::core::{argument_value_error, arity_error, int_arg, string_arg};
-use crate::Value;
 use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinResult, RuntimeSourceSpan,
 };
+use crate::{ArrayKey, PhpArray, PhpString, Value};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("iconv", builtin_iconv, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "iconv_get_encoding",
+        builtin_iconv_get_encoding,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "iconv_set_encoding",
+        builtin_iconv_set_encoding,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "iconv_strlen",
         builtin_iconv_strlen,
@@ -24,6 +34,62 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
 ];
+
+fn builtin_iconv_get_encoding(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("iconv_get_encoding", "zero or one argument"));
+    }
+    let kind = args
+        .first()
+        .map(|value| string_arg("iconv_get_encoding", value))
+        .transpose()?;
+    let state = context.iconv_state();
+    match kind
+        .as_ref()
+        .map(|value| value.to_string_lossy())
+        .as_deref()
+    {
+        None | Some("all") => {
+            let mut array = PhpArray::new();
+            array.insert(
+                ArrayKey::String(PhpString::from_test_str("input_encoding")),
+                Value::string(state.input_encoding().as_bytes().to_vec()),
+            );
+            array.insert(
+                ArrayKey::String(PhpString::from_test_str("output_encoding")),
+                Value::string(state.output_encoding().as_bytes().to_vec()),
+            );
+            array.insert(
+                ArrayKey::String(PhpString::from_test_str("internal_encoding")),
+                Value::string(state.internal_encoding().as_bytes().to_vec()),
+            );
+            Ok(Value::Array(array))
+        }
+        Some("input_encoding") => Ok(Value::string(state.input_encoding().as_bytes().to_vec())),
+        Some("output_encoding") => Ok(Value::string(state.output_encoding().as_bytes().to_vec())),
+        Some("internal_encoding") => {
+            Ok(Value::string(state.internal_encoding().as_bytes().to_vec()))
+        }
+        Some(_) => Ok(Value::Bool(false)),
+    }
+}
+
+fn builtin_iconv_set_encoding(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 2 {
+        return Err(arity_error("iconv_set_encoding", "two arguments"));
+    }
+    let kind = string_arg("iconv_set_encoding", &args[0])?.to_string_lossy();
+    let encoding = encoding_arg("iconv_set_encoding", &args[1])?;
+    Ok(Value::Bool(context.iconv_state().set(&kind, encoding)))
+}
 
 fn builtin_iconv(
     _context: &mut BuiltinContext<'_>,
@@ -139,6 +205,7 @@ fn canonical_encoding(encoding: &str) -> Option<&'static str> {
     match base.trim().to_ascii_uppercase().replace('_', "-").as_str() {
         "UTF-8" | "UTF8" => Some("UTF-8"),
         "ASCII" | "US-ASCII" => Some("ASCII"),
+        "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "LATIN-1" => Some("ISO-8859-1"),
         _ => None,
     }
 }
@@ -173,6 +240,35 @@ fn convert_encoding(name: &str, input: &[u8], from: &str, to: &str) -> BuiltinRe
                 Ok(Value::Bool(false))
             }
         }
+        ("ISO-8859-1", "ISO-8859-1") => Ok(Value::string(input.to_vec())),
+        ("ISO-8859-1", "UTF-8") => Ok(Value::string(
+            input
+                .iter()
+                .copied()
+                .map(char::from)
+                .collect::<String>()
+                .into_bytes(),
+        )),
+        ("ASCII", "ISO-8859-1") => {
+            if input.is_ascii() {
+                Ok(Value::string(input.to_vec()))
+            } else {
+                Err(argument_value_error(name, "#3 ($string)", "must be ASCII"))
+            }
+        }
+        ("UTF-8", "ISO-8859-1") => {
+            let value = std::str::from_utf8(input)
+                .map_err(|_| argument_value_error(name, "#3 ($string)", "must be valid UTF-8"))?;
+            let mut output = Vec::with_capacity(value.len());
+            for ch in value.chars() {
+                let code = ch as u32;
+                if code > 0xff {
+                    return Ok(Value::Bool(false));
+                }
+                output.push(code as u8);
+            }
+            Ok(Value::string(output))
+        }
         _ => Ok(Value::Bool(false)),
     }
 }
@@ -194,10 +290,11 @@ fn chars_for_encoding(
                 Err(argument_value_error(name, "#1 ($string)", "must be ASCII"))
             }
         }
+        "ISO-8859-1" => Ok(input.iter().map(|byte| char::from(*byte)).collect()),
         _ => Err(argument_value_error(
             name,
             "encoding",
-            "must be UTF-8 or ASCII",
+            "must be UTF-8, ASCII, or ISO-8859-1",
         )),
     }
 }

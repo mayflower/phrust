@@ -1,0 +1,17 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "apcu",
+  "priority": "Request-local cache MVP",
+  "selected_manifest": "tests/phpt/manifests/modules/apcu.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": ["Request-local store/fetch/add/delete/exists/clear"],
+  "non_scope": ["Shared process cache persistence across independent VM executions"],
+  "target_gates": ["just phpt-dev-module MODULE=apcu"],
+  "next_step": "Add array-key multi-fetch/delete coverage after cache API expansion."
+}

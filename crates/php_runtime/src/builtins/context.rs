@@ -6,7 +6,9 @@ use crate::{
     RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, SessionState, UploadRegistry,
     Value, datetime, emit_php_diagnostic, pcre,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub(in crate::builtins) const JSON_ERROR_NONE: i64 = 0;
 pub(in crate::builtins) const JSON_ERROR_DEPTH: i64 = 1;
@@ -98,6 +100,129 @@ enum StrtokMode {
     NeedsInput,
 }
 
+/// Request-local iconv encoding configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IconvEncodingState {
+    input_encoding: String,
+    output_encoding: String,
+    internal_encoding: String,
+}
+
+impl Default for IconvEncodingState {
+    fn default() -> Self {
+        Self {
+            input_encoding: "UTF-8".to_owned(),
+            output_encoding: "UTF-8".to_owned(),
+            internal_encoding: "UTF-8".to_owned(),
+        }
+    }
+}
+
+impl IconvEncodingState {
+    /// Returns the input encoding used by iconv defaults.
+    #[must_use]
+    pub fn input_encoding(&self) -> &str {
+        &self.input_encoding
+    }
+
+    /// Returns the output encoding used by iconv defaults.
+    #[must_use]
+    pub fn output_encoding(&self) -> &str {
+        &self.output_encoding
+    }
+
+    /// Returns the internal encoding used by iconv defaults.
+    #[must_use]
+    pub fn internal_encoding(&self) -> &str {
+        &self.internal_encoding
+    }
+
+    /// Updates one named iconv encoding setting.
+    pub fn set(&mut self, name: &str, encoding: impl Into<String>) -> bool {
+        match name {
+            "input_encoding" => self.input_encoding = encoding.into(),
+            "output_encoding" => self.output_encoding = encoding.into(),
+            "internal_encoding" => self.internal_encoding = encoding.into(),
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Request-local APCu entry.
+#[derive(Clone, Debug, PartialEq)]
+struct ApcuEntry {
+    value: Value,
+    expires_at: Option<SystemTime>,
+}
+
+impl ApcuEntry {
+    fn is_expired(&self, now: SystemTime) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+    }
+}
+
+/// Request-local APCu store.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ApcuState {
+    entries: BTreeMap<Vec<u8>, ApcuEntry>,
+}
+
+impl ApcuState {
+    /// Stores a value, replacing any existing key.
+    pub fn store(&mut self, key: Vec<u8>, value: Value, ttl: i64) {
+        let expires_at = ttl_expiration(ttl);
+        self.entries.insert(key, ApcuEntry { value, expires_at });
+    }
+
+    /// Stores a value only when the key does not already exist.
+    pub fn add(&mut self, key: Vec<u8>, value: Value, ttl: i64) -> bool {
+        self.purge_expired();
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        self.store(key, value, ttl);
+        true
+    }
+
+    /// Fetches a value when the key exists and has not expired.
+    #[must_use]
+    pub fn fetch(&mut self, key: &[u8]) -> Option<Value> {
+        self.purge_expired();
+        self.entries.get(key).map(|entry| entry.value.clone())
+    }
+
+    /// Returns true when the key exists and has not expired.
+    #[must_use]
+    pub fn exists(&mut self, key: &[u8]) -> bool {
+        self.fetch(key).is_some()
+    }
+
+    /// Deletes a key and reports whether it existed.
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        self.purge_expired();
+        self.entries.remove(key).is_some()
+    }
+
+    /// Clears all APCu entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn purge_expired(&mut self) {
+        let now = SystemTime::now();
+        self.entries.retain(|_, entry| !entry.is_expired(now));
+    }
+}
+
+fn ttl_expiration(ttl: i64) -> Option<SystemTime> {
+    if ttl <= 0 {
+        None
+    } else {
+        Some(SystemTime::now() + Duration::from_secs(ttl as u64))
+    }
+}
+
 /// Source location passed to internal builtins.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeSourceSpan {
@@ -128,6 +253,10 @@ pub struct BuiltinContext<'a> {
     json_last_error: i64,
     json_last_error_msg: String,
     strtok_state: Option<&'a mut StrtokState>,
+    iconv_state: IconvEncodingState,
+    iconv_state_slot: Option<&'a mut IconvEncodingState>,
+    apcu_state: ApcuState,
+    apcu_state_slot: Option<&'a mut ApcuState>,
     mb_internal_encoding: String,
     session_state: Option<&'a mut SessionState>,
     session_global: Option<ReferenceCell>,
@@ -158,6 +287,10 @@ impl<'a> BuiltinContext<'a> {
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
+            iconv_state: IconvEncodingState::default(),
+            iconv_state_slot: None,
+            apcu_state: ApcuState::default(),
+            apcu_state_slot: None,
             mb_internal_encoding: "UTF-8".to_owned(),
             session_state: None,
             session_global: None,
@@ -193,6 +326,10 @@ impl<'a> BuiltinContext<'a> {
             json_last_error: JSON_ERROR_NONE,
             json_last_error_msg: json_error_message(JSON_ERROR_NONE).to_string(),
             strtok_state: None,
+            iconv_state: IconvEncodingState::default(),
+            iconv_state_slot: None,
+            apcu_state: ApcuState::default(),
+            apcu_state_slot: None,
             mb_internal_encoding: "UTF-8".to_owned(),
             session_state: None,
             session_global: None,
@@ -381,6 +518,32 @@ impl<'a> BuiltinContext<'a> {
     /// Returns request-local `strtok` state.
     pub fn strtok_state(&mut self) -> Option<&mut StrtokState> {
         self.strtok_state.as_deref_mut()
+    }
+
+    /// Sets request-local iconv encoding state.
+    pub fn set_iconv_state(&mut self, state: &'a mut IconvEncodingState) {
+        self.iconv_state_slot = Some(state);
+    }
+
+    /// Mutable request-local iconv encoding state.
+    pub fn iconv_state(&mut self) -> &mut IconvEncodingState {
+        match self.iconv_state_slot.as_deref_mut() {
+            Some(state) => state,
+            None => &mut self.iconv_state,
+        }
+    }
+
+    /// Sets request-local APCu state.
+    pub fn set_apcu_state(&mut self, state: &'a mut ApcuState) {
+        self.apcu_state_slot = Some(state);
+    }
+
+    /// Mutable request-local APCu state.
+    pub fn apcu_state(&mut self) -> &mut ApcuState {
+        match self.apcu_state_slot.as_deref_mut() {
+            Some(state) => state,
+            None => &mut self.apcu_state,
+        }
     }
 
     /// Current request-local mbstring internal encoding.

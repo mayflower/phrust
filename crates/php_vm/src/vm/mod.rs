@@ -852,6 +852,8 @@ struct ExecutionState {
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
     strtok_state: php_runtime::StrtokState,
+    iconv_state: php_runtime::IconvEncodingState,
+    apcu_state: php_runtime::ApcuState,
     mb_internal_encoding: String,
     preg_last_error: php_runtime::pcre::PcreLastErrorState,
     json_last_error: i64,
@@ -37171,6 +37173,8 @@ fn execute_builtin_entry(
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
     context.set_strtok_state(&mut state.strtok_state);
+    context.set_iconv_state(&mut state.iconv_state);
+    context.set_apcu_state(&mut state.apcu_state);
     context.set_http_response_state(&mut state.http_response);
     context.set_upload_registry(&mut state.upload_registry);
     context.set_mysql_state(&mut state.mysql);
@@ -39622,6 +39626,7 @@ fn call_builtin_args_to_positional(
             || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
             || (function == "preg_replace" && index == 4)
             || (function == "preg_replace_callback" && index == 4)
+            || (function == "apcu_fetch" && index == 1)
             || (matches!(
                 function,
                 "array_pop"
@@ -39770,6 +39775,7 @@ fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static 
         ("str_replace", 3) => "count",
         ("preg_match" | "preg_match_all", 2) => "matches",
         ("preg_replace" | "preg_replace_callback", 4) => "count",
+        ("apcu_fetch", 1) => "success",
         (_, 0) => "array",
         _ => "arg",
     }

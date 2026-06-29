@@ -1,0 +1,17 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "sodium",
+  "priority": "Real crypto sodium MVP",
+  "selected_manifest": "tests/phpt/manifests/modules/sodium.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": ["BLAKE2b generichash, Ed25519 detached signatures, hex/base64, random key generation"],
+  "non_scope": ["Secretbox, password hashing, AEAD, key exchange"],
+  "target_gates": ["just phpt-dev-module MODULE=sodium"],
+  "next_step": "Add selected real-crypto fixtures for each newly supported sodium family."
+}
