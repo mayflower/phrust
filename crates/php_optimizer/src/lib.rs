@@ -3,10 +3,11 @@
 //! The optimizer pass pipeline supports the first
 //! conservative optimization pass.
 
+use php_diagnostics::{DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity};
 use php_ir::instruction::{CompareOp, TerminatorKind};
 use php_ir::{
     BinaryOp, BlockId, ConstId, InstrId, InstructionKind, IrConstant, IrFunction, IrUnit, Operand,
-    RegId, UnaryOp, VerificationError, verify_unit,
+    RegId, UnaryOp, VerificationDiagnosticContext, VerificationError, verify_unit,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -250,6 +251,71 @@ impl fmt::Display for PassError {
 }
 
 impl std::error::Error for PassError {}
+
+impl PassError {
+    /// Converts an optimizer failure to shared diagnostic envelope(s).
+    #[must_use]
+    pub fn to_diagnostic_envelopes(
+        &self,
+        optimization_level: OptimizationLevel,
+        unit_name: Option<&str>,
+        function_name: Option<&str>,
+    ) -> Vec<DiagnosticEnvelope> {
+        match self {
+            Self::PassFailed { pass, message } => {
+                let mut context = optimizer_context(optimization_level, unit_name, function_name);
+                context.insert("pass".to_string(), (*pass).to_string());
+                vec![
+                    DiagnosticEnvelope::new(
+                        "E_PHP_OPTIMIZER_PASS_FAILED",
+                        DiagnosticLayer::optimizer(),
+                        DiagnosticPhase::new("pass"),
+                        DiagnosticSeverity::Error,
+                        message.clone(),
+                    )
+                    .with_context(context),
+                ]
+            }
+            Self::Verification { phase, errors } => errors
+                .iter()
+                .map(|error| {
+                    let mut envelope =
+                        error.to_diagnostic_envelope(&VerificationDiagnosticContext::default());
+                    envelope.layer = DiagnosticLayer::optimizer();
+                    envelope.phase = DiagnosticPhase::new(format!("verify_{}", phase.as_str()));
+                    envelope.context.extend(optimizer_context(
+                        optimization_level,
+                        unit_name,
+                        function_name,
+                    ));
+                    envelope
+                        .context
+                        .insert("optimizer_phase".to_string(), phase.as_str().to_string());
+                    envelope
+                })
+                .collect(),
+        }
+    }
+}
+
+fn optimizer_context(
+    optimization_level: OptimizationLevel,
+    unit_name: Option<&str>,
+    function_name: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut context = BTreeMap::new();
+    context.insert(
+        "optimization_level".to_string(),
+        optimization_level.as_str().to_string(),
+    );
+    if let Some(unit_name) = unit_name {
+        context.insert("unit".to_string(), unit_name.to_string());
+    }
+    if let Some(function_name) = function_name {
+        context.insert("function".to_string(), function_name.to_string());
+    }
+    context
+}
 
 /// Ordered pass pipeline.
 pub struct PassPipeline {
@@ -2212,12 +2278,13 @@ fn block_has_exception_boundary(block: &php_ir::BasicBlock) -> bool {
 mod tests {
     use super::{
         ConstantFoldingPass, CopyPropagationPass, LiteralCompactionPass, NoopPass,
-        OptimizationLevel, OptimizerPass, PassContext, PassPhase, PassPipeline, PeepholeSimplify,
+        OptimizationLevel, OptimizerPass, PassContext, PassError, PassPhase, PassPipeline,
+        PeepholeSimplify,
     };
     use php_ir::instruction::TerminatorKind;
     use php_ir::{
         BinaryOp, CompareOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan,
-        Operand, UnaryOp, UnitId,
+        Operand, UnaryOp, UnitId, VerificationError, VerificationErrorCode,
     };
 
     fn simple_unit() -> php_ir::IrUnit {
@@ -2282,6 +2349,36 @@ mod tests {
         assert!("3".parse::<OptimizationLevel>().is_err());
         assert_eq!(OptimizationLevel::O1.as_str(), "1");
         assert!(OptimizationLevel::O0 < OptimizationLevel::O1);
+    }
+
+    #[test]
+    fn optimizer_verifier_failure_has_shared_envelope_context() {
+        let error = PassError::Verification {
+            phase: PassPhase::PostVerify,
+            errors: vec![VerificationError {
+                code: VerificationErrorCode::InvalidBlockId,
+                message: "block id mismatch".to_string(),
+            }],
+        };
+
+        let envelopes =
+            error.to_diagnostic_envelopes(OptimizationLevel::O2, Some("unit.php"), Some("main"));
+        let json: serde_json::Value = serde_json::from_str(
+            &envelopes
+                .first()
+                .expect("one envelope")
+                .compact_json()
+                .expect("json"),
+        )
+        .expect("parse json");
+
+        assert_eq!(json["code"], "E_PHP_IR_VERIFY_INVALID_BLOCK_ID");
+        assert_eq!(json["layer"], "optimizer");
+        assert_eq!(json["phase"], "verify_post_verify");
+        assert_eq!(json["context"]["optimization_level"], "2");
+        assert_eq!(json["context"]["optimizer_phase"], "post_verify");
+        assert_eq!(json["context"]["unit"], "unit.php");
+        assert_eq!(json["context"]["function"], "main");
     }
 
     #[test]

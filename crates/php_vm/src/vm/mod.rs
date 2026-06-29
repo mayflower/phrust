@@ -12,6 +12,7 @@ mod result;
 pub use options::{
     BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions,
 };
+pub use result::VmStepLimitDiagnostic;
 pub use result::{VmControlFlow, VmResult};
 
 use crate::aliasing::{AliasState, slot_alias_state};

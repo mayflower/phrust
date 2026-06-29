@@ -18,6 +18,9 @@ help:
       '  just fmt                  Check Rust formatting' \
       '  just lint                 Run Rust linting' \
       '  just test                 Run Rust workspace tests' \
+      '  just diagnostics-audit    Run diagnostic quality ratchet' \
+      '  just diagnostics-smoke    Run structured diagnostic smoke checks' \
+      '  just debug-smoke          Run debug-mode JSONL smoke checks' \
       '  just quality              Run additive Rust quality/tooling gates' \
       '  just quality-fast         Run required cheap integrity/dependency/docs gates' \
       '  just quality-deps         Check advisories, licenses, bans, sources' \
@@ -124,8 +127,17 @@ runtime-hardening-lints:
 test:
     RUST_MIN_STACK="${PHRUST_RUST_MIN_STACK:-8388608}" cargo test --workspace
 
+diagnostics-audit:
+    scripts/diagnostics/audit.py
+
 server-smoke:
     scripts/server/smoke.sh
+
+diagnostics-smoke:
+    scripts/diagnostics/smoke.sh diagnostics
+
+debug-smoke:
+    scripts/diagnostics/smoke.sh debug
 
 verify-server:
     cargo test -p php_executor -p php_server
@@ -162,6 +174,7 @@ quality:
 
 quality-fast:
     @just source-integrity
+    @just diagnostics-audit
     @just known-gaps
     @just quality-deps
     @just quality-unused-deps

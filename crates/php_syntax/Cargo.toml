@@ -6,8 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
 php_lexer = { path = "../php_lexer", version = "0.1.0" }
 php_source = { path = "../php_source", version = "0.0.0" }
+
+[dev-dependencies]
+serde_json = "1"
 
 [package.metadata.parser-snapshots]
 update_env = "UPDATE_PARSER_SNAPSHOTS"

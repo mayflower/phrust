@@ -19,6 +19,7 @@ mysql = { version = "28", default-features = false, features = ["minimal-rust"] 
 num-bigint = "0.4"
 num-traits = "0.2"
 pcre2 = "0.2"
+php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
 php_lexer = { path = "../php_lexer", version = "0.1.0" }
 rusqlite = "0.32"
 serde_json = { version = "1", features = ["preserve_order"] }

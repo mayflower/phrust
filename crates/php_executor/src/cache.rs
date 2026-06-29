@@ -459,13 +459,21 @@ fn stable_source_hash(source: &str) -> u64 {
 }
 
 fn read_script_source(path: &Path) -> Result<String, PhpExecutionError> {
-    fs::read_to_string(path)
-        .map_err(|error| PhpExecutionError::Engine(format!("{}: {error}", path.display())))
+    fs::read_to_string(path).map_err(|error| {
+        PhpExecutionError::Engine(format!(
+            "script cache read source failed for path `{}`: {error}; suggestion: check that the file exists and is readable",
+            path.display()
+        ))
+    })
 }
 
 fn read_script_metadata(path: &Path) -> Result<fs::Metadata, PhpExecutionError> {
-    fs::metadata(path)
-        .map_err(|error| PhpExecutionError::Engine(format!("{}: {error}", path.display())))
+    fs::metadata(path).map_err(|error| {
+        PhpExecutionError::Engine(format!(
+            "script cache stat failed for path `{}`: {error}; suggestion: check that the file exists and is readable",
+            path.display()
+        ))
+    })
 }
 
 fn default_cache_shards() -> usize {

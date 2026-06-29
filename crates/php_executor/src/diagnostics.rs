@@ -1,11 +1,112 @@
 use crate::input::{PhpExecutionOutput, PhpExecutionStatus};
 use crate::pipeline::Pipeline;
-use php_ir::module::IrUnit;
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase,
+    DiagnosticSeverity, DiagnosticSuggestion,
+};
+use php_ir::{VerificationDiagnosticContext, lower::LoweringDiagnosticContext, module::IrUnit};
 use php_runtime::api::{ExitStatus, RuntimeDiagnostic, RuntimeDiagnosticPayload};
 use php_semantics::{Severity, diagnostics::DiagnosticId};
 use php_source::{SourceText, TextRange};
 use php_vm::api::VmResult;
+use std::collections::BTreeMap;
 use std::io::Write;
+
+/// Creates a stable CLI/executor usage diagnostic envelope.
+#[must_use]
+pub fn usage_diagnostic(
+    message: impl Into<String>,
+    command: Option<&str>,
+    argument: Option<&str>,
+    accepted_values: Option<&str>,
+    suggestion: impl Into<String>,
+) -> DiagnosticEnvelope {
+    let mut context = BTreeMap::new();
+    if let Some(command) = command {
+        context.insert("command".to_string(), command.to_string());
+    }
+    if let Some(argument) = argument {
+        context.insert("argument".to_string(), argument.to_string());
+    }
+    if let Some(accepted_values) = accepted_values {
+        context.insert("accepted_values".to_string(), accepted_values.to_string());
+    }
+    let mut envelope = DiagnosticEnvelope::new(
+        "E_PHRUST_CLI_USAGE",
+        DiagnosticLayer::cli(),
+        DiagnosticPhase::new("parse"),
+        DiagnosticSeverity::Error,
+        message,
+    )
+    .with_context(context);
+    envelope.suggestion = Some(DiagnosticSuggestion::new(suggestion));
+    envelope.php_visible = false;
+    envelope
+}
+
+/// Renders one shared diagnostic envelope in the selected output format.
+pub fn render_diagnostic_envelope(
+    envelope: &DiagnosticEnvelope,
+    format: DiagnosticOutputFormat,
+) -> Result<String, String> {
+    match format {
+        DiagnosticOutputFormat::Text => {
+            let mut line = envelope.text_line();
+            line.push('\n');
+            Ok(line)
+        }
+        DiagnosticOutputFormat::Json => envelope.json_line().map_err(|error| error.to_string()),
+    }
+}
+
+/// Writes one shared diagnostic envelope in the selected output format.
+pub fn write_diagnostic_envelope<W: Write>(
+    writer: &mut W,
+    envelope: &DiagnosticEnvelope,
+    format: DiagnosticOutputFormat,
+) -> Result<(), String> {
+    writer
+        .write_all(render_diagnostic_envelope(envelope, format)?.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn frontend_diagnostic_envelopes(pipeline: &Pipeline) -> Vec<DiagnosticEnvelope> {
+    let mut diagnostics = Vec::new();
+    for diagnostic in pipeline.frontend.parser_diagnostics() {
+        diagnostics.push(diagnostic.to_diagnostic_envelope(
+            Some(&pipeline.source),
+            None,
+            Some(&pipeline.path),
+        ));
+    }
+    for diagnostic in pipeline.frontend.semantic_diagnostics() {
+        if diagnostic.severity() == Severity::Error {
+            diagnostics.push(diagnostic.to_diagnostic_envelope(
+                Some(&pipeline.source),
+                None,
+                Some(&pipeline.path),
+            ));
+        }
+    }
+    for diagnostic in &pipeline.lowering.diagnostics {
+        diagnostics.push(
+            diagnostic.to_diagnostic_envelope(
+                Some(&pipeline.path),
+                &LoweringDiagnosticContext::default(),
+            ),
+        );
+    }
+    if let Err(errors) = &pipeline.lowering.verification {
+        let context = VerificationDiagnosticContext {
+            source_path: Some(pipeline.path.clone()),
+            ..VerificationDiagnosticContext::default()
+        };
+        for error in errors {
+            diagnostics.push(error.to_diagnostic_envelope(&context));
+        }
+    }
+    diagnostics
+}
 
 pub(crate) fn render_frontend_diagnostics(pipeline: &Pipeline) -> Result<String, String> {
     let mut stderr = Vec::new();
@@ -47,6 +148,11 @@ pub(crate) fn execution_output_from_vm(
     PhpExecutionOutput {
         stdout: result.output.as_bytes().to_vec(),
         diagnostics_text,
+        diagnostics: result
+            .diagnostics
+            .iter()
+            .map(RuntimeDiagnostic::to_diagnostic_envelope)
+            .collect(),
         status,
         runtime_diagnostics: result.diagnostics,
         http_response: result.http_response,

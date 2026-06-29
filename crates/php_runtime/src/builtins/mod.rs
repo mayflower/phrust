@@ -10,6 +10,6 @@ pub use context::{
     ApcuState, BuiltinContext, FilesystemRuntimeState, IconvEncodingState, RuntimeSourceSpan,
     StreamContextState, StrtokState,
 };
-pub use error::BuiltinError;
+pub use error::{BuiltinError, BuiltinErrorContext};
 pub use registry::{BuiltinCompatibility, BuiltinEntry, BuiltinRegistry};
 pub use signatures::{BuiltinResult, InternalFunction};

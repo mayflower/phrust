@@ -1,6 +1,11 @@
 //! Runtime diagnostics shared by the VM and CLI.
 
 use crate::builtins::RuntimeSourceSpan;
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticLocation, DiagnosticPhase, DiagnosticSeverity,
+    DiagnosticSpan,
+};
+use std::collections::BTreeMap;
 
 /// Runtime diagnostic severity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +35,19 @@ impl RuntimeSeverity {
             Self::RecoverableError => "recoverable_error",
             Self::FatalError => "fatal_error",
             Self::UnsupportedFeature => "unsupported_feature",
+        }
+    }
+
+    /// Shared diagnostic severity.
+    #[must_use]
+    pub const fn envelope_severity(self) -> DiagnosticSeverity {
+        match self {
+            Self::Warning => DiagnosticSeverity::Warning,
+            Self::Notice => DiagnosticSeverity::Notice,
+            Self::Deprecation => DiagnosticSeverity::Deprecation,
+            Self::RecoverableError => DiagnosticSeverity::RecoverableError,
+            Self::FatalError => DiagnosticSeverity::FatalError,
+            Self::UnsupportedFeature => DiagnosticSeverity::UnsupportedFeature,
         }
     }
 }
@@ -343,6 +361,167 @@ impl VmCompileDiagnostic {
             _ => self.php_message(),
         }
     }
+
+    /// Structured payload fields for shared diagnostic envelopes.
+    #[must_use]
+    pub fn envelope_context(&self) -> BTreeMap<String, String> {
+        let mut context = BTreeMap::new();
+        context.insert("payload".to_string(), "vm_compile".to_string());
+        match self {
+            Self::MethodVisibilityOverride {
+                class_name,
+                method_name,
+                required_visibility,
+                parent_class_name,
+                weaker_suffix,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("method".to_string(), method_name.clone());
+                context.insert(
+                    "required_visibility".to_string(),
+                    required_visibility.clone(),
+                );
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+                context.insert("weaker_suffix".to_string(), weaker_suffix.clone());
+            }
+            Self::StaticMethodOverride {
+                class_name,
+                method_name,
+                parent_class_name,
+                parent_is_static,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("method".to_string(), method_name.clone());
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+                context.insert("parent_is_static".to_string(), parent_is_static.to_string());
+            }
+            Self::MethodSignatureOverride {
+                class_name,
+                method_name,
+                actual_signature,
+                expected_signature,
+            }
+            | Self::InterfaceMethodSignature {
+                class_name,
+                method_name,
+                actual_signature,
+                expected_signature,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("method".to_string(), method_name.clone());
+                context.insert("actual_signature".to_string(), actual_signature.clone());
+                context.insert("expected_signature".to_string(), expected_signature.clone());
+            }
+            Self::InterfaceMethodVisibility {
+                class_name,
+                method_name,
+            }
+            | Self::InterfaceMethodBody {
+                class_name,
+                method_name,
+            }
+            | Self::FinalMethodOverride {
+                class_name,
+                method_name,
+                ..
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("method".to_string(), method_name.clone());
+            }
+            Self::InterfaceMethodMissing {
+                class_name,
+                interface_name,
+                method_name,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("interface".to_string(), interface_name.clone());
+                context.insert("method".to_string(), method_name.clone());
+            }
+            Self::InterfaceConstantVisibility {
+                class_name,
+                constant_name,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("constant".to_string(), constant_name.clone());
+            }
+            Self::InterfaceProperty {
+                class_name,
+                property_name,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("property".to_string(), property_name.clone());
+            }
+            Self::FinalClassExtend {
+                class_name,
+                parent_class_name,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+            }
+            Self::PropertyStaticOverride {
+                class_name,
+                property_name,
+                parent_class_name,
+                parent_is_static,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("property".to_string(), property_name.clone());
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+                context.insert("parent_is_static".to_string(), parent_is_static.to_string());
+            }
+            Self::PropertyVisibilityOverride {
+                class_name,
+                property_name,
+                required_visibility,
+                parent_class_name,
+                weaker_suffix,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("property".to_string(), property_name.clone());
+                context.insert(
+                    "required_visibility".to_string(),
+                    required_visibility.clone(),
+                );
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+                context.insert("weaker_suffix".to_string(), weaker_suffix.clone());
+            }
+            Self::ClassConstantVisibilityOverride {
+                class_name,
+                constant_name,
+                required_visibility,
+                parent_class_name,
+                weaker_suffix,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("constant".to_string(), constant_name.clone());
+                context.insert(
+                    "required_visibility".to_string(),
+                    required_visibility.clone(),
+                );
+                context.insert("parent_class".to_string(), parent_class_name.clone());
+                context.insert("weaker_suffix".to_string(), weaker_suffix.clone());
+            }
+            Self::ClassExtendsInterface {
+                class_name,
+                interface_name,
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("interface".to_string(), interface_name.clone());
+            }
+            Self::ImplementsNonInterface {
+                class_name,
+                target_name,
+                ..
+            } => {
+                context.insert("class".to_string(), class_name.clone());
+                context.insert("target".to_string(), target_name.clone());
+            }
+            Self::TraversableDirectImplementation { class_name } => {
+                context.insert("class".to_string(), class_name.clone());
+            }
+        }
+        context
+    }
 }
 
 /// Additional structured payload attached to selected runtime diagnostics.
@@ -517,6 +696,54 @@ impl RuntimeDiagnostic {
         out.push('}');
         out
     }
+
+    /// Shared diagnostic envelope for debug and JSON diagnostic renderers.
+    #[must_use]
+    pub fn to_diagnostic_envelope(&self) -> DiagnosticEnvelope {
+        let mut context = BTreeMap::new();
+        if let Some(classification) = self.php_reference {
+            context.insert(
+                "php_reference".to_string(),
+                classification.as_str().to_string(),
+            );
+        }
+        context.insert(
+            "stack_depth".to_string(),
+            self.stack_trace.len().to_string(),
+        );
+        if !self.stack_trace.is_empty() {
+            context.insert(
+                "stack".to_string(),
+                self.stack_trace
+                    .iter()
+                    .map(RuntimeStackFrame::function)
+                    .collect::<Vec<_>>()
+                    .join(" > "),
+            );
+        }
+        if let Some(RuntimeDiagnosticPayload::VmCompile(payload)) = &self.payload {
+            context.extend(payload.envelope_context());
+        }
+
+        let mut envelope = DiagnosticEnvelope::new(
+            self.id.clone(),
+            DiagnosticLayer::runtime(),
+            DiagnosticPhase::new("execute"),
+            self.severity.envelope_severity(),
+            self.message.clone(),
+        )
+        .with_location(DiagnosticLocation::new(
+            self.source_span.file.as_deref(),
+            None::<&str>,
+            Some(DiagnosticSpan::new(
+                self.source_span.start as usize,
+                self.source_span.end as usize,
+            )),
+        ))
+        .with_context(context);
+        envelope.php_visible = true;
+        envelope
+    }
 }
 
 /// Runtime error wrapper kept separate from VM control flow.
@@ -670,6 +897,36 @@ mod tests {
     }
 
     #[test]
+    fn undefined_function_runtime_diagnostic_has_shared_envelope() {
+        let diagnostic = undefined_function(
+            "missing",
+            RuntimeSourceSpan {
+                file: Some("fixture.php".to_owned()),
+                start: 1,
+                end: 8,
+            },
+            vec![
+                RuntimeStackFrame::new("main"),
+                RuntimeStackFrame::new("caller"),
+            ],
+        );
+
+        let envelope = diagnostic.to_diagnostic_envelope();
+        let json: serde_json::Value =
+            serde_json::from_str(&envelope.compact_json().expect("json")).expect("parse json");
+
+        assert_eq!(json["code"], "E_PHP_RUNTIME_UNDEFINED_FUNCTION");
+        assert_eq!(json["layer"], "runtime");
+        assert_eq!(json["phase"], "execute");
+        assert_eq!(json["severity"], "fatal_error");
+        assert_eq!(json["location"]["path"], "fixture.php");
+        assert_eq!(json["context"]["php_reference"], "error");
+        assert_eq!(json["context"]["stack"], "main > caller");
+        assert_eq!(json["context"]["stack_depth"], "2");
+        assert_eq!(json["php_visible"], true);
+    }
+
+    #[test]
     fn errors_helpers_cover_warning_and_division_by_zero() {
         let warning =
             undefined_variable_warning("missing", RuntimeSourceSpan::default(), Vec::new());
@@ -767,5 +1024,9 @@ mod tests {
             diagnostic.payload(),
             Some(&RuntimeDiagnosticPayload::VmCompile(payload))
         );
+        let envelope = diagnostic.to_diagnostic_envelope();
+        assert_eq!(envelope.context["payload"], "vm_compile");
+        assert_eq!(envelope.context["class"], "Child");
+        assert_eq!(envelope.context["parent_class"], "Base");
     }
 }

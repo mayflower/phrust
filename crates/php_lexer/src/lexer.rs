@@ -1438,7 +1438,10 @@ fn digit_sequence_exceeds(digits: &[u8], max: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Lexer, LexerConfig, lex_all};
-    use crate::{LexDiagnosticKind, LexerMode, SymbolKind, TextRange, TokenKind, TokenName};
+    use crate::{
+        LexDiagnosticKind, LexerMode, SourceText, SymbolKind, TextRange, TokenKind, TokenName,
+    };
+    use serde_json::Value;
 
     #[test]
     fn empty_source_emits_no_tokens_by_default() {
@@ -1625,6 +1628,31 @@ mod tests {
     }
 
     #[test]
+    fn bad_control_character_diagnostic_has_structured_envelope() {
+        let source = SourceText::new("<?php \u{0001};");
+        let result = lex_all(source.as_str(), LexerConfig::default());
+        let envelope = result.diagnostics[0].to_diagnostic_envelope(
+            Some(&source),
+            Some("bad.php"),
+            Some(LexerMode::Scripting),
+        );
+        let json = envelope.compact_json().expect("diagnostic json renders");
+        let decoded: Value = serde_json::from_str(&json).expect("valid diagnostic json");
+
+        assert_eq!(decoded["code"], "E_PHP_LEXER_BAD_CHARACTER");
+        assert_eq!(decoded["layer"], "lexer");
+        assert_eq!(decoded["phase"], "scan");
+        assert_eq!(decoded["location"]["path"], "bad.php");
+        assert_eq!(decoded["location"]["line"], 1);
+        assert_eq!(decoded["location"]["column"], 7);
+        assert_eq!(decoded["context"]["scanner_mode"], "scripting");
+        assert_eq!(
+            decoded["suggestion"],
+            "remove the control character or escape it in a string"
+        );
+    }
+
+    #[test]
     fn unterminated_block_comment_recovers_to_eof() {
         let source = "<?php /* unterminated";
         let result = lex_all(source, LexerConfig::default());
@@ -1634,6 +1662,26 @@ mod tests {
             result.diagnostics[0].kind,
             LexDiagnosticKind::UnterminatedBlockComment
         );
+    }
+
+    #[test]
+    fn unterminated_string_diagnostic_has_stable_code() {
+        let source = SourceText::new("<?php 'unterminated");
+        let result = lex_all(source.as_str(), LexerConfig::default());
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.kind == LexDiagnosticKind::UnterminatedString)
+            .expect("unterminated string diagnostic");
+        let envelope = diagnostic.to_diagnostic_envelope(
+            Some(&source),
+            Some("string.php"),
+            Some(LexerMode::Scripting),
+        );
+
+        assert_eq!(envelope.code, "E_PHP_LEXER_UNTERMINATED_STRING");
+        assert!(envelope.text_line().contains("span=6..19"));
+        assert!(envelope.text_line().contains("scanner_mode=scripting"));
     }
 
     #[test]

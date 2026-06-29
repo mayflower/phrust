@@ -2,10 +2,10 @@
 
 use crate::builder::IrBuilder;
 use crate::constants::{IrConstant, IrConstantArrayEntry};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::function::{FunctionFlags, IrCapture, IrParam, IrReturnType};
-use crate::ids::{BlockId, FileId, FunctionId, LocalId, RegId, UnitId};
+use crate::ids::{BlockId, FileId, FunctionId, InstrId, LocalId, RegId, UnitId};
 use crate::instruction::{
     BinaryOp, CallableKind, CastKind, ClosureCaptureArg, CompareOp, IncludeKind, InstructionKind,
     IrCallArg, IrCallArgValueKind, IrCallDimTarget, IrCallPropertyTarget, IrDiagnosticSeverity,
@@ -23,6 +23,10 @@ use crate::module::{
 use crate::operand::Operand;
 use crate::source_map::{IrSourceMapTarget, IrSpan};
 use crate::verify::{VerificationError, verify_unit};
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLayer, DiagnosticLocation, DiagnosticPhase, DiagnosticSeverity,
+    DiagnosticSpan, DiagnosticSuggestion,
+};
 use php_semantics::hir::{
     AttributeId, AttributeTarget, BuiltinType, ClassLikeId, ClassLikeKind, ClassLikeMemberId,
     ConstExprContext, ConstExprId, ConstValue, DeclareValue, ExprId, FunctionSignature, HirCallArg,
@@ -139,6 +143,64 @@ impl UnsupportedFeature {
             Self::ObjectMethodModifier => "E_PHP_IR_UNSUPPORTED_OBJECT_METHOD_MODIFIER",
             Self::ObjectPropertyModifier => "E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER",
             Self::CatchType => "E_PHP_IR_UNSUPPORTED_CATCH_TYPE",
+        }
+    }
+
+    /// Stable feature spelling for diagnostic context.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generator => "generator",
+            Self::YieldFrom => "yield_from",
+            Self::Fiber => "fiber",
+            Self::Eval => "eval",
+            Self::Autoload => "autoload",
+            Self::Reflection => "reflection",
+            Self::TraitRuntime => "trait_runtime",
+            Self::EnumRuntime => "enum_runtime",
+            Self::PropertyHooks => "property_hooks",
+            Self::FullReferences => "full_references",
+            Self::HirStatement => "hir_statement",
+            Self::ForHeaderMultiExpression => "for_header_multi_expression",
+            Self::DynamicLoopControlLevel => "dynamic_loop_control_level",
+            Self::DynamicFunctionCall => "dynamic_function_call",
+            Self::ByReferenceParameter => "by_reference_parameter",
+            Self::ByReferenceReturn => "by_reference_return",
+            Self::AdvancedParameter => "advanced_parameter",
+            Self::ArraySpread => "array_spread",
+            Self::ByReferenceForeach => "by_reference_foreach",
+            Self::ArrayElementReference => "array_element_reference",
+            Self::ObjectPropertyReference => "object_property_reference",
+            Self::MethodCall => "method_call",
+            Self::LateStaticBinding => "late_static_binding",
+            Self::StaticProperty => "static_property",
+            Self::ClassLikeObject => "class_like_object",
+            Self::ObjectMethodModifier => "object_method_modifier",
+            Self::ObjectPropertyModifier => "object_property_modifier",
+            Self::CatchType => "catch_type",
+        }
+    }
+
+    fn suggestion(self) -> &'static str {
+        match self {
+            Self::Eval => {
+                "avoid eval or defer this script to a runtime path that supports dynamic compilation"
+            }
+            Self::Autoload => {
+                "preload the required declarations or record the lookup as deferred metadata"
+            }
+            Self::Reflection => {
+                "avoid reflection-dependent execution in lowered IR until reflection metadata is modeled"
+            }
+            Self::FullReferences
+            | Self::ByReferenceParameter
+            | Self::ByReferenceReturn
+            | Self::ByReferenceForeach
+            | Self::ArrayElementReference
+            | Self::ObjectPropertyReference => {
+                "rewrite this construct without PHP references or keep it as a known runtime gap"
+            }
+            _ => "rewrite this construct to the supported runtime subset or keep it as a known gap",
         }
     }
 }
@@ -315,6 +377,77 @@ pub struct LoweringDiagnostic {
     pub message: String,
 }
 
+/// Optional context for rendering a lowering diagnostic as a shared envelope.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LoweringDiagnosticContext {
+    /// Stable source identifier, if different from the path.
+    pub source_id: Option<String>,
+    /// HIR or source-map origin that produced the diagnostic.
+    pub origin: Option<String>,
+    /// Function currently being lowered.
+    pub function: Option<FunctionId>,
+    /// Basic block currently being emitted.
+    pub block: Option<BlockId>,
+    /// Instruction mapped from this diagnostic.
+    pub instruction: Option<InstrId>,
+    /// Class context, if available.
+    pub class_name: Option<String>,
+    /// Method context, if available.
+    pub method_name: Option<String>,
+}
+
+impl LoweringDiagnostic {
+    /// Converts this lowering diagnostic to the shared diagnostic envelope.
+    #[must_use]
+    pub fn to_diagnostic_envelope(
+        &self,
+        source_path: Option<&str>,
+        context: &LoweringDiagnosticContext,
+    ) -> DiagnosticEnvelope {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("feature".to_string(), self.feature.as_str().to_string());
+        metadata.insert("file_id".to_string(), self.span.file.raw().to_string());
+        if let Some(origin) = &context.origin {
+            metadata.insert("origin".to_string(), origin.clone());
+        }
+        if let Some(function) = context.function {
+            metadata.insert("function_id".to_string(), function.raw().to_string());
+        }
+        if let Some(block) = context.block {
+            metadata.insert("block_id".to_string(), block.raw().to_string());
+        }
+        if let Some(instruction) = context.instruction {
+            metadata.insert("instruction_id".to_string(), instruction.raw().to_string());
+        }
+        if let Some(class_name) = &context.class_name {
+            metadata.insert("class".to_string(), class_name.clone());
+        }
+        if let Some(method_name) = &context.method_name {
+            metadata.insert("method".to_string(), method_name.clone());
+        }
+
+        let mut envelope = DiagnosticEnvelope::new(
+            self.id.clone(),
+            DiagnosticLayer::ir(),
+            DiagnosticPhase::new("lower"),
+            DiagnosticSeverity::UnsupportedFeature,
+            self.message.clone(),
+        )
+        .with_location(DiagnosticLocation::new(
+            source_path,
+            context.source_id.as_deref(),
+            Some(DiagnosticSpan::new(
+                self.span.start as usize,
+                self.span.end as usize,
+            )),
+        ))
+        .with_context(metadata);
+        envelope.suggestion = Some(DiagnosticSuggestion::new(self.feature.suggestion()));
+        envelope.php_visible = false;
+        envelope
+    }
+}
+
 /// Result of lowering one frontend file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoweringResult {
@@ -343,8 +476,9 @@ struct LoopTargets {
 
 #[derive(Clone, Copy, Debug)]
 struct ConditionTargets {
-    true_block: BlockId,
-    false_block: BlockId,
+    true_target: BlockId,
+    false_target: BlockId,
+    span: IrSpan,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2859,10 +2993,10 @@ impl LoweringContext<'_> {
             condition_block,
             condition,
             ConditionTargets {
-                true_block: then_block,
-                false_block: first_false_target,
+                true_target: then_block,
+                false_target: first_false_target,
+                span,
             },
-            span,
         );
 
         let then_end = self.lower_stmt_list(builder, function, then_block, body);
@@ -2882,10 +3016,10 @@ impl LoweringContext<'_> {
                 condition_block,
                 branch.condition,
                 ConditionTargets {
-                    true_block: body_block,
-                    false_block: false_target,
+                    true_target: body_block,
+                    false_target,
+                    span,
                 },
-                span,
             );
             let body_end = self.lower_stmt_list(builder, function, body_block, branch.body);
             self.jump_if_open(builder, function, body_end, after_block, span);
@@ -2920,10 +3054,10 @@ impl LoweringContext<'_> {
             condition_block,
             condition,
             ConditionTargets {
-                true_block: body_block,
-                false_block: after_block,
+                true_target: body_block,
+                false_target: after_block,
+                span,
             },
-            span,
         );
         self.loop_stack.push(LoopTargets {
             break_block: after_block,
@@ -3018,10 +3152,10 @@ impl LoweringContext<'_> {
                 current_condition,
                 Some(*last_condition),
                 ConditionTargets {
-                    true_block: body_block,
-                    false_block: after_block,
+                    true_target: body_block,
+                    false_target: after_block,
+                    span,
                 },
-                span,
             );
         } else {
             self.jump_if_open(builder, function, condition_block, body_block, span);
@@ -3860,7 +3994,9 @@ impl LoweringContext<'_> {
                 continue;
             };
             match statement.kind() {
-                HirStmtKind::Label { name: Some(name) } => labels.push((name.clone(), *stmt)),
+                HirStmtKind::Label { name: Some(name) } => {
+                    labels.push((name.clone(), *stmt));
+                }
                 HirStmtKind::Label { name: None } => {}
                 HirStmtKind::Block { statements }
                 | HirStmtKind::While {
@@ -4203,12 +4339,11 @@ impl LoweringContext<'_> {
         block: BlockId,
         condition: Option<ExprId>,
         targets: ConditionTargets,
-        span: IrSpan,
     ) {
         let Some(condition) = condition else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
-                TextRange::new(span.start as usize, span.end as usize),
+                TextRange::new(targets.span.start as usize, targets.span.end as usize),
                 "control-flow condition is missing",
             );
             return;
@@ -4218,9 +4353,9 @@ impl LoweringContext<'_> {
                 function,
                 value.block,
                 Operand::Register(value.register),
-                targets.true_block,
-                targets.false_block,
-                span,
+                targets.true_target,
+                targets.false_target,
+                targets.span,
             );
         }
     }
@@ -11240,6 +11375,40 @@ mod tests {
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_feature_diagnostic_has_shared_envelope() {
+        let diagnostic = LoweringDiagnostic {
+            id: UnsupportedFeature::Eval.diagnostic_id().to_string(),
+            feature: UnsupportedFeature::Eval,
+            span: IrSpan::new(FileId::new(0), 10, 14),
+            message: "eval is not supported by IR lowering".to_string(),
+        };
+        let context = LoweringDiagnosticContext {
+            source_id: Some("source:0".to_string()),
+            origin: Some("hir:expr:2".to_string()),
+            function: Some(FunctionId::new(1)),
+            block: Some(BlockId::new(2)),
+            instruction: None,
+            class_name: Some("C".to_string()),
+            method_name: Some("m".to_string()),
+        };
+
+        let envelope = diagnostic.to_diagnostic_envelope(Some("demo.php"), &context);
+        let json: serde_json::Value =
+            serde_json::from_str(&envelope.compact_json().expect("json")).expect("parse json");
+
+        assert_eq!(json["code"], "E_PHP_IR_UNSUPPORTED_EVAL");
+        assert_eq!(json["layer"], "ir");
+        assert_eq!(json["phase"], "lower");
+        assert_eq!(json["severity"], "unsupported_feature");
+        assert_eq!(json["location"]["path"], "demo.php");
+        assert_eq!(json["location"]["span"]["start"], 10);
+        assert_eq!(json["context"]["feature"], "eval");
+        assert_eq!(json["context"]["function_id"], "1");
+        assert_eq!(json["context"]["block_id"], "2");
+        assert_eq!(json["context"]["origin"], "hir:expr:2");
     }
 
     #[test]

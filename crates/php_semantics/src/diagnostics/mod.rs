@@ -2,6 +2,11 @@
 
 pub mod ids;
 
+use php_diagnostics::{
+    DiagnosticEnvelope, DiagnosticLabel as EnvelopeLabel, DiagnosticLayer,
+    DiagnosticLocation as EnvelopeLocation, DiagnosticPhase as EnvelopePhase,
+    DiagnosticSeverity as EnvelopeSeverity, DiagnosticSpan,
+};
 use php_source::TextRange;
 
 pub use ids::DiagnosticId;
@@ -28,6 +33,17 @@ impl DiagnosticSeverity {
             Self::Warning => "warning",
             Self::Deprecation => "deprecation",
             Self::Note => "note",
+        }
+    }
+
+    /// Returns the shared diagnostic envelope severity.
+    #[must_use]
+    pub const fn envelope_severity(self) -> EnvelopeSeverity {
+        match self {
+            Self::Error => EnvelopeSeverity::Error,
+            Self::Warning => EnvelopeSeverity::Warning,
+            Self::Deprecation => EnvelopeSeverity::Deprecation,
+            Self::Note => EnvelopeSeverity::Note,
         }
     }
 }
@@ -253,6 +269,50 @@ impl SemanticDiagnostic {
         out.push_str("]}");
         out
     }
+
+    /// Returns a structured diagnostic envelope for this semantic diagnostic.
+    #[must_use]
+    pub fn to_diagnostic_envelope(
+        &self,
+        source: Option<&php_source::SourceText>,
+        source_id: Option<&str>,
+        path: Option<&str>,
+    ) -> DiagnosticEnvelope {
+        let mut envelope = DiagnosticEnvelope::new(
+            self.id.as_str(),
+            DiagnosticLayer::semantic(),
+            EnvelopePhase::new(self.phase.as_str()),
+            self.severity.envelope_severity(),
+            self.message.clone(),
+        );
+        envelope.legacy_id = Some(self.id.as_str().to_owned());
+        envelope.php_visible = true;
+        envelope.location = self.span.map(|span| match source {
+            Some(source) => EnvelopeLocation::from_source_range(
+                path.map(str::to_owned),
+                source_id.map(str::to_owned),
+                source,
+                span,
+            ),
+            None => EnvelopeLocation::new(
+                path.map(str::to_owned),
+                source_id.map(str::to_owned),
+                Some(DiagnosticSpan::from_range(span)),
+            ),
+        });
+        envelope.labels = self
+            .labels
+            .iter()
+            .map(|label| {
+                EnvelopeLabel::new(
+                    label.message().to_owned(),
+                    DiagnosticSpan::from_range(label.range()),
+                )
+            })
+            .collect();
+        envelope.notes = self.notes.clone();
+        envelope
+    }
 }
 
 /// Collector for semantic diagnostics.
@@ -400,6 +460,7 @@ mod tests {
         SemanticDiagnostic,
     };
     use php_source::TextRange;
+    use serde_json::Value;
 
     #[test]
     fn diagnostic_ids_are_stable_strings() {
@@ -455,5 +516,63 @@ mod tests {
         assert!(json.contains("\"span\":{\"start\":10,\"end\":15}"));
         assert!(json.contains("\"labels\":[{\"message\":\"previous alias is here\""));
         assert!(json.contains("\"notes\":[\"aliases are compared"));
+    }
+
+    #[test]
+    fn duplicate_parameter_diagnostic_has_structured_envelope() {
+        let source = php_source::SourceText::new("<?php function f($x, $x) {}");
+        let diagnostic = SemanticDiagnostic::with_span(
+            DiagnosticId::DuplicateParameter,
+            DiagnosticSeverity::Error,
+            DiagnosticPhase::HirLowering,
+            "duplicate parameter name `$x`",
+            TextRange::new(22, 24),
+        )
+        .with_label(DiagnosticLabel::new(
+            TextRange::new(18, 20),
+            "previous parameter is here",
+        ))
+        .with_note("parameter names are unique within a function signature");
+        let envelope =
+            diagnostic.to_diagnostic_envelope(Some(&source), Some("sem-source"), Some("sem.php"));
+        let json = envelope.compact_json().expect("diagnostic json renders");
+        let decoded: Value = serde_json::from_str(&json).expect("valid diagnostic json");
+
+        assert_eq!(decoded["code"], "E_PHP_DUPLICATE_PARAMETER");
+        assert_eq!(decoded["layer"], "semantic");
+        assert_eq!(decoded["phase"], "hir_lowering");
+        assert_eq!(decoded["severity"], "error");
+        assert_eq!(decoded["location"]["path"], "sem.php");
+        assert_eq!(decoded["location"]["source_id"], "sem-source");
+        assert_eq!(decoded["location"]["span"]["start"], 22);
+        assert_eq!(
+            decoded["labels"][0]["message"],
+            "previous parameter is here"
+        );
+        assert_eq!(
+            decoded["notes"][0],
+            "parameter names are unique within a function signature"
+        );
+    }
+
+    #[test]
+    fn break_outside_loop_diagnostic_preserves_code_and_text() {
+        let diagnostic = SemanticDiagnostic::with_span(
+            DiagnosticId::BreakNotInLoopOrSwitch,
+            DiagnosticSeverity::Error,
+            DiagnosticPhase::ControlFlowValidation,
+            "break is not in a loop or switch",
+            TextRange::new(6, 11),
+        );
+        let envelope = diagnostic.to_diagnostic_envelope(None, None, Some("break.php"));
+
+        assert_eq!(envelope.code, "E_PHP_BREAK_NOT_IN_LOOP_OR_SWITCH");
+        assert!(
+            envelope
+                .text_line()
+                .contains("phase=control_flow_validation")
+        );
+        assert!(envelope.text_line().contains("path=break.php"));
+        assert!(envelope.text_line().contains("span=6..11"));
     }
 }

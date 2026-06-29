@@ -7,5 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 php_ast = { path = "../php_ast", version = "0.1.0" }
+php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
 php_source = { path = "../php_source", version = "0.0.0" }
 php_syntax = { path = "../php_syntax", version = "0.1.0" }
+
+[dev-dependencies]
+serde_json = "1"
