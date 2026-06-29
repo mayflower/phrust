@@ -3449,7 +3449,7 @@ impl Vm {
     }
 
     fn method_call_inline_cache_enabled(&self) -> bool {
-        self.options.inline_caches.enabled()
+        self.options.inline_caches.enabled() || matches!(self.options.jit, JitMode::Cranelift)
     }
 
     fn lookup_function_call_inline_cache(
@@ -3580,7 +3580,15 @@ impl Vm {
         if !self.method_call_inline_cache_enabled() {
             return;
         }
-        self.inline_caches.borrow_mut().install_method_call(
+        let mut inline_caches = self.inline_caches.borrow_mut();
+        inline_caches.observe_slot(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            block_id,
+            instruction_id,
+            InlineCacheKind::MethodCall,
+        );
+        inline_caches.install_method_call(
             compiled_unit_cache_key(compiled),
             function_id,
             block_id,

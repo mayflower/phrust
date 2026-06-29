@@ -3557,6 +3557,12 @@ fn lower_inline_cfg_terminator(
                 "by-reference returns are outside inline CFG native subset",
             ));
         }
+        TerminatorKind::Exit { .. } => {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_HELPER_EXIT",
+                "exit terminators are outside inline CFG native subset",
+            ));
+        }
     }
     Ok(())
 }
