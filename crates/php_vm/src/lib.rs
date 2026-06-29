@@ -9,10 +9,6 @@
 //!
 //! Root re-exports remain as compatibility aliases while local crates migrate to
 //! the explicit facades.
-//!
-//! The `todo_runtime` module and `vm_skeleton_status()` export are historical
-//! wiring-test compatibility markers. They are not the current VM architecture
-//! and should not be used to infer execution coverage.
 
 pub mod aliasing;
 pub mod bytecode;
@@ -32,7 +28,6 @@ pub mod quickening;
 pub mod region_profile;
 pub mod std_builtins;
 pub mod tiering;
-pub mod todo_runtime;
 pub mod vm;
 
 /// Stable VM execution surface.
@@ -46,7 +41,6 @@ pub mod api {
     pub use crate::include::{
         IncludeLoader, IncludePathFileFingerprint, LoadedInclude, ResolvedIncludePath,
     };
-    pub use crate::todo_runtime::{VmTodo, vm_skeleton_status};
     pub use crate::vm::{
         BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
         VmOptions, VmResult,
@@ -193,29 +187,7 @@ pub use region_profile::{
     BranchBias, BytecodeRange, PrivacyPolicy, RegionCandidate, RegionProfile, RegionTrace,
 };
 pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
-pub use todo_runtime::{VmTodo, vm_skeleton_status};
 pub use vm::{
     BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
     VmOptions, VmResult,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::{VmTodo, vm_skeleton_status};
-
-    #[test]
-    fn exposes_vm_skeleton() {
-        let todo = VmTodo::new("compiled units, frames, registers, and dispatch");
-        assert_eq!(
-            todo.area(),
-            "compiled units, frames, registers, and dispatch"
-        );
-        assert_eq!(vm_skeleton_status(), "vm-skeleton");
-        assert_eq!(php_ir::ir_skeleton_status(), "ir-core-model");
-        assert_eq!(php_runtime::runtime_skeleton_status(), "runtime-skeleton");
-        assert_eq!(
-            php_testkit::reference_checkout_path(),
-            "third_party/php-src"
-        );
-    }
-}

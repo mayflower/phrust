@@ -259,8 +259,9 @@ Start with:
 - [Semantic frontend contract](docs/frontend/definition-of-done.md)
 - [Runtime contract](docs/runtime-contract.md)
 - [Runtime semantics contract](docs/runtime-semantics-contract.md)
-- [Performance audit](docs/performance-final-audit.md)
-- [Performance acceleration plan](docs/performance-acceleration-plan.md)
+- [Performance methodology](docs/performance-methodology.md)
+- [Performance runtime](docs/performance-runtime.md)
+- [Performance known gaps](docs/performance-known-gaps.md)
 - [PHPT runtime completion](docs/phpt/README.md)
 
 ## Git Hygiene

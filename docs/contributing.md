@@ -59,3 +59,16 @@ Use [Work with PHPT](how-to/work-with-phpt.md) for commands and the
 Run artifacts belong under `target/` and must not be committed. Committed
 reports should be concise summaries with current status, evidence, and
 remaining gaps.
+
+## Documentation Hygiene
+
+Committed documentation describes the current project: architecture, contracts,
+commands, compatibility status, and known gaps. Active implementation tasks
+belong in issues, PR descriptions, or external task notes, not as committed task
+transcripts or work orders.
+
+Do not create directories for removed documentation. Delete stale docs because
+git history preserves removed content. A current document should either be
+linked from `docs/README.md`, be an ADR or research note with clear status, or
+be owned by a generator or validator. Reports under `docs/` must name the
+command that regenerates or validates them.

@@ -44,17 +44,11 @@ pub use rule_selection::{
 pub use source_map::{IrSourceMap, IrSourceMapEntry, IrSourceMapTarget, IrSpan};
 pub use verify::{VerificationError, VerificationErrorCode, verify_unit};
 
-/// Stable status string used by early wiring tests.
-#[must_use]
-pub const fn ir_skeleton_status() -> &'static str {
-    "ir-core-model"
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan, Operand, RegId,
-        UnitId, ir_skeleton_status,
+        UnitId, verify_unit,
     };
 
     #[test]
@@ -108,6 +102,7 @@ mod tests {
         builder.set_entry(entry);
 
         let unit = builder.finish();
+        verify_unit(&unit).expect("builder should create verifiable IR");
         assert_eq!(unit.entry, entry);
         assert_eq!(unit.constants.len(), 2);
         assert_eq!(unit.functions[entry.index()].register_count, 3);
@@ -118,10 +113,5 @@ mod tests {
             3
         );
         assert!(format!("{unit:#?}").contains("IrUnit"));
-    }
-
-    #[test]
-    fn status_reflects_core_model() {
-        assert_eq!(ir_skeleton_status(), "ir-core-model");
     }
 }

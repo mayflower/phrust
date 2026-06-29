@@ -3,8 +3,7 @@
 Date: 2026-06-28.
 
 This catalog tracks remaining high-value gaps for the v2 fastest-engine work.
-It is additive to `docs/performance-acceleration-known-gaps.md`,
-`docs/performance-known-gaps.md`, and
+It is additive to `docs/performance-known-gaps.md` and
 `docs/performance-cranelift-known-gaps.md`.
 
 Generated reports under `target/performance/` are local evidence only and must

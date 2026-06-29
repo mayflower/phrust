@@ -1,10 +1,8 @@
-# Performance Final Audit
-
-Date: 2026-06-23.
+# Performance Validation Summary
 
 Reference target: PHP 8.5.7 (`php-8.5.7`).
 
-Performance closes the first performance layer. It keeps the existing pipeline:
+Performance uses the existing engine pipeline:
 
 ```text
 php_lexer -> php_syntax -> php_ast -> php_semantics/HIR -> php_ir -> php_runtime -> php_vm -> php_vm_cli
@@ -18,7 +16,7 @@ order.
 
 ## Required Gates
 
-Run these before closing Performance:
+Run these before handing off performance changes:
 
 ```bash
 nix develop -c just verify-performance
@@ -62,7 +60,7 @@ nix develop -c just benchmark-suite
 | --- | --- | --- |
 | Layer scope and principles | Implemented as performance-only internal layers with behavior preservation requirements. | `docs/adr/0070-performance-scope.md`, `docs/performance-runtime.md` |
 | Nix/devshell performance tooling | Implemented with cache/linker optimization where supported and skip-safe optional tooling. | `flake.nix`, `docs/performance-methodology.md` |
-| Performance command gates | Implemented through concrete `just` recipes; no placeholder Performance gate remains. | `justfile`, `docs/performance-gate-todos.md` |
+| Performance command gates | Implemented through concrete `just` recipes; no placeholder Performance gate remains. | `justfile`, `docs/performance-methodology.md`, `docs/performance-runtime.md`, `docs/performance-known-gaps.md` |
 | Benchmark corpus and runner | Implemented deterministic smoke corpus, JSON runner, baseline/compare/report flow, and hot-path inventory. | `tests/fixtures/performance/perf_smoke/`, `scripts/performance/bench_matrix.py`, `scripts/performance/compare_perf_json.py`, `scripts/performance/perf_report.py`, `docs/performance-benchmark-corpus.md`, `docs/performance-results.md` |
 | Bytecode cache | Implemented local disk cache artifacts with fingerprints, target/version/config metadata, verified IR payloads, corrupt-cache fallback, CLI read/write modes, and path-component hardening. | `crates/php_bytecode_cache`, `crates/php_vm_cli/src/main.rs`, `docs/adr/0072-bytecode-cache-format.md`, `docs/performance-bytecode-cache.md`, `just cache-roundtrip` |
 | Optimizer passes | Implemented pass framework, opt levels 0/1/2, safe constant folding, peepholes, branch simplification, CFG verifier checks, and differential output comparison. | `crates/php_optimizer`, `docs/performance-optimizer-passes.md`, `just optimizer-diff` |
@@ -100,11 +98,12 @@ carryovers are:
 - production native JIT execution, executable-memory ownership, W^X, and native
   entry/exit ABI proof.
 
-These are not silent failures. They are explicit future runtime-or-later follow-ups.
+These are not silent failures. They are explicit known gaps with owning docs and
+validation checks.
 
-## future runtime Follow-up
+## Runtime and Deployment Boundaries
 
-Recommended future runtime entry points:
+The following areas remain outside the current performance contract:
 
 - production SAPI/FPM/daemon lifecycle, including request reset, worker
   recycling, config reloads, and cache lifetime ownership;
@@ -118,14 +117,13 @@ Recommended future runtime entry points:
 - broader offline framework performance smokes for router dispatch,
   dependency-injection lookup, attribute/reflection warm paths, and template
   output;
-- optional native JIT continuation only after W^X/executable-memory policy,
+- optional native JIT expansion only after W^X/executable-memory policy,
   native call ABI proof, deopt safety, and crash containment gates exist;
-- packaging and distribution profiles for CLI, daemon, and future production
-  deployment forms.
+- packaging and distribution profiles for CLI and daemon deployment forms.
 
 ## Closure Criteria
 
-Performance is complete when `verify-performance` and `perf-report` pass after this
-audit is written. Any red gate must be classified as a new regression, an
+Performance changes are acceptable when `verify-performance` and `perf-report`
+pass. Any red gate must be classified as a new regression, an
 environment/tool skip with explicit output, or an existing known gap before the
-layer can be considered closed.
+change is handed off.

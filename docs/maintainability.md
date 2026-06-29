@@ -43,7 +43,8 @@ The following remain explicit deferred work:
 - Server execution timeout that safely interrupts long-running PHP VM execution is not implemented.
 - Cross-process OPcache-style dependency graph invalidation is not implemented.
 - Optional Cranelift fastest-engine rows, persistent-feedback rows, Callgrind, and Miri smoke remain opt-in or platform/toolchain dependent.
-- Historical `todo_*` and `*_skeleton_status()` exports remain as compatibility markers for early wiring tests; current docs state they are not architecture truth.
+- Removed early wiring markers stay removed from public APIs; current tests assert
+  real layer behavior and public facades.
 
 ## Ownership Map
 
