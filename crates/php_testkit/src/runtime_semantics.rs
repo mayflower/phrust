@@ -29,6 +29,7 @@ pub const RUNTIME_SEMANTICS_FIXTURE_CATEGORIES: &[&str] = &[
     "include_eval_autoload",
     "globals",
     "real_world",
+    "wordpress_blockers",
     "regressions",
     "known_gaps",
 ];
@@ -63,7 +64,7 @@ mod tests {
 
     #[test]
     fn runtime_semantics_categories_match_coverage_matrix() {
-        assert_eq!(RUNTIME_SEMANTICS_FIXTURE_CATEGORIES.len(), 27);
+        assert_eq!(RUNTIME_SEMANTICS_FIXTURE_CATEGORIES.len(), 28);
         assert!(is_runtime_semantics_category("refs"));
         assert!(is_runtime_semantics_category("errors"));
         assert!(is_runtime_semantics_category("destructors"));
@@ -71,6 +72,7 @@ mod tests {
         assert!(is_runtime_semantics_category("include_eval_autoload"));
         assert!(is_runtime_semantics_category("globals"));
         assert!(is_runtime_semantics_category("real_world"));
+        assert!(is_runtime_semantics_category("wordpress_blockers"));
         assert!(is_runtime_semantics_category("regressions"));
         assert!(is_runtime_semantics_category("known_gaps"));
         assert!(!is_runtime_semantics_category("syntax"));

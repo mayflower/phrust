@@ -1,0 +1,88 @@
+fixture: valid/construct_precedence.php
+roundtrip_ok: true
+diagnostics: 0
+
+SOURCE_FILE @0..199
+  PHP_BLOCK @0..199
+    T_OPEN_TAG @0..6 line=1 text="<?php\n"
+    STATEMENT_LIST @6..199
+      EXPR_STMT @6..43
+        EXPR @6..42
+          CONSTRUCT_EXPR @6..42
+            T_INCLUDE @6..13 line=2 text="include"
+            T_WHITESPACE @13..14 line=2 text=" "
+            BINARY_EXPR @14..42
+              LITERAL @14..21
+                T_DIR @14..21 line=2 text="__DIR__"
+              T_WHITESPACE @21..22 line=2 text=" "
+              . @22..23 line=2 text="."
+              EXPR @23..42
+                T_WHITESPACE @23..24 line=2 text=" "
+                STRING @24..42
+                  T_CONSTANT_ENCAPSED_STRING @24..42 line=2 text="\"/_data/child.php\""
+        ; @42..43 line=2 text=";"
+      T_WHITESPACE @43..44 line=2 text="\n"
+      EXPR_STMT @44..85
+        EXPR @44..84
+          CONSTRUCT_EXPR @44..84
+            T_INCLUDE_ONCE @44..56 line=3 text="include_once"
+            T_WHITESPACE @56..57 line=3 text=" "
+            BINARY_EXPR @57..84
+              LITERAL @57..64
+                T_DIR @57..64 line=3 text="__DIR__"
+              T_WHITESPACE @64..65 line=3 text=" "
+              . @65..66 line=3 text="."
+              EXPR @66..84
+                T_WHITESPACE @66..67 line=3 text=" "
+                STRING @67..84
+                  T_CONSTANT_ENCAPSED_STRING @67..84 line=3 text="\"/_data/once.php\""
+        ; @84..85 line=3 text=";"
+      T_WHITESPACE @85..86 line=3 text="\n"
+      EXPR_STMT @86..126
+        EXPR @86..125
+          CONSTRUCT_EXPR @86..125
+            T_REQUIRE @86..93 line=4 text="require"
+            T_WHITESPACE @93..94 line=4 text=" "
+            BINARY_EXPR @94..125
+              LITERAL @94..101
+                T_DIR @94..101 line=4 text="__DIR__"
+              T_WHITESPACE @101..102 line=4 text=" "
+              . @102..103 line=4 text="."
+              EXPR @103..125
+                T_WHITESPACE @103..104 line=4 text=" "
+                STRING @104..125
+                  T_CONSTANT_ENCAPSED_STRING @104..125 line=4 text="\"/_data/required.php\""
+        ; @125..126 line=4 text=";"
+      T_WHITESPACE @126..127 line=4 text="\n"
+      EXPR_STMT @127..177
+        EXPR @127..176
+          CONSTRUCT_EXPR @127..176
+            T_REQUIRE_ONCE @127..139 line=5 text="require_once"
+            T_WHITESPACE @139..140 line=5 text=" "
+            BINARY_EXPR @140..176
+              LITERAL @140..147
+                T_DIR @140..147 line=5 text="__DIR__"
+              T_WHITESPACE @147..148 line=5 text=" "
+              . @148..149 line=5 text="."
+              EXPR @149..176
+                T_WHITESPACE @149..150 line=5 text=" "
+                STRING @150..176
+                  T_CONSTANT_ENCAPSED_STRING @150..176 line=5 text="\"/_data/required-once.php\""
+        ; @176..177 line=5 text=";"
+      T_WHITESPACE @177..178 line=5 text="\n"
+      EXPR_STMT @178..198
+        EXPR @178..197
+          CONSTRUCT_EXPR @178..197
+            T_PRINT @178..183 line=6 text="print"
+            T_WHITESPACE @183..184 line=6 text=" "
+            BINARY_EXPR @184..197
+              STRING @184..190
+                T_CONSTANT_ENCAPSED_STRING @184..190 line=6 text="\"done\""
+              T_WHITESPACE @190..191 line=6 text=" "
+              . @191..192 line=6 text="."
+              EXPR @192..197
+                T_WHITESPACE @192..193 line=6 text=" "
+                STRING @193..197
+                  T_CONSTANT_ENCAPSED_STRING @193..197 line=6 text="\"\\n\""
+        ; @197..198 line=6 text=";"
+      T_WHITESPACE @198..199 line=6 text="\n"

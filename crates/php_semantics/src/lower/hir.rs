@@ -1432,22 +1432,270 @@ impl HirLowerer<'_> {
     }
 
     fn ternary_expr_kind(&mut self, node: &SyntaxNode) -> HirExprKind {
-        let children = syntax_child_nodes(node)
-            .filter(|child| ExprNode::cast(child).is_some())
-            .collect::<Vec<_>>();
-        if children.len() == 2 {
+        let Some((question, colon)) = ternary_question_colon_offsets(node) else {
             return HirExprKind::Ternary {
-                condition: Some(self.lower_expr(children[0], ResolveContext::ConstantFetch)),
+                condition: self.nth_expr_child(node, 0, true),
+                if_true: self.nth_expr_child(node, 1, false),
+                if_false: self.nth_expr_child(node, 2, true),
+            };
+        };
+        let range = node.text_range();
+        let condition = self.expr_chain_in_range(
+            node,
+            range.start().to_usize(),
+            question,
+            ResolveContext::ConstantFetch,
+        );
+        let if_true =
+            self.expr_chain_in_range(node, question + 1, colon, ResolveContext::ConstantFetch);
+        let if_false = self.expr_chain_in_range(
+            node,
+            colon + 1,
+            range.end().to_usize(),
+            ResolveContext::ConstantFetch,
+        );
+
+        if if_true.is_none() {
+            return HirExprKind::Ternary {
+                condition,
                 if_true: None,
-                if_false: Some(self.lower_expr(children[1], ResolveContext::ConstantFetch)),
+                if_false: if_false
+                    .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
             };
         }
 
         HirExprKind::Ternary {
-            condition: self.nth_expr_child(node, 0, true),
-            if_true: self.nth_expr_child(node, 1, false),
-            if_false: self.nth_expr_child(node, 2, true),
+            condition,
+            if_true,
+            if_false: if_false
+                .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
         }
+    }
+
+    fn expr_chain_in_range(
+        &mut self,
+        node: &SyntaxNode,
+        start: usize,
+        end: usize,
+        context: ResolveContext,
+    ) -> Option<ExprId> {
+        let mut operands = self.expr_operands_in_range(node, start, end, context);
+        if operands.is_empty() {
+            self.collect_expr_descendants_in_range_with_context(
+                node,
+                start,
+                end,
+                context,
+                &mut operands,
+            );
+        }
+        match operands.len() {
+            0 => None,
+            1 => operands.first().copied(),
+            _ => Some(self.alloc_binary_chain_expr(
+                node,
+                operands,
+                operator_texts_in_range(node, start, end),
+            )),
+        }
+    }
+
+    fn expr_operands_in_range(
+        &mut self,
+        node: &SyntaxNode,
+        start: usize,
+        end: usize,
+        context: ResolveContext,
+    ) -> Vec<ExprId> {
+        let mut out = Vec::new();
+        for child in syntax_child_nodes(node).filter(|child| ExprNode::cast(child).is_some()) {
+            let range = child.text_range();
+            let child_start = range.start().to_usize();
+            let child_end = range.end().to_usize();
+            if child_end <= start || child_start >= end {
+                continue;
+            }
+            if child_start < start || child_end > end {
+                self.collect_expr_descendants_in_range_with_context(
+                    child, start, end, context, &mut out,
+                );
+                continue;
+            }
+            if child.kind().name() == "PROPERTY_FETCH_EXPR"
+                && let Some(receiver) = out.pop()
+            {
+                let property = self
+                    .first_expr_child(child, false)
+                    .or_else(|| self.property_name_literal(child));
+                let span = TextRange::new(
+                    self.frontend_span(receiver)
+                        .map(|span| span.start().to_usize())
+                        .unwrap_or_else(|| child_start),
+                    child_end,
+                );
+                out.push(self.alloc_expr(
+                    HirExprKind::PropertyFetch {
+                        receiver: Some(receiver),
+                        property,
+                        nullsafe: has_descendant_token_text(child, "?->"),
+                    },
+                    span,
+                ));
+                continue;
+            }
+            if child.kind().name() == "ARRAY_DIM_FETCH_EXPR"
+                && let Some(receiver) = out.pop()
+            {
+                let dim = self
+                    .first_expr_child(child, false)
+                    .or_else(|| self.array_dim_literal(child));
+                let span = TextRange::new(
+                    self.frontend_span(receiver)
+                        .map(|span| span.start().to_usize())
+                        .unwrap_or_else(|| child_start),
+                    child_end,
+                );
+                out.push(self.alloc_expr(
+                    HirExprKind::DimFetch {
+                        receiver: Some(receiver),
+                        dim,
+                    },
+                    span,
+                ));
+                continue;
+            }
+            if child.kind().name() == "STATIC_ACCESS_EXPR"
+                && let Some(target) = out.last().copied()
+                && self
+                    .database
+                    .source_map()
+                    .span(target)
+                    .is_some_and(|span| span.end() == child.text_range().start())
+            {
+                let Some(target) = out.pop() else {
+                    continue;
+                };
+                let member = self
+                    .first_expr_child(child, false)
+                    .or_else(|| self.static_member_literal(child));
+                let span = TextRange::new(
+                    self.frontend_span(target)
+                        .map(|span| span.start().to_usize())
+                        .unwrap_or_else(|| child_start),
+                    child_end,
+                );
+                out.push(self.alloc_expr(
+                    HirExprKind::StaticAccess {
+                        target: Some(target),
+                        member,
+                    },
+                    span,
+                ));
+                continue;
+            }
+            if child.kind().name() == "CALL_EXPR"
+                && let Some(previous) = out.pop()
+                && self.expr_has_trailing_call(node, previous, child)
+            {
+                let args = self.call_args(child);
+                let current_kind = self
+                    .database
+                    .module(self.module_id)
+                    .and_then(|module| module.expressions().get(previous))
+                    .map(|expr| expr.kind().as_str())
+                    .unwrap_or_default();
+                let kind = if current_kind == "property_fetch" {
+                    HirExprKind::MethodCall {
+                        receiver: None,
+                        method: Some(previous),
+                        args,
+                        nullsafe: has_descendant_token_text(child, "?->"),
+                    }
+                } else {
+                    HirExprKind::Call {
+                        callee: Some(previous),
+                        args,
+                    }
+                };
+                let span = TextRange::new(
+                    self.frontend_span(previous)
+                        .map(|span| span.start().to_usize())
+                        .unwrap_or_else(|| child.text_range().start().to_usize()),
+                    child.text_range().end().to_usize(),
+                );
+                out.push(self.alloc_expr(kind, span));
+                continue;
+            }
+            out.push(self.lower_expr(child, context));
+        }
+        out
+    }
+
+    fn collect_expr_descendants_in_range_with_context(
+        &mut self,
+        node: &SyntaxNode,
+        start: usize,
+        end: usize,
+        context: ResolveContext,
+        expressions: &mut Vec<ExprId>,
+    ) {
+        let range = node.text_range();
+        let node_start = range.start().to_usize();
+        let node_end = range.end().to_usize();
+        if node_end <= start || node_start >= end {
+            return;
+        }
+        if ExprNode::cast(node).is_some() {
+            if node_start >= start && node_end <= end {
+                expressions.push(self.lower_expr(node, context));
+                return;
+            }
+        }
+        for child in syntax_child_nodes(node) {
+            if Stmt::cast(child).is_some() {
+                continue;
+            }
+            self.collect_expr_descendants_in_range_with_context(
+                child,
+                start,
+                end,
+                context,
+                expressions,
+            );
+        }
+    }
+
+    fn alloc_binary_chain_expr(
+        &mut self,
+        node: &SyntaxNode,
+        operands: Vec<ExprId>,
+        operators: Vec<String>,
+    ) -> ExprId {
+        let mut left = operands[0];
+        for (index, right) in operands.iter().copied().enumerate().skip(1) {
+            let operator = operators
+                .get(index - 1)
+                .or_else(|| operators.first())
+                .cloned()
+                .unwrap_or_else(|| "binary".to_owned());
+            let span = TextRange::new(
+                self.frontend_span(left)
+                    .map(|span| span.start().to_usize())
+                    .unwrap_or_else(|| node.text_range().start().to_usize()),
+                self.frontend_span(right)
+                    .map(|span| span.end().to_usize())
+                    .unwrap_or_else(|| node.text_range().end().to_usize()),
+            );
+            left = self.alloc_expr(
+                HirExprKind::Binary {
+                    operator,
+                    left: Some(left),
+                    right: Some(right),
+                },
+                span,
+            );
+        }
+        left
     }
 
     fn first_expr_child_or_placeholder(&mut self, node: &SyntaxNode) -> Option<ExprId> {
@@ -1982,6 +2230,33 @@ fn operator_texts(node: &SyntaxNode) -> Vec<String> {
         .collect()
 }
 
+fn operator_texts_in_range(node: &SyntaxNode, start: usize, end: usize) -> Vec<String> {
+    syntax_child_tokens(node)
+        .filter(|token| !token.kind().is_trivia())
+        .filter(|token| is_operator_token(token))
+        .filter(|token| {
+            let range = token.text_range();
+            range.start().to_usize() >= start && range.end().to_usize() <= end
+        })
+        .map(SyntaxToken::text)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn ternary_question_colon_offsets(node: &SyntaxNode) -> Option<(usize, usize)> {
+    let mut question = None;
+    for token in syntax_child_tokens(node).filter(|token| !token.kind().is_trivia()) {
+        match token.text() {
+            "?" if question.is_none() => question = Some(token.text_range().start().to_usize()),
+            ":" if question.is_some() => {
+                return Some((question?, token.text_range().start().to_usize()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn first_assignment_operator_text(node: &SyntaxNode) -> Option<String> {
     let mut tokens = syntax_child_tokens(node).filter(|token| !token.kind().is_trivia());
     while let Some(token) = tokens.next() {
@@ -2235,6 +2510,92 @@ mod tests {
         });
 
         assert!(has_binary_dim, "array dim should preserve `$counter - 1`");
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_binary_condition_in_unparenthesized_ternary() {
+        let source = "<?php echo $limit === PHP_INT_MAX ? \"limit\" : \"bad\";\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let condition = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Ternary {
+                    condition: Some(condition),
+                    ..
+                } => Some(*condition),
+                _ => None,
+            })
+            .expect("ternary condition");
+
+        assert!(matches!(
+            module.expressions()[condition].kind(),
+            HirExprKind::Binary { operator, .. } if operator == "==="
+        ));
+        assert!(reporter.into_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_method_call_condition_in_unparenthesized_ternary() {
+        let source = "<?php echo $g->valid() ? \"T\" : \"F\";\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let condition = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Ternary {
+                    condition: Some(condition),
+                    ..
+                } => Some(*condition),
+                _ => None,
+            })
+            .expect("ternary condition");
+
+        let HirExprKind::MethodCall {
+            receiver: None,
+            method: Some(method),
+            ..
+        } = module.expressions()[condition].kind()
+        else {
+            panic!("ternary condition should preserve method call");
+        };
+        assert!(matches!(
+            module.expressions()[*method].kind(),
+            HirExprKind::PropertyFetch {
+                receiver: Some(_),
+                property: Some(_),
+                ..
+            }
+        ));
         assert!(reporter.into_diagnostics().is_empty());
     }
 

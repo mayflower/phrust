@@ -1715,6 +1715,7 @@ impl LoweringContext<'_> {
         let Some(module) = module else {
             return Vec::new();
         };
+        let named_constants = predefined_constant_initializer_map();
         module
             .const_exprs()
             .iter()
@@ -1723,11 +1724,12 @@ impl LoweringContext<'_> {
                     && const_expr.is_allowed()
             })
             .map(|(_, const_expr)| {
-                constant_from_expr(module, const_expr.expr_id()).or_else(|| {
-                    const_expr
-                        .folded_value()
-                        .and_then(ir_constant_from_const_value)
-                })
+                constant_from_expr_with_names(module, const_expr.expr_id(), &named_constants)
+                    .or_else(|| {
+                        const_expr
+                            .folded_value()
+                            .and_then(ir_constant_from_const_value)
+                    })
             })
             .collect()
     }
@@ -1740,8 +1742,9 @@ impl LoweringContext<'_> {
         else {
             return HashMap::new();
         };
+        let mut map = predefined_constant_initializer_map();
         let mut values = self.global_const_initializers().into_iter();
-        module
+        for (name, value) in module
             .declaration_table()
             .entries()
             .iter()
@@ -1757,7 +1760,10 @@ impl LoweringContext<'_> {
                     (entry.fqn().canonical(NameKind::Constant), value),
                 ]
             })
-            .collect()
+        {
+            map.insert(name, value);
+        }
+        map
     }
 
     fn lower_function_declarations(&mut self, builder: &mut IrBuilder, main_function: FunctionId) {
@@ -1860,14 +1866,18 @@ impl LoweringContext<'_> {
 
     fn lower_param_default(&self, param: &Parameter) -> Option<IrConstant> {
         let default = param.default()?;
-        if !default.is_const_expr_candidate() {
-            return None;
-        }
         let module = self
             .frontend
             .database()
             .module(self.frontend.module().module_id())?;
         let named_constants = self.global_constant_initializer_map();
+        if !default.is_const_expr_candidate() {
+            return self
+                .source_text
+                .as_str()
+                .get(default.span().start().to_usize()..default.span().end().to_usize())
+                .and_then(|source| named_constant_from_default_source(source, &named_constants));
+        }
         module
             .const_exprs()
             .iter()
@@ -1904,7 +1914,10 @@ impl LoweringContext<'_> {
                 self.source_text
                     .as_str()
                     .get(default.span().start().to_usize()..default.span().end().to_usize())
-                    .and_then(literal_constant)
+                    .and_then(|source| {
+                        named_constant_from_default_source(source, &named_constants)
+                            .or_else(|| literal_constant(source))
+                    })
             })
     }
 
@@ -2012,11 +2025,14 @@ impl LoweringContext<'_> {
         {
             return None;
         }
-        constant_from_expr(module, const_expr.expr_id()).or_else(|| {
-            const_expr
-                .folded_value()
-                .and_then(ir_constant_from_const_value)
-        })
+        let named_constants = self.global_constant_initializer_map();
+        constant_from_expr_with_names(module, const_expr.expr_id(), &named_constants).or_else(
+            || {
+                const_expr
+                    .folded_value()
+                    .and_then(ir_constant_from_const_value)
+            },
+        )
     }
 
     fn lower_enum_backing_type(
@@ -2138,6 +2154,10 @@ impl LoweringContext<'_> {
             {
                 return None;
             }
+            let named_constants = self.global_constant_initializer_map();
+            if let Some(value) = constant_from_expr_with_names(module, expr_id, &named_constants) {
+                return Some(value);
+            }
             if let Some(value) = const_expr.folded_value() {
                 return ir_constant_from_const_value(value);
             }
@@ -2166,10 +2186,11 @@ impl LoweringContext<'_> {
             return None;
         }
         let mut visiting = Vec::new();
+        let named_constants = self.global_constant_initializer_map();
         constant_from_expr_with_class_constants(
             module,
             const_expr.expr_id(),
-            &HashMap::new(),
+            &named_constants,
             current_class,
             class_constants,
             class_parents,
@@ -2259,7 +2280,7 @@ impl LoweringContext<'_> {
         &mut self,
         builder: &mut IrBuilder,
         function: FunctionId,
-        mut block: BlockId,
+        block: BlockId,
     ) -> BlockId {
         let Some(module) = self
             .frontend
@@ -2269,6 +2290,7 @@ impl LoweringContext<'_> {
             return block;
         };
 
+        let mut statements = Vec::new();
         for namespace in module.namespaces().values() {
             for item in namespace.items() {
                 if item.kind() != TopLevelItemKind::Statement
@@ -2277,18 +2299,12 @@ impl LoweringContext<'_> {
                     continue;
                 }
                 if let Some(stmt_id) = self.statement_id_for_span(item.span()) {
-                    block = self.lower_stmt(builder, function, block, stmt_id);
-                    if builder.is_terminated(function, block) {
-                        break;
-                    }
+                    statements.push(stmt_id);
                 }
-            }
-            if builder.is_terminated(function, block) {
-                break;
             }
         }
 
-        block
+        self.lower_stmt_list(builder, function, block, statements)
     }
 
     fn lower_stmt(
@@ -2315,14 +2331,7 @@ impl LoweringContext<'_> {
                 self.lower_inline_html_stmt(builder, function, block, stmt_id, text)
             }
             HirStmtKind::Block { statements } => {
-                let mut current = block;
-                for stmt in statements {
-                    current = self.lower_stmt(builder, function, current, stmt);
-                    if builder.is_terminated(function, current) {
-                        break;
-                    }
-                }
-                current
+                self.lower_stmt_list(builder, function, block, statements)
             }
             HirStmtKind::Expr { expr } => {
                 if let Some(expr) = expr {
@@ -3557,23 +3566,13 @@ impl LoweringContext<'_> {
         self.ensure_label_blocks(builder, function, labels);
         let mut current = block;
         for stmt in statements {
-            current = self.lower_stmt(builder, function, current, stmt);
-            if builder.is_terminated(function, current) {
-                if !has_labels {
-                    break;
+            if builder.is_terminated(function, current) && !self.is_label_stmt(stmt) {
+                if has_labels {
+                    continue;
                 }
-                let next = builder.append_block(function);
-                let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt)));
-                builder.add_source_map(
-                    IrSourceMapTarget::Block {
-                        function,
-                        block: next,
-                    },
-                    format!("hir:stmt:{}:unreachable-continuation", stmt.raw()),
-                    span,
-                );
-                current = next;
+                break;
             }
+            current = self.lower_stmt(builder, function, current, stmt);
         }
         current
     }
@@ -3608,58 +3607,62 @@ impl LoweringContext<'_> {
     }
 
     fn collect_label_statements(&self, statements: &[StmtId]) -> Vec<(String, StmtId)> {
-        let mut labels = Vec::new();
-        self.collect_label_statements_into(statements, &mut labels);
-        labels
-    }
-
-    fn collect_label_statements_into(
-        &self,
-        statements: &[StmtId],
-        labels: &mut Vec<(String, StmtId)>,
-    ) {
         let Some(module) = self
             .frontend
             .database()
             .module(self.frontend.module().module_id())
         else {
-            return;
+            return Vec::new();
         };
+        let mut labels = Vec::new();
+        self.collect_label_statements_into(module, statements, &mut labels);
+        labels
+    }
 
-        for stmt_id in statements {
-            let Some(statement) = module.statements().get(*stmt_id) else {
+    fn collect_label_statements_into(
+        &self,
+        module: &HirModule,
+        statements: &[StmtId],
+        labels: &mut Vec<(String, StmtId)>,
+    ) {
+        for stmt in statements {
+            let Some(statement) = module.statements().get(*stmt) else {
                 continue;
             };
             match statement.kind() {
-                HirStmtKind::Label { name: Some(name) } => labels.push((name.clone(), *stmt_id)),
+                HirStmtKind::Label { name } => {
+                    if let Some(name) = name {
+                        labels.push((name.clone(), *stmt));
+                    }
+                }
                 HirStmtKind::Block { statements }
+                | HirStmtKind::While {
+                    body: statements, ..
+                }
+                | HirStmtKind::DoWhile {
+                    body: statements, ..
+                }
                 | HirStmtKind::Declare {
                     body: statements, ..
-                } => {
-                    self.collect_label_statements_into(statements, labels);
-                }
+                } => self.collect_label_statements_into(module, statements, labels),
                 HirStmtKind::If {
                     body,
                     elseifs,
                     else_body,
                     ..
                 } => {
-                    self.collect_label_statements_into(body, labels);
+                    self.collect_label_statements_into(module, body, labels);
                     for branch in elseifs {
-                        self.collect_label_statements_into(&branch.body, labels);
+                        self.collect_label_statements_into(module, &branch.body, labels);
                     }
-                    self.collect_label_statements_into(else_body, labels);
+                    self.collect_label_statements_into(module, else_body, labels);
                 }
-                HirStmtKind::While { body, .. }
-                | HirStmtKind::DoWhile { body, .. }
-                | HirStmtKind::For { body, .. }
-                | HirStmtKind::Foreach { body, .. } => {
-                    self.collect_label_statements_into(body, labels);
+                HirStmtKind::For { body, .. } | HirStmtKind::Foreach { body, .. } => {
+                    self.collect_label_statements_into(module, body, labels);
                 }
-                HirStmtKind::Switch { body, cases, .. } => {
-                    self.collect_label_statements_into(body, labels);
+                HirStmtKind::Switch { cases, .. } => {
                     for case in cases {
-                        self.collect_label_statements_into(&case.body, labels);
+                        self.collect_label_statements_into(module, &case.body, labels);
                     }
                 }
                 HirStmtKind::Try {
@@ -3667,15 +3670,23 @@ impl LoweringContext<'_> {
                     catches,
                     finally_body,
                 } => {
-                    self.collect_label_statements_into(body, labels);
+                    self.collect_label_statements_into(module, body, labels);
                     for catch in catches {
-                        self.collect_label_statements_into(&catch.body, labels);
+                        self.collect_label_statements_into(module, &catch.body, labels);
                     }
-                    self.collect_label_statements_into(finally_body, labels);
+                    self.collect_label_statements_into(module, finally_body, labels);
                 }
                 _ => {}
             }
         }
+    }
+
+    fn is_label_stmt(&self, stmt: StmtId) -> bool {
+        self.frontend
+            .database()
+            .module(self.frontend.module().module_id())
+            .and_then(|module| module.statements().get(stmt))
+            .is_some_and(|statement| matches!(statement.kind(), HirStmtKind::Label { .. }))
     }
 
     fn lower_label_stmt(
@@ -3691,12 +3702,34 @@ impl LoweringContext<'_> {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 self.span_for(SourceMappedId::from(stmt_id)),
-                "label statement is missing its target name",
+                "label statement is missing its label name",
             );
             return block;
         };
-        let target = self.label_block(builder, function, stmt_id, &name);
-        self.jump_if_open(builder, function, block, target, span);
+        let Some(target) = self
+            .label_blocks
+            .get(&function)
+            .and_then(|labels| labels.get(&name))
+            .copied()
+        else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                self.span_for(SourceMappedId::from(stmt_id)),
+                format!("label `{name}` has no lowered target block"),
+            );
+            return block;
+        };
+        if block != target && !builder.is_terminated(function, block) {
+            builder.terminate_jump(function, block, target, span);
+        }
+        builder.add_source_map(
+            IrSourceMapTarget::Block {
+                function,
+                block: target,
+            },
+            format!("hir:label:{name}"),
+            span,
+        );
         target
     }
 
@@ -3717,44 +3750,27 @@ impl LoweringContext<'_> {
             );
             return block;
         };
-        let target = self.label_block(builder, function, stmt_id, &label);
+        let Some(target) = self
+            .label_blocks
+            .get(&function)
+            .and_then(|labels| labels.get(&label))
+            .copied()
+        else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                self.span_for(SourceMappedId::from(stmt_id)),
+                format!("goto target label `{label}` was not found in this function"),
+            );
+            return block;
+        };
         if !builder.is_terminated(function, block) {
             builder.terminate_jump(function, block, target, span);
             builder.add_source_map(
                 IrSourceMapTarget::Terminator { function, block },
-                format!("hir:stmt:{}", stmt_id.raw()),
+                format!("hir:goto:{label}"),
                 span,
             );
         }
-        block
-    }
-
-    fn label_block(
-        &mut self,
-        builder: &mut IrBuilder,
-        function: FunctionId,
-        stmt_id: StmtId,
-        name: &str,
-    ) -> BlockId {
-        if let Some(block) = self
-            .label_blocks
-            .get(&function)
-            .and_then(|labels| labels.get(name))
-            .copied()
-        {
-            return block;
-        }
-        let block = builder.append_block(function);
-        let span = span_from_range(self.file, self.span_for(SourceMappedId::from(stmt_id)));
-        builder.add_source_map(
-            IrSourceMapTarget::Block { function, block },
-            format!("hir:stmt:{}:label:{name}", stmt_id.raw()),
-            span,
-        );
-        self.label_blocks
-            .entry(function)
-            .or_default()
-            .insert(name.to_owned(), block);
         block
     }
 
@@ -10245,37 +10261,37 @@ fn language_constant(name: &str) -> Option<IrConstant> {
     } else if normalized.eq_ignore_ascii_case("PHP_INT_SIZE") {
         Some(IrConstant::Int(std::mem::size_of::<isize>() as i64))
     } else if normalized.eq_ignore_ascii_case("E_ERROR") {
-        Some(IrConstant::Int(1))
+        Some(IrConstant::Int(php_std::constants::E_ERROR))
     } else if normalized.eq_ignore_ascii_case("E_WARNING") {
-        Some(IrConstant::Int(2))
+        Some(IrConstant::Int(php_std::constants::E_WARNING))
     } else if normalized.eq_ignore_ascii_case("E_PARSE") {
-        Some(IrConstant::Int(4))
+        Some(IrConstant::Int(php_std::constants::E_PARSE))
     } else if normalized.eq_ignore_ascii_case("E_NOTICE") {
-        Some(IrConstant::Int(8))
+        Some(IrConstant::Int(php_std::constants::E_NOTICE))
     } else if normalized.eq_ignore_ascii_case("E_CORE_ERROR") {
-        Some(IrConstant::Int(16))
+        Some(IrConstant::Int(php_std::constants::E_CORE_ERROR))
     } else if normalized.eq_ignore_ascii_case("E_CORE_WARNING") {
-        Some(IrConstant::Int(32))
+        Some(IrConstant::Int(php_std::constants::E_CORE_WARNING))
     } else if normalized.eq_ignore_ascii_case("E_COMPILE_ERROR") {
-        Some(IrConstant::Int(64))
+        Some(IrConstant::Int(php_std::constants::E_COMPILE_ERROR))
     } else if normalized.eq_ignore_ascii_case("E_COMPILE_WARNING") {
-        Some(IrConstant::Int(128))
+        Some(IrConstant::Int(php_std::constants::E_COMPILE_WARNING))
     } else if normalized.eq_ignore_ascii_case("E_USER_ERROR") {
-        Some(IrConstant::Int(256))
+        Some(IrConstant::Int(php_std::constants::E_USER_ERROR))
     } else if normalized.eq_ignore_ascii_case("E_USER_WARNING") {
-        Some(IrConstant::Int(512))
+        Some(IrConstant::Int(php_std::constants::E_USER_WARNING))
     } else if normalized.eq_ignore_ascii_case("E_USER_NOTICE") {
-        Some(IrConstant::Int(1024))
+        Some(IrConstant::Int(php_std::constants::E_USER_NOTICE))
     } else if normalized.eq_ignore_ascii_case("E_STRICT") {
-        Some(IrConstant::Int(2048))
+        Some(IrConstant::Int(php_std::constants::E_STRICT))
     } else if normalized.eq_ignore_ascii_case("E_RECOVERABLE_ERROR") {
-        Some(IrConstant::Int(4096))
+        Some(IrConstant::Int(php_std::constants::E_RECOVERABLE_ERROR))
     } else if normalized.eq_ignore_ascii_case("E_DEPRECATED") {
-        Some(IrConstant::Int(8192))
+        Some(IrConstant::Int(php_std::constants::E_DEPRECATED))
     } else if normalized.eq_ignore_ascii_case("E_USER_DEPRECATED") {
-        Some(IrConstant::Int(16384))
+        Some(IrConstant::Int(php_std::constants::E_USER_DEPRECATED))
     } else if normalized.eq_ignore_ascii_case("E_ALL") {
-        Some(IrConstant::Int(32767))
+        Some(IrConstant::Int(php_std::constants::E_ALL))
     } else {
         None
     }
@@ -10367,8 +10383,15 @@ fn class_like_normalized_name(class_like: &HirClassLike) -> Option<String> {
         .map(|name| normalize_class_name(&name))
 }
 
-fn constant_from_expr(module: &HirModule, expr_id: ExprId) -> Option<IrConstant> {
-    constant_from_expr_with_names(module, expr_id, &HashMap::new())
+fn named_constant_from_default_source(
+    source: &str,
+    named_constants: &HashMap<String, IrConstant>,
+) -> Option<IrConstant> {
+    let value = source
+        .split_once('=')
+        .map_or(source, |(_, value)| value)
+        .trim();
+    named_constants.get(value).cloned()
 }
 
 fn constant_from_expr_with_names(
@@ -10414,6 +10437,7 @@ fn constant_from_expr_with_class_constants(
             match operator.as_str() {
                 "parenthesized" | "+" => Some(value),
                 "-" => negate_ir_constant(value),
+                "~" => bitnot_ir_constant(value),
                 _ => None,
             }
         }
@@ -10627,6 +10651,37 @@ fn named_constant_value(
         .find_map(|name| named_constants.get(name).cloned())
 }
 
+fn predefined_constant_initializer_map() -> HashMap<String, IrConstant> {
+    let registry = php_std::ExtensionRegistry::standard_library();
+    registry
+        .enabled_constants()
+        .into_iter()
+        .filter_map(|constant| {
+            Some((
+                constant.name().to_owned(),
+                ir_constant_from_std_value(constant.value()?)?,
+            ))
+        })
+        .collect()
+}
+
+fn ir_constant_from_std_value(value: php_std::ConstantValue) -> Option<IrConstant> {
+    match value {
+        php_std::ConstantValue::Null => Some(IrConstant::Null),
+        php_std::ConstantValue::Bool(value) => Some(IrConstant::Bool(value)),
+        php_std::ConstantValue::Int(value) => Some(IrConstant::Int(value)),
+        php_std::ConstantValue::Float(value) => Some(IrConstant::Float(value.to_f64())),
+        php_std::ConstantValue::String(value) => Some(IrConstant::String(value.to_owned())),
+        php_std::ConstantValue::Array(values) => values
+            .iter()
+            .copied()
+            .map(ir_constant_from_std_value)
+            .map(|value| value.map(|value| IrConstantArrayEntry { key: None, value }))
+            .collect::<Option<Vec<_>>>()
+            .map(IrConstant::Array),
+    }
+}
+
 fn negate_ir_constant(value: IrConstant) -> Option<IrConstant> {
     match value {
         IrConstant::Int(value) => value.checked_neg().map(IrConstant::Int),
@@ -10646,9 +10701,16 @@ fn binary_ir_constant(operator: &str, left: IrConstant, right: IrConstant) -> Op
         ("*", IrConstant::Int(left), IrConstant::Int(right)) => {
             left.checked_mul(right).map(IrConstant::Int)
         }
+        ("&", IrConstant::Int(left), IrConstant::Int(right)) => Some(IrConstant::Int(left & right)),
+        ("|", IrConstant::Int(left), IrConstant::Int(right)) => Some(IrConstant::Int(left | right)),
+        ("^", IrConstant::Int(left), IrConstant::Int(right)) => Some(IrConstant::Int(left ^ right)),
         ("<<", IrConstant::Int(left), IrConstant::Int(right)) => u32::try_from(right)
             .ok()
             .and_then(|shift| left.checked_shl(shift))
+            .map(IrConstant::Int),
+        (">>", IrConstant::Int(left), IrConstant::Int(right)) => u32::try_from(right)
+            .ok()
+            .and_then(|shift| left.checked_shr(shift))
             .map(IrConstant::Int),
         (".", IrConstant::String(left), IrConstant::String(right)) => {
             Some(IrConstant::String(format!("{left}{right}")))
@@ -10657,6 +10719,13 @@ fn binary_ir_constant(operator: &str, left: IrConstant, right: IrConstant) -> Op
             left.extend(right);
             Some(IrConstant::StringBytes(left))
         }
+        _ => None,
+    }
+}
+
+fn bitnot_ir_constant(value: IrConstant) -> Option<IrConstant> {
+    match value {
+        IrConstant::Int(value) => Some(IrConstant::Int(!value)),
         _ => None,
     }
 }
@@ -11596,7 +11665,7 @@ mod tests {
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
         let snapshot = result.unit.to_snapshot_text();
         assert!(snapshot.contains("echo r0"), "{snapshot}");
-        assert!(snapshot.contains("return"), "{snapshot}");
+        assert!(snapshot.contains("exit"), "{snapshot}");
         assert!(!snapshot.contains("after"), "{snapshot}");
     }
 
@@ -11609,8 +11678,7 @@ mod tests {
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
         let snapshot = result.unit.to_snapshot_text();
         assert!(snapshot.contains("string \"skip platform\""), "{snapshot}");
-        assert!(snapshot.contains("echo r"), "{snapshot}");
-        assert!(snapshot.contains("return"), "{snapshot}");
+        assert!(snapshot.contains("exit r"), "{snapshot}");
         assert!(!snapshot.contains("after"), "{snapshot}");
     }
 
@@ -11642,6 +11710,123 @@ mod tests {
         assert!(snapshot.contains("exit r"), "{snapshot}");
         assert!(!snapshot.contains("unsupported"), "{snapshot}");
         assert!(!snapshot.contains("missing"), "{snapshot}");
+    }
+
+    #[test]
+    fn include_construct_operand_keeps_full_concat_expression() {
+        let frontend = analyze_source("<?php include __DIR__ . '/_data/child.php';");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert_eq!(
+            snapshot.matches("include r3 include r2").count(),
+            1,
+            "{snapshot}"
+        );
+        assert!(snapshot.contains(" concat "), "{snapshot}");
+        assert!(!snapshot.contains("E_PHP_IR_UNSUPPORTED"), "{snapshot}");
+    }
+
+    #[test]
+    fn label_and_goto_lower_to_jumps_without_unsupported_hir() {
+        let frontend = analyze_source(
+            "<?php $i = 0; start: $i++; if ($i < 3) { goto start; } goto done; echo 'skip'; done: echo $i;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("hir:label:start"), "{snapshot}");
+        assert!(snapshot.contains("hir:label:done"), "{snapshot}");
+        assert!(snapshot.contains("hir:goto:start"), "{snapshot}");
+        assert!(snapshot.contains("hir:goto:done"), "{snapshot}");
+        assert!(snapshot.matches("jump block:").count() >= 3, "{snapshot}");
+        assert!(
+            !snapshot.contains("E_PHP_IR_UNSUPPORTED_HIR_STATEMENT"),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
+    fn predefined_constants_fold_in_compile_time_contexts() {
+        let source = "<?php
+            #[Attr(PHP_INT_MAX)]
+            class C {
+                public const MASK = E_ALL & ~E_DEPRECATED;
+                public const ROOT = DIRECTORY_SEPARATOR . 'wp';
+                public string $eol = PHP_EOL;
+            }
+            function boot($limit = PHP_INT_MAX, $path = DEFAULT_INCLUDE_PATH) {}
+            ";
+        let frontend = analyze_source(source);
+        let result = lower_frontend_result(
+            &frontend,
+            LoweringOptions {
+                source_text: Some(source.to_owned()),
+                ..LoweringOptions::default()
+            },
+        );
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::Int(php_std::constants::PHP_INT_MAX)),
+            "{:#?}",
+            result.unit.constants
+        );
+        assert!(
+            result.unit.constants.contains(&IrConstant::Int(
+                php_std::constants::E_ALL & !php_std::constants::E_DEPRECATED
+            )),
+            "{:#?}",
+            result.unit.constants
+        );
+        assert!(
+            result
+                .unit
+                .constants
+                .contains(&IrConstant::String(php_std::constants::PHP_EOL.to_string())),
+            "{:#?}",
+            result.unit.constants
+        );
+        assert!(
+            result.unit.constants.contains(&IrConstant::String(format!(
+                "{}wp",
+                php_std::constants::DIRECTORY_SEPARATOR
+            ))),
+            "{:#?}",
+            result.unit.constants
+        );
+
+        let class = result
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == "c")
+            .expect("class C");
+        assert_eq!(class.attributes[0].arguments.len(), 1);
+        let function = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "boot")
+            .expect("boot function");
+        assert_eq!(
+            function.params[0].default,
+            Some(IrConstant::Int(php_std::constants::PHP_INT_MAX))
+        );
+        assert_eq!(
+            function.params[1].default,
+            Some(IrConstant::String(
+                php_std::constants::DEFAULT_INCLUDE_PATH.to_string()
+            ))
+        );
     }
 
     #[test]

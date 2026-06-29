@@ -28,6 +28,8 @@ pub struct VmOptions {
     pub trace: bool,
     /// Capture deterministic runtime object, reference, COW, and suspension events.
     pub trace_runtime: bool,
+    /// Capture deterministic include/bootstrap trace events.
+    pub trace_includes: bool,
     /// Collect performance VM/runtime counters in the execution result.
     pub collect_counters: bool,
     /// Optional dense-bytecode execution mode. The default keeps the rich-IR
@@ -71,6 +73,7 @@ impl Default for VmOptions {
             runtime_context: RuntimeContext::default(),
             trace: false,
             trace_runtime: false,
+            trace_includes: trace_includes_from_env(),
             collect_counters: false,
             execution_format: ExecutionFormat::Ir,
             superinstructions: SuperinstructionMode::Off,
@@ -87,6 +90,15 @@ impl Default for VmOptions {
             internal_function_dispatch_cache: true,
         }
     }
+}
+
+fn trace_includes_from_env() -> bool {
+    std::env::var("PHRUST_TRACE_INCLUDES").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Optional VM execution-format switch.

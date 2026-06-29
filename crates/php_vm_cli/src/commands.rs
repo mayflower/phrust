@@ -695,6 +695,7 @@ where
         include_optimization_level: run_options.opt_level,
         trace: run_options.trace,
         trace_runtime: run_options.trace_runtime,
+        trace_includes: run_options.trace_includes,
         collect_counters: run_options.counters_json.is_some()
             || run_options.jit_stats.is_json()
             || run_options.region_profile_json.is_some(),
@@ -720,7 +721,7 @@ where
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
     write_runtime_diagnostics(stderr, path, &result)?;
-    if run_options.trace || run_options.trace_runtime {
+    if run_options.trace || run_options.trace_runtime || run_options.trace_includes {
         write_trace(stderr, &result.trace)?;
     }
     if let Some(path) = &run_options.counters_json {
@@ -801,6 +802,7 @@ where
         vm_options: VmOptions {
             trace: run_options.trace,
             trace_runtime: run_options.trace_runtime,
+            trace_includes: run_options.trace_includes,
             collect_counters,
             include_optimization_level: run_options.opt_level,
             execution_format: run_options.execution_format,
@@ -858,7 +860,7 @@ where
             .write_all(output.diagnostics_text.as_bytes())
             .map_err(|error| error.to_string())?;
     }
-    if run_options.trace || run_options.trace_runtime {
+    if run_options.trace || run_options.trace_runtime || run_options.trace_includes {
         write_trace(stderr, &output.trace)?;
     }
     if let Some(path) = &run_options.counters_json {
@@ -1631,6 +1633,7 @@ struct RunOptions<'a> {
     env: Vec<(String, String)>,
     trace: bool,
     trace_runtime: bool,
+    trace_includes: bool,
     counters_json: Option<String>,
     region_profile_json: Option<String>,
     bytecode_cache: BytecodeCacheOptions,
@@ -2274,12 +2277,14 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 let Some(path) = path else {
                     return Err("run requires <path.php> before `--`".to_string());
                 };
+                let trace_includes = trace_includes_enabled(&env);
                 return Ok(RunOptions {
                     path,
                     script_args: args[index + 1..].to_vec(),
                     env,
                     trace,
                     trace_runtime,
+                    trace_includes,
                     counters_json,
                     region_profile_json,
                     bytecode_cache,
@@ -2313,12 +2318,14 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let Some(path) = path else {
         return Err("run requires <path.php>".to_string());
     };
+    let trace_includes = trace_includes_enabled(&env);
     Ok(RunOptions {
         path,
         script_args: Vec::new(),
         env,
         trace,
         trace_runtime,
+        trace_includes,
         counters_json,
         region_profile_json,
         bytecode_cache,
@@ -2339,6 +2346,25 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         tiering_stats_json,
         persistent_feedback,
     })
+}
+
+fn trace_includes_enabled(env: &[(String, String)]) -> bool {
+    if let Some(value) = env
+        .iter()
+        .find_map(|(key, value)| (key == "PHRUST_TRACE_INCLUDES").then_some(value.as_str()))
+    {
+        return trace_includes_value_enabled(value);
+    }
+    std::env::var("PHRUST_TRACE_INCLUDES")
+        .ok()
+        .is_some_and(|value| trace_includes_value_enabled(&value))
+}
+
+fn trace_includes_value_enabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {

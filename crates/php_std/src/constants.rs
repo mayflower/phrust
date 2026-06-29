@@ -83,6 +83,14 @@ pub const PATH_SEPARATOR: &str = ":";
 
 /// PHP end-of-line constant for this CLI engine.
 pub const PHP_EOL: &str = "\n";
+/// PHP server API for this CLI engine.
+pub const PHP_SAPI: &str = "cli";
+/// PHP binary display path for this CLI engine.
+pub const PHP_BINARY: &str = "phrust-php";
+/// Default include path for this CLI engine.
+pub const DEFAULT_INCLUDE_PATH: &str = ".";
+/// Maximum path length used by the compatibility surface.
+pub const PHP_MAXPATHLEN: i64 = 1024;
 
 /// PHP OS string for the current build target.
 #[cfg(target_os = "macos")]
@@ -140,8 +148,95 @@ pub const E_RECOVERABLE_ERROR: i64 = 4096;
 pub const E_DEPRECATED: i64 = 8192;
 /// PHP `E_USER_DEPRECATED`.
 pub const E_USER_DEPRECATED: i64 = 16384;
-/// PHP 8.x `E_ALL`.
-pub const E_ALL: i64 = 32767;
+/// PHP 8.5 `E_ALL`.
+pub const E_ALL: i64 = 30719;
+
+/// Append mode flag for file writes.
+pub const FILE_APPEND: i64 = 8;
+/// Search include_path for file reads.
+pub const FILE_USE_INCLUDE_PATH: i64 = 1;
+/// Strip newlines while reading files.
+pub const FILE_IGNORE_NEW_LINES: i64 = 2;
+/// Skip empty lines while reading files.
+pub const FILE_SKIP_EMPTY_LINES: i64 = 4;
+/// Disable default stream context for file operations.
+pub const FILE_NO_DEFAULT_CONTEXT: i64 = 16;
+/// Shared file lock flag.
+pub const LOCK_SH: i64 = 1;
+/// Exclusive lock flag for file writes.
+pub const LOCK_EX: i64 = 2;
+/// Unlock file lock flag.
+pub const LOCK_UN: i64 = 3;
+/// Non-blocking lock flag.
+pub const LOCK_NB: i64 = 4;
+/// Seek from start of file.
+pub const SEEK_SET: i64 = 0;
+/// Seek from current file position.
+pub const SEEK_CUR: i64 = 1;
+/// Seek from end of file.
+pub const SEEK_END: i64 = 2;
+/// `glob()` brace expansion flag.
+pub const GLOB_BRACE: i64 = 128;
+/// `glob()` mark directory flag.
+pub const GLOB_MARK: i64 = 8;
+/// `glob()` no-sort flag.
+pub const GLOB_NOSORT: i64 = 32;
+/// `glob()` no-check flag.
+pub const GLOB_NOCHECK: i64 = 16;
+/// `glob()` no-escape flag.
+pub const GLOB_NOESCAPE: i64 = 4096;
+/// `glob()` error flag.
+pub const GLOB_ERR: i64 = 4;
+/// `glob()` directories-only flag.
+pub const GLOB_ONLYDIR: i64 = 1_073_741_824;
+/// `pathinfo()` dirname selector.
+pub const PATHINFO_DIRNAME: i64 = 1;
+/// `pathinfo()` basename selector.
+pub const PATHINFO_BASENAME: i64 = 2;
+/// `pathinfo()` extension selector.
+pub const PATHINFO_EXTENSION: i64 = 4;
+/// `pathinfo()` filename selector.
+pub const PATHINFO_FILENAME: i64 = 8;
+/// Normal INI scanner mode.
+pub const INI_SCANNER_NORMAL: i64 = 0;
+/// Raw INI scanner mode.
+pub const INI_SCANNER_RAW: i64 = 1;
+/// Typed INI scanner mode.
+pub const INI_SCANNER_TYPED: i64 = 2;
+/// `fnmatch()` no-escape flag.
+pub const FNM_NOESCAPE: i64 = 1;
+/// `fnmatch()` pathname flag.
+pub const FNM_PATHNAME: i64 = 2;
+/// `fnmatch()` period flag.
+pub const FNM_PERIOD: i64 = 4;
+/// `fnmatch()` case-fold flag.
+pub const FNM_CASEFOLD: i64 = 16;
+/// HTML entity translation mode.
+pub const HTML_ENTITIES: i64 = 1;
+/// HTML escaping compatibility quote mode.
+pub const ENT_COMPAT: i64 = 2;
+/// Default HTML escaping quote mode.
+pub const ENT_QUOTES: i64 = 3;
+/// HTML escaping no-quotes mode.
+pub const ENT_NOQUOTES: i64 = 0;
+/// Ignore invalid code units during HTML escaping.
+pub const ENT_IGNORE: i64 = 4;
+/// Substitute invalid code units during HTML escaping.
+pub const ENT_SUBSTITUTE: i64 = 8;
+/// Disallow invalid code points during HTML escaping.
+pub const ENT_DISALLOWED: i64 = 128;
+/// HTML 4.01 document type flag.
+pub const ENT_HTML401: i64 = 0;
+/// XML 1 document type flag.
+pub const ENT_XML1: i64 = 16;
+/// XHTML document type flag.
+pub const ENT_XHTML: i64 = 32;
+/// HTML5 document type flag.
+pub const ENT_HTML5: i64 = 48;
+/// Maximum signed char value.
+pub const CHAR_MAX: i64 = 127;
+/// `htmlspecialchars()` escaping mode.
+pub const HTML_SPECIALCHARS: i64 = 0;
 
 /// `parse_url()` component selector for the URL scheme.
 pub const PHP_URL_SCHEME: i64 = 0;
@@ -212,6 +307,9 @@ pub const ARRAY_FILTER_USE_BOTH: i64 = 1;
 /// `array_filter()` callback receives key.
 pub const ARRAY_FILTER_USE_KEY: i64 = 2;
 
+/// DateTimeInterface::ATOM date format.
+pub const DATE_ATOM: &str = "Y-m-d\\TH:i:sP";
+
 /// `str_pad()` left padding selector.
 pub const STR_PAD_LEFT: i64 = 0;
 /// `str_pad()` right padding selector.
@@ -240,10 +338,14 @@ pub const UPLOAD_ERR_EXTENSION: i64 = 8;
 #[must_use]
 pub fn constant_to_value(value: ConstantValue) -> Value {
     match value {
+        ConstantValue::Null => Value::Null,
         ConstantValue::Bool(value) => Value::Bool(value),
         ConstantValue::Int(value) => Value::Int(value),
         ConstantValue::Float(value) => Value::Float(value),
         ConstantValue::String(value) => Value::String(PhpString::from(value)),
+        ConstantValue::Array(values) => {
+            Value::packed_array(values.iter().copied().map(constant_to_value).collect())
+        }
     }
 }
 
@@ -306,6 +408,33 @@ mod tests {
                 .and_then(crate::ConstantDescriptor::value),
             Some(ConstantValue::Float(value)) if value.to_f64().is_nan()
         ));
+    }
+
+    #[test]
+    fn constant_value_metadata_supports_php_scalar_and_array_shapes() {
+        static ARRAY_CONSTANT: &[ConstantValue] = &[
+            ConstantValue::Null,
+            ConstantValue::Bool(true),
+            ConstantValue::Int(42),
+            ConstantValue::Float(php_runtime::FloatValue::from_f64(1.5)),
+            ConstantValue::String("x"),
+        ];
+
+        let null = constant_to_value(ConstantValue::Null);
+        assert_eq!(null, Value::Null);
+
+        let array = constant_to_value(ConstantValue::Array(ARRAY_CONSTANT));
+        let elements = array
+            .packed_elements()
+            .expect("array constant should be packed");
+        assert_eq!(elements[0], &Value::Null);
+        assert_eq!(elements[1], &Value::Bool(true));
+        assert_eq!(elements[2], &Value::Int(42));
+        assert_eq!(
+            elements[3],
+            &Value::Float(php_runtime::FloatValue::from_f64(1.5))
+        );
+        assert_eq!(elements[4], &Value::String(PhpString::from("x")));
     }
 
     #[test]

@@ -44,6 +44,7 @@ CATEGORIES = (
     "include_eval_autoload",
     "globals",
     "real_world",
+    "wordpress_blockers",
     "regressions",
     "known_gaps",
 )
@@ -100,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file", action="append", default=[], help="single PHP file to compare")
     parser.add_argument("--dir", action="append", default=[], help="directory of PHP files")
     parser.add_argument(
+        "--stop-on-fail",
+        action="store_true",
+        help="stop after the first failing fixture and still write the JSON report",
+    )
+    parser.add_argument(
         "--category",
         action="append",
         choices=CATEGORIES,
@@ -116,11 +122,20 @@ def run(args: argparse.Namespace) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fixtures = discover_fixtures(fixtures_root, args.file, args.dir, args.category, args.paths)
-    results = [compare_fixture(fixture, Path(args.rust_vm)) for fixture in fixtures]
+    results = []
+    stopped_early = False
+    for fixture in fixtures:
+        result_item = compare_fixture(fixture, Path(args.rust_vm))
+        results.append(result_item)
+        if args.stop_on_fail and result_item["status"] == "fail":
+            stopped_early = True
+            break
     summary = summarize(results)
     report = {
         "fixtures_root": str(fixtures_root),
         "categories": list(CATEGORIES),
+        "selected": len(fixtures),
+        "stopped_early": stopped_early,
         "summary": summary,
         "results": results,
     }
@@ -362,12 +377,52 @@ def result(
         "category": fixture.category,
         "expect": fixture.expect,
         "status": status,
+        "failure_category": failure_category(fixture, status, reference, rust, message),
         "known_gap_id": fixture.known_gap_id,
         "metadata": fixture.metadata,
         "reference": reference,
         "rust": rust,
         "message": message,
     }
+
+
+def failure_category(
+    fixture: Fixture,
+    status: str,
+    reference: dict | None,
+    rust: dict | None,
+    message: str | None,
+) -> str | None:
+    if status not in {"fail", "known_gap"}:
+        return None
+    explicit = fixture.metadata.get("failure_category")
+    if explicit:
+        return explicit
+    text = " ".join(
+        str(value or "")
+        for value in (
+            message,
+            rust.get("stderr_normalized") if rust else None,
+            rust.get("stderr") if rust else None,
+            reference.get("stderr_normalized") if reference else None,
+            reference.get("stderr") if reference else None,
+        )
+    )
+    if "E_PHP_PARSE" in text or "parser" in text.lower():
+        return "parser"
+    if "E_PHP_SEMANTIC" in text or "semantic" in text.lower():
+        return "semantic_folding"
+    if "E_PHP_IR" in text or "unsupported hir" in text.lower():
+        return "ir_lowering"
+    if "constant" in text.lower() or "defined" in text.lower():
+        return "predefined_constant"
+    if "error_reporting" in text or "Warning:" in text or "Fatal error:" in text:
+        return "error_reporting"
+    if "include" in text.lower() or "require" in text.lower() or "cache" in text.lower():
+        return "include_cache_runaway"
+    if rust and rust.get("status") == "error":
+        return "vm_runtime"
+    return "vm_runtime"
 
 
 def summarize(results: list[dict]) -> dict:

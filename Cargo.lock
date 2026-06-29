@@ -1317,6 +1317,7 @@ version = "0.0.0"
 dependencies = [
  "php_semantics",
  "php_source",
+ "php_std",
  "php_testkit",
  "serde",
  "serde_json",

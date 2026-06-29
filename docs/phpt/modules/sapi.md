@@ -22,8 +22,8 @@ semantics.
   behavior, request environment, headers, process management, and web lifecycle
   integration.
 - Current phrust behavior: only CLI-style execution is supported;
-  `php_sapi_name()` reports `cli`, but `PHP_SAPI` is not yet defined as a
-  constant. Non-CLI SAPI probes are unsupported or skipped by the PHPT runner.
+  `php_sapi_name()` reports `cli` and `PHP_SAPI` is registered as `cli`.
+  Non-CLI SAPI probes are unsupported or skipped by the PHPT runner.
 - Fixture: `tests/phpt/generated/sapi/platform-checks.phpt`
 - Next owner layer: target CLI for CLI-compatible behavior; no owner for
   production web SAPIs in current scope.

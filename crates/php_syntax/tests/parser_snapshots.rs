@@ -8,6 +8,7 @@ const CASES: &[(&str, &str)] = &[
     ("php_html_modes", "valid/php_html_modes.php"),
     ("statements_basic", "valid/statements_basic.php"),
     ("control_flow", "valid/control_flow.php"),
+    ("construct_precedence", "valid/construct_precedence.php"),
     ("alternative_syntax", "valid/alternative_syntax.php"),
     ("operator_groups", "valid/operator_groups.php"),
     ("expressions_postfix", "valid/expressions_postfix.php"),

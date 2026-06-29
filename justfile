@@ -846,6 +846,10 @@ real-world-fixtures:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py --category real_world --out target/runtime-semantics/real-world
 
+wordpress-blockers:
+    cargo build -p php_vm_cli
+    scripts/runtime_semantics_diff.py --category wordpress_blockers --out target/runtime-semantics/wordpress-blockers
+
 regression-fixtures:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py --category regressions --out target/runtime-semantics/regressions

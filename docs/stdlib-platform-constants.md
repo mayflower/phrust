@@ -8,6 +8,7 @@ Reference target: PHP 8.5.7 (`php-8.5.7`).
   `PHP_MINOR_VERSION`, `PHP_RELEASE_VERSION`
 - `DIRECTORY_SEPARATOR`, `PATH_SEPARATOR`, `PHP_OS`, `PHP_OS_FAMILY`,
   `PHP_EOL`
+- `PHP_SAPI`, `PHP_BINARY`, `DEFAULT_INCLUDE_PATH`, `PHP_MAXPATHLEN`
 - baseline error constants such as `E_ERROR`, `E_WARNING`, and `E_ALL`
 - extension-specific stubs such as `JSON_ERROR_NONE` and `PREG_NO_ERROR`
 

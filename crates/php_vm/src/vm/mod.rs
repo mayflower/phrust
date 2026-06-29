@@ -889,6 +889,7 @@ impl InternalFunctionDispatchCache {
 struct ExecutionState {
     globals: GlobalSymbolTable,
     included_once: Vec<PathBuf>,
+    include_stack: Vec<PathBuf>,
     cwd: PathBuf,
     static_locals: HashMap<(u32, String), ReferenceCell>,
     static_properties: HashMap<(String, String), Value>,
@@ -2209,7 +2210,7 @@ impl Vm {
         result.http_response = state.http_response;
         result.upload_registry = state.upload_registry;
         result.session = state.session;
-        if self.options.trace || self.options.trace_runtime {
+        if self.options.trace || self.options.trace_runtime || self.options.trace_includes {
             result.trace = self.trace.borrow().clone();
         }
         if self.options.collect_counters {
@@ -2235,6 +2236,13 @@ impl Vm {
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_instruction(kind);
         }
+    }
+
+    fn current_instructions_executed(&self) -> Option<u64> {
+        self.counters
+            .borrow()
+            .as_ref()
+            .map(|counters| counters.instructions_executed)
     }
 
     fn record_counter_bytecode_lower_attempt(&self) {
@@ -5366,6 +5374,15 @@ impl Vm {
         let mut trace = self.trace.borrow_mut();
         let step = trace.len() + 1;
         trace.push(format!("step={step} runtime {}", event.as_ref()));
+    }
+
+    fn record_include_trace_event(&self, event: impl AsRef<str>) {
+        if !(self.options.trace_includes || self.options.trace_runtime) {
+            return;
+        }
+        let mut trace = self.trace.borrow_mut();
+        let step = trace.len() + 1;
+        trace.push(format!("step={step} include {}", event.as_ref()));
     }
 
     fn record_gc_root_trace_event(&self, stack: &CallStack, state: &ExecutionState) {
@@ -25454,6 +25471,16 @@ impl Vm {
         let including_file = current_source_path(compiled, stack);
         let include_path = state_include_path(state);
         let cwd = state.cwd.clone();
+        self.record_include_trace_event(format!(
+            "request kind={} path={} including_file={} stack_depth={}",
+            include_kind_function_name(kind),
+            path,
+            including_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<entry>".to_owned()),
+            state.include_stack.len(),
+        ));
         let request = IncludePathCacheKey {
             path: path.clone(),
             include_path: include_path.clone(),
@@ -25519,13 +25546,58 @@ impl Vm {
                     }
                 };
                 self.record_include_cache_stats_delta(before_resolve, cache.cache_stats());
+                let after_resolve = cache.cache_stats();
+                self.record_include_trace_event(format!(
+                    "resolved kind={} path={} canonical={} resolution_cache={} stack_depth={}",
+                    include_kind_function_name(kind),
+                    path,
+                    resolved.canonical_path.display(),
+                    include_cache_resolution_outcome(before_resolve, after_resolve),
+                    state.include_stack.len(),
+                ));
                 if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
                     if state.included_once.contains(&resolved.canonical_path) {
                         self.record_counter_include_once_skip();
+                        self.record_include_trace_event(format!(
+                            "once kind={} canonical={} decision=skip stack_depth={}",
+                            include_kind_function_name(kind),
+                            resolved.canonical_path.display(),
+                            state.include_stack.len(),
+                        ));
                         return VmResult::success(output.clone(), Some(Value::Bool(true)));
                     }
                     state.included_once.push(resolved.canonical_path.clone());
                     once_tracked = true;
+                    self.record_include_trace_event(format!(
+                        "once kind={} canonical={} decision=record stack_depth={}",
+                        include_kind_function_name(kind),
+                        resolved.canonical_path.display(),
+                        state.include_stack.len(),
+                    ));
+                } else {
+                    self.record_include_trace_event(format!(
+                        "once kind={} canonical={} decision=not_once stack_depth={}",
+                        include_kind_function_name(kind),
+                        resolved.canonical_path.display(),
+                        state.include_stack.len(),
+                    ));
+                }
+                if self.options.trace_includes
+                    && state.include_stack.contains(&resolved.canonical_path)
+                {
+                    return include_failure(
+                        output,
+                        compiled,
+                        instruction_span,
+                        kind,
+                        format!(
+                            "E_PHP_VM_INCLUDE_CYCLE: recursive include {} stack=[{}]",
+                            resolved.canonical_path.display(),
+                            format_include_stack(&state.include_stack),
+                        ),
+                        state,
+                        stack_trace(compiled, stack),
+                    );
                 }
                 let before_compile = cache.cache_stats();
                 let included = match cache.get_or_compile_include(
@@ -25548,6 +25620,17 @@ impl Vm {
                     }
                 };
                 self.record_include_cache_stats_delta(before_compile, cache.cache_stats());
+                let after_compile = cache.cache_stats();
+                self.record_include_trace_event(format!(
+                    "compiled kind={} canonical={} compile_cache={} functions={} classes={} constants={} entry_instructions={}",
+                    include_kind_function_name(kind),
+                    resolved.canonical_path.display(),
+                    include_cache_compile_outcome(before_compile, after_compile),
+                    included.unit().functions.len(),
+                    included.unit().classes.len(),
+                    included.unit().constant_table.len(),
+                    entry_instruction_count(included.unit()),
+                ));
                 compiled_include = Some(included.as_ref().clone());
                 LoadedInclude {
                     canonical_path: resolved.canonical_path,
@@ -25702,11 +25785,47 @@ impl Vm {
         if !once_tracked && matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if state.included_once.contains(&loaded.canonical_path) {
                 self.record_counter_include_once_skip();
+                self.record_include_trace_event(format!(
+                    "once kind={} canonical={} decision=skip stack_depth={}",
+                    include_kind_function_name(kind),
+                    loaded.canonical_path.display(),
+                    state.include_stack.len(),
+                ));
                 return VmResult::success(output.clone(), Some(Value::Bool(true)));
             }
             state.included_once.push(loaded.canonical_path.clone());
+            self.record_include_trace_event(format!(
+                "once kind={} canonical={} decision=record stack_depth={}",
+                include_kind_function_name(kind),
+                loaded.canonical_path.display(),
+                state.include_stack.len(),
+            ));
+        } else if !matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
+            self.record_include_trace_event(format!(
+                "once kind={} canonical={} decision=not_once stack_depth={}",
+                include_kind_function_name(kind),
+                loaded.canonical_path.display(),
+                state.include_stack.len(),
+            ));
         }
 
+        if self.options.trace_includes && state.include_stack.contains(&loaded.canonical_path) {
+            return include_failure(
+                output,
+                compiled,
+                instruction_span,
+                kind,
+                format!(
+                    "E_PHP_VM_INCLUDE_CYCLE: recursive include {} stack=[{}]",
+                    loaded.canonical_path.display(),
+                    format_include_stack(&state.include_stack),
+                ),
+                state,
+                stack_trace(compiled, stack),
+            );
+        }
+
+        let compiled_from_shared_cache = compiled_include.is_some();
         let included = match compiled_include {
             Some(included) => included,
             None => match compile_loaded_include(loaded, self.options.include_optimization_level) {
@@ -25727,6 +25846,16 @@ impl Vm {
                 }
             },
         };
+        if !compiled_from_shared_cache {
+            self.record_include_trace_event(format!(
+                "compiled kind={} cache=off functions={} classes={} constants={} entry_instructions={}",
+                include_kind_function_name(kind),
+                included.unit().functions.len(),
+                included.unit().classes.len(),
+                included.unit().constant_table.len(),
+                entry_instruction_count(included.unit()),
+            ));
+        }
         register_dynamic_unit(state, included.clone());
         let mut shared = shared_locals_from_current_frame(compiled, stack);
         let call = FunctionCall {
@@ -25748,8 +25877,37 @@ impl Vm {
             resume_fiber_continuation: None,
             resume_fiber_input: None,
         };
+        let included_path = included
+            .unit()
+            .files
+            .first()
+            .map(|file| PathBuf::from(&file.path))
+            .unwrap_or_default();
+        state.include_stack.push(included_path.clone());
+        self.record_include_trace_event(format!(
+            "execute-start kind={} canonical={} stack_depth={}",
+            include_kind_function_name(kind),
+            included_path.display(),
+            state.include_stack.len(),
+        ));
+        let include_instructions_before = self.current_instructions_executed();
         let result =
             self.execute_function(&included, included.unit().entry, call, output, stack, state);
+        let include_instructions_after = self.current_instructions_executed();
+        let include_instructions_executed = include_instructions_before
+            .zip(include_instructions_after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned());
+        self.record_include_trace_event(format!(
+            "execute-end kind={} canonical={} status={:?} stack_depth={} instructions_executed={}",
+            include_kind_function_name(kind),
+            included_path.display(),
+            result.status.exit_status(),
+            state.include_stack.len(),
+            include_instructions_executed,
+        ));
+        state.include_stack.pop();
         if result.status.is_success() {
             write_shared_locals_to_current_frame(compiled, stack, &shared);
         }
@@ -37476,6 +37634,55 @@ fn include_kind_function_name(kind: IncludeKind) -> &'static str {
     }
 }
 
+fn include_cache_resolution_outcome(
+    before: IncludeCacheStats,
+    after: IncludeCacheStats,
+) -> &'static str {
+    if after.resolution_hits > before.resolution_hits {
+        "hit"
+    } else if after.resolution_misses > before.resolution_misses {
+        "miss"
+    } else {
+        "unchanged"
+    }
+}
+
+fn include_cache_compile_outcome(
+    before: IncludeCacheStats,
+    after: IncludeCacheStats,
+) -> &'static str {
+    if after.compile_hits > before.compile_hits {
+        "hit"
+    } else if after.compile_misses > before.compile_misses {
+        "miss"
+    } else if after.compile_errors > before.compile_errors {
+        "error"
+    } else {
+        "unchanged"
+    }
+}
+
+fn entry_instruction_count(unit: &IrUnit) -> usize {
+    unit.functions
+        .get(unit.entry.index())
+        .map(|function| {
+            function
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len() + usize::from(block.terminator.is_some()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn format_include_stack(stack: &[PathBuf]) -> String {
+    stack
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
 fn is_autoload_builtin_name(name: &str) -> bool {
     matches!(
         name,
@@ -44736,6 +44943,107 @@ mod tests {
     }
 
     #[test]
+    fn error_reporting_getter_setter_masks_are_request_local_bitmasks() {
+        let result = execute_source(
+            "<?php
+            $old = error_reporting();
+            echo is_int($old) ? \"old-int\\n\" : \"bad\\n\";
+            error_reporting(E_ALL & ~E_DEPRECATED);
+            echo error_reporting() === (E_ALL & ~E_DEPRECATED) ? \"mask-ok\\n\" : \"mask-bad\\n\";
+            error_reporting($old);
+            echo error_reporting() === $old ? \"restore-ok\\n\" : \"restore-bad\\n\";
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "old-int\nmask-ok\nrestore-ok\n"
+        );
+    }
+
+    #[test]
+    fn error_suppression_suppresses_one_warning_and_restores_reporting() {
+        let result =
+            execute_source("<?php echo @$missing, 'suppressed|'; echo $missing, 'restored';");
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.starts_with("suppressed|\nWarning: Undefined variable $missing in "),
+            "{output}"
+        );
+        assert!(output.ends_with("restored"), "{output}");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].id(),
+            "E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING"
+        );
+    }
+
+    #[test]
+    fn bootstrap_warning_sources_respect_display_and_reporting_masks() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-warning-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp warning root should be created");
+        let source = "<?php
+            echo file_get_contents('missing.txt') === false ? 'read-false|' : 'bad|';
+            echo file_put_contents('/missing-dir/out.txt', 'x') === false ? 'write-false|' : 'bad|';
+            echo [1, 2];
+            $s = 'abc';
+            echo $s[9];
+            trigger_error('notice', E_USER_NOTICE);
+            trigger_error('warn', E_USER_WARNING);
+            echo 'done';
+            ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                runtime_context: RuntimeContext::default()
+                    .with_cwd(root.clone())
+                    .with_filesystem_capabilities(
+                        php_runtime::FilesystemCapabilities::none()
+                            .with_allowed_roots(vec![root.clone()]),
+                    ),
+                ..VmOptions::default()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("read-false|"), "{output}");
+        assert!(output.contains("write-false|"), "{output}");
+        assert!(
+            output.contains("Warning: Array to string conversion"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Warning: Uninitialized string offset"),
+            "{output}"
+        );
+        assert!(output.contains("Notice: notice in "), "{output}");
+        assert!(output.contains("Warning: warn in "), "{output}");
+        assert!(output.ends_with("done"), "{output}");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_VM_USER_NOTICE"),
+            "{:#?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_VM_USER_WARNING"),
+            "{:#?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn exception_handler_stack_tracks_previous_handlers() {
         let result = execute_source(
             "<?php
@@ -45636,6 +45944,215 @@ good"
         assert!(counters.include_resolution_hits >= 2, "{counters:?}");
         assert_eq!(counters.include_compile_misses, 1, "{counters:?}");
         assert_eq!(counters.include_once_skips, 2, "{counters:?}");
+    }
+
+    #[test]
+    fn include_trace_records_cache_and_once_decisions() {
+        let cache = Arc::new(IncludeCache::new(1));
+        let result = execute_fixture_file_with_options(
+            "fixtures/runtime/valid/includes/include-once.php",
+            VmOptions {
+                include_cache: Some(Arc::clone(&cache)),
+                trace_includes: true,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1\n");
+        let events = include_trace_events(&result.trace);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("request kind=include_once")),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("resolution_cache=hit")),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("compile_cache=miss")),
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| event.contains("decision=skip")),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("entry_instructions=")),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("instructions_executed=")),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn include_trace_records_repeated_normal_include_compile_cache_hits() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-include-repeat-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(
+            root.join("common.php"),
+            "<?php $count++; echo $count, '|';\n",
+        )
+        .expect("common include should be written");
+        let cache = Arc::new(IncludeCache::new(1));
+        let result = execute_source_with_options_and_path(
+            "<?php $count = 0; include 'common.php'; include './common.php'; echo $count, \"\\n\";",
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                include_cache: Some(Arc::clone(&cache)),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                trace_includes: true,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|2|2\n");
+        let stats = cache.cache_stats();
+        assert_eq!(stats.compile_misses, 1, "{stats:?}");
+        assert!(stats.compile_hits >= 1, "{stats:?}");
+        let events = include_trace_events(&result.trace);
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.contains("execute-start kind=include"))
+                .count()
+                >= 2,
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("compile_cache=hit")),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn include_once_tracking_is_request_local_with_shared_compile_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-include-once-request-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("once.php"), "<?php $count++;\n")
+            .expect("once include should be written");
+        let source = "<?php $count = 0; include_once 'once.php'; include_once './once.php'; echo $count, \"\\n\";";
+        let cache = Arc::new(IncludeCache::new(1));
+        let options = || VmOptions {
+            include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+            include_cache: Some(Arc::clone(&cache)),
+            runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+            ..VmOptions::default()
+        };
+        let first = execute_source_with_options_and_path(
+            source,
+            options(),
+            root.join("first.php").to_string_lossy().into_owned(),
+        );
+        let second = execute_source_with_options_and_path(
+            source,
+            options(),
+            root.join("second.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(first.status.is_success(), "{:?}", first.status);
+        assert!(second.status.is_success(), "{:?}", second.status);
+        assert_eq!(first.output.as_bytes(), b"1\n");
+        assert_eq!(second.output.as_bytes(), b"1\n");
+        let stats = cache.cache_stats();
+        assert_eq!(stats.compile_misses, 1, "{stats:?}");
+        assert!(stats.compile_hits >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn include_trace_records_deep_finite_chain_without_recompilation() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-include-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("a.php"), "<?php include 'b.php'; echo 'a|';\n")
+            .expect("a include should be written");
+        std::fs::write(root.join("b.php"), "<?php include 'c.php'; echo 'b|';\n")
+            .expect("b include should be written");
+        std::fs::write(root.join("c.php"), "<?php echo 'c|';\n")
+            .expect("c include should be written");
+        let cache = Arc::new(IncludeCache::new(1));
+        let result = execute_source_with_options_and_path(
+            "<?php include 'a.php'; include 'a.php'; echo \"done\\n\";",
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                include_cache: Some(Arc::clone(&cache)),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                trace_includes: true,
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"c|b|a|c|b|a|done\n");
+        let stats = cache.cache_stats();
+        assert_eq!(stats.compile_misses, 3, "{stats:?}");
+        assert!(stats.compile_hits >= 3, "{stats:?}");
+        let events = include_trace_events(&result.trace);
+        assert!(
+            events.iter().any(|event| event.contains("stack_depth=3")),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("compile_cache=hit")),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    fn include_trace_detects_recursive_cycle_with_stack() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-include-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("a.php"), "<?php require 'b.php';\n")
+            .expect("a include should be written");
+        std::fs::write(root.join("b.php"), "<?php require 'a.php';\n")
+            .expect("b include should be written");
+        let result = execute_source_with_options_and_path(
+            "<?php require 'a.php'; echo 'after';",
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                include_cache: Some(Arc::new(IncludeCache::new(1))),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                trace_includes: true,
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("E_PHP_VM_INCLUDE_CYCLE"), "{output}");
+        assert!(output.contains("stack=["), "{output}");
     }
 
     #[test]
@@ -54806,6 +55323,16 @@ dense_property_write_typed_failure($typed, 'bad');
             .iter()
             .filter_map(|line| {
                 line.split_once(" runtime ")
+                    .map(|(_, event)| event.to_owned())
+            })
+            .collect()
+    }
+
+    fn include_trace_events(trace: &[String]) -> Vec<String> {
+        trace
+            .iter()
+            .filter_map(|line| {
+                line.split_once(" include ")
                     .map(|(_, event)| event.to_owned())
             })
             .collect()

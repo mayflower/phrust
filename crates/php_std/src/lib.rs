@@ -218,6 +218,8 @@ impl ConstantDescriptor {
 /// Registry-safe constant value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConstantValue {
+    /// PHP null constant.
+    Null,
     /// PHP bool constant.
     Bool(bool),
     /// PHP int constant.
@@ -226,6 +228,8 @@ pub enum ConstantValue {
     Float(php_runtime::FloatValue),
     /// PHP string constant.
     String(&'static str),
+    /// PHP packed array constant.
+    Array(&'static [ConstantValue]),
 }
 
 /// Descriptor for an internal class, interface, trait, or enum symbol.
@@ -411,6 +415,26 @@ impl ExtensionRegistry {
                     "PHP_EOL",
                     "core",
                     ConstantValue::String(constants::PHP_EOL),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_SAPI",
+                    "core",
+                    ConstantValue::String(constants::PHP_SAPI),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_BINARY",
+                    "core",
+                    ConstantValue::String(constants::PHP_BINARY),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "DEFAULT_INCLUDE_PATH",
+                    "core",
+                    ConstantValue::String(constants::DEFAULT_INCLUDE_PATH),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PHP_MAXPATHLEN",
+                    "core",
+                    ConstantValue::Int(constants::PHP_MAXPATHLEN),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "E_ERROR",
@@ -717,6 +741,221 @@ impl ExtensionRegistry {
                     "PHP_ROUND_HALF_ODD",
                     "standard",
                     ConstantValue::Int(constants::PHP_ROUND_HALF_ODD),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILE_APPEND",
+                    "standard",
+                    ConstantValue::Int(constants::FILE_APPEND),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILE_USE_INCLUDE_PATH",
+                    "standard",
+                    ConstantValue::Int(constants::FILE_USE_INCLUDE_PATH),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILE_IGNORE_NEW_LINES",
+                    "standard",
+                    ConstantValue::Int(constants::FILE_IGNORE_NEW_LINES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILE_SKIP_EMPTY_LINES",
+                    "standard",
+                    ConstantValue::Int(constants::FILE_SKIP_EMPTY_LINES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FILE_NO_DEFAULT_CONTEXT",
+                    "standard",
+                    ConstantValue::Int(constants::FILE_NO_DEFAULT_CONTEXT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LOCK_SH",
+                    "standard",
+                    ConstantValue::Int(constants::LOCK_SH),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LOCK_EX",
+                    "standard",
+                    ConstantValue::Int(constants::LOCK_EX),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LOCK_UN",
+                    "standard",
+                    ConstantValue::Int(constants::LOCK_UN),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "LOCK_NB",
+                    "standard",
+                    ConstantValue::Int(constants::LOCK_NB),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SEEK_SET",
+                    "standard",
+                    ConstantValue::Int(constants::SEEK_SET),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SEEK_CUR",
+                    "standard",
+                    ConstantValue::Int(constants::SEEK_CUR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "SEEK_END",
+                    "standard",
+                    ConstantValue::Int(constants::SEEK_END),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_BRACE",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_BRACE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_MARK",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_MARK),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_NOSORT",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_NOSORT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_NOCHECK",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_NOCHECK),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_NOESCAPE",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_NOESCAPE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_ERR",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_ERR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "GLOB_ONLYDIR",
+                    "standard",
+                    ConstantValue::Int(constants::GLOB_ONLYDIR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PATHINFO_DIRNAME",
+                    "standard",
+                    ConstantValue::Int(constants::PATHINFO_DIRNAME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PATHINFO_BASENAME",
+                    "standard",
+                    ConstantValue::Int(constants::PATHINFO_BASENAME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PATHINFO_EXTENSION",
+                    "standard",
+                    ConstantValue::Int(constants::PATHINFO_EXTENSION),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PATHINFO_FILENAME",
+                    "standard",
+                    ConstantValue::Int(constants::PATHINFO_FILENAME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INI_SCANNER_NORMAL",
+                    "standard",
+                    ConstantValue::Int(constants::INI_SCANNER_NORMAL),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INI_SCANNER_RAW",
+                    "standard",
+                    ConstantValue::Int(constants::INI_SCANNER_RAW),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "INI_SCANNER_TYPED",
+                    "standard",
+                    ConstantValue::Int(constants::INI_SCANNER_TYPED),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FNM_NOESCAPE",
+                    "standard",
+                    ConstantValue::Int(constants::FNM_NOESCAPE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FNM_PATHNAME",
+                    "standard",
+                    ConstantValue::Int(constants::FNM_PATHNAME),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FNM_PERIOD",
+                    "standard",
+                    ConstantValue::Int(constants::FNM_PERIOD),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "FNM_CASEFOLD",
+                    "standard",
+                    ConstantValue::Int(constants::FNM_CASEFOLD),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "HTML_ENTITIES",
+                    "standard",
+                    ConstantValue::Int(constants::HTML_ENTITIES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_COMPAT",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_COMPAT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_QUOTES",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_QUOTES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_NOQUOTES",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_NOQUOTES),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_IGNORE",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_IGNORE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_SUBSTITUTE",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_SUBSTITUTE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_DISALLOWED",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_DISALLOWED),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_HTML401",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_HTML401),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_XML1",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_XML1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_XHTML",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_XHTML),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "ENT_HTML5",
+                    "standard",
+                    ConstantValue::Int(constants::ENT_HTML5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "CHAR_MAX",
+                    "standard",
+                    ConstantValue::Int(constants::CHAR_MAX),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "HTML_SPECIALCHARS",
+                    "standard",
+                    ConstantValue::Int(constants::HTML_SPECIALCHARS),
                 ))
                 .with_class(ClassDescriptor::new(
                     "RoundingMode",
@@ -1220,6 +1459,36 @@ impl ExtensionRegistry {
                     ConstantValue::Int(2),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
+                    "JSON_HEX_TAG",
+                    "json",
+                    ConstantValue::Int(1),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_HEX_AMP",
+                    "json",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_HEX_APOS",
+                    "json",
+                    ConstantValue::Int(4),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_HEX_QUOT",
+                    "json",
+                    ConstantValue::Int(8),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_FORCE_OBJECT",
+                    "json",
+                    ConstantValue::Int(16),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_NUMERIC_CHECK",
+                    "json",
+                    ConstantValue::Int(32),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
                     "JSON_ERROR_DEPTH",
                     "json",
                     ConstantValue::Int(1),
@@ -1230,6 +1499,16 @@ impl ExtensionRegistry {
                     ConstantValue::Int(0),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_STATE_MISMATCH",
+                    "json",
+                    ConstantValue::Int(2),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_CTRL_CHAR",
+                    "json",
+                    ConstantValue::Int(3),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
                     "JSON_ERROR_SYNTAX",
                     "json",
                     ConstantValue::Int(4),
@@ -1238,6 +1517,31 @@ impl ExtensionRegistry {
                     "JSON_ERROR_UTF8",
                     "json",
                     ConstantValue::Int(5),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_RECURSION",
+                    "json",
+                    ConstantValue::Int(6),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_INF_OR_NAN",
+                    "json",
+                    ConstantValue::Int(7),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_UNSUPPORTED_TYPE",
+                    "json",
+                    ConstantValue::Int(8),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_INVALID_PROPERTY_NAME",
+                    "json",
+                    ConstantValue::Int(9),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_ERROR_UTF16",
+                    "json",
+                    ConstantValue::Int(10),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "JSON_OBJECT_AS_ARRAY",
@@ -1255,6 +1559,11 @@ impl ExtensionRegistry {
                     ConstantValue::Int(1024),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
+                    "JSON_PARTIAL_OUTPUT_ON_ERROR",
+                    "json",
+                    ConstantValue::Int(512),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
                     "JSON_THROW_ON_ERROR",
                     "json",
                     ConstantValue::Int(4_194_304),
@@ -1268,6 +1577,21 @@ impl ExtensionRegistry {
                     "JSON_UNESCAPED_UNICODE",
                     "json",
                     ConstantValue::Int(256),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_UNESCAPED_LINE_TERMINATORS",
+                    "json",
+                    ConstantValue::Int(2048),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_INVALID_UTF8_IGNORE",
+                    "json",
+                    ConstantValue::Int(1_048_576),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "JSON_INVALID_UTF8_SUBSTITUTE",
+                    "json",
+                    ConstantValue::Int(2_097_152),
                 )),
             ExtensionDescriptor::new("pcre")
                 .with_function(FunctionDescriptor::php("preg_grep", "pcre"))
@@ -2095,6 +2419,11 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("random_bytes", "random"))
                 .with_function(FunctionDescriptor::php("random_int", "random")),
             ExtensionDescriptor::new("date")
+                .with_constant(ConstantDescriptor::with_value(
+                    "DATE_ATOM",
+                    "date",
+                    ConstantValue::String(constants::DATE_ATOM),
+                ))
                 .with_function(FunctionDescriptor::php("date", "date"))
                 .with_function(FunctionDescriptor::php("date_default_timezone_get", "date"))
                 .with_function(FunctionDescriptor::php("date_default_timezone_set", "date"))
@@ -2368,6 +2697,20 @@ impl ExtensionRegistry {
         }
         functions.sort_by_key(|function| function.name());
         functions
+    }
+
+    /// Returns enabled constant descriptors in stable order.
+    #[must_use]
+    pub fn enabled_constants(&self) -> Vec<&ConstantDescriptor> {
+        let mut constants = Vec::new();
+        for extension_name in &self.enabled {
+            let Some(extension) = self.extensions.get(extension_name) else {
+                continue;
+            };
+            constants.extend(extension.constants());
+        }
+        constants.sort_by_key(|constant| constant.name());
+        constants
     }
 
     /// Returns enabled extension names in stable order.
@@ -3068,6 +3411,96 @@ mod tests {
     }
 
     #[test]
+    fn standard_registry_tracks_wordpress_bootstrap_constants() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for (name, expected) in [
+            ("PHP_SAPI", ConstantValue::String(constants::PHP_SAPI)),
+            ("PHP_BINARY", ConstantValue::String(constants::PHP_BINARY)),
+            (
+                "DEFAULT_INCLUDE_PATH",
+                ConstantValue::String(constants::DEFAULT_INCLUDE_PATH),
+            ),
+            (
+                "PHP_MAXPATHLEN",
+                ConstantValue::Int(constants::PHP_MAXPATHLEN),
+            ),
+            ("FILE_APPEND", ConstantValue::Int(constants::FILE_APPEND)),
+            ("LOCK_EX", ConstantValue::Int(constants::LOCK_EX)),
+            ("ENT_QUOTES", ConstantValue::Int(constants::ENT_QUOTES)),
+            (
+                "HTML_SPECIALCHARS",
+                ConstantValue::Int(constants::HTML_SPECIALCHARS),
+            ),
+            ("DATE_ATOM", ConstantValue::String(constants::DATE_ATOM)),
+        ] {
+            assert_eq!(
+                registry
+                    .enabled_constant(name)
+                    .and_then(ConstantDescriptor::value),
+                Some(expected),
+                "{name} should be registered with its runtime value"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_registry_tracks_runtime_constant_families() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "FILE_APPEND",
+            "FILE_USE_INCLUDE_PATH",
+            "FILE_IGNORE_NEW_LINES",
+            "FILE_SKIP_EMPTY_LINES",
+            "FILE_NO_DEFAULT_CONTEXT",
+            "LOCK_SH",
+            "LOCK_EX",
+            "LOCK_UN",
+            "LOCK_NB",
+            "SEEK_SET",
+            "SEEK_CUR",
+            "SEEK_END",
+            "GLOB_BRACE",
+            "GLOB_MARK",
+            "GLOB_NOSORT",
+            "GLOB_NOCHECK",
+            "GLOB_NOESCAPE",
+            "GLOB_ERR",
+            "GLOB_ONLYDIR",
+            "PATHINFO_DIRNAME",
+            "PATHINFO_BASENAME",
+            "PATHINFO_EXTENSION",
+            "PATHINFO_FILENAME",
+            "INI_SCANNER_NORMAL",
+            "INI_SCANNER_RAW",
+            "INI_SCANNER_TYPED",
+            "FNM_NOESCAPE",
+            "FNM_PATHNAME",
+            "FNM_PERIOD",
+            "FNM_CASEFOLD",
+            "HTML_SPECIALCHARS",
+            "HTML_ENTITIES",
+            "ENT_COMPAT",
+            "ENT_QUOTES",
+            "ENT_NOQUOTES",
+            "ENT_IGNORE",
+            "ENT_SUBSTITUTE",
+            "ENT_DISALLOWED",
+            "ENT_HTML401",
+            "ENT_XML1",
+            "ENT_XHTML",
+            "ENT_HTML5",
+            "CHAR_MAX",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a standard runtime constant"
+            );
+        }
+    }
+
+    #[test]
     fn standard_registry_tracks_stdlib_file_io_functions() {
         let registry = ExtensionRegistry::standard_library();
 
@@ -3170,9 +3603,34 @@ mod tests {
             );
         }
         for name in [
-            "JSON_ERROR_NONE",
-            "JSON_THROW_ON_ERROR",
+            "JSON_BIGINT_AS_STRING",
+            "JSON_HEX_TAG",
+            "JSON_HEX_AMP",
+            "JSON_HEX_APOS",
+            "JSON_HEX_QUOT",
+            "JSON_FORCE_OBJECT",
+            "JSON_NUMERIC_CHECK",
+            "JSON_PRETTY_PRINT",
+            "JSON_UNESCAPED_SLASHES",
+            "JSON_UNESCAPED_UNICODE",
+            "JSON_PARTIAL_OUTPUT_ON_ERROR",
+            "JSON_PRESERVE_ZERO_FRACTION",
+            "JSON_UNESCAPED_LINE_TERMINATORS",
+            "JSON_INVALID_UTF8_IGNORE",
+            "JSON_INVALID_UTF8_SUBSTITUTE",
             "JSON_OBJECT_AS_ARRAY",
+            "JSON_ERROR_NONE",
+            "JSON_ERROR_DEPTH",
+            "JSON_ERROR_STATE_MISMATCH",
+            "JSON_ERROR_CTRL_CHAR",
+            "JSON_ERROR_SYNTAX",
+            "JSON_ERROR_UTF8",
+            "JSON_ERROR_RECURSION",
+            "JSON_ERROR_INF_OR_NAN",
+            "JSON_ERROR_UNSUPPORTED_TYPE",
+            "JSON_ERROR_INVALID_PROPERTY_NAME",
+            "JSON_ERROR_UTF16",
+            "JSON_THROW_ON_ERROR",
         ] {
             assert!(
                 registry.enabled_constant(name).is_some(),
@@ -3219,7 +3677,16 @@ mod tests {
             "PREG_PATTERN_ORDER",
             "PREG_SET_ORDER",
             "PREG_SPLIT_NO_EMPTY",
+            "PREG_SPLIT_DELIM_CAPTURE",
+            "PREG_SPLIT_OFFSET_CAPTURE",
             "PREG_GREP_INVERT",
+            "PREG_UNMATCHED_AS_NULL",
+            "PREG_INTERNAL_ERROR",
+            "PREG_BACKTRACK_LIMIT_ERROR",
+            "PREG_RECURSION_LIMIT_ERROR",
+            "PREG_BAD_UTF8_ERROR",
+            "PREG_BAD_UTF8_OFFSET_ERROR",
+            "PREG_JIT_STACKLIMIT_ERROR",
         ] {
             assert!(
                 registry.enabled_constant(name).is_some(),
@@ -3262,6 +3729,74 @@ mod tests {
                 .map(ClassDescriptor::kind),
             Some(ClassKind::Interface)
         ));
+    }
+
+    #[test]
+    fn filter_extension_tracks_option_constants_for_registered_builtins() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in ["filter_input", "filter_var"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a filter function"
+            );
+        }
+        for name in [
+            "INPUT_POST",
+            "INPUT_GET",
+            "INPUT_COOKIE",
+            "INPUT_ENV",
+            "INPUT_SERVER",
+            "FILTER_DEFAULT",
+            "FILTER_VALIDATE_BOOL",
+            "FILTER_VALIDATE_BOOLEAN",
+            "FILTER_VALIDATE_INT",
+            "FILTER_VALIDATE_FLOAT",
+            "FILTER_VALIDATE_URL",
+            "FILTER_VALIDATE_EMAIL",
+            "FILTER_VALIDATE_IP",
+            "FILTER_SANITIZE_EMAIL",
+            "FILTER_SANITIZE_URL",
+            "FILTER_SANITIZE_NUMBER_INT",
+            "FILTER_NULL_ON_FAILURE",
+            "FILTER_FLAG_IPV4",
+            "FILTER_FLAG_IPV6",
+            "FILTER_FLAG_PATH_REQUIRED",
+            "FILTER_FLAG_QUERY_REQUIRED",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a filter constant"
+            );
+        }
+    }
+
+    #[test]
+    fn session_extension_tracks_state_constants_for_registered_builtins() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "session_destroy",
+            "session_id",
+            "session_name",
+            "session_start",
+            "session_status",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a session function"
+            );
+        }
+        for name in [
+            "PHP_SESSION_DISABLED",
+            "PHP_SESSION_NONE",
+            "PHP_SESSION_ACTIVE",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a session constant"
+            );
+        }
     }
 
     #[test]
@@ -3386,6 +3921,23 @@ mod tests {
                 "print"
             ],
             "`print` is a PHP language construct; APCu is a PECL-style surface; visible function descriptors should otherwise have generated php-src arginfo"
+        );
+    }
+
+    #[test]
+    fn visible_stdlib_constants_have_generated_metadata_or_platform_note() {
+        let registry = ExtensionRegistry::standard_library();
+        let missing = registry
+            .enabled_constants()
+            .into_iter()
+            .filter(|constant| constant.source_metadata().is_none())
+            .map(ConstantDescriptor::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            missing,
+            Vec::<&str>::new(),
+            "registered constants should stay backed by generated php-src metadata"
         );
     }
 
