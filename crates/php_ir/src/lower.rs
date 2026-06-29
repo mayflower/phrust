@@ -702,11 +702,11 @@ impl LoweringContext<'_> {
         for (class_like_id, class_like) in class_likes {
             if !matches!(
                 class_like.kind(),
-                ClassLikeKind::Class | ClassLikeKind::Interface | ClassLikeKind::Enum
+                ClassLikeKind::Class
+                    | ClassLikeKind::Interface
+                    | ClassLikeKind::Trait
+                    | ClassLikeKind::Enum
             ) {
-                if class_like.kind() == ClassLikeKind::Trait {
-                    continue;
-                }
                 let feature = match class_like.kind() {
                     ClassLikeKind::Enum => UnsupportedFeature::EnumRuntime,
                     _ => UnsupportedFeature::ClassLikeObject,
@@ -1030,6 +1030,7 @@ impl LoweringContext<'_> {
                     is_readonly: class_like.modifiers().is_readonly(),
                     is_interface: class_like.kind() == ClassLikeKind::Interface,
                     is_enum: class_like.kind() == ClassLikeKind::Enum,
+                    is_trait: class_like.kind() == ClassLikeKind::Trait,
                 },
                 span,
             });
@@ -1109,6 +1110,7 @@ impl LoweringContext<'_> {
                     is_readonly: false,
                     is_interface: true,
                     is_enum: false,
+                    is_trait: false,
                 },
                 span: IrSpan::default(),
             });

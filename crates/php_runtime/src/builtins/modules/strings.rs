@@ -5,7 +5,7 @@ use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     RuntimeSourceSpan,
 };
-use crate::{ArrayKey, PhpArray, PhpString, Value, to_bool};
+use crate::{ArrayKey, PhpArray, PhpString, RuntimeIniOptions, Value, to_bool};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest, Md5};
 use php_lexer::{LexerConfig, SymbolKind, TokenKind, TokenName, lex_all};
@@ -69,6 +69,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("md5", builtin_md5, BuiltinCompatibility::Php),
     BuiltinEntry::new("ord", builtin_ord, BuiltinCompatibility::Php),
     BuiltinEntry::new("pack", builtin_pack, BuiltinCompatibility::Php),
+    BuiltinEntry::new("parse_str", builtin_parse_str, BuiltinCompatibility::Php),
     BuiltinEntry::new("parse_url", builtin_parse_url, BuiltinCompatibility::Php),
     BuiltinEntry::new("printf", builtin_printf, BuiltinCompatibility::Php),
     BuiltinEntry::new(
@@ -1216,6 +1217,19 @@ pub(in crate::builtins::modules) fn builtin_parse_url(
     insert_url_component(&mut array, "query", parsed.query);
     insert_url_component(&mut array, "fragment", parsed.fragment);
     Ok(Value::Array(array))
+}
+
+pub(in crate::builtins::modules) fn builtin_parse_str(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("parse_str", &args, 2)?;
+    let query = string_arg("parse_str", &args[0])?.to_string_lossy();
+    let pairs = crate::parse_query_string(&query);
+    let array = crate::context::input_pairs_array(&pairs, &RuntimeIniOptions::default());
+    assign_reference_arg(args.get(1), Value::Array(array));
+    Ok(Value::Null)
 }
 
 pub(in crate::builtins::modules) fn builtin_http_build_query(

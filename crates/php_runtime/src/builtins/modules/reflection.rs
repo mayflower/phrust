@@ -153,6 +153,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "phpversion",
+        builtin_symbol_introspection_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "property_exists",
         builtin_symbol_introspection_requires_vm,
         BuiltinCompatibility::Php,

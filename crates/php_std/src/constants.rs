@@ -160,6 +160,13 @@ pub const PHP_URL_QUERY: i64 = 6;
 /// `parse_url()` component selector for the URL fragment.
 pub const PHP_URL_FRAGMENT: i64 = 7;
 
+/// PHP `PASSWORD_DEFAULT` algorithm marker.
+pub const PASSWORD_DEFAULT: &str = "2y";
+/// PHP `PASSWORD_BCRYPT` algorithm marker.
+pub const PASSWORD_BCRYPT: &str = "2y";
+/// PHP default bcrypt password hashing cost.
+pub const PASSWORD_BCRYPT_DEFAULT_COST: i64 = 12;
+
 /// `sort()`/`array_multisort()` ascending order flag.
 pub const SORT_ASC: i64 = 4;
 /// `sort()`/`array_multisort()` descending order flag.

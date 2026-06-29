@@ -796,6 +796,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("dechex", "standard"))
                 .with_function(FunctionDescriptor::php("decoct", "standard"))
                 .with_function(FunctionDescriptor::php("deg2rad", "standard"))
+                .with_function(FunctionDescriptor::php("define", "standard"))
                 .with_function(FunctionDescriptor::php("defined", "standard"))
                 .with_function(FunctionDescriptor::php("dirname", "standard"))
                 .with_function(FunctionDescriptor::php("enum_exists", "standard"))
@@ -865,6 +866,10 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("getenv", "standard"))
                 .with_function(FunctionDescriptor::php("gettype", "standard"))
                 .with_function(FunctionDescriptor::php("glob", "standard"))
+                .with_function(FunctionDescriptor::php("header", "standard"))
+                .with_function(FunctionDescriptor::php("header_remove", "standard"))
+                .with_function(FunctionDescriptor::php("headers_list", "standard"))
+                .with_function(FunctionDescriptor::php("headers_sent", "standard"))
                 .with_function(FunctionDescriptor::php("hex2bin", "standard"))
                 .with_function(FunctionDescriptor::php("hexdec", "standard"))
                 .with_function(FunctionDescriptor::php("htmlentities", "standard"))
@@ -876,6 +881,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("hypot", "standard"))
                 .with_function(FunctionDescriptor::php("hrtime", "standard"))
                 .with_function(FunctionDescriptor::php("http_build_query", "standard"))
+                .with_function(FunctionDescriptor::php("http_response_code", "standard"))
                 .with_function(FunctionDescriptor::php("implode", "standard"))
                 .with_function(FunctionDescriptor::php("in_array", "standard"))
                 .with_function(FunctionDescriptor::php("ini_get", "standard"))
@@ -915,6 +921,8 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("ltrim", "standard"))
                 .with_function(FunctionDescriptor::php("max", "standard"))
                 .with_function(FunctionDescriptor::php("md5", "standard"))
+                .with_function(FunctionDescriptor::php("memory_get_peak_usage", "standard"))
+                .with_function(FunctionDescriptor::php("memory_get_usage", "standard"))
                 .with_function(FunctionDescriptor::php("method_exists", "standard"))
                 .with_function(FunctionDescriptor::php("min", "standard"))
                 .with_function(FunctionDescriptor::php("mkdir", "standard"))
@@ -933,11 +941,16 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("opendir", "standard"))
                 .with_function(FunctionDescriptor::php("ord", "standard"))
                 .with_function(FunctionDescriptor::php("pathinfo", "standard"))
+                .with_function(FunctionDescriptor::php("parse_str", "standard"))
                 .with_function(FunctionDescriptor::php("parse_url", "standard"))
                 .with_function(FunctionDescriptor::php("passthru", "standard"))
                 .with_function(FunctionDescriptor::php("pclose", "standard"))
                 .with_function(FunctionDescriptor::php("php_sapi_name", "standard"))
                 .with_function(FunctionDescriptor::php("php_uname", "standard"))
+                .with_function(FunctionDescriptor::php("phpversion", "standard"))
+                .with_function(FunctionDescriptor::php("password_hash", "standard"))
+                .with_function(FunctionDescriptor::php("password_needs_rehash", "standard"))
+                .with_function(FunctionDescriptor::php("password_verify", "standard"))
                 .with_function(FunctionDescriptor::php("pi", "standard"))
                 .with_function(FunctionDescriptor::php("popen", "standard"))
                 .with_function(FunctionDescriptor::php("print", "standard"))
@@ -972,6 +985,8 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("serialize", "standard"))
                 .with_function(FunctionDescriptor::php("set_error_handler", "standard"))
                 .with_function(FunctionDescriptor::php("set_exception_handler", "standard"))
+                .with_function(FunctionDescriptor::php("setcookie", "standard"))
+                .with_function(FunctionDescriptor::php("setrawcookie", "standard"))
                 .with_function(FunctionDescriptor::php("set_time_limit", "standard"))
                 .with_function(FunctionDescriptor::php("sha1", "standard"))
                 .with_function(FunctionDescriptor::php("shell_exec", "standard"))
@@ -1084,6 +1099,21 @@ impl ExtensionRegistry {
                     "PHP_URL_FRAGMENT",
                     "standard",
                     ConstantValue::Int(constants::PHP_URL_FRAGMENT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PASSWORD_DEFAULT",
+                    "standard",
+                    ConstantValue::String(constants::PASSWORD_DEFAULT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PASSWORD_BCRYPT",
+                    "standard",
+                    ConstantValue::String(constants::PASSWORD_BCRYPT),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "PASSWORD_BCRYPT_DEFAULT_COST",
+                    "standard",
+                    ConstantValue::Int(constants::PASSWORD_BCRYPT_DEFAULT_COST),
                 ))
                 .with_constant(ConstantDescriptor::with_value(
                     "IMAGETYPE_GIF",
@@ -2515,6 +2545,7 @@ mod tests {
             "http_build_query",
             "md5",
             "ord",
+            "parse_str",
             "parse_url",
             "rawurldecode",
             "rawurlencode",
@@ -2717,6 +2748,7 @@ mod tests {
         let registry = ExtensionRegistry::standard_library();
 
         for name in [
+            "define",
             "defined",
             "constant",
             "function_exists",
@@ -2779,6 +2811,7 @@ mod tests {
             "class_exists",
             "function_exists",
             "hrtime",
+            "phpversion",
             "version_compare",
         ] {
             assert!(
@@ -2879,6 +2912,51 @@ mod tests {
                 "{name} should be registered as a standard function"
             );
         }
+    }
+
+    #[test]
+    fn standard_registry_tracks_stdlib_http_memory_and_password_functions() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "header",
+            "header_remove",
+            "headers_list",
+            "headers_sent",
+            "http_response_code",
+            "setcookie",
+            "setrawcookie",
+            "memory_get_usage",
+            "memory_get_peak_usage",
+            "password_hash",
+            "password_verify",
+            "password_needs_rehash",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a standard function"
+            );
+        }
+
+        for (name, expected) in [
+            ("PASSWORD_DEFAULT", constants::PASSWORD_DEFAULT),
+            ("PASSWORD_BCRYPT", constants::PASSWORD_BCRYPT),
+        ] {
+            assert_eq!(
+                registry
+                    .enabled_constant(name)
+                    .and_then(ConstantDescriptor::value),
+                Some(ConstantValue::String(expected)),
+                "{name} should be registered with its PHP value"
+            );
+        }
+
+        assert_eq!(
+            registry
+                .enabled_constant("PASSWORD_BCRYPT_DEFAULT_COST")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(constants::PASSWORD_BCRYPT_DEFAULT_COST))
+        );
     }
 
     #[test]

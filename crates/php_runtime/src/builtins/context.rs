@@ -246,6 +246,7 @@ pub struct BuiltinContext<'a> {
     resources: Option<&'a mut ResourceTable>,
     http_response: RuntimeHttpResponseState,
     http_response_state: Option<&'a mut RuntimeHttpResponseState>,
+    filter_inputs: BTreeMap<i64, crate::PhpArray>,
     upload_registry: Option<&'a mut UploadRegistry>,
     pcre_cache: PcreCache,
     preg_last_error: pcre::PcreLastErrorState,
@@ -280,6 +281,7 @@ impl<'a> BuiltinContext<'a> {
             resources: None,
             http_response: RuntimeHttpResponseState::default(),
             http_response_state: None,
+            filter_inputs: BTreeMap::new(),
             upload_registry: None,
             pcre_cache: PcreCache::default(),
             preg_last_error: pcre::PcreLastErrorState::default(),
@@ -319,6 +321,7 @@ impl<'a> BuiltinContext<'a> {
             resources,
             http_response: RuntimeHttpResponseState::default(),
             http_response_state: None,
+            filter_inputs: BTreeMap::new(),
             upload_registry: None,
             pcre_cache: PcreCache::default(),
             preg_last_error: pcre::PcreLastErrorState::default(),
@@ -493,6 +496,23 @@ impl<'a> BuiltinContext<'a> {
             Some(state) => state,
             None => &mut self.http_response,
         }
+    }
+
+    /// Sets a deterministic request-input array for `filter_input`.
+    pub fn set_filter_input_array(&mut self, source: i64, array: crate::PhpArray) {
+        self.filter_inputs.insert(source, array);
+    }
+
+    /// Looks up a top-level request-input value for `filter_input`.
+    #[must_use]
+    pub fn filter_input_value(&self, source: i64, name: &str) -> Option<Value> {
+        self.filter_inputs.get(&source).and_then(|array| {
+            array
+                .get(&crate::ArrayKey::String(crate::PhpString::from_test_str(
+                    name,
+                )))
+                .cloned()
+        })
     }
 
     /// Sets request-local upload registry state.

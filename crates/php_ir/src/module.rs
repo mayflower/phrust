@@ -76,6 +76,8 @@ pub struct ClassFlags {
     pub is_interface: bool,
     /// `enum` declaration.
     pub is_enum: bool,
+    /// `trait` declaration.
+    pub is_trait: bool,
 }
 
 /// Class method table entry.

@@ -1,0 +1,6 @@
+{"path":"tests/phpt/generated/wp.core-builtins/symbol-extension-introspection.phpt","module":"wp.core-builtins","kind":"generated","reason":"WordPress core builtin symbol, extension, and PHP version introspection"}
+{"path":"tests/phpt/generated/wp.core-builtins/ini-env-config.phpt","module":"wp.core-builtins","kind":"generated","reason":"WordPress core INI, environment, SAPI, and memory helper coverage"}
+{"path":"tests/phpt/generated/wp.core-builtins/http-response.phpt","module":"wp.core-builtins","kind":"generated","reason":"WordPress core HTTP response callable surface and CLI-comparable initial state"}
+{"path":"tests/phpt/generated/wp.core-builtins/output-buffering.phpt","module":"wp.core-builtins","kind":"generated","reason":"WordPress template output buffering capture and flush helpers"}
+{"path":"tests/phpt/generated/wp.core-builtins/url-filter-hash-password-serialization.phpt","module":"wp.core-builtins","kind":"generated","reason":"WordPress URL, hash, password, and serialization helper coverage"}
+{"path":"tests/phpt/generated/wp.core-builtins/filter-helpers.phpt","module":"wp.core-builtins","kind":"generated-skip-optional","reason":"WordPress filter helper coverage when the reference binary provides ext/filter"}

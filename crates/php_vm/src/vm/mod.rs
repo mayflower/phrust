@@ -23028,6 +23028,34 @@ impl Vm {
                     )),
                 )
             }
+            "phpversion" => {
+                if values.len() > 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_SYMBOL_ARITY: phpversion expects zero or one argument",
+                    );
+                }
+                let registry = php_std::ExtensionRegistry::standard_library();
+                let value = match values.first().map(effective_value) {
+                    None | Some(Value::Null) => Value::string(php_std::constants::PHP_VERSION),
+                    Some(value) => {
+                        let extension_name = match to_string(&value) {
+                            Ok(name) => name.to_string_lossy(),
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if php_std::introspection::extension_loaded(&registry, &extension_name) {
+                            Value::string(php_std::constants::PHP_VERSION)
+                        } else {
+                            Value::Bool(false)
+                        }
+                    }
+                };
+                VmResult::success(output.clone(), Some(value))
+            }
             _ => self.runtime_error(
                 output,
                 compiled,
@@ -23792,8 +23820,8 @@ impl Vm {
             .into_iter()
             .filter(|class| match name {
                 "get_declared_interfaces" => class.flags.is_interface,
-                "get_declared_traits" => false,
-                _ => !class.flags.is_interface,
+                "get_declared_traits" => class.flags.is_trait,
+                _ => !class.flags.is_interface && !class.flags.is_trait,
             })
             .map(|class| Value::string(class.display_name))
             .collect();
@@ -24818,7 +24846,7 @@ fn runtime_class_entry(
         }),
         constructor_id: class.constructor.map(|function| function.raw()),
         flags: RuntimeClassFlags {
-            is_abstract: class.flags.is_abstract,
+            is_abstract: class.flags.is_abstract || class.flags.is_trait,
             is_final: class.flags.is_final,
             is_readonly: class.flags.is_readonly,
             is_interface: class.flags.is_interface,
@@ -34451,6 +34479,7 @@ fn is_symbol_introspection_builtin_name(name: &str) -> bool {
             | "get_declared_interfaces"
             | "get_declared_traits"
             | "get_loaded_extensions"
+            | "phpversion"
             | "get_mangled_object_vars"
             | "get_object_vars"
     )
@@ -34911,8 +34940,8 @@ fn class_like_exists_direct(
     lookup_class_in_state(compiled, state, class_name).is_some_and(|class| match kind {
         AutoloadClassLookupKind::Interface => class.flags.is_interface,
         AutoloadClassLookupKind::Enum => class.flags.is_enum,
-        AutoloadClassLookupKind::Trait => false,
-        AutoloadClassLookupKind::Class => !class.flags.is_interface,
+        AutoloadClassLookupKind::Trait => class.flags.is_trait,
+        AutoloadClassLookupKind::Class => !class.flags.is_interface && !class.flags.is_trait,
     }) || php_std::ExtensionRegistry::standard_library()
         .enabled_class(class_name)
         .is_some_and(|class| match kind {
@@ -37087,6 +37116,7 @@ fn execute_builtin_entry(
         state.default_timezone.clone()
     });
     context.set_diagnostic_display(diagnostic_display);
+    set_filter_input_arrays(&mut context, runtime_context);
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
     context.set_strtok_state(&mut state.strtok_state);
@@ -37141,6 +37171,14 @@ fn execute_builtin_entry(
             );
             result.diagnostics = diagnostics;
             result
+        }
+    }
+}
+
+fn set_filter_input_arrays(context: &mut BuiltinContext<'_>, runtime_context: &RuntimeContext) {
+    for source in [0, 1, 2, 5] {
+        if let Some(array) = runtime_context.filter_input_array(source) {
+            context.set_filter_input_array(source, array);
         }
     }
 }
@@ -39540,6 +39578,7 @@ fn call_builtin_args_to_positional(
             )));
         }
         let bind_by_ref = (function == "str_replace" && index == 3)
+            || (function == "parse_str" && index == 1)
             || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
             || (function == "preg_replace" && index == 4)
             || (function == "preg_replace_callback" && index == 4)
@@ -39690,6 +39729,7 @@ fn generated_default_value_for_call(default: Option<&str>) -> Option<Value> {
 fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static str {
     match (function, index) {
         ("str_replace", 3) => "count",
+        ("parse_str", 1) => "result",
         ("preg_match" | "preg_match_all", 2) => "matches",
         ("preg_replace" | "preg_replace_callback", 4) => "count",
         ("apcu_fetch", 1) => "success",

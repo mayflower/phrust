@@ -47,33 +47,37 @@ fn builtin_filter_var(
         .unwrap_or(FILTER_DEFAULT);
     let flags = args
         .get(2)
-        .map(filter_options_flags)
+        .map(|value| filter_options_flags("filter_var", value))
         .transpose()?
         .unwrap_or(0);
+    apply_filter("filter_var", &args[0], filter, flags)
+}
+
+fn apply_filter(name: &str, value: &Value, filter: i64, flags: i64) -> BuiltinResult {
     let failure = if flags & FILTER_NULL_ON_FAILURE != 0 {
         Value::Null
     } else {
         Value::Bool(false)
     };
     match filter {
-        FILTER_DEFAULT => Ok(args[0].clone()),
-        FILTER_VALIDATE_EMAIL => validate_email(&args[0], failure),
-        FILTER_VALIDATE_INT => validate_int(&args[0], failure),
-        FILTER_VALIDATE_FLOAT => validate_float(&args[0], failure),
-        FILTER_VALIDATE_URL => validate_url(&args[0], flags, failure),
-        FILTER_VALIDATE_IP => validate_ip(&args[0], flags, failure),
-        FILTER_VALIDATE_BOOL => validate_bool(&args[0], flags, failure),
-        FILTER_SANITIZE_EMAIL => sanitize(&args[0], is_email_sanitize_byte),
-        FILTER_SANITIZE_URL => sanitize(&args[0], is_url_sanitize_byte),
-        FILTER_SANITIZE_NUMBER_INT => sanitize(&args[0], |byte| {
+        FILTER_DEFAULT => Ok(value.clone()),
+        FILTER_VALIDATE_EMAIL => validate_email(name, value, failure),
+        FILTER_VALIDATE_INT => validate_int(name, value, failure),
+        FILTER_VALIDATE_FLOAT => validate_float(name, value, failure),
+        FILTER_VALIDATE_URL => validate_url(name, value, flags, failure),
+        FILTER_VALIDATE_IP => validate_ip(name, value, flags, failure),
+        FILTER_VALIDATE_BOOL => validate_bool(name, value, flags, failure),
+        FILTER_SANITIZE_EMAIL => sanitize(name, value, is_email_sanitize_byte),
+        FILTER_SANITIZE_URL => sanitize(name, value, is_url_sanitize_byte),
+        FILTER_SANITIZE_NUMBER_INT => sanitize(name, value, |byte| {
             byte.is_ascii_digit() || byte == b'+' || byte == b'-'
         }),
         _ => Ok(failure),
     }
 }
 
-fn validate_int(value: &Value, failure: Value) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn validate_int(name: &str, value: &Value, failure: Value) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     let text = input.to_string_lossy();
     let trimmed = text.trim();
     if trimmed.parse::<i64>().is_ok()
@@ -87,8 +91,8 @@ fn validate_int(value: &Value, failure: Value) -> BuiltinResult {
     }
 }
 
-fn validate_float(value: &Value, failure: Value) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn validate_float(name: &str, value: &Value, failure: Value) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     let text = input.to_string_lossy();
     let trimmed = text.trim();
     match trimmed.parse::<f64>() {
@@ -98,31 +102,46 @@ fn validate_float(value: &Value, failure: Value) -> BuiltinResult {
 }
 
 fn builtin_filter_input(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(2..=5).contains(&args.len()) {
         return Err(arity_error("filter_input", "two to five argument(s)"));
     }
-    Ok(Value::Null)
+    let source = int_arg("filter_input", &args[0])?;
+    let name = string_arg("filter_input", &args[1])?.to_string_lossy();
+    let Some(value) = context.filter_input_value(source, &name) else {
+        return Ok(Value::Null);
+    };
+    let filter = args
+        .get(2)
+        .map(|value| int_arg("filter_input", value))
+        .transpose()?
+        .unwrap_or(FILTER_DEFAULT);
+    let flags = args
+        .get(3)
+        .map(|value| filter_options_flags("filter_input", value))
+        .transpose()?
+        .unwrap_or(0);
+    apply_filter("filter_input", &value, filter, flags)
 }
 
-fn filter_options_flags(value: &Value) -> Result<i64, crate::builtins::BuiltinError> {
+fn filter_options_flags(name: &str, value: &Value) -> Result<i64, crate::builtins::BuiltinError> {
     match deref_value(value) {
         Value::Array(array) => {
             let key = ArrayKey::String(crate::PhpString::from_test_str("flags"));
             match array.get(&key) {
-                Some(value) => int_arg("filter_var", value),
+                Some(value) => int_arg(name, value),
                 None => Ok(0),
             }
         }
-        other => int_arg("filter_var", &other),
+        other => int_arg(name, &other),
     }
 }
 
-fn validate_email(value: &Value, failure: Value) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn validate_email(name: &str, value: &Value, failure: Value) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     let string = input.to_string_lossy();
     let mut parts = string.split('@');
     let Some(local) = parts.next() else {
@@ -142,8 +161,8 @@ fn validate_email(value: &Value, failure: Value) -> BuiltinResult {
     }
 }
 
-fn validate_url(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn validate_url(name: &str, value: &Value, flags: i64, failure: Value) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     let string = input.to_string_lossy();
     let has_scheme = string.starts_with("http://") || string.starts_with("https://");
     let after_scheme = string.split_once("://").map(|(_, tail)| tail).unwrap_or("");
@@ -159,8 +178,8 @@ fn validate_url(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
     }
 }
 
-fn validate_ip(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn validate_ip(name: &str, value: &Value, flags: i64, failure: Value) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     let string = input.to_string_lossy();
     match string.parse::<IpAddr>() {
         Ok(IpAddr::V4(_)) if flags & FILTER_FLAG_IPV6 == 0 => Ok(Value::String(input)),
@@ -170,9 +189,9 @@ fn validate_ip(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
     }
 }
 
-fn validate_bool(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
+fn validate_bool(name: &str, value: &Value, flags: i64, failure: Value) -> BuiltinResult {
     let string = to_string(value)
-        .map_err(|message| conversion_error("filter_var", message))?
+        .map_err(|message| conversion_error(name, message))?
         .to_string_lossy()
         .to_ascii_lowercase();
     match string.as_str() {
@@ -183,8 +202,8 @@ fn validate_bool(value: &Value, flags: i64, failure: Value) -> BuiltinResult {
     }
 }
 
-fn sanitize(value: &Value, keep: impl Fn(u8) -> bool) -> BuiltinResult {
-    let input = string_arg("filter_var", value)?;
+fn sanitize(name: &str, value: &Value, keep: impl Fn(u8) -> bool) -> BuiltinResult {
+    let input = string_arg(name, value)?;
     Ok(Value::string(
         input
             .as_bytes()

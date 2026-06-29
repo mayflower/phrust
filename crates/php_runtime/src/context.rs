@@ -240,6 +240,18 @@ impl RuntimeHttpResponseState {
         });
         Ok(())
     }
+
+    pub fn remove_header(&mut self, name: Option<&str>) -> Result<(), String> {
+        let Some(name) = name else {
+            self.headers.clear();
+            return Ok(());
+        };
+        reject_response_splitting(name)?;
+        validate_header_name(name)?;
+        self.headers
+            .retain(|header| !header.name.eq_ignore_ascii_case(name));
+        Ok(())
+    }
 }
 
 impl RuntimeHttpRequestContext {
@@ -573,6 +585,18 @@ impl RuntimeContext {
         }
     }
 
+    /// Returns the request input array used by `filter_input`.
+    #[must_use]
+    pub fn filter_input_array(&self, source: i64) -> Option<PhpArray> {
+        match source {
+            0 => Some(self.filter_post_array()),
+            1 => Some(self.filter_get_array()),
+            2 => Some(self.filter_cookie_array()),
+            5 => Some(self.filter_server_array()),
+            _ => None,
+        }
+    }
+
     fn argv_array(&self) -> Value {
         Value::packed_array(
             self.argv
@@ -596,6 +620,62 @@ impl RuntimeContext {
         array.insert(string_key("DOCUMENT_ROOT"), Value::string(""));
         array.insert(string_key("REQUEST_TIME"), Value::Int(0));
         array
+    }
+
+    fn filter_get_array(&self) -> PhpArray {
+        match &self.request_mode {
+            RuntimeRequestMode::Http(_) => self.get_array(),
+            RuntimeRequestMode::Cli => self
+                .env_value("QUERY_STRING")
+                .map_or_else(PhpArray::new, |query| {
+                    input_pairs_array(&parse_query_string(query), &self.ini)
+                }),
+        }
+    }
+
+    fn filter_post_array(&self) -> PhpArray {
+        match &self.request_mode {
+            RuntimeRequestMode::Http(_) => self.post_array(),
+            RuntimeRequestMode::Cli => self
+                .env_value("PHPT_REQUEST_BODY")
+                .map_or_else(PhpArray::new, |body| {
+                    input_pairs_array(&parse_form_urlencoded_body(body.as_bytes()), &self.ini)
+                }),
+        }
+    }
+
+    fn filter_cookie_array(&self) -> PhpArray {
+        match &self.request_mode {
+            RuntimeRequestMode::Http(_) => self.cookie_array(),
+            RuntimeRequestMode::Cli => self
+                .env_value("HTTP_COOKIE")
+                .map_or_else(PhpArray::new, |cookie| {
+                    flat_pairs_array(&parse_cookie_header(cookie), &self.ini)
+                }),
+        }
+    }
+
+    fn filter_server_array(&self) -> PhpArray {
+        let mut array = self.server_array();
+        for name in [
+            "REQUEST_METHOD",
+            "QUERY_STRING",
+            "HTTP_COOKIE",
+            "CONTENT_TYPE",
+            "CONTENT_LENGTH",
+        ] {
+            if let Some(value) = self.env_value(name) {
+                insert_string(&mut array, name, value);
+            }
+        }
+        array
+    }
+
+    fn env_value(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
     }
 
     fn env_array(&self) -> PhpArray {
@@ -713,7 +793,8 @@ fn header_server_name(name: &str) -> Option<String> {
     Some(normalized)
 }
 
-fn input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) -> PhpArray {
+#[must_use]
+pub fn input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) -> PhpArray {
     let mut array = PhpArray::new();
     InputArrayBuilder::new(ini).insert_pairs(&mut array, pairs);
     array

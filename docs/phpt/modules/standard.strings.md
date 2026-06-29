@@ -8,6 +8,7 @@
 ## Scope
 
 - Common binary-safe string helpers
+- URL query parsing through `parse_str`
 - Focused generated fixtures for length, substring, search, trimming,
   split/join, formatted output, replacement, ASCII case conversion, and
   tokenizer state
@@ -30,6 +31,7 @@
 ## Relevant Source Areas
 
 - `crates/php_runtime/src/builtins/modules/strings.rs`
+- `crates/php_runtime/src/context.rs`
 - `crates/php_runtime/src/value.rs`
 - `crates/php_vm/src/vm/mod.rs`
 
@@ -59,3 +61,5 @@
 - The full upstream string corpus remains larger than this focused slice.
 - Additional formatting, encoding, flag, and uncommon helper behavior remains
   backlog work.
+- `parse_str` shares the request parser's selected query-decoding surface; the
+  exhaustive bracket-name matrix remains backlog work.

@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"wp.core-builtins",
+  "priority":"WordPress-focused core builtin, HTTP, and configuration surface",
+  "selected_manifest":"tests/phpt/manifests/modules/wp.core-builtins.selected.jsonl",
+  "corpus_count":6,
+  "selected_count":6,
+  "pass_count":5,
+  "skip_count":1,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["symbol, extension, and class-like introspection","INI and environment helpers","HTTP response callable surface","output buffering helpers","URL, filter, request input, hash, random, password, and serialization helpers"],
+  "non_scope":["FPM","FastCGI","Apache SAPI","complete Zend memory accounting","Argon2 password algorithms","full standard-library parity"],
+  "target_gates":["nix develop -c cargo test -p php_runtime","nix develop -c cargo test -p php_vm","nix develop -c cargo test -p php_std","nix develop -c cargo test -p php_server","nix develop -c just server-smoke","PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=wp.core-builtins","PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.variables","PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.strings","PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.serialization","PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=diagnostics.output","nix develop -c just verify-runtime","nix develop -c just verify-stdlib","nix develop -c just verify-server","nix develop -c just verify-phpt"],
+  "next_step":"Keep this selected WordPress-critical core builtin surface green before promoting broader upstream standard and SAPI corpora."
+}

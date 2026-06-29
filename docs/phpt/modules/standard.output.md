@@ -10,6 +10,8 @@
 - Stack-backed output buffering basics
 - `ob_start`, `ob_get_clean`, nested buffers, clean, flush, and basic state
   transitions covered by the selected gate
+- The `wp.core-builtins` generated gate reuses this selected output-buffering
+  surface for WordPress-style template capture.
 
 ## Non-Scope
 

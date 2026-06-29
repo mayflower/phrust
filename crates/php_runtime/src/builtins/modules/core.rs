@@ -16,6 +16,7 @@ use crate::{
     equal, identical, normalize_class_name, pcre, serialize as serialize_value, to_bool, to_float,
     to_int, to_number, to_string, unserialize as unserialize_value, value::FloatValue,
 };
+use bcrypt::{DEFAULT_COST, hash as bcrypt_hash, verify as bcrypt_verify};
 use md5::{Digest, Md5};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sha1::Sha1;
@@ -90,6 +91,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
     BuiltinEntry::new("header", builtin_header, BuiltinCompatibility::Php),
     BuiltinEntry::new(
+        "header_remove",
+        builtin_header_remove,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "headers_list",
         builtin_headers_list,
         BuiltinCompatibility::Php,
@@ -159,6 +165,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
     BuiltinEntry::new("is_scalar", builtin_is_scalar, BuiltinCompatibility::Php),
     BuiltinEntry::new("is_string", builtin_is_string, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "memory_get_peak_usage",
+        builtin_memory_get_peak_usage,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "memory_get_usage",
+        builtin_memory_get_usage,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "ob_end_clean",
         builtin_output_buffering_requires_vm,
@@ -234,6 +250,21 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
         "proc_open",
         builtin_process_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "password_hash",
+        builtin_password_hash,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "password_needs_rehash",
+        builtin_password_needs_rehash,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "password_verify",
+        builtin_password_verify,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -432,6 +463,131 @@ pub(in crate::builtins::modules) fn builtin_random_int(
     }
 }
 
+pub(in crate::builtins::modules) fn builtin_password_hash(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(arity_error("password_hash", "two or three argument(s)"));
+    }
+    let password = string_arg("password_hash", &args[0])?;
+    validate_password_algorithm("password_hash", args.get(1))?;
+    let cost = password_cost(args.get(2))?;
+    let hash = bcrypt_hash(password.as_bytes(), cost).map_err(|error| {
+        BuiltinError::new(
+            "E_PHP_RUNTIME_PASSWORD_HASH",
+            format!("password_hash(): failed to hash password: {error}"),
+        )
+    })?;
+    Ok(Value::string(bcrypt_to_php_prefix(&hash)))
+}
+
+pub(in crate::builtins::modules) fn builtin_password_verify(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("password_verify", &args, 2)?;
+    let password = string_arg("password_verify", &args[0])?;
+    let hash = string_arg("password_verify", &args[1])?.to_string_lossy();
+    let bcrypt_hash = php_to_bcrypt_prefix(&hash);
+    let verified = bcrypt_verify(password.as_bytes(), &bcrypt_hash).unwrap_or(false);
+    Ok(Value::Bool(verified))
+}
+
+pub(in crate::builtins::modules) fn builtin_password_needs_rehash(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(arity_error(
+            "password_needs_rehash",
+            "two or three argument(s)",
+        ));
+    }
+    validate_password_algorithm("password_needs_rehash", args.get(1))?;
+    let hash = string_arg("password_needs_rehash", &args[0])?.to_string_lossy();
+    let expected_cost = password_cost(args.get(2))?;
+    let Some(actual_cost) = bcrypt_cost_from_hash(&hash) else {
+        return Ok(Value::Bool(true));
+    };
+    Ok(Value::Bool(
+        !hash.starts_with("$2y$") || actual_cost != expected_cost,
+    ))
+}
+
+fn validate_password_algorithm(function: &str, value: Option<&Value>) -> Result<(), BuiltinError> {
+    match value.map(deref_value).unwrap_or(Value::Null) {
+        Value::Null => Ok(()),
+        Value::String(algorithm) => {
+            let algorithm = algorithm.to_string_lossy();
+            if matches!(algorithm.as_str(), "2y" | "bcrypt") {
+                Ok(())
+            } else {
+                Err(value_error(
+                    function,
+                    "Argument #2 ($algo) must be a valid password hashing algorithm",
+                ))
+            }
+        }
+        Value::Int(1) => Ok(()),
+        other => {
+            let algorithm = to_string(&other)
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_else(|_| String::new());
+            if matches!(algorithm.as_str(), "2y" | "bcrypt") {
+                Ok(())
+            } else {
+                Err(value_error(
+                    function,
+                    "Argument #2 ($algo) must be a valid password hashing algorithm",
+                ))
+            }
+        }
+    }
+}
+
+fn password_cost(options: Option<&Value>) -> Result<u32, BuiltinError> {
+    let Some(Value::Array(options)) = options.map(deref_value) else {
+        return Ok(DEFAULT_COST);
+    };
+    let cost = options
+        .get(&string_array_key("cost"))
+        .map_or(Ok(i64::from(DEFAULT_COST)), |value| {
+            to_int(value).map_err(|message| conversion_error("password_hash", message))
+        })?;
+    if !(4..=31).contains(&cost) {
+        return Err(value_error(
+            "password_hash",
+            "Invalid bcrypt cost parameter specified: cost must be in the range 04-31",
+        ));
+    }
+    Ok(cost as u32)
+}
+
+fn bcrypt_to_php_prefix(hash: &str) -> String {
+    hash.strip_prefix("$2b$")
+        .map_or_else(|| hash.to_string(), |suffix| format!("$2y${suffix}"))
+}
+
+fn php_to_bcrypt_prefix(hash: &str) -> String {
+    hash.strip_prefix("$2y$")
+        .map_or_else(|| hash.to_string(), |suffix| format!("$2b${suffix}"))
+}
+
+fn bcrypt_cost_from_hash(hash: &str) -> Option<u32> {
+    let normalized = php_to_bcrypt_prefix(hash);
+    let mut parts = normalized.split('$');
+    let _empty = parts.next()?;
+    let version = parts.next()?;
+    if !matches!(version, "2a" | "2b" | "2x" | "2y") {
+        return None;
+    }
+    parts.next()?.parse::<u32>().ok()
+}
+
 pub(in crate::builtins::modules) fn builtin_gc_collect_cycles(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -535,6 +691,28 @@ pub(in crate::builtins::modules) fn builtin_headers_list(
     )))
 }
 
+pub(in crate::builtins::modules) fn builtin_header_remove(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("header_remove", "zero or one argument(s)"));
+    }
+    let name = match args.first().map(deref_value) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(string_arg("header_remove", &value)?.to_string_lossy()),
+    };
+    if let Err(message) = context.http_response_mut().remove_header(name.as_deref()) {
+        context.php_warning(
+            "E_PHP_RUNTIME_INVALID_HEADER",
+            format!("header_remove(): {message}"),
+            span,
+        );
+    }
+    Ok(Value::Null)
+}
+
 pub(in crate::builtins::modules) fn builtin_headers_sent(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -544,6 +722,26 @@ pub(in crate::builtins::modules) fn builtin_headers_sent(
         return Err(arity_error("headers_sent", "zero to two argument(s)"));
     }
     Ok(Value::Bool(context.http_response().headers_sent))
+}
+
+pub(in crate::builtins::modules) fn builtin_memory_get_usage(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("memory_get_usage", "zero or one argument(s)"));
+    }
+    let output_bytes = context.output().len() as i64;
+    Ok(Value::Int(output_bytes.max(0)))
+}
+
+pub(in crate::builtins::modules) fn builtin_memory_get_peak_usage(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    builtin_memory_get_usage(context, args, span)
 }
 
 pub(in crate::builtins::modules) fn builtin_setcookie(

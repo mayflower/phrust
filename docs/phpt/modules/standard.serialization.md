@@ -10,6 +10,8 @@
 - `serialize`
 - `unserialize`
 - Scalar, array, and simple object persistence covered by the selected gate
+- `wp.core-builtins` reuses scalar and array serialization roundtrips for
+  WordPress-style cache payload coverage.
 
 ## Non-Scope
 

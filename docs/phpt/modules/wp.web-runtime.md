@@ -6,8 +6,8 @@
 
 ## Implemented Scope
 
-- Response functions: `header`, `headers_list`, `headers_sent`,
-  `http_response_code`, `setcookie`, and `setrawcookie`.
+- Response functions: `header`, `header_remove`, `headers_list`,
+  `headers_sent`, `http_response_code`, `setcookie`, and `setrawcookie`.
 - HTTP request superglobals: `$_GET`, `$_POST`, `$_COOKIE`, `$_REQUEST`,
   `$_SERVER`, and `$_FILES`.
 - URL-encoded request parsing supports nested bracket keys such as
