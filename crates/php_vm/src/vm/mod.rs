@@ -6423,6 +6423,16 @@ impl Vm {
                             .get(instruction.span.index())
                             .copied()
                             .unwrap_or_default();
+                        let suppress_undefined_warning =
+                            dense_load_local_is_pre_call_by_ref_out_param(
+                                compiled,
+                                state,
+                                dense,
+                                instructions,
+                                instruction_offset,
+                                dst,
+                                src.index,
+                            );
                         let value = match self.load_local_value(
                             compiled,
                             ir_function,
@@ -6432,7 +6442,7 @@ impl Vm {
                             &mut diagnostics,
                             LocalId::new(src.index),
                             span,
-                            false,
+                            suppress_undefined_warning,
                         ) {
                             Ok(value) => value,
                             Err(result) => {
@@ -10118,6 +10128,8 @@ impl Vm {
                                 }
                                 Some(Value::Uninitialized)
                                     if load_local_is_pre_call_by_ref_out_param(
+                                        compiled,
+                                        state,
                                         &block.instructions,
                                         instruction_index,
                                         *dst,
@@ -10348,52 +10360,6 @@ impl Vm {
                             *local,
                             &dims,
                         );
-                    }
-                    InstructionKind::BindReferenceProperty {
-                        object,
-                        property,
-                        source,
-                    } => {
-                        self.record_counter_alias_state_transition(
-                            AliasState::NoReferencesObserved,
-                            AliasState::PropertyOrArrayDimReference,
-                        );
-                        self.record_counter_fast_path_disabled_by_reference(
-                            AliasState::PropertyOrArrayDimReference,
-                        );
-                        let object = match read_operand(unit, stack, *object) {
-                            Ok(Value::Object(object)) => object,
-                            Ok(other) => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_PROPERTY_REF_NON_OBJECT: cannot bind property on {}",
-                                        value_type_name(&other)
-                                    ),
-                                );
-                            }
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        let cell = match stack
-                            .current_mut()
-                            .expect("frame was pushed")
-                            .locals
-                            .ensure_reference_cell(*source)
-                        {
-                            Ok(cell) => cell,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        if let Err(message) = bind_property_to_reference_cell(
-                            compiled, state, stack, &object, property, cell,
-                        ) {
-                            return self.runtime_error(output, compiled, stack, message);
-                        }
                     }
                     InstructionKind::BindReferencePropertyDim {
                         object,
@@ -32951,30 +32917,6 @@ fn property_dimension_storage_name(
     Ok(property_storage_name(resolved.class, resolved.property))
 }
 
-fn assign_property_dim(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    stack: &CallStack,
-    object: &ObjectRef,
-    property: &str,
-    dims: &[ArrayKey],
-    value: Value,
-    append: bool,
-) -> Result<(), String> {
-    let storage_name =
-        property_dimension_storage_name(compiled, state, stack, object, property, true)?;
-    let mut current = object
-        .get_property(&storage_name)
-        .or_else(|| object.get_property(property))
-        .unwrap_or(Value::Null);
-    if matches!(current, Value::Uninitialized | Value::Null) {
-        current = Value::Array(PhpArray::new());
-    }
-    assign_dim_value(&mut current, dims, value, append)?;
-    object.set_property(storage_name, current);
-    Ok(())
-}
-
 fn unset_property_dim(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -43805,6 +43747,8 @@ fn concat_operand_fallback_reason(value: &Value) -> Option<&'static str> {
 }
 
 fn load_local_is_pre_call_by_ref_out_param(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
     instructions: &[Instruction],
     instruction_index: usize,
     dst: RegId,
@@ -43823,8 +43767,12 @@ fn load_local_is_pre_call_by_ref_out_param(
                 }
                 continue;
             }
-            InstructionKind::CallFunction { args, .. }
-            | InstructionKind::CallMethod { args, .. }
+            InstructionKind::CallFunction { name, args, .. } => {
+                return call_function_load_is_actual_by_ref_arg(
+                    compiled, state, name, args, loaded, local,
+                );
+            }
+            InstructionKind::CallMethod { args, .. }
             | InstructionKind::CallStaticMethod { args, .. }
             | InstructionKind::CallClosure { args, .. }
             | InstructionKind::CallCallable { args, .. }
@@ -43839,6 +43787,296 @@ fn load_local_is_pre_call_by_ref_out_param(
         }
     }
     false
+}
+
+fn call_function_load_is_actual_by_ref_arg(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    name: &str,
+    args: &[IrCallArg],
+    loaded: Operand,
+    local: LocalId,
+) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        arg.value == loaded
+            && arg.by_ref_local.is_some_and(|arg_local| arg_local == local)
+            && direct_function_arg_requires_reference(compiled, state, name, index, arg)
+    })
+}
+
+fn direct_function_arg_requires_reference(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    name: &str,
+    index: usize,
+    arg: &IrCallArg,
+) -> bool {
+    let normalized = normalize_function_name(name);
+    if !normalized.contains('\\') && builtin_function_call_target(&normalized).is_some() {
+        return direct_builtin_arg_requires_reference(
+            &normalized,
+            index,
+            arg.by_ref_local.is_some() || arg.by_ref_dim.is_some() || arg.by_ref_property.is_some(),
+        );
+    }
+    if let Some(function_id) = compiled.lookup_function(&normalized)
+        && let Some(function) = compiled.unit().functions.get(function_id.index())
+    {
+        return ir_function_arg_requires_reference(function, index, arg);
+    }
+    if let Some((owner, function_id)) = dynamic_function_in_state(state, &normalized)
+        && let Some(function) = owner.unit().functions.get(function_id.index())
+    {
+        return ir_function_arg_requires_reference(function, index, arg);
+    }
+    if let Some(fallback_name) = namespaced_function_global_fallback(&normalized) {
+        if let Some(function_id) = compiled.lookup_function(fallback_name)
+            && let Some(function) = compiled.unit().functions.get(function_id.index())
+        {
+            return ir_function_arg_requires_reference(function, index, arg);
+        }
+        if let Some((owner, function_id)) = dynamic_function_in_state(state, fallback_name)
+            && let Some(function) = owner.unit().functions.get(function_id.index())
+        {
+            return ir_function_arg_requires_reference(function, index, arg);
+        }
+    }
+    direct_builtin_arg_requires_reference(
+        &normalized,
+        index,
+        arg.by_ref_local.is_some() || arg.by_ref_dim.is_some() || arg.by_ref_property.is_some(),
+    )
+}
+
+fn ir_function_arg_requires_reference(
+    function: &IrFunction,
+    index: usize,
+    arg: &IrCallArg,
+) -> bool {
+    ir_function_param_requires_reference(function, index, arg.name.as_deref())
+}
+
+fn ir_function_param_requires_reference(
+    function: &IrFunction,
+    index: usize,
+    arg_name: Option<&str>,
+) -> bool {
+    let param = if let Some(name) = arg_name {
+        function.params.iter().find(|param| param.name == name)
+    } else {
+        function.params.get(index).or_else(|| {
+            function
+                .params
+                .last()
+                .filter(|param| param.variadic && index >= function.params.len())
+        })
+    };
+    param.is_some_and(|param| param.by_ref)
+}
+
+fn direct_builtin_arg_requires_reference(
+    name: &str,
+    index: usize,
+    arg_is_referenceable: bool,
+) -> bool {
+    let target = builtin_function_call_target(name).or_else(|| {
+        namespaced_function_global_fallback(name).and_then(builtin_function_call_target)
+    });
+    let Some(FunctionCallCacheTarget::Builtin { kind, name }) = target else {
+        return false;
+    };
+    match kind {
+        FunctionCallBuiltinKind::InternalRegistry | FunctionCallBuiltinKind::PcreCallback => {
+            internal_builtin_param_requires_reference(&name, index)
+        }
+        FunctionCallBuiltinKind::Process => process_builtin_param_requires_reference(&name, index),
+        FunctionCallBuiltinKind::ArraySort => {
+            array_sort_builtin_param_requires_reference(&name, index, arg_is_referenceable)
+        }
+        _ => false,
+    }
+}
+
+fn internal_builtin_param_requires_reference(function: &str, index: usize) -> bool {
+    (function == "str_replace" && index == 3)
+        || (function == "parse_str" && index == 1)
+        || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
+        || (function == "preg_replace" && index == 4)
+        || (function == "preg_replace_callback" && index == 4)
+        || (function == "apcu_fetch" && index == 1)
+        || (matches!(
+            function,
+            "array_pop"
+                | "array_push"
+                | "array_shift"
+                | "array_splice"
+                | "array_unshift"
+                | "end"
+                | "next"
+                | "prev"
+                | "reset"
+                | "shuffle"
+        ) && index == 0)
+}
+
+fn process_builtin_param_requires_reference(function: &str, index: usize) -> bool {
+    matches!((function, index), ("exec", 1 | 2) | ("passthru", 1))
+}
+
+fn array_sort_builtin_param_requires_reference(
+    function: &str,
+    index: usize,
+    arg_is_referenceable: bool,
+) -> bool {
+    if function == "array_multisort" {
+        return arg_is_referenceable;
+    }
+    index == 0
+}
+
+fn dense_load_local_is_pre_call_by_ref_out_param(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    dense: &DenseBytecodeUnit,
+    instructions: &[DenseInstruction],
+    instruction_offset: usize,
+    dst: u32,
+    local: u32,
+) -> bool {
+    let loaded = DenseOperand {
+        kind: DenseOperandKind::Register,
+        index: dst,
+    };
+    for instruction in instructions.iter().skip(instruction_offset + 1) {
+        match instruction.opcode {
+            DenseOpcode::Nop => continue,
+            DenseOpcode::LoadConst
+            | DenseOpcode::LoadConstEcho
+            | DenseOpcode::Move
+            | DenseOpcode::LoadLocal
+            | DenseOpcode::LoadLocalEcho => {
+                if dense_instruction_dst(instruction) == Some(dst) {
+                    return false;
+                }
+                continue;
+            }
+            DenseOpcode::CallFunction => {
+                let DenseOperands::Call { name, ref args, .. } = instruction.operands else {
+                    return false;
+                };
+                let Some(name) = dense.names.get(name as usize) else {
+                    return false;
+                };
+                return dense_call_function_load_is_actual_by_ref_arg(
+                    compiled, state, dense, name, args, loaded, local,
+                );
+            }
+            DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
+                let Some(args) = dense_instruction_call_args(instruction) else {
+                    return false;
+                };
+                return args.iter().any(|arg| {
+                    arg.value == loaded
+                        && arg.by_ref_local.is_some_and(|arg_local| arg_local == local)
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn dense_call_function_load_is_actual_by_ref_arg(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    dense: &DenseBytecodeUnit,
+    name: &str,
+    args: &[DenseCallArg],
+    loaded: DenseOperand,
+    local: u32,
+) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        arg.value == loaded
+            && arg.by_ref_local.is_some_and(|arg_local| arg_local == local)
+            && dense_direct_function_arg_requires_reference(
+                compiled, state, dense, name, index, arg,
+            )
+    })
+}
+
+fn dense_direct_function_arg_requires_reference(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    dense: &DenseBytecodeUnit,
+    name: &str,
+    index: usize,
+    arg: &DenseCallArg,
+) -> bool {
+    let normalized = normalize_function_name(name);
+    if !normalized.contains('\\') && builtin_function_call_target(&normalized).is_some() {
+        return direct_builtin_arg_requires_reference(
+            &normalized,
+            index,
+            arg.by_ref_local.is_some() || arg.by_ref_dim.is_some() || arg.by_ref_property.is_some(),
+        );
+    }
+    let arg_name = arg
+        .name
+        .and_then(|name| dense.names.get(name as usize).map(String::as_str));
+    if let Some(function_id) = compiled.lookup_function(&normalized)
+        && let Some(function) = compiled.unit().functions.get(function_id.index())
+    {
+        return ir_function_param_requires_reference(function, index, arg_name);
+    }
+    if let Some((owner, function_id)) = dynamic_function_in_state(state, &normalized)
+        && let Some(function) = owner.unit().functions.get(function_id.index())
+    {
+        return ir_function_param_requires_reference(function, index, arg_name);
+    }
+    if let Some(fallback_name) = namespaced_function_global_fallback(&normalized) {
+        if let Some(function_id) = compiled.lookup_function(fallback_name)
+            && let Some(function) = compiled.unit().functions.get(function_id.index())
+        {
+            return ir_function_param_requires_reference(function, index, arg_name);
+        }
+        if let Some((owner, function_id)) = dynamic_function_in_state(state, fallback_name)
+            && let Some(function) = owner.unit().functions.get(function_id.index())
+        {
+            return ir_function_param_requires_reference(function, index, arg_name);
+        }
+    }
+    direct_builtin_arg_requires_reference(
+        &normalized,
+        index,
+        arg.by_ref_local.is_some() || arg.by_ref_dim.is_some() || arg.by_ref_property.is_some(),
+    )
+}
+
+fn dense_instruction_dst(instruction: &DenseInstruction) -> Option<u32> {
+    match instruction.operands {
+        DenseOperands::RegConst { dst, .. }
+        | DenseOperands::RegOperand { dst, .. }
+        | DenseOperands::Binary { dst, .. }
+        | DenseOperands::Call { dst, .. }
+        | DenseOperands::MethodCall { dst, .. }
+        | DenseOperands::StaticCall { dst, .. }
+        | DenseOperands::Dst { dst }
+        | DenseOperands::FetchDim { dst, .. }
+        | DenseOperands::AssignDim { dst, .. }
+        | DenseOperands::ForeachNext { has_value: dst, .. }
+        | DenseOperands::FetchProperty { dst, .. }
+        | DenseOperands::AssignProperty { dst, .. } => Some(dst),
+        _ => None,
+    }
+}
+
+fn dense_instruction_call_args(instruction: &DenseInstruction) -> Option<&[DenseCallArg]> {
+    match &instruction.operands {
+        DenseOperands::Call { args, .. }
+        | DenseOperands::MethodCall { args, .. }
+        | DenseOperands::StaticCall { args, .. } => Some(args),
+        _ => None,
+    }
 }
 
 fn read_call_args(
@@ -44812,25 +45050,7 @@ fn call_builtin_args_to_positional(
                 "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${name}"
             )));
         }
-        let bind_by_ref = (function == "str_replace" && index == 3)
-            || (function == "parse_str" && index == 1)
-            || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
-            || (function == "preg_replace" && index == 4)
-            || (function == "preg_replace_callback" && index == 4)
-            || (function == "apcu_fetch" && index == 1)
-            || (matches!(
-                function,
-                "array_pop"
-                    | "array_push"
-                    | "array_shift"
-                    | "array_splice"
-                    | "array_unshift"
-                    | "end"
-                    | "next"
-                    | "prev"
-                    | "reset"
-                    | "shuffle"
-            ) && index == 0);
+        let bind_by_ref = internal_builtin_param_requires_reference(function, index);
         if bind_by_ref {
             if let Some(cell) = call_argument_reference_cell(compiled, &arg, stack)
                 .map_err(InternalBuiltinArgError::Message)?
@@ -45308,20 +45528,6 @@ fn bind_dim_value_to_reference_cell(
         *child = Value::Array(PhpArray::new());
     }
     bind_dim_value_to_reference_cell(child, rest, append, cell)
-}
-
-fn bind_property_to_reference_cell(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    stack: &CallStack,
-    object: &ObjectRef,
-    property: &str,
-    cell: ReferenceCell,
-) -> Result<(), String> {
-    let storage_name =
-        property_dimension_storage_name(compiled, state, stack, object, property, true)?;
-    object.set_property(storage_name, Value::Reference(cell));
-    Ok(())
 }
 
 fn bind_property_dim_to_reference_cell(
