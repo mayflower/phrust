@@ -771,6 +771,8 @@ struct ExecutionState {
     strtok_state: php_runtime::StrtokState,
     iconv_state: php_runtime::IconvEncodingState,
     apcu_state: php_runtime::ApcuState,
+    filesystem_state: php_runtime::FilesystemRuntimeState,
+    stream_context_state: php_runtime::StreamContextState,
     mb_internal_encoding: String,
     preg_last_error: php_runtime::pcre::PcreLastErrorState,
     json_last_error: i64,
@@ -37122,6 +37124,8 @@ fn execute_builtin_entry(
     context.set_strtok_state(&mut state.strtok_state);
     context.set_iconv_state(&mut state.iconv_state);
     context.set_apcu_state(&mut state.apcu_state);
+    context.set_filesystem_state(&mut state.filesystem_state);
+    context.set_stream_context_state(&mut state.stream_context_state);
     context.set_http_response_state(&mut state.http_response);
     context.set_upload_registry(&mut state.upload_registry);
     context.set_mysql_state(&mut state.mysql);

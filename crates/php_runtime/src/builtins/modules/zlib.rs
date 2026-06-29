@@ -1,20 +1,25 @@
-//! Bounded zlib compression helpers.
+//! Bounded zlib compression helpers and gzip file resources.
 
-use super::core::{arity_error, int_arg, string_arg};
+use super::core::{arity_error, int_arg, resolve_runtime_path, resource_arg, string_arg};
 use crate::Value;
 use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinResult, RuntimeSourceSpan,
 };
+use crate::resource::{StreamFlags, decode_gzip_bytes};
 use flate2::Compression;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use std::io::{Read, Write};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new("gzclose", builtin_gzclose, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzdeflate", builtin_gzdeflate, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzcompress", builtin_gzcompress, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzdecode", builtin_gzdecode, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzencode", builtin_gzencode, BuiltinCompatibility::Php),
+    BuiltinEntry::new("gzopen", builtin_gzopen, BuiltinCompatibility::Php),
+    BuiltinEntry::new("gzread", builtin_gzread, BuiltinCompatibility::Php),
+    BuiltinEntry::new("gzwrite", builtin_gzwrite, BuiltinCompatibility::Php),
     BuiltinEntry::new("gzinflate", builtin_gzinflate, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "gzuncompress",
@@ -36,6 +41,104 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 pub(in crate::builtins::modules) const ZLIB_ENCODING_RAW: i64 = -15;
 pub(in crate::builtins::modules) const ZLIB_ENCODING_GZIP: i64 = 31;
 pub(in crate::builtins::modules) const ZLIB_ENCODING_DEFLATE: i64 = 15;
+
+fn builtin_gzopen(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_error("gzopen", "two or three argument(s)"));
+    }
+    let path_arg = string_arg("gzopen", &args[0])?.to_string_lossy();
+    let mode = string_arg("gzopen", &args[1])?.to_string_lossy();
+    let path = resolve_runtime_path(context, &path_arg);
+    if !context.filesystem_capabilities().allows_path(&path) {
+        return Ok(Value::Bool(false));
+    }
+    let readable = mode.starts_with('r');
+    let writable = matches!(mode.as_bytes().first().copied(), Some(b'w' | b'a'));
+    if !readable && !writable {
+        return Ok(Value::Bool(false));
+    }
+    let buffer = if readable || mode.starts_with('a') {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) if writable => Vec::new(),
+            Err(_) => return Ok(Value::Bool(false)),
+        };
+        if bytes.is_empty() {
+            Vec::new()
+        } else {
+            match decode_gzip_bytes(&bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(Value::Bool(false)),
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let cursor = if mode.starts_with('a') {
+        buffer.len()
+    } else {
+        0
+    };
+    let Some(resources) = context.resources() else {
+        return Ok(Value::Bool(false));
+    };
+    let flags = StreamFlags::new(
+        readable || mode.contains('+'),
+        writable || mode.contains('+'),
+        true,
+    );
+    Ok(Value::Resource(
+        resources.register_gzip_file(path, mode, flags, buffer, cursor),
+    ))
+}
+
+fn builtin_gzread(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_zlib_arity("gzread", args.len(), 2, 2)?;
+    let Some(resource) = resource_arg(&args[0]) else {
+        return Ok(Value::Bool(false));
+    };
+    let length = int_arg("gzread", &args[1])?.max(0) as usize;
+    Ok(resource
+        .read_bytes(length)
+        .map_or(Value::Bool(false), Value::string))
+}
+
+fn builtin_gzwrite(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_error("gzwrite", "two or three argument(s)"));
+    }
+    let Some(resource) = resource_arg(&args[0]) else {
+        return Ok(Value::Bool(false));
+    };
+    let mut bytes = string_arg("gzwrite", &args[1])?.as_bytes().to_vec();
+    if let Some(length) = args.get(2) {
+        bytes.truncate(int_arg("gzwrite", length)?.max(0) as usize);
+    }
+    Ok(resource
+        .write_bytes(&bytes)
+        .map_or(Value::Bool(false), |written| Value::Int(written as i64)))
+}
+
+fn builtin_gzclose(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_zlib_arity("gzclose", args.len(), 1, 1)?;
+    Ok(resource_arg(&args[0]).map_or(Value::Bool(false), |resource| Value::Bool(resource.close())))
+}
 
 fn builtin_gzencode(
     _context: &mut BuiltinContext<'_>,
@@ -204,4 +307,16 @@ fn decode_with(mut decoder: impl Read) -> BuiltinResult {
     } else {
         Value::Bool(false)
     })
+}
+
+fn expect_zlib_arity(
+    name: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), crate::builtins::BuiltinError> {
+    if actual < min || actual > max {
+        return Err(arity_error(name, "the expected number of argument(s)"));
+    }
+    Ok(())
 }

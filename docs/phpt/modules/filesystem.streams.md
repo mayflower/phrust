@@ -200,3 +200,11 @@ Validation:
 No new known-gap IDs were added for this selected gate. Network streams, PHAR,
 extension-backed wrappers, user stream wrappers, and stream filters remain
 outside this module scope.
+
+## Request Filesystem Overlay
+
+The `wp.request-filesystem` overlay adds selected coverage for permission/stat
+helpers, `sys_get_temp_dir`, `tempnam`, `tmpfile`, request-local `umask`,
+directory iteration, stream context defaults/options, and local
+`stream_set_timeout` behavior without changing the closed
+`filesystem.streams` selected count.

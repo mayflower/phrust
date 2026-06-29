@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("basename", builtin_basename, BuiltinCompatibility::Php),
     BuiltinEntry::new("chdir", builtin_chdir, BuiltinCompatibility::Php),
+    BuiltinEntry::new("chmod", builtin_chmod, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "clearstatcache",
         builtin_clearstatcache,
@@ -18,6 +19,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
     BuiltinEntry::new("copy", builtin_copy, BuiltinCompatibility::Php),
     BuiltinEntry::new("dirname", builtin_dirname, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "disk_free_space",
+        builtin_disk_free_space,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "disk_total_space",
+        builtin_disk_total_space,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "file_exists",
         builtin_file_exists,
@@ -33,7 +44,10 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_file_put_contents,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("filegroup", builtin_filegroup, BuiltinCompatibility::Php),
     BuiltinEntry::new("filemtime", builtin_filemtime, BuiltinCompatibility::Php),
+    BuiltinEntry::new("fileowner", builtin_fileowner, BuiltinCompatibility::Php),
+    BuiltinEntry::new("fileperms", builtin_fileperms, BuiltinCompatibility::Php),
     BuiltinEntry::new("filesize", builtin_filesize, BuiltinCompatibility::Php),
     BuiltinEntry::new("filetype", builtin_filetype, BuiltinCompatibility::Php),
     BuiltinEntry::new("getcwd", builtin_getcwd, BuiltinCompatibility::Php),
@@ -69,9 +83,15 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("rename", builtin_rename, BuiltinCompatibility::Php),
     BuiltinEntry::new("rmdir", builtin_rmdir, BuiltinCompatibility::Php),
     BuiltinEntry::new("stat", builtin_stat, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "sys_get_temp_dir",
+        builtin_sys_get_temp_dir,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("tempnam", builtin_tempnam, BuiltinCompatibility::Php),
     BuiltinEntry::new("tmpfile", builtin_tmpfile, BuiltinCompatibility::Php),
     BuiltinEntry::new("touch", builtin_touch, BuiltinCompatibility::Php),
+    BuiltinEntry::new("umask", builtin_umask, BuiltinCompatibility::Php),
     BuiltinEntry::new("unlink", builtin_unlink, BuiltinCompatibility::Php),
 ];
 
@@ -192,6 +212,12 @@ pub(in crate::builtins::modules) fn builtin_file_exists(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("file_exists", &args, 1)?;
+    let path = string_arg("file_exists", &args[0])?.to_string_lossy();
+    if crate::phar::is_phar_uri(&path) {
+        return Ok(Value::Bool(
+            crate::phar::read_uri(&path, context.cwd(), context.filesystem_capabilities()).is_ok(),
+        ));
+    }
     Ok(Value::Bool(
         metadata_for_arg(context, "file_exists", &args[0], true)?.is_some(),
     ))
@@ -203,6 +229,12 @@ pub(in crate::builtins::modules) fn builtin_is_file(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("is_file", &args, 1)?;
+    let path = string_arg("is_file", &args[0])?.to_string_lossy();
+    if crate::phar::is_phar_uri(&path) {
+        return Ok(Value::Bool(
+            crate::phar::read_uri(&path, context.cwd(), context.filesystem_capabilities()).is_ok(),
+        ));
+    }
     Ok(Value::Bool(
         metadata_for_arg(context, "is_file", &args[0], true)?
             .is_some_and(|metadata| metadata.is_file()),
@@ -294,6 +326,42 @@ pub(in crate::builtins::modules) fn builtin_filemtime(
         }))
 }
 
+pub(in crate::builtins::modules) fn builtin_fileperms(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("fileperms", &args, 1)?;
+    Ok(metadata_for_arg(context, "fileperms", &args[0], true)?
+        .map_or(Value::Bool(false), |metadata| {
+            Value::Int(metadata_mode(&metadata) as i64)
+        }))
+}
+
+pub(in crate::builtins::modules) fn builtin_fileowner(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("fileowner", &args, 1)?;
+    Ok(metadata_for_arg(context, "fileowner", &args[0], true)?
+        .map_or(Value::Bool(false), |metadata| {
+            Value::Int(metadata_owner(&metadata) as i64)
+        }))
+}
+
+pub(in crate::builtins::modules) fn builtin_filegroup(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("filegroup", &args, 1)?;
+    Ok(metadata_for_arg(context, "filegroup", &args[0], true)?
+        .map_or(Value::Bool(false), |metadata| {
+            Value::Int(metadata_group(&metadata) as i64)
+        }))
+}
+
 pub(in crate::builtins::modules) fn builtin_filetype(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -304,6 +372,70 @@ pub(in crate::builtins::modules) fn builtin_filetype(
         .map_or(Value::Bool(false), |metadata| {
             Value::string(file_type_name(&metadata))
         }))
+}
+
+pub(in crate::builtins::modules) fn builtin_chmod(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("chmod", &args, 2)?;
+    let path = resolve_runtime_path(context, &string_arg("chmod", &args[0])?.to_string_lossy());
+    if !context.filesystem_capabilities().allows_path(&path) {
+        return Ok(Value::Bool(false));
+    }
+    let mode = int_arg("chmod", &args[1])?;
+    Ok(Value::Bool(
+        set_permissions_mode(&path, mode as u32).is_ok(),
+    ))
+}
+
+pub(in crate::builtins::modules) fn builtin_umask(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("umask", "zero or one argument(s)"));
+    }
+    let previous = context.filesystem_state().umask();
+    if let Some(value) = args.first() {
+        let mode = int_arg("umask", value)?;
+        context.filesystem_state().set_umask(mode);
+    }
+    Ok(Value::Int(previous))
+}
+
+pub(in crate::builtins::modules) fn builtin_sys_get_temp_dir(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("sys_get_temp_dir", &args, 0)?;
+    let path = context
+        .filesystem_capabilities()
+        .first_allowed_root()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    Ok(Value::string(path.to_string_lossy().as_bytes().to_vec()))
+}
+
+pub(in crate::builtins::modules) fn builtin_disk_free_space(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("disk_free_space", &args, 1)?;
+    disk_space_value(context, "disk_free_space", &args[0])
+}
+
+pub(in crate::builtins::modules) fn builtin_disk_total_space(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("disk_total_space", &args, 1)?;
+    disk_space_value(context, "disk_total_space", &args[0])
 }
 
 pub(in crate::builtins::modules) fn builtin_stat(
@@ -435,11 +567,6 @@ pub(in crate::builtins::modules) fn builtin_move_uploaded_file(
         .upload_registry()
         .is_some_and(|registry| registry.is_active_upload(&from))
     {
-        context.php_warning(
-            "E_PHP_UPLOAD_INVALID_SOURCE",
-            "move_uploaded_file(): source is not a valid uploaded file",
-            span.clone(),
-        );
         return Ok(Value::Bool(false));
     }
 
@@ -517,7 +644,23 @@ pub(in crate::builtins::modules) fn builtin_mkdir(
     if !context.filesystem_capabilities().allows_path(&path) {
         return Ok(Value::Bool(false));
     }
-    Ok(Value::Bool(fs::create_dir(&path).is_ok()))
+    let recursive = args
+        .get(2)
+        .is_some_and(|value| matches!(deref_value(value), Value::Bool(true)));
+    let result = if recursive {
+        fs::create_dir_all(&path)
+    } else {
+        fs::create_dir(&path)
+    };
+    if result.is_ok() {
+        if let Some(mode_value) = args.get(1) {
+            let mode = int_arg("mkdir", mode_value)?;
+            let masked = mode & !context.filesystem_state().umask();
+            let _ = set_permissions_mode(&path, masked as u32);
+        }
+        return Ok(Value::Bool(true));
+    }
+    Ok(Value::Bool(false))
 }
 
 pub(in crate::builtins::modules) fn builtin_rmdir(
@@ -659,6 +802,14 @@ pub(in crate::builtins::modules) fn builtin_chdir(
     }
     context.set_cwd(path);
     Ok(Value::Bool(true))
+}
+
+fn disk_space_value(context: &mut BuiltinContext<'_>, name: &str, value: &Value) -> BuiltinResult {
+    let path = resolve_runtime_path(context, &string_arg(name, value)?.to_string_lossy());
+    if !context.filesystem_capabilities().allows_path(&path) || !path.exists() {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::float(1_099_511_627_776.0))
 }
 
 #[cfg(test)]

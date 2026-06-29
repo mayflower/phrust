@@ -39,3 +39,9 @@
 
 - Full libmagic parity remains out of scope. Add MIME patterns only with a
   caller-backed fixture and deterministic expected output.
+
+## Request Filesystem Overlay
+
+The `wp.request-filesystem` overlay reuses the deterministic fileinfo MIME
+surface for package/archive media checks. Full host libmagic parity remains
+outside the selected gate.

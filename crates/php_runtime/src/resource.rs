@@ -1,10 +1,13 @@
 //! Resource handles and stream metadata for standard-library.
 
 use crate::{ArrayKey, PhpArray, PhpString, Value};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
@@ -339,6 +342,11 @@ enum StreamData {
         buffer: Vec<u8>,
         cursor: usize,
     },
+    GzipFile {
+        path: PathBuf,
+        buffer: Vec<u8>,
+        cursor: usize,
+    },
     Directory {
         path: PathBuf,
         entries: Vec<String>,
@@ -427,7 +435,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => {
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
                 if *cursor > buffer.len() {
                     buffer.resize(*cursor, 0);
                 }
@@ -467,7 +476,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => {
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
                 let end = (*cursor).saturating_add(length).min(buffer.len());
                 let bytes = buffer[*cursor..end].to_vec();
                 *cursor = end;
@@ -500,7 +510,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => {
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
                 let remaining = &buffer[*cursor..];
                 let len = remaining
                     .iter()
@@ -538,7 +549,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => {
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
                 let bytes = buffer.get(*cursor..).unwrap_or_default().to_vec();
                 *cursor = buffer.len();
                 Ok(bytes)
@@ -575,7 +587,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { cursor, .. }
             | StreamData::Stdio { cursor, .. }
-            | StreamData::File { cursor, .. } => *cursor = offset,
+            | StreamData::File { cursor, .. }
+            | StreamData::GzipFile { cursor, .. } => *cursor = offset,
             StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
                 return Err(StreamOpenError::new(
                     "E_PHP_RUNTIME_STREAM_NOT_SEEKABLE",
@@ -604,7 +617,8 @@ impl ResourceRef {
         match &mut state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => {
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
                 buffer.resize(length, 0);
                 if *cursor > length {
                     *cursor = length;
@@ -633,6 +647,7 @@ impl ResourceRef {
             StreamData::Memory { cursor, .. }
             | StreamData::Stdio { cursor, .. }
             | StreamData::File { cursor, .. }
+            | StreamData::GzipFile { cursor, .. }
             | StreamData::Directory { cursor, .. } => *cursor,
             StreamData::Context { .. } => 0,
             StreamData::FileInfo => 0,
@@ -651,7 +666,8 @@ impl ResourceRef {
         Ok(match &state.data {
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
-            | StreamData::File { buffer, cursor, .. } => *cursor >= buffer.len(),
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => *cursor >= buffer.len(),
             StreamData::Directory {
                 entries, cursor, ..
             } => *cursor >= entries.len(),
@@ -900,6 +916,26 @@ impl ResourceTable {
         resource
     }
 
+    /// Registers a gzip file resource backed by decompressed bytes.
+    pub fn register_gzip_file(
+        &mut self,
+        path: PathBuf,
+        mode: impl Into<String>,
+        flags: StreamFlags,
+        buffer: Vec<u8>,
+        cursor: usize,
+    ) -> ResourceRef {
+        self.register_stream_data(
+            flags,
+            StreamMetadata::new("zlib", "ZLIB", mode, path.to_string_lossy()),
+            StreamData::GzipFile {
+                path,
+                buffer,
+                cursor,
+            },
+        )
+    }
+
     /// Looks up a resource by ID.
     #[must_use]
     pub fn get(&self, id: ResourceId) -> Option<ResourceRef> {
@@ -1126,7 +1162,41 @@ fn flush_file_data(data: &StreamData) -> Result<(), StreamOpenError> {
             )
         })?;
     }
+    if let StreamData::GzipFile { path, buffer, .. } = data {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(buffer).map_err(|error| {
+            StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_FLUSH",
+                format!("failed to encode gzip `{}`: {error}", path.display()),
+            )
+        })?;
+        let encoded = encoder.finish().map_err(|error| {
+            StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_FLUSH",
+                format!("failed to finish gzip `{}`: {error}", path.display()),
+            )
+        })?;
+        std::fs::write(path, encoded).map_err(|error| {
+            StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_FLUSH",
+                format!("failed to flush `{}`: {error}", path.display()),
+            )
+        })?;
+    }
     Ok(())
+}
+
+/// Decodes gzip bytes for gzip-backed resources.
+pub fn decode_gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, StreamOpenError> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).map_err(|error| {
+        StreamOpenError::new(
+            "E_PHP_RUNTIME_GZIP_DECODE",
+            format!("failed to decode gzip stream: {error}"),
+        )
+    })?;
+    Ok(output)
 }
 
 fn is_remote_uri(uri: &str) -> bool {

@@ -2,9 +2,9 @@
 
 use crate::{
     FilesystemCapabilities, IniRegistry, MysqlState, OutputBuffer, PHP_E_DEPRECATED, PHP_E_WARNING,
-    PcreCache, PhpDiagnosticChannel, PhpDiagnosticDisplayOptions, ReferenceCell, ResourceTable,
-    RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, SessionState, UploadRegistry,
-    Value, datetime, emit_php_diagnostic, pcre,
+    PcreCache, PhpArray, PhpDiagnosticChannel, PhpDiagnosticDisplayOptions, ReferenceCell,
+    ResourceTable, RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, SessionState,
+    UploadRegistry, Value, datetime, emit_php_diagnostic, pcre,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -223,6 +223,52 @@ fn ttl_expiration(ttl: i64) -> Option<SystemTime> {
     }
 }
 
+/// Request-local filesystem process state exposed through standard builtins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemRuntimeState {
+    umask: i64,
+}
+
+impl Default for FilesystemRuntimeState {
+    fn default() -> Self {
+        Self { umask: 0o022 }
+    }
+}
+
+impl FilesystemRuntimeState {
+    /// Returns the current request-local umask.
+    #[must_use]
+    pub const fn umask(&self) -> i64 {
+        self.umask
+    }
+
+    /// Updates the request-local umask and returns the previous value.
+    pub fn set_umask(&mut self, umask: i64) -> i64 {
+        let previous = self.umask;
+        self.umask = umask & 0o777;
+        previous
+    }
+}
+
+/// Request-local default stream context options.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StreamContextState {
+    default_options: PhpArray,
+}
+
+impl StreamContextState {
+    /// Returns a snapshot of the current default stream context options.
+    #[must_use]
+    pub fn default_options(&self) -> PhpArray {
+        self.default_options.clone()
+    }
+
+    /// Replaces default stream context options.
+    pub fn set_default_options(&mut self, options: PhpArray) {
+        self.default_options = options;
+    }
+}
+
 /// Source location passed to internal builtins.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeSourceSpan {
@@ -258,6 +304,10 @@ pub struct BuiltinContext<'a> {
     iconv_state_slot: Option<&'a mut IconvEncodingState>,
     apcu_state: ApcuState,
     apcu_state_slot: Option<&'a mut ApcuState>,
+    filesystem_state: FilesystemRuntimeState,
+    filesystem_state_slot: Option<&'a mut FilesystemRuntimeState>,
+    stream_context_state: StreamContextState,
+    stream_context_state_slot: Option<&'a mut StreamContextState>,
     mb_internal_encoding: String,
     session_state: Option<&'a mut SessionState>,
     session_global: Option<ReferenceCell>,
@@ -293,6 +343,10 @@ impl<'a> BuiltinContext<'a> {
             iconv_state_slot: None,
             apcu_state: ApcuState::default(),
             apcu_state_slot: None,
+            filesystem_state: FilesystemRuntimeState::default(),
+            filesystem_state_slot: None,
+            stream_context_state: StreamContextState::default(),
+            stream_context_state_slot: None,
             mb_internal_encoding: "UTF-8".to_owned(),
             session_state: None,
             session_global: None,
@@ -333,6 +387,10 @@ impl<'a> BuiltinContext<'a> {
             iconv_state_slot: None,
             apcu_state: ApcuState::default(),
             apcu_state_slot: None,
+            filesystem_state: FilesystemRuntimeState::default(),
+            filesystem_state_slot: None,
+            stream_context_state: StreamContextState::default(),
+            stream_context_state_slot: None,
             mb_internal_encoding: "UTF-8".to_owned(),
             session_state: None,
             session_global: None,
@@ -563,6 +621,32 @@ impl<'a> BuiltinContext<'a> {
         match self.apcu_state_slot.as_deref_mut() {
             Some(state) => state,
             None => &mut self.apcu_state,
+        }
+    }
+
+    /// Sets request-local filesystem builtin state.
+    pub fn set_filesystem_state(&mut self, state: &'a mut FilesystemRuntimeState) {
+        self.filesystem_state_slot = Some(state);
+    }
+
+    /// Mutable request-local filesystem builtin state.
+    pub fn filesystem_state(&mut self) -> &mut FilesystemRuntimeState {
+        match self.filesystem_state_slot.as_deref_mut() {
+            Some(state) => state,
+            None => &mut self.filesystem_state,
+        }
+    }
+
+    /// Sets request-local stream context default state.
+    pub fn set_stream_context_state(&mut self, state: &'a mut StreamContextState) {
+        self.stream_context_state_slot = Some(state);
+    }
+
+    /// Mutable request-local stream context default state.
+    pub fn stream_context_state(&mut self) -> &mut StreamContextState {
+        match self.stream_context_state_slot.as_deref_mut() {
+            Some(state) => state,
+            None => &mut self.stream_context_state,
         }
     }
 

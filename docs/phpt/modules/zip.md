@@ -40,3 +40,9 @@
 
 - Keep archive mutation and complete metadata parity as future work with
   focused fixtures.
+
+## Request Filesystem Overlay
+
+The `wp.request-filesystem` overlay reuses the local read/extract `ZipArchive`
+MVP for package archive checks. ZIP writing, encryption, comments, passwords,
+and complete metadata parity remain outside the selected gate.

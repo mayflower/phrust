@@ -58,8 +58,8 @@ pub mod api {
     pub use crate::autoload::AutoloadRegistry;
     pub use crate::builtins::{
         ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
-        BuiltinRegistry, BuiltinResult, IconvEncodingState, InternalFunction, RuntimeSourceSpan,
-        StrtokState,
+        BuiltinRegistry, BuiltinResult, FilesystemRuntimeState, IconvEncodingState,
+        InternalFunction, RuntimeSourceSpan, StreamContextState, StrtokState,
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
@@ -180,7 +180,8 @@ pub use array::{
 pub use autoload::AutoloadRegistry;
 pub use builtins::{
     ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinRegistry,
-    BuiltinResult, IconvEncodingState, InternalFunction, RuntimeSourceSpan, StrtokState,
+    BuiltinResult, FilesystemRuntimeState, IconvEncodingState, InternalFunction, RuntimeSourceSpan,
+    StreamContextState, StrtokState,
 };
 pub use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,

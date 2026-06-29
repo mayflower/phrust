@@ -40,3 +40,9 @@
 
 - Keep this layer focused on whole-buffer helpers until runtime streaming APIs
   have a broader owner.
+
+## Request Filesystem Overlay
+
+The `wp.request-filesystem` overlay adds selected gzip file-handle coverage for
+`gzopen`, `gzread`, `gzwrite`, and `gzclose` using deterministic local files.
+It does not introduce stream-filter or network zlib contexts.

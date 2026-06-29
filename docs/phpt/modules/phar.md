@@ -33,6 +33,13 @@
 - `phar://` metadata/stat functions are intentionally narrower than full PHP
   stream-wrapper parity.
 
+## Request Filesystem Overlay
+
+The `wp.request-filesystem` overlay exercises `phar://` package reads through
+`file_exists`, `is_file`, `file_get_contents`, and include behavior. It keeps
+the same read-only local PHAR boundary and does not claim writable archives,
+alias registration, or full metadata/stat parity.
+
 ## Source References
 
 - `ext/phar/phar.c`

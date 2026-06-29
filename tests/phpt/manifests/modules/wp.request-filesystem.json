@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"wp.request-filesystem",
+  "priority":"WordPress request, filesystem, archive, and update primitives",
+  "selected_manifest":"tests/phpt/manifests/modules/wp.request-filesystem.selected.jsonl",
+  "corpus_count":0,
+  "selected_count":7,
+  "pass_count":6,
+  "skip_count":1,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":0,
+  "scope":["multipart upload surface","local filesystem permissions and stat","temporary files","directory iteration","stream contexts","include/require local and phar package reads","PHAR read/include","ZipArchive extraction","zlib gzip file handles","fileinfo MIME detection"],
+  "non_scope":["FPM","FastCGI","CGI","Apache SAPI","mod_php","phpdbg","remote filesystem clients","database clients","full libmagic parity","stream filters","writable PHAR archives"],
+  "target_gates":["nix develop -c cargo test -p php_server","nix develop -c cargo test -p php_runtime","nix develop -c cargo test -p php_vm","nix develop -c just server-smoke","nix develop -c just phpt-dev-module MODULE=wp.request-filesystem","nix develop -c just phpt-dev-module MODULE=filesystem.streams","nix develop -c just phpt-dev-module MODULE=phar","nix develop -c just verify-runtime","nix develop -c just verify-stdlib","nix develop -c just verify-server"],
+  "next_step":"Keep the selected request/filesystem gate green while multipart upload success stays covered by server transport tests."
+}

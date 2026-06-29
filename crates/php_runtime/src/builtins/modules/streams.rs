@@ -10,6 +10,7 @@ use std::path::Path;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("closedir", builtin_closedir, BuiltinCompatibility::Php),
+    BuiltinEntry::new("dir", builtin_dir, BuiltinCompatibility::Php),
     BuiltinEntry::new("fclose", builtin_fclose, BuiltinCompatibility::Php),
     BuiltinEntry::new("feof", builtin_feof, BuiltinCompatibility::Php),
     BuiltinEntry::new("fflush", builtin_fflush, BuiltinCompatibility::Php),
@@ -34,8 +35,18 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "stream_context_get_default",
+        builtin_stream_context_get_default,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "stream_context_get_options",
         builtin_stream_context_get_options,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "stream_context_set_default",
+        builtin_stream_context_set_default,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -71,6 +82,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
         "stream_isatty",
         builtin_stream_isatty,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "stream_set_timeout",
+        builtin_stream_set_timeout,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
@@ -353,6 +369,18 @@ pub(in crate::builtins::modules) fn builtin_opendir(
         resources.register_directory(resolved, entries, uri),
     ))
 }
+
+pub(in crate::builtins::modules) fn builtin_dir(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 2 {
+        return Err(arity_error("dir", "one or two argument(s)"));
+    }
+    builtin_opendir(context, vec![args[0].clone()], span)
+}
+
 pub(in crate::builtins::modules) fn builtin_readdir(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -395,7 +423,8 @@ pub(in crate::builtins::modules) fn builtin_closedir(
     let Some(resources) = context.resources() else {
         return Ok(Value::Bool(false));
     };
-    Ok(Value::Bool(resources.close(resource.id())))
+    let _ = resources.close(resource.id());
+    Ok(Value::Null)
 }
 pub(in crate::builtins::modules) fn builtin_stream_get_wrappers(
     _context: &mut BuiltinContext<'_>,
@@ -545,6 +574,32 @@ pub(in crate::builtins::modules) fn builtin_stream_context_create(
     };
     Ok(Value::Resource(resources.register_stream_context(options)))
 }
+
+pub(in crate::builtins::modules) fn builtin_stream_context_get_default(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error(
+            "stream_context_get_default",
+            "zero or one argument(s)",
+        ));
+    }
+    if let Some(Value::Array(options)) = args.first().map(deref_value) {
+        context
+            .stream_context_state()
+            .set_default_options(options.clone());
+    } else if !args.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    let options = context.stream_context_state().default_options();
+    let Some(resources) = context.resources() else {
+        return Ok(Value::Bool(false));
+    };
+    Ok(Value::Resource(resources.register_stream_context(options)))
+}
+
 pub(in crate::builtins::modules) fn builtin_stream_context_get_options(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -558,6 +613,27 @@ pub(in crate::builtins::modules) fn builtin_stream_context_get_options(
         .context_options()
         .map_or(Value::Bool(false), Value::Array))
 }
+
+pub(in crate::builtins::modules) fn builtin_stream_context_set_default(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("stream_context_set_default", &args, 1)?;
+    let Value::Array(options) = deref_value(&args[0]) else {
+        return Ok(Value::Bool(false));
+    };
+    context
+        .stream_context_state()
+        .set_default_options(options.clone());
+    let Some(resources) = context.resources() else {
+        return Ok(Value::Bool(false));
+    };
+    Ok(Value::Resource(
+        resources.register_stream_context(options.clone()),
+    ))
+}
+
 pub(in crate::builtins::modules) fn builtin_stream_context_set_option(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -673,6 +749,34 @@ pub(in crate::builtins::modules) fn builtin_stream_isatty(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("stream_isatty", &args, 1)?;
+    Ok(Value::Bool(false))
+}
+
+pub(in crate::builtins::modules) fn builtin_stream_set_timeout(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_error(
+            "stream_set_timeout",
+            "two or three argument(s)",
+        ));
+    }
+    let Some(resource) = resource_arg(&args[0]) else {
+        return Ok(Value::Bool(false));
+    };
+    let seconds = int_arg("stream_set_timeout", &args[1])?;
+    if seconds < 0 {
+        return Ok(Value::Bool(false));
+    }
+    if let Some(microseconds) = args.get(2) {
+        let microseconds = int_arg("stream_set_timeout", microseconds)?;
+        if microseconds < 0 {
+            return Ok(Value::Bool(false));
+        }
+    }
+    let _ = resource;
     Ok(Value::Bool(false))
 }
 

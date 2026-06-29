@@ -778,6 +778,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("boolval", "standard"))
                 .with_function(FunctionDescriptor::php("ceil", "standard"))
                 .with_function(FunctionDescriptor::php("chdir", "standard"))
+                .with_function(FunctionDescriptor::php("chmod", "standard"))
                 .with_function(FunctionDescriptor::php("chr", "standard"))
                 .with_function(FunctionDescriptor::php("class_exists", "standard"))
                 .with_function(FunctionDescriptor::php("call_user_func", "standard"))
@@ -799,6 +800,9 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("define", "standard"))
                 .with_function(FunctionDescriptor::php("defined", "standard"))
                 .with_function(FunctionDescriptor::php("dirname", "standard"))
+                .with_function(FunctionDescriptor::php("dir", "standard"))
+                .with_function(FunctionDescriptor::php("disk_free_space", "standard"))
+                .with_function(FunctionDescriptor::php("disk_total_space", "standard"))
                 .with_function(FunctionDescriptor::php("enum_exists", "standard"))
                 .with_function(FunctionDescriptor::php("error_reporting", "standard"))
                 .with_function(FunctionDescriptor::php("exec", "standard"))
@@ -814,7 +818,10 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("file_exists", "standard"))
                 .with_function(FunctionDescriptor::php("file_get_contents", "standard"))
                 .with_function(FunctionDescriptor::php("file_put_contents", "standard"))
+                .with_function(FunctionDescriptor::php("filegroup", "standard"))
                 .with_function(FunctionDescriptor::php("filemtime", "standard"))
+                .with_function(FunctionDescriptor::php("fileowner", "standard"))
+                .with_function(FunctionDescriptor::php("fileperms", "standard"))
                 .with_function(FunctionDescriptor::php("filesize", "standard"))
                 .with_function(FunctionDescriptor::php("filetype", "standard"))
                 .with_function(FunctionDescriptor::php("floor", "standard"))
@@ -999,7 +1006,15 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("stat", "standard"))
                 .with_function(FunctionDescriptor::php("stream_context_create", "standard"))
                 .with_function(FunctionDescriptor::php(
+                    "stream_context_get_default",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php(
                     "stream_context_get_options",
+                    "standard",
+                ))
+                .with_function(FunctionDescriptor::php(
+                    "stream_context_set_default",
                     "standard",
                 ))
                 .with_function(FunctionDescriptor::php(
@@ -1012,6 +1027,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("stream_get_wrappers", "standard"))
                 .with_function(FunctionDescriptor::php("stream_is_local", "standard"))
                 .with_function(FunctionDescriptor::php("stream_isatty", "standard"))
+                .with_function(FunctionDescriptor::php("stream_set_timeout", "standard"))
                 .with_function(FunctionDescriptor::php(
                     "stream_resolve_include_path",
                     "standard",
@@ -1037,6 +1053,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("strtr", "standard"))
                 .with_function(FunctionDescriptor::php("substr", "standard"))
                 .with_function(FunctionDescriptor::php("system", "standard"))
+                .with_function(FunctionDescriptor::php("sys_get_temp_dir", "standard"))
                 .with_function(FunctionDescriptor::php("tan", "standard"))
                 .with_function(FunctionDescriptor::php("tanh", "standard"))
                 .with_function(FunctionDescriptor::php("tempnam", "standard"))
@@ -1047,6 +1064,7 @@ impl ExtensionRegistry {
                 .with_function(FunctionDescriptor::php("trait_exists", "standard"))
                 .with_function(FunctionDescriptor::php("uasort", "standard"))
                 .with_function(FunctionDescriptor::php("uksort", "standard"))
+                .with_function(FunctionDescriptor::php("umask", "standard"))
                 .with_function(FunctionDescriptor::php("unlink", "standard"))
                 .with_function(FunctionDescriptor::php("unserialize", "standard"))
                 .with_function(FunctionDescriptor::php("urldecode", "standard"))
@@ -1139,6 +1157,46 @@ impl ExtensionRegistry {
                     "IMAGETYPE_AVIF",
                     "standard",
                     ConstantValue::Int(19),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_OK",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_OK),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_INI_SIZE",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_INI_SIZE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_FORM_SIZE",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_FORM_SIZE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_PARTIAL",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_PARTIAL),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_NO_FILE",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_NO_FILE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_NO_TMP_DIR",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_NO_TMP_DIR),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_CANT_WRITE",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_CANT_WRITE),
+                ))
+                .with_constant(ConstantDescriptor::with_value(
+                    "UPLOAD_ERR_EXTENSION",
+                    "standard",
+                    ConstantValue::Int(constants::UPLOAD_ERR_EXTENSION),
                 )),
             ExtensionDescriptor::new("json")
                 .with_function(FunctionDescriptor::php("json_decode", "json"))
@@ -1950,10 +2008,14 @@ impl ExtensionRegistry {
                     ConstantValue::Int(6),
                 )),
             ExtensionDescriptor::new("zlib")
+                .with_function(FunctionDescriptor::php("gzclose", "zlib"))
                 .with_function(FunctionDescriptor::php("gzdeflate", "zlib"))
                 .with_function(FunctionDescriptor::php("gzcompress", "zlib"))
                 .with_function(FunctionDescriptor::php("gzdecode", "zlib"))
                 .with_function(FunctionDescriptor::php("gzencode", "zlib"))
+                .with_function(FunctionDescriptor::php("gzopen", "zlib"))
+                .with_function(FunctionDescriptor::php("gzread", "zlib"))
+                .with_function(FunctionDescriptor::php("gzwrite", "zlib"))
                 .with_function(FunctionDescriptor::php("gzinflate", "zlib"))
                 .with_function(FunctionDescriptor::php("gzuncompress", "zlib"))
                 .with_function(FunctionDescriptor::php("zlib_decode", "zlib"))
@@ -2988,9 +3050,14 @@ mod tests {
             "is_writable",
             "filesize",
             "filemtime",
+            "fileperms",
+            "fileowner",
+            "filegroup",
             "filetype",
             "stat",
             "lstat",
+            "chmod",
+            "umask",
             "clearstatcache",
         ] {
             assert!(
@@ -3027,6 +3094,9 @@ mod tests {
             "touch",
             "tempnam",
             "tmpfile",
+            "sys_get_temp_dir",
+            "disk_free_space",
+            "disk_total_space",
         ] {
             assert!(
                 registry.enabled_php_function(name).is_some(),
@@ -3045,6 +3115,7 @@ mod tests {
             "rewinddir",
             "closedir",
             "scandir",
+            "dir",
             "glob",
             "getcwd",
             "chdir",
@@ -3066,11 +3137,14 @@ mod tests {
             "stream_get_contents",
             "stream_copy_to_stream",
             "stream_context_create",
+            "stream_context_get_default",
             "stream_context_get_options",
+            "stream_context_set_default",
             "stream_context_set_option",
             "stream_resolve_include_path",
             "stream_is_local",
             "stream_isatty",
+            "stream_set_timeout",
         ] {
             assert!(
                 registry.enabled_php_function(name).is_some(),

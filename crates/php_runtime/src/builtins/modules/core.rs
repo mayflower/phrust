@@ -2825,6 +2825,77 @@ pub(in crate::builtins::modules) fn metadata_mtime(metadata: &Metadata) -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
+#[cfg(unix)]
+pub(in crate::builtins::modules) fn metadata_mode(metadata: &Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+pub(in crate::builtins::modules) fn metadata_mode(metadata: &Metadata) -> u32 {
+    let file_type = if metadata.is_dir() {
+        0o040000
+    } else if metadata.is_file() {
+        0o100000
+    } else {
+        0
+    };
+    let permissions = if metadata.permissions().readonly() {
+        0o444
+    } else if metadata.is_dir() {
+        0o777
+    } else {
+        0o666
+    };
+    file_type | permissions
+}
+
+#[cfg(unix)]
+pub(in crate::builtins::modules) fn metadata_owner(metadata: &Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.uid()
+}
+
+#[cfg(not(unix))]
+pub(in crate::builtins::modules) fn metadata_owner(_metadata: &Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+pub(in crate::builtins::modules) fn metadata_group(metadata: &Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.gid()
+}
+
+#[cfg(not(unix))]
+pub(in crate::builtins::modules) fn metadata_group(_metadata: &Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+pub(in crate::builtins::modules) fn set_permissions_mode(
+    path: &Path,
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = fs::Permissions::from_mode(mode & 0o7777);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+pub(in crate::builtins::modules) fn set_permissions_mode(
+    path: &Path,
+    mode: u32,
+) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    fs::set_permissions(path, permissions)
+}
+
 pub(in crate::builtins::modules) fn file_type_name(metadata: &Metadata) -> &'static str {
     let file_type = metadata.file_type();
     if file_type.is_file() {
@@ -2841,13 +2912,7 @@ pub(in crate::builtins::modules) fn file_type_name(metadata: &Metadata) -> &'sta
 pub(in crate::builtins::modules) fn stat_array(metadata: Metadata) -> Value {
     let size = metadata.len() as i64;
     let mtime = metadata_mtime(&metadata);
-    let mode = if metadata.is_dir() {
-        0o040000
-    } else if metadata.is_file() {
-        0o100000
-    } else {
-        0
-    };
+    let mode = metadata_mode(&metadata) as i64;
     let mut array = crate::PhpArray::new();
     array.insert(ArrayKey::Int(2), Value::Int(mode));
     array.insert(ArrayKey::Int(7), Value::Int(size));
@@ -8344,7 +8409,7 @@ mod tests {
                 capabilities,
                 &mut resources,
             ),
-            Value::Bool(true)
+            Value::Null
         );
 
         let _ = std::fs::remove_dir_all(root);

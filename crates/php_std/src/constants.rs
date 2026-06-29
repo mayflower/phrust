@@ -219,6 +219,23 @@ pub const STR_PAD_RIGHT: i64 = 1;
 /// `str_pad()` both-sides padding selector.
 pub const STR_PAD_BOTH: i64 = 2;
 
+/// Successful file upload.
+pub const UPLOAD_ERR_OK: i64 = 0;
+/// Uploaded file exceeded the configured upload max filesize.
+pub const UPLOAD_ERR_INI_SIZE: i64 = 1;
+/// Uploaded file exceeded the form-specified max filesize.
+pub const UPLOAD_ERR_FORM_SIZE: i64 = 2;
+/// Uploaded file was only partially received.
+pub const UPLOAD_ERR_PARTIAL: i64 = 3;
+/// No file was uploaded.
+pub const UPLOAD_ERR_NO_FILE: i64 = 4;
+/// Missing temporary upload directory.
+pub const UPLOAD_ERR_NO_TMP_DIR: i64 = 6;
+/// Uploaded file could not be written to disk.
+pub const UPLOAD_ERR_CANT_WRITE: i64 = 7;
+/// Upload stopped by an extension.
+pub const UPLOAD_ERR_EXTENSION: i64 = 8;
+
 /// Converts registry constant metadata into a runtime value.
 #[must_use]
 pub fn constant_to_value(value: ConstantValue) -> Value {
@@ -316,6 +333,14 @@ mod tests {
         assert_eq!(PHP_ROUND_HALF_DOWN, 2);
         assert_eq!(PHP_ROUND_HALF_EVEN, 3);
         assert_eq!(PHP_ROUND_HALF_ODD, 4);
+        assert_eq!(UPLOAD_ERR_OK, 0);
+        assert_eq!(UPLOAD_ERR_INI_SIZE, 1);
+        assert_eq!(UPLOAD_ERR_FORM_SIZE, 2);
+        assert_eq!(UPLOAD_ERR_PARTIAL, 3);
+        assert_eq!(UPLOAD_ERR_NO_FILE, 4);
+        assert_eq!(UPLOAD_ERR_NO_TMP_DIR, 6);
+        assert_eq!(UPLOAD_ERR_CANT_WRITE, 7);
+        assert_eq!(UPLOAD_ERR_EXTENSION, 8);
         assert_eq!(M_PI.to_f64(), std::f64::consts::PI);
         assert_eq!(M_SQRTPI.to_f64(), 1.772453850905516);
         assert_eq!(M_EULER.to_f64(), 0.5772156649015329);
