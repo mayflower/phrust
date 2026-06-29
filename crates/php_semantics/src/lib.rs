@@ -2355,6 +2355,36 @@ mod tests {
     }
 
     #[test]
+    fn comma_separated_class_constants_lower_as_separate_items() {
+        let result = analyze_source("<?php class C { public const int A = 1, B = 2; }");
+        let module = result
+            .database()
+            .module(result.module().module_id())
+            .expect("module");
+
+        assert!(!result.has_errors());
+        let constants: Vec<_> = module.class_consts().iter().map(|(_, c)| c).collect();
+        assert_eq!(constants.len(), 2);
+        assert_eq!(constants[0].name(), Some("A"));
+        assert_eq!(constants[1].name(), Some("B"));
+
+        let folded: Vec<_> = constants
+            .iter()
+            .map(|constant| {
+                module
+                    .const_exprs()
+                    .get(constant.value().expect("class constant initializer"))
+                    .and_then(|expr| expr.folded_value())
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(
+            folded,
+            vec![Some(hir::ConstValue::Int(1)), Some(hir::ConstValue::Int(2))]
+        );
+    }
+
+    #[test]
     fn attributes_are_lowered_with_targets_args_and_repetition() {
         let result = analyze_source(
             "<?php #[Attr('a'), Attr('b')] class C { #[Prop] public string $p = 'x'; public function m(#[Param(1)] $v): void {} }",

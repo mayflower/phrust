@@ -119,6 +119,12 @@ pub struct ClassPropertyEntry {
     pub name: String,
     /// Constant-pool default when the MVP can lower it.
     pub default: Option<ConstId>,
+    /// Runtime-resolved class constant default when the target class may be loaded dynamically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_class_constant: Option<ClassConstantReference>,
+    /// Runtime-resolved named constant default for values created by `define()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_named_constant: Option<NamedConstantReference>,
     /// Optional Semantic frontend lowered runtime type enforced by the VM MVP.
     pub type_: Option<IrReturnType>,
     /// Property flags captured from Semantic frontend.
@@ -166,6 +172,12 @@ pub struct ClassConstantEntry {
     pub name: String,
     /// Constant-pool value when the MVP can lower it.
     pub value: Option<ConstId>,
+    /// Runtime-resolved class constant value when the target class may be loaded dynamically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_class_constant: Option<ClassConstantReference>,
+    /// Runtime-resolved named constant value for values created by `define()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_named_constant: Option<NamedConstantReference>,
     /// PHP doc comment attached to this class constant declaration.
     pub doc_comment: Option<String>,
     /// Constant flags captured from Semantic frontend.
@@ -174,6 +186,28 @@ pub struct ClassConstantEntry {
     pub attributes: Vec<AttributeEntry>,
     /// Source span for the class constant declaration.
     pub span: IrSpan,
+}
+
+/// Class constant reference preserved for runtime initializer resolution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClassConstantReference {
+    /// Normalized target class name.
+    pub class_name: String,
+    /// PHP-visible target class spelling.
+    #[serde(default)]
+    pub display_class_name: String,
+    /// Source-spelled constant name.
+    pub constant_name: String,
+}
+
+/// Named constant reference preserved for runtime initializer resolution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NamedConstantReference {
+    /// Candidate names in lookup order.
+    pub names: Vec<String>,
+    /// PHP-visible source spelling.
+    #[serde(default)]
+    pub display_name: String,
 }
 
 /// Class constant flags.

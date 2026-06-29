@@ -21,12 +21,12 @@ use crate::lower::types::{
 };
 use crate::symbols::resolution::{NameResolver, ResolveContext, ResolvedName};
 use php_ast::{
-    AstNode, AstToken, ClassConstDecl, ClassDecl, EnumCase, EnumDecl, InterfaceDecl, MemberDecl,
-    MethodDecl, PropertyDecl, TokenView, TraitDecl, TraitUseDecl, descendant_nodes,
+    AstNode, AstToken, ClassConstDecl, ClassDecl, EnumCase, EnumDecl, ExprNode, InterfaceDecl,
+    MemberDecl, MethodDecl, PropertyDecl, TokenView, TraitDecl, TraitUseDecl, descendant_nodes,
     descendant_tokens, modifier_tokens, syntax_child_nodes, syntax_child_tokens,
 };
 use php_source::TextRange;
-use php_syntax::SyntaxNode;
+use php_syntax::{SyntaxElement, SyntaxNode};
 
 /// Collects structural class-like HIR inside one top-level node.
 pub fn collect_class_likes_in_node(
@@ -264,22 +264,32 @@ impl ClassLikeLowerer<'_> {
                     ));
                 }
                 Some(MemberDecl::ClassConst(class_const)) => {
-                    let name = class_const.name_text().map(str::to_owned);
-                    if let Some(name) = &name
-                        && !seen_consts.insert(name.clone())
-                    {
-                        self.error(
-                            DiagnosticId::DuplicateClassMember,
-                            format!("duplicate class constant `{name}`"),
-                            class_const.text_range(),
-                        );
+                    let items = class_const_items(class_const.syntax());
+                    let items = if items.is_empty() {
+                        vec![ClassConstItem {
+                            name: class_const.name_text().map(str::to_owned),
+                            value_range: None,
+                        }]
+                    } else {
+                        items
+                    };
+                    for item in items {
+                        if let Some(name) = &item.name
+                            && !seen_consts.insert(name.clone())
+                        {
+                            self.error(
+                                DiagnosticId::DuplicateClassMember,
+                                format!("duplicate class constant `{name}`"),
+                                class_const.text_range(),
+                            );
+                        }
+                        let id = self.alloc_class_const(class_like_id, class_const, &item);
+                        members.push(ClassLikeMember::with_id(
+                            ClassLikeMemberKind::ClassConstant,
+                            item.name,
+                            ClassLikeMemberId::ClassConstant(id),
+                        ));
                     }
-                    let id = self.alloc_class_const(class_like_id, class_const);
-                    members.push(ClassLikeMember::with_id(
-                        ClassLikeMemberKind::ClassConstant,
-                        name,
-                        ClassLikeMemberId::ClassConstant(id),
-                    ));
                 }
                 Some(MemberDecl::TraitUse(trait_use)) => {
                     let id = self.alloc_trait_use(class_like_id, trait_use);
@@ -591,10 +601,11 @@ impl ClassLikeLowerer<'_> {
         &mut self,
         class_like_id: ClassLikeId,
         class_const: ClassConstDecl<'_>,
+        item: &ClassConstItem,
     ) -> ConstId {
         let const_hir = HirClassConst::new(
             class_like_id,
-            class_const.name_text().map(str::to_owned),
+            item.name.clone(),
             collect_modifier_set(class_const.syntax()),
             self.type_id_in_node(class_const.syntax(), TypeContext::ClassConstant)
                 .or_else(|| {
@@ -610,10 +621,14 @@ impl ClassLikeLowerer<'_> {
                         )
                     })
                 }),
-            self.const_expr_id_in_node(
-                class_const.syntax(),
-                ConstExprContext::ClassConstInitializer,
-            ),
+            if let Some(range) = item.value_range {
+                self.const_expr_id_for_range(range, ConstExprContext::ClassConstInitializer)
+            } else {
+                self.const_expr_id_in_node(
+                    class_const.syntax(),
+                    ConstExprContext::ClassConstInitializer,
+                )
+            },
             self.collect_attribute_ids(class_const.syntax()),
         );
         let id = self
@@ -667,6 +682,21 @@ impl ClassLikeLowerer<'_> {
         module.const_exprs().iter().find_map(|(id, expr)| {
             let span = self.database.source_map().span(id)?;
             (expr.context() == context && contains_range(node.text_range(), span)).then_some(id)
+        })
+    }
+
+    fn const_expr_id_for_range(
+        &self,
+        range: TextRange,
+        context: ConstExprContext,
+    ) -> Option<ConstExprId> {
+        let module = self
+            .database
+            .module(self.module_id)
+            .expect("module allocated before class-like lowering");
+        module.const_exprs().iter().find_map(|(id, expr)| {
+            let span = self.database.source_map().span(id)?;
+            (expr.context() == context && span == range).then_some(id)
         })
     }
 
@@ -943,6 +973,49 @@ fn property_item_names(node: &SyntaxNode) -> Vec<String> {
         .filter(|token| token.kind().name() == "T_VARIABLE")
         .map(|token| token.text().to_owned())
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct ClassConstItem {
+    name: Option<String>,
+    value_range: Option<TextRange>,
+}
+
+fn class_const_items(node: &SyntaxNode) -> Vec<ClassConstItem> {
+    let mut items = Vec::new();
+    let mut last_string: Option<String> = None;
+    let mut pending_name: Option<String> = None;
+
+    for child in node.children() {
+        match child {
+            SyntaxElement::Token(token) => {
+                if token.kind().is_trivia() {
+                    continue;
+                }
+                match token.kind().name().as_str() {
+                    "T_STRING" => last_string = Some(token.text().to_owned()),
+                    _ if token.text() == "=" => {
+                        pending_name = last_string.take();
+                    }
+                    _ if token.text() == "," => {
+                        pending_name = None;
+                        last_string = None;
+                    }
+                    _ => {}
+                }
+            }
+            SyntaxElement::Node(expr_node) if ExprNode::cast(expr_node).is_some() => {
+                items.push(ClassConstItem {
+                    name: pending_name.take(),
+                    value_range: Some(expr_node.text_range()),
+                });
+                last_string = None;
+            }
+            SyntaxElement::Node(_) => {}
+        }
+    }
+
+    items
 }
 
 fn property_type_tokens(node: &SyntaxNode) -> Option<Vec<TypeToken>> {

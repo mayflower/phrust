@@ -16,9 +16,10 @@ use crate::literal_text::{
     quoted_literal_body,
 };
 use crate::module::{
-    AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
-    ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,
-    ClassPropertyFlags, ClassPropertyHooks, IrUnit, display_class_name, normalize_class_name,
+    AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassConstantReference, ClassEntry,
+    ClassEnumBackingType, ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags,
+    ClassPropertyEntry, ClassPropertyFlags, ClassPropertyHooks, IrUnit, NamedConstantReference,
+    display_class_name, normalize_class_name,
 };
 use crate::operand::Operand;
 use crate::source_map::{IrSourceMapTarget, IrSpan};
@@ -995,6 +996,8 @@ impl LoweringContext<'_> {
                 properties.push(ClassPropertyEntry {
                     name: "name".to_owned(),
                     default: None,
+                    default_class_constant: None,
+                    default_named_constant: None,
                     type_: Some(IrReturnType::String),
                     flags: ClassPropertyFlags {
                         is_readonly: true,
@@ -1008,6 +1011,8 @@ impl LoweringContext<'_> {
                     properties.push(ClassPropertyEntry {
                         name: "value".to_owned(),
                         default: None,
+                        default_class_constant: None,
+                        default_named_constant: None,
                         type_: Some(match backing_type {
                             ClassEnumBackingType::Int => IrReturnType::Int,
                             ClassEnumBackingType::String => IrReturnType::String,
@@ -1130,13 +1135,47 @@ impl LoweringContext<'_> {
                                 .lower_property_default(
                                     item.default(),
                                     Some(&name),
+                                    Some(&display_class_name),
                                     &class_constant_initializers,
                                     &class_parents,
                                 )
                                 .map(|constant| builder.intern_constant(constant));
+                            let default_class_constant = if default.is_none() {
+                                self.lower_const_expr_class_constant_reference(
+                                    item.default(),
+                                    |context| {
+                                        matches!(
+                                            context,
+                                            ConstExprContext::PropertyDefault
+                                                | ConstExprContext::PromotedPropertyDefault
+                                        )
+                                    },
+                                    Some(&name),
+                                    &class_parents,
+                                )
+                            } else {
+                                None
+                            };
+                            let default_named_constant =
+                                if default.is_none() && default_class_constant.is_none() {
+                                    self.lower_const_expr_named_constant_reference(
+                                        item.default(),
+                                        |context| {
+                                            matches!(
+                                                context,
+                                                ConstExprContext::PropertyDefault
+                                                    | ConstExprContext::PromotedPropertyDefault
+                                            )
+                                        },
+                                    )
+                                } else {
+                                    None
+                                };
                             properties.push(ClassPropertyEntry {
                                 name: local_name(item.name()).to_owned(),
                                 default,
+                                default_class_constant,
+                                default_named_constant,
                                 type_: property_type.clone(),
                                 flags: ClassPropertyFlags {
                                     is_static: property.modifiers().is_static(),
@@ -1172,13 +1211,39 @@ impl LoweringContext<'_> {
                             .lower_class_constant_value(
                                 constant.value(),
                                 &name,
+                                &display_class_name,
                                 &class_constant_initializers,
                                 &class_parents,
                             )
                             .map(|constant| builder.intern_constant(constant));
+                        let value_class_constant = if value.is_none() {
+                            self.lower_const_expr_class_constant_reference(
+                                constant.value(),
+                                |context| {
+                                    matches!(context, ConstExprContext::ClassConstInitializer)
+                                },
+                                Some(&name),
+                                &class_parents,
+                            )
+                        } else {
+                            None
+                        };
+                        let value_named_constant =
+                            if value.is_none() && value_class_constant.is_none() {
+                                self.lower_const_expr_named_constant_reference(
+                                    constant.value(),
+                                    |context| {
+                                        matches!(context, ConstExprContext::ClassConstInitializer)
+                                    },
+                                )
+                            } else {
+                                None
+                            };
                         constants.push(ClassConstantEntry {
                             name: constant_name,
                             value,
+                            value_class_constant,
+                            value_named_constant,
                             doc_comment: self
                                 .doc_comment_before(self.span_for(SourceMappedId::from(const_id))),
                             flags: ClassConstantFlags {
@@ -1267,6 +1332,8 @@ impl LoweringContext<'_> {
             properties.push(ClassPropertyEntry {
                 name: property_name,
                 default: None,
+                default_class_constant: None,
+                default_named_constant: None,
                 type_: self.lower_runtime_type(param.type_id()),
                 flags: ClassPropertyFlags {
                     is_private: promotion.visibility() == Visibility::Private,
@@ -2259,10 +2326,14 @@ impl LoweringContext<'_> {
         &self,
         default: Option<ConstExprId>,
         current_class: Option<&str>,
+        current_class_display: Option<&str>,
         class_constants: &ClassConstantInitializerMap,
         class_parents: &ClassParentMap,
     ) -> Option<IrConstant> {
         let default = default?;
+        if let Some(value) = self.lower_const_expr_magic_constant(default, current_class_display) {
+            return Some(value);
+        }
         self.lower_const_expr_value(
             default,
             |context| {
@@ -2281,10 +2352,16 @@ impl LoweringContext<'_> {
         &self,
         value: Option<ConstExprId>,
         current_class: &str,
+        current_class_display: &str,
         class_constants: &ClassConstantInitializerMap,
         class_parents: &ClassParentMap,
     ) -> Option<IrConstant> {
         let value = value?;
+        if let Some(value) =
+            self.lower_const_expr_magic_constant(value, Some(current_class_display))
+        {
+            return Some(value);
+        }
         self.lower_const_expr_value(
             value,
             |context| matches!(context, ConstExprContext::ClassConstInitializer),
@@ -2292,6 +2369,41 @@ impl LoweringContext<'_> {
             class_constants,
             class_parents,
         )
+    }
+
+    fn lower_const_expr_magic_constant(
+        &self,
+        const_expr_id: ConstExprId,
+        current_class_display: Option<&str>,
+    ) -> Option<IrConstant> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let const_expr = module.const_exprs().get(const_expr_id)?;
+        let expr = module.expressions().get(const_expr.expr_id())?;
+        let text = match expr.kind() {
+            HirExprKind::Name { resolution } => resolution.source(),
+            HirExprKind::Literal { text } => text,
+            _ => return None,
+        };
+        let span = self.span_for(SourceMappedId::from(const_expr_id));
+        match text.to_ascii_uppercase().as_str() {
+            "__FILE__" => Some(IrConstant::String(self.options.source_path.clone())),
+            "__DIR__" => Some(IrConstant::String(source_dir(&self.options.source_path))),
+            "__LINE__" => Some(IrConstant::Int(
+                self.source_text
+                    .line_col(BytePos::new(span.start().to_usize()))
+                    .line as i64,
+            )),
+            "__CLASS__" => Some(IrConstant::String(
+                current_class_display.unwrap_or_default().to_owned(),
+            )),
+            "__METHOD__" | "__FUNCTION__" | "__NAMESPACE__" => {
+                Some(IrConstant::String(String::new()))
+            }
+            _ => None,
+        }
     }
 
     fn lower_enum_case_value(&self, value: Option<ConstExprId>) -> Option<IrConstant> {
@@ -2481,6 +2593,89 @@ impl LoweringContext<'_> {
             const_expr
                 .folded_value()
                 .and_then(ir_constant_from_const_value)
+        })
+    }
+
+    fn lower_const_expr_class_constant_reference(
+        &self,
+        const_expr_id: Option<ConstExprId>,
+        accepts_context: impl Fn(ConstExprContext) -> bool,
+        current_class: Option<&str>,
+        class_parents: &ClassParentMap,
+    ) -> Option<ClassConstantReference> {
+        let const_expr_id = const_expr_id?;
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let const_expr = module.const_exprs().get(const_expr_id)?;
+        if !accepts_context(const_expr.context()) || !const_expr.is_allowed() {
+            return None;
+        }
+        let expr = module.expressions().get(const_expr.expr_id())?;
+        let HirExprKind::StaticAccess { target, member } = expr.kind() else {
+            return None;
+        };
+        Some(ClassConstantReference {
+            class_name: class_constant_initializer_target_class(
+                module,
+                (*target)?,
+                current_class,
+                class_parents,
+            )?,
+            display_class_name: class_constant_initializer_target_display_class(
+                module,
+                (*target)?,
+                current_class,
+                class_parents,
+            )?,
+            constant_name: class_constant_initializer_member_name(module, (*member)?)?,
+        })
+    }
+
+    fn lower_const_expr_named_constant_reference(
+        &self,
+        const_expr_id: Option<ConstExprId>,
+        accepts_context: impl Fn(ConstExprContext) -> bool,
+    ) -> Option<NamedConstantReference> {
+        let const_expr_id = const_expr_id?;
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let const_expr = module.const_exprs().get(const_expr_id)?;
+        if !accepts_context(const_expr.context()) || !const_expr.is_allowed() {
+            return None;
+        }
+        let expr = module.expressions().get(const_expr.expr_id())?;
+        let HirExprKind::Name { resolution } = expr.kind() else {
+            return None;
+        };
+        if language_constant(resolution.source()).is_some()
+            || self
+                .lower_const_expr_magic_constant(const_expr_id, None)
+                .is_some()
+        {
+            return None;
+        }
+        let mut names = Vec::new();
+        for candidate in [
+            resolution.resolved(),
+            resolution.fallback(),
+            Some(resolution.source()),
+            resolution.source().strip_prefix('\\'),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let name = candidate.trim_start_matches('\\').to_owned();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then(|| NamedConstantReference {
+            display_name: resolution.source().trim_start_matches('\\').to_owned(),
+            names,
         })
     }
 
@@ -11732,6 +11927,28 @@ fn class_constant_initializer_target_class(
             .or_else(|| resolution.fallback())
             .unwrap_or(source),
     ))
+}
+
+fn class_constant_initializer_target_display_class(
+    module: &HirModule,
+    expr_id: ExprId,
+    current_class: Option<&str>,
+    class_parents: &ClassParentMap,
+) -> Option<String> {
+    let expr = module.expressions().get(expr_id)?;
+    let HirExprKind::Name { resolution } = expr.kind() else {
+        return None;
+    };
+    let source = resolution.source();
+    if source.eq_ignore_ascii_case("self") || source.eq_ignore_ascii_case("static") {
+        return current_class.map(ToOwned::to_owned);
+    }
+    if source.eq_ignore_ascii_case("parent") {
+        return current_class
+            .map(normalize_class_name)
+            .and_then(|class| class_parents.get(&class).cloned().flatten());
+    }
+    Some(source.trim_start_matches('\\').to_owned())
 }
 
 fn class_constant_initializer_member_name(module: &HirModule, expr_id: ExprId) -> Option<String> {

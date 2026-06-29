@@ -52,7 +52,8 @@ use php_ir::instruction::{
     InstructionKind, IrCallArg, IrCallArgValueKind, IrDiagnosticSeverity, TerminatorKind, UnaryOp,
 };
 use php_ir::module::{
-    ClassEntry, ClassPropertyEntry, IrUnit, display_class_name, normalize_class_name,
+    ClassConstantReference, ClassEntry, ClassPropertyEntry, IrUnit, NamedConstantReference,
+    display_class_name, normalize_class_name,
 };
 use php_ir::operand::Operand;
 use php_ir::source_map::IrSpan;
@@ -10947,7 +10948,12 @@ impl Vm {
                         let current = if let Some(value) = state.static_properties.get(&key) {
                             value.clone()
                         } else {
-                            match static_property_default(unit, resolved.class, resolved.property) {
+                            match static_property_default(
+                                compiled,
+                                state,
+                                resolved.class,
+                                resolved.property,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -11457,15 +11463,34 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         };
-                        let runtime_class =
-                            match runtime_class_entry(compiled, state, &class, &|value| {
-                                self.constant_value(compiled.unit(), value)
-                            }) {
-                                Ok(class) => class,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                        let runtime_class = match runtime_class_entry(
+                            compiled,
+                            state,
+                            &class,
+                            &|value| self.constant_value(compiled.unit(), value),
+                            &|reference| class_constant_reference_value(compiled, state, reference),
+                            &|reference| named_constant_reference_value(compiled, state, reference),
+                        ) {
+                            Ok(class) => class,
+                            Err(message) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                            };
+                            }
+                        };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             match self.raise_runtime_error(
                                 compiled,
@@ -12271,15 +12296,34 @@ impl Vm {
                                 }
                             }
                         };
-                        let runtime_class =
-                            match runtime_class_entry(compiled, state, &class, &|value| {
-                                self.constant_value(compiled.unit(), value)
-                            }) {
-                                Ok(class) => class,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                        let runtime_class = match runtime_class_entry(
+                            compiled,
+                            state,
+                            &class,
+                            &|value| self.constant_value(compiled.unit(), value),
+                            &|reference| class_constant_reference_value(compiled, state, reference),
+                            &|reference| named_constant_reference_value(compiled, state, reference),
+                        ) {
+                            Ok(class) => class,
+                            Err(message) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                            };
+                            }
+                        };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             match self.raise_runtime_error(
                                 compiled,
@@ -12448,15 +12492,19 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class =
-                            match runtime_class_entry(compiled, state, &class, &|value| {
-                                self.constant_value(compiled.unit(), value)
-                            }) {
-                                Ok(class) => class,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                            };
+                        let runtime_class = match runtime_class_entry(
+                            compiled,
+                            state,
+                            &class,
+                            &|value| self.constant_value(compiled.unit(), value),
+                            &|reference| class_constant_reference_value(compiled, state, reference),
+                            &|reference| named_constant_reference_value(compiled, state, reference),
+                        ) {
+                            Ok(class) => class,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -12545,15 +12593,19 @@ impl Vm {
                                 );
                             }
                         };
-                        let runtime_class =
-                            match runtime_class_entry(compiled, state, &class, &|value| {
-                                self.constant_value(compiled.unit(), value)
-                            }) {
-                                Ok(class) => class,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                            };
+                        let runtime_class = match runtime_class_entry(
+                            compiled,
+                            state,
+                            &class,
+                            &|value| self.constant_value(compiled.unit(), value),
+                            &|reference| class_constant_reference_value(compiled, state, reference),
+                            &|reference| named_constant_reference_value(compiled, state, reference),
+                        ) {
+                            Ok(class) => class,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -13462,7 +13514,8 @@ impl Vm {
                         let key = static_property_key(resolved.class, resolved.property);
                         if !state.static_properties.contains_key(&key) {
                             let default = match static_property_default(
-                                unit,
+                                compiled,
+                                state,
                                 resolved.class,
                                 resolved.property,
                             ) {
@@ -13552,7 +13605,7 @@ impl Vm {
                         property,
                     } => {
                         let result = match static_property_isset_empty_result(
-                            unit, compiled, state, stack, class_name, property, false,
+                            compiled, state, stack, class_name, property, false,
                         ) {
                             Ok(result) => result,
                             Err(message) => {
@@ -13589,7 +13642,7 @@ impl Vm {
                         property,
                     } => {
                         let result = match static_property_isset_empty_result(
-                            unit, compiled, state, stack, class_name, property, true,
+                            compiled, state, stack, class_name, property, true,
                         ) {
                             Ok(result) => result,
                             Err(message) => {
@@ -13858,7 +13911,36 @@ impl Vm {
                                             .runtime_error(output, compiled, stack, message);
                                     }
                                 },
-                                None => Value::Null,
+                                None => {
+                                    if let Some(reference) = &resolved.constant.value_class_constant
+                                    {
+                                        match class_constant_reference_value(
+                                            compiled, state, reference,
+                                        ) {
+                                            Ok(value) => value,
+                                            Err(message) => {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
+                                        }
+                                    } else if let Some(reference) =
+                                        &resolved.constant.value_named_constant
+                                    {
+                                        match named_constant_reference_value(
+                                            compiled, state, reference,
+                                        ) {
+                                            Ok(value) => value,
+                                            Err(message) => {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        Value::Null
+                                    }
+                                }
                             };
                             self.install_class_constant_static_property_inline_cache(
                                 compiled,
@@ -16137,7 +16219,12 @@ impl Vm {
                         let current = if let Some(value) = state.static_properties.get(&key) {
                             value.clone()
                         } else {
-                            match static_property_default(unit, resolved.class, resolved.property) {
+                            match static_property_default(
+                                compiled,
+                                state,
+                                resolved.class,
+                                resolved.property,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -22924,7 +23011,15 @@ impl Vm {
                 }
                 let value = match constant.value {
                     Some(value) => constant_value(owner.unit(), value)?,
-                    None => Value::Null,
+                    None => {
+                        if let Some(reference) = &constant.value_class_constant {
+                            class_constant_reference_value(compiled, state, reference)?
+                        } else if let Some(reference) = &constant.value_named_constant {
+                            named_constant_reference_value(compiled, state, reference)?
+                        } else {
+                            Value::Null
+                        }
+                    }
                 };
                 Ok(ClassStaticCacheRead::Value(value))
             }
@@ -22954,7 +23049,7 @@ impl Vm {
                 }
                 let key = static_property_key(class, property);
                 if !state.static_properties.contains_key(&key) {
-                    let default = static_property_default(owner.unit(), class, property)?;
+                    let default = static_property_default(&owner, state, class, property)?;
                     state.static_properties.insert(key.clone(), default);
                 }
                 let value = state
@@ -28605,14 +28700,28 @@ fn runtime_class_entry(
     state: &ExecutionState,
     class: &php_ir::module::ClassEntry,
     constant_value: &impl Fn(ConstId) -> Result<Value, String>,
+    class_constant_reference_value: &impl Fn(&ClassConstantReference) -> Result<Value, String>,
+    named_constant_reference_value: &impl Fn(&NamedConstantReference) -> Result<Value, String>,
 ) -> Result<RuntimeClassEntry, String> {
     let mut lineage = Vec::new();
     collect_class_lineage(compiled, state, class, &mut lineage)?;
     let mut properties = Vec::new();
     let mut constants = Vec::new();
     for class in &lineage {
-        push_runtime_properties(class, &mut properties, constant_value)?;
-        push_runtime_constants(class, &mut constants, constant_value)?;
+        push_runtime_properties(
+            class,
+            &mut properties,
+            constant_value,
+            class_constant_reference_value,
+            named_constant_reference_value,
+        )?;
+        push_runtime_constants(
+            class,
+            &mut constants,
+            constant_value,
+            class_constant_reference_value,
+            named_constant_reference_value,
+        )?;
     }
     Ok(RuntimeClassEntry {
         name: class.name.clone(),
@@ -28739,6 +28848,8 @@ fn push_runtime_properties(
     class: &php_ir::module::ClassEntry,
     properties: &mut Vec<RuntimeClassPropertyEntry>,
     constant_value: &impl Fn(ConstId) -> Result<Value, String>,
+    class_constant_reference_value: &impl Fn(&ClassConstantReference) -> Result<Value, String>,
+    named_constant_reference_value: &impl Fn(&NamedConstantReference) -> Result<Value, String>,
 ) -> Result<(), String> {
     for property in &class.properties {
         if (property.hooks.get.is_some() || property.hooks.set.is_some())
@@ -28769,6 +28880,10 @@ fn push_runtime_properties(
         }
         let default = if let Some(default) = property.default {
             constant_value(default)?
+        } else if let Some(reference) = &property.default_class_constant {
+            class_constant_reference_value(reference)?
+        } else if let Some(reference) = &property.default_named_constant {
+            named_constant_reference_value(reference)?
         } else if property.flags.is_typed {
             Value::Uninitialized
         } else {
@@ -28802,10 +28917,16 @@ fn push_runtime_constants(
     class: &php_ir::module::ClassEntry,
     constants: &mut Vec<RuntimeClassConstantEntry>,
     constant_value: &impl Fn(ConstId) -> Result<Value, String>,
+    class_constant_reference_value: &impl Fn(&ClassConstantReference) -> Result<Value, String>,
+    named_constant_reference_value: &impl Fn(&NamedConstantReference) -> Result<Value, String>,
 ) -> Result<(), String> {
     for constant in &class.constants {
         let value = if let Some(value) = constant.value {
             constant_value(value)?
+        } else if let Some(reference) = &constant.value_class_constant {
+            class_constant_reference_value(reference)?
+        } else if let Some(reference) = &constant.value_named_constant {
+            named_constant_reference_value(reference)?
         } else {
             Value::Null
         };
@@ -31042,7 +31163,14 @@ fn enum_case_object(
     if let Some(object) = state.enum_cases.get(&key) {
         return Ok(object.clone());
     }
-    let runtime_class = runtime_class_entry(compiled, state, class, constant_value)?;
+    let runtime_class = runtime_class_entry(
+        compiled,
+        state,
+        class,
+        constant_value,
+        &|reference| class_constant_reference_value(compiled, state, reference),
+        &|reference| named_constant_reference_value(compiled, state, reference),
+    )?;
     let object = ObjectRef::new_with_display_name(&runtime_class, class.display_name.clone());
     object.set_property("name", Value::String(PhpString::from_test_str(&case.name)));
     if runtime_class.enum_backing_type.is_some() {
@@ -32951,12 +33079,18 @@ fn static_property_key(
 }
 
 fn static_property_default(
-    unit: &IrUnit,
-    _class: &php_ir::module::ClassEntry,
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
     property: &php_ir::module::ClassPropertyEntry,
 ) -> Result<Value, String> {
     if let Some(default) = property.default {
-        constant_value(unit, default)
+        let owner = class_owner_in_state(compiled, state, &class.name);
+        constant_value(owner.unit(), default)
+    } else if let Some(reference) = &property.default_class_constant {
+        class_constant_reference_value(compiled, state, reference)
+    } else if let Some(reference) = &property.default_named_constant {
+        named_constant_reference_value(compiled, state, reference)
     } else if property.flags.is_typed {
         Ok(Value::Uninitialized)
     } else {
@@ -32965,7 +33099,6 @@ fn static_property_default(
 }
 
 fn static_property_isset_empty_result(
-    unit: &IrUnit,
     compiled: &CompiledUnit,
     state: &mut ExecutionState,
     stack: &CallStack,
@@ -32991,7 +33124,7 @@ fn static_property_isset_empty_result(
     }
     let key = static_property_key(resolved.class, resolved.property);
     if !state.static_properties.contains_key(&key) {
-        let default = static_property_default(unit, resolved.class, resolved.property)?;
+        let default = static_property_default(compiled, state, resolved.class, resolved.property)?;
         state.static_properties.insert(key.clone(), default);
     }
     let value = state
@@ -39725,11 +39858,179 @@ fn class_constant_value_by_name(
         return Ok(None);
     };
     validate_constant_access(compiled, stack, resolved.class, resolved.constant)?;
-    let Some(value) = resolved.constant.value else {
-        return Ok(Some(Value::Null));
+    if let Some(value) = resolved.constant.value {
+        let owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        constant_value(owner.unit(), value).map(Some)
+    } else if let Some(reference) = &resolved.constant.value_class_constant {
+        class_constant_reference_value(compiled, state, reference).map(Some)
+    } else if let Some(reference) = &resolved.constant.value_named_constant {
+        named_constant_reference_value(compiled, state, reference).map(Some)
+    } else {
+        Ok(Some(Value::Null))
+    }
+}
+
+fn named_constant_reference_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    reference: &NamedConstantReference,
+) -> Result<Value, String> {
+    for name in &reference.names {
+        if let Some(constant) = compiled.lookup_constant(name) {
+            return Ok(inline_constant_value(constant));
+        }
+        if let Some(value) = state.user_constants.get(name) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = predefined_constant_value(name) {
+            return Ok(value);
+        }
+    }
+    Err(format!(
+        "E_PHP_VM_UNDEFINED_CONSTANT: Undefined constant \"{}\"",
+        if reference.display_name.is_empty() {
+            reference
+                .names
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default()
+        } else {
+            &reference.display_name
+        }
+    ))
+}
+
+fn class_constant_reference_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    reference: &ClassConstantReference,
+) -> Result<Value, String> {
+    class_constant_reference_value_inner(compiled, state, reference, &mut Vec::new())
+}
+
+fn class_constant_reference_value_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    reference: &ClassConstantReference,
+    visiting: &mut Vec<(String, String)>,
+) -> Result<Value, String> {
+    let key = (
+        normalize_class_name(&reference.class_name),
+        reference.constant_name.clone(),
+    );
+    if visiting.iter().any(|entry| entry == &key) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_CONSTANT_CYCLE: class constant {}::{} has a recursive initializer",
+            reference.class_name, reference.constant_name
+        ));
+    }
+    visiting.push(key);
+    let (class, constant) = lookup_class_constant_in_state(
+        compiled,
+        state,
+        &reference.class_name,
+        &reference.display_class_name,
+        &reference.constant_name,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "E_PHP_VM_UNKNOWN_CLASS_CONSTANT: Undefined constant {}::{}",
+            class_constant_reference_display_class(reference),
+            reference.constant_name
+        )
+    })?;
+    let value = if let Some(value) = constant.value {
+        let owner = class_owner_in_state(compiled, state, &class.name);
+        constant_value(owner.unit(), value)?
+    } else if let Some(next) = &constant.value_class_constant {
+        class_constant_reference_value_inner(compiled, state, next, visiting)?
+    } else if let Some(reference) = &constant.value_named_constant {
+        named_constant_reference_value(compiled, state, reference)?
+    } else {
+        Value::Null
     };
-    let owner = class_owner_in_state(compiled, state, &resolved.class.name);
-    constant_value(owner.unit(), value).map(Some)
+    visiting.pop();
+    Ok(value)
+}
+
+fn lookup_class_constant_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    reference_display_class_name: &str,
+    constant_name: &str,
+) -> Result<
+    Option<(
+        php_ir::module::ClassEntry,
+        php_ir::module::ClassConstantEntry,
+    )>,
+    String,
+> {
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: Class \"{}\" not found",
+            if reference_display_class_name.is_empty() {
+                display_class_name(class_name)
+            } else {
+                reference_display_class_name.to_owned()
+            }
+        ));
+    };
+    lookup_class_constant_in_state_inner(compiled, state, class, constant_name, &mut Vec::new())
+}
+
+fn lookup_class_constant_in_state_inner(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: php_ir::module::ClassEntry,
+    constant_name: &str,
+    seen: &mut Vec<String>,
+) -> Result<
+    Option<(
+        php_ir::module::ClassEntry,
+        php_ir::module::ClassConstantEntry,
+    )>,
+    String,
+> {
+    let normalized = normalize_class_name(&class.name);
+    if seen.iter().any(|name| name == &normalized) {
+        return Err(format!(
+            "E_PHP_VM_CLASS_INHERITANCE_CYCLE: class {} participates in an inheritance cycle",
+            class.name
+        ));
+    }
+    seen.push(normalized);
+    if let Some(constant) = class
+        .constants
+        .iter()
+        .find(|entry| entry.name == constant_name)
+        .cloned()
+    {
+        seen.pop();
+        return Ok(Some((class, constant)));
+    }
+    let Some(parent_name) = class.parent.as_deref() else {
+        seen.pop();
+        return Ok(None);
+    };
+    let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
+            class.name, parent_name
+        ));
+    };
+    let resolved =
+        lookup_class_constant_in_state_inner(compiled, state, parent, constant_name, seen)?;
+    seen.pop();
+    Ok(resolved)
+}
+
+fn class_constant_reference_display_class(reference: &ClassConstantReference) -> String {
+    if reference.display_class_name.is_empty() {
+        display_class_name(&reference.class_name)
+    } else {
+        reference.display_class_name.clone()
+    }
 }
 
 fn predefined_constant_value(name: &str) -> Option<Value> {
@@ -40117,7 +40418,7 @@ fn visible_class_vars(
                 property.flags.is_private,
                 property.flags.is_protected,
             ) {
-                let value = static_property_default(compiled.unit(), &class, property)
+                let value = static_property_default(compiled, state, &class, property)
                     .unwrap_or(Value::Uninitialized);
                 array.insert(php_string_key(&property.name), value);
             }
@@ -47535,6 +47836,84 @@ good"
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"int(2)\n");
+    }
+
+    #[test]
+    fn include_declares_class_constants_before_initializer_reads_them() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-include-class-constant-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(
+            root.join("constants.inc"),
+            "<?php class A { const MY_CONST = 'hello from A'; }\n",
+        )
+        .expect("constant include should be written");
+        let source = "<?php
+            include 'constants.inc';
+            class B {
+                public static $a = A::MY_CONST;
+                const ca = A::MY_CONST;
+            }
+            var_dump(B::$a);
+            var_dump(B::ca);
+        ";
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+            root.join("main.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"string(12) \"hello from A\"\nstring(12) \"hello from A\"\n"
+        );
+    }
+
+    #[test]
+    fn comma_separated_class_constants_are_each_fetchable() {
+        let result = execute_source(
+            "<?php define('DYN', 123); class C { public const int A = 1, B = 2; const L = __LINE__; const F = __FILE__; const CL = __CLASS__; const D = DYN; } var_dump(C::A); var_dump(C::B); var_dump(C::L); var_dump(C::F); var_dump(C::CL); var_dump(C::D);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"int(1)\nint(2)\nint(1)\nstring(20) \"/tmp/phrust-test.php\"\nstring(1) \"C\"\nint(123)\n"
+        );
+    }
+
+    #[test]
+    fn missing_class_constant_initializer_fails_when_class_is_used() {
+        let result = execute_source(
+            "<?php class C { const c1 = D::hello; } $a = new C(); echo 'unreachable';",
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
+        assert!(
+            result
+                .output
+                .to_string_lossy()
+                .contains("Fatal error: Uncaught Error: Class \"D\" not found"),
+            "{}",
+            result.output.to_string_lossy()
+        );
+        assert!(
+            result
+                .status
+                .message()
+                .is_some_and(|message| message.contains("Class \"D\" not found")),
+            "{:?}",
+            result.status
+        );
     }
 
     #[test]

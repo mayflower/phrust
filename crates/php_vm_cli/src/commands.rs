@@ -2637,6 +2637,7 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
         | DenseOpcode::Move
         | DenseOpcode::LoadLocal
         | DenseOpcode::StoreLocal
+        | DenseOpcode::InitStaticLocal
         | DenseOpcode::StoreLocalDiscard
         | DenseOpcode::LoadConstEcho
         | DenseOpcode::LoadLocalEcho
@@ -2973,6 +2974,7 @@ fn classify_copy_patch_stencil_instruction(
             unsupported_reason: None,
         },
         DenseOpcode::Exit => unsupported_copy_patch_class("script_exit_requires_request_state"),
+        DenseOpcode::InitStaticLocal => unsupported_copy_patch_class("static_local_request_state"),
         DenseOpcode::LoadConst
         | DenseOpcode::Move
         | DenseOpcode::StoreLocal
@@ -3263,6 +3265,10 @@ fn classify_mid_tier_instruction(
         }
         DenseOpcode::Exit => {
             push_unique(&mut plan.rejection_reasons, "script_exit_control_flow");
+            plan.deopt_points += 1;
+        }
+        DenseOpcode::InitStaticLocal => {
+            push_unique(&mut plan.rejection_reasons, "static_local_request_state");
             plan.deopt_points += 1;
         }
         DenseOpcode::LoadConst

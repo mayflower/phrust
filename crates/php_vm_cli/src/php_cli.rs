@@ -492,6 +492,78 @@ mod tests {
     }
 
     #[test]
+    fn run_code_handles_recursive_autoload_callbacks() {
+        let source = r#"
+        spl_autoload_register(function ($name) {
+            echo "IN:  autoload($name)\n";
+
+            static $i = 0;
+            if ($i++ > 10) {
+                echo "-> Recursion detected - as expected.\n";
+                return;
+            }
+
+            class_exists('UndefinedClass' . $i);
+
+            echo "OUT: autoload($name)\n";
+        });
+
+        var_dump(class_exists('UndefinedClass0'));
+        "#;
+        let source = source.to_owned();
+
+        let handle = std::thread::Builder::new()
+            .name("recursive-autoload-cli-test".to_owned())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(move || {
+                let mut stdin = TestInput(Cursor::new(Vec::new()));
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let status = run(
+                    ["-r".to_owned(), source],
+                    &mut stdin,
+                    &mut stdout,
+                    &mut stderr,
+                );
+                (status, stdout, stderr)
+            })
+            .expect("spawn recursive autoload test thread");
+        let (status, stdout, stderr) = handle.join().expect("recursive autoload test finished");
+
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf8"),
+            concat!(
+                "IN:  autoload(UndefinedClass0)\n",
+                "IN:  autoload(UndefinedClass1)\n",
+                "IN:  autoload(UndefinedClass2)\n",
+                "IN:  autoload(UndefinedClass3)\n",
+                "IN:  autoload(UndefinedClass4)\n",
+                "IN:  autoload(UndefinedClass5)\n",
+                "IN:  autoload(UndefinedClass6)\n",
+                "IN:  autoload(UndefinedClass7)\n",
+                "IN:  autoload(UndefinedClass8)\n",
+                "IN:  autoload(UndefinedClass9)\n",
+                "IN:  autoload(UndefinedClass10)\n",
+                "IN:  autoload(UndefinedClass11)\n",
+                "-> Recursion detected - as expected.\n",
+                "OUT: autoload(UndefinedClass10)\n",
+                "OUT: autoload(UndefinedClass9)\n",
+                "OUT: autoload(UndefinedClass8)\n",
+                "OUT: autoload(UndefinedClass7)\n",
+                "OUT: autoload(UndefinedClass6)\n",
+                "OUT: autoload(UndefinedClass5)\n",
+                "OUT: autoload(UndefinedClass4)\n",
+                "OUT: autoload(UndefinedClass3)\n",
+                "OUT: autoload(UndefinedClass2)\n",
+                "OUT: autoload(UndefinedClass1)\n",
+                "OUT: autoload(UndefinedClass0)\n",
+                "bool(false)\n"
+            )
+        );
+    }
+
+    #[test]
     fn run_file_seeds_argv_and_argc() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let root = temp_root("argv");

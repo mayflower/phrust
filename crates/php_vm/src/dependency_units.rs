@@ -1555,6 +1555,8 @@ mod tests {
             properties: vec![ClassPropertyEntry {
                 name: "value".to_owned(),
                 default: Some(include_path),
+                default_class_constant: None,
+                default_named_constant: None,
                 type_: None,
                 flags: ClassPropertyFlags::default(),
                 hooks: ClassPropertyHooks::default(),
