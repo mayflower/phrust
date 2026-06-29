@@ -14,6 +14,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_date_format,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("date_diff", builtin_date_diff, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "date_interval_format",
         builtin_date_interval_format,
@@ -196,6 +197,32 @@ pub(in crate::builtins::modules) fn builtin_date_format(
         timestamp, &timezone, &format,
     )))
 }
+pub(in crate::builtins::modules) fn builtin_date_diff(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("date_diff", &args, 2)?;
+    let Value::Object(left) = deref_value(&args[0]) else {
+        return Err(type_error("date_diff", "DateTimeInterface", &args[0]));
+    };
+    let Value::Object(right) = deref_value(&args[1]) else {
+        return Err(type_error("date_diff", "DateTimeInterface", &args[1]));
+    };
+    if datetime::object_timestamp(&left).is_none() {
+        return Err(value_error(
+            "date_diff",
+            "first object is not a DateTimeInterface MVP",
+        ));
+    }
+    if datetime::object_timestamp(&right).is_none() {
+        return Err(value_error(
+            "date_diff",
+            "second object is not a DateTimeInterface MVP",
+        ));
+    }
+    Ok(datetime::diff_objects(&left, &right))
+}
 pub(in crate::builtins::modules) fn builtin_timezone_open(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -267,4 +294,35 @@ pub(in crate::builtins::modules) fn builtin_timezone_identifiers_list(
             .map(|identifier| Value::string(*identifier))
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BuiltinContext, RuntimeSourceSpan, builtin_date_diff};
+    use crate::{OutputBuffer, Value, datetime};
+
+    #[test]
+    fn date_diff_returns_datetimeinterval_for_datetimeinterface_objects() {
+        let Value::Object(left) = datetime::datetime_object(1_603_238_400, "UTC") else {
+            panic!("expected DateTime object");
+        };
+        let Value::Object(right) = datetime::datetime_immutable_object(1_603_929_600, "UTC") else {
+            panic!("expected DateTimeImmutable object");
+        };
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        let result = builtin_date_diff(
+            &mut context,
+            vec![Value::Object(left), Value::Object(right)],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("date_diff succeeds");
+        let Value::Object(interval) = result else {
+            panic!("expected DateInterval object");
+        };
+
+        assert_eq!(interval.get_property("days"), Some(Value::Int(8)));
+        assert_eq!(interval.get_property("d"), Some(Value::Int(8)));
+        assert_eq!(interval.get_property("invert"), Some(Value::Int(0)));
+    }
 }

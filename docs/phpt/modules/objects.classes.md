@@ -3,7 +3,7 @@
 - Priority: 10
 - Selected manifest: `tests/phpt/manifests/modules/objects.classes.selected.jsonl`
 - Current corpus counts: 178 PASS, 33 SKIP, 1924 FAIL, 0 BORK from 2136 corpus candidates
-- Current selected run: 191 PASS, 0 SKIP, 9 FAIL, 0 BORK from 200 selected rows
+- Current selected run: 193 PASS, 0 SKIP, 7 FAIL, 0 BORK from 200 selected rows
 - Core close gate: `objects.core` is 16 PASS / 0 FAIL for reference and target
 
 ## Scope
@@ -78,16 +78,21 @@
 ## Branch 1 Closure Runtime Impact
 
 On `phpt/closure-core-runtime-semantics`, after the closure runtime semantics
-work and class-constant initializer fatal-output fix:
+work plus selected class-output/declaration dependency fixes:
 
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=objects.classes`
 - reference: 200 PASS
-- target: 191 PASS, 9 FAIL
+- target: 193 PASS, 7 FAIL
 
 The selected `tests/classes/constants_error_004.phpt` case now matches PHP's
 class-constant initializer fatal location and `[constant expression]()` trace
-frame. Remaining failures are dashboard backlog items outside the
-`closure.core` gate.
+frame. The selected `tests/classes/bug23951.phpt` and
+`tests/classes/bug75765.phpt` cases now match PHP for nested `print_r()` object
+property arrays and catchable missing-parent class declarations. The selected
+`tests/classes/bug65768.phpt` case now reaches the PHP-compatible
+DateTimeInterface fatal after `date_diff()`, but remains in the dashboard
+backlog because the PHPT runner still reports an output-format mismatch for the
+fatal path/trace expectation.
 
 ## Branch 2 Advanced Integration Impact
 
@@ -121,7 +126,7 @@ Current selected `objects.classes` non-green rows are outside the
 - autoload and ReflectionException catch-type behavior
 - iterator/destructor ordering and exception behavior
 - serialization, `__sleep`, and `__toString` object formatting
-- eval declaration merging and runtime class-declaration dependency catchability
+- eval declaration merging and DateTimeInterface fatal output formatting
 - autoload incomplete-class behavior and object formatting parity
 
 ## Next Step

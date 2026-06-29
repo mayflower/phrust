@@ -8066,6 +8066,21 @@ mod tests {
                 "Array\n(\n    [0] => Array\n        (\n            [0] => 1\n        )\n\n)\n"
             )
         );
+        let object = ObjectRef::new_with_display_name(&empty_class("A"), "A");
+        let mut property_array = PhpArray::new();
+        property_array.insert(ArrayKey::Int(1), Value::string("foo1_value"));
+        property_array.insert(ArrayKey::Int(2), Value::string("foo2_value"));
+        object.set_property("a_var", Value::Array(property_array));
+        assert_eq!(
+            call(
+                "print_r",
+                vec![Value::Object(object), Value::Bool(true)],
+                &mut output
+            ),
+            Value::string(
+                "A Object\n(\n    [a_var] => Array\n        (\n            [1] => foo1_value\n            [2] => foo2_value\n        )\n\n)\n"
+            )
+        );
         assert_eq!(
             call(
                 "var_export",

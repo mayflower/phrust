@@ -920,6 +920,7 @@ struct ExecutionState {
     dynamic_functions: Vec<DynamicFunctionEntry>,
     dynamic_classes: Vec<DynamicClassEntry>,
     validated_class_dependencies: HashSet<String>,
+    failed_class_declarations: HashSet<String>,
     user_constants: HashMap<String, Value>,
     shutdown_functions: Vec<ShutdownFunctionEntry>,
     ini: IniRegistry,
@@ -1030,6 +1031,11 @@ struct DynamicFunctionEntry {
 struct DynamicClassEntry {
     class: php_ir::module::ClassEntry,
     unit_index: usize,
+}
+
+enum ClassDependencyValidationFailure {
+    Throwable(Value),
+    Result(VmResult),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11077,6 +11083,53 @@ impl Vm {
                             after: *after,
                             exception_local: *exception_local,
                         });
+                        if let Some(catch) = *catch
+                            && let Some(failure) = self.validate_runtime_class_dependencies_in_try(
+                                compiled,
+                                function,
+                                catch,
+                                output,
+                                stack,
+                                state,
+                                instruction.span,
+                            )
+                        {
+                            match failure {
+                                ClassDependencyValidationFailure::Throwable(throwable) => {
+                                    state.pending_trace =
+                                        Some(capture_backtrace_string(compiled, stack));
+                                    if let Some(target) = handle_throw(
+                                        compiled,
+                                        throwable.clone(),
+                                        &mut exception_handlers,
+                                        stack,
+                                        &mut pending_control,
+                                    ) {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
+                                ClassDependencyValidationFailure::Result(result) => {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                            }
+                        }
                     }
                     InstructionKind::LeaveTry => {
                         let _ = exception_handlers.pop();
@@ -27595,7 +27648,65 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Option<VmResult> {
+        match self.validate_runtime_class_dependencies_matching(
+            compiled,
+            declared_unit,
+            output,
+            stack,
+            state,
+            |_| true,
+        )? {
+            ClassDependencyValidationFailure::Throwable(throwable) => {
+                state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                Some(self.handle_uncaught_exception(compiled, output, stack, state, throwable))
+            }
+            ClassDependencyValidationFailure::Result(result) => Some(result),
+        }
+    }
+
+    fn validate_runtime_class_dependencies_in_try(
+        &self,
+        compiled: &CompiledUnit,
+        function: &php_ir::function::IrFunction,
+        catch: BlockId,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        try_span: IrSpan,
+    ) -> Option<ClassDependencyValidationFailure> {
+        let catch_start = function
+            .blocks
+            .get(catch.index())
+            .and_then(block_first_span)
+            .map_or(try_span.end, |span| span.start);
+        self.validate_runtime_class_dependencies_matching(
+            compiled,
+            compiled,
+            output,
+            stack,
+            state,
+            |class| {
+                class.span != IrSpan::default()
+                    && class.span.file == try_span.file
+                    && class.span.start >= try_span.start
+                    && class.span.end <= catch_start
+            },
+        )
+    }
+
+    fn validate_runtime_class_dependencies_matching(
+        &self,
+        compiled: &CompiledUnit,
+        declared_unit: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        mut matches_class: impl FnMut(&php_ir::module::ClassEntry) -> bool,
+    ) -> Option<ClassDependencyValidationFailure> {
         for class in &declared_unit.unit().classes {
+            if !matches_class(class) {
+                continue;
+            }
             let normalized_class = normalize_class_name(&class.name);
             if !state
                 .validated_class_dependencies
@@ -27618,21 +27729,38 @@ impl Vm {
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
-                        return Some(self.class_dependency_not_found(
-                            declared_unit,
-                            class,
-                            &display,
-                            "Class",
-                            output,
-                            stack,
-                            state,
-                        ));
+                        return Some(
+                            match self.class_dependency_not_found_throwable(
+                                declared_unit,
+                                class,
+                                &display,
+                                "Class",
+                                state,
+                            ) {
+                                Ok(throwable) => {
+                                    ClassDependencyValidationFailure::Throwable(throwable)
+                                }
+                                Err(result) => ClassDependencyValidationFailure::Result(result),
+                            },
+                        );
                     }
-                    Err(result) => return Some(result),
+                    Err(result) => return Some(ClassDependencyValidationFailure::Result(result)),
                 }
             }
 
             for interface in &class.interfaces {
+                if normalize_class_name(interface) == "datetimeinterface"
+                    && !class_extends_datetime_implementation(declared_unit, class)
+                {
+                    return Some(ClassDependencyValidationFailure::Result(
+                        self.datetime_interface_user_implementation_fatal(
+                            declared_unit,
+                            class,
+                            output,
+                            stack,
+                        ),
+                    ));
+                }
                 let display = class_dependency_display_name(declared_unit, class, interface);
                 match self.class_like_exists_with_autoload_cache(
                     compiled,
@@ -27646,48 +27774,88 @@ impl Vm {
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
-                        return Some(self.class_dependency_not_found(
-                            declared_unit,
-                            class,
-                            &display,
-                            "Interface",
-                            output,
-                            stack,
-                            state,
-                        ));
+                        return Some(
+                            match self.class_dependency_not_found_throwable(
+                                declared_unit,
+                                class,
+                                &display,
+                                "Interface",
+                                state,
+                            ) {
+                                Ok(throwable) => {
+                                    ClassDependencyValidationFailure::Throwable(throwable)
+                                }
+                                Err(result) => ClassDependencyValidationFailure::Result(result),
+                            },
+                        );
                     }
-                    Err(result) => return Some(result),
+                    Err(result) => return Some(ClassDependencyValidationFailure::Result(result)),
                 }
             }
         }
         None
     }
 
-    fn class_dependency_not_found(
+    fn class_dependency_not_found_throwable(
         &self,
         compiled: &CompiledUnit,
         class: &php_ir::module::ClassEntry,
         dependency: &str,
         kind: &str,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> VmResult {
+    ) -> Result<Value, VmResult> {
+        state
+            .failed_class_declarations
+            .insert(normalize_class_name(&class.name));
+        state.bump_class_table_epoch();
         let message = Value::string(format!("{kind} \"{dependency}\" not found").into_bytes());
         let throwable = match make_exception_object("Error", &message) {
             Ok(object) => Value::Object(object),
             Err(message) => {
-                return self.runtime_error(
-                    output,
-                    compiled,
-                    stack,
+                return Err(VmResult::runtime_error_with_diagnostic(
+                    OutputBuffer::new(),
                     format!("E_PHP_VM_CLASS_DEPENDENCY_ERROR: {message}"),
-                );
+                    RuntimeDiagnostic::new(
+                        "E_PHP_VM_CLASS_DEPENDENCY_ERROR",
+                        RuntimeSeverity::FatalError,
+                        format!("E_PHP_VM_CLASS_DEPENDENCY_ERROR: {message}"),
+                        RuntimeSourceSpan::default(),
+                        Vec::new(),
+                        None,
+                    ),
+                ));
             }
         };
         tag_throwable_location(&throwable, compiled, class.span);
-        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
-        self.handle_uncaught_exception(compiled, output, stack, state, throwable)
+        Ok(throwable)
+    }
+
+    fn datetime_interface_user_implementation_fatal(
+        &self,
+        compiled: &CompiledUnit,
+        class: &php_ir::module::ClassEntry,
+        output: &mut OutputBuffer,
+        stack: &CallStack,
+    ) -> VmResult {
+        let source_span = runtime_source_span(compiled, class.span);
+        let location = php_runtime::PhpDiagnosticLocation::from_span(&source_span);
+        let message = "DateTimeInterface can't be implemented by user classes";
+        output.write_test_str(&format!(
+            "\nFatal error: {message} in {} on line {}\nStack trace:\n#0 {{main}}\n",
+            location.file, location.line
+        ));
+        VmResult::runtime_error_with_diagnostic(
+            output.clone(),
+            format!("E_PHP_VM_DATETIMEINTERFACE_USER_IMPLEMENTATION: {message}"),
+            RuntimeDiagnostic::new(
+                "E_PHP_VM_DATETIMEINTERFACE_USER_IMPLEMENTATION",
+                RuntimeSeverity::FatalError,
+                format!("E_PHP_VM_DATETIMEINTERFACE_USER_IMPLEMENTATION: {message}"),
+                source_span,
+                stack_trace(compiled, stack),
+                Some(php_runtime::PhpReferenceClassification::FatalError),
+            ),
+        )
     }
 
     fn preflight_reflection_constructor(
@@ -31709,6 +31877,9 @@ fn validate_internal_interface_implementation(
     class: &php_ir::module::ClassEntry,
     interface_name: &str,
 ) -> Result<(), VmCompileError> {
+    if normalize_class_name(interface_name) == "datetimeinterface" {
+        return Ok(());
+    }
     for parent_name in internal_class_interfaces(interface_name) {
         validate_internal_interface_implementation(compiled, class, &parent_name)?;
     }
@@ -31737,6 +31908,35 @@ fn validate_internal_interface_implementation(
         }
     }
     Ok(())
+}
+
+fn class_extends_datetime_implementation(
+    compiled: &CompiledUnit,
+    class: &php_ir::module::ClassEntry,
+) -> bool {
+    let mut current = class;
+    let mut seen = Vec::new();
+    loop {
+        let normalized = normalize_class_name(&current.name);
+        if matches!(normalized.as_str(), "datetime" | "datetimeimmutable") {
+            return true;
+        }
+        if seen.iter().any(|name| name == &normalized) {
+            return false;
+        }
+        seen.push(normalized);
+        let Some(parent) = current.parent.as_deref() else {
+            return false;
+        };
+        let parent_normalized = normalize_class_name(parent);
+        if matches!(parent_normalized.as_str(), "datetime" | "datetimeimmutable") {
+            return true;
+        }
+        let Some(parent_class) = compiled.lookup_class(parent) else {
+            return false;
+        };
+        current = parent_class;
+    }
 }
 
 fn validate_final_method_overrides(
@@ -39517,6 +39717,14 @@ fn register_dynamic_classes(state: &mut ExecutionState, unit_index: usize, unit:
     }
 }
 
+fn block_first_span(block: &php_ir::block::BasicBlock) -> Option<IrSpan> {
+    block
+        .instructions
+        .first()
+        .map(|instruction| instruction.span)
+        .or_else(|| block.terminator.as_ref().map(|terminator| terminator.span))
+}
+
 fn dynamic_function_in_state(
     state: &ExecutionState,
     function_name: &str,
@@ -39601,8 +39809,11 @@ fn lookup_class_in_state(
     state: &ExecutionState,
     class_name: &str,
 ) -> Option<php_ir::module::ClassEntry> {
+    let normalized = normalize_class_name(class_name);
+    if state.failed_class_declarations.contains(&normalized) {
+        return None;
+    }
     compiled.lookup_class(class_name).cloned().or_else(|| {
-        let normalized = normalize_class_name(class_name);
         state
             .dynamic_classes
             .iter()
@@ -46884,6 +47095,49 @@ $a = new C();
         );
         assert!(output.contains("  thrown in "), "{output}");
         assert!(output.contains(" on line "), "{output}");
+    }
+
+    #[test]
+    fn missing_parent_class_declaration_error_is_catchable() {
+        let result = execute_source(
+            "<?php
+try {
+    class A extends B {}
+} catch (Error $e) {
+    var_dump(class_exists('A'));
+    var_dump(class_exists('B'));
+    throw $e;
+}
+",
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let output = result.output.to_string_lossy();
+        assert!(output.starts_with("bool(false)\nbool(false)\n"), "{output}");
+        assert!(
+            output.contains("Fatal error: Uncaught Error: Class \""),
+            "{output}"
+        );
+        assert!(output.contains("\" not found in "), "{output}");
+    }
+
+    #[test]
+    fn datetimeinterface_user_implementation_fails_at_runtime_declaration() {
+        let result = execute_source(
+            "<?php
+class AllowedDateTimeChild extends DateTime implements DateTimeInterface {}
+echo \"before\\n\";
+class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
+",
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let output = result.output.to_string_lossy();
+        assert!(output.starts_with("before\n\nFatal error: "), "{output}");
+        assert!(
+            output.contains("DateTimeInterface can't be implemented by user classes"),
+            "{output}"
+        );
     }
 
     #[test]

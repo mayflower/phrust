@@ -326,7 +326,12 @@ impl DebugFormatter {
                     // or `name:Class:private` — the var_dump label without quotes.
                     let label = object.property_debug_label(&name).replace('"', "");
                     output.write_test_str(&format!("[{label}] => "));
-                    self.write_print_r_value(output, &property, indent + 4);
+                    let property_indent = if print_r_value_starts_multiline(&property) {
+                        indent + 8
+                    } else {
+                        indent + 4
+                    };
+                    self.write_print_r_value(output, &property, property_indent);
                     output.write_test_str("\n");
                 }
                 write_indent(output, indent);
