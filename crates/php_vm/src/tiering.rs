@@ -4,7 +4,11 @@ use std::collections::BTreeMap;
 
 use php_ir::ids::{BlockId, FunctionId};
 
-use crate::{InlineCacheObservation, JitMode, QuickeningMode, QuickeningObservation};
+use crate::{
+    ExitCounterKey, ExitCounterTable, ExitPolicyThresholds, GuardKind, GuardedTier,
+    InlineCacheObservation, JitMode, QuickeningMode, QuickeningObservation,
+    exit_policy::inline_cache_guard_kind,
+};
 
 /// Runtime tier selected by the policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +36,14 @@ pub struct TieringOptions {
     pub ic_stability_threshold: i64,
     /// Guard failures after which a site is treated as unstable.
     pub guard_failure_threshold: u64,
+    /// Side exits after which the exit policy treats a site as unstable.
+    pub side_exit_threshold: u64,
+    /// Megamorphic transitions after which the exit policy keeps a site generic.
+    pub megamorphic_threshold: u64,
+    /// Guard failures after which request-local blacklisting is recommended.
+    pub blacklist_threshold: u64,
+    /// Exits after which a future recompile is reported as a candidate.
+    pub recompile_candidate_threshold: u64,
     /// Compile immediately when JIT execution is enabled; intended for tests.
     pub jit_eager: bool,
     /// Maximum native compile time budget for one request, in microseconds.
@@ -51,9 +63,26 @@ impl Default for TieringOptions {
             loop_backedge_threshold: 8,
             ic_stability_threshold: 4,
             guard_failure_threshold: 2,
+            side_exit_threshold: 2,
+            megamorphic_threshold: 1,
+            blacklist_threshold: 3,
+            recompile_candidate_threshold: 4,
             jit_eager: false,
             jit_max_compile_us: u64::MAX,
             jit_max_functions: u64::MAX,
+        }
+    }
+}
+
+impl TieringOptions {
+    #[must_use]
+    pub const fn exit_policy_thresholds(&self) -> ExitPolicyThresholds {
+        ExitPolicyThresholds {
+            guard_failure_threshold: self.guard_failure_threshold,
+            side_exit_threshold: self.side_exit_threshold,
+            megamorphic_threshold: self.megamorphic_threshold,
+            blacklist_threshold: self.blacklist_threshold,
+            recompile_candidate_threshold: self.recompile_candidate_threshold,
         }
     }
 }
@@ -76,6 +105,7 @@ pub struct TieringStats {
     pub jit_compile_budget_rejections: u64,
     pub jit_compile_budget_used_us: u64,
     pub jit_compiled_functions: u64,
+    pub exit_policy: ExitCounterTable,
 }
 
 impl TieringStats {
@@ -84,7 +114,7 @@ impl TieringStats {
         format!(
             concat!(
                 "{{\n",
-                "  \"schema_version\": 1,\n",
+                "  \"schema_version\": 2,\n",
                 "  \"function_entry_count\": {},\n",
                 "  \"loop_backedge_count\": {},\n",
                 "  \"ic_stability_score\": {},\n",
@@ -99,7 +129,8 @@ impl TieringStats {
                 "  \"jit_blacklist_rejections\": {},\n",
                 "  \"jit_compile_budget_rejections\": {},\n",
                 "  \"jit_compile_budget_used_us\": {},\n",
-                "  \"jit_compiled_functions\": {}\n",
+                "  \"jit_compiled_functions\": {},\n",
+                "  \"exit_policy\": {}\n",
                 "}}\n"
             ),
             self.function_entry_count,
@@ -116,7 +147,8 @@ impl TieringStats {
             self.jit_blacklist_rejections,
             self.jit_compile_budget_rejections,
             self.jit_compile_budget_used_us,
-            self.jit_compiled_functions
+            self.jit_compiled_functions,
+            self.exit_policy.to_json()
         )
     }
 }
@@ -138,9 +170,13 @@ pub struct TieringState {
 impl TieringState {
     #[must_use]
     pub fn new(options: TieringOptions) -> Self {
+        let exit_policy_thresholds = options.exit_policy_thresholds();
         Self {
             options,
-            stats: TieringStats::default(),
+            stats: TieringStats {
+                exit_policy: ExitCounterTable::new(exit_policy_thresholds),
+                ..TieringStats::default()
+            },
             functions: BTreeMap::new(),
         }
     }
@@ -222,6 +258,35 @@ impl TieringState {
         }
     }
 
+    pub fn record_quickening_site(
+        &mut self,
+        function: FunctionId,
+        bytecode_offset: u32,
+        observation: QuickeningObservation,
+    ) {
+        self.record_quickening(observation);
+        if !self.options.enabled {
+            return;
+        }
+        let key = ExitCounterKey::bytecode(
+            function.raw(),
+            bytecode_offset,
+            GuardedTier::Quickening,
+            if observation.dequickened {
+                "type_flip"
+            } else {
+                "quickening_guard"
+            },
+            Some(GuardKind::QuickeningType),
+        );
+        if observation.guard_hit || observation.specialized {
+            self.stats.exit_policy.record_stable_hit(key.clone());
+        }
+        if observation.guard_failure {
+            self.stats.exit_policy.record_guard_failure(key);
+        }
+    }
+
     pub fn record_inline_cache(&mut self, observation: InlineCacheObservation) {
         if !self.options.enabled {
             return;
@@ -232,6 +297,59 @@ impl TieringState {
         if observation.guard_failure {
             self.stats.guard_failure_score = self.stats.guard_failure_score.saturating_add(1);
         }
+    }
+
+    pub fn record_inline_cache_site(
+        &mut self,
+        function: FunctionId,
+        bytecode_offset: u32,
+        observation: InlineCacheObservation,
+    ) {
+        self.record_inline_cache(observation);
+        if !self.options.enabled {
+            return;
+        }
+        let guard_kind = inline_cache_guard_kind(observation.kind);
+        let key = ExitCounterKey::bytecode(
+            function.raw(),
+            bytecode_offset,
+            GuardedTier::InlineCache,
+            inline_cache_exit_reason(observation),
+            Some(guard_kind),
+        );
+        if observation.hit {
+            self.stats.exit_policy.record_stable_hit(key.clone());
+        }
+        if observation.guard_failure {
+            self.stats.exit_policy.record_guard_failure(key.clone());
+        }
+        if observation.megamorphic {
+            self.stats.exit_policy.record_megamorphic(key.clone());
+        }
+        if observation.miss && !observation.guard_failure && !observation.megamorphic {
+            self.stats.exit_policy.record_side_exit(key);
+        }
+    }
+
+    pub fn record_jit_side_exit(
+        &mut self,
+        function: FunctionId,
+        region_id: impl Into<String>,
+        reason: impl Into<String>,
+        guard_kind: Option<GuardKind>,
+    ) {
+        if !self.options.enabled {
+            return;
+        }
+        self.stats
+            .exit_policy
+            .record_side_exit(ExitCounterKey::region(
+                function.raw(),
+                region_id,
+                GuardedTier::Cranelift,
+                reason,
+                guard_kind,
+            ));
     }
 
     pub fn record_jit_blacklist_rejection(&mut self) {
@@ -258,6 +376,29 @@ impl TieringState {
     #[must_use]
     pub fn jit_compiled_functions(&self) -> u64 {
         self.stats.jit_compiled_functions
+    }
+}
+
+fn inline_cache_exit_reason(observation: InlineCacheObservation) -> &'static str {
+    if observation.megamorphic {
+        "megamorphic_site"
+    } else if observation.guard_failure {
+        match observation.kind {
+            Some(crate::InlineCacheKind::MethodCall | crate::InlineCacheKind::PropertyFetch) => {
+                "wrong_class_shape"
+            }
+            Some(crate::InlineCacheKind::DimFetch) => "packed_to_mixed_layout",
+            Some(crate::InlineCacheKind::FunctionCall) => "builtin_or_function_shape",
+            _ => "inline_cache_guard",
+        }
+    } else if observation.miss {
+        match observation.kind {
+            Some(crate::InlineCacheKind::DimFetch) => "packed_to_mixed_layout",
+            Some(crate::InlineCacheKind::FunctionCall) => "builtin_stub_fallback",
+            _ => "inline_cache_miss",
+        }
+    } else {
+        "stable"
     }
 }
 

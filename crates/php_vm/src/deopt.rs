@@ -201,6 +201,442 @@ pub struct DeoptMetadata {
     pub regions: Vec<DeoptRegionMetadata>,
 }
 
+/// Stable guard identifier for guard/snapshot/resume metadata v2.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GuardId(u32);
+
+impl GuardId {
+    /// Creates a guard id.
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw id.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Stable snapshot identifier for guard/snapshot/resume metadata v2.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SnapshotId(u32);
+
+impl SnapshotId {
+    /// Creates a snapshot id.
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw id.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Stable exit identifier for guard/snapshot/resume metadata v2.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExitId(u32);
+
+impl ExitId {
+    /// Creates an exit id.
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw id.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Guard family shared by adaptive interpreter and future native tiers.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GuardKind {
+    IntAdd,
+    PropertyShape,
+    PackedArray,
+    BuiltinCall,
+    QuickeningType,
+    InlineCacheShape,
+    RegionAssumption,
+}
+
+impl GuardKind {
+    /// Stable report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntAdd => "int_add",
+            Self::PropertyShape => "property_shape",
+            Self::PackedArray => "packed_array",
+            Self::BuiltinCall => "builtin_call",
+            Self::QuickeningType => "quickening_type",
+            Self::InlineCacheShape => "inline_cache_shape",
+            Self::RegionAssumption => "region_assumption",
+        }
+    }
+}
+
+/// Optimized tier or feature owning a guard.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GuardedTier {
+    Quickening,
+    InlineCache,
+    DenseBytecode,
+    RegionIr,
+    CopyPatch,
+    Cranelift,
+}
+
+impl GuardedTier {
+    /// Stable report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quickening => "quickening",
+            Self::InlineCache => "inline_cache",
+            Self::DenseBytecode => "dense_bytecode",
+            Self::RegionIr => "region_ir",
+            Self::CopyPatch => "copy_patch",
+            Self::Cranelift => "cranelift",
+        }
+    }
+}
+
+/// Guard-failure policy attached to a side exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SideExitPolicy {
+    GenericFallback,
+    Dequicken,
+    BlacklistForRequest,
+    BlacklistPersistentlyCandidate,
+    DisableFeature,
+}
+
+impl SideExitPolicy {
+    /// Stable report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GenericFallback => "generic_fallback",
+            Self::Dequicken => "dequicken",
+            Self::BlacklistForRequest => "blacklist_for_request",
+            Self::BlacklistPersistentlyCandidate => "blacklist_persistently_candidate",
+            Self::DisableFeature => "disable_feature",
+        }
+    }
+}
+
+/// One live slot entry in a v2 snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotEntry {
+    /// VM live slot.
+    pub slot: LiveValueSlot,
+    /// Stable type/value-class label when available.
+    pub value_class: &'static str,
+}
+
+/// V2 snapshot with PHP state markers required for precise resume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotRecord {
+    /// Snapshot id.
+    pub id: SnapshotId,
+    /// Live VM slots.
+    pub entries: Vec<SnapshotEntry>,
+    /// Foreach state marker.
+    pub foreach_state: ControlStateMarker,
+    /// Exception/try/finally state marker.
+    pub exception_or_finally_state: ControlStateMarker,
+    /// Output-buffer state marker.
+    pub output_buffer_state: ControlStateMarker,
+    /// True when reference/COW state poisons optimized deopt.
+    pub reference_cow_poisoned: bool,
+}
+
+/// Interpreter resume point used by guard/snapshot/resume metadata v2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResumePoint {
+    /// Source function id.
+    pub function: u32,
+    /// Bytecode instruction offset.
+    pub bytecode_offset: u32,
+}
+
+impl From<DeoptResumePoint> for ResumePoint {
+    fn from(value: DeoptResumePoint) -> Self {
+        Self {
+            function: value.function,
+            bytecode_offset: value.instruction,
+        }
+    }
+}
+
+/// One guard record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardRecord {
+    /// Guard id.
+    pub id: GuardId,
+    /// Guard family.
+    pub kind: GuardKind,
+    /// Source function id.
+    pub source_function: u32,
+    /// Bytecode instruction offset.
+    pub bytecode_offset: u32,
+    /// Source span for diagnostics/traces.
+    pub ir_span: Option<IrSpan>,
+    /// Optimized tier or feature.
+    pub tier: GuardedTier,
+    /// Snapshot to restore on failure.
+    pub snapshot: SnapshotId,
+    /// Interpreter resume point.
+    pub resume: ResumePoint,
+    /// Stable exit reason.
+    pub exit_reason: VmDeoptReason,
+    /// Counter key for reports.
+    pub counter_id: String,
+    /// Blacklist/dequickening policy.
+    pub policy: SideExitPolicy,
+}
+
+/// Shared side-exit label metadata. No machine label is stored here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedExit {
+    /// Exit id.
+    pub id: ExitId,
+    /// Stable label for reports.
+    pub label: String,
+    /// Exit reason.
+    pub reason: VmDeoptReason,
+    /// Snapshot restore plan.
+    pub snapshot: SnapshotId,
+    /// Interpreter resume point.
+    pub resume: ResumePoint,
+}
+
+/// Guard/snapshot/side-exit/resume metadata v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeTable {
+    /// Versioned report schema.
+    pub schema_version: u32,
+    /// Guard records.
+    pub guards: Vec<GuardRecord>,
+    /// Snapshot records.
+    pub snapshots: Vec<SnapshotRecord>,
+    /// Shared exits.
+    pub exits: Vec<SharedExit>,
+}
+
+impl Default for ResumeTable {
+    fn default() -> Self {
+        Self {
+            schema_version: 2,
+            guards: Vec::new(),
+            snapshots: Vec::new(),
+            exits: Vec::new(),
+        }
+    }
+}
+
+impl ResumeTable {
+    /// Adds a snapshot and assigns the next stable id.
+    pub fn add_snapshot(
+        &mut self,
+        entries: Vec<SnapshotEntry>,
+        foreach_state: ControlStateMarker,
+        exception_or_finally_state: ControlStateMarker,
+        output_buffer_state: ControlStateMarker,
+        reference_cow_poisoned: bool,
+    ) -> SnapshotId {
+        let id = SnapshotId::new(self.snapshots.len() as u32);
+        self.snapshots.push(SnapshotRecord {
+            id,
+            entries,
+            foreach_state,
+            exception_or_finally_state,
+            output_buffer_state,
+            reference_cow_poisoned,
+        });
+        id
+    }
+
+    /// Adds a guard.
+    pub fn add_guard(&mut self, mut guard: GuardRecord) -> GuardId {
+        let id = GuardId::new(self.guards.len() as u32);
+        guard.id = id;
+        self.guards.push(guard);
+        id
+    }
+
+    /// Adds a shared side exit.
+    pub fn add_exit(
+        &mut self,
+        label: impl Into<String>,
+        reason: VmDeoptReason,
+        snapshot: SnapshotId,
+        resume: ResumePoint,
+    ) -> ExitId {
+        let id = ExitId::new(self.exits.len() as u32);
+        self.exits.push(SharedExit {
+            id,
+            label: label.into(),
+            reason,
+            snapshot,
+            resume,
+        });
+        id
+    }
+
+    /// Validates snapshot references and unsupported PHP state markers.
+    pub fn validate(&self) -> Result<(), Vec<ResumeTableError>> {
+        let mut errors = Vec::new();
+
+        for guard in &self.guards {
+            validate_snapshot_ref(self, guard.snapshot, "guard", guard.id.raw(), &mut errors);
+            if let Some(snapshot) = self.snapshots.get(guard.snapshot.index()) {
+                reject_unsupported_snapshot(snapshot, "guard", guard.id.raw(), &mut errors);
+            }
+        }
+        for exit in &self.exits {
+            validate_snapshot_ref(self, exit.snapshot, "exit", exit.id.raw(), &mut errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Compact versioned JSON report for tiering/JIT/performance stats.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut json = String::new();
+        json.push_str("{\"schema_version\":");
+        json.push_str(&self.schema_version.to_string());
+        json.push_str(",\"guards\":[");
+        for (index, guard) in self.guards.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str("{\"id\":");
+            json.push_str(&guard.id.raw().to_string());
+            json.push_str(",\"kind\":\"");
+            json.push_str(guard.kind.as_str());
+            json.push_str("\",\"tier\":\"");
+            json.push_str(guard.tier.as_str());
+            json.push_str("\",\"snapshot\":");
+            json.push_str(&guard.snapshot.raw().to_string());
+            json.push_str(",\"resume_offset\":");
+            json.push_str(&guard.resume.bytecode_offset.to_string());
+            json.push_str(",\"exit_reason\":\"");
+            json.push_str(guard.exit_reason.as_str());
+            json.push_str("\",\"policy\":\"");
+            json.push_str(guard.policy.as_str());
+            json.push_str("\"}");
+        }
+        json.push_str("],\"snapshots\":[");
+        for (index, snapshot) in self.snapshots.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str("{\"id\":");
+            json.push_str(&snapshot.id.raw().to_string());
+            json.push_str(",\"entries\":");
+            json.push_str(&snapshot.entries.len().to_string());
+            json.push_str(",\"reference_cow_poisoned\":");
+            json.push_str(if snapshot.reference_cow_poisoned {
+                "true"
+            } else {
+                "false"
+            });
+            json.push('}');
+        }
+        json.push_str("],\"exits\":[");
+        for (index, exit) in self.exits.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str("{\"id\":");
+            json.push_str(&exit.id.raw().to_string());
+            json.push_str(",\"reason\":\"");
+            json.push_str(exit.reason.as_str());
+            json.push_str("\",\"snapshot\":");
+            json.push_str(&exit.snapshot.raw().to_string());
+            json.push('}');
+        }
+        json.push_str("]}");
+        json
+    }
+}
+
+fn validate_snapshot_ref(
+    table: &ResumeTable,
+    snapshot: SnapshotId,
+    owner: &'static str,
+    owner_id: u32,
+    errors: &mut Vec<ResumeTableError>,
+) {
+    if table.snapshots.get(snapshot.index()).is_none() {
+        errors.push(ResumeTableError {
+            code: "invalid_snapshot",
+            detail: format!(
+                "{} {} references missing snapshot s{}",
+                owner,
+                owner_id,
+                snapshot.raw()
+            ),
+        });
+    }
+}
+
+fn reject_unsupported_snapshot(
+    snapshot: &SnapshotRecord,
+    owner: &'static str,
+    owner_id: u32,
+    errors: &mut Vec<ResumeTableError>,
+) {
+    if snapshot.reference_cow_poisoned {
+        errors.push(ResumeTableError {
+            code: "reference_cow_poisoned",
+            detail: format!(
+                "{} {} snapshot carries reference/COW poison",
+                owner, owner_id
+            ),
+        });
+    }
+    if snapshot.exception_or_finally_state == ControlStateMarker::Rejected {
+        errors.push(ResumeTableError {
+            code: "exception_or_finally_state_rejected",
+            detail: format!("{} {} snapshot rejects try/finally state", owner, owner_id),
+        });
+    }
+    if snapshot.foreach_state == ControlStateMarker::Rejected {
+        errors.push(ResumeTableError {
+            code: "foreach_state_rejected",
+            detail: format!("{} {} snapshot rejects foreach state", owner, owner_id),
+        });
+    }
+}
+
+/// Resume-table validation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeTableError {
+    /// Machine-readable code.
+    pub code: &'static str,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
 impl DeoptMetadata {
     /// Generate metadata from rich IR by first rejecting unsupported VM state,
     /// then lowering to verified dense bytecode.
@@ -725,5 +1161,198 @@ mod tests {
         assert_eq!(VmDeoptReason::HelperStatus.code(), 5);
         assert_eq!(VmDeoptReason::ExceptionPending.code(), 6);
         assert_eq!(VmDeoptReason::AbiMismatch.code(), 7);
+    }
+
+    #[test]
+    fn resume_table_models_int_add_quickening_guard() {
+        let mut table = ResumeTable::default();
+        let snapshot = scalar_snapshot(&mut table);
+        let guard = guard_record(
+            GuardKind::IntAdd,
+            GuardedTier::Quickening,
+            snapshot,
+            VmDeoptReason::TypeMismatch,
+        );
+        table.add_guard(guard);
+        table.add_exit(
+            "int_add_type_exit",
+            VmDeoptReason::TypeMismatch,
+            snapshot,
+            ResumePoint {
+                function: 0,
+                bytecode_offset: 3,
+            },
+        );
+
+        table.validate().expect("int-add guard table verifies");
+        let json = table.to_json();
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"kind\":\"int_add\""));
+        assert!(json.contains("\"tier\":\"quickening\""));
+    }
+
+    #[test]
+    fn resume_table_models_property_shape_guard() {
+        let mut table = ResumeTable::default();
+        let snapshot = scalar_snapshot(&mut table);
+        table.add_guard(guard_record(
+            GuardKind::PropertyShape,
+            GuardedTier::InlineCache,
+            snapshot,
+            VmDeoptReason::GuardFailed,
+        ));
+
+        table
+            .validate()
+            .expect("property-shape guard table verifies");
+        assert!(table.to_json().contains("\"kind\":\"property_shape\""));
+    }
+
+    #[test]
+    fn resume_table_models_packed_array_guard() {
+        let mut table = ResumeTable::default();
+        let snapshot = scalar_snapshot(&mut table);
+        table.add_guard(guard_record(
+            GuardKind::PackedArray,
+            GuardedTier::DenseBytecode,
+            snapshot,
+            VmDeoptReason::UnsupportedValue,
+        ));
+
+        table.validate().expect("packed-array guard table verifies");
+        assert!(table.to_json().contains("\"kind\":\"packed_array\""));
+    }
+
+    #[test]
+    fn resume_table_models_builtin_call_guard() {
+        let mut table = ResumeTable::default();
+        let snapshot = scalar_snapshot(&mut table);
+        table.add_guard(guard_record(
+            GuardKind::BuiltinCall,
+            GuardedTier::Cranelift,
+            snapshot,
+            VmDeoptReason::HelperStatus,
+        ));
+
+        table.validate().expect("builtin-call guard table verifies");
+        assert!(table.to_json().contains("\"kind\":\"builtin_call\""));
+    }
+
+    #[test]
+    fn resume_table_rejects_reference_cow_poison() {
+        let mut table = ResumeTable::default();
+        let snapshot = table.add_snapshot(
+            vec![snapshot_entry(0)],
+            ControlStateMarker::None,
+            ControlStateMarker::None,
+            ControlStateMarker::None,
+            true,
+        );
+        table.add_guard(guard_record(
+            GuardKind::RegionAssumption,
+            GuardedTier::RegionIr,
+            snapshot,
+            VmDeoptReason::ReferenceCowIdentity,
+        ));
+
+        let errors = table
+            .validate()
+            .expect_err("reference/COW poisoned snapshot should fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "reference_cow_poisoned")
+        );
+    }
+
+    #[test]
+    fn resume_table_rejects_try_finally_or_generator_state() {
+        let mut table = ResumeTable::default();
+        let try_finally = table.add_snapshot(
+            vec![snapshot_entry(0)],
+            ControlStateMarker::None,
+            ControlStateMarker::Rejected,
+            ControlStateMarker::None,
+            false,
+        );
+        table.add_guard(guard_record(
+            GuardKind::RegionAssumption,
+            GuardedTier::RegionIr,
+            try_finally,
+            VmDeoptReason::PendingFinally,
+        ));
+        let generator = table.add_snapshot(
+            vec![snapshot_entry(1)],
+            ControlStateMarker::Rejected,
+            ControlStateMarker::None,
+            ControlStateMarker::None,
+            false,
+        );
+        table.add_guard(guard_record(
+            GuardKind::RegionAssumption,
+            GuardedTier::RegionIr,
+            generator,
+            VmDeoptReason::GeneratorOrFiberState,
+        ));
+
+        let errors = table
+            .validate()
+            .expect_err("unsupported control state should fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "exception_or_finally_state_rejected")
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "foreach_state_rejected")
+        );
+    }
+
+    fn scalar_snapshot(table: &mut ResumeTable) -> SnapshotId {
+        table.add_snapshot(
+            vec![snapshot_entry(0), snapshot_entry(1)],
+            ControlStateMarker::None,
+            ControlStateMarker::None,
+            ControlStateMarker::None,
+            false,
+        )
+    }
+
+    fn snapshot_entry(index: u32) -> SnapshotEntry {
+        SnapshotEntry {
+            slot: LiveValueSlot {
+                class: LiveValueClass::Register,
+                index,
+                initialized: Some(true),
+                identity: LiveIdentityMarker::Plain,
+            },
+            value_class: "i64",
+        }
+    }
+
+    fn guard_record(
+        kind: GuardKind,
+        tier: GuardedTier,
+        snapshot: SnapshotId,
+        exit_reason: VmDeoptReason,
+    ) -> GuardRecord {
+        GuardRecord {
+            id: GuardId::new(u32::MAX),
+            kind,
+            source_function: 0,
+            bytecode_offset: 3,
+            ir_span: Some(IrSpan::default()),
+            tier,
+            snapshot,
+            resume: ResumePoint {
+                function: 0,
+                bytecode_offset: 3,
+            },
+            exit_reason,
+            counter_id: format!("{}.{}", tier.as_str(), kind.as_str()),
+            policy: SideExitPolicy::GenericFallback,
+        }
     }
 }

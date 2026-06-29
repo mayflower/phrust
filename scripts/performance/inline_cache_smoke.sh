@@ -76,6 +76,7 @@ required_fields = [
     "inline_cache_property_slots",
     "inline_cache_property_assign_slots",
     "inline_cache_dim_slots",
+    "inline_cache_class_relation_slots",
     "inline_cache_hits",
     "inline_cache_misses",
     "inline_cache_invalidations",
@@ -109,6 +110,13 @@ required_fields = [
     "class_static_ic_hits",
     "class_static_ic_misses",
     "class_static_ic_guard_failures",
+    "class_relation_cache_hits",
+    "class_relation_cache_misses",
+    "class_relation_cache_invalidations",
+    "instanceof_cache_hits",
+    "instanceof_cache_misses",
+    "method_override_cache_hits",
+    "method_override_cache_misses",
     "include_path_ic_hits",
     "include_path_ic_misses",
     "include_path_ic_invalidations",
@@ -160,6 +168,12 @@ off_function_call_hits = total(off, "function_call_ic_hits")
 off_function_call_misses = total(off, "function_call_ic_misses")
 off_builtin_call_hits = total(off, "builtin_call_ic_hits")
 off_builtin_call_misses = total(off, "builtin_call_ic_misses")
+off_class_relation_hits = total(off, "class_relation_cache_hits")
+off_class_relation_misses = total(off, "class_relation_cache_misses")
+off_instanceof_hits = total(off, "instanceof_cache_hits")
+off_instanceof_misses = total(off, "instanceof_cache_misses")
+off_method_override_hits = total(off, "method_override_cache_hits")
+off_method_override_misses = total(off, "method_override_cache_misses")
 on_slots = total(on, "inline_cache_slots")
 on_observations = total(on, "inline_cache_observations")
 on_function_slots = total(on, "inline_cache_function_slots")
@@ -167,6 +181,7 @@ on_method_slots = total(on, "inline_cache_method_slots")
 on_property_slots = total(on, "inline_cache_property_slots")
 on_property_assign_slots = total(on, "inline_cache_property_assign_slots")
 on_dim_slots = total(on, "inline_cache_dim_slots")
+on_class_relation_slots = total(on, "inline_cache_class_relation_slots")
 on_hits = total(on, "inline_cache_hits")
 on_misses = total(on, "inline_cache_misses")
 on_invalidations = total(on, "inline_cache_invalidations")
@@ -194,6 +209,13 @@ on_property_assign_dynamic_exits = total(on, "property_assign_ic_dynamic_exits")
 on_class_static_hits = total(on, "class_static_ic_hits")
 on_class_static_misses = total(on, "class_static_ic_misses")
 on_class_static_guard_failures = total(on, "class_static_ic_guard_failures")
+on_class_relation_hits = total(on, "class_relation_cache_hits")
+on_class_relation_misses = total(on, "class_relation_cache_misses")
+on_class_relation_invalidations = total(on, "class_relation_cache_invalidations")
+on_instanceof_hits = total(on, "instanceof_cache_hits")
+on_instanceof_misses = total(on, "instanceof_cache_misses")
+on_method_override_hits = total(on, "method_override_cache_hits")
+on_method_override_misses = total(on, "method_override_cache_misses")
 on_include_path_hits = total(on, "include_path_ic_hits")
 on_include_path_misses = total(on, "include_path_ic_misses")
 on_include_path_guard_failures = total(on, "include_path_ic_guard_failures")
@@ -214,6 +236,15 @@ if off_slots != 0 or off_observations != 0:
     raise SystemExit(f"[fail] inline-caches=off recorded slots={off_slots} observations={off_observations}")
 if off_function_call_hits or off_function_call_misses or off_builtin_call_hits or off_builtin_call_misses:
     raise SystemExit("[fail] inline-caches=off recorded function/builtin IC counters")
+if (
+    off_class_relation_hits
+    or off_class_relation_misses
+    or off_instanceof_hits
+    or off_instanceof_misses
+    or off_method_override_hits
+    or off_method_override_misses
+):
+    raise SystemExit("[fail] inline-caches=off recorded class-relation/method-override cache counters")
 for builtin in ["strlen", "count", "is_int", "is_string", "is_array"]:
     if total_map(off, "builtin_fast_stub_hits", builtin) or total_map(off, "builtin_fast_stub_misses", builtin):
         raise SystemExit(f"[fail] inline-caches=off recorded builtin fast-stub counters for {builtin}")
@@ -239,6 +270,8 @@ if on_property_assign_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no property assignment slots")
 if on_dim_slots <= 0:
     raise SystemExit("[fail] inline-caches=on recorded no dim fetch slots")
+if on_class_relation_slots <= 0:
+    raise SystemExit("[fail] inline-caches=on recorded no class-relation slots")
 if on_hits <= 0:
     raise SystemExit("[fail] function-call inline cache recorded no hits")
 if on_misses <= 0:
@@ -323,6 +356,20 @@ if on_class_static_hits <= 0:
     raise SystemExit("[fail] class-constant/static-property inline cache recorded no hits")
 if on_class_static_misses <= 0:
     raise SystemExit("[fail] class-constant/static-property inline cache recorded no misses")
+if on_class_relation_hits <= 0:
+    raise SystemExit("[fail] class-relation cache recorded no hits")
+if on_class_relation_misses <= 0:
+    raise SystemExit("[fail] class-relation cache recorded no misses")
+if on_class_relation_invalidations <= 0:
+    raise SystemExit("[fail] class-relation cache recorded no invalidations")
+if on_instanceof_hits <= 0:
+    raise SystemExit("[fail] instanceof cache recorded no hits")
+if on_instanceof_misses <= 0:
+    raise SystemExit("[fail] instanceof cache recorded no misses")
+if on_method_override_hits <= 0:
+    raise SystemExit("[fail] method-override cache recorded no hits")
+if on_method_override_misses <= 0:
+    raise SystemExit("[fail] method-override cache recorded no misses")
 if on_include_path_hits <= 0:
     raise SystemExit("[fail] include-path inline cache recorded no hits")
 if on_include_path_misses <= 0:

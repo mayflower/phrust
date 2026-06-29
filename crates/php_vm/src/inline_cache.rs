@@ -72,6 +72,7 @@ pub enum InlineCacheKind {
     PropertyFetch,
     PropertyAssign,
     ClassConstantStaticProperty,
+    ClassRelation,
     IncludePath,
     AutoloadClassLookup,
     DimFetch,
@@ -86,6 +87,7 @@ impl InlineCacheKind {
             Self::PropertyFetch => "property_fetch",
             Self::PropertyAssign => "property_assign",
             Self::ClassConstantStaticProperty => "class_constant_static_property",
+            Self::ClassRelation => "class_relation",
             Self::IncludePath => "include_path",
             Self::AutoloadClassLookup => "autoload_class_lookup",
             Self::DimFetch => "dim_fetch",
@@ -450,6 +452,129 @@ pub struct AutoloadClassLookupEpochs {
 pub enum AutoloadClassLookupCacheTarget {
     Positive { display_name: String },
     Negative,
+}
+
+/// Class/interface/trait/method relation cached by request-local relation slots.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ClassRelationKind {
+    ExtendsClass,
+    ImplementsInterface,
+    TraitComposition,
+    InstanceOf,
+    MethodOverrideSlot,
+    FinalMethodOrClass,
+    VisibilityContext,
+    AbstractInterfaceMethodRelation,
+}
+
+/// Stable request key for class, interface, trait, `instanceof`, and method
+/// relation checks.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ClassRelationCacheKey {
+    pub kind: ClassRelationKind,
+    pub subject: String,
+    pub target: String,
+    pub member: Option<String>,
+    pub visibility_context: Option<String>,
+    pub config_fingerprint: String,
+}
+
+/// Epoch guards for relation checks that are sensitive to declaration loading,
+/// autoload registration, trait/interface maps, and method-table layout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClassRelationEpochs {
+    pub class_table_epoch: u64,
+    pub autoload_epoch: u64,
+    pub include_eval_epoch: u64,
+    pub trait_interface_map_version: u64,
+    pub method_table_version: u64,
+}
+
+/// Cached boolean relation result plus optional resolved method metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassRelationCacheTarget {
+    pub matches: bool,
+    pub method_slot: Option<u32>,
+    pub declaring_class: Option<String>,
+}
+
+/// One request-local class-relation cache entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassRelationCacheEntry {
+    pub slot: InlineCacheId,
+    pub key: ClassRelationCacheKey,
+    pub epochs: ClassRelationEpochs,
+    pub target: ClassRelationCacheTarget,
+}
+
+/// Lookup result for class-relation caches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClassRelationCacheLookup {
+    Hit(ClassRelationCacheTarget),
+    Miss,
+    Invalidated,
+}
+
+/// Request-local class-relation cache.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClassRelationCache {
+    next_slot: u32,
+    entries: BTreeMap<ClassRelationCacheKey, ClassRelationCacheEntry>,
+}
+
+impl ClassRelationCache {
+    #[must_use]
+    pub fn lookup(
+        &mut self,
+        key: &ClassRelationCacheKey,
+        epochs: ClassRelationEpochs,
+    ) -> ClassRelationCacheLookup {
+        let Some(entry) = self.entries.get(key) else {
+            return ClassRelationCacheLookup::Miss;
+        };
+        if entry.epochs == epochs {
+            return ClassRelationCacheLookup::Hit(entry.target.clone());
+        }
+        self.entries.remove(key);
+        ClassRelationCacheLookup::Invalidated
+    }
+
+    pub fn install(
+        &mut self,
+        key: ClassRelationCacheKey,
+        epochs: ClassRelationEpochs,
+        target: ClassRelationCacheTarget,
+    ) -> InlineCacheId {
+        let slot = self
+            .entries
+            .get(&key)
+            .map(|entry| entry.slot)
+            .unwrap_or_else(|| {
+                let slot = InlineCacheId::new(self.next_slot);
+                self.next_slot = self.next_slot.saturating_add(1);
+                slot
+            });
+        self.entries.insert(
+            key.clone(),
+            ClassRelationCacheEntry {
+                slot,
+                key,
+                epochs,
+                target,
+            },
+        );
+        slot
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// One request-local inline-cache slot.
@@ -2167,9 +2292,10 @@ pub fn inline_cache_kind_for_instruction(kind: &InstructionKind) -> Option<Inlin
             Some(InlineCacheKind::ClassConstantStaticProperty)
         }
         InstructionKind::Include { .. } => Some(InlineCacheKind::IncludePath),
-        InstructionKind::InstanceOf { .. }
-        | InstructionKind::DynamicInstanceOf { .. }
-        | InstructionKind::NewObject { .. } => Some(InlineCacheKind::AutoloadClassLookup),
+        InstructionKind::InstanceOf { .. } | InstructionKind::DynamicInstanceOf { .. } => {
+            Some(InlineCacheKind::ClassRelation)
+        }
+        InstructionKind::NewObject { .. } => Some(InlineCacheKind::AutoloadClassLookup),
         InstructionKind::FetchDim { .. } | InstructionKind::ArrayGet { .. } => {
             Some(InlineCacheKind::DimFetch)
         }
@@ -2198,12 +2324,13 @@ mod tests {
     use super::{
         AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
         AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
-        ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind,
-        FunctionCallBuiltinMetadata, FunctionCallCacheTarget, FunctionCallShape,
-        IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind, InlineCacheState,
-        InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget, MethodCallGuardMetadata,
-        MethodCallResolvedTarget, MethodCallShape, PropertyFetchCacheTarget,
-        PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
+        ClassConstantStaticPropertyCacheTarget, ClassRelationCache, ClassRelationCacheKey,
+        ClassRelationCacheLookup, ClassRelationCacheTarget, ClassRelationEpochs, ClassRelationKind,
+        FunctionCallBuiltinKind, FunctionCallBuiltinMetadata, FunctionCallCacheTarget,
+        FunctionCallShape, IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind,
+        InlineCacheState, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
+        MethodCallGuardMetadata, MethodCallResolvedTarget, MethodCallShape,
+        PropertyFetchCacheTarget, PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
     };
     use crate::include::IncludePathFileFingerprint;
     use php_ir::ids::{BlockId, FunctionId, InstrId};
@@ -3546,5 +3673,89 @@ mod tests {
         assert_eq!(event.kind, Some(InlineCacheKind::IncludePath));
         assert!(event.invalidation);
         assert!(event.miss);
+    }
+
+    fn class_relation_key(kind: ClassRelationKind) -> ClassRelationCacheKey {
+        ClassRelationCacheKey {
+            kind,
+            subject: "child".to_owned(),
+            target: "base".to_owned(),
+            member: None,
+            visibility_context: None,
+            config_fingerprint: "unit:1:strict:false".to_owned(),
+        }
+    }
+
+    #[test]
+    fn class_relation_cache_records_hit_miss_and_invalidation() {
+        let mut cache = ClassRelationCache::default();
+        let key = class_relation_key(ClassRelationKind::InstanceOf);
+        let epochs = ClassRelationEpochs {
+            class_table_epoch: 1,
+            autoload_epoch: 2,
+            include_eval_epoch: 3,
+            trait_interface_map_version: 4,
+            method_table_version: 5,
+        };
+        let target = ClassRelationCacheTarget {
+            matches: true,
+            method_slot: None,
+            declaring_class: None,
+        };
+
+        assert_eq!(cache.lookup(&key, epochs), ClassRelationCacheLookup::Miss);
+        let slot = cache.install(key.clone(), epochs, target.clone());
+        assert_eq!(slot.raw(), 0);
+        assert_eq!(
+            cache.lookup(&key, epochs),
+            ClassRelationCacheLookup::Hit(target)
+        );
+        assert_eq!(
+            cache.lookup(
+                &key,
+                ClassRelationEpochs {
+                    class_table_epoch: 2,
+                    ..epochs
+                },
+            ),
+            ClassRelationCacheLookup::Invalidated
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn class_relation_cache_exposes_required_slot_kinds() {
+        let kinds = [
+            ClassRelationKind::ExtendsClass,
+            ClassRelationKind::ImplementsInterface,
+            ClassRelationKind::TraitComposition,
+            ClassRelationKind::InstanceOf,
+            ClassRelationKind::MethodOverrideSlot,
+            ClassRelationKind::FinalMethodOrClass,
+            ClassRelationKind::VisibilityContext,
+            ClassRelationKind::AbstractInterfaceMethodRelation,
+        ];
+        let mut cache = ClassRelationCache::default();
+        let epochs = ClassRelationEpochs::default();
+
+        for (index, kind) in kinds.iter().copied().enumerate() {
+            let mut key = class_relation_key(kind);
+            key.member = Some(format!("m{index}"));
+            cache.install(
+                key.clone(),
+                epochs,
+                ClassRelationCacheTarget {
+                    matches: index % 2 == 0,
+                    method_slot: u32::try_from(index).ok(),
+                    declaring_class: Some("child".to_owned()),
+                },
+            );
+            assert!(matches!(
+                cache.lookup(&key, epochs),
+                ClassRelationCacheLookup::Hit(_)
+            ));
+        }
+
+        assert_eq!(cache.len(), kinds.len());
     }
 }

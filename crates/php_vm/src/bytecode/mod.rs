@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use php_ir::ids::{LocalId, RegId};
 use php_ir::instruction::UnaryOp;
 use php_ir::instruction::{IrCallArg, IrCallArgValueKind, Terminator, TerminatorKind};
+use php_ir::rule_selection::{RuleKind, RuleSelection, RuleSelectionReport};
 use php_ir::source_map::{IrSourceMapTarget, IrSpan};
 use php_ir::{BinaryOp, CompareOp, Instruction, InstructionKind, IrFunction, IrUnit, Operand};
 
@@ -478,6 +479,81 @@ pub struct SuperinstructionSelectionReport {
     pub skipped_by_reason: BTreeMap<String, u64>,
 }
 
+/// Request-local dense-bytecode block profile used by conservative layout.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BytecodeLayoutProfile {
+    /// Dense block entries keyed as `f{function}:b{block}`.
+    pub block_entries: BTreeMap<String, u64>,
+}
+
+impl BytecodeLayoutProfile {
+    /// Returns true when no block-frequency data is available.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.block_entries.is_empty()
+    }
+
+    #[must_use]
+    fn block_entry_count(&self, function: u32, block: u32) -> u64 {
+        self.block_entries
+            .get(&dense_block_key(function, block))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// One dense function layout result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BytecodeFunctionLayout {
+    /// Function table index.
+    pub function: u32,
+    /// Whether this function's block descriptor order changed.
+    pub changed: bool,
+    /// Old block index to new block index.
+    pub old_to_new: Vec<u32>,
+    /// New block order expressed as old block indexes.
+    pub new_to_old: Vec<u32>,
+}
+
+/// Summary of a dense-bytecode block layout pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BytecodeLayoutReport {
+    /// Layout mode requested by the caller.
+    pub mode: &'static str,
+    /// Stable skip/reject reasons.
+    pub skipped_by_reason: BTreeMap<String, u64>,
+    /// Per-function mapping tables.
+    pub functions: Vec<BytecodeFunctionLayout>,
+}
+
+impl BytecodeLayoutReport {
+    #[must_use]
+    fn source(reason: &'static str) -> Self {
+        let mut report = Self {
+            mode: "source",
+            ..Self::default()
+        };
+        report.record_skip(reason);
+        report
+    }
+
+    fn record_skip(&mut self, reason: &'static str) {
+        *self
+            .skipped_by_reason
+            .entry(reason.to_string())
+            .or_default() += 1;
+    }
+
+    /// Number of function block orders changed by the pass.
+    #[must_use]
+    pub fn changed_functions(&self) -> u64 {
+        self.functions
+            .iter()
+            .filter(|function| function.changed)
+            .count() as u64
+    }
+}
+
 impl SuperinstructionSelectionReport {
     fn record_candidate(&mut self, opcode: DenseOpcode) {
         self.candidates += 1;
@@ -523,11 +599,279 @@ impl DenseBytecodeUnit {
         report
     }
 
+    /// Select report-only dense bytecode rules without mutating instruction order.
+    #[must_use]
+    pub fn select_rule_metadata(&self) -> RuleSelectionReport {
+        let mut report = RuleSelectionReport::default();
+        for function in &self.functions {
+            select_dense_function_rules(function, &mut report);
+        }
+        report
+    }
+
+    /// Build metadata-only OSR entry maps for loop headers.
+    #[must_use]
+    pub fn osr_entry_map(&self) -> crate::osr::OsrEntryMap {
+        crate::osr::analyze_dense_osr_entries(self)
+    }
+
+    /// Apply a conservative profile-guided dense block descriptor layout.
+    ///
+    /// Instruction arrays are not reordered. Branch operands and source-map
+    /// block targets are remapped so dense instruction IDs and source spans stay
+    /// stable.
+    pub fn apply_profiled_layout(
+        &mut self,
+        profile: Option<&BytecodeLayoutProfile>,
+    ) -> BytecodeLayoutReport {
+        let Some(profile) = profile else {
+            return BytecodeLayoutReport::source("missing_profile");
+        };
+        if profile.is_empty() {
+            return BytecodeLayoutReport::source("empty_profile");
+        }
+
+        let mut report = BytecodeLayoutReport {
+            mode: "profiled",
+            ..BytecodeLayoutReport::default()
+        };
+        let mut mappings = Vec::with_capacity(self.functions.len());
+        for (function_index, function) in self.functions.iter_mut().enumerate() {
+            let mapping = apply_profiled_function_layout(function_index as u32, function, profile);
+            if !mapping.changed {
+                report.record_skip("identity_order");
+            }
+            mappings.push(mapping);
+        }
+        remap_source_map_targets(&mut self.source_map, &mappings);
+        report.functions = mappings;
+        report
+    }
+
     /// Render a stable debug snapshot.
     #[must_use]
     pub fn to_snapshot_text(&self) -> String {
         render_snapshot(self)
     }
+}
+
+fn apply_profiled_function_layout(
+    function_index: u32,
+    function: &mut DenseFunction,
+    profile: &BytecodeLayoutProfile,
+) -> BytecodeFunctionLayout {
+    let block_count = function.blocks.len();
+    let identity: Vec<u32> = (0..block_count as u32).collect();
+    if block_count <= 1 {
+        return BytecodeFunctionLayout {
+            function: function_index,
+            changed: false,
+            old_to_new: identity.clone(),
+            new_to_old: identity,
+        };
+    }
+
+    let order = schedule_profiled_blocks(function_index, function, profile);
+    let changed = order
+        .iter()
+        .enumerate()
+        .any(|(new_index, old_index)| new_index as u32 != *old_index);
+    if !changed {
+        return BytecodeFunctionLayout {
+            function: function_index,
+            changed: false,
+            old_to_new: identity.clone(),
+            new_to_old: identity,
+        };
+    }
+
+    let mut old_to_new = vec![0; block_count];
+    for (new_index, old_index) in order.iter().copied().enumerate() {
+        old_to_new[old_index as usize] = new_index as u32;
+    }
+
+    for old_block in 0..block_count as u32 {
+        rewrite_terminator_for_layout(function, old_block, &old_to_new);
+    }
+
+    let mut blocks = Vec::with_capacity(block_count);
+    for (new_index, old_index) in order.iter().copied().enumerate() {
+        let mut block = function.blocks[old_index as usize].clone();
+        block.id = new_index as u32;
+        blocks.push(block);
+    }
+    function.blocks = blocks;
+
+    BytecodeFunctionLayout {
+        function: function_index,
+        changed,
+        old_to_new,
+        new_to_old: order,
+    }
+}
+
+fn schedule_profiled_blocks(
+    function_index: u32,
+    function: &DenseFunction,
+    profile: &BytecodeLayoutProfile,
+) -> Vec<u32> {
+    let block_count = function.blocks.len();
+    let mut scheduled = vec![false; block_count];
+    let mut order = Vec::with_capacity(block_count);
+    let mut current = 0_u32;
+
+    loop {
+        if scheduled[current as usize] {
+            break;
+        }
+        order.push(current);
+        scheduled[current as usize] = true;
+        let Some(next) = most_probable_unscheduled_successor(
+            function_index,
+            function,
+            current,
+            profile,
+            &scheduled,
+        ) else {
+            break;
+        };
+        current = next;
+    }
+
+    for block in 0..block_count as u32 {
+        if !scheduled[block as usize] {
+            order.push(block);
+            scheduled[block as usize] = true;
+        }
+    }
+    order
+}
+
+fn most_probable_unscheduled_successor(
+    function_index: u32,
+    function: &DenseFunction,
+    block: u32,
+    profile: &BytecodeLayoutProfile,
+    scheduled: &[bool],
+) -> Option<u32> {
+    let mut candidates: Vec<_> = dense_successors(function, block)
+        .into_iter()
+        .filter(|successor| {
+            (*successor as usize) < scheduled.len() && !scheduled[*successor as usize]
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        profile
+            .block_entry_count(function_index, *right)
+            .cmp(&profile.block_entry_count(function_index, *left))
+            .then_with(|| left.cmp(right))
+    });
+    candidates.into_iter().next()
+}
+
+fn dense_successors(function: &DenseFunction, block: u32) -> Vec<u32> {
+    let Some(block_meta) = function.blocks.get(block as usize) else {
+        return Vec::new();
+    };
+    let Some(terminator) = function.instructions.get(block_meta.terminator as usize) else {
+        return Vec::new();
+    };
+    let fallthrough = || {
+        let next = block + 1;
+        ((next as usize) < function.blocks.len()).then_some(next)
+    };
+    match (terminator.opcode, &terminator.operands) {
+        (DenseOpcode::Jump, DenseOperands::Jump { target }) => vec![*target],
+        (
+            DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue,
+            DenseOperands::JumpIf { target, .. },
+        ) => {
+            let mut successors = vec![*target];
+            if let Some(next) = fallthrough() {
+                successors.push(next);
+            }
+            successors
+        }
+        (
+            DenseOpcode::JumpIf,
+            DenseOperands::JumpIfElse {
+                if_true, if_false, ..
+            },
+        ) => vec![*if_true, *if_false],
+        _ => Vec::new(),
+    }
+}
+
+fn rewrite_terminator_for_layout(function: &mut DenseFunction, old_block: u32, old_to_new: &[u32]) {
+    let Some(block) = function.blocks.get(old_block as usize) else {
+        return;
+    };
+    let Some(instruction) = function.instructions.get_mut(block.terminator as usize) else {
+        return;
+    };
+    match (&mut instruction.opcode, &mut instruction.operands) {
+        (DenseOpcode::Jump, DenseOperands::Jump { target }) => {
+            *target = old_to_new[*target as usize];
+        }
+        (opcode @ (DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue), operands) => {
+            let DenseOperands::JumpIf { condition, target } = *operands else {
+                return;
+            };
+            let next_old = old_block + 1;
+            let next_new = old_to_new[next_old as usize];
+            let target_new = old_to_new[target as usize];
+            let (if_true, if_false) = if *opcode == DenseOpcode::JumpIfTrue {
+                (target_new, next_new)
+            } else {
+                (next_new, target_new)
+            };
+            *opcode = DenseOpcode::JumpIf;
+            *operands = DenseOperands::JumpIfElse {
+                condition,
+                if_true,
+                if_false,
+            };
+        }
+        (
+            DenseOpcode::JumpIf,
+            DenseOperands::JumpIfElse {
+                if_true, if_false, ..
+            },
+        ) => {
+            *if_true = old_to_new[*if_true as usize];
+            *if_false = old_to_new[*if_false as usize];
+        }
+        _ => {}
+    }
+}
+
+fn remap_source_map_targets(
+    source_map: &mut [DenseSourceMapEntry],
+    mappings: &[BytecodeFunctionLayout],
+) {
+    for entry in source_map {
+        match &mut entry.target {
+            DenseSourceMapTarget::Block { function, block }
+            | DenseSourceMapTarget::Instruction {
+                function, block, ..
+            }
+            | DenseSourceMapTarget::Terminator { function, block } => {
+                let Some(mapping) = mappings.get(*function as usize) else {
+                    continue;
+                };
+                let Some(new_block) = mapping.old_to_new.get(*block as usize) else {
+                    continue;
+                };
+                *block = *new_block;
+            }
+            DenseSourceMapTarget::Function { .. } => {}
+        }
+    }
+}
+
+#[must_use]
+pub fn dense_block_key(function: u32, block: u32) -> String {
+    format!("f{function}:b{block}")
 }
 
 fn select_function_superinstructions(
@@ -594,6 +938,188 @@ fn select_echo_fusion(
             Some(DenseOpcode::BinaryConcatEcho)
         }
         _ => None,
+    }
+}
+
+fn select_dense_function_rules(function: &DenseFunction, report: &mut RuleSelectionReport) {
+    for block in &function.blocks {
+        let first = block.first_instruction as usize;
+        let terminator = block.terminator as usize;
+        let mut index = first;
+        while index <= terminator && index < function.instructions.len() {
+            if let Some((kind, fused_child)) = select_dense_pair_rule(function, index, terminator) {
+                let parent = report.next_id();
+                report.push(RuleSelection::selected(
+                    parent,
+                    kind,
+                    vec![index as u32, fused_child as u32],
+                ));
+                let child = report.next_id();
+                report.push(RuleSelection::fused_child(
+                    child,
+                    parent,
+                    vec![fused_child as u32],
+                ));
+                index = fused_child + 1;
+                continue;
+            }
+
+            let instruction = &function.instructions[index];
+            let id = report.next_id();
+            match select_dense_single_rule(instruction) {
+                Some(kind) => report.push(RuleSelection::selected(id, kind, vec![index as u32])),
+                None => report.push(RuleSelection::skipped(
+                    id,
+                    vec![index as u32],
+                    dense_skip_reason(instruction.opcode),
+                )),
+            }
+            index += 1;
+        }
+    }
+}
+
+fn select_dense_pair_rule(
+    function: &DenseFunction,
+    index: usize,
+    terminator: usize,
+) -> Option<(RuleKind, usize)> {
+    if index + 1 > terminator || index + 1 >= function.instructions.len() {
+        return None;
+    }
+
+    let first = &function.instructions[index];
+    let second = &function.instructions[index + 1];
+    if second.opcode == DenseOpcode::Echo {
+        let DenseOperands::Operand { src: echo_src } = second.operands else {
+            return None;
+        };
+        return match select_echo_fusion(first.opcode, &first.operands, echo_src) {
+            Some(DenseOpcode::LoadConstEcho) => Some((RuleKind::LoadConstEcho, index + 1)),
+            Some(DenseOpcode::LoadLocalEcho) => Some((RuleKind::LoadLocalEcho, index + 1)),
+            Some(DenseOpcode::BinaryConcatEcho) => Some((RuleKind::ConcatEcho, index + 1)),
+            _ => None,
+        };
+    }
+
+    if is_compare_opcode(first.opcode)
+        && matches!(
+            second.opcode,
+            DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue | DenseOpcode::JumpIf
+        )
+        && compare_result_feeds_branch(&first.operands, &second.operands)
+    {
+        return Some((RuleKind::CompareAndBranch, index + 1));
+    }
+
+    None
+}
+
+fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> {
+    match instruction.opcode {
+        DenseOpcode::Nop => Some(RuleKind::NoRule),
+        DenseOpcode::LoadConst => Some(RuleKind::Const),
+        DenseOpcode::Move | DenseOpcode::LoadLocal | DenseOpcode::StoreLocal => {
+            Some(RuleKind::Move)
+        }
+        DenseOpcode::BinaryAdd
+        | DenseOpcode::BinarySub
+        | DenseOpcode::BinaryMul
+        | DenseOpcode::BinaryDiv
+        | DenseOpcode::BinaryMod
+        | DenseOpcode::BinaryBitAnd
+        | DenseOpcode::BinaryBitOr
+        | DenseOpcode::BinaryBitXor
+        | DenseOpcode::BinaryShiftLeft
+        | DenseOpcode::BinaryShiftRight => Some(RuleKind::BinaryInt),
+        DenseOpcode::BinaryConcat => Some(RuleKind::BinaryString),
+        DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship => Some(RuleKind::Compare),
+        DenseOpcode::LoadConstEcho => Some(RuleKind::LoadConstEcho),
+        DenseOpcode::LoadLocalEcho => Some(RuleKind::LoadLocalEcho),
+        DenseOpcode::BinaryConcatEcho => Some(RuleKind::ConcatEcho),
+        DenseOpcode::FetchDim => {
+            if matches!(
+                instruction.operands,
+                DenseOperands::FetchDim {
+                    key: DenseOperand {
+                        kind: DenseOperandKind::Constant,
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                Some(RuleKind::PackedFetchConst)
+            } else {
+                None
+            }
+        }
+        DenseOpcode::Return => Some(RuleKind::ReturnValue),
+        DenseOpcode::Jump
+        | DenseOpcode::JumpIfFalse
+        | DenseOpcode::JumpIfTrue
+        | DenseOpcode::JumpIf
+        | DenseOpcode::Echo
+        | DenseOpcode::Discard => Some(RuleKind::NoRule),
+        DenseOpcode::CallFunction
+        | DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim
+        | DenseOpcode::ForeachInit
+        | DenseOpcode::ForeachNext
+        | DenseOpcode::UnaryPlus
+        | DenseOpcode::UnaryMinus
+        | DenseOpcode::UnaryNot
+        | DenseOpcode::UnaryBitNot
+        | DenseOpcode::BinaryPow => None,
+    }
+}
+
+fn is_compare_opcode(opcode: DenseOpcode) -> bool {
+    matches!(
+        opcode,
+        DenseOpcode::CompareEqual
+            | DenseOpcode::CompareNotEqual
+            | DenseOpcode::CompareIdentical
+            | DenseOpcode::CompareNotIdentical
+            | DenseOpcode::CompareLess
+            | DenseOpcode::CompareLessEqual
+            | DenseOpcode::CompareGreater
+            | DenseOpcode::CompareGreaterEqual
+            | DenseOpcode::CompareSpaceship
+    )
+}
+
+fn compare_result_feeds_branch(compare: &DenseOperands, branch: &DenseOperands) -> bool {
+    let DenseOperands::Binary { dst, .. } = compare else {
+        return false;
+    };
+    match branch {
+        DenseOperands::JumpIf { condition, .. } | DenseOperands::JumpIfElse { condition, .. } => {
+            condition.kind == DenseOperandKind::Register && condition.index == *dst
+        }
+        _ => false,
+    }
+}
+
+fn dense_skip_reason(opcode: DenseOpcode) -> &'static str {
+    match opcode {
+        DenseOpcode::CallFunction => "effectful_call",
+        DenseOpcode::NewArray
+        | DenseOpcode::ArrayInsert
+        | DenseOpcode::AssignDim
+        | DenseOpcode::AppendDim
+        | DenseOpcode::ForeachInit
+        | DenseOpcode::ForeachNext => "php_value_or_memory_semantics",
+        _ => "unsupported_shape",
     }
 }
 
@@ -1728,8 +2254,9 @@ fn render_call_arg(arg: &DenseCallArg) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseBytecodeUnit, DenseInstruction, DenseOpcode, DenseOperands, DenseSpanId,
-        DenseVerifyErrorCode,
+        BytecodeLayoutProfile, DenseBlock, DenseBytecodeUnit, DenseFunction, DenseInstruction,
+        DenseOpcode, DenseOperand, DenseOperandKind, DenseOperands, DenseSourceMapEntry,
+        DenseSourceMapTarget, DenseSpanId, DenseVerifyErrorCode, dense_block_key,
     };
     use php_ir::{
         BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrConstant, IrSpan, Operand, UnitId,
@@ -1951,6 +2478,228 @@ echo "a" . "b";
     }
 
     #[test]
+    fn rule_selection_reports_concat_echo_and_skipped_child() {
+        let dense = manual_dense_unit(vec![
+            DenseInstruction {
+                opcode: DenseOpcode::BinaryConcat,
+                operands: DenseOperands::Binary {
+                    dst: 0,
+                    lhs: dense_const(0),
+                    rhs: dense_const(1),
+                },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+            DenseInstruction {
+                opcode: DenseOpcode::Echo,
+                operands: DenseOperands::Operand { src: dense_reg(0) },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+            DenseInstruction {
+                opcode: DenseOpcode::Return,
+                operands: DenseOperands::Return { value: None },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+        ]);
+
+        let report = dense.select_rule_metadata();
+        let dump = report.dump_text();
+
+        assert_eq!(report.rule_selection_selected, 2);
+        assert_eq!(report.rule_selection_fused, 1);
+        assert!(dump.contains("concat_echo=1"));
+        assert!(dump.contains("fused_into_r0=1"));
+        assert!(dump.contains("r0 concat_echo sources=[0,1]"));
+        assert!(dump.contains("r1 fused_into_r0 sources=[1] parent=r0 reason=fused_child"));
+    }
+
+    #[test]
+    fn rule_selection_reports_compare_and_branch() {
+        let dense = manual_dense_unit(vec![
+            DenseInstruction {
+                opcode: DenseOpcode::CompareLess,
+                operands: DenseOperands::Binary {
+                    dst: 0,
+                    lhs: dense_const(0),
+                    rhs: dense_const(1),
+                },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+            DenseInstruction {
+                opcode: DenseOpcode::JumpIfFalse,
+                operands: DenseOperands::JumpIf {
+                    condition: dense_reg(0),
+                    target: 1,
+                },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+            DenseInstruction {
+                opcode: DenseOpcode::Return,
+                operands: DenseOperands::Return { value: None },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+        ]);
+
+        let report = dense.select_rule_metadata();
+        let dump = report.dump_text();
+
+        assert!(dump.contains("compare_and_branch=1"));
+        assert!(dump.contains("r0 compare_and_branch sources=[0,1]"));
+        assert!(dump.contains("r1 fused_into_r0 sources=[1] parent=r0 reason=fused_child"));
+    }
+
+    #[test]
+    fn rule_selection_dump_is_stable_and_skips_effectful_call() {
+        let dense = manual_dense_unit(vec![
+            DenseInstruction {
+                opcode: DenseOpcode::CallFunction,
+                operands: DenseOperands::Call {
+                    dst: 0,
+                    name: 0,
+                    args: Vec::new(),
+                },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+            DenseInstruction {
+                opcode: DenseOpcode::Return,
+                operands: DenseOperands::Return {
+                    value: Some(dense_reg(0)),
+                },
+                span: DenseSpanId::new(0),
+                cache_slot: None,
+            },
+        ]);
+
+        assert_eq!(
+            dense.select_rule_metadata().dump_text(),
+            concat!(
+                "rule-selection\n",
+                "candidates=2\n",
+                "selected=1\n",
+                "fused=0\n",
+                "skipped=1\n",
+                "by-kind:\n",
+                "  return_value=1\n",
+                "  skipped=1\n",
+                "selections:\n",
+                "  r0 skipped sources=[0] reason=effectful_call\n",
+                "  r1 return_value sources=[1]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn profiled_layout_reorders_blocks_and_preserves_conditional_fallthrough() {
+        let file = php_ir::FileId::new(0);
+        let mut dense = DenseBytecodeUnit {
+            version: super::DENSE_BYTECODE_VERSION,
+            constant_count: 1,
+            file_count: 1,
+            functions: vec![DenseFunction {
+                name: "main".to_string(),
+                register_count: 0,
+                local_count: 0,
+                blocks: vec![
+                    DenseBlock {
+                        id: 0,
+                        first_instruction: 0,
+                        instruction_len: 1,
+                        terminator: 0,
+                    },
+                    DenseBlock {
+                        id: 1,
+                        first_instruction: 1,
+                        instruction_len: 1,
+                        terminator: 1,
+                    },
+                    DenseBlock {
+                        id: 2,
+                        first_instruction: 2,
+                        instruction_len: 1,
+                        terminator: 2,
+                    },
+                ],
+                instructions: vec![
+                    DenseInstruction {
+                        opcode: DenseOpcode::JumpIfFalse,
+                        operands: DenseOperands::JumpIf {
+                            condition: DenseOperand {
+                                kind: DenseOperandKind::Constant,
+                                index: 0,
+                            },
+                            target: 2,
+                        },
+                        span: DenseSpanId::new(0),
+                        cache_slot: None,
+                    },
+                    DenseInstruction {
+                        opcode: DenseOpcode::Return,
+                        operands: DenseOperands::Return { value: None },
+                        span: DenseSpanId::new(0),
+                        cache_slot: None,
+                    },
+                    DenseInstruction {
+                        opcode: DenseOpcode::Return,
+                        operands: DenseOperands::Return { value: None },
+                        span: DenseSpanId::new(0),
+                        cache_slot: None,
+                    },
+                ],
+            }],
+            spans: vec![IrSpan::new(file, 0, 1)],
+            names: Vec::new(),
+            cache_slots: Vec::new(),
+            source_map: vec![DenseSourceMapEntry {
+                target: DenseSourceMapTarget::Block {
+                    function: 0,
+                    block: 2,
+                },
+                origin: "manual".to_string(),
+                span: DenseSpanId::new(0),
+            }],
+        };
+        dense.verify().expect("manual dense unit verifies");
+        let mut profile = BytecodeLayoutProfile::default();
+        profile.block_entries.insert(dense_block_key(0, 2), 10);
+        profile.block_entries.insert(dense_block_key(0, 1), 1);
+
+        let report = dense.apply_profiled_layout(Some(&profile));
+
+        dense.verify().expect("layout-remapped dense unit verifies");
+        assert_eq!(report.changed_functions(), 1);
+        assert_eq!(report.functions[0].new_to_old, vec![0, 2, 1]);
+        assert_eq!(dense.functions[0].blocks[1].first_instruction, 2);
+        assert_eq!(
+            dense.functions[0].instructions[0].opcode,
+            DenseOpcode::JumpIf
+        );
+        assert_eq!(
+            dense.functions[0].instructions[0].operands,
+            DenseOperands::JumpIfElse {
+                condition: DenseOperand {
+                    kind: DenseOperandKind::Constant,
+                    index: 0,
+                },
+                if_true: 2,
+                if_false: 1,
+            }
+        );
+        assert_eq!(
+            dense.source_map[0].target,
+            DenseSourceMapTarget::Block {
+                function: 0,
+                block: 1,
+            }
+        );
+    }
+
+    #[test]
     fn bytecode_lowering_rejects_unsupported_instruction_family() {
         let mut unit = manual_basic_unit();
         unit.functions[0].blocks[0].instructions[2].kind = InstructionKind::FetchConst {
@@ -2001,6 +2750,44 @@ echo "a" . "b";
                 .iter()
                 .any(|error| error.code == DenseVerifyErrorCode::InvalidOperandShape)
         );
+    }
+
+    fn manual_dense_unit(instructions: Vec<DenseInstruction>) -> DenseBytecodeUnit {
+        DenseBytecodeUnit {
+            version: super::DENSE_BYTECODE_VERSION,
+            constant_count: 2,
+            file_count: 1,
+            functions: vec![DenseFunction {
+                name: "main".to_string(),
+                register_count: 4,
+                local_count: 0,
+                blocks: vec![DenseBlock {
+                    id: 0,
+                    first_instruction: 0,
+                    instruction_len: instructions.len() as u32,
+                    terminator: instructions.len().saturating_sub(1) as u32,
+                }],
+                instructions,
+            }],
+            spans: vec![IrSpan::new(php_ir::FileId::new(0), 0, 1)],
+            names: vec!["fn".to_string()],
+            cache_slots: Vec::new(),
+            source_map: Vec::new(),
+        }
+    }
+
+    fn dense_reg(index: u32) -> DenseOperand {
+        DenseOperand {
+            kind: DenseOperandKind::Register,
+            index,
+        }
+    }
+
+    fn dense_const(index: u32) -> DenseOperand {
+        DenseOperand {
+            kind: DenseOperandKind::Constant,
+            index,
+        }
     }
 
     fn manual_basic_unit() -> php_ir::IrUnit {

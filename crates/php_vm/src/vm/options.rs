@@ -1,3 +1,4 @@
+use crate::bytecode::BytecodeLayoutProfile;
 use crate::include::{IncludeCache, IncludeLoader};
 use crate::inline_cache::InlineCacheMode;
 use crate::quickening::QuickeningMode;
@@ -31,6 +32,11 @@ pub struct VmOptions {
     pub execution_format: ExecutionFormat,
     /// Optional dense-bytecode superinstruction selection pass.
     pub superinstructions: SuperinstructionMode,
+    /// Optional dense-bytecode block layout policy. The default preserves source
+    /// block order.
+    pub bytecode_layout: BytecodeLayoutMode,
+    /// Request-local or CLI-supplied dense-bytecode block profile.
+    pub bytecode_layout_profile: Option<BytecodeLayoutProfile>,
     /// Maintain request-local quickening metadata without changing semantics.
     pub quickening: QuickeningMode,
     /// Allocate request-local inline-cache slots without changing semantics.
@@ -64,6 +70,8 @@ impl Default for VmOptions {
             collect_counters: false,
             execution_format: ExecutionFormat::Ir,
             superinstructions: SuperinstructionMode::Off,
+            bytecode_layout: BytecodeLayoutMode::Source,
+            bytecode_layout_profile: None,
             quickening: QuickeningMode::Off,
             inline_caches: InlineCacheMode::Off,
             jit: JitMode::Off,
@@ -109,6 +117,32 @@ impl ExecutionFormat {
     #[must_use]
     pub(super) const fn is_strict_bytecode(self) -> bool {
         matches!(self, Self::Bytecode)
+    }
+}
+
+/// Optional dense-bytecode block layout mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BytecodeLayoutMode {
+    /// Preserve dense blocks in source/control-flow lowering order.
+    #[default]
+    Source,
+    /// Reorder dense block descriptors from a supplied local profile.
+    Profiled,
+}
+
+impl BytecodeLayoutMode {
+    /// Stable CLI/report spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Profiled => "profiled",
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn is_profiled(self) -> bool {
+        matches!(self, Self::Profiled)
     }
 }
 

@@ -6,7 +6,9 @@ cd "${ROOT}"
 
 ENGINE="${CARGO_TARGET_DIR:-target}/debug/php-vm"
 OUT_DIR="target/performance/superinstruction-smoke"
+RULE_DIR="target/performance/rules"
 mkdir -p "${OUT_DIR}"
+mkdir -p "${RULE_DIR}"
 
 if [[ ! -x "${ENGINE}" ]]; then
   printf '[error] missing VM engine: %s\n' "${ENGINE}" >&2
@@ -38,9 +40,13 @@ for fixture in "${fixtures[@]}"; do
   on_stdout="${OUT_DIR}/${stem}.on.stdout"
   on_stderr="${OUT_DIR}/${stem}.on.stderr"
   on_counters="${OUT_DIR}/${stem}.on.counters.json"
+  rule_dump="${RULE_DIR}/${stem}.rules.txt"
+  rule_json="${RULE_DIR}/${stem}.rules.json"
 
   "${ENGINE}" run --exec-format=bytecode --superinstructions=off "${fixture}" >"${off_stdout}" 2>"${off_stderr}"
   "${ENGINE}" run --exec-format=bytecode --superinstructions=on --counters-json="${on_counters}" "${fixture}" >"${on_stdout}" 2>"${on_stderr}"
+  "${ENGINE}" dump-rule-selection "${fixture}" >"${rule_dump}"
+  "${ENGINE}" dump-rule-selection --json "${fixture}" >"${rule_json}"
   cmp "${off_stdout}" "${on_stdout}"
   cmp "${off_stderr}" "${on_stderr}"
   python3 - "$on_counters" <<'PY'
@@ -59,6 +65,23 @@ if data.get("superinstruction_deopt_or_fallbacks") != 0:
     raise SystemExit(f"[error] {path}: expected no superinstruction deopt/fallback")
 if data.get("superinstruction_deopt_or_fallback_by_reason") != {}:
     raise SystemExit(f"[error] {path}: expected no superinstruction fallback reasons")
+PY
+  if ! grep -q '^rule-selection$' "${rule_dump}"; then
+    printf '[error] %s: missing rule-selection header\n' "${rule_dump}" >&2
+    exit 1
+  fi
+  python3 - "$rule_json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.loads(open(path, encoding="utf-8").read())
+if data.get("rule_selection_candidates", 0) <= 0:
+    raise SystemExit(f"[error] {path}: expected rule selection candidates")
+if data.get("rule_selection_selected", 0) <= 0:
+    raise SystemExit(f"[error] {path}: expected selected rules")
+if not isinstance(data.get("rule_selection_by_kind"), dict):
+    raise SystemExit(f"[error] {path}: rule_selection_by_kind must be an object")
 PY
   summary_rows+=("$(json_escape "${fixture}")")
 done

@@ -19,11 +19,14 @@ pub mod bytecode;
 pub mod compiled_unit;
 pub mod counters;
 pub mod deopt;
+pub mod dependency_units;
+pub mod exit_policy;
 pub mod fallback;
 pub mod frame;
 pub mod include;
 pub mod inline_cache;
 pub mod literal_pool;
+pub mod osr;
 pub mod persistent_feedback;
 pub mod quickening;
 pub mod region_profile;
@@ -45,7 +48,8 @@ pub mod api {
     };
     pub use crate::todo_runtime::{VmTodo, vm_skeleton_status};
     pub use crate::vm::{
-        ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm, VmOptions, VmResult,
+        BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
+        VmOptions, VmResult,
     };
 }
 
@@ -60,14 +64,31 @@ pub mod experimental {
         AliasState, alias_transition_key, slot_alias_state, value_alias_state,
     };
     #[doc(hidden)]
-    pub use crate::bytecode::{DenseBytecodeUnit, DenseOpcode, DenseOperands};
+    pub use crate::bytecode::{
+        BytecodeLayoutProfile, BytecodeLayoutReport, DenseBytecodeUnit, DenseOpcode, DenseOperands,
+        dense_block_key,
+    };
     #[doc(hidden)]
     pub use crate::counters::{JitCompileDescriptor, VmCounters};
     #[doc(hidden)]
     pub use crate::deopt::{
         ControlStateMarker, DeoptMetadata, DeoptMetadataError, DeoptRegionMetadata,
-        DeoptResumePoint, DeoptSideExitPoint, LiveIdentityMarker, LiveStateSnapshot,
-        LiveValueClass, LiveValueSlot, VmDeoptReason,
+        DeoptResumePoint, DeoptSideExitPoint, ExitId, GuardId, GuardKind, GuardRecord, GuardedTier,
+        LiveIdentityMarker, LiveStateSnapshot, LiveValueClass, LiveValueSlot, ResumePoint,
+        ResumeTable, ResumeTableError, SharedExit, SideExitPolicy, SnapshotEntry, SnapshotId,
+        SnapshotRecord, VmDeoptReason,
+    };
+    #[doc(hidden)]
+    pub use crate::dependency_units::{
+        DependencyEdge, DependencyEdgeKind, DependencyGraph, DependencyPlannerInputs,
+        DependencySpan, DependencyUnit, DependencyUnitId, DependencyUnitKind, DependencyUnitReport,
+        FileFingerprint, InvalidationReason, ObservedIncludeTarget, ObservedLookup,
+        plan_dependency_units, plan_dependency_units_with_inputs,
+    };
+    #[doc(hidden)]
+    pub use crate::exit_policy::{
+        ExitCounterKey, ExitCounterSite, ExitCounterTable, ExitPolicyDecision, ExitPolicyState,
+        ExitPolicyThresholds, ExitSiteLocation,
     };
     #[doc(hidden)]
     pub use crate::fallback::{
@@ -79,12 +100,20 @@ pub mod experimental {
     #[doc(hidden)]
     pub use crate::inline_cache::{
         ClassConstantStaticPropertyCacheKind, ClassConstantStaticPropertyCacheTarget,
+        ClassRelationCache, ClassRelationCacheEntry, ClassRelationCacheKey,
+        ClassRelationCacheLookup, ClassRelationCacheTarget, ClassRelationEpochs, ClassRelationKind,
         InlineCacheId, InlineCacheKind, InlineCacheMode, InlineCacheObservation, InlineCacheSlot,
         InlineCacheState, InlineCacheStats, InlineCacheTable, InvalidationEpoch,
         MethodCallCacheTarget, PropertyFetchCacheTarget,
     };
     #[doc(hidden)]
     pub use crate::literal_pool::{InternedLiteral, LiteralPool};
+    #[doc(hidden)]
+    pub use crate::osr::{
+        OsrEntry, OsrEntryId, OsrEntryMap, OsrEntryReport, OsrLiveSlot, OsrLoopStateAnnotations,
+        OsrRefCowSafety, OsrTargetLocation, OsrUnsupportedStateKind, OsrValueClass, OsrVmSlot,
+        analyze_dense_osr_entries, analyze_dense_osr_entries_with_annotations,
+    };
     #[doc(hidden)]
     pub use crate::persistent_feedback::{
         PERSISTENT_FEEDBACK_FORMAT_VERSION, PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION,
@@ -109,13 +138,21 @@ pub mod experimental {
 }
 
 pub use aliasing::{AliasState, alias_transition_key, slot_alias_state, value_alias_state};
-pub use bytecode::{DenseBytecodeUnit, DenseOpcode, DenseOperands};
+pub use bytecode::{
+    BytecodeLayoutProfile, BytecodeLayoutReport, DenseBytecodeUnit, DenseOpcode, DenseOperands,
+    dense_block_key,
+};
 pub use compiled_unit::CompiledUnit;
 pub use counters::{JitCompileDescriptor, VmCounters};
 pub use deopt::{
     ControlStateMarker, DeoptMetadata, DeoptMetadataError, DeoptRegionMetadata, DeoptResumePoint,
-    DeoptSideExitPoint, LiveIdentityMarker, LiveStateSnapshot, LiveValueClass, LiveValueSlot,
-    VmDeoptReason,
+    DeoptSideExitPoint, ExitId, GuardId, GuardKind, GuardRecord, GuardedTier, LiveIdentityMarker,
+    LiveStateSnapshot, LiveValueClass, LiveValueSlot, ResumePoint, ResumeTable, ResumeTableError,
+    SharedExit, SideExitPolicy, SnapshotEntry, SnapshotId, SnapshotRecord, VmDeoptReason,
+};
+pub use exit_policy::{
+    ExitCounterKey, ExitCounterSite, ExitCounterTable, ExitPolicyDecision, ExitPolicyState,
+    ExitPolicyThresholds, ExitSiteLocation,
 };
 pub use fallback::{
     DEQUICKEN_AFTER_GUARD_MISSES, DISABLE_AFTER_GUARD_MISSES, FallbackProtocolEvent,
@@ -127,12 +164,19 @@ pub use include::{
     ResolvedIncludePath,
 };
 pub use inline_cache::{
-    ClassConstantStaticPropertyCacheKind, ClassConstantStaticPropertyCacheTarget, InlineCacheId,
+    ClassConstantStaticPropertyCacheKind, ClassConstantStaticPropertyCacheTarget,
+    ClassRelationCache, ClassRelationCacheEntry, ClassRelationCacheKey, ClassRelationCacheLookup,
+    ClassRelationCacheTarget, ClassRelationEpochs, ClassRelationKind, InlineCacheId,
     InlineCacheKind, InlineCacheMode, InlineCacheObservation, InlineCacheSlot, InlineCacheState,
     InlineCacheStats, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
     PropertyFetchCacheTarget,
 };
 pub use literal_pool::{InternedLiteral, LiteralPool};
+pub use osr::{
+    OsrEntry, OsrEntryId, OsrEntryMap, OsrEntryReport, OsrLiveSlot, OsrLoopStateAnnotations,
+    OsrRefCowSafety, OsrTargetLocation, OsrUnsupportedStateKind, OsrValueClass, OsrVmSlot,
+    analyze_dense_osr_entries, analyze_dense_osr_entries_with_annotations,
+};
 pub use persistent_feedback::{
     PERSISTENT_FEEDBACK_FORMAT_VERSION, PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION,
     PersistentArrayKeyShape, PersistentArrayLayout, PersistentBranchBias, PersistentCallsiteState,
@@ -151,7 +195,8 @@ pub use region_profile::{
 pub use tiering::{ExecutionTier, TieringOptions, TieringState, TieringStats};
 pub use todo_runtime::{VmTodo, vm_skeleton_status};
 pub use vm::{
-    ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm, VmOptions, VmResult,
+    BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
+    VmOptions, VmResult,
 };
 
 #[cfg(test)]

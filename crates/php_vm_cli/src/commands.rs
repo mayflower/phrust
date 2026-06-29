@@ -18,14 +18,15 @@ use php_semantics::{FrontendResult, Severity, analyze_source, diagnostics::Diagn
 use php_source::{SourceText, TextRange};
 use php_vm::{
     api::{
-        ExecutionFormat, IncludeLoader, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
-        VmOptions, VmResult,
+        BytecodeLayoutMode, ExecutionFormat, IncludeLoader, JitBlacklistMode, JitMode,
+        SuperinstructionMode, Vm, VmOptions, VmResult,
     },
     experimental::{
-        DenseBytecodeUnit, DenseOpcode, DenseOperands, InlineCacheMode, JitCompileDescriptor,
-        PersistentFeedbackContext, PersistentFeedbackEpochs, PersistentFeedbackLoadReport,
-        PersistentFeedbackStats, PersistentFeedbackStore, QuickeningMode, RegionProfile,
-        TieringOptions, TieringStats, VmCounters,
+        BytecodeLayoutProfile, DenseBytecodeUnit, DenseOpcode, DenseOperands, InlineCacheMode,
+        JitCompileDescriptor, PersistentFeedbackContext, PersistentFeedbackEpochs,
+        PersistentFeedbackLoadReport, PersistentFeedbackStats, PersistentFeedbackStore,
+        QuickeningMode, RegionProfile, TieringOptions, TieringStats, VmCounters,
+        plan_dependency_units,
     },
 };
 use serde::Serialize;
@@ -83,6 +84,8 @@ where
         "compile" => compile_command(&args[1..], stdout, stderr),
         "dump-ir" => dump_ir_command(&args[1..], stdout, stderr),
         "dump-bytecode-patterns" => dump_bytecode_patterns_command(&args[1..], stdout, stderr),
+        "dump-rule-selection" => dump_rule_selection_command(&args[1..], stdout, stderr),
+        "dump-dependency-units" => dump_dependency_units_command(&args[1..], stdout, stderr),
         "dump-baseline-native-stencil" => {
             dump_baseline_native_stencil_command(&args[1..], stdout, stderr)
         }
@@ -289,6 +292,88 @@ where
         for (triple, count) in &report.triples {
             writeln!(stdout, "triple {count:>4} {triple}").map_err(|error| error.to_string())?;
         }
+    }
+    Ok(EXIT_SUCCESS)
+}
+
+fn dump_rule_selection_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_rule_selection_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let dense = match DenseBytecodeUnit::lower_from_ir(&pipeline.lowering.unit) {
+        Ok(dense) => dense,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "E_PHP_VM_DENSE_BYTECODE_UNSUPPORTED: {}",
+                error.message
+            )
+            .map_err(|io| io.to_string())?;
+            return Ok(EXIT_UNSUPPORTED);
+        }
+    };
+    if let Err(errors) = dense.verify() {
+        writeln!(
+            stderr,
+            "E_PHP_VM_DENSE_BYTECODE_VERIFY: dense bytecode verifier rejected unit with {} error(s)",
+            errors.len()
+        )
+        .map_err(|io| io.to_string())?;
+        return Ok(EXIT_UNSUPPORTED);
+    }
+    let report = dense.select_rule_metadata();
+    if json {
+        writeln!(stdout, "{}", rule_selection_json(path, &dense, &report))
+            .map_err(|error| error.to_string())?;
+    } else {
+        write!(stdout, "{}", report.dump_text()).map_err(|error| error.to_string())?;
+    }
+    Ok(EXIT_SUCCESS)
+}
+
+fn dump_dependency_units_command<W, E>(
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
+where
+    W: Write,
+    E: Write,
+{
+    let (path, json) = parse_dump_dependency_units_args(args)?;
+    let pipeline = match compile_pipeline(path) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|io| io.to_string())?;
+            return Ok(EXIT_COMPILE_ERROR);
+        }
+    };
+    if !pipeline.ok() {
+        write_frontend_diagnostics(stderr, &pipeline)?;
+        return Ok(EXIT_COMPILE_ERROR);
+    }
+    let report = plan_dependency_units(&pipeline.lowering.unit);
+    if json {
+        write!(stdout, "{}", report.to_json()).map_err(|error| error.to_string())?;
+    } else {
+        write!(stdout, "{}", report.to_markdown()).map_err(|error| error.to_string())?;
     }
     Ok(EXIT_SUCCESS)
 }
@@ -602,6 +687,7 @@ where
     );
     let jit_eligibility_json = build_jit_eligibility_json(&unit, run_options.jit);
     let persistent_feedback = load_persistent_feedback(&run_options, path, &unit)?;
+    let bytecode_layout_profile = load_bytecode_layout_profile(&run_options)?;
     let vm = Vm::with_options(VmOptions {
         include_loader,
         runtime_context,
@@ -612,6 +698,8 @@ where
             || run_options.region_profile_json.is_some(),
         execution_format: run_options.execution_format,
         superinstructions: run_options.superinstructions,
+        bytecode_layout: run_options.bytecode_layout,
+        bytecode_layout_profile,
         quickening: run_options.quickening,
         inline_caches: run_options.inline_caches,
         jit: run_options.jit,
@@ -704,6 +792,7 @@ where
     let collect_counters = run_options.counters_json.is_some()
         || run_options.jit_stats.is_json()
         || run_options.region_profile_json.is_some();
+    let bytecode_layout_profile = load_bytecode_layout_profile(run_options)?;
     let (source, real_path, source_path) = php_executor::read_script(Path::new(path))?;
     let executor = PhpExecutor::with_options(PhpExecutorOptions {
         optimization_level: run_options.opt_level,
@@ -713,6 +802,8 @@ where
             collect_counters,
             execution_format: run_options.execution_format,
             superinstructions: run_options.superinstructions,
+            bytecode_layout: run_options.bytecode_layout,
+            bytecode_layout_profile,
             quickening: run_options.quickening,
             inline_caches: run_options.inline_caches,
             jit: run_options.jit,
@@ -1543,6 +1634,8 @@ struct RunOptions<'a> {
     opt_level: OptimizationLevel,
     execution_format: ExecutionFormat,
     superinstructions: SuperinstructionMode,
+    bytecode_layout: BytecodeLayoutMode,
+    bytecode_layout_profile: Option<String>,
     quickening: QuickeningMode,
     inline_caches: InlineCacheMode,
     jit: JitMode,
@@ -1570,6 +1663,7 @@ impl EnginePreset {
                 opt_level: OptimizationLevel::O0,
                 execution_format: ExecutionFormat::Ir,
                 superinstructions: SuperinstructionMode::Off,
+                bytecode_layout: BytecodeLayoutMode::Source,
                 quickening: QuickeningMode::Off,
                 inline_caches: InlineCacheMode::Off,
                 jit: JitMode::Off,
@@ -1581,6 +1675,7 @@ impl EnginePreset {
                 opt_level: OptimizationLevel::O2,
                 execution_format: ExecutionFormat::Auto,
                 superinstructions: SuperinstructionMode::Off,
+                bytecode_layout: BytecodeLayoutMode::Source,
                 quickening: QuickeningMode::On,
                 inline_caches: InlineCacheMode::On,
                 jit: JitMode::Off,
@@ -1592,6 +1687,7 @@ impl EnginePreset {
                 opt_level: OptimizationLevel::O2,
                 execution_format: ExecutionFormat::Auto,
                 superinstructions: SuperinstructionMode::Off,
+                bytecode_layout: BytecodeLayoutMode::Source,
                 quickening: QuickeningMode::On,
                 inline_caches: InlineCacheMode::On,
                 jit: JitMode::Cranelift,
@@ -1608,6 +1704,7 @@ struct EnginePresetConfig {
     opt_level: OptimizationLevel,
     execution_format: ExecutionFormat,
     superinstructions: SuperinstructionMode,
+    bytecode_layout: BytecodeLayoutMode,
     quickening: QuickeningMode,
     inline_caches: InlineCacheMode,
     jit: JitMode,
@@ -1764,6 +1861,42 @@ fn parse_dump_bytecode_patterns_args(args: &[String]) -> Result<(&str, bool), St
     Ok((path, json))
 }
 
+fn parse_dump_rule_selection_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!("unexpected dump-rule-selection argument `{arg}`"));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-rule-selection requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
+fn parse_dump_dependency_units_args(args: &[String]) -> Result<(&str, bool), String> {
+    let mut path = None;
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if path.is_none() {
+            path = Some(arg.as_str());
+        } else {
+            return Err(format!("unexpected dump-dependency-units argument `{arg}`"));
+        }
+    }
+    let Some(path) = path else {
+        return Err("dump-dependency-units requires <path.php>".to_string());
+    };
+    Ok((path, json))
+}
+
 fn parse_dump_baseline_native_stencil_args(args: &[String]) -> Result<(&str, bool), String> {
     let mut path = None;
     let mut json = false;
@@ -1837,6 +1970,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
     let mut opt_level = OptimizationLevel::O0;
     let mut execution_format = ExecutionFormat::Ir;
     let mut superinstructions = SuperinstructionMode::Off;
+    let mut bytecode_layout = BytecodeLayoutMode::Source;
+    let mut bytecode_layout_profile = None;
     let mut quickening = QuickeningMode::Off;
     let mut inline_caches = InlineCacheMode::Off;
     let mut jit = JitMode::Off;
@@ -1866,6 +2001,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 opt_level = config.opt_level;
                 execution_format = config.execution_format;
                 superinstructions = config.superinstructions;
+                bytecode_layout = config.bytecode_layout;
                 quickening = config.quickening;
                 inline_caches = config.inline_caches;
                 jit = config.jit;
@@ -1880,6 +2016,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                 opt_level = config.opt_level;
                 execution_format = config.execution_format;
                 superinstructions = config.superinstructions;
+                bytecode_layout = config.bytecode_layout;
                 quickening = config.quickening;
                 inline_caches = config.inline_caches;
                 jit = config.jit;
@@ -1941,6 +2078,26 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
             }
             arg if let Some(value) = arg.strip_prefix("--superinstructions=") => {
                 superinstructions = parse_superinstruction_mode(value)?;
+            }
+            "--bytecode-layout" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --bytecode-layout requires source or profiled".to_string());
+                };
+                bytecode_layout = parse_bytecode_layout_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--bytecode-layout=") => {
+                bytecode_layout = parse_bytecode_layout_mode(value)?;
+            }
+            "--bytecode-layout-profile" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --bytecode-layout-profile requires <path>".to_string());
+                };
+                bytecode_layout_profile = Some(value.clone());
+            }
+            arg if let Some(value) = arg.strip_prefix("--bytecode-layout-profile=") => {
+                bytecode_layout_profile = Some(value.to_owned());
             }
             "--quickening" => {
                 index += 1;
@@ -2185,6 +2342,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
                     opt_level,
                     execution_format,
                     superinstructions,
+                    bytecode_layout,
+                    bytecode_layout_profile,
                     quickening,
                     inline_caches,
                     jit,
@@ -2221,6 +2380,8 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> {
         opt_level,
         execution_format,
         superinstructions,
+        bytecode_layout,
+        bytecode_layout_profile,
         quickening,
         inline_caches,
         jit,
@@ -2302,6 +2463,16 @@ fn parse_superinstruction_mode(value: &str) -> Result<SuperinstructionMode, Stri
         "on" => Ok(SuperinstructionMode::On),
         _ => Err(format!(
             "unsupported superinstructions mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+fn parse_bytecode_layout_mode(value: &str) -> Result<BytecodeLayoutMode, String> {
+    match value {
+        "source" => Ok(BytecodeLayoutMode::Source),
+        "profiled" => Ok(BytecodeLayoutMode::Profiled),
+        _ => Err(format!(
+            "unsupported bytecode-layout mode `{value}`; expected source or profiled"
         )),
     }
 }
@@ -2469,10 +2640,11 @@ fn persistent_feedback_context(
 
 fn persistent_feedback_compile_options(run_options: &RunOptions<'_>) -> String {
     format!(
-        "opt={},exec={},super={},quickening={},inline_caches={},bytecode_cache={},jit={},tiering={}",
+        "opt={},exec={},super={},layout={},quickening={},inline_caches={},bytecode_cache={},jit={},tiering={}",
         run_options.opt_level.as_str(),
         run_options.execution_format.as_str(),
         run_options.superinstructions.as_str(),
+        run_options.bytecode_layout.as_str(),
         on_off(run_options.quickening.enabled()),
         on_off(run_options.inline_caches.enabled()),
         run_options.bytecode_cache.mode.as_str(),
@@ -2677,6 +2849,34 @@ fn write_region_profile_json(path: String, profile: &RegionProfile) -> Result<()
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     fs::write(path, profile.to_json()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn load_bytecode_layout_profile(
+    options: &RunOptions<'_>,
+) -> Result<Option<BytecodeLayoutProfile>, String> {
+    let Some(path) = options.bytecode_layout_profile.as_ref() else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{path}: {error}"))?;
+    let block_entries = json
+        .get("block_entries")
+        .or_else(|| json.get("dense_block_entry_counts"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!("{path}: expected object field `block_entries` or `dense_block_entry_counts`")
+        })?;
+    let mut profile = BytecodeLayoutProfile::default();
+    for (key, value) in block_entries {
+        let Some(count) = value.as_u64() else {
+            return Err(format!(
+                "{path}: block entry `{key}` is not a non-negative integer"
+            ));
+        };
+        profile.block_entries.insert(key.clone(), count);
+    }
+    Ok(Some(profile))
 }
 
 fn write_jit_stats_json<W: Write>(
@@ -2978,7 +3178,7 @@ fn region_profile_json_from_env() -> Option<String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] [--counters-json <path>] [--region-profile-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-rule-selection <file> [--json]\n  php-vm dump-dependency-units <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--trace] [--trace-runtime] [--env KEY=VALUE] [--engine-preset baseline|fast|experimental-jit] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--opt-level 0|1|2] [--exec-format ir|auto|bytecode] [--superinstructions off|on] [--bytecode-layout source|profiled] [--bytecode-layout-profile <path>] [--quickening off|on] [--inline-caches off|on] [--jit off|noop|cranelift] [--jit-threshold N] [--jit-max-compile-us N] [--jit-max-functions N] [--jit-eager] [--jit-blacklist off|on] [--jit-dump-clif PATH] [--jit-stats json] [--tiering off|on] [--tiering-function-threshold N] [--tiering-loop-threshold N] [--tiering-ic-stability-threshold N] [--tiering-guard-failure-threshold N] [--tiering-stats-json <path>] [--persistent-feedback-read <path>] [--persistent-feedback-stats-json <path>] [--counters-json <path>] [--region-profile-json <path>] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nStatus:\n  {}\n  {}\n  {}\n  {}",
         php_ir::ir_skeleton_status(),
         php_runtime::runtime_skeleton_status(),
         php_vm::vm_skeleton_status(),
@@ -3698,6 +3898,38 @@ fn bytecode_patterns_json(
     })
 }
 
+fn rule_selection_json(
+    path: &str,
+    dense: &DenseBytecodeUnit,
+    report: &php_ir::RuleSelectionReport,
+) -> String {
+    to_json_string(&serde_json::json!({
+        "ok": true,
+        "path": path,
+        "functions": dense.functions.len(),
+        "rule_selection_candidates": report.rule_selection_candidates,
+        "rule_selection_selected": report.rule_selection_selected,
+        "rule_selection_fused": report.rule_selection_fused,
+        "rule_selection_skipped": report.rule_selection_skipped,
+        "rule_selection_by_kind": report.rule_selection_by_kind,
+        "selections": report.selections.iter().map(|selection| {
+            serde_json::json!({
+                "id": selection.id.raw(),
+                "kind": selection.kind.as_str(),
+                "source_indexes": &selection.source_indexes,
+                "parent": selection.parent.map(php_ir::RuleId::raw),
+                "reason": &selection.reason,
+                "operand_constraints": selection.operand_constraints.iter().map(|constraint| {
+                    serde_json::json!({
+                        "operand_index": constraint.operand_index,
+                        "constraint": &constraint.constraint,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
 #[derive(Serialize)]
 struct BytecodePatternsJson<'a> {
     ok: bool,
@@ -4157,12 +4389,15 @@ mod tests {
     use super::{
         BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_RUNTIME_ERROR, EXIT_SUCCESS, JitStatsMode,
         OptimizationLevel, PersistentFeedbackOptions, QuickeningMode, cache_file_for,
-        compile_pipeline_with_optimization, parse_run_args, run,
+        compile_pipeline_with_optimization, parse_dump_dependency_units_args,
+        parse_dump_rule_selection_args, parse_run_args, run,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
     use php_runtime::api::RuntimeContext;
     use php_vm::{
-        api::{ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode},
+        api::{
+            BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode,
+        },
         experimental::InlineCacheMode,
     };
     use serde_json::Value;
@@ -4295,6 +4530,113 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn dump_rule_selection_reports_stable_text_and_json() {
+        let fixture = fixture("fixtures/bytecode/literals/valid/echo-multiple.php");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            ["dump-rule-selection".to_string(), fixture.clone()],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.starts_with("rule-selection\n"));
+        assert!(!text.contains("rule_selection"));
+        assert!(text.contains("load_const_echo"));
+        assert!(text.contains("sources=["));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-rule-selection".to_string(),
+                fixture,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let json = parse_json_bytes(&stdout);
+        assert_eq!(json["ok"], true);
+        assert!(json["rule_selection_candidates"].as_u64().unwrap() > 0);
+        assert!(json["rule_selection_selected"].as_u64().unwrap() > 0);
+        assert!(
+            json["rule_selection_by_kind"]
+                .as_object()
+                .unwrap()
+                .contains_key("load_const_echo")
+        );
+        assert!(!json["selections"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dump_rule_selection_parser_rejects_extra_args() {
+        let args = vec!["file.php".to_string(), "extra".to_string()];
+        let error = parse_dump_rule_selection_args(&args).expect_err("extra arg should fail");
+
+        assert!(error.contains("unexpected dump-rule-selection argument"));
+    }
+
+    #[test]
+    fn dump_dependency_units_reports_stable_text_and_json() {
+        let fixture =
+            fixture("tests/fixtures/performance/framework_smoke/composer_autoload_lookup.php");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            ["dump-dependency-units".to_string(), fixture.clone()],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.starts_with("# Dependency Units\n"));
+        assert!(text.contains("autoload_resolver"));
+        assert!(text.contains("source_content_changed"));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-dependency-units".to_string(),
+                fixture,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        let json = parse_json_bytes(&stdout);
+        assert!(json["counters"]["dependency_units"].as_u64().unwrap() > 0);
+        assert!(json["counters"]["dependency_edges"].as_u64().unwrap() > 0);
+        assert!(
+            json["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|unit| unit["kind"] == "autoload_resolver")
+        );
+    }
+
+    #[test]
+    fn dump_dependency_units_parser_rejects_extra_args() {
+        let args = vec!["file.php".to_string(), "extra".to_string()];
+        let error = parse_dump_dependency_units_args(&args).expect_err("extra arg should fail");
+
+        assert!(error.contains("unexpected dump-dependency-units argument"));
     }
 
     #[test]
@@ -4478,6 +4820,8 @@ mod tests {
         assert_eq!(options.opt_level, OptimizationLevel::O2);
         assert_eq!(options.execution_format, ExecutionFormat::Auto);
         assert_eq!(options.superinstructions, SuperinstructionMode::Off);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
+        assert_eq!(options.bytecode_layout_profile, None);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
         assert_eq!(options.jit, JitMode::Off);
@@ -4506,6 +4850,7 @@ mod tests {
         assert_eq!(options.bytecode_cache.mode, BytecodeCacheMode::Read);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
     }
 
     #[test]
@@ -4520,6 +4865,7 @@ mod tests {
 
         assert_eq!(options.opt_level, OptimizationLevel::O2);
         assert_eq!(options.execution_format, ExecutionFormat::Auto);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
         assert_eq!(options.jit, JitMode::Cranelift);
@@ -4593,6 +4939,21 @@ mod tests {
         };
 
         assert!(error.contains("expected off or on"));
+    }
+
+    #[test]
+    fn invalid_bytecode_layout_mode_is_rejected() {
+        let args = vec![
+            "--bytecode-layout=sideways".to_string(),
+            "fixtures/runtime/valid/hello.php".to_string(),
+        ];
+
+        let error = match parse_run_args(&args) {
+            Ok(_) => panic!("invalid bytecode layout mode should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("expected source or profiled"));
     }
 
     #[test]
@@ -4874,6 +5235,8 @@ mod tests {
         assert_eq!(options.opt_level, OptimizationLevel::O0);
         assert_eq!(options.execution_format, ExecutionFormat::Ir);
         assert_eq!(options.superinstructions, SuperinstructionMode::Off);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Source);
+        assert_eq!(options.bytecode_layout_profile, None);
         assert_eq!(options.quickening, QuickeningMode::Off);
         assert_eq!(options.inline_caches, InlineCacheMode::Off);
         assert_eq!(options.jit, JitMode::Off);
@@ -4905,6 +5268,9 @@ mod tests {
             "--opt-level=1".to_string(),
             "--exec-format=bytecode".to_string(),
             "--superinstructions=on".to_string(),
+            "--bytecode-layout=profiled".to_string(),
+            "--bytecode-layout-profile".to_string(),
+            "target/performance/bytecode-layout/block-frequency.json".to_string(),
             "--quickening=on".to_string(),
             "--inline-caches=on".to_string(),
             "--jit=cranelift".to_string(),
@@ -4942,6 +5308,11 @@ mod tests {
         assert_eq!(options.opt_level, OptimizationLevel::O1);
         assert_eq!(options.execution_format, ExecutionFormat::Bytecode);
         assert_eq!(options.superinstructions, SuperinstructionMode::On);
+        assert_eq!(options.bytecode_layout, BytecodeLayoutMode::Profiled);
+        assert_eq!(
+            options.bytecode_layout_profile,
+            Some("target/performance/bytecode-layout/block-frequency.json".to_string())
+        );
         assert_eq!(options.quickening, QuickeningMode::On);
         assert_eq!(options.inline_caches, InlineCacheMode::On);
         assert_eq!(options.jit, JitMode::Cranelift);
@@ -5001,6 +5372,10 @@ mod tests {
         assert!(json.contains("\"function_entry_count\""));
         assert!(json.contains("\"tier0_interpreter_entries\""));
         assert!(json.contains("\"tiering_disabled_entries\""));
+        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"exit_policy\""));
+        assert!(json.contains("\"sites\""));
+        assert!(json.contains("\"decisions\""));
     }
 
     #[test]

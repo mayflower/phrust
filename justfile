@@ -43,6 +43,7 @@ help:
       'Runtime and VM:' \
       '  just bytecode-snapshots   Run bytecode snapshot checks' \
       '  just bytecode-exec-smoke  Run dense bytecode execution A/B smoke' \
+      '  just bytecode-layout-smoke Run dense bytecode block layout A/B smoke' \
       '  just superinstruction-smoke Run dense bytecode superinstruction A/B smoke' \
       '  just vm-smoke             Run VM CLI smoke checks' \
       '  just vm-trace-smoke       Run VM trace/debug smoke checks' \
@@ -314,7 +315,9 @@ verify-performance:
     @just mid-tier-plan-smoke
     @just cache-roundtrip
     @just optimizer-diff
+    @just bytecode-layout-smoke
     @just superinstruction-smoke
+    @just templates-smoke
     @just quickening-smoke
     @just inline-cache-smoke
     @just callgrind-smoke
@@ -603,6 +606,10 @@ bytecode-snapshots:
 bytecode-exec-smoke:
     cargo build -p php_vm_cli
     scripts/performance/bytecode_exec_smoke.sh
+
+bytecode-layout-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/performance/bytecode_layout_smoke.sh
 
 superinstruction-smoke:
     cargo build -p php_vm_cli --bin php-vm
@@ -971,11 +978,18 @@ perf-compare:
 
 cache-roundtrip:
     @just cache-fingerprint-smoke
+    @just dependency-units-smoke
     cargo test -p php_bytecode_cache bytecode_cache
     cargo test -p php_vm_cli bytecode_cache
 
 cache-fingerprint-smoke:
     scripts/performance/cache_fingerprint_smoke.sh
+
+dependency-units-smoke:
+    scripts/performance/dependency_units_smoke.sh
+
+templates-smoke:
+    scripts/performance/templates_smoke.sh
 
 optimizer-diff:
     @just ir-verify

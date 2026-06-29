@@ -33,7 +33,7 @@ VM_MOD_REQUIRED_SNIPPETS = [
     "mod arguments;",
     "mod options;",
     "mod result;",
-    "pub use options::{ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions};",
+    "BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions,",
     "pub use result::{VmControlFlow, VmResult};",
     "pub struct Vm",
     "impl Vm",
@@ -43,7 +43,7 @@ VM_MOD_REQUIRED_SNIPPETS = [
 VM_LIB_REQUIRED_SNIPPETS = [
     "pub mod vm;",
     "pub use vm::{",
-    "Vm, VmOptions, VmResult",
+    "BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,",
 ]
 
 ARGINFO_REQUIRED_SNIPPETS = [

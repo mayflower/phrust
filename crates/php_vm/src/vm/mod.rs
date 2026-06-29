@@ -7,7 +7,9 @@ mod arguments;
 mod options;
 mod result;
 
-pub use options::{ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions};
+pub use options::{
+    BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions,
+};
 pub use result::{VmControlFlow, VmResult};
 
 use crate::aliasing::{AliasState, slot_alias_state};
@@ -19,17 +21,21 @@ use crate::compiled_unit::CompiledUnit;
 #[cfg(feature = "jit-cranelift")]
 use crate::counters::JitCompileDescriptor;
 use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservation, VmCounters};
+#[cfg(feature = "jit-cranelift")]
+use crate::deopt::GuardKind;
 use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument};
 use crate::include::{LoadedInclude, include_path_file_fingerprint};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
     AutoloadClassLookupKind, ClassConstantStaticPropertyCacheKind,
-    ClassConstantStaticPropertyCacheTarget, FunctionCallBuiltinKind, FunctionCallBuiltinMetadata,
-    FunctionCallCacheTarget, FunctionCallShape, IncludePathCacheKey, IncludePathCacheTarget,
-    InlineCacheKind, InlineCacheObservation, InlineCacheTable, InvalidationEpoch,
-    MethodCallCacheTarget, MethodCallGuardMetadata, MethodCallResolvedTarget, MethodCallShape,
-    PropertyAssignCacheTarget, PropertyAssignLayoutMetadata, PropertyAssignResolvedTarget,
-    PropertyFetchCacheTarget, PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
+    ClassConstantStaticPropertyCacheTarget, ClassRelationCache, ClassRelationCacheKey,
+    ClassRelationCacheLookup, ClassRelationCacheTarget, ClassRelationEpochs, ClassRelationKind,
+    FunctionCallBuiltinKind, FunctionCallBuiltinMetadata, FunctionCallCacheTarget,
+    FunctionCallShape, IncludePathCacheKey, IncludePathCacheTarget, InlineCacheKind,
+    InlineCacheObservation, InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget,
+    MethodCallGuardMetadata, MethodCallResolvedTarget, MethodCallShape, PropertyAssignCacheTarget,
+    PropertyAssignLayoutMetadata, PropertyAssignResolvedTarget, PropertyFetchCacheTarget,
+    PropertyFetchLayoutMetadata, PropertyFetchResolvedTarget,
 };
 use crate::literal_pool::LiteralPool;
 use crate::quickening::{QuickeningObservation, QuickeningSpecialization, QuickeningTable};
@@ -105,6 +111,18 @@ const JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT: i32 = 22;
 const JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT: i32 = 23;
 #[cfg(feature = "jit-cranelift")]
 const JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT: i32 = 24;
+
+#[cfg(feature = "jit-cranelift")]
+fn jit_guard_kind_for_side_exit(reason: php_jit::SideExitReason) -> Option<GuardKind> {
+    match reason {
+        php_jit::SideExitReason::TypeMismatch => Some(GuardKind::QuickeningType),
+        php_jit::SideExitReason::Overflow => Some(GuardKind::IntAdd),
+        php_jit::SideExitReason::UnsupportedValue => Some(GuardKind::RegionAssumption),
+        php_jit::SideExitReason::GuardFailed => Some(GuardKind::RegionAssumption),
+        php_jit::SideExitReason::HelperStatus => Some(GuardKind::BuiltinCall),
+        php_jit::SideExitReason::ExceptionPending | php_jit::SideExitReason::AbiMismatch => None,
+    }
+}
 
 #[cfg(feature = "jit-cranelift")]
 extern "C" fn jit_array_len_abi(value_ptr: usize, out: *mut i64) -> i32 {
@@ -820,6 +838,7 @@ struct ExecutionState {
     autoload_stack_epoch: u64,
     class_table_epoch: u64,
     include_config_epoch: u64,
+    class_relation_cache: ClassRelationCache,
     autoload_registry: AutoloadRegistry,
     autoload_stack: Vec<String>,
     dynamic_units: Vec<CompiledUnit>,
@@ -869,6 +888,17 @@ impl ExecutionState {
             autoload_stack_epoch: self.autoload_stack_epoch,
             class_table_epoch: self.class_table_epoch,
             include_config_epoch: self.include_config_epoch,
+        }
+    }
+
+    fn class_relation_epochs(&self) -> ClassRelationEpochs {
+        ClassRelationEpochs {
+            class_table_epoch: self.class_table_epoch,
+            autoload_epoch: self.autoload_stack_epoch,
+            include_eval_epoch: self.include_config_epoch.wrapping_mul(1_000_003)
+                ^ self.eval_counter as u64,
+            trait_interface_map_version: self.class_table_epoch,
+            method_table_version: self.function_table_epoch,
         }
     }
 
@@ -2092,6 +2122,31 @@ impl Vm {
         }
     }
 
+    fn record_counter_dense_block_entry(&self, function: u32, block: u32) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_block_entry(function, block);
+        }
+    }
+
+    fn record_counter_dense_branch(
+        &self,
+        function: u32,
+        from_block: u32,
+        to_block: u32,
+        truthy: bool,
+        fallthrough: bool,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_branch(function, from_block, to_block, truthy, fallthrough);
+        }
+    }
+
     fn record_counter_bytecode_lowered_families(&self, dense: &DenseBytecodeUnit) {
         if !self.options.collect_counters {
             return;
@@ -2297,8 +2352,15 @@ impl Vm {
         }
     }
 
-    fn record_counter_quickening(&self, observation: QuickeningObservation) {
-        self.tiering.borrow_mut().record_quickening(observation);
+    fn record_counter_quickening_site(
+        &self,
+        function_id: FunctionId,
+        bytecode_offset: u32,
+        observation: QuickeningObservation,
+    ) {
+        self.tiering
+            .borrow_mut()
+            .record_quickening_site(function_id, bytecode_offset, observation);
         if !self.options.collect_counters {
             return;
         }
@@ -2307,8 +2369,17 @@ impl Vm {
         }
     }
 
-    fn record_counter_inline_cache(&self, observation: InlineCacheObservation) {
-        self.tiering.borrow_mut().record_inline_cache(observation);
+    fn record_counter_inline_cache_site(
+        &self,
+        function_id: FunctionId,
+        bytecode_offset: u32,
+        observation: InlineCacheObservation,
+    ) {
+        self.tiering.borrow_mut().record_inline_cache_site(
+            function_id,
+            bytecode_offset,
+            observation,
+        );
         if !self.options.collect_counters {
             return;
         }
@@ -2389,6 +2460,69 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_method_tiny_inline_rejection(reason);
+        }
+    }
+
+    fn record_counter_class_relation_cache_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_class_relation_cache_hit();
+        }
+    }
+
+    fn record_counter_class_relation_cache_miss(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_class_relation_cache_miss();
+        }
+    }
+
+    fn record_counter_class_relation_cache_invalidation(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_class_relation_cache_invalidation();
+        }
+    }
+
+    fn record_counter_instanceof_cache_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_instanceof_cache_hit();
+        }
+    }
+
+    fn record_counter_instanceof_cache_miss(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_instanceof_cache_miss();
+        }
+    }
+
+    fn record_counter_method_override_cache_hit(&self) {
+        if !self.options.collect_counters || !self.options.inline_caches.enabled() {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_override_cache_hit();
+        }
+    }
+
+    fn record_counter_method_override_cache_miss(&self) {
+        if !self.options.collect_counters || !self.options.inline_caches.enabled() {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_method_override_cache_miss();
         }
     }
 
@@ -2814,6 +2948,16 @@ impl Vm {
     #[cfg(feature = "jit-cranelift")]
     fn record_jit_side_exit_for_key(&self, key: JitFunctionKey, side_exit: php_jit::JitSideExit) {
         self.record_counter_jit_side_exit(side_exit.reason);
+        let region_id = side_exit
+            .resume_instruction
+            .map(|instruction| format!("bytecode-{}", instruction.raw()))
+            .unwrap_or_else(|| format!("function-{}", key.function.raw()));
+        self.tiering.borrow_mut().record_jit_side_exit(
+            key.function,
+            region_id,
+            side_exit.reason.as_str(),
+            jit_guard_kind_for_side_exit(side_exit.reason),
+        );
         if side_exit.reason == php_jit::SideExitReason::GuardFailed {
             self.record_counter_jit_guard_failure();
         }
@@ -2837,8 +2981,13 @@ impl Vm {
         }
     }
 
-    fn record_inline_cache_event(&self, observation: InlineCacheObservation) {
-        self.record_counter_inline_cache(observation);
+    fn record_inline_cache_site_event(
+        &self,
+        function_id: FunctionId,
+        instruction_id: php_ir::ids::InstrId,
+        observation: InlineCacheObservation,
+    ) {
+        self.record_counter_inline_cache_site(function_id, instruction_id.raw(), observation);
     }
 
     fn observe_inline_cache(
@@ -2865,7 +3014,7 @@ impl Vm {
             instruction_id,
             cache_kind,
         );
-        self.record_counter_inline_cache(observation);
+        self.record_counter_inline_cache_site(function_id, instruction_id.raw(), observation);
     }
 
     fn cranelift_method_direct_call_path_enabled(&self, kind: &InstructionKind) -> bool {
@@ -2911,7 +3060,7 @@ impl Vm {
             shape,
             expected_builtin_metadata.as_ref(),
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
         if observation.hit {
             self.record_counter_function_call_ic(true);
             if target.as_ref().is_some_and(function_call_target_is_builtin) {
@@ -2981,7 +3130,12 @@ impl Vm {
             scope,
             epoch,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
+        if observation.hit {
+            self.record_counter_method_override_cache_hit();
+        } else if observation.miss {
+            self.record_counter_method_override_cache_miss();
+        }
         (target, Some(observation))
     }
 
@@ -3037,7 +3191,7 @@ impl Vm {
             scope,
             epoch,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
         target
     }
 
@@ -3171,7 +3325,7 @@ impl Vm {
             scope,
             epoch,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
         target
     }
 
@@ -3325,7 +3479,7 @@ impl Vm {
                 scope,
                 epoch,
             );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function_id, instruction_id, observation);
         target
     }
 
@@ -3374,7 +3528,7 @@ impl Vm {
             self.quickening
                 .borrow_mut()
                 .observe(function_id, block_id, instruction_id);
-        self.record_counter_quickening(observation);
+        self.record_counter_quickening_site(function_id, instruction_id.raw(), observation);
     }
 
     fn record_quickening_guard(
@@ -3393,7 +3547,7 @@ impl Vm {
             instruction_id,
             hit,
         );
-        self.record_counter_quickening(observation);
+        self.record_counter_quickening_site(function_id, instruction_id.raw(), observation);
     }
 
     fn observe_dense_quickening(
@@ -3409,7 +3563,7 @@ impl Vm {
             self.quickening
                 .borrow_mut()
                 .observe_dense(unit_id, function_id, instruction_index);
-        self.record_counter_quickening(observation);
+        self.record_counter_quickening_site(function_id, instruction_index, observation);
     }
 
     fn record_dense_quickening_guard(
@@ -3428,7 +3582,7 @@ impl Vm {
             instruction_index,
             hit,
         );
-        self.record_counter_quickening(observation);
+        self.record_counter_quickening_site(function_id, instruction_index, observation);
     }
 
     fn record_counter_string_concat_fast_path(&self, hit: bool) {
@@ -4195,7 +4349,11 @@ impl Vm {
                             .observe_mul_int_int_candidate(function_id, block_id, instruction_id),
                         _ => return None,
                     };
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_id.raw(),
+                        observation,
+                    );
                 }
                 None
             }
@@ -4260,7 +4418,11 @@ impl Vm {
                             block_id,
                             instruction_id,
                         );
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_id.raw(),
+                        observation,
+                    );
                 }
                 None
             }
@@ -4391,7 +4553,11 @@ impl Vm {
                             block_id,
                             instruction_id,
                         );
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_id.raw(),
+                        observation,
+                    );
                 }
                 None
             }
@@ -4466,7 +4632,11 @@ impl Vm {
                             instruction_index,
                             expected,
                         );
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_index,
+                        observation,
+                    );
                 }
                 None
             }
@@ -4535,7 +4705,11 @@ impl Vm {
                             function_id,
                             instruction_index,
                         );
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_index,
+                        observation,
+                    );
                 }
                 None
             }
@@ -4590,7 +4764,11 @@ impl Vm {
                             function_id,
                             instruction_index,
                         );
-                    self.record_counter_quickening(observation);
+                    self.record_counter_quickening_site(
+                        function_id,
+                        instruction_index,
+                        observation,
+                    );
                 }
                 None
             }
@@ -5301,6 +5479,16 @@ impl Vm {
                 ));
             }
         }
+        if self.options.bytecode_layout.is_profiled() {
+            let _report =
+                dense.apply_profiled_layout(self.options.bytecode_layout_profile.as_ref());
+            if let Err(errors) = dense.verify() {
+                return BytecodeEntryAttempt::Unsupported(format!(
+                    "E_PHP_VM_DENSE_LAYOUT_VERIFY: profiled dense bytecode layout failed verification with {} error(s)",
+                    errors.len()
+                ));
+            }
+        }
         self.record_counter_bytecode_lowered_families(&dense);
         self.record_counter_bytecode_lower_success();
         let entry = compiled.unit().entry;
@@ -5381,6 +5569,7 @@ impl Vm {
                 stack.pop_recycle();
                 return result;
             };
+            self.record_counter_dense_block_entry(function_id.raw(), block_index);
             let start = block.first_instruction as usize;
             let end = start + block.instruction_len as usize;
             let Some(instructions) = dense_function.instructions.get(start..end) else {
@@ -6481,7 +6670,8 @@ impl Vm {
                         } else {
                             truthy
                         };
-                        block_index = if jump {
+                        let from_block = block_index;
+                        let next_block = if jump {
                             target
                         } else {
                             match next_dense_block_index(dense_function, block_index) {
@@ -6494,6 +6684,14 @@ impl Vm {
                                 }
                             }
                         };
+                        self.record_counter_dense_branch(
+                            function_id.raw(),
+                            from_block,
+                            next_block,
+                            truthy,
+                            !jump,
+                        );
+                        block_index = next_block;
                         continue 'dispatch;
                     }
                     DenseOpcode::JumpIf => {
@@ -6538,7 +6736,15 @@ impl Vm {
                                 }
                             },
                         };
-                        block_index = if truthy { if_true } else { if_false };
+                        let next_block = if truthy { if_true } else { if_false };
+                        self.record_counter_dense_branch(
+                            function_id.raw(),
+                            block_index,
+                            next_block,
+                            truthy,
+                            false,
+                        );
+                        block_index = next_block;
                         continue 'dispatch;
                     }
                     DenseOpcode::Return => {
@@ -7619,7 +7825,9 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = match object_instanceof(compiled, &object, class_name) {
+                        let value = match self
+                            .object_instanceof_cached(compiled, state, &object, class_name)
+                        {
                             Ok(value) => Value::Bool(value),
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -7665,7 +7873,12 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = match object_instanceof(compiled, &object, &class_name) {
+                        let value = match self.object_instanceof_cached(
+                            compiled,
+                            state,
+                            &object,
+                            &class_name,
+                        ) {
                             Ok(value) => Value::Bool(value),
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -16004,7 +16217,7 @@ impl Vm {
             request,
             epoch,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
         target
     }
 
@@ -16024,7 +16237,7 @@ impl Vm {
             block,
             instruction,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
     }
 
     fn record_include_path_inline_cache_invalidation(
@@ -16043,7 +16256,7 @@ impl Vm {
             block,
             instruction,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
     }
 
     fn install_include_path_inline_cache(
@@ -16086,7 +16299,7 @@ impl Vm {
             .inline_caches
             .borrow_mut()
             .lookup_autoload_class_lookup(unit_key, function, block, instruction, request, epochs);
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
         target
     }
 
@@ -16107,7 +16320,7 @@ impl Vm {
             instruction,
             InlineCacheKind::AutoloadClassLookup,
         );
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
     }
 
     fn invalidate_autoload_class_inline_cache(
@@ -16124,7 +16337,7 @@ impl Vm {
             .inline_caches
             .borrow_mut()
             .invalidate_autoload_class_lookup(unit_key, function, block, instruction);
-        self.record_inline_cache_event(observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
     }
 
     fn install_autoload_class_inline_cache(
@@ -16151,6 +16364,56 @@ impl Vm {
                 epochs,
                 target,
             );
+    }
+
+    fn object_instanceof_cached(
+        &self,
+        compiled: &CompiledUnit,
+        state: &mut ExecutionState,
+        value: &Value,
+        class_name: &str,
+    ) -> Result<bool, String> {
+        if !self.options.inline_caches.enabled() {
+            return object_instanceof(compiled, value, class_name);
+        }
+        let Some(subject) = class_relation_subject_name(value) else {
+            return object_instanceof(compiled, value, class_name);
+        };
+        let key = ClassRelationCacheKey {
+            kind: ClassRelationKind::InstanceOf,
+            subject,
+            target: normalize_class_name(class_name),
+            member: None,
+            visibility_context: None,
+            config_fingerprint: class_relation_config_fingerprint(compiled),
+        };
+        let epochs = state.class_relation_epochs();
+        match state.class_relation_cache.lookup(&key, epochs) {
+            ClassRelationCacheLookup::Hit(target) => {
+                self.record_counter_class_relation_cache_hit();
+                self.record_counter_instanceof_cache_hit();
+                return Ok(target.matches);
+            }
+            ClassRelationCacheLookup::Invalidated => {
+                self.record_counter_class_relation_cache_invalidation();
+                self.record_counter_instanceof_cache_miss();
+            }
+            ClassRelationCacheLookup::Miss => {
+                self.record_counter_class_relation_cache_miss();
+                self.record_counter_instanceof_cache_miss();
+            }
+        }
+        let matches = object_instanceof(compiled, value, class_name)?;
+        state.class_relation_cache.install(
+            key,
+            epochs,
+            ClassRelationCacheTarget {
+                matches,
+                method_slot: None,
+                declaring_class: None,
+            },
+        );
+        Ok(matches)
     }
 
     fn call_callable(
@@ -28894,6 +29157,24 @@ fn interface_or_extends(
     }
     seen.pop();
     Ok(false)
+}
+
+fn class_relation_subject_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Reference(cell) => class_relation_subject_name(&cell.get()),
+        Value::Object(object) => Some(normalize_class_name(&object.class_name())),
+        Value::Fiber(_) => Some("fiber".to_owned()),
+        Value::Callable(_) => Some("closure".to_owned()),
+        _ => None,
+    }
+}
+
+fn class_relation_config_fingerprint(compiled: &CompiledUnit) -> String {
+    format!(
+        "unit:{}:strict:{}",
+        compiled.unit().id.raw(),
+        compiled.unit().strict_types
+    )
 }
 
 fn object_instanceof(
@@ -44977,6 +45258,75 @@ echo perf_jit_unstable_types_debug(4), "\n";
         let counters = on.counters.expect("on counters");
         assert!(counters.method_ic_hits > 0, "{counters:?}");
         assert!(counters.method_ic_misses > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn class_relation_cache_preserves_instanceof_and_method_semantics() {
+        let source = r#"<?php
+class PerfRelationBase { public function value(): string { return 'p'; } }
+class PerfRelationChild extends PerfRelationBase {}
+interface PerfRelationIface { public function iface(): string; }
+class PerfRelationImpl implements PerfRelationIface { public function iface(): string { return 'i'; } }
+trait PerfRelationTrait { public function traitValue(): string { return 't'; } }
+class PerfRelationTraitUser { use PerfRelationTrait; }
+class PerfRelationOverride extends PerfRelationBase { public function value(): string { return 'c'; } }
+final class PerfRelationFinal { final public function value(): string { return 'f'; } }
+
+$child = new PerfRelationChild();
+$impl = new PerfRelationImpl();
+$trait = new PerfRelationTraitUser();
+$final = new PerfRelationFinal();
+for ($i = 0; $i < 4; $i++) {
+    echo ($child instanceof PerfRelationBase) ? 'T' : 'F';
+    echo ($child instanceof PerfRelationIface) ? 'T' : 'F';
+    echo ($impl instanceof PerfRelationIface) ? 'I' : 'N';
+    echo $trait->traitValue();
+    echo $final->value();
+}
+eval('$relationEpochTouch = 1;');
+for ($i = 0; $i < 3; $i++) {
+    echo ($child instanceof PerfRelationBase) ? 'T' : 'F';
+}
+foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBase(), new PerfRelationOverride()] as $object) {
+    echo $object->value();
+}
+"#;
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        assert_eq!(on.output, off.output);
+        assert_eq!(on.output.as_bytes(), b"TFItfTFItfTFItfTFItfTTTpcpc");
+        let off_counters = off.counters.expect("off counters");
+        assert_eq!(off_counters.class_relation_cache_hits, 0);
+        assert_eq!(off_counters.instanceof_cache_hits, 0);
+        assert_eq!(off_counters.method_override_cache_hits, 0);
+        let counters = on.counters.expect("on counters");
+        assert!(counters.class_relation_cache_hits > 0, "{counters:?}");
+        assert!(counters.class_relation_cache_misses > 0, "{counters:?}");
+        assert!(
+            counters.class_relation_cache_invalidations > 0,
+            "{counters:?}"
+        );
+        assert!(counters.instanceof_cache_hits > 0, "{counters:?}");
+        assert!(counters.instanceof_cache_misses > 0, "{counters:?}");
+        assert!(counters.method_override_cache_hits > 0, "{counters:?}");
+        assert!(counters.method_override_cache_misses > 0, "{counters:?}");
     }
 
     #[test]

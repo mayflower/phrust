@@ -1,0 +1,102 @@
+# Dependency Units
+
+Dependency units are metadata-only groups for future module-level compilation.
+The current planner lives in `php_vm` because it consumes VM-ready `IrUnit`
+metadata, include behavior, autoload lookup observations, and cache-facing
+fingerprints. It does not change execution, cache hits, or bytecode layout.
+
+## Graph Shape
+
+The planner emits `DependencyUnitId`, `DependencyUnit`, `DependencyEdge`,
+`DependencyGraph`, and `InvalidationReason` records.
+
+Unit families:
+
+- `file`: IR file-table entry plus best-effort content, mtime, and inode
+  fingerprint.
+- `function`: user function, closure, method body, or top-level body.
+- `class`: class, interface, enum, parent/interface metadata, methods, and
+  properties.
+- `method` and `property`: class-owned members with edges back to the class and
+  implementation function where available.
+- `constant` and `literal`: global/class constant values and executable literal
+  constants or arrays.
+- `include_expression`: static or dynamic include/require sites.
+- `lookup`: class, method, function, callable, or constant lookup sites.
+- `autoload_resolver`: autoload map/version metadata.
+- `configuration`: compile or runtime configuration components.
+
+Core edge families:
+
+- `file -> function/class/constant`
+- `class -> methods/properties`
+- `function/property/constant -> literal constants/arrays`
+- `function -> include expression`
+- `include expression -> observed or static target file`
+- `lookup -> autoload resolver`
+- `file/unit -> configuration component`
+
+Static include targets are recorded only when the include operand is a constant
+string. Runtime include target sets and negative lookup observations are explicit
+planner inputs so request-time behavior can enrich the report without making the
+IR planner execute filesystem or autoload logic.
+
+Reports are written by `just dependency-units-smoke` under:
+
+- `target/performance/dependency-units/dependency-units.json`
+- `target/performance/dependency-units/dependency-units.md`
+
+The JSON report also has a deterministic planner digest that can be supplied as
+an extra bytecode-cache fingerprint component in a later cache API change. FPE-40
+keeps this report-only.
+
+## Invalidation Constraints
+
+Symlinks: file units store both source-table path and canonical path when the
+filesystem is available. Reuse must invalidate when symlink targets change, not
+only when the source spelling is unchanged.
+
+`include_path`: include edges depend on include-path ordering, current working
+directory, and including-file directory. Include-path changes invalidate both
+positive and negative include observations.
+
+Case sensitivity: target files can resolve differently on case-sensitive and
+case-insensitive filesystems. File and include edges carry a
+`case_sensitivity_changed` invalidation reason where a path spelling is part of
+resolution.
+
+Generated files: generated source may appear, disappear, or change without a
+stable repository identity. Generated-file edges are never treated as permanent
+native-code cache proof; they need content and metadata revalidation.
+
+PHAR and archives: PHAR support is future-facing for dependency units. Archive
+member identity must include the archive fingerprint and member path rather than
+only a local extracted path.
+
+Development vs production mode: development mode should revalidate content and
+metadata aggressively. Production mode may rely on explicit deployment
+fingerprints, but those fingerprints must cover file content, autoload maps,
+configuration, and include-path policy.
+
+Negative lookup cache invalidation: missing include or autoload lookup results
+are not trusted forever. They carry `negative_lookup_expired` and must be
+invalidated by include-path, autoload-map, generated-file, or deployment
+fingerprint changes.
+
+## Persistent Feedback And Module Compilation
+
+Persistent feedback already records request-local observations and validates
+them with a cache fingerprint. Dependency units are the graph counterpart: they
+describe which immutable engine-owned groups the feedback depends on.
+
+Future module-level compilation can use this graph to:
+
+- group multiple functions and class metadata into one immutable unit;
+- attach persistent feedback to dependency units rather than one script path;
+- reason about autoload and include invalidation before cross-function
+  optimization;
+- reject or replan native code when any dependency edge becomes stale.
+
+The current implementation intentionally stops at planning and reporting. It
+does not introduce cross-function optimization, persistent native code caching,
+filesystem watchers, or SAPI/server behavior.

@@ -111,6 +111,13 @@ pub struct VmCounters {
     pub bytecode_lowered_by_family: BTreeMap<String, u64>,
     pub bytecode_executed_by_family: BTreeMap<String, u64>,
     pub bytecode_instructions_executed: u64,
+    pub dense_branch_executions: u64,
+    pub dense_branch_true: u64,
+    pub dense_branch_false: u64,
+    pub dense_branch_fallthrough_chosen: u64,
+    pub dense_block_entries: u64,
+    pub dense_block_entry_counts: BTreeMap<String, u64>,
+    pub dense_branch_edge_counts: BTreeMap<String, u64>,
     pub superinstruction_candidates: u64,
     pub superinstruction_candidates_by_kind: BTreeMap<String, u64>,
     pub superinstructions_emitted: u64,
@@ -291,6 +298,7 @@ pub struct VmCounters {
     pub inline_cache_property_assign_slots: u64,
     pub inline_cache_dim_slots: u64,
     pub inline_cache_class_constant_static_property_slots: u64,
+    pub inline_cache_class_relation_slots: u64,
     pub inline_cache_include_path_slots: u64,
     pub inline_cache_autoload_class_lookup_slots: u64,
     pub inline_cache_hits: u64,
@@ -328,6 +336,13 @@ pub struct VmCounters {
     pub class_static_ic_hits: u64,
     pub class_static_ic_misses: u64,
     pub class_static_ic_guard_failures: u64,
+    pub class_relation_cache_hits: u64,
+    pub class_relation_cache_misses: u64,
+    pub class_relation_cache_invalidations: u64,
+    pub instanceof_cache_hits: u64,
+    pub instanceof_cache_misses: u64,
+    pub method_override_cache_hits: u64,
+    pub method_override_cache_misses: u64,
     pub include_path_ic_hits: u64,
     pub include_path_ic_misses: u64,
     pub include_path_ic_invalidations: u64,
@@ -642,6 +657,37 @@ impl VmCounters {
         *self
             .bytecode_executed_by_family
             .entry(bytecode_opcode_family(opcode).to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_dense_block_entry(&mut self, function: u32, block: u32) {
+        self.dense_block_entries += 1;
+        *self
+            .dense_block_entry_counts
+            .entry(format!("f{function}:b{block}"))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_dense_branch(
+        &mut self,
+        function: u32,
+        from_block: u32,
+        to_block: u32,
+        truthy: bool,
+        fallthrough: bool,
+    ) {
+        self.dense_branch_executions += 1;
+        if truthy {
+            self.dense_branch_true += 1;
+        } else {
+            self.dense_branch_false += 1;
+        }
+        if fallthrough {
+            self.dense_branch_fallthrough_chosen += 1;
+        }
+        *self
+            .dense_branch_edge_counts
+            .entry(format!("f{function}:b{from_block}->b{to_block}"))
             .or_default() += 1;
     }
 
@@ -1230,6 +1276,9 @@ impl VmCounters {
             if observation.kind == Some(InlineCacheKind::ClassConstantStaticProperty) {
                 self.class_static_ic_hits += 1;
             }
+            if observation.kind == Some(InlineCacheKind::ClassRelation) {
+                self.class_relation_cache_hits += 1;
+            }
             if observation.kind == Some(InlineCacheKind::IncludePath) {
                 self.include_path_ic_hits += 1;
                 self.record_include_graph_hit();
@@ -1253,6 +1302,9 @@ impl VmCounters {
             if observation.kind == Some(InlineCacheKind::ClassConstantStaticProperty) {
                 self.class_static_ic_misses += 1;
             }
+            if observation.kind == Some(InlineCacheKind::ClassRelation) {
+                self.class_relation_cache_misses += 1;
+            }
             if observation.kind == Some(InlineCacheKind::IncludePath) {
                 self.include_path_ic_misses += 1;
                 self.record_include_graph_miss();
@@ -1271,6 +1323,10 @@ impl VmCounters {
             if observation.kind == Some(InlineCacheKind::AutoloadClassLookup) {
                 self.autoload_class_lookup_ic_invalidations += 1;
                 self.record_invalidation_by_reason("autoload_lookup_epoch_or_guard");
+            }
+            if observation.kind == Some(InlineCacheKind::ClassRelation) {
+                self.class_relation_cache_invalidations += 1;
+                self.record_invalidation_by_reason("class_relation_epoch_or_guard");
             }
         }
         if observation.guard_failure {
@@ -1324,6 +1380,7 @@ impl VmCounters {
             Some(InlineCacheKind::ClassConstantStaticProperty) => {
                 self.inline_cache_class_constant_static_property_slots += 1;
             }
+            Some(InlineCacheKind::ClassRelation) => self.inline_cache_class_relation_slots += 1,
             Some(InlineCacheKind::IncludePath) => self.inline_cache_include_path_slots += 1,
             Some(InlineCacheKind::AutoloadClassLookup) => {
                 self.inline_cache_autoload_class_lookup_slots += 1;
@@ -1349,6 +1406,35 @@ impl VmCounters {
             .method_tiny_inline_rejected_by_reason
             .entry(reason.to_owned())
             .or_default() += 1;
+    }
+
+    pub(crate) fn record_class_relation_cache_hit(&mut self) {
+        self.class_relation_cache_hits += 1;
+    }
+
+    pub(crate) fn record_class_relation_cache_miss(&mut self) {
+        self.class_relation_cache_misses += 1;
+    }
+
+    pub(crate) fn record_class_relation_cache_invalidation(&mut self) {
+        self.class_relation_cache_invalidations += 1;
+        self.record_invalidation_by_reason("class_relation_epoch_or_guard");
+    }
+
+    pub(crate) fn record_instanceof_cache_hit(&mut self) {
+        self.instanceof_cache_hits += 1;
+    }
+
+    pub(crate) fn record_instanceof_cache_miss(&mut self) {
+        self.instanceof_cache_misses += 1;
+    }
+
+    pub(crate) fn record_method_override_cache_hit(&mut self) {
+        self.method_override_cache_hits += 1;
+    }
+
+    pub(crate) fn record_method_override_cache_miss(&mut self) {
+        self.method_override_cache_misses += 1;
     }
 
     pub(crate) fn record_property_fetch_profile(
@@ -1556,6 +1642,43 @@ impl VmCounters {
             &mut json,
             "bytecode_instructions_executed",
             self.bytecode_instructions_executed,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_branch_executions",
+            self.dense_branch_executions,
+            true,
+        );
+        push_field(&mut json, "dense_branch_true", self.dense_branch_true, true);
+        push_field(
+            &mut json,
+            "dense_branch_false",
+            self.dense_branch_false,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_branch_fallthrough_chosen",
+            self.dense_branch_fallthrough_chosen,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_block_entries",
+            self.dense_block_entries,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_block_entry_counts",
+            &self.dense_block_entry_counts,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_branch_edge_counts",
+            &self.dense_branch_edge_counts,
             true,
         );
         push_field(
@@ -2522,6 +2645,12 @@ impl VmCounters {
         );
         push_field(
             &mut json,
+            "inline_cache_class_relation_slots",
+            self.inline_cache_class_relation_slots,
+            true,
+        );
+        push_field(
+            &mut json,
             "inline_cache_include_path_slots",
             self.inline_cache_include_path_slots,
             true,
@@ -2720,6 +2849,48 @@ impl VmCounters {
             &mut json,
             "class_static_ic_guard_failures",
             self.class_static_ic_guard_failures,
+            true,
+        );
+        push_field(
+            &mut json,
+            "class_relation_cache_hits",
+            self.class_relation_cache_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "class_relation_cache_misses",
+            self.class_relation_cache_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "class_relation_cache_invalidations",
+            self.class_relation_cache_invalidations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "instanceof_cache_hits",
+            self.instanceof_cache_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "instanceof_cache_misses",
+            self.instanceof_cache_misses,
+            true,
+        );
+        push_field(
+            &mut json,
+            "method_override_cache_hits",
+            self.method_override_cache_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "method_override_cache_misses",
+            self.method_override_cache_misses,
             true,
         );
         push_field(
@@ -4002,6 +4173,7 @@ mod tests {
             counters.inline_cache_class_constant_static_property_slots,
             1
         );
+        assert_eq!(counters.inline_cache_class_relation_slots, 0);
         assert_eq!(counters.inline_cache_include_path_slots, 1);
         assert_eq!(counters.inline_cache_autoload_class_lookup_slots, 1);
         assert_eq!(counters.method_ic_hits, 1);
@@ -4220,6 +4392,7 @@ mod tests {
         assert!(json.contains("\"inline_cache_property_assign_slots\": 0"));
         assert!(json.contains("\"inline_cache_dim_slots\": 0"));
         assert!(json.contains("\"inline_cache_class_constant_static_property_slots\": 0"));
+        assert!(json.contains("\"inline_cache_class_relation_slots\": 0"));
         assert!(json.contains("\"inline_cache_include_path_slots\": 0"));
         assert!(json.contains("\"inline_cache_autoload_class_lookup_slots\": 0"));
         assert!(json.contains("\"inline_cache_hits\": 0"));
@@ -4246,6 +4419,13 @@ mod tests {
         assert!(json.contains("\"method_direct_dispatch_fallbacks\": 0"));
         assert!(json.contains("\"method_tiny_inline_candidates\": 0"));
         assert!(json.contains("\"method_tiny_inline_rejected_by_reason\": {}"));
+        assert!(json.contains("\"class_relation_cache_hits\": 0"));
+        assert!(json.contains("\"class_relation_cache_misses\": 0"));
+        assert!(json.contains("\"class_relation_cache_invalidations\": 0"));
+        assert!(json.contains("\"instanceof_cache_hits\": 0"));
+        assert!(json.contains("\"instanceof_cache_misses\": 0"));
+        assert!(json.contains("\"method_override_cache_hits\": 0"));
+        assert!(json.contains("\"method_override_cache_misses\": 0"));
         assert!(json.contains("\"property_ic_hits\": 0"));
         assert!(json.contains("\"property_ic_misses\": 0"));
         assert!(json.contains("\"property_ic_guard_failures\": 0"));

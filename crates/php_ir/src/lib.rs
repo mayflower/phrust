@@ -14,6 +14,7 @@ pub mod instruction;
 pub mod lower;
 pub mod module;
 pub mod operand;
+pub mod rule_selection;
 pub mod source_map;
 pub mod verify;
 
@@ -37,6 +38,9 @@ pub use module::{
     normalize_class_name,
 };
 pub use operand::Operand;
+pub use rule_selection::{
+    RuleId, RuleKind, RuleOperandConstraint, RuleSelection, RuleSelectionReport,
+};
 pub use source_map::{IrSourceMap, IrSourceMapEntry, IrSourceMapTarget, IrSpan};
 pub use verify::{VerificationError, VerificationErrorCode, verify_unit};
 
