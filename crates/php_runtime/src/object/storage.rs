@@ -1,4 +1,4 @@
-use super::{ClassEntry, debug::property_debug_label, next_object_id};
+use super::{ClassEntry, ObjectIdGuard, debug::property_debug_label, next_object_id};
 use crate::Value;
 use std::cell::{BorrowError, BorrowMutError, RefCell};
 use std::collections::HashMap;
@@ -9,6 +9,7 @@ use std::rc::{Rc, Weak};
 struct ObjectStorage {
     class_name: String,
     display_name: String,
+    _id_guard: ObjectIdGuard,
     properties: HashMap<String, Value>,
     property_order: Vec<String>,
     property_debug_labels: HashMap<String, String>,
@@ -91,11 +92,13 @@ impl ObjectRef {
             }
         }
         let properties = property_entries.into_iter().collect();
+        let id = next_object_id();
         Self {
-            id: next_object_id(),
+            id,
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: class.name.clone(),
                 display_name,
+                _id_guard: ObjectIdGuard::new(id),
                 properties,
                 property_order,
                 property_debug_labels,
@@ -141,11 +144,13 @@ impl ObjectRef {
     pub fn clone_shallow(&self) -> Self {
         crate::layout_stats::record_object_allocation();
         let storage = self.storage.borrow();
+        let id = next_object_id();
         Self {
-            id: next_object_id(),
+            id,
             storage: Rc::new(RefCell::new(ObjectStorage {
                 class_name: storage.class_name.clone(),
                 display_name: storage.display_name.clone(),
+                _id_guard: ObjectIdGuard::new(id),
                 properties: storage.properties.clone(),
                 property_order: storage.property_order.clone(),
                 property_debug_labels: storage.property_debug_labels.clone(),
