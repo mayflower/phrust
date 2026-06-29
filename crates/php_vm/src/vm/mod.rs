@@ -78,12 +78,12 @@ use php_runtime::{
     PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpString,
     ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload,
     RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType,
-    Slot, UploadRegistry, Value, VmCompileDiagnostic, compare, division_by_zero_mvp,
-    emit_php_diagnostic, equal, error_reporting_allows_level, identical,
+    Slot, UnserializeOptions, UploadRegistry, Value, VmCompileDiagnostic, compare,
+    division_by_zero_mvp, emit_php_diagnostic, equal, error_reporting_allows_level, identical,
     reset_float_string_precision, runtime_type_name, serialize as serialize_value,
     set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
-    to_string, undefined_function, undefined_variable_warning, unsupported_feature,
-    value_matches_runtime_type, value_type_name,
+    to_string, undefined_function, undefined_variable_warning, unserialize as unserialize_value,
+    unsupported_feature, value_matches_runtime_type, value_type_name,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -20344,7 +20344,7 @@ impl Vm {
                 {
                     return self.runtime_error(output, compiled, stack, message);
                 }
-                if let Some(result) = self.try_execute_serialize_with_magic(
+                if let Some(result) = self.try_execute_serialization_builtin(
                     compiled, &name, &values, call_span, output, stack, state,
                 ) {
                     return result;
@@ -22616,7 +22616,7 @@ impl Vm {
             {
                 return self.runtime_error(output, compiled, stack, message);
             }
-            if let Some(result) = self.try_execute_serialize_with_magic(
+            if let Some(result) = self.try_execute_serialization_builtin(
                 compiled,
                 &normalized,
                 &values,
@@ -22778,7 +22778,7 @@ impl Vm {
                     {
                         return self.runtime_error(output, compiled, stack, message);
                     }
-                    if let Some(result) = self.try_execute_serialize_with_magic(
+                    if let Some(result) = self.try_execute_serialization_builtin(
                         compiled, &name, &values, call_span, output, stack, state,
                     ) {
                         return result;
@@ -24820,7 +24820,7 @@ impl Vm {
         Ok(())
     }
 
-    fn try_execute_serialize_with_magic(
+    fn try_execute_serialization_builtin(
         &self,
         compiled: &CompiledUnit,
         name: &str,
@@ -24830,7 +24830,27 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Option<VmResult> {
-        if name != "serialize" || values.len() != 1 {
+        match name {
+            "serialize" => self.try_execute_serialize_with_magic(
+                compiled, values, call_span, output, stack, state,
+            ),
+            "unserialize" => {
+                self.try_execute_unserialize_with_autoload(compiled, values, output, stack, state)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_execute_serialize_with_magic(
+        &self,
+        compiled: &CompiledUnit,
+        values: &[Value],
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<VmResult> {
+        if values.len() != 1 {
             return None;
         }
         let Value::Object(object) = effective_value(&values[0]) else {
@@ -24842,6 +24862,86 @@ impl Vm {
             Ok(value) => VmResult::success(OutputBuffer::new(), Some(Value::String(value))),
             Err(result) => result,
         })
+    }
+
+    fn try_execute_unserialize_with_autoload(
+        &self,
+        compiled: &CompiledUnit,
+        values: &[Value],
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<VmResult> {
+        if !(1..=2).contains(&values.len()) {
+            return None;
+        }
+        let Value::String(input) = effective_value(&values[0]) else {
+            return None;
+        };
+        let value = match unserialize_value(&input, UnserializeOptions::default()) {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        let result = self.resolve_unserialized_classes(compiled, value, output, stack, state);
+        Some(match result {
+            Ok(value) => VmResult::success(OutputBuffer::new(), Some(value)),
+            Err(result) => result,
+        })
+    }
+
+    fn resolve_unserialized_classes(
+        &self,
+        compiled: &CompiledUnit,
+        value: Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, VmResult> {
+        match value {
+            Value::Object(object) => {
+                let class_name = object.display_name();
+                if class_like_exists_direct(
+                    compiled,
+                    state,
+                    &class_name,
+                    AutoloadClassLookupKind::Class,
+                ) {
+                    return Ok(Value::Object(object));
+                }
+                self.autoload_class(compiled, &class_name, output, stack, state)?;
+                if class_like_exists_direct(
+                    compiled,
+                    state,
+                    &class_name,
+                    AutoloadClassLookupKind::Class,
+                ) {
+                    Ok(Value::Object(object))
+                } else {
+                    Ok(Value::Object(incomplete_class_object(class_name, object)))
+                }
+            }
+            Value::Array(array) => {
+                let mut resolved = PhpArray::new();
+                for (key, element) in array.iter() {
+                    let element = self.resolve_unserialized_classes(
+                        compiled,
+                        element.clone(),
+                        output,
+                        stack,
+                        state,
+                    )?;
+                    resolved.insert(key.clone(), element);
+                }
+                Ok(Value::Array(resolved))
+            }
+            Value::Reference(cell) => {
+                let resolved =
+                    self.resolve_unserialized_classes(compiled, cell.get(), output, stack, state)?;
+                cell.set(resolved);
+                Ok(Value::Reference(cell))
+            }
+            other => Ok(other),
+        }
     }
 
     fn serialize_object_with_magic(
@@ -28883,6 +28983,31 @@ fn std_class_entry() -> RuntimeClassEntry {
         constructor_id: None,
         flags: RuntimeClassFlags::default(),
     }
+}
+
+fn incomplete_class_object(class_name: String, source: ObjectRef) -> ObjectRef {
+    let class = RuntimeClassEntry {
+        name: normalize_class_name("__PHP_Incomplete_Class"),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    };
+    let object = ObjectRef::new_with_display_name(&class, "__PHP_Incomplete_Class");
+    object.set_property(
+        "__PHP_Incomplete_Class_Name",
+        Value::string(class_name.into_bytes()),
+    );
+    for (property, value) in source.properties_snapshot() {
+        object.set_property(property, value);
+    }
+    object
 }
 
 fn internal_throwable_method_value(
@@ -50894,6 +51019,31 @@ var_dump(str_replace("\0", '\0', serialize(new bar())));
             output.contains(
                 r#"string(114) "O:3:"bar":3:{s:12:"\0foo\0private";s:7:"private";s:12:"\0*\0protected";s:9:"protected";s:6:"public";s:6:"public";}""#
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn unserialize_autoloads_missing_class_as_incomplete_class() {
+        let result = execute_source(
+            r#"<?php
+spl_autoload_register(function ($name) {
+    echo "in autoload: $name\n";
+});
+
+var_dump(unserialize('O:1:"C":0:{}'));
+"#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("in autoload: C\n"), "{output}");
+        assert!(
+            output.contains("object(__PHP_Incomplete_Class)#"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"__PHP_Incomplete_Class_Name\"]=>\n  string(1) \"C\""),
             "{output}"
         );
     }

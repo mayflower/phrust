@@ -3,7 +3,7 @@
 - Priority: 10
 - Selected manifest: `tests/phpt/manifests/modules/objects.classes.selected.jsonl`
 - Current corpus counts: 178 PASS, 33 SKIP, 1924 FAIL, 0 BORK from 2136 corpus candidates
-- Current selected run: 194 PASS, 0 SKIP, 6 FAIL, 0 BORK from 200 selected rows
+- Current selected run: 195 PASS, 0 SKIP, 5 FAIL, 0 BORK from 200 selected rows
 - Core close gate: `objects.core` is 16 PASS / 0 FAIL for reference and target
 
 ## Scope
@@ -78,11 +78,12 @@
 ## Branch 1 Closure Runtime Impact
 
 On `phpt/closure-core-runtime-semantics`, after the closure runtime semantics
-work plus selected class-output/declaration dependency/serialization fixes:
+work plus selected class-output/declaration dependency/serialization/autoload
+fixes:
 
-- `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_WORK_DIR=/private/tmp/phrust-phpt-official-objects-classes PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=objects.classes`
+- `TMPDIR=/Volumes/CrucialMusic/tmp/phrust-phpt-objects-autoload-rebuilt REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_WORK_DIR=/Volumes/CrucialMusic/tmp/phrust-phpt-objects-autoload-rebuilt PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=objects.classes`
 - reference: 200 PASS
-- target: 194 PASS, 6 FAIL
+- target: 195 PASS, 5 FAIL
 
 The selected `tests/classes/constants_error_004.phpt` case now matches PHP's
 class-constant initializer fatal location and `[constant expression]()` trace
@@ -96,6 +97,9 @@ fatal path/trace expectation. The selected `tests/classes/bug26737.phpt` and
 `tests/classes/private_members_serialization.phpt` cases now match PHP for
 `__sleep()` property selection, including missing-property warnings and mangled
 parent-private property names.
+The selected `tests/classes/autoload_020.phpt` case now triggers registered
+autoload callbacks during `unserialize()` and materializes an unresolved class as
+`__PHP_Incomplete_Class` with `__PHP_Incomplete_Class_Name`, matching PHP.
 
 ## Branch 2 Advanced Integration Impact
 
@@ -126,11 +130,11 @@ static-as-instance edge cases, and broader object/reference COW behavior.
 Current selected `objects.classes` non-green rows are outside the
 `wp.core-language` slice. The remaining selected failures group around:
 
-- autoload and ReflectionException catch-type behavior
+- ReflectionException catch-type behavior
 - iterator/destructor ordering and exception behavior
 - legacy `Serializable` hooks and `__toString` object formatting
 - eval declaration merging and DateTimeInterface fatal output formatting
-- autoload incomplete-class behavior and object formatting parity
+- object formatting parity
 
 ## Next Step
 
