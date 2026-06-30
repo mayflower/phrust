@@ -16,6 +16,7 @@ pub mod compiled_unit;
 pub mod counters;
 pub mod deopt;
 pub mod dependency_units;
+pub mod error;
 pub mod exit_policy;
 pub mod fallback;
 pub mod frame;
@@ -147,6 +148,7 @@ pub use deopt::{
     SideExitPolicy, SnapshotEntry, SnapshotId, SnapshotRecord, SnapshotRejection,
     SnapshotStateFamily, VmDeoptReason,
 };
+pub use error::{VmError, VmErrorSeverity};
 pub use exit_policy::{
     ExitCounterKey, ExitCounterSite, ExitCounterTable, ExitPolicyDecision, ExitPolicyState,
     ExitPolicyThresholds, ExitSiteLocation,

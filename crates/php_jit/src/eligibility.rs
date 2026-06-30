@@ -780,11 +780,28 @@ fn packed_foreach_int_sum_candidate_is_eligible(
         }
     }
 
-    let [return_load] = after.instructions.as_slice() else {
-        return Err(JitEligibilityReason::function(
-            "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
-            "packed foreach return block must load the accumulator",
-        ));
+    let return_load = match after.instructions.as_slice() {
+        [return_load] => return_load,
+        [cleanup, return_load] => {
+            match cleanup.kind {
+                InstructionKind::ForeachCleanup {
+                    iterator: cleanup_iterator,
+                } if cleanup_iterator == iterator => {}
+                _ => {
+                    return Err(JitEligibilityReason::function(
+                        "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+                        "packed foreach return block cleanup must match the foreach iterator",
+                    ));
+                }
+            }
+            return_load
+        }
+        _ => {
+            return Err(JitEligibilityReason::function(
+                "JIT_ELIGIBILITY_REJECT_PACKED_FOREACH_RETURN",
+                "packed foreach return block must optionally cleanup foreach then load the accumulator",
+            ));
+        }
     };
     let InstructionKind::LoadLocal {
         dst: return_reg,

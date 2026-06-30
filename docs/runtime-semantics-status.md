@@ -145,6 +145,21 @@ should be minimized with `scripts/minimize_runtime_failure.py` and retained in
 `just regression-fixtures` is part of `just runtime-semantics-fixtures` and therefore part
 of `just verify-runtime`.
 
+## Compatibility Oracle Requirements
+
+Runnable fixtures under `fixtures/runtime_semantics/**/*.php` require
+`REFERENCE_PHP` by default. Missing reference execution is a gate failure unless
+the fixture declares `php_ref_optional_reason=<reason>` in its inline metadata.
+Known-gap fixtures must carry a stable `known_gap=<ID>` and are counted
+separately from pass/fail fixtures.
+
+`just runtime-semantics-diff` compares PHP-visible exit status, stdout, and
+normalized stderr against the PHP 8.5.7 reference binary. `just
+vm-semantics-oracle` compares the VM baseline engine with the default managed
+fast profile over the same runnable fixture set, so superinstructions,
+quickening, inline caches, dense bytecode selection, and native-tier fallback
+must preserve visible behavior. `just verify-runtime` runs both oracle gates.
+
 ## Runtime Baseline
 
 The remaining sections record the runtime baseline that the runtime semantics
@@ -165,9 +180,10 @@ Baseline validation set, run on 2026-06-21:
 
 The hard Runtime gate also runs `runtime-fixtures`, `runtime-corpus-smoke`,
 `phpt-smoke`, `runtime-known-gaps`, bytecode snapshots, Rust formatting,
-Clippy, and the Semantic frontend gate. `runtime-diff` remains reference-gated outside
-`verify-runtime`; run it with `REFERENCE_PHP` set when a PHP reference binary is
-available.
+Clippy, the Semantic frontend gate, `runtime-semantics-diff`, and
+`vm-semantics-oracle`. Full runtime verification requires `REFERENCE_PHP` to
+point at the PHP 8.5.7 reference binary; use narrower non-reference gates only
+when that binary is intentionally unavailable.
 
 ## Decision Record
 

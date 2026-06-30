@@ -1,6 +1,7 @@
 //! Local include/require loader for the runtime VM MVP.
 
 use crate::compiled_unit::CompiledUnit;
+use crate::error::VmError;
 use php_diagnostics::{
     DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity, DiagnosticSuggestion,
 };
@@ -78,7 +79,7 @@ impl IncludeCache {
         path: &str,
         include_path: &[PathBuf],
         cwd: Option<&Path>,
-    ) -> Result<ResolvedIncludePath, String> {
+    ) -> Result<ResolvedIncludePath, VmError> {
         let key = IncludeResolutionKey::new(loader, including_file, path, include_path, cwd);
         let shard_index = self.resolution_shard_index(&key);
         {
@@ -115,7 +116,7 @@ impl IncludeCache {
         loader: &IncludeLoader,
         resolved: &ResolvedIncludePath,
         optimization_level: OptimizationLevel,
-    ) -> Result<Arc<CompiledUnit>, String> {
+    ) -> Result<Arc<CompiledUnit>, VmError> {
         loop {
             let key = CompiledIncludeKey::new(resolved, optimization_level);
             let shard_index = self.compile_shard_index(&key);
@@ -303,11 +304,16 @@ pub struct IncludeLoader {
 
 impl IncludeLoader {
     /// Creates a loader with canonicalized allowed roots.
-    pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
+    pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Result<Self, VmError> {
         let mut allowed_roots = Vec::new();
         for root in roots {
-            let canonical = fs::canonicalize(&root)
-                .map_err(|error| format!("E_PHP_VM_INCLUDE_ROOT: {}: {error}", root.display()))?;
+            let canonical = fs::canonicalize(&root).map_err(|error| {
+                include_error(
+                    "E_PHP_VM_INCLUDE_ROOT",
+                    format!("{}: {error}", root.display()),
+                )
+                .with_context("root", root.display())
+            })?;
             if !allowed_roots.contains(&canonical) {
                 allowed_roots.push(canonical);
             }
@@ -316,7 +322,7 @@ impl IncludeLoader {
     }
 
     /// Creates a loader that permits files under `root`.
-    pub fn for_root(root: impl Into<PathBuf>) -> Result<Self, String> {
+    pub fn for_root(root: impl Into<PathBuf>) -> Result<Self, VmError> {
         Self::new([root.into()])
     }
 
@@ -330,17 +336,15 @@ impl IncludeLoader {
     #[must_use]
     pub fn include_failure_diagnostic(
         &self,
-        error: &str,
+        error: &VmError,
         path: &str,
         including_file: Option<&Path>,
         include_path: &[PathBuf],
         cwd: Option<&Path>,
         cache_used: bool,
     ) -> DiagnosticEnvelope {
-        let code = error
-            .split_once(':')
-            .map_or("E_PHP_VM_INCLUDE_ERROR", |(code, _)| code);
-        let mut context = HashMap::new();
+        let code = error.code();
+        let mut context = error.context().clone();
         context.insert("path".to_string(), path.to_string());
         context.insert("cache_used".to_string(), cache_used.to_string());
         if let Some(including_file) = including_file {
@@ -376,11 +380,11 @@ impl IncludeLoader {
         let mut envelope = DiagnosticEnvelope::new(
             code,
             DiagnosticLayer::vm(),
-            DiagnosticPhase::new("include"),
+            DiagnosticPhase::new(error.phase()),
             DiagnosticSeverity::FatalError,
-            error.to_string(),
+            error.render_message(),
         )
-        .with_context(context.into_iter().collect());
+        .with_context(context);
         envelope.suggestion = Some(DiagnosticSuggestion::new(include_error_suggestion(code)));
         envelope.php_visible = true;
         envelope
@@ -388,7 +392,11 @@ impl IncludeLoader {
 
     /// Loads a file after resolving it against the including file directory and
     /// checking that the canonical path remains within an allowed root.
-    pub fn load(&self, including_file: Option<&Path>, path: &str) -> Result<LoadedInclude, String> {
+    pub fn load(
+        &self,
+        including_file: Option<&Path>,
+        path: &str,
+    ) -> Result<LoadedInclude, VmError> {
         self.load_with_include_path(including_file, path, &[], None)
     }
 
@@ -400,7 +408,7 @@ impl IncludeLoader {
         path: &str,
         include_path: &[PathBuf],
         cwd: Option<&Path>,
-    ) -> Result<LoadedInclude, String> {
+    ) -> Result<LoadedInclude, VmError> {
         let resolved = self.resolve_with_include_path(including_file, path, include_path, cwd)?;
         self.load_resolved(resolved.canonical_path)
     }
@@ -413,19 +421,22 @@ impl IncludeLoader {
         path: &str,
         include_path: &[PathBuf],
         cwd: Option<&Path>,
-    ) -> Result<ResolvedIncludePath, String> {
+    ) -> Result<ResolvedIncludePath, VmError> {
         if self.allowed_roots.is_empty() {
-            return Err(
-                "E_PHP_VM_INCLUDE_DISABLED: include loader has no allowed roots".to_owned(),
-            );
+            return Err(include_error(
+                "E_PHP_VM_INCLUDE_DISABLED",
+                "include loader has no allowed roots",
+            ));
         }
         if phar::is_phar_uri(path) {
             return self.resolve_phar_include(path, cwd);
         }
         if path.contains("://") {
-            return Err(format!(
-                "E_PHP_VM_INCLUDE_UNSUPPORTED_SCHEME: stream include `{path}` is not supported"
-            ));
+            return Err(include_error(
+                "E_PHP_VM_INCLUDE_UNSUPPORTED_SCHEME",
+                format!("stream include `{path}` is not supported"),
+            )
+            .with_context("path", path));
         }
         let raw = Path::new(path);
         let mut candidates = Vec::new();
@@ -453,25 +464,32 @@ impl IncludeLoader {
                     break;
                 }
                 Err(error) => {
-                    last_error = Some(format!(
-                        "E_PHP_VM_INCLUDE_MISSING: {}: {error}",
-                        candidate.display()
-                    ));
+                    last_error = Some(
+                        include_error(
+                            "E_PHP_VM_INCLUDE_MISSING",
+                            format!("{}: {error}", candidate.display()),
+                        )
+                        .with_context("candidate", candidate.display()),
+                    );
                 }
             }
         }
         let canonical = canonical.ok_or_else(|| {
-            last_error.unwrap_or_else(|| format!("E_PHP_VM_INCLUDE_MISSING: {path}: not found"))
+            last_error.unwrap_or_else(|| {
+                include_error("E_PHP_VM_INCLUDE_MISSING", format!("{path}: not found"))
+                    .with_context("path", path)
+            })
         })?;
         if !self
             .allowed_roots
             .iter()
             .any(|root| canonical.starts_with(root))
         {
-            return Err(format!(
-                "E_PHP_VM_INCLUDE_OUTSIDE_ROOT: {} is outside allowed include roots",
-                canonical.display()
-            ));
+            return Err(include_error(
+                "E_PHP_VM_INCLUDE_OUTSIDE_ROOT",
+                format!("{} is outside allowed include roots", canonical.display()),
+            )
+            .with_context("canonical_path", canonical.display()));
         }
         let fingerprint = include_path_file_fingerprint(&canonical)?;
         Ok(ResolvedIncludePath {
@@ -482,7 +500,7 @@ impl IncludeLoader {
 
     /// Loads a previously resolved canonical include path, rechecking that the
     /// path remains inside an allowed root.
-    pub fn load_resolved(&self, canonical: PathBuf) -> Result<LoadedInclude, String> {
+    pub fn load_resolved(&self, canonical: PathBuf) -> Result<LoadedInclude, VmError> {
         let canonical_text = canonical.to_string_lossy();
         if phar::is_phar_uri(&canonical_text) {
             return self.load_phar_include(&canonical_text);
@@ -492,13 +510,19 @@ impl IncludeLoader {
             .iter()
             .any(|root| canonical.starts_with(root))
         {
-            return Err(format!(
-                "E_PHP_VM_INCLUDE_OUTSIDE_ROOT: {} is outside allowed include roots",
-                canonical.display()
-            ));
+            return Err(include_error(
+                "E_PHP_VM_INCLUDE_OUTSIDE_ROOT",
+                format!("{} is outside allowed include roots", canonical.display()),
+            )
+            .with_context("canonical_path", canonical.display()));
         }
-        let source = fs::read_to_string(&canonical)
-            .map_err(|error| format!("E_PHP_VM_INCLUDE_READ: {}: {error}", canonical.display()))?;
+        let source = fs::read_to_string(&canonical).map_err(|error| {
+            include_error(
+                "E_PHP_VM_INCLUDE_READ",
+                format!("{}: {error}", canonical.display()),
+            )
+            .with_context("canonical_path", canonical.display())
+        })?;
         Ok(LoadedInclude {
             canonical_path: canonical,
             source,
@@ -509,14 +533,15 @@ impl IncludeLoader {
         &self,
         path: &str,
         cwd: Option<&Path>,
-    ) -> Result<ResolvedIncludePath, String> {
+    ) -> Result<ResolvedIncludePath, VmError> {
         let cwd = cwd
             .or_else(|| self.allowed_roots.first().map(PathBuf::as_path))
             .unwrap_or_else(|| Path::new("."));
         let capabilities =
             FilesystemCapabilities::none().with_allowed_roots(self.allowed_roots.clone());
-        let parsed = phar::parse_uri(path, cwd, &capabilities)
-            .map_err(|error| format!("E_PHP_VM_INCLUDE_PHAR: {error}"))?;
+        let parsed = phar::parse_uri(path, cwd, &capabilities).map_err(|error| {
+            include_error("E_PHP_VM_INCLUDE_PHAR", error.to_string()).with_context("path", path)
+        })?;
         let canonical_path = PathBuf::from(format!(
             "phar://{}/{}",
             parsed.archive_path.display(),
@@ -529,13 +554,18 @@ impl IncludeLoader {
         })
     }
 
-    fn load_phar_include(&self, path: &str) -> Result<LoadedInclude, String> {
+    fn load_phar_include(&self, path: &str) -> Result<LoadedInclude, VmError> {
         let capabilities =
             FilesystemCapabilities::none().with_allowed_roots(self.allowed_roots.clone());
-        let bytes = phar::read_uri(path, Path::new("."), &capabilities)
-            .map_err(|error| format!("E_PHP_VM_INCLUDE_READ: {error}"))?;
+        let bytes = phar::read_uri(path, Path::new("."), &capabilities).map_err(|error| {
+            include_error("E_PHP_VM_INCLUDE_READ", error.to_string()).with_context("path", path)
+        })?;
         let source = String::from_utf8(bytes).map_err(|error| {
-            format!("E_PHP_VM_INCLUDE_READ: phar entry `{path}` is not valid UTF-8: {error}")
+            include_error(
+                "E_PHP_VM_INCLUDE_READ",
+                format!("phar entry `{path}` is not valid UTF-8: {error}"),
+            )
+            .with_context("path", path)
         })?;
         Ok(LoadedInclude {
             canonical_path: PathBuf::from(path),
@@ -565,9 +595,18 @@ fn include_error_suggestion(code: &str) -> &'static str {
     }
 }
 
-pub fn include_path_file_fingerprint(path: &Path) -> Result<IncludePathFileFingerprint, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("E_PHP_VM_INCLUDE_METADATA: {}: {error}", path.display()))?;
+fn include_error(code: &'static str, message: impl Into<String>) -> VmError {
+    VmError::fatal(code, "include", message)
+}
+
+pub fn include_path_file_fingerprint(path: &Path) -> Result<IncludePathFileFingerprint, VmError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        include_error(
+            "E_PHP_VM_INCLUDE_METADATA",
+            format!("{}: {error}", path.display()),
+        )
+        .with_context("path", path.display())
+    })?;
     let modified_unix_nanos = metadata
         .modified()
         .ok()
@@ -666,7 +705,7 @@ fn compile_include(
     loader: &IncludeLoader,
     resolved: &ResolvedIncludePath,
     optimization_level: OptimizationLevel,
-) -> Result<CompiledUnit, String> {
+) -> Result<CompiledUnit, VmError> {
     let loaded = loader.load_resolved(resolved.canonical_path.clone())?;
     compile_loaded_include(loaded, optimization_level)
 }
@@ -674,13 +713,18 @@ fn compile_include(
 fn compile_loaded_include(
     loaded: LoadedInclude,
     optimization_level: OptimizationLevel,
-) -> Result<CompiledUnit, String> {
+) -> Result<CompiledUnit, VmError> {
     let frontend = php_semantics::analyze_source(&loaded.source);
     if frontend.has_errors() {
-        return Err(format!(
-            "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} failed frontend analysis",
-            loaded.canonical_path.display()
-        ));
+        return Err(include_error(
+            "E_PHP_VM_INCLUDE_COMPILE_ERROR",
+            format!(
+                "{} failed frontend analysis",
+                loaded.canonical_path.display()
+            ),
+        )
+        .with_context("path", loaded.canonical_path.display())
+        .with_context("stage", "frontend"));
     }
     let mut lowering = php_ir::lower_frontend_result(
         &frontend,
@@ -691,19 +735,26 @@ fn compile_loaded_include(
         },
     );
     if !lowering.diagnostics.is_empty() || lowering.verification.is_err() {
-        return Err(format!(
-            "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} failed IR lowering",
-            loaded.canonical_path.display()
-        ));
+        return Err(include_error(
+            "E_PHP_VM_INCLUDE_COMPILE_ERROR",
+            format!("{} failed IR lowering", loaded.canonical_path.display()),
+        )
+        .with_context("path", loaded.canonical_path.display())
+        .with_context("stage", "ir_lowering"));
     }
     if optimization_level.runs_pipeline() {
         PassPipeline::performance()
             .run(&mut lowering.unit, &PassContext::new(optimization_level))
             .map_err(|error| {
-                format!(
-                    "E_PHP_VM_INCLUDE_COMPILE_ERROR: {} optimizer failed: {error}",
-                    loaded.canonical_path.display()
+                include_error(
+                    "E_PHP_VM_INCLUDE_COMPILE_ERROR",
+                    format!(
+                        "{} optimizer failed: {error}",
+                        loaded.canonical_path.display()
+                    ),
                 )
+                .with_context("path", loaded.canonical_path.display())
+                .with_context("stage", "optimizer")
             })?;
     }
     Ok(CompiledUnit::new(lowering.unit))

@@ -1,5 +1,6 @@
 //! Stack frame and register storage for the first VM core.
 
+use crate::error::VmError;
 use php_ir::IrSpan;
 use php_ir::ids::{FunctionId, LocalId, RegId};
 use php_runtime::{Lvalue, LvalueKind, ReferenceCell, Slot, TempValue, Value};
@@ -66,9 +67,9 @@ impl LocalFile {
     }
 
     /// Writes a local without panicking.
-    pub fn set(&mut self, id: LocalId, value: Value) -> Result<(), String> {
+    pub fn set(&mut self, id: LocalId, value: Value) -> Result<(), VmError> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
-            return Err(format!("invalid local local:{}", id.raw()));
+            return Err(invalid_local_error(id, "write"));
         };
         Lvalue::slot(slot, LvalueKind::LocalVariable)
             .write_value(value)
@@ -76,9 +77,9 @@ impl LocalFile {
     }
 
     /// Unsets a local name without writing through a referenced alias cell.
-    pub fn unset(&mut self, id: LocalId) -> Result<(), String> {
+    pub fn unset(&mut self, id: LocalId) -> Result<(), VmError> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
-            return Err(format!("invalid local local:{}", id.raw()));
+            return Err(invalid_local_error(id, "unset"));
         };
         Lvalue::slot(slot, LvalueKind::LocalVariable)
             .unset()
@@ -86,12 +87,12 @@ impl LocalFile {
     }
 
     /// Binds `target` to the same reference cell as `source`.
-    pub fn bind_reference(&mut self, target: LocalId, source: LocalId) -> Result<(), String> {
+    pub fn bind_reference(&mut self, target: LocalId, source: LocalId) -> Result<(), VmError> {
         if target.index() >= self.locals.len() {
-            return Err(format!("invalid local local:{}", target.raw()));
+            return Err(invalid_local_error(target, "bind_reference_target"));
         }
         let Some(source_slot) = self.locals.get_mut(source.index()) else {
-            return Err(format!("invalid local local:{}", source.raw()));
+            return Err(invalid_local_error(source, "bind_reference_source"));
         };
         if source_slot.is_uninitialized() {
             source_slot.write(Value::Null);
@@ -109,9 +110,9 @@ impl LocalFile {
     }
 
     /// Converts a local to a reference cell and returns that shared cell.
-    pub fn ensure_reference_cell(&mut self, id: LocalId) -> Result<ReferenceCell, String> {
+    pub fn ensure_reference_cell(&mut self, id: LocalId) -> Result<ReferenceCell, VmError> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
-            return Err(format!("invalid local local:{}", id.raw()));
+            return Err(invalid_local_error(id, "ensure_reference_cell"));
         };
         if slot.is_uninitialized() {
             slot.write(Value::Null);
@@ -122,9 +123,9 @@ impl LocalFile {
     }
 
     /// Binds a local to an existing reference cell.
-    pub fn bind_reference_cell(&mut self, id: LocalId, cell: ReferenceCell) -> Result<(), String> {
+    pub fn bind_reference_cell(&mut self, id: LocalId, cell: ReferenceCell) -> Result<(), VmError> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
-            return Err(format!("invalid local local:{}", id.raw()));
+            return Err(invalid_local_error(id, "bind_reference_cell"));
         };
         Lvalue::slot(slot, LvalueKind::LocalVariable)
             .bind_reference_cell(cell)
@@ -186,22 +187,42 @@ impl RegisterFile {
     }
 
     /// Writes a register without panicking.
-    pub fn set(&mut self, id: RegId, value: Value) -> Result<(), String> {
+    pub fn set(&mut self, id: RegId, value: Value) -> Result<(), VmError> {
         let Some(slot) = self.registers.get_mut(id.index()) else {
-            return Err(format!("invalid register r{}", id.raw()));
+            return Err(invalid_register_error(id, "write"));
         };
         slot.set(value);
         Ok(())
     }
 
     /// Clears a dead temporary register without affecting PHP-visible storage.
-    pub fn unset(&mut self, id: RegId) -> Result<(), String> {
+    pub fn unset(&mut self, id: RegId) -> Result<(), VmError> {
         let Some(slot) = self.registers.get_mut(id.index()) else {
-            return Err(format!("invalid register r{}", id.raw()));
+            return Err(invalid_register_error(id, "unset"));
         };
         *slot = TempValue::uninitialized();
         Ok(())
     }
+}
+
+fn invalid_local_error(id: LocalId, operation: &'static str) -> VmError {
+    VmError::internal(
+        "E_PHP_VM_INVALID_LOCAL_SLOT",
+        "frame",
+        format!("invalid local slot l{}", id.raw()),
+    )
+    .with_context("slot", id.raw())
+    .with_context("operation", operation)
+}
+
+fn invalid_register_error(id: RegId, operation: &'static str) -> VmError {
+    VmError::internal(
+        "E_PHP_VM_INVALID_REGISTER_SLOT",
+        "frame",
+        format!("invalid register slot r{}", id.raw()),
+    )
+    .with_context("slot", id.raw())
+    .with_context("operation", operation)
 }
 
 /// One executing frame.

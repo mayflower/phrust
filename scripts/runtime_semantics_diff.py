@@ -63,6 +63,7 @@ class Fixture:
     expect: str = "pass"
     known_gap_id: str | None = None
     php_ref_required: bool = False
+    php_ref_optional_reason: str | None = None
     args: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
 
@@ -222,6 +223,8 @@ def load_fixture(path: Path, fixtures_root: Path) -> Fixture:
                 fixture.known_gap_id = value
             elif key == "php_ref_required":
                 fixture.php_ref_required = value in {"1", "true", "yes"}
+            elif key == "php_ref_optional_reason":
+                fixture.php_ref_optional_reason = value
             elif key == "args":
                 fixture.args = [part for part in value.split(",") if part]
             else:
@@ -280,8 +283,19 @@ def compare_fixture(fixture: Fixture, rust_vm: Path) -> dict:
         return result(fixture, "known_gap", reference, rust, None)
 
     if reference["status"] == "skip":
-        status = "fail" if fixture.php_ref_required else "skip"
-        return result(fixture, status, reference, rust, reference["message"])
+        if fixture.php_ref_optional_reason:
+            return result(fixture, "skip", reference, rust, reference["message"])
+        return result(
+            fixture,
+            "fail",
+            reference,
+            rust,
+            (
+                f"{reference['message']}; runnable runtime-semantics fixtures "
+                "require REFERENCE_PHP unless they declare "
+                "php_ref_optional_reason=<reason>"
+            ),
+        )
     if reference["status"] == "error":
         return result(fixture, "fail", reference, rust, reference["message"])
     if rust["status"] == "error":

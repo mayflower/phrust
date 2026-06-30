@@ -18,6 +18,7 @@ just runtime-fixtures
 just runtime-known-gaps
 just runtime-semantics-fixtures
 just runtime-semantics-diff
+just vm-semantics-oracle
 test -f docs/runtime-semantics-final-audit.md
 test -f docs/runtime-semantics-coverage-matrix.md
 test -f docs/stdlib-roadmap.md

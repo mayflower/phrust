@@ -314,6 +314,7 @@ verify-runtime:
     @just runtime-known-gaps
     @just runtime-semantics-fixtures
     @just runtime-semantics-diff
+    @just vm-semantics-oracle
     @just runtime-hardening-lints
 
 verify-stdlib:
@@ -785,6 +786,10 @@ runtime-semantics-fixtures:
 runtime-semantics-diff *args:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py {{args}}
+
+vm-semantics-oracle *args:
+    cargo build -p php_vm_cli --bin php-vm
+    scripts/vm_semantics_oracle.py {{args}}
 
 runtime-toolchain-audit:
     @for tool in cargo rustc rustfmt cargo-clippy just jq python3 rg clang sccache; do \

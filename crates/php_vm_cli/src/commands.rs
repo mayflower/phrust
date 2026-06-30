@@ -1360,7 +1360,7 @@ fn include_loader_for(path: &str) -> Result<IncludeLoader, String> {
         .parent()
         .ok_or_else(|| format!("{}: missing parent directory", path.display()))?;
     let cwd = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
-    IncludeLoader::new([root.to_path_buf(), cwd])
+    IncludeLoader::new([root.to_path_buf(), cwd]).map_err(|error| error.render_message())
 }
 
 fn runtime_context_for(

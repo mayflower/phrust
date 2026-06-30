@@ -20,7 +20,10 @@ REQUIRED_FILES = [
     "crates/php_vm/src/lib.rs",
     "crates/php_vm/src/vm/mod.rs",
     "crates/php_vm/src/vm/arguments.rs",
+    "crates/php_vm/src/vm/dense_method_dispatch.rs",
+    "crates/php_vm/src/vm/generator_fiber.rs",
     "crates/php_vm/src/vm/options.rs",
+    "crates/php_vm/src/vm/prelude.rs",
     "crates/php_vm/src/vm/result.rs",
     "crates/php_std/src/lib.rs",
     "crates/php_std/src/arginfo.rs",
@@ -31,7 +34,10 @@ REQUIRED_FILES = [
 
 VM_MOD_REQUIRED_SNIPPETS = [
     "mod arguments;",
+    "mod dense_method_dispatch;",
+    "mod generator_fiber;",
     "mod options;",
+    "mod prelude;",
     "mod result;",
     "BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions,",
     "pub use result::{VmControlFlow, VmResult};",
@@ -39,6 +45,30 @@ VM_MOD_REQUIRED_SNIPPETS = [
     "impl Vm",
     "pub fn execute(&self, unit: impl Into<CompiledUnit>) -> VmResult",
 ]
+
+VM_RESULT_REQUIRED_SNIPPETS = [
+    "impl VmResult",
+    "pub(crate) fn success(",
+    "pub(crate) fn success_with_diagnostics(",
+    "pub(super) fn script_exit(",
+    "pub(crate) fn runtime_error_with_diagnostic(",
+    "pub(super) fn compile_error(",
+    "pub(super) fn unsupported(",
+    "pub(super) fn propagating_exception(",
+]
+
+VM_SUBMODULE_REQUIRED_SNIPPETS = {
+    "crates/php_vm/src/vm/arguments.rs": ["use super::prelude::*;"],
+    "crates/php_vm/src/vm/dense_method_dispatch.rs": ["use super::prelude::*;"],
+    "crates/php_vm/src/vm/generator_fiber.rs": ["use super::prelude::*;"],
+    "crates/php_vm/src/vm/prelude.rs": ["pub(super) use super::*;"],
+}
+
+VM_SUBMODULE_FORBIDDEN_SNIPPETS = {
+    "crates/php_vm/src/vm/arguments.rs": ["use super::*;"],
+    "crates/php_vm/src/vm/dense_method_dispatch.rs": ["use super::*;"],
+    "crates/php_vm/src/vm/generator_fiber.rs": ["use super::*;"],
+}
 
 VM_LIB_REQUIRED_SNIPPETS = [
     "pub mod vm;",
@@ -139,11 +169,24 @@ def require_snippets(label: str, text: str, snippets: list[str]) -> None:
         raise IntegrityError(f"{label} is missing required text:\n  - {joined}")
 
 
+def forbid_snippets(label: str, text: str, snippets: list[str]) -> None:
+    present = [snippet for snippet in snippets if snippet in text]
+    if present:
+        joined = "\n  - ".join(present)
+        raise IntegrityError(f"{label} contains forbidden text:\n  - {joined}")
+
+
 def check_vm_module_wiring() -> None:
     vm_mod = read_required("crates/php_vm/src/vm/mod.rs")
     vm_lib = read_required("crates/php_vm/src/lib.rs")
+    vm_result = read_required("crates/php_vm/src/vm/result.rs")
     require_snippets("php_vm::vm module", vm_mod, VM_MOD_REQUIRED_SNIPPETS)
     require_snippets("php_vm crate facade", vm_lib, VM_LIB_REQUIRED_SNIPPETS)
+    require_snippets("php_vm::vm result module", vm_result, VM_RESULT_REQUIRED_SNIPPETS)
+    for relative, snippets in VM_SUBMODULE_REQUIRED_SNIPPETS.items():
+        require_snippets(relative, read_required(relative), snippets)
+    for relative, snippets in VM_SUBMODULE_FORBIDDEN_SNIPPETS.items():
+        forbid_snippets(relative, read_required(relative), snippets)
 
 
 def generated_count(text: str, name: str) -> int:

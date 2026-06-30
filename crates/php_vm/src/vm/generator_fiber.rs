@@ -1,6 +1,6 @@
 //! Generator and fiber runtime method handling for the VM.
 
-use super::*;
+use super::prelude::*;
 
 impl Vm {
     pub(super) fn resume_fiber_continuations(
@@ -363,7 +363,7 @@ impl Vm {
                 )))
             }
             "resume" => {
-                validate_fiber_arg_count(&method_name, &args, 1)
+                validate_fiber_arg_count_range(&method_name, &args, 0, 1)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 if !matches!(fiber.state(), FiberState::Suspended) {
                     return Err(self.runtime_error(
@@ -381,16 +381,20 @@ impl Vm {
                         "E_PHP_VM_FIBER_CONTINUATION_MISSING: suspended fiber has no VM continuation",
                     ));
                 };
+                let resume_value = args
+                    .first()
+                    .map(|arg| arg.value.clone())
+                    .unwrap_or(Value::Null);
                 fiber.set_state(FiberState::Running);
                 self.record_runtime_trace_event(format!(
                     "fiber resume transition=suspended->running input={}",
-                    trace_value(&args[0].value)
+                    trace_value(&resume_value)
                 ));
                 let result = self.resume_fiber_continuations(
                     compiled,
                     fiber.clone(),
                     continuations,
-                    FiberResumeInput::Value(args[0].value.clone()),
+                    FiberResumeInput::Value(resume_value),
                     output,
                     stack,
                     state,

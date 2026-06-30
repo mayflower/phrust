@@ -1,4 +1,4 @@
-use super::*;
+use super::prelude::*;
 
 impl Vm {
     pub(super) fn execute_dense_method_call(

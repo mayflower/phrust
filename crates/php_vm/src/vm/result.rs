@@ -102,6 +102,142 @@ impl VmStepLimitDiagnostic {
     }
 }
 
+impl VmResult {
+    pub(crate) fn success(output: OutputBuffer, return_value: Option<Value>) -> Self {
+        Self {
+            status: ExecutionStatus::success(),
+            output,
+            diagnostics: Vec::new(),
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    pub(crate) fn success_with_diagnostics(
+        output: OutputBuffer,
+        return_value: Option<Value>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+    ) -> Self {
+        Self {
+            status: ExecutionStatus::success(),
+            output,
+            diagnostics,
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    pub(super) fn script_exit(output: OutputBuffer, code: i32) -> Self {
+        let mut result = Self::success(output, None);
+        result.process_exit_code = Some(code);
+        result
+    }
+
+    pub(crate) fn runtime_error_with_diagnostic(
+        output: OutputBuffer,
+        message: impl Into<String>,
+        diagnostic: RuntimeDiagnostic,
+    ) -> Self {
+        Self {
+            status: ExecutionStatus::runtime_error(message),
+            output,
+            diagnostics: vec![diagnostic],
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value: None,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    pub(super) fn compile_error(output: OutputBuffer, message: impl Into<String>) -> Self {
+        Self {
+            status: ExecutionStatus::compile_error(message),
+            output,
+            diagnostics: Vec::new(),
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value: None,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    pub(super) fn unsupported(output: OutputBuffer, message: impl Into<String>) -> Self {
+        Self {
+            status: ExecutionStatus::unsupported(message),
+            output,
+            diagnostics: Vec::new(),
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value: None,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+
+    /// Non-success result marking that a throwable is unwinding the call stack.
+    ///
+    /// The throwable itself travels in `ExecutionState::pending_throw`; this
+    /// result only signals callers (via `!is_success()`) to consult it.
+    pub(super) fn propagating_exception(output: OutputBuffer) -> Self {
+        Self {
+            status: ExecutionStatus::runtime_error(
+                "E_PHP_VM_PENDING_EXCEPTION: exception unwinding call stack",
+            ),
+            output,
+            diagnostics: Vec::new(),
+            http_response: RuntimeHttpResponseState::default(),
+            upload_registry: UploadRegistry::default(),
+            session: SessionState::default(),
+            return_value: None,
+            process_exit_code: None,
+            yielded: None,
+            fiber_suspension: None,
+            return_ref: None,
+            trace: Vec::new(),
+            counters: None,
+            tiering_stats: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

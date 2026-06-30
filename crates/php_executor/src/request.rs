@@ -25,7 +25,9 @@ pub(crate) fn include_loader_for(input: &EngineInput) -> Result<Option<IncludeLo
     if roots.is_empty() {
         return Ok(None);
     }
-    IncludeLoader::new(roots).map(Some)
+    IncludeLoader::new(roots)
+        .map(Some)
+        .map_err(|error| error.render_message())
 }
 
 pub(crate) fn include_loader_for_request(
@@ -49,7 +51,9 @@ pub(crate) fn include_loader_for_request(
     if roots.is_empty() {
         return Ok(None);
     }
-    IncludeLoader::new(roots).map(Some)
+    IncludeLoader::new(roots)
+        .map(Some)
+        .map_err(|error| error.render_message())
 }
 
 fn push_existing_root(roots: &mut Vec<PathBuf>, path: &Path) {

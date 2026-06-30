@@ -1,4 +1,67 @@
-use super::*;
+use super::prelude::*;
+use crate::error::VmError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ArgumentBindingPolicy {
+    pub(super) call_site_strict_types: bool,
+}
+
+pub(super) struct ArgumentBinder<'a, 'vm> {
+    compiled: &'a CompiledUnit,
+    function: &'a IrFunction,
+    stack: &'a mut CallStack,
+    state: &'a ExecutionState,
+    typecheck: TypecheckFastPathContext<'vm>,
+    policy: ArgumentBindingPolicy,
+}
+
+impl<'a, 'vm> ArgumentBinder<'a, 'vm> {
+    pub(super) fn new(
+        compiled: &'a CompiledUnit,
+        function: &'a IrFunction,
+        stack: &'a mut CallStack,
+        state: &'a ExecutionState,
+        typecheck: TypecheckFastPathContext<'vm>,
+        policy: ArgumentBindingPolicy,
+    ) -> Self {
+        Self {
+            compiled,
+            function,
+            stack,
+            state,
+            typecheck,
+            policy,
+        }
+    }
+
+    pub(super) fn bind(
+        &mut self,
+        args: Vec<CallArgument>,
+        allow_by_ref_value_warnings: bool,
+        call_span: Option<php_ir::IrSpan>,
+        by_ref_warning_callable_name: Option<&str>,
+    ) -> Result<PreparedArguments, VmError> {
+        let compiled = self.compiled;
+        let function = self.function;
+        let stack = &mut *self.stack;
+        let state = self.state;
+        let typecheck = self.typecheck;
+        let policy = self.policy;
+
+        bind_arguments(
+            compiled,
+            function,
+            args,
+            stack,
+            state,
+            typecheck,
+            policy,
+            allow_by_ref_value_warnings,
+            call_span,
+            by_ref_warning_callable_name,
+        )
+    }
+}
 
 pub(super) fn prepare_arguments(
     compiled: &CompiledUnit,
@@ -7,10 +70,31 @@ pub(super) fn prepare_arguments(
     stack: &mut CallStack,
     state: &ExecutionState,
     typecheck: TypecheckFastPathContext<'_>,
+    policy: ArgumentBindingPolicy,
     allow_by_ref_value_warnings: bool,
     call_span: Option<php_ir::IrSpan>,
     by_ref_warning_callable_name: Option<&str>,
-) -> Result<PreparedArguments, String> {
+) -> Result<PreparedArguments, VmError> {
+    ArgumentBinder::new(compiled, function, stack, state, typecheck, policy).bind(
+        args,
+        allow_by_ref_value_warnings,
+        call_span,
+        by_ref_warning_callable_name,
+    )
+}
+
+fn bind_arguments(
+    compiled: &CompiledUnit,
+    function: &IrFunction,
+    args: Vec<CallArgument>,
+    stack: &mut CallStack,
+    state: &ExecutionState,
+    typecheck: TypecheckFastPathContext<'_>,
+    policy: ArgumentBindingPolicy,
+    allow_by_ref_value_warnings: bool,
+    call_span: Option<php_ir::IrSpan>,
+    by_ref_warning_callable_name: Option<&str>,
+) -> Result<PreparedArguments, VmError> {
     let min = function
         .params
         .iter()
@@ -40,9 +124,13 @@ pub(super) fn prepare_arguments(
                     supplied_count += 1;
                     continue;
                 }
-                return Err(format!(
-                    "E_PHP_VM_UNKNOWN_NAMED_ARG: Unknown named parameter ${name}"
-                ));
+                return Err(VmError::fatal(
+                    "E_PHP_VM_UNKNOWN_NAMED_ARG",
+                    "arguments",
+                    format!("Unknown named parameter ${name}"),
+                )
+                .with_context("function", &function.name)
+                .with_context("parameter", name));
             };
             if function.params[index].variadic {
                 variadic_tail.push(VariadicTailArg {
@@ -53,9 +141,13 @@ pub(super) fn prepare_arguments(
                 continue;
             }
             if bound[index].is_some() {
-                return Err(format!(
-                    "E_PHP_VM_DUPLICATE_NAMED_ARG: Named parameter ${name} overwrites previous argument"
-                ));
+                return Err(VmError::fatal(
+                    "E_PHP_VM_DUPLICATE_NAMED_ARG",
+                    "arguments",
+                    format!("Named parameter ${name} overwrites previous argument"),
+                )
+                .with_context("function", &function.name)
+                .with_context("parameter", name));
             }
             bound[index] = Some(CallArgument {
                 name: None,
@@ -70,10 +162,15 @@ pub(super) fn prepare_arguments(
         }
 
         if saw_named {
-            return Err(format!(
-                "E_PHP_VM_POSITIONAL_AFTER_NAMED_ARG: function {} cannot use positional argument after named argument",
-                function.name
-            ));
+            return Err(VmError::fatal(
+                "E_PHP_VM_POSITIONAL_AFTER_NAMED_ARG",
+                "arguments",
+                format!(
+                    "function {} cannot use positional argument after named argument",
+                    function.name
+                ),
+            )
+            .with_context("function", &function.name));
         }
         if variadic_index.is_some_and(|index| positional_index >= index) {
             variadic_tail.push(VariadicTailArg {
@@ -94,10 +191,14 @@ pub(super) fn prepare_arguments(
             continue;
         }
         if bound[positional_index].is_some() {
-            return Err(format!(
-                "E_PHP_VM_DUPLICATE_NAMED_ARG: Named parameter ${} overwrites previous argument",
-                function.params[positional_index].name
-            ));
+            let name = function.params[positional_index].name.clone();
+            return Err(VmError::fatal(
+                "E_PHP_VM_DUPLICATE_NAMED_ARG",
+                "arguments",
+                format!("Named parameter ${name} overwrites previous argument"),
+            )
+            .with_context("function", &function.name)
+            .with_context("parameter", name));
         }
         bound[positional_index] = Some(CallArgument {
             name: None,
@@ -112,7 +213,16 @@ pub(super) fn prepare_arguments(
     }
 
     if supplied_count < min {
-        precheck_bound_argument_types(compiled, function, &mut bound, state, typecheck, call_span)?;
+        precheck_bound_argument_types(
+            compiled,
+            function,
+            &mut bound,
+            state,
+            typecheck,
+            policy.call_site_strict_types,
+            call_span,
+        )
+        .map_err(|message| argument_typecheck_error(&function.name, message))?;
         let requirement = if function.params.len() == min && variadic_index.is_none() {
             format!("exactly {min} expected")
         } else {
@@ -125,10 +235,17 @@ pub(super) fn prepare_arguments(
         let declaration_site = source_span_file_line(compiled, function.span)
             .map(|(file, line)| format!(" in {file}:{line}"))
             .unwrap_or_default();
-        return Err(format!(
-            "E_PHP_VM_TOO_FEW_ARGS: Too few arguments to function {}(), {} passed{} and {}{}",
-            function.name, supplied_count, call_site, requirement, declaration_site
-        ));
+        return Err(VmError::fatal(
+            "E_PHP_VM_TOO_FEW_ARGS",
+            "arguments",
+            format!(
+                "Too few arguments to function {}(), {} passed{} and {}{}",
+                function.name, supplied_count, call_site, requirement, declaration_site
+            ),
+        )
+        .with_context("function", &function.name)
+        .with_context("supplied_count", supplied_count)
+        .with_context("minimum_count", min));
     }
 
     let mut prepared = Vec::with_capacity(function.params.len());
@@ -149,7 +266,13 @@ pub(super) fn prepare_arguments(
         }
         if let Some(arg) = bound[index].take() {
             let reference = if param.by_ref {
-                if let Some(reference) = call_argument_reference_cell(compiled, &arg, stack)? {
+                if let Some(reference) = call_argument_reference_cell(compiled, &arg, stack)
+                    .map_err(|message| {
+                        VmError::fatal("E_PHP_VM_BY_REF_BINDING", "arguments", message)
+                            .with_context("function", &function.name)
+                            .with_context("parameter", &param.name)
+                    })?
+                {
                     Some(reference)
                 } else if allow_by_ref_value_warnings {
                     diagnostics.push(by_ref_value_given_warning(
@@ -176,28 +299,45 @@ pub(super) fn prepare_arguments(
                 reference,
             });
         } else if let Some(default) = &param.default {
-            if param.by_ref {
-                return Err(by_ref_not_referenceable_error(function, param, index));
-            }
             let value = inline_constant_value(default);
             trace_args.push(FrameTraceArgument {
                 name: None,
                 value: trace_value_for_param(&value, param_is_sensitive(param)),
             });
+            if param.by_ref {
+                let reference = ReferenceCell::new(value.clone());
+                prepared.push(PreparedArg {
+                    value,
+                    reference: Some(reference),
+                });
+                continue;
+            }
             prepared.push(PreparedArg {
                 value,
                 reference: None,
             });
         } else if param.required {
-            return Err(format!(
-                "E_PHP_VM_TOO_FEW_ARGS: function {} is missing argument ${}",
-                function.name, param.name
-            ));
+            return Err(VmError::fatal(
+                "E_PHP_VM_TOO_FEW_ARGS",
+                "arguments",
+                format!(
+                    "function {} is missing argument ${}",
+                    function.name, param.name
+                ),
+            )
+            .with_context("function", &function.name)
+            .with_context("parameter", &param.name));
         } else {
-            return Err(format!(
-                "E_PHP_VM_UNSUPPORTED_DEFAULT_ARG: function {} parameter ${} has no folded default",
-                function.name, param.name
-            ));
+            return Err(VmError::fatal(
+                "E_PHP_VM_UNSUPPORTED_DEFAULT_ARG",
+                "arguments",
+                format!(
+                    "function {} parameter ${} has no folded default",
+                    function.name, param.name
+                ),
+            )
+            .with_context("function", &function.name)
+            .with_context("parameter", &param.name));
         }
     }
     trace_args.extend(extra_positional.iter().map(|arg| FrameTraceArgument {
@@ -221,13 +361,29 @@ fn by_ref_not_referenceable_error(
     function: &IrFunction,
     param: &php_ir::function::IrParam,
     index: usize,
-) -> String {
-    format!(
-        "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE: {}(): Argument #{} (${}) could not be passed by reference",
-        function.name,
-        index + 1,
-        param.name
+) -> VmError {
+    VmError::fatal(
+        "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE",
+        "arguments",
+        format!(
+            "{}(): Argument #{} (${}) could not be passed by reference",
+            function.name,
+            index + 1,
+            param.name
+        ),
     )
+    .with_context("function", &function.name)
+    .with_context("parameter", &param.name)
+    .with_context("position", index + 1)
+}
+
+fn argument_typecheck_error(function_name: &str, message: String) -> VmError {
+    if let Some(message) = message.strip_prefix("E_PHP_VM_PARAM_TYPE_MISMATCH: ") {
+        return VmError::fatal("E_PHP_VM_PARAM_TYPE_MISMATCH", "arguments", message)
+            .with_context("function", function_name);
+    }
+    VmError::fatal("E_PHP_VM_ARGUMENT_TYPECHECK", "arguments", message)
+        .with_context("function", function_name)
 }
 
 fn variadic_array(args: Vec<VariadicTailArg>) -> Value {

@@ -7,6 +7,7 @@ mod arguments;
 mod dense_method_dispatch;
 mod generator_fiber;
 mod options;
+mod prelude;
 mod result;
 
 pub use options::{
@@ -1508,6 +1509,7 @@ struct FunctionCall<'a> {
     args: Vec<CallArgument>,
     captures: Vec<ClosureCaptureValue>,
     call_span: Option<php_ir::IrSpan>,
+    call_site_strict_types: Option<bool>,
     error_context_compiled: Option<CompiledUnit>,
     allow_by_ref_value_warnings: bool,
     by_ref_warning_callable_name: Option<String>,
@@ -1530,6 +1532,7 @@ impl FunctionCall<'_> {
             args,
             captures,
             call_span: None,
+            call_site_strict_types: None,
             error_context_compiled: None,
             allow_by_ref_value_warnings: false,
             by_ref_warning_callable_name: None,
@@ -1555,6 +1558,28 @@ impl FunctionCall<'_> {
     fn with_optional_call_span(mut self, span: Option<php_ir::IrSpan>) -> Self {
         self.call_span = span;
         self
+    }
+
+    fn with_call_site_strict_types(mut self, strict_types: bool) -> Self {
+        self.call_site_strict_types = Some(strict_types);
+        self
+    }
+
+    fn argument_binding_policy(
+        &self,
+        fallback_compiled: &CompiledUnit,
+    ) -> arguments::ArgumentBindingPolicy {
+        let strict_types = self
+            .call_site_strict_types
+            .or_else(|| {
+                self.error_context_compiled
+                    .as_ref()
+                    .map(|compiled| compiled.unit().strict_types)
+            })
+            .unwrap_or(fallback_compiled.unit().strict_types);
+        arguments::ArgumentBindingPolicy {
+            call_site_strict_types: strict_types,
+        }
     }
 
     fn with_error_context(mut self, compiled: CompiledUnit) -> Self {
@@ -1911,142 +1936,6 @@ fn function_call_builtin_metadata(
 
 fn function_call_target_is_builtin(target: &FunctionCallCacheTarget) -> bool {
     matches!(target, FunctionCallCacheTarget::Builtin { .. })
-}
-
-impl VmResult {
-    pub(crate) fn success(output: OutputBuffer, return_value: Option<Value>) -> Self {
-        Self {
-            status: ExecutionStatus::success(),
-            output,
-            diagnostics: Vec::new(),
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
-
-    pub(crate) fn success_with_diagnostics(
-        output: OutputBuffer,
-        return_value: Option<Value>,
-        diagnostics: Vec<RuntimeDiagnostic>,
-    ) -> Self {
-        Self {
-            status: ExecutionStatus::success(),
-            output,
-            diagnostics,
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
-
-    fn script_exit(output: OutputBuffer, code: i32) -> Self {
-        let mut result = Self::success(output, None);
-        result.process_exit_code = Some(code);
-        result
-    }
-
-    pub(crate) fn runtime_error_with_diagnostic(
-        output: OutputBuffer,
-        message: impl Into<String>,
-        diagnostic: RuntimeDiagnostic,
-    ) -> Self {
-        Self {
-            status: ExecutionStatus::runtime_error(message),
-            output,
-            diagnostics: vec![diagnostic],
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value: None,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
-
-    fn compile_error(output: OutputBuffer, message: impl Into<String>) -> Self {
-        Self {
-            status: ExecutionStatus::compile_error(message),
-            output,
-            diagnostics: Vec::new(),
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value: None,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
-
-    fn unsupported(output: OutputBuffer, message: impl Into<String>) -> Self {
-        Self {
-            status: ExecutionStatus::unsupported(message),
-            output,
-            diagnostics: Vec::new(),
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value: None,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
-
-    /// Non-success result marking that a throwable is unwinding the call stack.
-    ///
-    /// The throwable itself travels in `ExecutionState::pending_throw`; this
-    /// result only signals callers (via `!is_success()`) to consult it.
-    fn propagating_exception(output: OutputBuffer) -> Self {
-        Self {
-            status: ExecutionStatus::runtime_error(
-                "E_PHP_VM_PENDING_EXCEPTION: exception unwinding call stack",
-            ),
-            output,
-            diagnostics: Vec::new(),
-            http_response: RuntimeHttpResponseState::default(),
-            upload_registry: UploadRegistry::default(),
-            session: php_runtime::SessionState::default(),
-            return_value: None,
-            process_exit_code: None,
-            yielded: None,
-            fiber_suspension: None,
-            return_ref: None,
-            trace: Vec::new(),
-            counters: None,
-            tiering_stats: None,
-        }
-    }
 }
 
 /// Minimal interpreter VM.
@@ -6267,6 +6156,7 @@ impl Vm {
         }
         let mut diagnostics = Vec::new();
         let frame_layout = call_frame_layout_class(ir_function, &call);
+        let argument_policy = call.argument_binding_policy(compiled);
         let prepared = match arguments::prepare_arguments(
             compiled,
             ir_function,
@@ -6274,6 +6164,7 @@ impl Vm {
             stack,
             state,
             self.typecheck_fast_path_context(),
+            argument_policy,
             call.allow_by_ref_value_warnings,
             call.call_span,
             call.by_ref_warning_callable_name.as_deref(),
@@ -6368,7 +6259,6 @@ impl Vm {
         for (arg_index, (param, mut arg)) in ir_function.params.iter().zip(args).enumerate() {
             if let Err(message) = coerce_or_check_param_type(
                 compiled,
-                compiled.unit(),
                 state,
                 ir_function,
                 param,
@@ -6376,6 +6266,7 @@ impl Vm {
                 &mut arg.value,
                 arg.reference.is_some(),
                 self.typecheck_fast_path_context(),
+                argument_policy.call_site_strict_types,
                 call.call_span,
             ) {
                 let result = self.runtime_error(output, compiled, stack, message);
@@ -7237,6 +7128,7 @@ impl Vm {
                                         ir_function,
                                         function,
                                         FunctionCall::new(values, Vec::new())
+                                            .with_call_site_strict_types(compiled.unit().strict_types)
                                             .with_optional_call_span(
                                                 plan.unit
                                                     .spans
@@ -7255,6 +7147,7 @@ impl Vm {
                                         compiled,
                                         function,
                                         FunctionCall::new(values, Vec::new())
+                                            .with_call_site_strict_types(compiled.unit().strict_types)
                                             .with_optional_call_span(
                                                 plan.unit
                                                     .spans
@@ -9680,6 +9573,7 @@ impl Vm {
             let frame_reuse_call_shape_reason =
                 frame_reuse_call_shape_blocked_reason(function, &call);
             let frame_layout = call_frame_layout_class(function, &call);
+            let argument_policy = call.argument_binding_policy(compiled);
             let prepared = match arguments::prepare_arguments(
                 compiled,
                 function,
@@ -9687,6 +9581,7 @@ impl Vm {
                 stack,
                 state,
                 self.typecheck_fast_path_context(),
+                argument_policy,
                 call.allow_by_ref_value_warnings,
                 call.call_span,
                 call.by_ref_warning_callable_name.as_deref(),
@@ -9695,21 +9590,15 @@ impl Vm {
                 Err(message) => {
                     let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
                     let error_span = call.call_span.unwrap_or(function.span);
-                    let by_ref_not_referenceable =
-                        message.starts_with("E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE:");
                     let result = self.runtime_error(output, error_compiled, stack, message);
                     if let Some(throwable) = runtime_error_throwable(&result) {
                         tag_throwable_location(&throwable, error_compiled, error_span);
-                        state.pending_trace = Some(if by_ref_not_referenceable {
-                            capture_backtrace_string(error_compiled, stack)
-                        } else {
-                            capture_backtrace_string_with_failed_call(
-                                error_compiled,
-                                stack,
-                                function,
-                                error_span,
-                            )
-                        });
+                        state.pending_trace = Some(capture_backtrace_string_with_failed_call(
+                            error_compiled,
+                            stack,
+                            function,
+                            error_span,
+                        ));
                         state.pending_throw = Some(throwable);
                         return VmResult::propagating_exception(output.clone());
                     }
@@ -9867,7 +9756,6 @@ impl Vm {
             for (arg_index, (param, mut arg)) in function.params.iter().zip(args).enumerate() {
                 if let Err(message) = coerce_or_check_param_type(
                     compiled,
-                    compiled.unit(),
                     state,
                     function,
                     param,
@@ -9875,6 +9763,7 @@ impl Vm {
                     &mut arg.value,
                     arg.reference.is_some(),
                     self.typecheck_fast_path_context(),
+                    argument_policy.call_site_strict_types,
                     call.call_span,
                 ) {
                     let result = self.runtime_error(output, compiled, stack, message);
@@ -11902,6 +11791,7 @@ impl Vm {
                                 &class_owner,
                                 constructor.method.function,
                                 FunctionCall::new(values, Vec::new())
+                                    .with_call_site_strict_types(compiled.unit().strict_types)
                                     .with_call_span(instruction.span)
                                     .with_this(object.clone())
                                     .with_class_context(
@@ -12823,6 +12713,7 @@ impl Vm {
                                 &class_owner,
                                 constructor.method.function,
                                 FunctionCall::new(values, Vec::new())
+                                    .with_call_site_strict_types(compiled.unit().strict_types)
                                     .with_call_span(instruction.span)
                                     .with_this(object.clone())
                                     .with_class_context(
@@ -19171,6 +19062,7 @@ impl Vm {
                             &class_owner,
                             method_entry.function,
                             FunctionCall::new(values, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
                                 .with_call_span(instruction.span)
                                 .with_this(object.clone())
                                 .with_class_context(
@@ -19717,6 +19609,7 @@ impl Vm {
                         let called_class =
                             called_class_for_static_call(compiled, stack, class_name, &class);
                         let mut call = FunctionCall::new(values, Vec::new())
+                            .with_call_site_strict_types(compiled.unit().strict_types)
                             .with_call_span(instruction.span)
                             .with_class_context(
                                 declaring_class.name.clone(),
@@ -19822,6 +19715,7 @@ impl Vm {
                             }
                         };
                         let mut call = FunctionCall::new(values, payload.captures.clone())
+                            .with_call_site_strict_types(compiled.unit().strict_types)
                             .inherit_fiber_context(&running_fiber)
                             .with_call_span(instruction.span)
                             .with_error_context(compiled.clone());
@@ -20827,8 +20721,9 @@ impl Vm {
         match callee {
             Value::Callable(CallableValue::UserFunction { name }) => {
                 let make_call = |args, captures| {
-                    let call =
-                        FunctionCall::new(args, captures).with_optional_call_span(call_span);
+                    let call = FunctionCall::new(args, captures)
+                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .with_optional_call_span(call_span);
                     if allow_by_ref_value_warnings {
                         call.with_by_ref_value_warnings()
                     } else {
@@ -20867,6 +20762,7 @@ impl Vm {
             }
             Value::Callable(CallableValue::Closure(payload)) => {
                 let mut call = FunctionCall::new(args, payload.captures)
+                    .with_call_site_strict_types(compiled.unit().strict_types)
                     .with_optional_call_span(call_span)
                     .with_error_context(compiled.clone());
                 let closure_owner = closure_owner_for_function(
@@ -23048,7 +22944,9 @@ impl Vm {
                     self.execute_function(
                         compiled,
                         function,
-                        FunctionCall::new(args, Vec::new()).running_fiber(fiber),
+                        FunctionCall::new(args, Vec::new())
+                            .with_call_site_strict_types(compiled.unit().strict_types)
+                            .running_fiber(fiber),
                         output,
                         stack,
                         state,
@@ -23057,7 +22955,9 @@ impl Vm {
                     self.execute_function(
                         &owner,
                         function,
-                        FunctionCall::new(args, Vec::new()).running_fiber(fiber),
+                        FunctionCall::new(args, Vec::new())
+                            .with_call_site_strict_types(compiled.unit().strict_types)
+                            .running_fiber(fiber),
                         output,
                         stack,
                         state,
@@ -23073,6 +22973,7 @@ impl Vm {
             }
             Value::Callable(CallableValue::Closure(payload)) => {
                 let mut call = FunctionCall::new(args, payload.captures)
+                    .with_call_site_strict_types(compiled.unit().strict_types)
                     .running_fiber(fiber)
                     .with_error_context(compiled.clone());
                 let closure_owner = closure_owner_for_function(
@@ -23140,7 +23041,9 @@ impl Vm {
             return self.execute_function(
                 compiled,
                 function,
-                FunctionCall::new(args, Vec::new()).with_optional_call_span(call_span),
+                FunctionCall::new(args, Vec::new())
+                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_optional_call_span(call_span),
                 output,
                 stack,
                 state,
@@ -23150,7 +23053,9 @@ impl Vm {
             return self.execute_function(
                 &owner,
                 function,
-                FunctionCall::new(args, Vec::new()).with_optional_call_span(call_span),
+                FunctionCall::new(args, Vec::new())
+                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_optional_call_span(call_span),
                 output,
                 stack,
                 state,
@@ -23331,6 +23236,7 @@ impl Vm {
                 compiled,
                 function,
                 FunctionCall::new(args, Vec::new())
+                    .with_call_site_strict_types(compiled.unit().strict_types)
                     .inherit_fiber_context(running_fiber)
                     .with_optional_call_span(call_span),
                 output,
@@ -23355,6 +23261,7 @@ impl Vm {
                     &owner,
                     function,
                     FunctionCall::new(args, Vec::new())
+                        .with_call_site_strict_types(compiled.unit().strict_types)
                         .inherit_fiber_context(running_fiber)
                         .with_optional_call_span(call_span),
                     output,
@@ -23823,6 +23730,7 @@ impl Vm {
             &owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
@@ -24332,6 +24240,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
@@ -24427,6 +24336,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_class_context(
                     resolved.class.name.clone(),
                     normalize_class_name(class_name),
@@ -24504,6 +24414,7 @@ impl Vm {
                             &class_owner,
                             resolved.method.function,
                             FunctionCall::new(args, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
                                 .with_optional_call_span(call_span)
                                 .with_this(object.clone())
                                 .with_class_context(
@@ -24678,6 +24589,7 @@ impl Vm {
             &class_owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
@@ -25010,6 +24922,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
@@ -25082,6 +24995,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_class_context(
                     resolved.class.name.clone(),
@@ -25138,7 +25052,9 @@ impl Vm {
         let result = self.execute_function(
             compiled,
             FunctionId::new(generator.function()),
-            FunctionCall::new(args, Vec::new()).running_generator(generator.clone()),
+            FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
+                .running_generator(generator.clone()),
             output,
             stack,
             state,
@@ -26776,6 +26692,7 @@ impl Vm {
             compiled,
             resolved.method.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
@@ -26831,6 +26748,7 @@ impl Vm {
             compiled,
             function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_this(object.clone())
                 .with_class_context(class.name.clone(), object.class_name(), class.name.clone()),
             output,
@@ -26990,6 +26908,7 @@ impl Vm {
             compiled,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_class_context(
                     declaring_class.name.clone(),
                     called_class,
@@ -27085,7 +27004,10 @@ impl Vm {
                     Ok(resolved) => resolved,
                     Err(message) => {
                         self.record_include_cache_stats_delta(before_resolve, cache.cache_stats());
-                        self.record_include_graph_resolution_fallback(&path, &message);
+                        self.record_include_graph_resolution_fallback(
+                            &path,
+                            &message.render_message(),
+                        );
                         return include_failure(
                             output,
                             compiled,
@@ -27268,7 +27190,10 @@ impl Vm {
                                     }
                                 }
                                 Err(message) => {
-                                    self.record_include_graph_resolution_fallback(&path, &message);
+                                    self.record_include_graph_resolution_fallback(
+                                        &path,
+                                        &message.render_message(),
+                                    );
                                     return include_failure(
                                         output,
                                         compiled,
@@ -27319,7 +27244,10 @@ impl Vm {
                             }
                         }
                         Err(message) => {
-                            self.record_include_graph_resolution_fallback(&path, &message);
+                            self.record_include_graph_resolution_fallback(
+                                &path,
+                                &message.render_message(),
+                            );
                             return include_failure(
                                 output,
                                 compiled,
@@ -27414,6 +27342,7 @@ impl Vm {
             args: Vec::new(),
             captures: Vec::new(),
             call_span: Some(instruction_span),
+            call_site_strict_types: Some(compiled.unit().strict_types),
             error_context_compiled: None,
             allow_by_ref_value_warnings: false,
             by_ref_warning_callable_name: None,
@@ -29805,6 +29734,7 @@ impl Vm {
             args: Vec::new(),
             captures: Vec::new(),
             call_span: None,
+            call_site_strict_types: Some(compiled.unit().strict_types),
             error_context_compiled: None,
             allow_by_ref_value_warnings: false,
             by_ref_warning_callable_name: None,
@@ -30703,6 +30633,8 @@ fn uncaught_exception(
     };
     // PHP renders an uncaught throwable as a fatal error on the output stream.
     let trace = trace.unwrap_or_else(|| "#0 {main}".to_owned());
+    let diagnostic_stack =
+        stack_trace_from_captured_trace(&trace).unwrap_or_else(|| stack_trace(compiled, stack));
     if has_embedded_location {
         output.write_test_str(&format!(
             "\nFatal error: {heading}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
@@ -30721,10 +30653,33 @@ fn uncaught_exception(
             RuntimeSeverity::FatalError,
             full,
             RuntimeSourceSpan::default(),
-            stack_trace(compiled, stack),
+            diagnostic_stack,
             None,
         ),
     )
+}
+
+fn stack_trace_from_captured_trace(trace: &str) -> Option<Vec<RuntimeStackFrame>> {
+    let frames = trace
+        .lines()
+        .filter_map(runtime_stack_frame_from_trace_line)
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(frames)
+}
+
+fn runtime_stack_frame_from_trace_line(line: &str) -> Option<RuntimeStackFrame> {
+    let (_, rest) = line.split_once(' ')?;
+    if rest == "{main}" {
+        return Some(RuntimeStackFrame::new("main"));
+    }
+    let (_, call) = rest.split_once("): ")?;
+    let function = call.split_once('(').map_or(call, |(name, _)| name);
+    let function = function.trim();
+    if function.is_empty() {
+        None
+    } else {
+        Some(RuntimeStackFrame::new(function))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -42830,19 +42785,35 @@ fn validate_fiber_arg_count(
     args: &[CallArgument],
     expected: usize,
 ) -> Result<(), String> {
+    validate_fiber_arg_count_range(method, args, expected, expected)
+}
+
+fn validate_fiber_arg_count_range(
+    method: &str,
+    args: &[CallArgument],
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
     if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
         return Err(format!(
             "E_PHP_VM_UNKNOWN_NAMED_ARG: Fiber::{method} has no builtin parameter ${name}"
         ));
     }
-    if args.len() != expected {
-        let id = if args.len() < expected {
+    if args.len() < min || args.len() > max {
+        let id = if args.len() < min {
             "E_PHP_VM_TOO_FEW_ARGS"
         } else {
             "E_PHP_VM_TOO_MANY_ARGS"
         };
+        let expected = if min == max {
+            format!("exactly {min}")
+        } else if min == 0 {
+            format!("at most {max}")
+        } else {
+            format!("between {min} and {max}")
+        };
         return Err(format!(
-            "{id}: Fiber::{method} expects exactly {expected} argument(s), {} given",
+            "{id}: Fiber::{method} expects {expected} argument(s), {} given",
             args.len()
         ));
     }
@@ -47173,6 +47144,7 @@ fn precheck_bound_argument_types(
     bound: &mut [Option<CallArgument>],
     state: &ExecutionState,
     typecheck: TypecheckFastPathContext<'_>,
+    call_site_strict_types: bool,
     call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
     for (index, (param, arg)) in function.params.iter().zip(bound.iter_mut()).enumerate() {
@@ -47184,7 +47156,6 @@ fn precheck_bound_argument_types(
         };
         coerce_or_check_param_type(
             compiled,
-            compiled.unit(),
             state,
             function,
             param,
@@ -47192,6 +47163,7 @@ fn precheck_bound_argument_types(
             &mut arg.value,
             false,
             typecheck,
+            call_site_strict_types,
             call_span,
         )?;
     }
@@ -47205,7 +47177,7 @@ fn call_argument_reference_cell(
 ) -> Result<Option<ReferenceCell>, String> {
     if let Some(local) = arg.by_ref_local {
         let frame = stack.current_mut().ok_or("no active frame")?;
-        return frame.locals.ensure_reference_cell(local).map(Some);
+        return Ok(frame.locals.ensure_reference_cell(local).map(Some)?);
     }
     if let Some(target) = &arg.by_ref_dim {
         return ensure_dim_reference_cell(stack, target.local, &target.dims).map(Some);
@@ -47344,14 +47316,14 @@ fn param_type_mismatch_message(
 
 fn coerce_or_check_param_type(
     compiled: &CompiledUnit,
-    unit: &IrUnit,
     state: &ExecutionState,
     function: &IrFunction,
     param: &IrParam,
     arg_index: usize,
     value: &mut Value,
-    _by_ref_arg: bool,
+    by_ref_arg: bool,
     typecheck: TypecheckFastPathContext<'_>,
+    call_site_strict_types: bool,
     call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
     let Some(runtime_type) = ir_runtime_type(param.type_.as_ref()) else {
@@ -47360,7 +47332,6 @@ fn coerce_or_check_param_type(
     if param.variadic {
         return coerce_or_check_variadic_param_type(
             compiled,
-            unit,
             state,
             function,
             param,
@@ -47368,10 +47339,12 @@ fn coerce_or_check_param_type(
             value,
             &runtime_type,
             typecheck,
+            call_site_strict_types,
             call_span,
         );
     }
-    if !unit.strict_types
+    if !call_site_strict_types
+        && !by_ref_arg
         && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type)
     {
         *value = coerced;
@@ -47396,7 +47369,6 @@ fn coerce_or_check_param_type(
 
 fn coerce_or_check_variadic_param_type(
     compiled: &CompiledUnit,
-    unit: &IrUnit,
     state: &ExecutionState,
     function: &IrFunction,
     param: &IrParam,
@@ -47404,6 +47376,7 @@ fn coerce_or_check_variadic_param_type(
     value: &mut Value,
     runtime_type: &RuntimeType,
     typecheck: TypecheckFastPathContext<'_>,
+    call_site_strict_types: bool,
     call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
     let Value::Array(array) = value else {
@@ -47414,7 +47387,7 @@ fn coerce_or_check_variadic_param_type(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
     for (offset, (key, mut element)) in entries.into_iter().enumerate() {
-        if !unit.strict_types
+        if !call_site_strict_types
             && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
         {
             element = coerced;
@@ -47520,11 +47493,11 @@ fn initialize_this(
             function.name
         ));
     };
-    stack
+    Ok(stack
         .current_mut()
         .expect("frame was pushed")
         .locals
-        .set(LocalId::new(index as u32), Value::Object(this_value))
+        .set(LocalId::new(index as u32), Value::Object(this_value))?)
 }
 
 fn coerce_return_value(
@@ -50423,7 +50396,7 @@ fn unset_register_operand(stack: &mut CallStack, operand: Operand) -> Result<(),
         return Ok(());
     };
     let frame = stack.current_mut().ok_or("no active frame")?;
-    frame.registers.unset(id)
+    Ok(frame.registers.unset(id)?)
 }
 
 fn unset_dense_register_operand(
@@ -50434,7 +50407,7 @@ fn unset_dense_register_operand(
         return Ok(());
     }
     let frame = stack.current_mut().ok_or("no active frame")?;
-    frame.registers.unset(RegId::new(operand.index))
+    Ok(frame.registers.unset(RegId::new(operand.index))?)
 }
 
 fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, String> {

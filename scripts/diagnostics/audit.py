@@ -83,8 +83,8 @@ LEGACY_BASELINE = {
     # Existing CLI/reporting helpers still return String internally, but the
     # process boundary converts command errors to E_PHRUST_CLI_USAGE envelopes.
     # Keep this count visible and fail when it grows.
-    ("crates/php_vm_cli/src/commands.rs", "boundary-string-error"): 19,
-    ("crates/php_vm_cli/src/commands.rs", "map-err-to-string"): 3,
+    ("crates/php_vm_cli/src/commands.rs", "boundary-string-error"): 11,
+    ("crates/php_vm_cli/src/commands.rs", "map-err-to-string"): 2,
 }
 
 
