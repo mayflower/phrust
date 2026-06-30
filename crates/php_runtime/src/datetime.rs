@@ -163,12 +163,18 @@ pub fn format_interval(seconds: i64, format: &str) -> String {
                     }
                 }
                 'y' => output.push_str(&parts.years.to_string()),
+                'Y' => output.push_str(&format!("{:02}", parts.years)),
                 'm' => output.push_str(&parts.months.to_string()),
+                'M' => output.push_str(&format!("{:02}", parts.months)),
                 'd' => output.push_str(&parts.days.to_string()),
+                'D' => output.push_str(&format!("{:02}", parts.days)),
                 'a' => output.push_str(&parts.total_days.to_string()),
                 'h' => output.push_str(&parts.hours.to_string()),
+                'H' => output.push_str(&format!("{:02}", parts.hours)),
                 'i' => output.push_str(&parts.minutes.to_string()),
+                'I' => output.push_str(&format!("{:02}", parts.minutes)),
                 's' => output.push_str(&parts.seconds.to_string()),
+                'S' => output.push_str(&format!("{:02}", parts.seconds)),
                 other => {
                     output.push('%');
                     output.push(other);
@@ -630,4 +636,19 @@ fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_interval;
+
+    #[test]
+    fn interval_format_supports_unpadded_and_padded_fields() {
+        let seconds = 425 * 86_400 + 3 * 3_600 + 4 * 60 + 5;
+
+        assert_eq!(
+            format_interval(seconds, "%y/%Y %m/%M %d/%D %h/%H %i/%I %s/%S"),
+            "1/01 2/02 0/00 3/03 4/04 5/05"
+        );
+    }
 }

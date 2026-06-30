@@ -40863,10 +40863,15 @@ fn call_phar_static_method(method: &str, args: Vec<Value>) -> Result<Value, Stri
     match method.as_str() {
         "getsupportedcompression" => {
             validate_phar_arg_count("Phar::getSupportedCompression", args.len(), 0, 0)?;
-            Ok(Value::Array(PhpArray::from_packed(vec![
-                Value::string("GZ"),
-                Value::string("BZIP2"),
-            ])))
+            let registry = php_std::ExtensionRegistry::standard_library();
+            let mut compression = Vec::new();
+            if php_std::introspection::extension_loaded(&registry, "zlib") {
+                compression.push(Value::string("GZ"));
+            }
+            if php_std::introspection::extension_loaded(&registry, "bz2") {
+                compression.push(Value::string("BZIP2"));
+            }
+            Ok(Value::Array(PhpArray::from_packed(compression)))
         }
         "getsupportedsignatures" => {
             validate_phar_arg_count("Phar::getSupportedSignatures", args.len(), 0, 0)?;
@@ -55805,6 +55810,23 @@ good"
         assert_eq!(
             result.output.to_string_lossy(),
             "int(0)\nstring(8) \"No error\"\nbool(false)\nint(1)\nstring(14) \"Internal error\"\nint(1)\nint(0)\nstring(8) \"No error\"\n"
+        );
+    }
+
+    #[test]
+    fn phar_supported_compression_follows_loaded_capabilities() {
+        let result = execute_source(
+            "<?php
+            var_dump(extension_loaded('zlib'));
+            var_dump(extension_loaded('bz2'));
+            var_dump(Phar::getSupportedCompression());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "bool(true)\nbool(false)\narray(1) {\n  [0]=>\n  string(2) \"GZ\"\n}\n"
         );
     }
 

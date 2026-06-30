@@ -1,6 +1,7 @@
 {"path":"tests/phpt/generated/phar/platform-checks.phpt"}
 {"path":"ext/phar/tests/phar_get_supportedcomp1.phpt"}
 {"path":"ext/phar/tests/phar_get_supportedcomp2.phpt"}
+{"path":"ext/phar/tests/phar_get_supportedcomp3.phpt"}
 {"path":"ext/phar/tests/phar_get_supportedcomp4.phpt"}
 {"path":"ext/phar/tests/phar_get_supported_signatures_002.phpt"}
 {"path":"ext/phar/tests/phar_get_supported_signatures_002a.phpt"}

@@ -2,7 +2,7 @@
 
 - Priority: 19
 - Selected manifest: `tests/phpt/manifests/modules/date.selected.jsonl`
-- Focused selected counts: 9 PASS, 0 SKIP, 0 FAIL, 0 BORK from 9 Date/Time
+- Focused selected counts: 10 PASS, 0 SKIP, 0 FAIL, 0 BORK from 10 Date/Time
   fixtures
 - Corpus triage counts: 14 PASS, 12 SKIP, 661 FAIL, 0 BORK from 687
   upstream `ext/date` corpus candidates before this focused promotion
@@ -35,6 +35,7 @@
 - `tests/phpt/generated/date/datetimezone-mvp.phpt`
 - `tests/phpt/generated/date/strtotime-mvp.phpt`
 - `tests/phpt/generated/date/dateinterval-mvp.phpt`
+- `ext/date/tests/DateInterval_format.phpt`
 - `ext/date/tests/DateTimeZone_getName_basic1.phpt`
 - `ext/date/tests/006.phpt`
 
@@ -56,7 +57,7 @@
 
 ## Known Gaps
 
-- focused selected manifest contains nine Date/Time contracts and is expected
+- focused selected manifest contains ten Date/Time contracts and is expected
   to be green for both reference PHP 8.5.7 and the
   target runtime
 - broader upstream `ext/date` rows remain documented corpus/backlog work for
