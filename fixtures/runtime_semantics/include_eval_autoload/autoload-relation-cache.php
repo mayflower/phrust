@@ -1,5 +1,5 @@
 <?php
-// runtime-semantics: expect=known_gap known_gap=autoload_relation_dynamic_class_lookup
+// runtime-semantics: expect=known_gap known_gap=E_PHP_RUNTIME_AUTOLOAD_RELATION_MATRIX
 spl_autoload_register(function ($class) {
     include (__DIR__ . "/_data/AutoloadRelationCacheChild.php");
 });

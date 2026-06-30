@@ -18,6 +18,7 @@ CATEGORIES = (
     "refs",
     "cow",
     "arrays",
+    "strings",
     "foreach",
     "functions",
     "closures",
@@ -283,8 +284,9 @@ def compare_fixture(fixture: Fixture, rust_vm: Path) -> dict:
         return result(fixture, "known_gap", reference, rust, None)
 
     if reference["status"] == "skip":
-        if fixture.php_ref_optional_reason:
-            return result(fixture, "skip", reference, rust, reference["message"])
+        if not fixture.php_ref_required:
+            reason = fixture.php_ref_optional_reason or reference["message"]
+            return result(fixture, "skip", reference, rust, reason)
         return result(
             fixture,
             "fail",
@@ -292,8 +294,7 @@ def compare_fixture(fixture: Fixture, rust_vm: Path) -> dict:
             rust,
             (
                 f"{reference['message']}; runnable runtime-semantics fixtures "
-                "require REFERENCE_PHP unless they declare "
-                "php_ref_optional_reason=<reason>"
+                "with php_ref_required=1 require REFERENCE_PHP"
             ),
         )
     if reference["status"] == "error":

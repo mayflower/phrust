@@ -10,7 +10,7 @@ nix develop -c env REFERENCE_PHP=third_party/php-src/sapi/cli/php just runtime-s
 Result:
 
 ```text
-total=303 pass=254 fail=0 skip=0 known_gap=49
+total=333 pass=273 fail=0 skip=0 known_gap=60
 ```
 
 When `REFERENCE_PHP` is not set, `just runtime-semantics-diff` skips pass-candidate
@@ -20,25 +20,25 @@ provided and skip-explicit when the local reference binary is unavailable.
 
 | Category | Pass | Fail | Known gap | Skip | Fixture root or examples |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `arrays` | 12 | 0 | 0 | 0 | `fixtures/runtime_semantics/arrays/*.php` |
-| `callables` | 23 | 0 | 1 | 0 | `fixtures/runtime_semantics/callables/*.php` |
+| `arrays` | 15 | 0 | 1 | 0 | `fixtures/runtime_semantics/arrays/*.php` |
+| `callables` | 24 | 0 | 1 | 0 | `fixtures/runtime_semantics/callables/*.php` |
 | `clone_with` | 5 | 0 | 4 | 0 | `fixtures/runtime_semantics/clone_with/*.php` |
 | `closures` | 12 | 0 | 0 | 0 | `fixtures/runtime_semantics/closures/*.php` |
 | `comparisons` | 5 | 0 | 0 | 0 | `fixtures/runtime_semantics/comparisons/*.php` |
 | `const_expr` | 0 | 0 | 4 | 0 | `fixtures/runtime_semantics/const_expr/*.php` |
 | `conversions` | 4 | 0 | 3 | 0 | `fixtures/runtime_semantics/conversions/*.php` |
-| `cow` | 2 | 0 | 1 | 0 | `fixtures/runtime_semantics/cow/*.php` |
+| `cow` | 2 | 0 | 0 | 0 | `fixtures/runtime_semantics/cow/*.php` |
 | `destructors` | 4 | 0 | 1 | 0 | `fixtures/runtime_semantics/destructors/*.php` |
 | `enums` | 11 | 0 | 2 | 0 | `fixtures/runtime_semantics/enums/*.php` |
 | `errors` | 6 | 0 | 0 | 0 | `fixtures/runtime_semantics/errors/*.php` |
-| `fibers` | 11 | 0 | 0 | 0 | `fixtures/runtime_semantics/fibers/*.php` |
-| `foreach` | 14 | 0 | 2 | 0 | `fixtures/runtime_semantics/foreach/*.php` |
-| `functions` | 12 | 0 | 3 | 0 | `fixtures/runtime_semantics/functions/*.php` |
+| `fibers` | 12 | 0 | 0 | 0 | `fixtures/runtime_semantics/fibers/*.php` |
+| `foreach` | 16 | 0 | 2 | 0 | `fixtures/runtime_semantics/foreach/*.php` |
+| `functions` | 14 | 0 | 3 | 0 | `fixtures/runtime_semantics/functions/*.php` |
 | `gc` | 0 | 0 | 4 | 0 | `fixtures/runtime_semantics/gc/*.php` |
 | `generators` | 15 | 0 | 1 | 0 | `fixtures/runtime_semantics/generators/*.php` |
-| `globals` | 7 | 0 | 0 | 0 | `fixtures/runtime_semantics/globals/*.php` |
+| `globals` | 8 | 0 | 1 | 0 | `fixtures/runtime_semantics/globals/*.php` |
 | `include_eval_autoload` | 16 | 0 | 2 | 0 | `fixtures/runtime_semantics/include_eval_autoload/*.php` |
-| `known_gaps` | 0 | 0 | 3 | 0 | `fixtures/runtime_semantics/known_gaps/*.php` |
+| `known_gaps` | 0 | 0 | 12 | 0 | `fixtures/runtime_semantics/known_gaps/*.php` |
 | `magic` | 12 | 0 | 2 | 0 | `fixtures/runtime_semantics/magic/*.php` |
 | `objects` | 24 | 0 | 0 | 0 | `fixtures/runtime_semantics/objects/*.php` |
 | `pipe` | 6 | 0 | 0 | 0 | `fixtures/runtime_semantics/pipe/*.php` |
@@ -48,8 +48,12 @@ provided and skip-explicit when the local reference binary is unavailable.
 | `reflection` | 11 | 0 | 3 | 0 | `fixtures/runtime_semantics/reflection/*.php` |
 | `refs` | 5 | 0 | 1 | 0 | `fixtures/runtime_semantics/refs/*.php` |
 | `regressions` | 2 | 0 | 1 | 0 | `fixtures/runtime_semantics/regressions/**/*.php` |
+| `statics` | 2 | 0 | 0 | 0 | `fixtures/runtime_semantics/statics/*.php` |
+| `strings` | 2 | 0 | 1 | 0 | `fixtures/runtime_semantics/strings/*.php` |
+| `superglobals` | 1 | 0 | 0 | 0 | `fixtures/runtime_semantics/superglobals/*.php` |
 | `traits` | 9 | 0 | 0 | 0 | `fixtures/runtime_semantics/traits/*.php` |
-| `types` | 6 | 0 | 6 | 0 | `fixtures/runtime_semantics/types/*.php` |
+| `types` | 8 | 0 | 6 | 0 | `fixtures/runtime_semantics/types/*.php` |
+| `variables` | 2 | 0 | 0 | 0 | `fixtures/runtime_semantics/variables/*.php` |
 | `void_cast` | 0 | 0 | 1 | 0 | `fixtures/runtime_semantics/void_cast/*.php` |
 | `wordpress_blockers` | 7 | 0 | 0 | 0 | `fixtures/runtime_semantics/wordpress_blockers/*.php` |
 

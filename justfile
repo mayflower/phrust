@@ -55,6 +55,7 @@ help:
       '  just runtime-fixtures     Run runtime fixture checks' \
       '  just runtime-diff         Compare runtime output with PHP reference when configured' \
       '  just runtime-known-gaps   Validate runtime known-gap catalog' \
+      '  just runtime-gap-report   Regenerate runtime gap closure report' \
       '' \
       'Server:' \
       '  just verify-server        Run integrated web server verification' \
@@ -702,6 +703,7 @@ phpt-smoke:
 
 runtime-known-gaps:
     @just known-gaps
+    scripts/runtime_gap_report.py --check
     cargo build -p php_vm_cli
     test -s docs/runtime-known-gaps.md
     grep -q 'E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS' docs/runtime-known-gaps.md
@@ -759,6 +761,9 @@ runtime-known-gaps:
       grep -q "$diagnostic" "$tmp_dir/$name.err"; \
     done; \
     printf '%s\n' '[ok] runtime known-gap catalog and reference fixtures passed.'
+
+runtime-gap-report:
+    scripts/runtime_gap_report.py
 
 known-gaps:
     scripts/known_gaps/validate.py

@@ -47370,7 +47370,7 @@ fn coerce_or_check_param_type(
     param: &IrParam,
     arg_index: usize,
     value: &mut Value,
-    by_ref_arg: bool,
+    _by_ref_arg: bool,
     typecheck: TypecheckFastPathContext<'_>,
     call_site_strict_types: bool,
     call_span: Option<php_ir::IrSpan>,
@@ -47393,7 +47393,6 @@ fn coerce_or_check_param_type(
         );
     }
     if !call_site_strict_types
-        && !by_ref_arg
         && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type)
     {
         *value = coerced;

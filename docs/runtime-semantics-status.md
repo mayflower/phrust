@@ -1,7 +1,8 @@
 # Runtime Semantics Status
 
 For the final Runtime semantics closure state, use `docs/runtime-semantics-final-audit.md`,
-`docs/runtime-semantics-coverage-matrix.md`, and `docs/stdlib-roadmap.md`.
+`docs/runtime-semantics-coverage-matrix.md`, `docs/runtime-gap-closure-plan.md`,
+and `docs/stdlib-roadmap.md`.
 
 This document records the current runtime semantics position for the PHP engine
 work. It is a status and backlog document, not a compatibility claim.
@@ -22,7 +23,9 @@ php_lexer -> php_syntax -> php_ast -> php_semantics -> php_ir -> php_runtime -> 
 
 No Runtime semantics feature should be considered complete unless it has a fixture,
 known-gap entry where appropriate, and validation through the relevant
-`just` gate. Current topic docs are:
+`just` gate. `just runtime-gap-report` regenerates the executable compatibility
+gap closure report under `target/runtime-gap-report/` and refreshes the
+committed closure plan. Current topic docs are:
 
 | Area | Document |
 | --- | --- |
