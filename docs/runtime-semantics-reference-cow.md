@@ -14,13 +14,44 @@ frontend or IR contracts.
   `ReferenceCell`.
 - `ReferenceCell`: shared alias storage. Assigning through any slot bound to
   the cell updates the value observed through every other bound slot.
+- `Lvalue`: a resolved assignable storage facade. It can address locals through
+  `Slot`, globals/statics through shared cells or value-table entries, array
+  elements through direct `Value` fields, and object properties through
+  `ObjectRef` storage.
 - `TempValue`: a VM temporary/register value. Temporaries snapshot effective
   values and are not referenceable storage locations.
 - `PhpString`: byte-string payload with shared storage. Cloning shares bytes;
   write APIs call `separate_for_write` before mutation.
 - `PhpArray`: ordered-map payload with shared storage. Cloning shares the
-  private storage enum; mutating APIs call `separate_for_write` before changing
-  entries, append metadata, or internal-pointer state.
+  private storage enum; mutating APIs call `prepare_for_write` with a
+  `PhpArrayWriteIntent` before changing entries, append metadata, or
+  internal-pointer state.
+
+## Current Storage Inventory
+
+- Locals are `php_vm::frame::LocalFile` entries backed by
+  `php_runtime::Slot`. `StoreLocal`, by-reference assignment, by-reference
+  parameters, by-reference returns, static locals, and globals bound into a
+  frame all eventually write or bind local slots.
+- References are represented by `ReferenceCell`, with `Value::Reference` used
+  only where a reference must be stored inside a value payload such as an array
+  element, object property, static property, callable argument, or `$GLOBALS`
+  view.
+- Arrays are `PhpArray` handles over shared opaque storage. Cloning shares the
+  handle; `insert`, `append`, `get_mut`, `remove`, and pointer mutations
+  prepare the array for write and separate shared storage before mutation.
+- Object properties are stored in `ObjectRef` as an ordered map of storage names
+  to `Value`. Direct referenceable property storage uses `Value::Reference`;
+  property visibility, hooks, magic methods, and diagnostics stay in the VM.
+- Static locals live in the VM request state as `ReferenceCell`s keyed by
+  function and local name. Static properties live in the VM request state as
+  `(class, property) -> Value` entries and now write through a static-property
+  lvalue when an entry contains `Value::Reference`.
+- Mutating VM instructions that need lvalue handling include local stores,
+  `BindReference*`, global binding, static-local initialization, static-property
+  assignment/binding, array dimension assign/append/unset, property
+  assign/bind/unset, by-reference call argument preparation, by-reference
+  returns, and by-reference foreach.
 
 ## Invariants
 
@@ -32,6 +63,9 @@ frontend or IR contracts.
   `ReferenceCell` and returns the cell for the aliasing target.
 - Binding a slot to an existing `ReferenceCell` makes the slot an alias of the
   same storage.
+- Resolved lvalue operations are the preferred write path: read dereferences,
+  write preserves aliases, bind-reference replaces the target binding when the
+  target is rebindable, and unset removes or clears only that target.
 - Writing a `Value::Reference` into a `TempValue` dereferences the cell first.
   The temporary is a snapshot and later mutations to the cell do not mutate the
   temporary.
@@ -55,7 +89,10 @@ frontend or IR contracts.
 
 Arrays and strings now use shared payload storage with separation-on-write.
 Array writes are covered through `PhpArray::insert`, `append`, `get_mut`, and
-`remove`, which are the VM's current mutation boundaries.
+`remove`, which are the VM's current mutation boundaries. All of those methods
+route through `PhpArray::prepare_for_write(intent)`, using intents such as
+`NestedDimensionWrite`, `Append`, `BindReferenceElement`, `Remove`, and
+`PointerMutation`.
 
 `PhpArray` owns the packed/mixed storage boundary. The packed variant is used
 for exact `0..len` integer-key arrays, including safe overwrites, append, and
@@ -94,9 +131,11 @@ $c =& $b;    // $c is rebound to $b; $a remains 1
 $c = 4;      // $b and $c read 4
 ```
 
-Array-element references are executable for direct dimension lvalues.
-Object-property references are still an explicit known gap:
-`E_PHP_IR_UNSUPPORTED_PROPERTY_REFERENCE`.
+Array-element references are executable for direct dimension lvalues. Direct
+object-property storage references are executable for the covered public and
+resolved-property cases. Wider object-property reference behavior remains an
+explicit gap for property hooks, magic `__get` by-reference lvalues, and exact
+engine diagnostics.
 
 ## Public API Surface
 
@@ -104,10 +143,19 @@ Standard library reference and COW work should reuse:
 
 - `php_runtime::Slot` for writable storage;
 - `php_runtime::ReferenceCell` for alias identity;
+- `php_runtime::Lvalue` and `LvalueKind` for resolved assignable locations;
 - `php_runtime::TempValue` for non-referenceable VM temporaries;
 - `php_runtime::PhpArray` and `PhpString` for shared payload storage and
   separation-on-write;
-- `php_vm::frame::LocalFile` and VM lvalue helpers for local/global binding.
+- `PhpArray::prepare_for_write` and `PhpArrayWriteIntent` for array COW
+  mutation preparation;
+- `php_vm::frame::LocalFile` for local/global/static-local binding.
+
+To add a new lvalue kind later, resolve names, visibility, hooks, and
+diagnostics outside `php_runtime`, then hand the resolved storage to `Lvalue`.
+If a location cannot be rebound by reference, return an explicit diagnostic
+instead of falling back to value-copy semantics. Do not expose raw
+`Rc<RefCell<Value>>` outside the runtime storage API.
 
 `ReferenceCell::try_get`, `ReferenceCell::try_set`, and
 `ReferenceCell::try_with_value` are the preferred non-panicking inspection

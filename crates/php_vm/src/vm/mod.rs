@@ -74,12 +74,12 @@ use php_runtime::{
     ClassPropertyFlags as RuntimeClassPropertyFlags,
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureContext,
     ClosureDebugInfo, ClosureDebugParameter, ClosurePayload, ExecutionStatus, FiberRef, FiberState,
-    GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef, OutputBuffer,
-    PhpArray, PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback,
-    PhpString, ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic,
-    RuntimeDiagnosticPayload, RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan,
-    RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions, UploadRegistry, Value,
-    VmCompileDiagnostic, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
+    GeneratorRef, GeneratorState, GlobalSymbolTable, Lvalue, LvalueKind, NumericValue, ObjectRef,
+    OutputBuffer, PhpArray, PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup,
+    PhpArrayShapeLookupFallback, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
+    RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeHttpResponseState, RuntimeSeverity,
+    RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions, UploadRegistry,
+    Value, VmCompileDiagnostic, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
     error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
     serialize as serialize_value, set_float_string_precision, to_arithmetic_number, to_bool,
     to_float, to_int, to_number, to_string, undefined_function, undefined_variable_warning,
@@ -11016,7 +11016,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let reference = Value::Reference(cell);
+                        let reference = Value::Reference(cell.clone());
                         let property_type = ir_runtime_type(entry.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
@@ -11154,7 +11154,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let reference = Value::Reference(cell);
+                        let reference = Value::Reference(cell.clone());
                         let property_type = ir_runtime_type(resolved.property.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
@@ -11207,7 +11207,14 @@ impl Vm {
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        state.static_properties.insert(key, reference);
+                        if let Err(message) = bind_static_property_lvalue(
+                            &mut state.static_properties,
+                            key,
+                            current.clone(),
+                            cell,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
                             compiled,
                             output,
@@ -16694,7 +16701,14 @@ impl Vm {
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        state.static_properties.insert(key, value.clone());
+                        if let Err(message) = write_static_property_lvalue(
+                            &mut state.static_properties,
+                            key,
+                            current.clone(),
+                            value.clone(),
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
                             compiled,
                             output,
@@ -35146,16 +35160,14 @@ fn ensure_property_reference_cell(
     } else {
         property.to_owned()
     };
-    let current = object
-        .get_property(&storage_name)
-        .or_else(|| object.get_property(property))
-        .unwrap_or(Value::Uninitialized);
-    if let Value::Reference(cell) = current {
-        return Ok(cell);
+    if object.get_property(&storage_name).is_none()
+        && let Some(value) = object.get_property(property)
+    {
+        object.set_property(storage_name.clone(), value);
     }
-    let cell = ReferenceCell::new(current);
-    object.set_property(storage_name, Value::Reference(cell.clone()));
-    Ok(cell)
+    Lvalue::object_property(object.clone(), storage_name, LvalueKind::ObjectProperty)
+        .ensure_reference_cell()
+        .map_err(|error| error.to_string())
 }
 
 fn validate_static_property_write(
@@ -35189,6 +35201,30 @@ fn static_property_key(
     property: &php_ir::module::ClassPropertyEntry,
 ) -> (String, String) {
     (normalize_class_name(&class.name), property.name.clone())
+}
+
+fn write_static_property_lvalue(
+    static_properties: &mut HashMap<(String, String), Value>,
+    key: (String, String),
+    default: Value,
+    value: Value,
+) -> Result<(), String> {
+    let entry = static_properties.entry(key).or_insert(default);
+    Lvalue::value(entry, LvalueKind::StaticProperty)
+        .write_value(value)
+        .map_err(|error| error.to_string())
+}
+
+fn bind_static_property_lvalue(
+    static_properties: &mut HashMap<(String, String), Value>,
+    key: (String, String),
+    default: Value,
+    cell: ReferenceCell,
+) -> Result<(), String> {
+    let entry = static_properties.entry(key).or_insert(default);
+    Lvalue::value(entry, LvalueKind::StaticProperty)
+        .bind_reference_cell(cell)
+        .map_err(|error| error.to_string())
 }
 
 fn static_property_default(
@@ -50154,28 +50190,21 @@ fn ensure_dim_reference_cell_value(
 }
 
 fn ensure_value_reference_cell(value: &mut Value) -> ReferenceCell {
-    match value {
-        Value::Reference(cell) => cell.clone(),
-        value => {
-            let cell = ReferenceCell::new(value.clone());
-            *value = Value::Reference(cell.clone());
-            cell
-        }
-    }
+    Lvalue::value(value, LvalueKind::ArrayElement)
+        .ensure_reference_cell()
+        .expect("array element lvalue can become a reference cell")
 }
 
 fn write_property_storage_value(object: &ObjectRef, storage_name: &str, value: Value) {
-    match object.get_property(storage_name) {
-        Some(Value::Reference(cell)) => cell.set(value),
-        _ => object.set_property(storage_name, value),
-    }
+    Lvalue::object_property(object.clone(), storage_name, LvalueKind::ObjectProperty)
+        .write_value(value)
+        .expect("object property lvalue writes are supported")
 }
 
 fn write_lvalue(target: &mut Value, value: Value) {
-    match target {
-        Value::Reference(cell) => cell.set(value),
-        target => *target = value,
-    }
+    Lvalue::value(target, LvalueKind::ArrayElement)
+        .write_value(value)
+        .expect("array element lvalue writes are supported")
 }
 
 fn unset_dim_local(stack: &mut CallStack, local: LocalId, dims: &[ArrayKey]) -> Result<(), String> {

@@ -5,7 +5,7 @@
 //! aliasing explicit through `Slot`. Temporaries are represented by `TempValue`
 //! so register values cannot accidentally become reference aliases.
 
-use crate::Value;
+use crate::{Value, object::ObjectRef};
 use std::cell::{BorrowError, BorrowMutError, Ref, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -154,6 +154,12 @@ pub enum Slot {
 }
 
 impl Slot {
+    /// Creates an ordinary slot initialized to PHP `null`.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self::Value(Value::Null)
+    }
+
     /// Creates an ordinary value slot.
     #[must_use]
     pub const fn value(value: Value) -> Self {
@@ -175,6 +181,12 @@ impl Slot {
         }
     }
 
+    /// Reads the effective value for PHP value reads.
+    #[must_use]
+    pub fn read_value(&self) -> Value {
+        self.read()
+    }
+
     /// Returns true when the effective value is uninitialized.
     #[must_use]
     pub fn is_uninitialized(&self) -> bool {
@@ -187,6 +199,16 @@ impl Slot {
             Self::Value(slot) => *slot = value,
             Self::Reference(cell) => cell.set(value),
         }
+    }
+
+    /// Writes the PHP value through this slot.
+    pub fn write_value(&mut self, value: Value) {
+        self.write(value);
+    }
+
+    /// Unsets this slot name without mutating an aliased reference cell.
+    pub fn unset(&mut self) {
+        *self = Self::uninitialized();
     }
 
     /// Converts an ordinary slot into a reference cell or returns its existing
@@ -206,6 +228,18 @@ impl Slot {
     pub fn bind_reference(&mut self, cell: ReferenceCell) {
         *self = Self::Reference(cell);
     }
+
+    /// Returns true when two slots are aliases of the same reference cell.
+    ///
+    /// This is for tests, tracing, and conservative optimization guards. It is
+    /// not a PHP-visible identity operation.
+    #[must_use]
+    pub fn aliases(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reference(left), Self::Reference(right)) => left.ptr_eq(right),
+            _ => false,
+        }
+    }
 }
 
 /// Backwards-compatible exported name for runtime slot users.
@@ -213,6 +247,224 @@ pub type ValueSlot = Slot;
 
 /// Backwards-compatible exported name for earlier placeholder references.
 pub type ReferencePlaceholder = ReferenceCell;
+
+/// Resolved assignable runtime location kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LvalueKind {
+    LocalVariable,
+    GlobalVariable,
+    ArrayElement,
+    ArrayAppendElement,
+    ObjectProperty,
+    StaticLocal,
+    StaticProperty,
+}
+
+impl LvalueKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalVariable => "local_variable",
+            Self::GlobalVariable => "global_variable",
+            Self::ArrayElement => "array_element",
+            Self::ArrayAppendElement => "array_append_element",
+            Self::ObjectProperty => "object_property",
+            Self::StaticLocal => "static_local",
+            Self::StaticProperty => "static_property",
+        }
+    }
+}
+
+enum LvalueTarget<'a> {
+    Slot(&'a mut Slot),
+    Value(&'a mut Value),
+    Cell(ReferenceCell),
+    ObjectProperty { object: ObjectRef, name: String },
+}
+
+/// Runtime lvalue facade for PHP-visible storage locations.
+///
+/// This type keeps PHP read/write/reference operations centralized without
+/// exposing `Rc<RefCell<Value>>` to VM instructions. It intentionally models
+/// only resolved storage; name lookup, visibility, property hooks, and
+/// diagnostic routing stay in the VM/frontend layers that already own them.
+pub struct Lvalue<'a> {
+    kind: LvalueKind,
+    target: LvalueTarget<'a>,
+}
+
+impl<'a> Lvalue<'a> {
+    /// Creates an lvalue over a variable slot.
+    pub fn slot(slot: &'a mut Slot, kind: LvalueKind) -> Self {
+        Self {
+            kind,
+            target: LvalueTarget::Slot(slot),
+        }
+    }
+
+    /// Creates an lvalue over a direct value field such as an array element or
+    /// static-property table entry.
+    pub fn value(value: &'a mut Value, kind: LvalueKind) -> Self {
+        Self {
+            kind,
+            target: LvalueTarget::Value(value),
+        }
+    }
+
+    /// Creates an lvalue over an existing shared reference cell.
+    #[must_use]
+    pub fn cell(cell: ReferenceCell, kind: LvalueKind) -> Self {
+        Self {
+            kind,
+            target: LvalueTarget::Cell(cell),
+        }
+    }
+
+    /// Creates an lvalue over object property storage.
+    #[must_use]
+    pub fn object_property(object: ObjectRef, name: impl Into<String>, kind: LvalueKind) -> Self {
+        Self {
+            kind,
+            target: LvalueTarget::ObjectProperty {
+                object,
+                name: name.into(),
+            },
+        }
+    }
+
+    /// Returns the lvalue kind.
+    #[must_use]
+    pub const fn kind(&self) -> LvalueKind {
+        self.kind
+    }
+
+    /// Reads the effective PHP value.
+    #[must_use]
+    pub fn read_value(&self) -> Value {
+        match &self.target {
+            LvalueTarget::Slot(slot) => slot.read_value(),
+            LvalueTarget::Value(value) => deref_value_for_read(value),
+            LvalueTarget::Cell(cell) => cell.get(),
+            LvalueTarget::ObjectProperty { object, name } => object
+                .get_property(name)
+                .map(deref_owned_value_for_read)
+                .unwrap_or(Value::Uninitialized),
+        }
+    }
+
+    /// Writes a PHP value through this lvalue.
+    pub fn write_value(&mut self, value: Value) -> Result<(), LvalueError> {
+        match &mut self.target {
+            LvalueTarget::Slot(slot) => slot.write_value(value),
+            LvalueTarget::Value(target) => write_value(target, value),
+            LvalueTarget::Cell(cell) => cell.set(value),
+            LvalueTarget::ObjectProperty { object, name } => match object.get_property(name) {
+                Some(Value::Reference(cell)) => cell.set(value),
+                _ => object.set_property(name.clone(), value),
+            },
+        }
+        Ok(())
+    }
+
+    /// Converts this lvalue to reference storage and returns the shared cell.
+    pub fn ensure_reference_cell(&mut self) -> Result<ReferenceCell, LvalueError> {
+        match &mut self.target {
+            LvalueTarget::Slot(slot) => Ok(slot.ensure_reference_cell()),
+            LvalueTarget::Value(value) => Ok(ensure_value_reference_cell(value)),
+            LvalueTarget::Cell(cell) => Ok(cell.clone()),
+            LvalueTarget::ObjectProperty { object, name } => {
+                let current = object.get_property(name).unwrap_or(Value::Uninitialized);
+                if let Value::Reference(cell) = current {
+                    return Ok(cell);
+                }
+                let cell = ReferenceCell::new(current);
+                object.set_property(name.clone(), Value::Reference(cell.clone()));
+                Ok(cell)
+            }
+        }
+    }
+
+    /// Binds this lvalue to an existing reference cell when the lvalue storage
+    /// can itself be rebound.
+    pub fn bind_reference_cell(&mut self, cell: ReferenceCell) -> Result<(), LvalueError> {
+        match &mut self.target {
+            LvalueTarget::Slot(slot) => slot.bind_reference(cell),
+            LvalueTarget::Value(value) => **value = Value::Reference(cell),
+            LvalueTarget::ObjectProperty { object, name } => {
+                object.set_property(name.clone(), Value::Reference(cell));
+            }
+            LvalueTarget::Cell(_) => {
+                return Err(LvalueError::CannotRebindCell { kind: self.kind });
+            }
+        }
+        Ok(())
+    }
+
+    /// Unsets this lvalue without corrupting still-live aliases.
+    pub fn unset(&mut self) -> Result<(), LvalueError> {
+        match &mut self.target {
+            LvalueTarget::Slot(slot) => slot.unset(),
+            LvalueTarget::Value(value) => **value = Value::Uninitialized,
+            LvalueTarget::Cell(cell) => cell.set(Value::Uninitialized),
+            LvalueTarget::ObjectProperty { object, name } => {
+                object.unset_property(name);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lvalue operation failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LvalueError {
+    CannotRebindCell { kind: LvalueKind },
+}
+
+impl std::fmt::Display for LvalueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CannotRebindCell { kind } => write!(
+                f,
+                "E_PHP_RUNTIME_LVALUE_REBIND_CELL: cannot rebind {} cell storage",
+                kind.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LvalueError {}
+
+fn deref_value_for_read(value: &Value) -> Value {
+    match value {
+        Value::Reference(cell) => cell.get(),
+        value => value.clone(),
+    }
+}
+
+fn deref_owned_value_for_read(value: Value) -> Value {
+    match value {
+        Value::Reference(cell) => cell.get(),
+        value => value,
+    }
+}
+
+fn write_value(target: &mut Value, value: Value) {
+    match target {
+        Value::Reference(cell) => cell.set(value),
+        target => *target = value,
+    }
+}
+
+fn ensure_value_reference_cell(value: &mut Value) -> ReferenceCell {
+    match value {
+        Value::Reference(cell) => cell.clone(),
+        value => {
+            let cell = ReferenceCell::new(value.clone());
+            *value = Value::Reference(cell.clone());
+            cell
+        }
+    }
+}
 
 /// VM temporary value.
 ///
@@ -277,7 +529,7 @@ impl From<Value> for TempValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReferenceCell, Slot, TempValue};
+    use super::{Lvalue, LvalueKind, ReferenceCell, Slot, TempValue};
     use crate::{ArrayKey, PhpArray, Value};
 
     #[test]
@@ -317,6 +569,7 @@ mod tests {
 
         assert_eq!(left.read(), Value::Int(3));
         assert_eq!(right.read(), Value::Int(3));
+        assert!(left.aliases(&right));
     }
 
     #[test]
@@ -335,6 +588,47 @@ mod tests {
 
         assert_eq!(original.read(), Value::Int(3));
         assert_eq!(alias.read(), Value::Int(3));
+        assert!(original.aliases(&alias));
+    }
+
+    #[test]
+    fn lvalue_slot_write_bind_and_unset_preserve_alias_model() {
+        let mut left = Slot::null();
+        let mut right = Slot::value(Value::Int(1));
+        let cell = Lvalue::slot(&mut right, LvalueKind::LocalVariable)
+            .ensure_reference_cell()
+            .expect("reference cell");
+
+        Lvalue::slot(&mut left, LvalueKind::LocalVariable)
+            .bind_reference_cell(cell)
+            .expect("bind reference");
+        Lvalue::slot(&mut left, LvalueKind::LocalVariable)
+            .write_value(Value::Int(9))
+            .expect("write through lvalue");
+
+        assert_eq!(right.read(), Value::Int(9));
+        assert!(left.aliases(&right));
+
+        Lvalue::slot(&mut left, LvalueKind::LocalVariable)
+            .unset()
+            .expect("unset lvalue");
+        assert_eq!(left.read(), Value::Uninitialized);
+        assert_eq!(right.read(), Value::Int(9));
+    }
+
+    #[test]
+    fn lvalue_array_element_converts_to_reference_cell() {
+        let mut value = Value::Int(1);
+        let cell = Lvalue::value(&mut value, LvalueKind::ArrayElement)
+            .ensure_reference_cell()
+            .expect("reference cell");
+
+        cell.set(Value::Int(4));
+
+        assert_eq!(
+            Lvalue::value(&mut value, LvalueKind::ArrayElement).read_value(),
+            Value::Int(4)
+        );
     }
 
     #[test]

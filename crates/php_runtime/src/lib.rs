@@ -54,6 +54,7 @@ pub mod api {
         ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary,
         PhpArrayKind, PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, PhpArrayShapeKind,
         PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata,
+        PhpArrayWriteIntent,
     };
     pub use crate::autoload::AutoloadRegistry;
     pub use crate::builtins::{
@@ -110,7 +111,10 @@ pub mod api {
         PREG_UNMATCHED_AS_NULL, PcreCache,
     };
     pub use crate::phar::{PharArchive, PharEntry, PharError, PharUri};
-    pub use crate::reference::{ReferenceCell, ReferencePlaceholder, Slot, TempValue, ValueSlot};
+    pub use crate::reference::{
+        Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
+        ValueSlot,
+    };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
         StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamWrapperRegistry,
@@ -176,7 +180,8 @@ pub mod experimental {
 pub use array::{
     ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
     PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, PhpArrayShapeKind,
-    PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata, WeakArrayHandle,
+    PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata, PhpArrayWriteIntent,
+    WeakArrayHandle,
 };
 pub use autoload::AutoloadRegistry;
 pub use builtins::{
@@ -244,7 +249,8 @@ pub use pcre::{
 };
 pub use phar::{PharArchive, PharEntry, PharError, PharUri};
 pub use reference::{
-    ReferenceCell, ReferencePlaceholder, Slot, TempValue, ValueSlot, WeakReferenceHandle,
+    Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
+    ValueSlot, WeakReferenceHandle,
 };
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,

@@ -1,6 +1,6 @@
 //! Runtime global-symbol table storage for CLI execution.
 
-use crate::{ArrayKey, PhpArray, PhpString, ReferenceCell, Value};
+use crate::{ArrayKey, Lvalue, LvalueKind, PhpArray, PhpString, ReferenceCell, Value};
 use std::collections::BTreeMap;
 
 /// Shared storage for PHP global variables and superglobals.
@@ -34,7 +34,9 @@ impl GlobalSymbolTable {
     /// Writes through a global slot, creating it if necessary.
     pub fn set(&mut self, name: impl Into<String>, value: Value) {
         let slot = self.ensure_slot(name, Value::Uninitialized);
-        slot.set(value);
+        Lvalue::cell(slot, LvalueKind::GlobalVariable)
+            .write_value(value)
+            .expect("global variable lvalue writes are supported");
     }
 
     /// Reads an effective global value.

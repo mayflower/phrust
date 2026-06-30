@@ -2,7 +2,7 @@
 
 use php_ir::IrSpan;
 use php_ir::ids::{FunctionId, LocalId, RegId};
-use php_runtime::{ReferenceCell, Slot, TempValue, Value};
+use php_runtime::{Lvalue, LvalueKind, ReferenceCell, Slot, TempValue, Value};
 
 /// Register storage with checked accessors.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,8 +70,9 @@ impl LocalFile {
         let Some(slot) = self.locals.get_mut(id.index()) else {
             return Err(format!("invalid local local:{}", id.raw()));
         };
-        slot.write(value);
-        Ok(())
+        Lvalue::slot(slot, LvalueKind::LocalVariable)
+            .write_value(value)
+            .map_err(|error| error.to_string())
     }
 
     /// Unsets a local name without writing through a referenced alias cell.
@@ -79,8 +80,9 @@ impl LocalFile {
         let Some(slot) = self.locals.get_mut(id.index()) else {
             return Err(format!("invalid local local:{}", id.raw()));
         };
-        *slot = Slot::uninitialized();
-        Ok(())
+        Lvalue::slot(slot, LvalueKind::LocalVariable)
+            .unset()
+            .map_err(|error| error.to_string())
     }
 
     /// Binds `target` to the same reference cell as `source`.
@@ -94,13 +96,16 @@ impl LocalFile {
         if source_slot.is_uninitialized() {
             source_slot.write(Value::Null);
         }
-        let cell: ReferenceCell = source_slot.ensure_reference_cell();
+        let cell: ReferenceCell = Lvalue::slot(source_slot, LvalueKind::LocalVariable)
+            .ensure_reference_cell()
+            .map_err(|error| error.to_string())?;
         let target_slot = self
             .locals
             .get_mut(target.index())
             .expect("target bounds checked");
-        target_slot.bind_reference(cell);
-        Ok(())
+        Lvalue::slot(target_slot, LvalueKind::LocalVariable)
+            .bind_reference_cell(cell)
+            .map_err(|error| error.to_string())
     }
 
     /// Converts a local to a reference cell and returns that shared cell.
@@ -108,7 +113,9 @@ impl LocalFile {
         let Some(slot) = self.locals.get_mut(id.index()) else {
             return Err(format!("invalid local local:{}", id.raw()));
         };
-        Ok(slot.ensure_reference_cell())
+        Lvalue::slot(slot, LvalueKind::LocalVariable)
+            .ensure_reference_cell()
+            .map_err(|error| error.to_string())
     }
 
     /// Binds a local to an existing reference cell.
@@ -116,8 +123,9 @@ impl LocalFile {
         let Some(slot) = self.locals.get_mut(id.index()) else {
             return Err(format!("invalid local local:{}", id.raw()));
         };
-        slot.bind_reference(cell);
-        Ok(())
+        Lvalue::slot(slot, LvalueKind::LocalVariable)
+            .bind_reference_cell(cell)
+            .map_err(|error| error.to_string())
     }
 }
 

@@ -211,6 +211,31 @@ pub enum PhpArrayPackedIntReductionError {
     Overflow,
 }
 
+/// PHP-visible reason an array is being prepared for mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhpArrayWriteIntent {
+    VariableWrite,
+    NestedDimensionWrite,
+    Append,
+    BindReferenceElement,
+    Remove,
+    PointerMutation,
+}
+
+impl PhpArrayWriteIntent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VariableWrite => "variable_write",
+            Self::NestedDimensionWrite => "nested_dimension_write",
+            Self::Append => "append",
+            Self::BindReferenceElement => "bind_reference_element",
+            Self::Remove => "remove",
+            Self::PointerMutation => "pointer_mutation",
+        }
+    }
+}
+
 /// One ordered array slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayEntry {
@@ -730,13 +755,23 @@ impl PhpArray {
 
     /// Ensures this array has unique storage before mutation.
     pub fn separate_for_write(&mut self) {
-        let _ = self.storage_mut();
+        let _ = self.storage_mut_for(PhpArrayWriteIntent::VariableWrite);
+    }
+
+    /// Central copy-on-write preparation point for PHP array mutations.
+    pub fn prepare_for_write(&mut self, intent: PhpArrayWriteIntent) {
+        let _ = self.storage_mut_for(intent);
     }
 
     /// Inserts or overwrites a key. Existing-key overwrites preserve insertion
     /// order.
     pub fn insert(&mut self, key: ArrayKey, value: Value) -> Option<Value> {
-        let storage = self.storage_mut();
+        let intent = if matches!(value, Value::Reference(_)) {
+            PhpArrayWriteIntent::BindReferenceElement
+        } else {
+            PhpArrayWriteIntent::NestedDimensionWrite
+        };
+        let storage = self.storage_mut_for(intent);
         bump_append_key(storage, &key);
         if let Some(index) = storage.entries().iter().position(|entry| entry.key == key) {
             bump_mutation_epoch(storage);
@@ -761,7 +796,12 @@ impl PhpArray {
 
     /// Appends with the next integer key.
     pub fn append(&mut self, value: Value) -> ArrayKey {
-        let storage = self.storage_mut();
+        let intent = if matches!(value, Value::Reference(_)) {
+            PhpArrayWriteIntent::BindReferenceElement
+        } else {
+            PhpArrayWriteIntent::Append
+        };
+        let storage = self.storage_mut_for(intent);
         let key = ArrayKey::Int(storage.next_append_key().unwrap_or(0));
         let old_len = storage.len();
         let remains_packed =
@@ -808,7 +848,7 @@ impl PhpArray {
 
     /// Returns a mutable value by normalized key without exposing storage.
     pub fn get_mut(&mut self, key: &ArrayKey) -> Option<&mut Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::NestedDimensionWrite);
         if let Some(index) = storage.entries().iter().position(|entry| &entry.key == key) {
             bump_mutation_epoch(storage);
             return Some(&mut storage.entries_mut()[index].value);
@@ -818,7 +858,7 @@ impl PhpArray {
 
     /// Removes a value by normalized key.
     pub fn remove(&mut self, key: &ArrayKey) -> Option<Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::Remove);
         storage
             .entries()
             .iter()
@@ -848,7 +888,8 @@ impl PhpArray {
         if let ArrayKey::Int(key) = last_key
             && previous_next == Some(key.saturating_add(1))
         {
-            self.storage_mut().set_next_append_key(Some(key));
+            self.storage_mut_for(PhpArrayWriteIntent::PointerMutation)
+                .set_next_append_key(Some(key));
         }
         value
     }
@@ -875,7 +916,7 @@ impl PhpArray {
 
     /// Moves the internal pointer to the first element.
     pub fn reset_pointer(&mut self) -> Option<Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::PointerMutation);
         if storage.is_empty() {
             storage.set_internal_pointer(None);
             return None;
@@ -886,7 +927,7 @@ impl PhpArray {
 
     /// Moves the internal pointer to the last element.
     pub fn end_pointer(&mut self) -> Option<Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::PointerMutation);
         let last = storage.len().checked_sub(1)?;
         storage.set_internal_pointer(Some(last));
         storage.entries().get(last).map(ArrayEntry::value).cloned()
@@ -894,7 +935,7 @@ impl PhpArray {
 
     /// Advances the internal pointer by one element.
     pub fn next_pointer(&mut self) -> Option<Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::PointerMutation);
         let current = storage.internal_pointer()?;
         let next = current.saturating_add(1);
         if next >= storage.len() {
@@ -907,7 +948,7 @@ impl PhpArray {
 
     /// Moves the internal pointer one element backwards.
     pub fn prev_pointer(&mut self) -> Option<Value> {
-        let storage = self.storage_mut();
+        let storage = self.storage_mut_for(PhpArrayWriteIntent::PointerMutation);
         let Some(current) = storage.internal_pointer() else {
             let last = storage.len().checked_sub(1)?;
             storage.set_internal_pointer(Some(last));
@@ -974,7 +1015,7 @@ impl PhpArray {
             .flatten()
     }
 
-    fn storage_mut(&mut self) -> &mut ArrayStorage {
+    fn storage_mut_for(&mut self, _intent: PhpArrayWriteIntent) -> &mut ArrayStorage {
         if self.is_shared() {
             crate::layout_stats::record_cow_separation();
         }
