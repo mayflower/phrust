@@ -160,7 +160,9 @@ fixtures:
 - `php://memory`: `php-memory-stream.phpt` and `stream-seek-contents.phpt`
 - `php://temp`: `php-temp-stream.phpt`
 - `feof`, `ftell`, `fseek`, `rewind`, and `stream_get_contents`:
-  `stream-seek-contents.phpt`
+  `stream-seek-contents.phpt`; the selected fixture covers `SEEK_SET`,
+  `SEEK_CUR`, `SEEK_END`, invalid negative targets, and invalid `whence`
+  values
 - `stream_get_meta_data`: `local-file-resource.phpt`,
   `php-memory-stream.phpt`, and `php-temp-stream.phpt`
 

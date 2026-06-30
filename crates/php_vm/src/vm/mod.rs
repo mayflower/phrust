@@ -47580,6 +47580,9 @@ fn execute_builtin_entry(
     );
     context.set_include_path(include_path);
     context.set_ini_registry(state.ini.clone());
+    if let php_runtime::RuntimeRequestMode::Http(request) = &runtime_context.request_mode {
+        context.set_php_input(request.raw_body.clone());
+    }
     context.set_default_timezone(if state.default_timezone.is_empty() {
         php_runtime::datetime::DEFAULT_TIMEZONE.to_owned()
     } else {
@@ -53894,6 +53897,29 @@ good"
     }
 
     #[test]
+    fn php_input_stream_reads_http_request_body_inside_vm_builtins() {
+        let mut request = php_runtime::RuntimeHttpRequestContext::new(
+            "POST",
+            "127.0.0.1:18080",
+            "/submit.php",
+            "/submit.php",
+            "/private/tmp/phrust-submit/submit.php",
+            "/private/tmp/phrust-submit",
+        );
+        request.raw_body = b"raw=hello&n=2".to_vec();
+        let result = execute_source_with_options(
+            "<?php echo file_get_contents('php://input');",
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_http(request),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"raw=hello&n=2");
+    }
+
+    #[test]
     fn process_surface_is_disabled_by_default_without_crashing() {
         let result = execute_source(
             "<?php
@@ -56442,6 +56468,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             "{}",
             readonly.output.to_string_lossy()
         );
+        assert!(readonly.output.as_bytes().starts_with(b"1"));
 
         let static_property = execute_source(
             "<?php class C { public static int $count; public static $name = 'x'; } C::$count = 2; echo C::$count, '|', C::$name;",

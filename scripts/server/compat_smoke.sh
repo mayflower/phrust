@@ -4,11 +4,11 @@ set -euo pipefail
 section="${1:-all}"
 
 case "$section" in
-  input|upload|cookie|session|output-buffer|include|static|all)
+  input|upload|cookie|session|session-persistence|output-buffer|include|static|headers|php-input|stream-output|filesystem-cwd|deadline|cache-invalidation|all)
     ;;
   *)
     printf '[fail] unknown server compat smoke section: %s\n' "$section"
-    printf '%s\n' 'usage: scripts/server/compat_smoke.sh [input|upload|cookie|session|output-buffer|include|static|all]'
+    printf '%s\n' 'usage: scripts/server/compat_smoke.sh [input|upload|cookie|session|session-persistence|output-buffer|include|static|headers|php-input|stream-output|filesystem-cwd|deadline|cache-invalidation|all]'
     exit 2
     ;;
 esac
@@ -33,6 +33,7 @@ cleanup() {
     wait "$server_pid" >/dev/null 2>&1 || true
   fi
   rm -f fixtures/server/apps/compat/public/moved-upload.txt
+  rm -rf fixtures/server/apps/compat/public/cwd-fixture
   rm -rf "$session_dir"
   rm -f "$log_file"
 }
@@ -43,6 +44,7 @@ trap cleanup EXIT
   --docroot fixtures/server/apps/compat/public \
   --front-controller fixtures/server/apps/compat/public/index.php \
   --session-save-path "$session_dir" \
+  --enable-cache-clear-endpoint \
   >"$log_file" 2>&1 &
 server_pid="$!"
 
@@ -166,6 +168,36 @@ run_cookie() {
   printf '%s\n' '[ok] server compat cookie passed'
 }
 
+run_headers() {
+  local headers_file
+  local body_file
+  headers_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-headers.XXXXXX")"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-headers-body.XXXXXX")"
+  curl -g -fsS -D "$headers_file" -o "$body_file" "http://$address/headers.php"
+  local actual
+  actual="$(cat "$body_file")"
+  local expected=$'X-Compat: beta\n201\nnot-sent'
+  if [[ "$actual" != "$expected" ]]; then
+    printf '[fail] headers expected %q got %q\n' "$expected" "$actual"
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  local normalized_headers
+  normalized_headers="$(tr -d '\r' <"$headers_file")"
+  rm -f "$headers_file" "$body_file"
+  if ! grep -q '^HTTP/1.1 201 Created$' <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] headers response did not use status 201'
+    printf '%s\n' "$normalized_headers"
+    exit 1
+  fi
+  if ! grep -Fiqx 'X-Compat: beta' <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] headers response missing X-Compat header'
+    printf '%s\n' "$normalized_headers"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat headers passed'
+}
+
 run_session() {
   local headers_file
   local body_file
@@ -246,6 +278,33 @@ run_session() {
   printf '%s\n' '[ok] server compat session passed'
 }
 
+run_php_input() {
+  local actual
+  actual="$(
+    curl -g -fsS \
+      -X POST \
+      -H 'Content-Type: text/plain' \
+      --data-binary 'raw=hello&n=2' \
+      "http://$address/php-input.php"
+  )"
+  local expected=$'len=13\nbody=raw=hello&n=2\npost-count=0'
+  if [[ "$actual" != "$expected" ]]; then
+    printf '[fail] php-input expected %q got %q\n' "$expected" "$actual"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat php-input passed'
+}
+
+run_stream_output() {
+  assert_body '/stream-output.php' 'prefix|stdout|memory'
+  printf '%s\n' '[ok] server compat stream-output passed'
+}
+
+run_filesystem_cwd() {
+  assert_body '/filesystem-cwd.php' $'changed=yes\nbase-restored=yes\ncontent=from-cwd'
+  printf '%s\n' '[ok] server compat filesystem-cwd passed'
+}
+
 run_output_buffer() {
   assert_body \
     '/output-buffer.php' \
@@ -256,6 +315,66 @@ run_output_buffer() {
 run_include() {
   assert_body '/include-entry.php' 'compat include helper'
   printf '%s\n' '[ok] server compat include passed'
+}
+
+run_cache_invalidation() {
+  local clear_body
+  clear_body="$(curl -g -fsS -X POST "http://$address/__phrust/cache/clear")"
+  if [[ "$clear_body" != 'cache cleared' ]]; then
+    printf '[fail] cache-invalidation expected %q got %q\n' 'cache cleared' "$clear_body"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat cache-invalidation passed'
+}
+
+run_deadline() {
+  local deadline_log
+  local deadline_pid=""
+  local deadline_address=""
+  deadline_log="$(mktemp "${TMPDIR:-/tmp}/phrust-server-deadline-log.XXXXXX")"
+  "${CARGO_TARGET_DIR:-target}/debug/phrust-server" \
+    --listen 127.0.0.1:0 \
+    --docroot fixtures/server/apps/compat/public \
+    --max-execution-ms 1 \
+    >"$deadline_log" 2>&1 &
+  deadline_pid="$!"
+  for _ in {1..100}; do
+    deadline_address="$(sed -n 's/^listening http:\/\///p' "$deadline_log" | tail -n 1)"
+    if [[ -n "$deadline_address" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ -z "$deadline_address" ]]; then
+    printf '%s\n' '[fail] deadline server did not print listening address'
+    cat "$deadline_log"
+    kill "$deadline_pid" >/dev/null 2>&1 || true
+    wait "$deadline_pid" >/dev/null 2>&1 || true
+    rm -f "$deadline_log"
+    exit 1
+  fi
+  local headers_file
+  local body_file
+  headers_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-deadline-headers.XXXXXX")"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/phrust-server-deadline-body.XXXXXX")"
+  curl -g -sS -D "$headers_file" -o "$body_file" "http://$deadline_address/deadline.php"
+  local normalized_headers
+  normalized_headers="$(tr -d '\r' <"$headers_file")"
+  local actual
+  actual="$(cat "$body_file")"
+  kill "$deadline_pid" >/dev/null 2>&1 || true
+  wait "$deadline_pid" >/dev/null 2>&1 || true
+  rm -f "$deadline_log" "$headers_file" "$body_file"
+  if ! grep -q '^HTTP/1.1 504 Gateway Timeout$' <<<"$normalized_headers"; then
+    printf '%s\n' '[fail] deadline response did not use status 504'
+    printf '%s\n' "$normalized_headers"
+    exit 1
+  fi
+  if [[ "$actual" != 'php execution timeout' ]]; then
+    printf '[fail] deadline expected %q got %q\n' 'php execution timeout' "$actual"
+    exit 1
+  fi
+  printf '%s\n' '[ok] server compat deadline passed'
 }
 
 case "$section" in
@@ -274,11 +393,32 @@ case "$section" in
   session)
     run_session
     ;;
+  session-persistence)
+    run_session
+    ;;
   output-buffer)
     run_output_buffer
     ;;
   include)
     run_include
+    ;;
+  headers)
+    run_headers
+    ;;
+  php-input)
+    run_php_input
+    ;;
+  stream-output)
+    run_stream_output
+    ;;
+  filesystem-cwd)
+    run_filesystem_cwd
+    ;;
+  deadline)
+    run_deadline
+    ;;
+  cache-invalidation)
+    run_cache_invalidation
     ;;
   all)
     run_static
@@ -288,5 +428,11 @@ case "$section" in
     run_session
     run_output_buffer
     run_include
+    run_headers
+    run_php_input
+    run_stream_output
+    run_filesystem_cwd
+    run_deadline
+    run_cache_invalidation
     ;;
 esac

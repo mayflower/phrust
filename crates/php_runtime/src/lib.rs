@@ -122,7 +122,8 @@ pub mod api {
     };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
-        StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamWrapperRegistry,
+        StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamSeekWhence,
+        StreamWrapperRegistry,
     };
     pub use crate::serialization::{
         SerializationError, UnserializeOptions, serialize, unserialize,
@@ -263,7 +264,8 @@ pub use reference::{
 };
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
-    StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamWrapperRegistry,
+    StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamSeekWhence,
+    StreamWrapperRegistry,
 };
 pub use serialization::{
     SerializationError, UnserializeOptions, serialize, serialize_object_properties, unserialize,

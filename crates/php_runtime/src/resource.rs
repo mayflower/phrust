@@ -55,6 +55,17 @@ pub struct StreamFlags {
     pub seekable: bool,
 }
 
+/// Seek origin for PHP stream cursor movement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSeekWhence {
+    /// Seek from the beginning of the stream.
+    Set,
+    /// Seek from the current stream cursor.
+    Current,
+    /// Seek from the end of the stream buffer.
+    End,
+}
+
 impl StreamFlags {
     /// Creates stream flags.
     #[must_use]
@@ -571,6 +582,11 @@ impl ResourceRef {
 
     /// Moves the stream cursor to an absolute byte offset.
     pub fn seek(&self, offset: usize) -> Result<(), StreamOpenError> {
+        self.seek_from(offset as i64, StreamSeekWhence::Set)
+    }
+
+    /// Moves the stream cursor relative to a PHP seek origin.
+    pub fn seek_from(&self, offset: i64, whence: StreamSeekWhence) -> Result<(), StreamOpenError> {
         let mut state = self.0.borrow_mut();
         if state.kind == ResourceKind::Closed {
             return Err(StreamOpenError::new(
@@ -585,10 +601,39 @@ impl ResourceRef {
             ));
         }
         match &mut state.data {
-            StreamData::Memory { cursor, .. }
-            | StreamData::Stdio { cursor, .. }
-            | StreamData::File { cursor, .. }
-            | StreamData::GzipFile { cursor, .. } => *cursor = offset,
+            StreamData::Memory { buffer, cursor }
+            | StreamData::Stdio { buffer, cursor }
+            | StreamData::File { buffer, cursor, .. }
+            | StreamData::GzipFile { buffer, cursor, .. } => {
+                let base = match whence {
+                    StreamSeekWhence::Set => 0_i64,
+                    StreamSeekWhence::Current => (*cursor).try_into().map_err(|_| {
+                        StreamOpenError::new(
+                            "E_PHP_RUNTIME_STREAM_SEEK",
+                            "stream cursor is outside supported range",
+                        )
+                    })?,
+                    StreamSeekWhence::End => buffer.len().try_into().map_err(|_| {
+                        StreamOpenError::new(
+                            "E_PHP_RUNTIME_STREAM_SEEK",
+                            "stream length is outside supported range",
+                        )
+                    })?,
+                };
+                let Some(target) = base.checked_add(offset) else {
+                    return Err(StreamOpenError::new(
+                        "E_PHP_RUNTIME_STREAM_SEEK",
+                        "stream seek offset overflowed",
+                    ));
+                };
+                if target < 0 {
+                    return Err(StreamOpenError::new(
+                        "E_PHP_RUNTIME_STREAM_SEEK",
+                        "stream seek offset is negative",
+                    ));
+                }
+                *cursor = target as usize;
+            }
             StreamData::Directory { .. } | StreamData::Context { .. } | StreamData::FileInfo => {
                 return Err(StreamOpenError::new(
                     "E_PHP_RUNTIME_STREAM_NOT_SEEKABLE",
@@ -1226,7 +1271,7 @@ fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
 mod tests {
     use super::{
         FilesystemCapabilities, ResourceKind, ResourceTable, StreamFlags, StreamMetadata,
-        StreamWrapperRegistry,
+        StreamSeekWhence, StreamWrapperRegistry,
     };
     use std::path::Path;
 
@@ -1308,6 +1353,42 @@ mod tests {
 
         assert_eq!(resource.read_to_end().expect("read input"), b"name=phrust");
         assert_eq!(resource.flags(), StreamFlags::new(true, false, true));
+    }
+
+    #[test]
+    fn stream_seek_supports_set_current_and_end_origins() {
+        let registry = StreamWrapperRegistry::new();
+        let capabilities = FilesystemCapabilities::none();
+        let mut table = ResourceTable::new();
+        let resource = registry
+            .open(
+                &mut table,
+                "php://memory",
+                "w+",
+                Path::new("."),
+                &capabilities,
+                &[],
+            )
+            .expect("php memory opens");
+
+        resource.write_bytes(b"abcdef").expect("write stream");
+        resource
+            .seek_from(-2, StreamSeekWhence::End)
+            .expect("seek end");
+        assert_eq!(resource.tell().expect("tell after end seek"), 4);
+        assert_eq!(resource.read_bytes(1).expect("read after end seek"), b"e");
+
+        resource
+            .seek_from(-3, StreamSeekWhence::Current)
+            .expect("seek current");
+        assert_eq!(resource.tell().expect("tell after current seek"), 2);
+        assert!(resource.seek_from(-1, StreamSeekWhence::Set).is_err());
+        assert_eq!(resource.tell().expect("failed seek does not move"), 2);
+
+        resource
+            .seek_from(10, StreamSeekWhence::End)
+            .expect("seek beyond end");
+        assert_eq!(resource.tell().expect("tell after beyond end"), 16);
     }
 
     #[test]

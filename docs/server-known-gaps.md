@@ -9,7 +9,10 @@ Implemented surface:
 
 - `server-compat-smoke all` is strict for static files, nested URL-encoded
   input, bounded multipart uploads, `$_FILES`, upload movement builtins,
-  cookies, persistent sessions, output-buffer basics, and include execution.
+  cookies, persistent sessions, output-buffer basics, include execution,
+  response headers/status, `php://input`, stream output, request-local
+  filesystem CWD behavior, cooperative execution deadlines, and loopback cache
+  invalidation.
 - The server has cooperative PHP execution deadlines, process-local include and
   entry-script caches, bounded/preloaded script-cache controls, loopback-only
   cache clearing, streaming static files, validators, byte ranges,

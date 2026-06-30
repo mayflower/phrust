@@ -58,14 +58,23 @@ can run named sections:
 - `upload`
 - `cookie`
 - `session`
+- `session-persistence`
 - `output-buffer`
 - `include`
+- `headers`
+- `php-input`
+- `stream-output`
+- `filesystem-cwd`
+- `deadline`
+- `cache-invalidation`
 - `all`
 
 All listed sections are strict. `all` runs the same fixture server once and
 executes static serving, nested URL-encoded input, bounded multipart uploads,
-upload movement, cookies, persistent sessions, output-buffer basics, and
-include execution.
+upload movement, cookies, persistent sessions, output-buffer basics, include
+execution, response headers/status, `php://input`, stream output,
+request-local filesystem CWD behavior, a focused execution-deadline timeout
+check, and loopback cache invalidation.
 
 ## Persistent Web Sessions
 

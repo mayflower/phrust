@@ -58,8 +58,8 @@ Remote stream wrappers remain disabled by default. `php://memory` and
 ## Known Gaps
 
 The MVP returns PHP-style failure values (`false` or `-1`) but does not yet emit
-byte-perfect warning text for every failed operation. `fseek` currently supports
-absolute offsets only; the optional `whence` argument is accepted for arity
-compatibility but not modeled yet. `tmpfile` creates a deterministic temporary
-file under the first allowed root and does not yet implement PHP's automatic
-unlink-on-close lifetime.
+byte-perfect warning text for every failed operation. `fseek` supports
+`SEEK_SET`, `SEEK_CUR`, and `SEEK_END`, including PHP-style `-1` returns for
+invalid negative targets and invalid `whence` values without moving the cursor.
+`tmpfile` creates a deterministic temporary file under the first allowed root
+and does not yet implement PHP's automatic unlink-on-close lifetime.

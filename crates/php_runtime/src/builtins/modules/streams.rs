@@ -5,7 +5,7 @@ use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     RuntimeSourceSpan,
 };
-use crate::{ArrayKey, ResourceRef, StreamWrapperRegistry, Value};
+use crate::{ArrayKey, ResourceRef, StreamSeekWhence, StreamWrapperRegistry, Value};
 use std::path::Path;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
@@ -296,8 +296,21 @@ pub(in crate::builtins::modules) fn builtin_fseek(
     let Some(resource) = resource_arg(&args[0]) else {
         return Ok(Value::Int(-1));
     };
-    let offset = int_arg("fseek", &args[1])?.max(0) as usize;
-    Ok(if resource.seek(offset).is_ok() {
+    let offset = int_arg("fseek", &args[1])?;
+    let whence = match args
+        .get(2)
+        .map(|value| int_arg("fseek", value))
+        .transpose()?
+    {
+        None | Some(0) => Some(StreamSeekWhence::Set),
+        Some(1) => Some(StreamSeekWhence::Current),
+        Some(2) => Some(StreamSeekWhence::End),
+        Some(_) => None,
+    };
+    let Some(whence) = whence else {
+        return Ok(Value::Int(-1));
+    };
+    Ok(if resource.seek_from(offset, whence).is_ok() {
         Value::Int(0)
     } else {
         Value::Int(-1)
