@@ -75,17 +75,13 @@
         let
           pkgs = import nixpkgs { inherit system; };
           inherit (pkgs) lib;
-          rustcSccacheWrapper = pkgs.writeShellScriptBin "rustc-sccache-wrapper" ''
-            unset CARGO_INCREMENTAL
-            exec ${pkgs.sccache}/bin/sccache "$@"
-          '';
-
           commonPackages = with pkgs; [
             rustc
             cargo
             rustfmt
             clippy
             rust-analyzer
+            llvmPackages.llvm
 
             git
             curl
@@ -152,7 +148,10 @@
             PHP_REF_TAG = "php-8.5.7";
             PHP_REF_REPO = "https://github.com/php/php-src.git";
             RUST_BACKTRACE = "1";
-            RUSTC_WRAPPER = "${rustcSccacheWrapper}/bin/rustc-sccache-wrapper";
+            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+            CARGO_INCREMENTAL = "0";
+            LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
+            LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
             SCCACHE_CACHE_SIZE = "20G";
             CARGO_REGISTRIES_CRATES_IO_PROTOCOL = "sparse";
 

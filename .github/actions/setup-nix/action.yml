@@ -1,5 +1,5 @@
 name: Setup Nix
-description: Install Nix and enable the shared CI cache.
+description: Install Nix for CI jobs.
 
 runs:
   using: composite
@@ -40,6 +40,3 @@ runs:
       with:
         enable_kvm: false
         github_access_token: ${{ github.token }}
-
-    - name: Enable Nix cache
-      uses: DeterminateSystems/magic-nix-cache-action@v10
