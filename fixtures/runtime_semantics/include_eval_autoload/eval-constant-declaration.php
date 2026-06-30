@@ -1,0 +1,3 @@
+<?php
+eval('const EVAL_DECLARED_CONSTANT_FIXTURE = "constant";');
+echo EVAL_DECLARED_CONSTANT_FIXTURE, "|", constant("EVAL_DECLARED_CONSTANT_FIXTURE"), "\n";

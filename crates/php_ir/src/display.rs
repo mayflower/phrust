@@ -419,6 +419,9 @@ fn format_instruction(kind: &InstructionKind) -> String {
         InstructionKind::RegisterConstant { name, value } => {
             format!("register_constant {:?} {}", name, format_operand(value))
         }
+        InstructionKind::DeclareFunction { name, function } => {
+            format!("declare_function {:?} function:{}", name, function.raw())
+        }
         InstructionKind::DeclareClass { name } => {
             format!("declare_class {:?}", name)
         }
@@ -1334,6 +1337,10 @@ mod tests {
             InstructionKind::FetchConst {
                 dst: RegId::new(0),
                 name: "ANSWER".to_string(),
+            },
+            InstructionKind::DeclareFunction {
+                name: "runtime_declared".to_string(),
+                function: FunctionId::new(1),
             },
             InstructionKind::DeclareClass {
                 name: "RuntimeDeclared".to_string(),

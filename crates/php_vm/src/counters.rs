@@ -3924,6 +3924,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::LoadConst { .. } => "load_const",
         InstructionKind::FetchConst { .. } => "fetch_const",
         InstructionKind::RegisterConstant { .. } => "register_constant",
+        InstructionKind::DeclareFunction { .. } => "declare_function",
         InstructionKind::DeclareClass { .. } => "declare_class",
         InstructionKind::Move { .. } => "move",
         InstructionKind::LoadLocal { .. } => "load_local",

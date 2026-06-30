@@ -72,7 +72,7 @@ through the known-gap catalog rather than through non-green source modules:
 | Risk group | Representative IDs | Owner layer |
 | --- | --- | --- |
 | broader Reflection and class metadata APIs | `E_PHP_IR_UNSUPPORTED_REFLECTION` | `php_vm`, `php_runtime::object` |
-| eval function declarations and dynamic declaration edges | `E_PHP_IR_UNSUPPORTED_EVAL`, `E_PHP_VM_EVAL_DECLARATION_GAP` | `php_vm`, `php_semantics` |
+| conditional eval/include function declarations and dynamic declaration edges | `E_PHP_IR_UNSUPPORTED_EVAL`, `E_PHP_VM_CONDITIONAL_FUNCTION_DECLARATION_GAP`, `E_PHP_RUNTIME_CONSTANT_REDECLARATION_WARNING_COMPAT` | `php_vm`, `php_semantics` |
 | full static property, type, readonly, and property-hook matrix | `E_PHP_IR_UNSUPPORTED_STATIC_PROPERTY`, `E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER` | `php_ir`, `php_vm`, `php_runtime::object` |
 | exact fatal text, object formatting, and stack parity outside selected fixtures | `E_PHP_RUNTIME_UNSUPPORTED_THROWABLE_HIERARCHY`, `E_PHP_RUNTIME_VAR_DUMP_FORMAT_MATRIX` | `php_vm`, `php_runtime::error_output`, `php_runtime::object` |
 
@@ -175,12 +175,12 @@ remain, but the current behavior and executable fixtures are now narrowed:
 | `E_PHP_VM_TOO_FEW_ARGS`, `E_PHP_VM_TOO_MANY_ARGS` | Narrowed diagnostics to catchable selected arity objects while leaving exact engine wording and stack formatting open. |
 | `E_PHP_RUNTIME_BUILTIN_ARITY`, `E_PHP_RUNTIME_BUILTIN_TYPE` | Added selected catchable builtin arity/type diagnostic fixtures; full arginfo/coercion matrices remain gaps. |
 | `E_PHP_RUNTIME_CONST_EXPR_MATRIX` | Added selected deferred static-property default evaluation for literal, named-constant, class-constant, and array expressions while keeping the broader constant-expression matrix explicit. |
-| `E_PHP_IR_UNSUPPORTED_EVAL` | Added selected eval class declaration merging; eval function declarations and the broader dynamic declaration matrix remain gaps. |
+| `E_PHP_IR_UNSUPPORTED_EVAL` | Added selected eval function/class/constant declaration merging; remaining dynamic declaration gaps are conditional function body execution and PHP 8.5 duplicate global `const` warning compatibility. |
 | `E_PHP_IR_UNSUPPORTED_REFLECTION` | Added selected interface targets for `ReflectionClass`; the wider Reflection API matrix remains explicit. |
 | `E_PHP_IR_UNSUPPORTED_STATIC_PROPERTY` | Added selected untyped static-property storage with deferred default expression evaluation; typed, readonly, and full initialization validation remain gaps. |
 
 The highest-risk remaining core blockers are broader Reflection/class metadata
-APIs, eval function and dynamic declaration handling, full static
+APIs, conditional function and dynamic declaration compatibility, full static
 property/type/readonly/property-hook validation, and exact fatal/object
 formatting parity outside selected fixtures. They are known gaps rather than
 current selected module failures.

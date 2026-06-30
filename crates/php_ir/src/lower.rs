@@ -243,6 +243,7 @@ pub struct LoweringContext<'a> {
     label_blocks: HashMap<FunctionId, HashMap<String, BlockId>>,
     closure_functions: HashMap<ExprId, FunctionId>,
     function_names: HashMap<FunctionId, String>,
+    conditional_function_declarations: Vec<(TextRange, String, FunctionId)>,
     class_names: HashMap<FunctionId, String>,
     method_names: HashMap<FunctionId, String>,
     source_text: SourceText,
@@ -263,6 +264,7 @@ impl<'a> LoweringContext<'a> {
             label_blocks: HashMap::new(),
             closure_functions: HashMap::new(),
             function_names: HashMap::new(),
+            conditional_function_declarations: Vec::new(),
             class_names: HashMap::new(),
             method_names: HashMap::new(),
             source_text,
@@ -2097,7 +2099,6 @@ impl LoweringContext<'_> {
             .collect::<Vec<_>>();
         let class_constant_initializers = collect_class_constant_initializers(module, &class_likes);
         let class_parents = collect_class_parents(&class_likes);
-        let mut registered_conditional_names = HashSet::new();
         for signature in signatures {
             if signature.kind() != SignatureKind::Function {
                 continue;
@@ -2124,9 +2125,13 @@ impl LoweringContext<'_> {
             self.function_names.insert(function, name.to_string());
             let normalized_name = normalize_function_name(&registered_name);
             let declaration_kind = function_declaration_kind(module, &signature, &normalized_name);
-            if declaration_kind != Some(DeclarationKind::ConditionalFunction)
-                || registered_conditional_names.insert(normalized_name.clone())
-            {
+            if declaration_kind == Some(DeclarationKind::ConditionalFunction) {
+                self.conditional_function_declarations.push((
+                    signature.span(),
+                    normalized_name,
+                    function,
+                ));
+            } else {
                 builder.register_function_name(normalized_name, function);
             }
             builder.set_return_type(function, self.lower_return_type(signature.return_type()));
@@ -3136,6 +3141,20 @@ impl LoweringContext<'_> {
             }
             kind => {
                 let span = self.span_for(SourceMappedId::from(stmt_id));
+                if let Some((name, declared_function)) =
+                    self.conditional_function_declaration_for_span(span)
+                {
+                    builder.emit(
+                        function,
+                        block,
+                        InstructionKind::DeclareFunction {
+                            name,
+                            function: declared_function,
+                        },
+                        span_from_range(self.file, span),
+                    );
+                    return block;
+                }
                 if let Some(name) = conditional_class_declaration_name_for_span(module, span) {
                     builder.emit(
                         function,
@@ -3197,6 +3216,46 @@ impl LoweringContext<'_> {
                 block,
                 InstructionKind::BindGlobal { local, name },
                 span,
+            );
+        }
+        block
+    }
+
+    fn conditional_function_declaration_for_span(
+        &self,
+        span: TextRange,
+    ) -> Option<(String, FunctionId)> {
+        self.conditional_function_declarations
+            .iter()
+            .find(|(declaration_span, _, _)| {
+                range_contains(span, *declaration_span)
+                    || range_contains(*declaration_span, span)
+                    || ranges_overlap(span, *declaration_span)
+            })
+            .map(|(_, name, function)| (name.clone(), *function))
+    }
+
+    fn emit_conditional_function_declarations_for_range(
+        &self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        block: BlockId,
+        span: TextRange,
+    ) -> BlockId {
+        let ir_span = span_from_range(self.file, span);
+        for (_, name, declared_function) in self
+            .conditional_function_declarations
+            .iter()
+            .filter(|(declaration_span, _, _)| range_contains(span, *declaration_span))
+        {
+            builder.emit(
+                function,
+                block,
+                InstructionKind::DeclareFunction {
+                    name: name.clone(),
+                    function: *declared_function,
+                },
+                ir_span,
             );
         }
         block
@@ -3385,6 +3444,13 @@ impl LoweringContext<'_> {
             },
         );
 
+        let then_block = if elseifs.is_empty() && else_body.is_empty() {
+            self.emit_conditional_function_declarations_for_range(
+                builder, function, then_block, range,
+            )
+        } else {
+            then_block
+        };
         let then_end = self.lower_stmt_list(builder, function, then_block, body);
         self.jump_if_open(builder, function, then_end, after_block, span);
 
@@ -14340,8 +14406,7 @@ mod tests {
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
         assert_eq!(result.unit.functions.len(), 3);
-        assert_eq!(result.unit.function_table.len(), 1);
-        assert_eq!(result.unit.function_table[0].name, "branch_dup");
+        assert_eq!(result.unit.function_table.len(), 0);
         assert_eq!(
             result
                 .unit
@@ -14352,7 +14417,21 @@ mod tests {
             2
         );
         let snapshot = result.unit.to_snapshot_text();
-        assert_eq!(snapshot.matches("function_name \"branch_dup\"").count(), 1);
+        assert_eq!(snapshot.matches("function_name \"branch_dup\"").count(), 0);
+    }
+
+    #[test]
+    fn conditional_function_declaration_emits_runtime_declare() {
+        let frontend = analyze_source(
+            "<?php if (true) { function branch_runtime() { return 'yes'; } } echo branch_runtime();",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert_eq!(result.unit.function_table.len(), 0);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("declare_function \"branch_runtime\""));
     }
 
     #[test]

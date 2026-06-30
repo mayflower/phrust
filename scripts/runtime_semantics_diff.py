@@ -44,6 +44,8 @@ CATEGORIES = (
     "gc",
     "includes",
     "include_eval_autoload",
+    "constants",
+    "namespaces",
     "globals",
     "superglobals",
     "variables",

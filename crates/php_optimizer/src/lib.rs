@@ -1041,6 +1041,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
             registers
         }
         InstructionKind::Nop
+        | InstructionKind::DeclareFunction { .. }
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::RegisterConstant { .. }
         | InstructionKind::StoreLocal { .. }
@@ -1362,6 +1363,7 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
         | InstructionKind::FetchConst { .. }
         | InstructionKind::LoadLocal { .. }
         | InstructionKind::LoadLocalQuiet { .. }
+        | InstructionKind::DeclareFunction { .. }
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::BindReference { .. }
         | InstructionKind::BindGlobal { .. }
@@ -1654,6 +1656,7 @@ fn rewrite_instruction_register_operands(
         | InstructionKind::FetchConst { .. }
         | InstructionKind::LoadLocal { .. }
         | InstructionKind::LoadLocalQuiet { .. }
+        | InstructionKind::DeclareFunction { .. }
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::BindReference { .. }
         | InstructionKind::BindGlobal { .. }

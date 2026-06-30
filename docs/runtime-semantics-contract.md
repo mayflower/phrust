@@ -292,13 +292,17 @@ parse and compile failures emit `E_PHP_VM_EVAL_PARSE_ERROR` or
 the same execution state and is bounded by `E_PHP_VM_EVAL_RECURSION_LIMIT` to
 avoid recursive VM panics.
 
-Eval-time function and class declarations are merged into the active request
-dynamic symbol tables for the fixture-covered cases, are available to later
-runtime lookups, can participate in simple inheritance relationships, and keep
-duplicate declaration failures fatal. Eval-generated declarations from
-autoload callbacks are visible to the autoload lookup that triggered them.
-Exact `ParseError` object parity and wider eval scope interactions remain later
-work.
+Eval-time named function, class, and constant declarations merge into the
+request-local runtime symbol tables for fixture-covered top-level eval code,
+are available to later runtime lookups, can participate in simple inheritance
+relationships, and remain visible to the autoload lookup that triggered
+eval-generated declarations. Duplicate eval-declared functions and classes are
+rejected deterministically before they can silently override earlier
+declarations. Conditional function declaration bodies remain
+`E_PHP_VM_CONDITIONAL_FUNCTION_DECLARATION_GAP`, duplicate global `const`
+warning compatibility remains
+`E_PHP_RUNTIME_CONSTANT_REDECLARATION_WARNING_COMPAT`, and exact `ParseError`
+object parity plus wider eval scope interactions remain later work.
 
 ## Autoload MVP
 

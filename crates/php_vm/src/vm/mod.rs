@@ -1042,12 +1042,14 @@ struct DynamicFunctionEntry {
     name: String,
     unit_index: usize,
     function: FunctionId,
+    origin: DeclarationOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct DynamicClassEntry {
     class: php_ir::module::ClassEntry,
     unit_index: usize,
+    origin: DeclarationOrigin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1055,6 +1057,31 @@ struct DynamicConstantEntry {
     name: String,
     unit_index: usize,
     value: ConstId,
+    origin: DeclarationOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclarationKind {
+    Function,
+    ClassLike,
+    GlobalConstant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclarationLoadKind {
+    Include,
+    Eval,
+    Conditional,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeclarationOrigin {
+    source_path: String,
+    line: i64,
+    span: IrSpan,
+    namespace: Option<String>,
+    kind: DeclarationKind,
+    load_kind: DeclarationLoadKind,
 }
 
 enum ClassDependencyValidationFailure {
@@ -9961,12 +9988,32 @@ impl Vm {
                                 );
                             }
                         };
-                        if compiled.lookup_constant(name).is_none()
-                            && !state.user_constants.contains_key(name)
+                        if compiled.lookup_constant(name).is_some()
+                            || state.user_constants.contains_key(name)
+                            || state
+                                .dynamic_constants
+                                .iter()
+                                .any(|entry| entry.name == *name)
                         {
-                            state
-                                .user_constants
-                                .insert(name.clone(), effective_value(&value));
+                            return self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!(
+                                    "E_PHP_VM_CONSTANT_REDECLARATION: Cannot redeclare constant {name}"
+                                ),
+                            );
+                        }
+                        state
+                            .user_constants
+                            .insert(name.clone(), effective_value(&value));
+                        state.bump_lookup_epoch();
+                    }
+                    InstructionKind::DeclareFunction { name, function } => {
+                        if let Err(message) =
+                            declare_runtime_function(compiled, state, name, *function)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
                         }
                     }
                     InstructionKind::DeclareClass { name } => {
@@ -20098,7 +20145,7 @@ impl Vm {
                             state,
                         );
                         if !result.status.is_success() {
-                            if matches!(kind, IncludeKind::Include | IncludeKind::IncludeOnce) {
+                            if include_failure_allows_continuation(*kind, &result) {
                                 diagnostics.extend(result.diagnostics);
                                 if let Err(message) = stack
                                     .current_mut()
@@ -27369,7 +27416,10 @@ impl Vm {
                 entry_instruction_count(included.unit()),
             ));
         }
-        register_dynamic_unit(state, included.clone());
+        if let Err(message) = validate_dynamic_declarations(compiled, state, &included) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+        register_dynamic_unit(state, included.clone(), DeclarationLoadKind::Include);
         let mut shared = shared_locals_from_current_frame(compiled, stack);
         let call = FunctionCall {
             args: Vec::new(),
@@ -27745,6 +27795,7 @@ impl Vm {
                 state
                     .user_constants
                     .insert(constant_name, effective_value(&values[1]));
+                state.bump_lookup_epoch();
                 VmResult::success(output.clone(), Some(Value::Bool(true)))
             }
             "constant" => {
@@ -42996,6 +43047,18 @@ fn include_failure_id(message: &str) -> &str {
         .unwrap_or("E_PHP_VM_INCLUDE_ERROR")
 }
 
+fn include_failure_allows_continuation(kind: IncludeKind, result: &VmResult) -> bool {
+    matches!(kind, IncludeKind::Include | IncludeKind::IncludeOnce)
+        && result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity() == RuntimeSeverity::Warning)
+        && result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity() == RuntimeSeverity::Warning)
+}
+
 #[cold]
 fn emit_include_failure_output(
     output: &mut OutputBuffer,
@@ -43453,7 +43516,11 @@ fn autoload_resolve_method(
     Ok(resolved)
 }
 
-fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) -> usize {
+fn register_dynamic_unit(
+    state: &mut ExecutionState,
+    unit: CompiledUnit,
+    load_kind: DeclarationLoadKind,
+) -> usize {
     let unit_index = state.dynamic_units.len();
     for entry in unit.function_table() {
         if state
@@ -43467,9 +43534,10 @@ fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) -> usiz
             name: entry.name.clone(),
             unit_index,
             function: entry.function,
+            origin: function_declaration_origin(&unit, entry.function, &entry.name, load_kind),
         });
     }
-    register_dynamic_classes(state, unit_index, unit.unit());
+    register_dynamic_classes(state, unit_index, &unit, load_kind);
     for entry in unit.constant_table() {
         if state
             .dynamic_constants
@@ -43482,6 +43550,7 @@ fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) -> usiz
             name: entry.name.clone(),
             unit_index,
             value: entry.value,
+            origin: constant_declaration_origin(&unit, &entry.name, load_kind),
         });
     }
     state.dynamic_units.push(unit);
@@ -43494,18 +43563,21 @@ fn register_dynamic_eval_unit(
     state: &mut ExecutionState,
     unit: CompiledUnit,
 ) -> Result<usize, String> {
-    validate_eval_dynamic_declarations(compiled, state, &unit)?;
-    Ok(register_dynamic_unit(state, unit))
+    validate_dynamic_declarations(compiled, state, &unit)?;
+    Ok(register_dynamic_unit(
+        state,
+        unit,
+        DeclarationLoadKind::Eval,
+    ))
 }
 
-fn validate_eval_dynamic_declarations(
+fn validate_dynamic_declarations(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     unit: &CompiledUnit,
 ) -> Result<(), String> {
     for entry in unit.function_table() {
         if compiled.lookup_function(&entry.name).is_some()
-            || dynamic_function_in_state(state, &entry.name).is_some()
             || BuiltinRegistry::new().contains(&entry.name)
         {
             return Err(format!(
@@ -43513,15 +43585,29 @@ fn validate_eval_dynamic_declarations(
                 entry.name
             ));
         }
+        if let Some(existing) = dynamic_function_entry_in_state(state, &entry.name) {
+            return Err(format!(
+                "E_PHP_VM_FUNCTION_REDECLARATION: Cannot redeclare function {}() previously declared at {}",
+                entry.name,
+                existing.origin.display_site()
+            ));
+        }
     }
     for class in unit.class_table() {
         if is_lowered_internal_interface_skeleton(class) {
             continue;
         }
-        if lookup_class_in_state(compiled, state, &class.name).is_some() {
+        if compiled.lookup_class(&class.name).is_some() {
             return Err(format!(
                 "E_PHP_VM_CLASS_REDECLARATION: Cannot declare class {}, because the name is already in use",
                 class.display_name
+            ));
+        }
+        if let Some(existing) = dynamic_class_entry_in_state(state, &class.name) {
+            return Err(format!(
+                "E_PHP_VM_CLASS_REDECLARATION: Cannot declare class {}, because the name is already in use; previous declaration at {}",
+                class.display_name,
+                existing.origin.display_site()
             ));
         }
     }
@@ -43534,14 +43620,15 @@ fn validate_eval_dynamic_declarations(
                 entry.name
             ));
         }
-        if state
+        if let Some(existing) = state
             .dynamic_constants
             .iter()
-            .any(|existing| existing.name == entry.name)
+            .find(|existing| existing.name == entry.name)
         {
             return Err(format!(
-                "E_PHP_VM_CONSTANT_REDECLARATION: Cannot redeclare constant {}",
-                entry.name
+                "E_PHP_VM_CONSTANT_REDECLARATION: Cannot redeclare constant {} previously declared at {}",
+                entry.name,
+                existing.origin.display_site()
             ));
         }
     }
@@ -43554,6 +43641,11 @@ fn retain_dynamic_closure_unit(state: &mut ExecutionState, unit: CompiledUnit) -
     unit_index
 }
 
+fn dynamic_or_retain_unit_index(state: &mut ExecutionState, compiled: &CompiledUnit) -> usize {
+    dynamic_unit_index_for_compiled(state, compiled)
+        .unwrap_or_else(|| retain_dynamic_closure_unit(state, compiled.clone()))
+}
+
 fn dynamic_unit_index_for_compiled(
     state: &ExecutionState,
     compiled: &CompiledUnit,
@@ -43564,8 +43656,132 @@ fn dynamic_unit_index_for_compiled(
         .rposition(|unit| unit == compiled)
 }
 
-fn register_dynamic_classes(state: &mut ExecutionState, unit_index: usize, unit: &IrUnit) {
-    for class in unit.classes.iter().filter(|class| {
+impl DeclarationOrigin {
+    fn display_site(&self) -> String {
+        let namespace = self
+            .namespace
+            .as_deref()
+            .map_or_else(|| "global".to_string(), ToOwned::to_owned);
+        format!(
+            "{}:{} ({} {:?} {:?} bytes {}..{})",
+            self.source_path,
+            self.line,
+            namespace,
+            self.load_kind,
+            self.kind,
+            self.span.start,
+            self.span.end
+        )
+    }
+}
+
+fn function_declaration_origin(
+    compiled: &CompiledUnit,
+    function: FunctionId,
+    name: &str,
+    load_kind: DeclarationLoadKind,
+) -> DeclarationOrigin {
+    let span = compiled
+        .unit()
+        .functions
+        .get(function.index())
+        .map_or(IrSpan::default(), |function| function.span);
+    declaration_origin(compiled, span, name, DeclarationKind::Function, load_kind)
+}
+
+fn constant_declaration_origin(
+    compiled: &CompiledUnit,
+    name: &str,
+    load_kind: DeclarationLoadKind,
+) -> DeclarationOrigin {
+    let span = compiled
+        .unit()
+        .constant_table
+        .iter()
+        .find(|entry| entry.name == name)
+        .map_or(IrSpan::default(), |entry| entry.span);
+    declaration_origin(
+        compiled,
+        span,
+        name,
+        DeclarationKind::GlobalConstant,
+        load_kind,
+    )
+}
+
+fn declaration_origin(
+    compiled: &CompiledUnit,
+    span: IrSpan,
+    name: &str,
+    kind: DeclarationKind,
+    load_kind: DeclarationLoadKind,
+) -> DeclarationOrigin {
+    let (source_path, line) = source_span_file_line(compiled, span).unwrap_or_else(|| {
+        let source_path = compiled
+            .unit()
+            .files
+            .get(span.file.index())
+            .map_or_else(|| "<unknown>".to_string(), |file| file.path.clone());
+        (source_path, i64::from(span.start))
+    });
+    DeclarationOrigin {
+        source_path,
+        line,
+        span,
+        namespace: declaration_namespace(name),
+        kind,
+        load_kind,
+    }
+}
+
+fn declaration_namespace(name: &str) -> Option<String> {
+    let trimmed = name.trim_start_matches('\\');
+    let (namespace, _) = trimmed.rsplit_once('\\')?;
+    if namespace.is_empty() {
+        None
+    } else {
+        Some(namespace.to_owned())
+    }
+}
+
+fn declare_runtime_function(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    function_name: &str,
+    function: FunctionId,
+) -> Result<(), String> {
+    let normalized = normalize_function_name(function_name);
+    if compiled.lookup_function(&normalized).is_some()
+        || dynamic_function_in_state(state, &normalized).is_some()
+        || BuiltinRegistry::new().contains(&normalized)
+    {
+        return Err(format!(
+            "E_PHP_VM_FUNCTION_REDECLARATION: Cannot redeclare function {normalized}()"
+        ));
+    }
+    let unit_index = dynamic_or_retain_unit_index(state, compiled);
+    state.dynamic_functions.push(DynamicFunctionEntry {
+        name: normalized,
+        unit_index,
+        function,
+        origin: function_declaration_origin(
+            compiled,
+            function,
+            function_name,
+            DeclarationLoadKind::Conditional,
+        ),
+    });
+    state.bump_lookup_epoch();
+    Ok(())
+}
+
+fn register_dynamic_classes(
+    state: &mut ExecutionState,
+    unit_index: usize,
+    compiled: &CompiledUnit,
+    load_kind: DeclarationLoadKind,
+) {
+    for class in compiled.unit().classes.iter().filter(|class| {
         class.span != php_ir::source_map::IrSpan::default() && !class.flags.is_conditional
     }) {
         let normalized = normalize_class_name(&class.name);
@@ -43579,6 +43795,13 @@ fn register_dynamic_classes(state: &mut ExecutionState, unit_index: usize, unit:
         state.dynamic_classes.push(DynamicClassEntry {
             class: class.clone(),
             unit_index,
+            origin: declaration_origin(
+                compiled,
+                class.span,
+                &class.name,
+                DeclarationKind::ClassLike,
+                load_kind,
+            ),
         });
     }
 }
@@ -43627,9 +43850,17 @@ fn declare_runtime_class(
         ));
     };
     let unit_index = dynamic_unit_index_for_compiled(state, compiled).unwrap_or(usize::MAX);
-    state
-        .dynamic_classes
-        .push(DynamicClassEntry { class, unit_index });
+    state.dynamic_classes.push(DynamicClassEntry {
+        origin: declaration_origin(
+            compiled,
+            class.span,
+            &class.name,
+            DeclarationKind::ClassLike,
+            DeclarationLoadKind::Conditional,
+        ),
+        class,
+        unit_index,
+    });
     state.bump_class_table_epoch();
     Ok(())
 }
@@ -43643,16 +43874,34 @@ fn dynamic_function_in_state(
     Some((owner, function))
 }
 
+fn dynamic_function_entry_in_state<'a>(
+    state: &'a ExecutionState,
+    function_name: &str,
+) -> Option<&'a DynamicFunctionEntry> {
+    let normalized = normalize_function_name(function_name);
+    state
+        .dynamic_functions
+        .iter()
+        .find(|entry| entry.name == normalized)
+}
+
 fn dynamic_function_target_in_state(
     state: &ExecutionState,
     function_name: &str,
 ) -> Option<(usize, FunctionId)> {
-    let normalized = normalize_function_name(function_name);
-    let entry = state
-        .dynamic_functions
-        .iter()
-        .find(|entry| entry.name == normalized)?;
+    let entry = dynamic_function_entry_in_state(state, function_name)?;
     Some((entry.unit_index, entry.function))
+}
+
+fn dynamic_class_entry_in_state<'a>(
+    state: &'a ExecutionState,
+    class_name: &str,
+) -> Option<&'a DynamicClassEntry> {
+    let normalized = normalize_class_name(class_name);
+    state
+        .dynamic_classes
+        .iter()
+        .find(|entry| normalize_class_name(&entry.class.name) == normalized)
 }
 
 fn closure_owner_for_function(

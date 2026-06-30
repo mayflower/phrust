@@ -134,7 +134,10 @@ Prompt 1.2 started with eval/autoload/declaration visibility because it has
 the largest direct blocker cluster and unlocks later constant and reflection
 cases. The initial concrete starting points were:
 
-- `constants_basic_006.phpt`: `E_PHP_VM_EVAL_DECLARATION_GAP`
+- `constants_basic_006.phpt`: dynamic eval declaration handling now routes
+  through the request-local declaration tables; remaining failures should be
+  classified under the narrower conditional-function or constant-redeclaration
+  compatibility IDs when reproduced.
 - `autoload_010.phpt` and `autoload_011.phpt`: missing autoload-triggered
   class/interface declaration behavior
 - `autoload_016.phpt` and `autoload_017.phpt`: reflection/autoload interactions
@@ -145,7 +148,9 @@ Implemented in Prompt 1.2:
 
 - `eval()` now registers named function, class, and constant declarations into
   request-local dynamic runtime tables instead of raising
-  `E_PHP_VM_EVAL_DECLARATION_GAP`.
+  `E_PHP_VM_CONDITIONAL_FUNCTION_DECLARATION_GAP` and
+  `E_PHP_RUNTIME_CONSTANT_REDECLARATION_WARNING_COMPAT` where those narrower
+  IDs match the reproduced behavior.
 - Eval redeclaration checks now reject duplicate functions, classes, and
   constants before merging the dynamic unit.
 - Runtime class, class-constant, and static-property hierarchy lookup can see

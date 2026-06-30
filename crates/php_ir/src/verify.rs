@@ -324,6 +324,12 @@ fn verify_instruction(
         InstructionKind::RegisterConstant { value, .. } => {
             verify_operand(value, function, unit, errors);
         }
+        InstructionKind::DeclareFunction {
+            function: declared_function,
+            ..
+        } => {
+            verify_function_id(*declared_function, unit.functions.len(), errors);
+        }
         InstructionKind::Move { dst, src } => {
             verify_register(*dst, function.register_count, errors);
             verify_operand(src, function, unit, errors);
@@ -1146,6 +1152,7 @@ fn verify_operand(
 fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
     match kind {
         InstructionKind::Nop
+        | InstructionKind::DeclareFunction { .. }
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::LoadConst { .. }
         | InstructionKind::FetchConst { .. }
@@ -1466,6 +1473,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
             }
         }
         InstructionKind::Nop
+        | InstructionKind::DeclareFunction { .. }
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::RegisterConstant { .. }
         | InstructionKind::StoreLocal { .. }

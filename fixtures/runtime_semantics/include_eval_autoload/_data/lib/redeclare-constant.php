@@ -1,0 +1,2 @@
+<?php
+const INCLUDE_REDECLARED_SYMBOL_CONST = "const";

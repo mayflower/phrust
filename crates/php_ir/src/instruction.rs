@@ -212,6 +212,8 @@ pub enum InstructionKind {
     FetchConst { dst: RegId, name: String },
     /// Registers a global constant at runtime.
     RegisterConstant { name: String, value: Operand },
+    /// Registers a function declaration when execution reaches it.
+    DeclareFunction { name: String, function: FunctionId },
     /// Registers a class-like declaration when execution reaches it.
     DeclareClass { name: String },
     /// `dst = src`.
