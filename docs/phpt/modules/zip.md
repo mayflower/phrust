@@ -2,8 +2,8 @@
 
 - Priority: archive read/extract MVP
 - Selected manifest: `tests/phpt/manifests/modules/zip.selected.jsonl`
-- Current focused snapshot: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK from 1 selected
-  generated fixture
+- Current focused snapshot: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK from 2 selected
+  fixtures
 
 ## Scope
 
@@ -22,6 +22,7 @@
 ## Selected PHPT Fixtures
 
 - `tests/phpt/generated/zip/archive-basic.phpt`
+- `ext/zip/tests/oo_extract.phpt`
 
 ## Relevant Source Areas
 
@@ -33,13 +34,15 @@
 
 - `nix develop -c cargo test -p php_runtime zip`
 - `nix develop -c cargo test -p php_vm`
-- `nix develop -c just phpt-dev-module MODULE=zip`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=zip`
 - `nix develop -c just verify-phpt`
 
 ## Known Gaps
 
 - Keep archive mutation and complete metadata parity as future work with
   focused fixtures.
+- `oo_open.phpt` remains outside the selected gate until the complete
+  `ZipArchive::CREATE` mutation surface and constants are implemented.
 
 ## Request Filesystem Overlay
 

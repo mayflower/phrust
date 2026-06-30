@@ -2,7 +2,7 @@
 
 - Priority: 11
 - Selected manifest: `tests/phpt/manifests/modules/filesystem.streams.selected.jsonl`
-- Current counts: 11 PASS, 0 SKIP, 0 FAIL, 0 BORK from 11 selected module fixtures
+- Current counts: 25 PASS, 0 SKIP, 0 FAIL, 0 BORK from 25 selected module fixtures
 
 ## Scope
 
@@ -11,6 +11,8 @@
 - resources
 - include_path
 - include/require
+- selected upstream local file, stat, temp, glob, readfile, and
+  `stream_get_contents` behavior
 
 ## Non-Scope
 
@@ -22,6 +24,20 @@
 ## Selected PHPT Fixtures
 
 - `tests/phpt/generated/filesystem.streams/local-file-roundtrip.phpt`
+- `ext/standard/tests/file/file_get_contents_basic.phpt`
+- `ext/standard/tests/file/file_get_contents_basic001.phpt`
+- `ext/standard/tests/file/file_get_contents_file_put_contents_basic.phpt`
+- `ext/standard/tests/file/file_get_contents_variation7.phpt`
+- `ext/standard/tests/file/file_put_contents_variation1.phpt`
+- `ext/standard/tests/file/readfile_basic.phpt`
+- `ext/standard/tests/file/readfile_variation9.phpt`
+- `ext/standard/tests/file/chmod_variation1.phpt`
+- `ext/standard/tests/file/glob_basic.phpt`
+- `ext/standard/tests/file/lstat_stat_variation1.phpt`
+- `ext/standard/tests/file/lstat_stat_variation2.phpt`
+- `ext/standard/tests/file/tempnam_variation5.phpt`
+- `ext/standard/tests/file/touch_variation2.phpt`
+- `ext/standard/tests/streams/stream_get_contents_001.phpt`
 - `tests/phpt/generated/filesystem.streams/php-memory-stream.phpt`
 - `tests/phpt/generated/filesystem.streams/include-path-scope.phpt`
 - `tests/phpt/generated/filesystem.streams/directory-cwd-roundtrip.phpt`
@@ -50,12 +66,13 @@
 
 - Network streams, PHAR streams, extension-backed wrappers, and user stream
   wrappers are outside this module contract.
-- Additional local file, directory, cwd, and warning/error PHPTs should be
-  added as deterministic selected fixtures before expanding this module count.
+- Broader `file_get_contents`/`readfile` argument diagnostics, stat metadata
+  helpers, stream metadata shape, symlink/link helpers, and warning text parity
+  remain outside this selected gate.
 
 ## Next Step
 
-The selected gate is closed at 11 selected fixtures passing on reference and target.
+The selected gate is closed at 25 selected fixtures passing on reference and target.
 Continue with standard-core dashboard.
 
 ## Harness Report
@@ -195,7 +212,7 @@ Validation:
 
 - `nix develop -c just verify-runtime`: PASS
 - `nix develop -c just verify-stdlib`: PASS
-- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=filesystem.streams`: reference 11 PASS, target 11 PASS
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=filesystem.streams`: reference 25 PASS, target 25 PASS
 
 No new known-gap IDs were added for this selected gate. Network streams, PHAR,
 extension-backed wrappers, user stream wrappers, and stream filters remain
@@ -206,5 +223,5 @@ outside this module scope.
 The `wp.request-filesystem` overlay adds selected coverage for permission/stat
 helpers, `sys_get_temp_dir`, `tempnam`, `tmpfile`, request-local `umask`,
 directory iteration, stream context defaults/options, and local
-`stream_set_timeout` behavior without changing the closed
-`filesystem.streams` selected count.
+`stream_set_timeout` behavior without adding overlay-specific rows to
+`filesystem.streams`.

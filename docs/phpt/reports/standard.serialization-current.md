@@ -11,13 +11,13 @@ verification.
 ## Selected Manifest
 
 - `tests/phpt/manifests/modules/standard.serialization.selected.jsonl`
-- 5 selected fixtures.
+- 23 selected fixtures.
 
 ## Current Status
 
 | Check | Result |
 | --- | ---: |
-| `standard.serialization` selected PHPTs | 5 PASS / 0 FAIL |
+| `standard.serialization` selected PHPTs | 23 PASS / 0 FAIL |
 
 ## Implemented Builtins
 
@@ -26,17 +26,19 @@ verification.
 - Scalar value persistence
 - Array value persistence
 - Simple object persistence in the selected fixture surface
+- Selected upstream serialization regression files that pass the current
+  runtime surface
 
 ## Remaining Gaps
 
 - `R`/`r` reference identity records are intentionally documented as
   `STDLIB-GAP-SERIALIZE-REFERENCES`.
-- `allowed_classes`, magic hooks, resources, and deep object/reference graphs
-  remain outside the selected focused gate.
+- `allowed_classes` validation diagnostics, magic hooks, resources, and deep
+  object/reference graphs remain outside the selected focused gate.
 
 ## Verification
 
 Latest branch verification:
 
-- `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_DISABLE_REFERENCE_REUSE=1 PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.serialization`: PASS, reference 5 PASS and target 5 PASS.
+- `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_DISABLE_REFERENCE_REUSE=1 PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.serialization`: PASS, reference 23 PASS and target 23 PASS.
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just verify-stdlib`: PASS.

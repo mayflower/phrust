@@ -4,14 +4,14 @@
   "priority":15,
   "selected_manifest":"tests/phpt/manifests/modules/standard.variables.selected.jsonl",
   "corpus_count":446,
-  "selected_count":27,
-  "pass_count":26,
+  "selected_count":33,
+  "pass_count":32,
   "skip_count":1,
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":435,
-  "scope":["variable inspection and conversion builtins"],
+  "scope":["variable inspection and conversion builtins","debug output for scalar, string, and array values"],
   "non_scope":["general VM symbol-table redesign"],
   "target_gates":["PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=standard.variables","nix develop -c just verify-stdlib"],
-  "next_step":"selected variable/debug-output contracts are closed and green; keep them green while expanding value rendering coverage."
+  "next_step":"selected variable/debug-output contracts are closed and green; keep them green while expanding object, reference, and settype coverage."
 }

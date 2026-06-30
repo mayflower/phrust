@@ -3,12 +3,13 @@
 - Priority: 15
 - Selected manifest: `tests/phpt/manifests/modules/standard.variables.selected.jsonl`
 - Corpus baseline: 23 PASS, 74 SKIP, 348 FAIL, 0 BORK from 446 corpus candidates
-- focused gate: 26 PASS, 1 SKIP, 0 FAIL, 0 BORK
+- focused gate: 32 PASS, 1 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
 - Variable inspection and conversion builtins covered by the selected focused
   gate
+- Debug output formatting for scalar, string, and array values
 
 ## Non-Scope
 
@@ -37,17 +38,22 @@
 
 - Kept the selected variable-inspection slice green after the standard-core
   follow-up changes.
-- Latest focused target run: PASS, 27 selected PHPTs with 26 PASS and 1 SKIP.
+- Latest focused target run: PASS, 33 selected PHPTs with 32 PASS / 1 SKIP
+  and no non-green target outcomes.
 
 ## Evidence
 
 - Reused the selected variable-inspection and debug-output surface as the
   the selected gate variables acceptance gate.
-- Latest focused target run: PASS, 27 selected PHPTs with no non-green target
-  outcomes.
+- Latest focused target run: PASS, 33 selected PHPTs with 32 PASS / 1 SKIP
+  and no non-green target outcomes.
 - Latest oracle-backed stdlib aggregate run: PASS.
 
 ## Known Gaps
 
+- `get_debug_type_basic.phpt` remains outside this selected gate because
+  anonymous class execution is still a known frontend/runtime gap.
+- `gettype_settype_basic.phpt` remains outside this selected gate because
+  `settype` is not registered.
 - Full `var_dump`/`print_r` object visibility, magic behavior, and reference
   formatting remain outside this selected gate.

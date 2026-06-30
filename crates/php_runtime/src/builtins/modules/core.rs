@@ -9260,6 +9260,28 @@ mod tests {
             call("http_build_query", vec![Value::Array(query)], &mut output),
             Value::string("a=b&c=1")
         );
+        let mut prefixed_query = PhpArray::new();
+        prefixed_query.insert(
+            ArrayKey::String(PhpString::from_test_str("foo")),
+            Value::string("bar"),
+        );
+        prefixed_query.insert(ArrayKey::Int(0), Value::string("abc"));
+        prefixed_query.insert(
+            ArrayKey::String(PhpString::from_test_str("true")),
+            Value::Bool(true),
+        );
+        assert_eq!(
+            call(
+                "http_build_query",
+                vec![
+                    Value::Array(prefixed_query),
+                    Value::string("num"),
+                    Value::string(";")
+                ],
+                &mut output
+            ),
+            Value::string("foo=bar;num0=abc;true=1")
+        );
     }
 
     #[test]
@@ -11071,6 +11093,59 @@ mod tests {
                 Value::packed_array(vec![Value::Int(3)])
             ])
         );
+        let mut keyed_chunk_input = PhpArray::new();
+        keyed_chunk_input.insert(
+            ArrayKey::String(PhpString::from_test_str("key1")),
+            Value::Int(1),
+        );
+        keyed_chunk_input.insert(
+            ArrayKey::String(PhpString::from_test_str("key2")),
+            Value::Int(2),
+        );
+        keyed_chunk_input.insert(
+            ArrayKey::String(PhpString::from_test_str("key3")),
+            Value::Int(3),
+        );
+        assert_eq!(
+            call(
+                "array_chunk",
+                vec![Value::Array(keyed_chunk_input.clone()), Value::Int(2)],
+                &mut output
+            ),
+            Value::packed_array(vec![
+                Value::packed_array(vec![Value::Int(1), Value::Int(2)]),
+                Value::packed_array(vec![Value::Int(3)])
+            ])
+        );
+        let mut expected_preserved_chunk = PhpArray::new();
+        expected_preserved_chunk.insert(
+            ArrayKey::String(PhpString::from_test_str("key1")),
+            Value::Int(1),
+        );
+        expected_preserved_chunk.insert(
+            ArrayKey::String(PhpString::from_test_str("key2")),
+            Value::Int(2),
+        );
+        let mut expected_preserved_tail = PhpArray::new();
+        expected_preserved_tail.insert(
+            ArrayKey::String(PhpString::from_test_str("key3")),
+            Value::Int(3),
+        );
+        assert_eq!(
+            call(
+                "array_chunk",
+                vec![
+                    Value::Array(keyed_chunk_input),
+                    Value::Int(2),
+                    Value::Bool(true)
+                ],
+                &mut output
+            ),
+            Value::packed_array(vec![
+                Value::Array(expected_preserved_chunk),
+                Value::Array(expected_preserved_tail)
+            ])
+        );
 
         let mut flip_input = PhpArray::new();
         flip_input.insert(
@@ -11090,6 +11165,42 @@ mod tests {
         assert_eq!(
             call("array_flip", vec![Value::Array(flip_input)], &mut output),
             Value::Array(expected_flip)
+        );
+        let mut flip_skip_input = PhpArray::new();
+        flip_skip_input.insert(
+            ArrayKey::String(PhpString::from_test_str("d")),
+            Value::Bool(true),
+        );
+        flip_skip_input.insert(
+            ArrayKey::String(PhpString::from_test_str("E")),
+            Value::Bool(false),
+        );
+        flip_skip_input.insert(ArrayKey::String(PhpString::from_test_str("F")), Value::Null);
+        flip_skip_input.insert(ArrayKey::Int(0), Value::string("G"));
+        let diagnostics = {
+            let mut context = BuiltinContext::new(&mut output);
+            assert_eq!(
+                call_in_context(
+                    &mut context,
+                    "array_flip",
+                    vec![Value::Array(flip_skip_input)]
+                ),
+                Value::Array({
+                    let mut expected = PhpArray::new();
+                    expected.insert(
+                        ArrayKey::String(PhpString::from_test_str("G")),
+                        Value::Int(0),
+                    );
+                    expected
+                })
+            );
+            context.take_diagnostics()
+        };
+        assert_eq!(diagnostics.len(), 3);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.id() == "E_PHP_RUNTIME_ARRAY_FLIP_ENTRY_SKIPPED")
         );
 
         let mut first = PhpArray::new();

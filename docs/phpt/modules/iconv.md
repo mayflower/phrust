@@ -2,7 +2,13 @@
 
 - Strategy: bounded encoding conversion MVP
 - Selected manifest: `tests/phpt/manifests/modules/iconv.selected.jsonl`
-- Selected fixture: `tests/phpt/generated/iconv/basic.phpt`
+- Current focused snapshot: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK from 2 selected
+  fixtures
+
+## Selected PHPT Fixtures
+
+- `tests/phpt/generated/iconv/basic.phpt`
+- `ext/iconv/tests/iconv_strlen_basic.phpt`
 
 ## Implemented Surface
 
@@ -20,4 +26,4 @@ legacy multibyte encodings remain out of scope.
 ## Target Gates
 
 - `nix develop -c cargo test -p php_runtime iconv`
-- `nix develop -c just phpt-dev-module MODULE=iconv`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=iconv`

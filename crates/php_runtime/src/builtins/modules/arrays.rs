@@ -1141,7 +1141,7 @@ pub(in crate::builtins::modules) fn builtin_array_chunk(
         let chunk_array = if preserve_keys {
             array_from_entries_preserve(chunk_entries)
         } else {
-            array_from_entries_for_slice(chunk_entries, false)
+            PhpArray::from_packed(chunk_entries.into_iter().map(|(_, value)| value).collect())
         };
         chunks.push(Value::Array(chunk_array));
     }
@@ -1157,7 +1157,7 @@ pub(in crate::builtins::modules) fn builtin_array_flip(
     let array = array_value_arg("array_flip", &args[0])?;
     let mut output = crate::PhpArray::new();
     for (key, value) in array.iter() {
-        let Some(output_key) = ArrayKey::from_value_mvp(value) else {
+        let Some(output_key) = array_flip_key(value) else {
             context.php_warning(
                 "E_PHP_RUNTIME_ARRAY_FLIP_ENTRY_SKIPPED",
                 "array_flip(): Can only flip string and integer values, entry skipped",
@@ -1168,6 +1168,14 @@ pub(in crate::builtins::modules) fn builtin_array_flip(
         output.insert(output_key, array_key_to_value(key));
     }
     Ok(Value::Array(output))
+}
+
+fn array_flip_key(value: &Value) -> Option<ArrayKey> {
+    match value {
+        Value::Int(value) => Some(ArrayKey::Int(*value)),
+        Value::String(value) => Some(ArrayKey::from_php_string(value.clone())),
+        _ => None,
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_array_callback_requires_vm(

@@ -1,1 +1,3 @@
 {"path":"tests/phpt/generated/exif/jpeg-metadata-basic.phpt"}
+{"path":"ext/exif/tests/exif_imagetype_basic.phpt"}
+{"path":"ext/exif/tests/exif_imagetype_error.phpt"}

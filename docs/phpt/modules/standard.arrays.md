@@ -3,11 +3,13 @@
 - Priority: 12
 - Selected manifest: `tests/phpt/manifests/modules/standard.arrays.selected.jsonl`
 - Corpus baseline: 218 PASS, 7 SKIP, 595 FAIL, 0 BORK from 821 corpus candidates
-- focused gate: 17 PASS, 0 SKIP, 0 FAIL, 0 BORK
+- focused gate: 35 PASS, 0 SKIP, 0 FAIL, 0 BORK
 
 ## Scope
 
 - Core array builtins with stable scalar/packed-array behavior
+- Promoted upstream coverage for `array_chunk`, `array_flip`,
+  `array_diff_assoc`, `array_intersect`, and `array_intersect_assoc`
 - Focused generated fixtures for `count`, `array_keys`, `array_values`,
   `array_merge`, `array_slice`, `array_key_exists`, `array_splice`,
   `array_column`, `in_array`, `array_search`, `array_unique`, `range`, and
@@ -33,6 +35,17 @@
 - `tests/phpt/generated/standard.arrays/array-unique-smoke.phpt`
 - `tests/phpt/generated/standard.arrays/range-smoke.phpt`
 - `tests/phpt/generated/standard.arrays/sort-deterministic-smoke.phpt`
+- `ext/standard/tests/array/array_chunk_basic1.phpt`
+- `ext/standard/tests/array/array_chunk_basic2.phpt`
+- `ext/standard/tests/array/array_flip.phpt`
+- `ext/standard/tests/array/array_flip_basic.phpt`
+- `ext/standard/tests/array/array_flip_variation2.phpt`
+- `ext/standard/tests/array/array_flip_variation3.phpt`
+- `ext/standard/tests/array/array_flip_variation4.phpt`
+- `ext/standard/tests/array/array_flip_variation5.phpt`
+- `ext/standard/tests/array/array_diff_assoc.phpt`
+- `ext/standard/tests/array/array_intersect_basic.phpt`
+- `ext/standard/tests/array/array_intersect_assoc_basic.phpt`
 
 ## Relevant Source Areas
 
@@ -47,17 +60,12 @@
 
 ## Evidence
 
-- Added focused generated array fixtures and selected-manifest coverage.
-- Added VM array-cast behavior for arrays, null/uninitialized values, objects,
-  and scalar/resource values.
-- Latest focused target run: PASS, 10 selected PHPTs.
-
-## Evidence
-
 - Added generated fixtures for the remaining builtin list:
   `array_key_exists`, `array_splice`, `array_column`, `in_array`,
   `array_search`, `array_unique`, `range`, and deterministic sort coverage.
-- Latest focused target run: PASS, 17 selected PHPTs.
+- Promoted upstream `array_chunk`, `array_flip`, `array_diff_assoc`,
+  `array_intersect`, and `array_intersect_assoc` PHPTs.
+- Latest focused target run: PASS, 35 selected PHPTs.
 - Latest oracle-backed stdlib verification: PASS, `verify-stdlib` with
   `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php`.
 
@@ -66,3 +74,6 @@
 - Full upstream array corpus remains larger than the selected gate.
 - Callback-heavy, object, and reference-sensitive array cases need later slices
   before they can be treated as complete.
+- `array_intersect_key` is not registered yet, `array_replace` still lacks
+  recursion detection for the upstream endless-recursion case, and
+  `array_rand` error text still needs PHP-compatible user-facing messages.

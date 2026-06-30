@@ -220,6 +220,7 @@ pub(in crate::builtins::modules) fn url_decode(bytes: &[u8], raw: bool) -> Vec<u
 
 pub(in crate::builtins::modules) fn build_query_pairs(
     prefix: Option<String>,
+    numeric_prefix: Option<&str>,
     value: &Value,
     pairs: &mut Vec<String>,
 ) -> Result<(), BuiltinError> {
@@ -227,13 +228,16 @@ pub(in crate::builtins::modules) fn build_query_pairs(
         Value::Array(array) => {
             for (key, value) in array.iter() {
                 let key = match key {
-                    ArrayKey::Int(index) => index.to_string(),
+                    ArrayKey::Int(index) => match (prefix.as_ref(), numeric_prefix) {
+                        (None, Some(numeric_prefix)) => format!("{numeric_prefix}{index}"),
+                        _ => index.to_string(),
+                    },
                     ArrayKey::String(key) => key.to_string_lossy(),
                 };
                 let name = prefix
                     .as_ref()
                     .map_or(key.clone(), |prefix| format!("{prefix}[{key}]"));
-                build_query_pairs(Some(name), value, pairs)?;
+                build_query_pairs(Some(name), numeric_prefix, value, pairs)?;
             }
         }
         Value::Null => {}

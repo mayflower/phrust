@@ -1246,9 +1246,24 @@ pub(in crate::builtins::modules) fn builtin_http_build_query(
     let Value::Array(array) = deref_value(&args[0]) else {
         return Err(type_error("http_build_query", "array", &args[0]));
     };
+    let numeric_prefix = args
+        .get(1)
+        .map(|value| string_arg("http_build_query", value))
+        .transpose()?;
+    let arg_separator = args
+        .get(2)
+        .map(|value| string_arg("http_build_query", value))
+        .transpose()?
+        .map_or_else(|| "&".to_owned(), |value| value.to_string_lossy());
+    let numeric_prefix_text = numeric_prefix.as_ref().map(|value| value.to_string_lossy());
     let mut pairs = Vec::new();
-    build_query_pairs(None, &Value::Array(array), &mut pairs)?;
-    Ok(Value::string(pairs.join("&").into_bytes()))
+    build_query_pairs(
+        None,
+        numeric_prefix_text.as_deref(),
+        &Value::Array(array),
+        &mut pairs,
+    )?;
+    Ok(Value::string(pairs.join(&arg_separator).into_bytes()))
 }
 
 pub(in crate::builtins::modules) fn builtin_substr(

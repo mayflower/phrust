@@ -1,1 +1,6 @@
 {"path":"tests/phpt/generated/zlib/compression-basic.phpt"}
+{"path":"ext/zlib/tests/gzcompress_basic1.phpt"}
+{"path":"ext/zlib/tests/gzdeflate_basic1.phpt"}
+{"path":"ext/zlib/tests/gzdeflate_variation1.phpt"}
+{"path":"ext/zlib/tests/gzencode_basic1.phpt"}
+{"path":"ext/zlib/tests/gzuncompress_basic1.phpt"}

@@ -1,1 +1,2 @@
 {"path":"tests/phpt/generated/iconv/basic.phpt"}
+{"path":"ext/iconv/tests/iconv_strlen_basic.phpt"}

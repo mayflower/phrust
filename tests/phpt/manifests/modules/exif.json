@@ -3,9 +3,9 @@
   "module":"exif",
   "priority":"media upload image metadata",
   "selected_manifest":"tests/phpt/manifests/modules/exif.selected.jsonl",
-  "corpus_count":1,
-  "selected_count":1,
-  "pass_count":1,
+  "corpus_count":3,
+  "selected_count":3,
+  "pass_count":3,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
@@ -13,5 +13,5 @@
   "scope":["exif_imagetype","getimagesize","getimagesizefromstring","exif_read_data minimal JPEG/TIFF tags"],
   "non_scope":["MakerNote parsing","GPS tag matrix","EXIF writing","full TIFF matrix"],
   "target_gates":["nix develop -c cargo test -p php_runtime exif","nix develop -c just phpt-dev-module MODULE=exif","nix develop -c just verify-stdlib"],
-  "next_step":"Add tags only with focused fixtures and deterministic malformed-image behavior."
+  "next_step":"Add tags only with focused fixtures and keep deterministic malformed-image behavior green."
 }
