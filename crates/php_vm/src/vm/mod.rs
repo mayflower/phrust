@@ -6393,6 +6393,7 @@ impl Vm {
                 .locals;
             let result = if param.by_ref {
                 if let Some(reference) = arg.reference {
+                    reference.set(arg.value.clone());
                     locals.bind_reference_cell(param.local, reference)
                 } else {
                     locals.set(param.local, arg.value)
@@ -9888,6 +9889,7 @@ impl Vm {
                 let locals = &mut stack.current_mut().expect("frame was pushed").locals;
                 let result = if param.by_ref {
                     if let Some(reference) = arg.reference {
+                        reference.set(arg.value.clone());
                         self.record_counter_alias_state_transition(
                             AliasState::NoReferencesObserved,
                             AliasState::EscapedReference,
@@ -47348,7 +47350,7 @@ fn coerce_or_check_param_type(
     param: &IrParam,
     arg_index: usize,
     value: &mut Value,
-    by_ref_arg: bool,
+    _by_ref_arg: bool,
     typecheck: TypecheckFastPathContext<'_>,
     call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), String> {
@@ -47370,12 +47372,12 @@ fn coerce_or_check_param_type(
         );
     }
     if !unit.strict_types
-        && !by_ref_arg
         && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type)
     {
         *value = coerced;
         return Ok(());
     }
+    materialize_int_to_float_runtime_type(value, &runtime_type);
     if vm_value_matches_runtime_type(compiled, Some(state), value, &runtime_type, typecheck)? {
         Ok(())
     } else {
@@ -47434,6 +47436,7 @@ fn coerce_or_check_variadic_param_type(
                 false,
             ));
         }
+        materialize_int_to_float_runtime_type(&mut element, runtime_type);
         if let Some(slot) = array.get_mut(&key) {
             *slot = element;
         }
@@ -47552,6 +47555,7 @@ fn coerce_return_value(
     {
         value = coerced;
     }
+    materialize_int_to_float_runtime_type(&mut value, &return_type);
     if vm_value_matches_runtime_type(compiled, Some(state), &value, &return_type, typecheck)? {
         Ok(Some(value))
     } else {
@@ -47759,6 +47763,9 @@ fn ir_runtime_type(return_type: Option<&IrReturnType>) -> Option<RuntimeType> {
 }
 
 fn coerce_value_to_runtime_type(value: &Value, runtime_type: &RuntimeType) -> Option<Value> {
+    if matches!((runtime_type, value), (RuntimeType::Float, Value::Int(_))) {
+        return to_float(value).ok().map(Value::float);
+    }
     if value_matches_runtime_type(value, runtime_type) {
         return Some(value.clone());
     }
@@ -47788,6 +47795,15 @@ fn coerce_value_to_runtime_type(value: &Value, runtime_type: &RuntimeType) -> Op
         RuntimeType::String => to_string(value).ok().map(Value::String),
         RuntimeType::Bool => to_bool(value).ok().map(Value::Bool),
         _ => None,
+    }
+}
+
+fn materialize_int_to_float_runtime_type(value: &mut Value, runtime_type: &RuntimeType) {
+    if matches!(runtime_type, RuntimeType::Float)
+        && matches!(value, Value::Int(_))
+        && let Ok(float) = to_float(value)
+    {
+        *value = Value::float(float);
     }
 }
 
@@ -60100,6 +60116,37 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn weak_by_ref_scalar_params_coerce_and_write_back() {
+        let result = execute_source(
+            "<?php function takes_int(int &$value): void { echo gettype($value), ':', $value, '|'; } $value = '42'; takes_int($value); echo gettype($value), ':', $value;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"integer:42|integer:42");
+
+        let float_result = execute_source(
+            "<?php function takes_float(float &$value): void { echo gettype($value), ':', $value, '|'; } $value = 1; takes_float($value); echo gettype($value), ':', $value;",
+        );
+
+        assert!(
+            float_result.status.is_success(),
+            "{:?}",
+            float_result.status
+        );
+        assert_eq!(float_result.output.as_bytes(), b"double:1|double:1");
+    }
+
+    #[test]
+    fn strict_int_to_float_params_and_returns_materialize_float() {
+        let result = execute_source(
+            "<?php declare(strict_types=1); function takes_float(float $value): float { echo gettype($value), ':', $value, '|'; return 1; } $result = takes_float(1); echo gettype($result), ':', $result;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"double:1|double:1");
+    }
+
+    #[test]
     fn frame_call_site_lines_feed_debug_backtrace() {
         let function_call = execute_temp_source_file(
             "frame-function-call",
@@ -60374,9 +60421,26 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         let strict = "<?php declare(strict_types=1); function takes_int(int $value): int { return $value; } takes_int('42');";
         assert_typecheck_fast_path_error_matches_slow_path(strict, "E_PHP_VM_UNCAUGHT_EXCEPTION");
 
-        let by_ref =
-            "<?php function takes_ref(int &$value): void {} $value = '42'; takes_ref($value);";
-        assert_typecheck_fast_path_error_matches_slow_path(by_ref, "E_PHP_VM_UNCAUGHT_EXCEPTION");
+        let by_ref = "<?php function takes_ref(int &$value): void {} $value = '42'; takes_ref($value); echo gettype($value), ':', $value;";
+        let by_ref_fast = execute_source_with_options(
+            by_ref,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: true,
+                ..VmOptions::default()
+            },
+        );
+        let by_ref_slow = execute_source_with_options(
+            by_ref,
+            VmOptions {
+                collect_counters: true,
+                typecheck_fast_paths: false,
+                ..VmOptions::default()
+            },
+        );
+        assert!(by_ref_fast.status.is_success(), "{:?}", by_ref_fast.status);
+        assert_eq!(by_ref_fast.output.as_bytes(), by_ref_slow.output.as_bytes());
+        assert_eq!(by_ref_fast.output.as_bytes(), b"integer:42");
 
         let variadic = "<?php function ints(int ...$xs): int { return $xs[0] + $xs[1]; } echo ints('40', 2), '|'; ints('bad');";
         let variadic_result = execute_source_with_options(

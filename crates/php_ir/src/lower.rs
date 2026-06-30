@@ -2090,6 +2090,13 @@ impl LoweringContext<'_> {
             return;
         };
         let signatures = module.signatures().to_vec();
+        let class_likes = module
+            .class_likes()
+            .iter()
+            .map(|(id, class_like)| (id, class_like.clone()))
+            .collect::<Vec<_>>();
+        let class_constant_initializers = collect_class_constant_initializers(module, &class_likes);
+        let class_parents = collect_class_parents(&class_likes);
         let mut registered_conditional_names = HashSet::new();
         for signature in signatures {
             if signature.kind() != SignatureKind::Function {
@@ -2132,7 +2139,12 @@ impl LoweringContext<'_> {
             for param in signature.parameters() {
                 let local_name = local_name(param.name()).to_owned();
                 let local = builder.intern_local(function, &local_name);
-                let default = self.lower_param_default(param);
+                let default = self.lower_param_default_with_class_constants(
+                    param,
+                    None,
+                    &class_constant_initializers,
+                    &class_parents,
+                );
                 if param.default().is_some() && default.is_none() {
                     self.unsupported(
                         UnsupportedFeature::AdvancedParameter,
@@ -12079,6 +12091,43 @@ fn constant_from_expr_with_class_constants(
             )?;
             binary_ir_constant(operator, left, right)
         }
+        HirExprKind::Ternary {
+            condition,
+            if_true,
+            if_false,
+        } => {
+            let condition_value = constant_from_expr_with_class_constants(
+                module,
+                (*condition)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            if ir_constant_truthy(&condition_value)? {
+                let selected = if_true.unwrap_or((*condition)?);
+                constant_from_expr_with_class_constants(
+                    module,
+                    selected,
+                    named_constants,
+                    current_class,
+                    class_constants,
+                    class_parents,
+                    visiting_class_constants,
+                )
+            } else {
+                constant_from_expr_with_class_constants(
+                    module,
+                    (*if_false)?,
+                    named_constants,
+                    current_class,
+                    class_constants,
+                    class_parents,
+                    visiting_class_constants,
+                )
+            }
+        }
         HirExprKind::Array { elements } => {
             let mut entries = Vec::with_capacity(elements.len());
             for element_id in elements {
@@ -12150,6 +12199,27 @@ fn constant_from_expr_with_class_constants(
                 visiting_class_constants,
             )
         }
+        HirExprKind::DimFetch { receiver, dim } => {
+            let receiver = constant_from_expr_with_class_constants(
+                module,
+                (*receiver)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            let dim = constant_from_expr_with_class_constants(
+                module,
+                (*dim)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            ir_constant_dim_fetch(receiver, &dim)
+        }
         _ => None,
     }
 }
@@ -12210,6 +12280,43 @@ fn constant_from_expr_with_runtime_constants(
                 visiting_class_constants,
             )?;
             binary_ir_constant(operator, left, right)
+        }
+        HirExprKind::Ternary {
+            condition,
+            if_true,
+            if_false,
+        } => {
+            let condition_value = constant_from_expr_with_runtime_constants(
+                module,
+                (*condition)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            if ir_constant_truthy(&condition_value)? {
+                let selected = if_true.unwrap_or((*condition)?);
+                constant_from_expr_with_runtime_constants(
+                    module,
+                    selected,
+                    named_constants,
+                    current_class,
+                    class_constants,
+                    class_parents,
+                    visiting_class_constants,
+                )
+            } else {
+                constant_from_expr_with_runtime_constants(
+                    module,
+                    (*if_false)?,
+                    named_constants,
+                    current_class,
+                    class_constants,
+                    class_parents,
+                    visiting_class_constants,
+                )
+            }
         }
         HirExprKind::Array { elements } => {
             let mut entries = Vec::with_capacity(elements.len());
@@ -12285,6 +12392,27 @@ fn constant_from_expr_with_runtime_constants(
                 class_name: target_class,
                 constant_name: member,
             }))
+        }
+        HirExprKind::DimFetch { receiver, dim } => {
+            let receiver = constant_from_expr_with_runtime_constants(
+                module,
+                (*receiver)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            let dim = constant_from_expr_with_runtime_constants(
+                module,
+                (*dim)?,
+                named_constants,
+                current_class,
+                class_constants,
+                class_parents,
+                visiting_class_constants,
+            )?;
+            ir_constant_dim_fetch(receiver, &dim)
         }
         _ => None,
     }
@@ -12505,6 +12633,13 @@ fn negate_ir_constant(value: IrConstant) -> Option<IrConstant> {
 }
 
 fn binary_ir_constant(operator: &str, left: IrConstant, right: IrConstant) -> Option<IrConstant> {
+    if operator == "??" {
+        return if matches!(left, IrConstant::Null) {
+            Some(right)
+        } else {
+            Some(left)
+        };
+    }
     match (operator, left, right) {
         ("+", IrConstant::Int(left), IrConstant::Int(right)) => {
             left.checked_add(right).map(IrConstant::Int)
@@ -12534,6 +12669,90 @@ fn binary_ir_constant(operator: &str, left: IrConstant, right: IrConstant) -> Op
             Some(IrConstant::StringBytes(left))
         }
         _ => None,
+    }
+}
+
+fn ir_constant_truthy(value: &IrConstant) -> Option<bool> {
+    match value {
+        IrConstant::Null => Some(false),
+        IrConstant::Bool(value) => Some(*value),
+        IrConstant::Int(value) => Some(*value != 0),
+        IrConstant::Float(value) => Some(*value != 0.0 && !value.is_nan()),
+        IrConstant::String(value) => Some(!value.is_empty() && value != "0"),
+        IrConstant::StringBytes(value) => Some(!value.is_empty() && value.as_slice() != b"0"),
+        IrConstant::Array(entries) => Some(!entries.is_empty()),
+        IrConstant::NamedConstant(_) | IrConstant::ClassConstant { .. } => None,
+    }
+}
+
+fn ir_constant_dim_fetch(receiver: IrConstant, dim: &IrConstant) -> Option<IrConstant> {
+    match receiver {
+        IrConstant::Array(entries) => {
+            let mut next_index = 0_i64;
+            for entry in entries {
+                let key = entry.key.unwrap_or_else(|| {
+                    let key = IrConstant::Int(next_index);
+                    next_index += 1;
+                    key
+                });
+                if let IrConstant::Int(index) = key {
+                    next_index = next_index.max(index.saturating_add(1));
+                    if ir_constant_array_key_matches_int(index, dim) {
+                        return Some(entry.value);
+                    }
+                } else if ir_constant_array_key_matches(&key, dim) {
+                    return Some(entry.value);
+                }
+            }
+            None
+        }
+        IrConstant::String(value) => {
+            let IrConstant::Int(index) = dim else {
+                return None;
+            };
+            let bytes = value.as_bytes();
+            let length = bytes.len() as i64;
+            let resolved = if *index < 0 { *index + length } else { *index };
+            if resolved < 0 || resolved >= length {
+                None
+            } else {
+                Some(IrConstant::String(
+                    char::from(bytes[resolved as usize]).to_string(),
+                ))
+            }
+        }
+        IrConstant::StringBytes(value) => {
+            let IrConstant::Int(index) = dim else {
+                return None;
+            };
+            let length = value.len() as i64;
+            let resolved = if *index < 0 { *index + length } else { *index };
+            if resolved < 0 || resolved >= length {
+                None
+            } else {
+                Some(IrConstant::StringBytes(vec![value[resolved as usize]]))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ir_constant_array_key_matches(key: &IrConstant, dim: &IrConstant) -> bool {
+    match (key, dim) {
+        (IrConstant::Int(left), _) => ir_constant_array_key_matches_int(*left, dim),
+        (IrConstant::String(left), IrConstant::String(right)) => left == right,
+        (IrConstant::StringBytes(left), IrConstant::StringBytes(right)) => left == right,
+        (IrConstant::Bool(left), _) => ir_constant_array_key_matches_int(i64::from(*left), dim),
+        (IrConstant::Null, IrConstant::String(right)) => right.is_empty(),
+        _ => key == dim,
+    }
+}
+
+fn ir_constant_array_key_matches_int(index: i64, dim: &IrConstant) -> bool {
+    match dim {
+        IrConstant::Int(value) => index == *value,
+        IrConstant::Bool(value) => index == i64::from(*value),
+        _ => false,
     }
 }
 
@@ -12968,6 +13187,49 @@ mod tests {
                 key: None,
                 value: IrConstant::Int(25),
             }]))
+        );
+    }
+
+    #[test]
+    fn parameter_default_expression_matrix_lowers_to_ir_constants() {
+        let frontend = analyze_source(
+            "<?php const LABEL = 'B'; class Source { const FIRST = 'A'; } function f($items = ['left' => Source::FIRST, 'right' => LABEL], $selected = ['x', 'y'][1], $fallback = null ?? 'fallback', $conditional = true ? 'yes' : 'no') {}",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let function = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("function f");
+
+        assert_eq!(
+            function.params[0].default,
+            Some(IrConstant::Array(vec![
+                IrConstantArrayEntry {
+                    key: Some(IrConstant::String("left".to_owned())),
+                    value: IrConstant::String("A".to_owned()),
+                },
+                IrConstantArrayEntry {
+                    key: Some(IrConstant::String("right".to_owned())),
+                    value: IrConstant::String("B".to_owned()),
+                },
+            ]))
+        );
+        assert_eq!(
+            function.params[1].default,
+            Some(IrConstant::String("y".to_owned()))
+        );
+        assert_eq!(
+            function.params[2].default,
+            Some(IrConstant::String("fallback".to_owned()))
+        );
+        assert_eq!(
+            function.params[3].default,
+            Some(IrConstant::String("yes".to_owned()))
         );
     }
 

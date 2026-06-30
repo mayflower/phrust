@@ -55,7 +55,7 @@ The Runtime MVP should execute:
 | Variables | locals, script-scope variables, assignment, unset, simple local aliases | top-level locals, assignments, compound assignments, scalar inc/dec, local unset, and `$b =& $a` MVP implemented |
 | Expressions | arithmetic, comparisons, casts, truthiness, concatenation | scalar MVP implemented |
 | Control flow | if/elseif/else, loops, break, continue, switch, match, return | implemented for the Runtime scalar subset |
-| Functions | user functions, parameters, defaults, variadics, recursion | named declarations, positional by-value params, folded scalar defaults, packed-list variadics, scalar/nullable parameter checks, scalar/nullable/void return checks, frames, returns, recursion implemented |
+| Functions | user functions, parameters, defaults, variadics, recursion | named declarations, positional/named/unpacked params, folded const-expression defaults, variadics, scalar/nullable/callable parameter checks, scalar/nullable/void return checks, frames, returns, recursion, and `func_*` argument introspection implemented |
 | Closures | by-value/by-reference capture and arrow functions | closure values, `use ($x)`, `use (&$x)`, arrow by-value capture, closure returns, static closure locals, and closure calls implemented; full `Closure::bind` compatibility remains a known gap |
 | Arrays | ordered int/string-key map, literals, fetch, assign, append, foreach | literals, local dim operations, array-element references, by-value array foreach, and local-array by-reference foreach implemented; by-value foreach snapshots insertion-ordered entries at loop entry; temporary by-reference sources and Traversable objects are known gaps |
 | Constants | user constants and MVP magic constants | global `const` declarations with folded Semantic frontend const-expression values, `FetchConst`, `PHP_VERSION`, undefined-constant runtime errors, and top-level/function/method magic constants implemented; `define()` and the full predefined constants matrix remain gaps |
@@ -303,12 +303,14 @@ the scalar subset. Runtime errors raised while more than one frame is active
 append a `call_stack:` section listing the active functions from current frame
 back to `main`; top-level-only errors keep their previous message text.
 
-Work item adds required/optional parameter metadata, folded scalar/null/string
-defaults, simple variadics, argument-count runtime diagnostics, and return-type
-MVP checks. Omitted optional parameters are filled only from Semantic frontend
-constant-expression candidates that folded without runtime evaluation. Variadic
-parameters collect remaining positional arguments into the packed-list facade;
-integer offset reads such as `$args[0]` are supported only for that facade.
+Work item adds required/optional parameter metadata, folded const-expression
+defaults, simple variadics, named/unpacked argument binding, argument-count
+runtime diagnostics, and return-type MVP checks. Omitted optional parameters are
+filled from Semantic frontend constant-expression candidates that folded without
+runtime execution, including fixture-covered arrays, named constants, class
+constants, ternaries, coalesce expressions, and array dimension fetches.
+Variadic parameters collect remaining positional arguments and covered named
+tails into ordinary PHP array values.
 
 Too few and too many positional arguments produce stable runtime diagnostic IDs:
 `E_PHP_VM_TOO_FEW_ARGS` and `E_PHP_VM_TOO_MANY_ARGS`. Return declarations for
@@ -317,12 +319,17 @@ and nullable wrappers are lowered into the runtime type adapter. Work item uses
 that Semantic frontend type information for scalar/nullable parameter checks,
 scalar/nullable/void return checks, and simple public property write checks.
 Checks are exact except `int` values satisfy `float`; the full PHP
-weak/strict conversion matrix is documented as a known gap. Parameter, return,
-and property mismatches produce `E_PHP_VM_PARAM_TYPE_MISMATCH`,
+weak/strict conversion matrix is documented as a known gap. Non-strict scalar
+parameter checks perform fixture-covered weak coercion, including by-reference
+write-back to the caller slot. Parameter, return, and property mismatches produce
+`E_PHP_VM_PARAM_TYPE_MISMATCH`,
 `E_PHP_VM_RETURN_TYPE_MISMATCH`, and `E_PHP_VM_PROPERTY_TYPE_MISMATCH`.
 
 By-reference parameters, named arguments, argument unpacking, dynamic functions,
-and callable fallback behavior remain known gaps or later function slices.
+and callable fallback behavior are executable for the covered function/callable
+fixtures. Remaining gaps are the wider reference/COW matrix, namespace/import
+callable fallback, cross-file call-site strictness, and exact engine diagnostic
+wording.
 
 ## Closure MVP
 
@@ -353,7 +360,9 @@ matching user function, or to `CallableValue::InternalBuiltin` for registered
 entries in `php_runtime::BuiltinRegistry`. Closure values, dynamic string
 callables, array method callables, static method callables, and invokable
 objects are callable through the same helper for covered fixtures. Unresolved
-dynamic callables remain explicit placeholder/gap variants.
+dynamic callables remain explicit placeholder/gap variants. Callable parameter
+type checks use the same resolution helper for strings, closures, first-class
+callables, and invokable objects in the covered fixture matrix.
 
 The PHP 8.5 pipe operator evaluates the LHS first, evaluates or resolves the
 RHS callable second, and then calls that callable with exactly one argument.
