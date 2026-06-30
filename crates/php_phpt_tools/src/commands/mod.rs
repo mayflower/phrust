@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use php_testkit::compatibility::{MismatchCategory, classify_phpt_detail};
+
 use php_phpt_tools::expect::{ExpectationKind, match_expectation};
 use php_phpt_tools::phpt::{PhptDocument, PhptSection, parse_phpt};
 
@@ -1151,6 +1153,7 @@ struct PhptRunResult {
     path: String,
     outcome: String,
     detail: String,
+    mismatch_category: Option<MismatchCategory>,
     cache_key: Option<String>,
     input_cache_key: Option<String>,
     cache_status: Option<String>,
@@ -1158,10 +1161,13 @@ struct PhptRunResult {
 
 impl PhptRunResult {
     fn new(path: impl Into<String>, outcome: impl Into<String>, detail: impl Into<String>) -> Self {
+        let outcome = outcome.into();
+        let detail = detail.into();
         Self {
             path: path.into(),
-            outcome: outcome.into(),
-            detail: detail.into(),
+            mismatch_category: classify_phpt_detail(&outcome, &detail),
+            outcome,
+            detail,
             cache_key: None,
             input_cache_key: None,
             cache_status: None,
@@ -1192,6 +1198,9 @@ impl PhptRunResult {
             escape_json(&self.outcome),
             escape_json(&self.detail)
         );
+        if let Some(category) = self.mismatch_category {
+            line.push_str(&format!(",\"mismatch_category\":\"{}\"", category.as_str()));
+        }
         if let Some(cache_key) = &self.cache_key {
             line.push_str(&format!(",\"cache_key\":\"{}\"", escape_json(cache_key)));
         }
@@ -1212,15 +1221,24 @@ impl PhptRunResult {
     }
 
     fn from_json_line(line: &str) -> Result<Self, String> {
+        let category = extract_optional_json_string(line, "mismatch_category")?
+            .as_deref()
+            .map(parse_mismatch_category)
+            .transpose()?;
         Ok(Self {
             path: extract_json_string(line, "path")?,
             outcome: extract_json_string(line, "outcome")?,
             detail: extract_json_string(line, "detail")?,
+            mismatch_category: category,
             cache_key: extract_optional_json_string(line, "cache_key")?,
             input_cache_key: extract_optional_json_string(line, "input_cache_key")?,
             cache_status: extract_optional_json_string(line, "cache_status")?,
         })
     }
+}
+
+fn parse_mismatch_category(value: &str) -> Result<MismatchCategory, String> {
+    MismatchCategory::parse(value).ok_or_else(|| format!("unknown mismatch_category `{value}`"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5546,11 +5564,26 @@ mod tests {
         assert_eq!(parsed.cache_key.as_deref(), Some("abc"));
         assert_eq!(parsed.input_cache_key.as_deref(), Some("input-abc"));
         assert_eq!(parsed.cache_status.as_deref(), Some("miss"));
+        assert_eq!(parsed.mismatch_category, None);
+
+        let failed = PhptRunResult::new(
+            "Zend/tests/fail.phpt",
+            "FAIL",
+            "target exited with status 255",
+        );
+        let failed_json = failed.to_json_line();
+        assert!(failed_json.contains("\"mismatch_category\":\"RuntimeExitMismatch\""));
+        let parsed_failed = PhptRunResult::from_json_line(&failed_json).unwrap();
+        assert_eq!(
+            parsed_failed.mismatch_category,
+            Some(MismatchCategory::RuntimeExitMismatch)
+        );
 
         let legacy = PhptRunResult::from_json_line(
             "{\"path\":\"Zend/tests/legacy.phpt\",\"outcome\":\"FAIL\",\"detail\":\"old\"}",
         )
         .unwrap();
+        assert_eq!(legacy.mismatch_category, None);
         assert_eq!(legacy.cache_key, None);
         assert_eq!(legacy.input_cache_key, None);
         assert_eq!(legacy.cache_status, None);

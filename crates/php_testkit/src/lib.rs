@@ -4,6 +4,7 @@
 //! `token_get_all()`, `php -l`, and runtime behavior. It intentionally contains
 //! no PHP engine implementation.
 
+pub mod compatibility;
 pub mod diff;
 pub mod fixtures;
 pub mod lexer_reference;

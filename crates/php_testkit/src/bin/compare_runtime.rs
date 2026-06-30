@@ -1,11 +1,13 @@
 //! Runtime fixture differential runner for runtime.
 
+use php_testkit::compatibility::{MismatchCategory, first_differing_line, summarize_output};
 use php_testkit::normalize_output::normalize_runtime_stderr;
 use php_testkit::runtime_fixture::{
     RuntimeComparisonResult, RuntimeComparisonStatus, RuntimeFixture, RuntimeFixtureExpectation,
-    RuntimeFixtureKind, RuntimeSideResult,
+    RuntimeFixtureKind, RuntimeOutputSummary, RuntimeSideResult,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,7 +28,36 @@ struct RuntimeReport {
     fail: usize,
     skipped: usize,
     known_gap: usize,
+    unexpected_pass: usize,
+    categories: BTreeMap<String, usize>,
+    feature_areas: BTreeMap<String, usize>,
+    diagnostic_ids: BTreeMap<String, usize>,
+    owner_areas: BTreeMap<String, usize>,
     results: Vec<RuntimeComparisonResult>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KnownGapEntry {
+    id: String,
+    feature: String,
+    status: String,
+    layer: String,
+    fixtures: Vec<String>,
+    owner_area: String,
+}
+
+#[derive(Clone, Debug)]
+struct KnownGapMatch {
+    id: String,
+    confidence: &'static str,
+    feature: Option<String>,
+    owner_area: Option<String>,
+}
+
+#[derive(Default)]
+struct KnownGapCatalog {
+    by_id: BTreeMap<String, KnownGapEntry>,
+    by_fixture: BTreeMap<String, String>,
 }
 
 fn main() {
@@ -57,13 +88,15 @@ fn run() -> Result<RuntimeReport, String> {
             options.out_dir.display()
         )
     })?;
+    let known_gaps = KnownGapCatalog::load(Path::new("docs/known_gaps/runtime.jsonl"))?;
     let fixtures = discover_fixtures(&options.fixtures_root)?;
     let mut results = Vec::new();
     for fixture in fixtures {
-        let result = compare_fixture(&fixture, &options);
+        let result = compare_fixture(&fixture, &options, &known_gaps);
         write_result(&options.out_dir, &result)?;
         results.push(result);
     }
+    write_results_jsonl(&options.out_dir, &results)?;
     let report = RuntimeReport {
         fixtures_root: options.fixtures_root.display().to_string(),
         total: results.len(),
@@ -83,18 +116,52 @@ fn run() -> Result<RuntimeReport, String> {
             .iter()
             .filter(|result| result.status == RuntimeComparisonStatus::KnownGap)
             .count(),
+        unexpected_pass: results
+            .iter()
+            .filter(|result| result.status == RuntimeComparisonStatus::UnexpectedPass)
+            .count(),
+        categories: count_by(results.iter().filter_map(|result| {
+            result
+                .category
+                .map(|category| category.as_str().to_string())
+        })),
+        feature_areas: count_by(
+            results
+                .iter()
+                .filter_map(|result| result.feature_area.clone()),
+        ),
+        diagnostic_ids: count_by(
+            results
+                .iter()
+                .flat_map(|result| result.diagnostic_ids.clone()),
+        ),
+        owner_areas: count_by(
+            results
+                .iter()
+                .filter_map(|result| result.owner_area.clone()),
+        ),
         results,
     };
     let report_json = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
     fs::write(options.out_dir.join("runtime-report.json"), report_json)
         .map_err(|error| format!("failed to write runtime report: {error}"))?;
+    fs::write(
+        options.out_dir.join("runtime-report.md"),
+        render_markdown_report(&report),
+    )
+    .map_err(|error| format!("failed to write runtime markdown report: {error}"))?;
+    if options.out_dir == PathBuf::from("target/runtime/runtime-diff") {
+        write_docs_reports(&report)?;
+    }
     println!(
-        "[ok] runtime comparison report: total={} pass={} fail={} skip={} known_gap={} path={}",
+        "[ok] runtime comparison report: total={} pass={} fail={} skip={} known_gap={} unexpected_pass={} top_categories={} path={}",
         report.total,
         report.pass,
         report.fail,
         report.skipped,
         report.known_gap,
+        report.unexpected_pass,
+        summarize_counts(&report.categories),
         options.out_dir.join("runtime-report.json").display()
     );
     Ok(report)
@@ -179,15 +246,21 @@ fn collect_php_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn compare_fixture(fixture: &RuntimeFixture, options: &Options) -> RuntimeComparisonResult {
+fn compare_fixture(
+    fixture: &RuntimeFixture,
+    options: &Options,
+    known_gaps: &KnownGapCatalog,
+) -> RuntimeComparisonResult {
     if fixture.expect == RuntimeFixtureExpectation::Skip {
         return result(
             fixture,
             None,
             None,
             RuntimeComparisonStatus::Skipped,
+            None,
             Vec::new(),
-            fixture.known_gap_id.clone(),
+            None,
+            known_gaps.find_for_fixture_metadata(fixture),
             Some("fixture metadata requested skip".to_string()),
         );
     }
@@ -206,18 +279,51 @@ fn compare_fixture(fixture: &RuntimeFixture, options: &Options) -> RuntimeCompar
     if fixture.expect == RuntimeFixtureExpectation::KnownGap
         || fixture.kind == RuntimeFixtureKind::KnownGap
     {
-        let known_gap_id = fixture
-            .known_gap_id
-            .clone()
-            .or_else(|| diagnostic_ids.first().cloned());
+        if rust.is_err() {
+            return result(
+                fixture,
+                run_reference_side(fixture).ok().flatten(),
+                rust_side,
+                RuntimeComparisonStatus::Fail,
+                Some(MismatchCategory::HarnessError),
+                diagnostic_ids,
+                None,
+                known_gaps.find_for_fixture_metadata(fixture),
+                rust.err(),
+            );
+        }
+        let reference = run_reference_side(fixture).ok().flatten();
+        let gap_match = known_gaps.find(fixture, &diagnostic_ids);
+        let status = match (&reference, &rust_side) {
+            (Some(reference), Some(rust)) if same_side(reference, rust) => {
+                RuntimeComparisonStatus::UnexpectedPass
+            }
+            _ => RuntimeComparisonStatus::KnownGap,
+        };
+        let category = match status {
+            RuntimeComparisonStatus::UnexpectedPass => Some(MismatchCategory::UnexpectedPass),
+            _ => fixture
+                .category
+                .or(Some(MismatchCategory::ExpectedKnownGap)),
+        };
+        let message = if status == RuntimeComparisonStatus::UnexpectedPass {
+            Some(
+                "known-gap fixture now matches the PHP reference; retire or reclassify the gap"
+                    .to_string(),
+            )
+        } else {
+            rust.err()
+        };
         return result(
             fixture,
-            run_reference_side(fixture).ok().flatten(),
+            reference,
             rust_side,
-            RuntimeComparisonStatus::KnownGap,
+            status,
+            category,
             diagnostic_ids,
-            known_gap_id,
-            rust.err(),
+            None,
+            gap_match,
+            message,
         );
     }
 
@@ -239,8 +345,11 @@ fn compare_fixture(fixture: &RuntimeFixture, options: &Options) -> RuntimeCompar
             run_reference_side(fixture).ok().flatten(),
             rust_side,
             status,
+            (status == RuntimeComparisonStatus::Fail)
+                .then_some(MismatchCategory::RuntimeExitMismatch),
             diagnostic_ids,
             fixture.known_gap_id.clone(),
+            known_gaps.find_for_fixture_metadata(fixture),
             message.or_else(|| rust.err()),
         );
     }
@@ -253,7 +362,9 @@ fn compare_fixture(fixture: &RuntimeFixture, options: &Options) -> RuntimeCompar
                 None,
                 rust_side,
                 RuntimeComparisonStatus::Fail,
+                Some(MismatchCategory::HarnessError),
                 diagnostic_ids,
+                None,
                 None,
                 Some(message),
             );
@@ -270,27 +381,59 @@ fn compare_fixture(fixture: &RuntimeFixture, options: &Options) -> RuntimeCompar
             None,
             rust_side,
             status,
+            (status == RuntimeComparisonStatus::Fail).then_some(MismatchCategory::HarnessError),
             diagnostic_ids,
+            None,
             None,
             Some("REFERENCE_PHP is not set".to_string()),
         );
     };
-    let status = match (&reference, &rust_side) {
-        (reference, Some(rust)) if same_side(reference, rust) => RuntimeComparisonStatus::Pass,
-        _ => RuntimeComparisonStatus::Fail,
-    };
-    let message = if status == RuntimeComparisonStatus::Fail {
-        Some(diff_message(&reference, rust_side.as_ref()))
+    let gap_match = known_gaps.find(fixture, &diagnostic_ids);
+    let sides_match =
+        matches!((&reference, &rust_side), (reference, Some(rust)) if same_side(reference, rust));
+    let status = if sides_match {
+        if gap_match.is_some() {
+            RuntimeComparisonStatus::UnexpectedPass
+        } else {
+            RuntimeComparisonStatus::Pass
+        }
+    } else if gap_match.is_some() {
+        RuntimeComparisonStatus::KnownGap
     } else {
-        None
+        RuntimeComparisonStatus::Fail
+    };
+    let category = match status {
+        RuntimeComparisonStatus::Fail => Some(classify_runtime_mismatch(
+            &reference,
+            rust_side.as_ref(),
+            &diagnostic_ids,
+            rust.as_ref().err().map(String::as_str),
+        )),
+        RuntimeComparisonStatus::KnownGap => fixture
+            .category
+            .or(Some(MismatchCategory::ExpectedKnownGap)),
+        RuntimeComparisonStatus::UnexpectedPass => Some(MismatchCategory::UnexpectedPass),
+        RuntimeComparisonStatus::Pass | RuntimeComparisonStatus::Skipped => None,
+    };
+    let message = match status {
+        RuntimeComparisonStatus::Fail | RuntimeComparisonStatus::KnownGap => {
+            Some(diff_message(&reference, rust_side.as_ref()))
+        }
+        RuntimeComparisonStatus::UnexpectedPass => Some(
+            "known-gap fixture now matches the PHP reference; retire or reclassify the gap"
+                .to_string(),
+        ),
+        RuntimeComparisonStatus::Pass | RuntimeComparisonStatus::Skipped => None,
     };
     result(
         fixture,
         Some(reference),
         rust_side,
         status,
+        category,
         diagnostic_ids,
         None,
+        gap_match,
         message.or_else(|| rust.err()),
     )
 }
@@ -408,17 +551,39 @@ fn result(
     reference: Option<RuntimeSideResult>,
     rust: Option<RuntimeSideResult>,
     status: RuntimeComparisonStatus,
+    category: Option<MismatchCategory>,
     diagnostic_ids: Vec<String>,
     known_gap_id: Option<String>,
+    known_gap_match: Option<KnownGapMatch>,
     message: Option<String>,
 ) -> RuntimeComparisonResult {
+    let known_gap_id =
+        known_gap_id.or_else(|| known_gap_match.as_ref().map(|matched| matched.id.clone()));
+    let feature_area = known_gap_match
+        .as_ref()
+        .and_then(|matched| matched.feature.clone())
+        .or_else(|| infer_feature_area(fixture));
+    let owner_area = known_gap_match
+        .as_ref()
+        .and_then(|matched| matched.owner_area.clone());
+    let reference_summary = reference.as_ref().map(output_summary);
+    let phrust_summary = rust.as_ref().map(output_summary);
+    let first_differing_line = compare_first_differing_line(reference.as_ref(), rust.as_ref());
     RuntimeComparisonResult {
         file: fixture.display_path(),
+        mode: "compare-runtime".to_string(),
         reference,
         rust,
         status,
+        category,
         diagnostic_ids,
         known_gap_id,
+        known_gap_match_confidence: known_gap_match.map(|matched| matched.confidence.to_string()),
+        feature_area,
+        owner_area,
+        reference_summary,
+        phrust_summary,
+        first_differing_line,
         message,
     }
 }
@@ -432,6 +597,275 @@ fn write_result(out_dir: &Path, result: &RuntimeComparisonResult) -> Result<(), 
     let json = result.to_pretty_json().map_err(|error| error.to_string())?;
     fs::write(out_dir.join(format!("{filename}.json")), json)
         .map_err(|error| format!("failed to write fixture result: {error}"))
+}
+
+fn write_results_jsonl(out_dir: &Path, results: &[RuntimeComparisonResult]) -> Result<(), String> {
+    let mut lines = String::new();
+    for result in results {
+        let line = serde_json::to_string(result).map_err(|error| error.to_string())?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+    fs::write(out_dir.join("runtime-results.jsonl"), lines)
+        .map_err(|error| format!("failed to write runtime JSONL report: {error}"))
+}
+
+fn write_docs_reports(report: &RuntimeReport) -> Result<(), String> {
+    let docs_dir = Path::new("docs/runtime/reports");
+    fs::create_dir_all(docs_dir)
+        .map_err(|error| format!("failed to create docs report directory: {error}"))?;
+    fs::write(
+        docs_dir.join("runtime-diff-report.md"),
+        render_markdown_report(report),
+    )
+    .map_err(|error| format!("failed to write docs runtime markdown report: {error}"))?;
+
+    let mut lines = String::new();
+    for result in &report.results {
+        let line = serde_json::to_string(result).map_err(|error| error.to_string())?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+    fs::write(docs_dir.join("runtime-diff-results.jsonl"), lines)
+        .map_err(|error| format!("failed to write docs runtime JSONL report: {error}"))
+}
+
+fn output_summary(side: &RuntimeSideResult) -> RuntimeOutputSummary {
+    RuntimeOutputSummary {
+        exit_code: side.exit_code,
+        stdout: summarize_output(&side.stdout),
+        stderr: summarize_output(&side.stderr_normalized),
+    }
+}
+
+fn compare_first_differing_line(
+    reference: Option<&RuntimeSideResult>,
+    rust: Option<&RuntimeSideResult>,
+) -> Option<usize> {
+    let reference = reference?;
+    let rust = rust?;
+    if reference.stdout != rust.stdout {
+        first_differing_line(&reference.stdout, &rust.stdout)
+    } else if reference.stderr_normalized != rust.stderr_normalized {
+        first_differing_line(&reference.stderr_normalized, &rust.stderr_normalized)
+    } else {
+        None
+    }
+}
+
+fn classify_runtime_mismatch(
+    reference: &RuntimeSideResult,
+    rust: Option<&RuntimeSideResult>,
+    diagnostic_ids: &[String],
+    harness_error: Option<&str>,
+) -> MismatchCategory {
+    if let Some(error) = harness_error {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("timeout") {
+            return MismatchCategory::TimeoutOrNontermination;
+        }
+        return MismatchCategory::HarnessError;
+    }
+    let Some(rust) = rust else {
+        return MismatchCategory::HarnessError;
+    };
+    if diagnostic_ids.iter().any(|id| id.contains("UNSUPPORTED")) {
+        return MismatchCategory::UnsupportedFeature;
+    }
+    let stderr_lower = rust.stderr_normalized.to_ascii_lowercase();
+    if stderr_lower.contains("timeout") || stderr_lower.contains("step limit") {
+        return MismatchCategory::TimeoutOrNontermination;
+    }
+    if stderr_lower.contains("parse") || stderr_lower.contains("syntax") {
+        return MismatchCategory::PhrustParseMismatch;
+    }
+    if stderr_lower.contains("compile") || stderr_lower.contains("lower") {
+        return MismatchCategory::CompileMismatch;
+    }
+    if reference.exit_code != rust.exit_code {
+        return MismatchCategory::RuntimeExitMismatch;
+    }
+    if reference.stdout != rust.stdout {
+        return MismatchCategory::StdoutMismatch;
+    }
+    if !diagnostic_ids.is_empty() {
+        return MismatchCategory::DiagnosticMismatch;
+    }
+    if reference.stderr_normalized != rust.stderr_normalized {
+        return MismatchCategory::StderrMismatch;
+    }
+    MismatchCategory::HarnessError
+}
+
+fn infer_feature_area(fixture: &RuntimeFixture) -> Option<String> {
+    let mut parts = fixture.path.components().filter_map(|component| {
+        let text = component.as_os_str().to_str()?;
+        (!matches!(
+            text,
+            "fixtures" | "runtime" | "valid" | "invalid" | "known_gaps"
+        ))
+        .then_some(text.to_string())
+    });
+    parts.next()
+}
+
+fn count_by(values: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for value in values {
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn summarize_counts(counts: &BTreeMap<String, usize>) -> String {
+    let mut entries = counts
+        .iter()
+        .map(|(key, count)| format!("{key}:{count}"))
+        .collect::<Vec<_>>();
+    entries.truncate(5);
+    if entries.is_empty() {
+        "none".to_string()
+    } else {
+        entries.join(",")
+    }
+}
+
+fn render_markdown_report(report: &RuntimeReport) -> String {
+    let mut out = String::new();
+    out.push_str("# Runtime Compatibility Report\n\n");
+    out.push_str(&format!(
+        "- Fixtures: {}\n- Pass: {}\n- Unexpected failures: {}\n- Skipped: {}\n- Expected known gaps: {}\n- Unexpected passes: {}\n\n",
+        report.total,
+        report.pass,
+        report.fail,
+        report.skipped,
+        report.known_gap,
+        report.unexpected_pass
+    ));
+    render_count_section(&mut out, "Categories", &report.categories);
+    render_count_section(&mut out, "Feature Areas", &report.feature_areas);
+    render_count_section(&mut out, "Diagnostic IDs", &report.diagnostic_ids);
+    render_count_section(&mut out, "Owner Streams", &report.owner_areas);
+    out.push_str("## Non-Pass Fixtures\n\n");
+    out.push_str("| Fixture | Status | Category | Known gap | Feature area | Owner | First differing line | Message |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for result in &report.results {
+        if result.status == RuntimeComparisonStatus::Pass {
+            continue;
+        }
+        out.push_str(&format!(
+            "| `{}` | `{:?}` | {} | {} | {} | {} | {} | {} |\n",
+            markdown_escape(&result.file),
+            result.status,
+            result
+                .category
+                .map(|category| format!("`{}`", category.as_str()))
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .known_gap_id
+                .as_deref()
+                .map(|id| format!("`{}`", markdown_escape(id)))
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .feature_area
+                .as_deref()
+                .map(markdown_escape)
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .owner_area
+                .as_deref()
+                .map(markdown_escape)
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .first_differing_line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .message
+                .as_deref()
+                .map(markdown_escape)
+                .unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    out
+}
+
+fn render_count_section(out: &mut String, title: &str, counts: &BTreeMap<String, usize>) {
+    out.push_str(&format!("## {title}\n\n"));
+    if counts.is_empty() {
+        out.push_str("- none\n\n");
+        return;
+    }
+    for (key, count) in counts {
+        out.push_str(&format!("- `{}`: {}\n", markdown_escape(key), count));
+    }
+    out.push('\n');
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+impl KnownGapCatalog {
+    fn load(path: &Path) -> Result<Self, String> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let mut catalog = Self::default();
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: KnownGapEntry = serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))?;
+            for fixture in &entry.fixtures {
+                catalog.by_fixture.insert(fixture.clone(), entry.id.clone());
+            }
+            catalog.by_id.insert(entry.id.clone(), entry);
+        }
+        Ok(catalog)
+    }
+
+    fn find_for_fixture_metadata(&self, fixture: &RuntimeFixture) -> Option<KnownGapMatch> {
+        fixture
+            .known_gap_id
+            .as_ref()
+            .and_then(|id| self.match_by_id(id, "fixture-metadata"))
+    }
+
+    fn find(&self, fixture: &RuntimeFixture, diagnostic_ids: &[String]) -> Option<KnownGapMatch> {
+        if let Some(matched) = self.find_for_fixture_metadata(fixture) {
+            return Some(matched);
+        }
+        for diagnostic_id in diagnostic_ids {
+            if let Some(matched) = self.match_by_id(diagnostic_id, "diagnostic-id") {
+                return Some(matched);
+            }
+        }
+        self.by_fixture
+            .get(&fixture.display_path())
+            .and_then(|id| self.match_by_id(id, "fixture-path"))
+    }
+
+    fn match_by_id(&self, id: &str, confidence: &'static str) -> Option<KnownGapMatch> {
+        let entry = self.by_id.get(id)?;
+        if entry.status == "implemented" && confidence != "fixture-metadata" {
+            return None;
+        }
+        Some(KnownGapMatch {
+            id: entry.id.clone(),
+            confidence,
+            feature: Some(entry.feature.clone()),
+            owner_area: Some(if entry.owner_area.is_empty() {
+                entry.layer.clone()
+            } else {
+                entry.owner_area.clone()
+            }),
+        })
+    }
 }
 
 fn extract_diagnostic_ids(stderr: &str) -> Vec<String> {

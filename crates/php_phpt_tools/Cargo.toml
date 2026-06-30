@@ -10,5 +10,6 @@ name = "php-phpt-tools"
 path = "src/main.rs"
 
 [dependencies]
+php_testkit = { path = "../php_testkit" }
 regex = "1"
 sha2 = "0.10"

@@ -1390,6 +1390,7 @@ dependencies = [
 name = "php_phpt_tools"
 version = "0.1.0"
 dependencies = [
+ "php_testkit",
  "regex",
  "sha2",
 ]

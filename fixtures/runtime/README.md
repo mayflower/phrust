@@ -18,6 +18,7 @@ Runtime fixtures are small, focused programs grouped by behavior:
 | `corpus_smoke` | tiny self-contained programs that resemble real PHP shapes without vendored projects |
 | `invalid/*` | focused expected Rust runtime or compile failures |
 | `known_gaps/*` | explicit unsupported/deferred runtime categories |
+| `governance/*` | small compatibility-governance seed fixtures |
 
 `just runtime-fixtures` runs the Rust VM-only regression gate without requiring
 a PHP reference binary.
@@ -41,8 +42,12 @@ autoload surface.
 `just runtime-diff` runs `compare-runtime`, writes per-fixture JSON plus
 `runtime-report.json` under `target/runtime/runtime-diff`, and compares valid
 fixtures against `REFERENCE_PHP` when configured. The runner records
-`pass`, `fail`, `skipped`, and `known_gap` statuses and includes exit code,
-stdout, normalized stderr/diagnostics, diagnostic IDs, and known-gap IDs.
+`pass`, `fail`, `skipped`, `known_gap`, and `unexpected_pass` statuses and
+includes exit code, stdout, normalized stderr/diagnostics, diagnostic IDs,
+known-gap IDs, mismatch category, output summaries, first differing line,
+feature area, and owner area. It also writes `runtime-results.jsonl`,
+`runtime-report.md`, and canonical copies under `docs/runtime/reports/` for
+grouped triage by category, diagnostic ID, feature area, and owner stream.
 
 Optional per-fixture metadata can be placed near the top of a fixture:
 
@@ -51,6 +56,12 @@ Optional per-fixture metadata can be placed near the top of a fixture:
 // runtime-fixture: expect=pass args=alpha,beta normalize=path_lines php_ref_required=true
 ```
 
-Supported keys are `expect`, `known_gap`, `args`, `normalize`, and
-`php_ref_required`. Metadata is intentionally minimal so fixture behavior stays
-visible in the PHP source.
+Supported keys are `expect`, `known_gap`, `args`, `normalize`,
+`php_ref_required`, and `category`. Metadata is intentionally minimal so
+fixture behavior stays visible in the PHP source.
+
+Governance seed fixtures use `expect=known_gap` to demonstrate report grouping.
+They may set `category=<taxonomy name>` to show the intended mismatch bucket
+without changing pass/fail status. When `REFERENCE_PHP` is available and such a
+fixture now matches the reference, the report emits `UnexpectedPass` so the gap
+can be retired with evidence.

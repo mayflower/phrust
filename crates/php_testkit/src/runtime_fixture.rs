@@ -1,5 +1,6 @@
 //! Runtime fixture metadata and comparison result formats.
 
+use crate::compatibility::MismatchCategory;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,8 @@ pub struct RuntimeFixture {
     pub normalize: Option<String>,
     /// Optional stable known-gap ID.
     pub known_gap_id: Option<String>,
+    /// Optional explicit report category for governance fixtures.
+    pub category: Option<MismatchCategory>,
     /// Script arguments passed after `--`.
     pub args: Vec<String>,
 }
@@ -82,6 +85,7 @@ impl RuntimeFixture {
             php_ref_required: false,
             normalize: None,
             known_gap_id: None,
+            category: None,
             args: Vec::new(),
         };
         fixture.apply_comment_metadata();
@@ -122,6 +126,7 @@ impl RuntimeFixture {
                     }
                     "normalize" => self.normalize = Some(value.to_owned()),
                     "known_gap" => self.known_gap_id = Some(value.to_owned()),
+                    "category" => self.category = MismatchCategory::parse(value),
                     "args" => {
                         self.args = value
                             .split(',')
@@ -159,6 +164,19 @@ pub enum RuntimeComparisonStatus {
     Skipped,
     /// Difference is explicitly documented as a known gap.
     KnownGap,
+    /// A known-gap fixture now matches the reference output.
+    UnexpectedPass,
+}
+
+/// Short output summary for reports and triage lists.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeOutputSummary {
+    /// Exit code classification or numeric code string.
+    pub exit_code: Option<i32>,
+    /// Short stdout summary.
+    pub stdout: String,
+    /// Short stderr summary.
+    pub stderr: String,
 }
 
 /// JSON shape for runtime runtime comparison results.
@@ -166,16 +184,32 @@ pub enum RuntimeComparisonStatus {
 pub struct RuntimeComparisonResult {
     /// Fixture path.
     pub file: String,
+    /// Tool or command mode that produced this record.
+    pub mode: String,
     /// PHP reference side when available.
     pub reference: Option<RuntimeSideResult>,
     /// Rust runtime side when available.
     pub rust: Option<RuntimeSideResult>,
     /// Comparison status.
     pub status: RuntimeComparisonStatus,
+    /// Stable compatibility mismatch category for non-pass records.
+    pub category: Option<MismatchCategory>,
     /// Stable runtime diagnostic IDs emitted by the Rust runtime.
     pub diagnostic_ids: Vec<String>,
     /// Known-gap ID when `status` is `KnownGap`.
     pub known_gap_id: Option<String>,
+    /// How the known-gap ID was selected.
+    pub known_gap_match_confidence: Option<String>,
+    /// Feature area used for grouped reports.
+    pub feature_area: Option<String>,
+    /// Suggested owning wave/stream or layer.
+    pub owner_area: Option<String>,
+    /// Reference output summary.
+    pub reference_summary: Option<RuntimeOutputSummary>,
+    /// Phrust output summary.
+    pub phrust_summary: Option<RuntimeOutputSummary>,
+    /// First differing stdout/stderr line when both sides are available.
+    pub first_differing_line: Option<usize>,
     /// Human-readable failure or skip details.
     pub message: Option<String>,
 }
@@ -203,7 +237,7 @@ fn infer_runtime_kind(path: &Path) -> RuntimeFixtureKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeComparisonResult, RuntimeComparisonStatus, RuntimeFixture,
+        MismatchCategory, RuntimeComparisonResult, RuntimeComparisonStatus, RuntimeFixture,
         RuntimeFixtureExpectation, RuntimeFixtureKind, RuntimeSideResult,
     };
     use std::path::PathBuf;
@@ -250,6 +284,14 @@ mod tests {
         assert_eq!(fixture.normalize.as_deref(), Some("path_lines"));
         assert_eq!(fixture.known_gap_id.as_deref(), Some("E_TEST"));
         assert_eq!(fixture.args, ["one", "two"]);
+
+        std::fs::write(
+            &path,
+            "<?php\n// runtime-fixture: category=UnsupportedFeature\n",
+        )
+        .expect("fixture write");
+        let fixture = RuntimeFixture::new(path.clone());
+        assert_eq!(fixture.category, Some(MismatchCategory::UnsupportedFeature));
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(dir);
     }
@@ -258,6 +300,7 @@ mod tests {
     fn runtime_comparison_result_has_expected_json_shape() {
         let result = RuntimeComparisonResult {
             file: "fixtures/runtime/valid/hello.php".to_owned(),
+            mode: "compare-runtime".to_owned(),
             reference: Some(RuntimeSideResult {
                 exit_code: Some(0),
                 stdout: "hello runtime\n".to_owned(),
@@ -265,14 +308,22 @@ mod tests {
             }),
             rust: None,
             status: RuntimeComparisonStatus::Skipped,
+            category: None,
             diagnostic_ids: vec![],
             known_gap_id: None,
+            known_gap_match_confidence: None,
+            feature_area: None,
+            owner_area: None,
+            reference_summary: None,
+            phrust_summary: None,
+            first_differing_line: None,
             message: None,
         };
         let json = result.to_pretty_json().expect("runtime JSON");
         assert!(json.contains("\"reference\""));
         assert!(json.contains("\"rust\""));
         assert!(json.contains("\"status\""));
+        assert!(json.contains("\"category\""));
         assert!(json.contains("\"diagnostic_ids\""));
         assert!(json.contains("\"known_gap_id\""));
     }
