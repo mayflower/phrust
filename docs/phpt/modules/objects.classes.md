@@ -3,7 +3,7 @@
 - Priority: 10
 - Selected manifest: `tests/phpt/manifests/modules/objects.classes.selected.jsonl`
 - Current corpus counts: 178 PASS, 33 SKIP, 1924 FAIL, 0 BORK from 2136 corpus candidates
-- Current selected run: reference 246 PASS; target 245 PASS, 1 FAIL from
+- Current selected run: reference 246 PASS; target 246 PASS, 0 FAIL from
   246 selected rows
 - Core close gate: `objects.core` is 16 PASS / 0 FAIL for reference and target
 
@@ -148,15 +148,14 @@ static-as-instance edge cases, and broader object/reference COW behavior.
 - `frontend-parse-or-compile`: 2
 - `runtime-timeout`: 1
 
-Current selected `objects.classes` has one target non-green row outside the
-prompt slice:
-
-- `tests/classes/autoload_021.phpt`: output-formatting parity for an unresolved
-  autoload class name; target prints the class name before the expected fatal
-  header.
+Current selected `objects.classes` is green for all 246 selected rows. The
+Wave 4A follow-up moved `tests/classes/autoload_021.phpt` and
+`tests/classes/constants_error_003.phpt` to target PASS without adding new known
+gaps.
 
 ## Next Step
 
 Keep `objects.core` as the construction/property/method/visibility/static/type
-regression gate. Continue reducing the remaining selected `objects.classes`
-failures by owned runtime area while keeping the advanced submodule gates green.
+regression gate. Future object/class work should expand the selected
+`objects.classes` manifest in bounded, reference-clean batches while keeping the
+advanced submodule gates green.

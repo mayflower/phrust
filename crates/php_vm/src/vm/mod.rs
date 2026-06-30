@@ -6207,15 +6207,20 @@ impl Vm {
             Err(message) => {
                 let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
                 let error_span = call.call_span.unwrap_or(ir_function.span);
+                let caller_only_trace = message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
                 let result = self.runtime_error(output, error_compiled, stack, message);
                 if let Some(throwable) = runtime_error_throwable(&result) {
                     tag_throwable_location(&throwable, error_compiled, error_span);
-                    state.pending_trace = Some(capture_backtrace_string_with_failed_call(
-                        error_compiled,
-                        stack,
-                        ir_function,
-                        error_span,
-                    ));
+                    state.pending_trace = Some(if caller_only_trace {
+                        capture_backtrace_string(error_compiled, stack)
+                    } else {
+                        capture_backtrace_string_with_failed_call(
+                            error_compiled,
+                            stack,
+                            ir_function,
+                            error_span,
+                        )
+                    });
                     state.pending_throw = Some(throwable);
                     return VmResult::propagating_exception(output.clone());
                 }
@@ -9628,15 +9633,21 @@ impl Vm {
                 Err(message) => {
                     let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
                     let error_span = call.call_span.unwrap_or(function.span);
+                    let caller_only_trace =
+                        message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
                     let result = self.runtime_error(output, error_compiled, stack, message);
                     if let Some(throwable) = runtime_error_throwable(&result) {
                         tag_throwable_location(&throwable, error_compiled, error_span);
-                        state.pending_trace = Some(capture_backtrace_string_with_failed_call(
-                            error_compiled,
-                            stack,
-                            function,
-                            error_span,
-                        ));
+                        state.pending_trace = Some(if caller_only_trace {
+                            capture_backtrace_string(error_compiled, stack)
+                        } else {
+                            capture_backtrace_string_with_failed_call(
+                                error_compiled,
+                                stack,
+                                function,
+                                error_span,
+                            )
+                        });
                         state.pending_throw = Some(throwable);
                         return VmResult::propagating_exception(output.clone());
                     }
@@ -21132,7 +21143,7 @@ impl Vm {
                     );
                 }
                 let values = match call_builtin_args_to_positional(
-                    compiled, &name, args, output, stack, state,
+                    compiled, &name, args, call_span, output, stack, state,
                 ) {
                     Ok(values) => values,
                     Err(InternalBuiltinArgError::Message(message)) => {
@@ -22125,7 +22136,8 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> VmResult {
         let values =
-            match call_builtin_args_to_positional(compiled, name, args, output, stack, state) {
+            match call_builtin_args_to_positional(compiled, name, args, None, output, stack, state)
+            {
                 Ok(values) => values,
                 Err(InternalBuiltinArgError::Message(message)) => {
                     return self.runtime_error(output, compiled, stack, message);
@@ -23413,6 +23425,7 @@ impl Vm {
                 compiled,
                 &normalized,
                 args,
+                None,
                 output,
                 stack,
                 state,
@@ -23581,7 +23594,7 @@ impl Vm {
                     }
                     FunctionCallBuiltinKind::InternalRegistry => {
                         let values = match call_builtin_args_to_positional(
-                            compiled, &name, args, output, stack, state,
+                            compiled, &name, args, call_span, output, stack, state,
                         ) {
                             Ok(values) => values,
                             Err(InternalBuiltinArgError::Message(message)) => {
@@ -29965,6 +29978,7 @@ impl Vm {
         let normalized = normalize_class_name(class_name);
         if lookup_class_in_state(compiled, state, class_name).is_some()
             || state.autoload_stack.iter().any(|name| name == &normalized)
+            || !is_valid_autoload_class_name(class_name)
         {
             return Ok(());
         }
@@ -44548,6 +44562,30 @@ fn php_name_tokens(source: &str) -> Vec<String> {
     tokens
 }
 
+fn is_valid_autoload_class_name(class_name: &str) -> bool {
+    let name = class_name.strip_prefix('\\').unwrap_or(class_name);
+    if name.is_empty() {
+        return false;
+    }
+    name.split('\\')
+        .all(|segment| is_valid_autoload_class_name_segment(segment.as_bytes()))
+}
+
+fn is_valid_autoload_class_name_segment(segment: &[u8]) -> bool {
+    let Some((&first, rest)) = segment.split_first() else {
+        return false;
+    };
+    is_php_name_start_byte(first) && rest.iter().copied().all(is_php_name_byte)
+}
+
+fn is_php_name_start_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic() || byte >= 0x80
+}
+
+fn is_php_name_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric() || byte >= 0x80
+}
+
 impl AutoloadClassLookupKind {
     const fn exists_function_name(self) -> &'static str {
         match self {
@@ -50291,6 +50329,7 @@ fn call_builtin_args_to_positional(
     compiled: &CompiledUnit,
     function: &str,
     args: Vec<CallArgument>,
+    call_span: Option<IrSpan>,
     output: &mut OutputBuffer,
     stack: &mut CallStack,
     state: &mut ExecutionState,
@@ -50331,6 +50370,7 @@ fn call_builtin_args_to_positional(
                     function,
                     index + 1,
                     param_name,
+                    call_span,
                 ),
             )));
         }
@@ -50527,8 +50567,11 @@ fn internal_builtin_by_ref_temporary_fatal_result(
     function: &str,
     position: usize,
     param_name: &str,
+    span: Option<IrSpan>,
 ) -> VmResult {
-    let source_span = RuntimeSourceSpan::default();
+    let source_span = span.map_or_else(RuntimeSourceSpan::default, |span| {
+        runtime_source_span(compiled, span)
+    });
     let location = php_runtime::PhpDiagnosticLocation::from_span(&source_span);
     let message = format!(
         "Uncaught Error: {function}(): Argument #{position} (${param_name}) could not be passed by reference"
@@ -52344,6 +52387,27 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             result.output.to_string_lossy(),
             "autoload:MissingAutoloadTarget|first"
         );
+    }
+
+    #[test]
+    fn spl_autoload_skips_invalid_dynamic_class_names() {
+        let result = execute_source(
+            "<?php
+            spl_autoload_register(function ($name) {
+                echo $name, \"\\n\";
+            });
+            $class = '../BUG';
+            new $class;
+            ",
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.contains("Fatal error: Uncaught Error: Class \"../BUG\" not found in "),
+            "{output}"
+        );
+        assert!(!output.starts_with("../BUG\n"), "{output}");
     }
 
     #[test]
@@ -63309,6 +63373,7 @@ $c = new foo;"#,
             output.contains("Stack trace:\n#0 {main}\n  thrown in "),
             "{output}"
         );
+        assert!(!output.contains("<unknown>:0"), "{output}");
         assert_eq!(
             result.diagnostics[0].id(),
             "E_PHP_VM_INTERNAL_BY_REF_ARG_NOT_REFERENCEABLE"
@@ -63632,6 +63697,28 @@ $c = new foo;"#,
         let ret = execute_source("<?php function &bad_ref() { return 1; } $x =& bad_ref();");
         assert_eq!(ret.status.exit_status(), ExitStatus::RuntimeError);
         assert_eq!(ret.diagnostics[0].id(), "E_PHP_VM_BY_REF_RETURN_TEMPORARY");
+    }
+
+    #[test]
+    fn call_by_ref_class_constant_uses_caller_only_trace() {
+        let result = execute_source(
+            "<?php
+            class C { const VALUE = 1; }
+            function take_ref(&$value) {}
+            take_ref(C::VALUE);
+            ",
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.contains(
+                "Fatal error: Uncaught Error: take_ref(): Argument #1 ($value) could not be passed by reference"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("Stack trace:\n#0 {main}"), "{output}");
+        assert!(!output.contains("): take_ref()"), "{output}");
     }
 
     #[test]
