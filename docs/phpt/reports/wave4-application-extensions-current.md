@@ -12,7 +12,7 @@ Oracle: PHP 8.5.7 from
 | `json` | 15 PASS | Selected gate is green after promoting 5 upstream rows and adding `JSON_NUMERIC_CHECK` support. |
 | `pcre` | 11 PASS | Selected gate is green after promoting 6 upstream rows. |
 | `date` | 9 PASS | Selected gate is green after promoting 2 upstream rows and adding `checkdate()`. |
-| `spl` | 18 PASS, 1 SKIP, 189 FAIL | Broad selected gate remains red on unsupported SPL classes, iterator behavior, and serialization parity. |
+| `spl` | 76 PASS, 1 SKIP, 131 FAIL | Broad selected gate remains red, but the upstream `spl_autoload_bug48541.phpt`, `spl_autoload_010.phpt`, and `spl_autoload_013.phpt` rows now pass after preserving evaluated `eval()` concat operands, honoring autoload prepend order, delaying function-local class declarations until execution, and exposing closure/autoload callback metadata in PHP's expected shape. |
 | `reflection` | 22 PASS | Selected aggregate gate is green. |
 | `mysqli` | 5 PASS | Default-off selected gate is green after promoting mysqlnd metadata probes. |
 | `pdo` | 4 PASS | Selected gate is green after promoting driver-list coverage. |
@@ -37,7 +37,7 @@ source-integrity manifest when it ran in this checkout.
 | JSON | 10 PASS | 15 PASS | +5 upstream PHPTs |
 | PCRE | 5 PASS | 11 PASS | +6 upstream PHPTs |
 | Date | 7 PASS | 9 PASS | +2 upstream PHPTs |
-| SPL | 18 PASS, 1 SKIP, 189 FAIL | 18 PASS, 1 SKIP, 189 FAIL | unchanged; broad aggregate remains blocked |
+| SPL | 18 PASS, 1 SKIP, 189 FAIL | 76 PASS, 1 SKIP, 131 FAIL | +3 upstream autoload PHPTs in the current selected aggregate; broad aggregate remains blocked |
 | Reflection | 22 PASS | 22 PASS | unchanged |
 | DB/network modules | 25 PASS, 5 SKIP | 34 PASS, 5 SKIP | +9 upstream PHPTs; optional live rows stayed default-off |
 | XML/SimpleXML/Intl | 10 PASS | 14 PASS | +4 upstream PHPTs |
@@ -91,6 +91,12 @@ The DB/network count includes `mysqli`, `pdo`, `pdo_sqlite`, `sqlite3`,
 
 - `ext/date/tests/DateTimeZone_getName_basic1.phpt`
 - `ext/date/tests/006.phpt`
+
+### SPL
+
+- `ext/spl/tests/spl_autoload_bug48541.phpt`
+- `ext/spl/tests/spl_autoload_010.phpt`
+- `ext/spl/tests/spl_autoload_013.phpt`
 
 ### DB, cURL, and OpenSSL
 
@@ -161,10 +167,12 @@ this wave.
 Passed:
 
 - `nix develop -c cargo fmt --check`
+- `nix develop -c cargo test -p php_semantics`
 - `nix develop -c cargo test -p php_runtime json -- --nocapture`
 - `nix develop -c cargo test -p php_runtime checkdate -- --nocapture`
 - `nix develop -c cargo test -p php_runtime`
 - `nix develop -c cargo test -p php_std`
+- `nix develop -c cargo test -p php_ir`
 - `nix develop -c cargo test -p php_vm`
 - `nix develop -c cargo test -p php_runtime session`
 - `nix develop -c cargo test -p php_server`
@@ -184,6 +192,10 @@ Passed:
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=phar`
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=session`
 - `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=wp.db-network`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_PASS=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-fast MODULE=spl FILE=ext/spl/tests/spl_autoload_bug48541.phpt`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_PASS=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-fast MODULE=spl FILE=ext/spl/tests/spl_autoload_010.phpt`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_PASS=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-fast MODULE=spl FILE=ext/spl/tests/spl_autoload_013.phpt`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=spl.autoload`
 - `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHP_SRC_DIR=$PWD/third_party/php-src nix develop -c just verify-stdlib`
 - `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHP_SRC_DIR=$PWD/third_party/php-src nix develop -c just verify-runtime`
 - `REFERENCE_PHP=$PWD/third_party/php-src/sapi/cli/php PHP_SRC_DIR=$PWD/third_party/php-src nix develop -c just verify-server`
@@ -214,7 +226,7 @@ Inventory gates run before the promotion:
 
 Failed:
 
-- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=spl`
+- `PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=spl` now reports 76 PASS, 1 SKIP, and 131 FAIL in the target run.
 
 `spl` is the only non-green selected module gate. It is not broadened in this
 slice; the current failures remain visible instead of being skipped or

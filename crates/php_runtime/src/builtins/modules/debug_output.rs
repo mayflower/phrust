@@ -1,6 +1,6 @@
 //! Debug-output formatting for core inspection builtins.
 
-use crate::{ArrayKey, CallableValue, OutputBuffer, Value, value::FloatValue};
+use crate::{ArrayKey, CallableValue, OutputBuffer, PhpArray, Value, value::FloatValue};
 use std::collections::BTreeSet;
 
 pub(in crate::builtins::modules) struct DebugFormatter {
@@ -132,7 +132,11 @@ impl DebugFormatter {
                 let debug = payload.debug.as_ref().expect("checked above");
                 let has_static = !payload.captures.is_empty();
                 let has_this = payload.bound_this.is_some();
-                let property_count = 3 + usize::from(has_static) + usize::from(has_this);
+                let has_parameters = !debug.parameters.is_empty();
+                let property_count = 3
+                    + usize::from(has_parameters)
+                    + usize::from(has_static)
+                    + usize::from(has_this);
                 output.write_test_str(&format!(
                     "object(Closure)#{} ({property_count}) {{\n",
                     payload.id
@@ -150,6 +154,14 @@ impl DebugFormatter {
                     indent,
                 );
                 self.write_var_dump_property(output, "line", Value::Int(debug.line), indent);
+                if has_parameters {
+                    self.write_var_dump_property(
+                        output,
+                        "parameter",
+                        closure_parameter_debug_array(&debug.parameters),
+                        indent,
+                    );
+                }
                 if has_static {
                     self.write_closure_static_var_dump(
                         output,
@@ -509,6 +521,25 @@ pub(in crate::builtins::modules) fn write_export_single_quoted_string(
         }
     }
     output.write_test_str("'");
+}
+
+fn closure_parameter_debug_array(parameters: &[crate::ClosureDebugParameter]) -> Value {
+    let mut array = PhpArray::new();
+    for parameter in parameters {
+        let state = if parameter.required {
+            "<required>"
+        } else {
+            "<optional>"
+        };
+        array.insert(
+            ArrayKey::String(crate::PhpString::from_test_str(&format!(
+                "${}",
+                parameter.name
+            ))),
+            Value::string(state),
+        );
+    }
+    Value::Array(array)
 }
 
 pub(in crate::builtins::modules) fn php_float_debug_string(

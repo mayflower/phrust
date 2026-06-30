@@ -73,17 +73,18 @@ use php_runtime::{
     ClassPropertyEntry as RuntimeClassPropertyEntry,
     ClassPropertyFlags as RuntimeClassPropertyFlags,
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureContext,
-    ClosureDebugInfo, ClosurePayload, ExecutionStatus, FiberRef, FiberState, GeneratorRef,
-    GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef, OutputBuffer, PhpArray,
-    PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpString,
-    ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload,
-    RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType,
-    Slot, UnserializeOptions, UploadRegistry, Value, VmCompileDiagnostic, compare,
-    division_by_zero_mvp, emit_php_diagnostic, equal, error_reporting_allows_level, identical,
-    reset_float_string_precision, runtime_type_name, serialize as serialize_value,
-    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
-    to_string, undefined_function, undefined_variable_warning, unserialize as unserialize_value,
-    unsupported_feature, value_matches_runtime_type, value_type_name,
+    ClosureDebugInfo, ClosureDebugParameter, ClosurePayload, ExecutionStatus, FiberRef, FiberState,
+    GeneratorRef, GeneratorState, GlobalSymbolTable, NumericValue, ObjectRef, OutputBuffer,
+    PhpArray, PhpArrayKind, PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback,
+    PhpString, ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic,
+    RuntimeDiagnosticPayload, RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan,
+    RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions, UploadRegistry, Value,
+    VmCompileDiagnostic, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
+    error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
+    serialize as serialize_value, set_float_string_precision, to_arithmetic_number, to_bool,
+    to_float, to_int, to_number, to_string, undefined_function, undefined_variable_warning,
+    unserialize as unserialize_value, unsupported_feature, value_matches_runtime_type,
+    value_type_name,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -102,6 +103,10 @@ const SORT_DESC: i64 = 3;
 const SORT_ASC: i64 = 4;
 const SORT_LOCALE_STRING: i64 = 5;
 const SORT_NATURAL: i64 = 6;
+const SPL_RUNTIME_CLASS_PROPERTY: &str = "__spl_runtime_class";
+const SPL_PRIORITY_QUEUE_EXTR_DATA: i64 = 1;
+const SPL_PRIORITY_QUEUE_EXTR_PRIORITY: i64 = 2;
+const SPL_PRIORITY_QUEUE_EXTR_BOTH: i64 = 3;
 const SORT_FLAG_CASE: i64 = 8;
 const NORMALIZER_FORM_C: i64 = 4;
 #[cfg(feature = "jit-cranelift")]
@@ -388,6 +393,12 @@ enum RaiseOutcome {
     Caught(BlockId),
     /// Nothing caught it in this frame; return this result to the caller.
     Done(Box<VmResult>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutoloadTraceOrigin {
+    function_name: &'static str,
+    span: php_ir::IrSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +928,7 @@ struct ExecutionState {
     class_relation_cache: ClassRelationCache,
     autoload_registry: AutoloadRegistry,
     autoload_stack: Vec<String>,
+    spl_autoload_extensions: String,
     dynamic_units: Vec<CompiledUnit>,
     dynamic_functions: Vec<DynamicFunctionEntry>,
     dynamic_classes: Vec<DynamicClassEntry>,
@@ -2141,6 +2153,7 @@ impl Vm {
             ini: self.options.runtime_context.ini_registry(),
             default_timezone: php_runtime::datetime::DEFAULT_TIMEZONE.to_owned(),
             env: self.options.runtime_context.env.clone(),
+            spl_autoload_extensions: ".inc,.php".to_owned(),
             upload_registry: self.options.runtime_context.upload_registry(),
             session: self.options.runtime_context.session.clone(),
             execution_deadline_at: self
@@ -4546,8 +4559,13 @@ impl Vm {
             return None;
         };
         let class_name = object.class_name();
-        let is_countable = internal_spl_container_instanceof(&class_name, "Countable")
-            .or_else(|| internal_spl_iterator_instanceof(&class_name, "Countable"))
+        let is_countable = spl_runtime_marker(&object)
+            .and_then(|spl_class| {
+                internal_spl_container_instanceof(&spl_class, "Countable")
+                    .or_else(|| internal_spl_iterator_instanceof(&spl_class, "Countable"))
+                    .or_else(|| internal_spl_file_instanceof(&spl_class, "Countable"))
+                    .or_else(|| internal_spl_heap_instanceof(&spl_class, "Countable"))
+            })
             .unwrap_or(false)
             || class_implements_in_state(
                 compiled,
@@ -4582,6 +4600,9 @@ impl Vm {
         compiled: &CompiledUnit,
     ) -> Option<VmResult> {
         match name {
+            "iterator_apply" => {
+                Some(self.execute_iterator_apply(values, output, stack, state, compiled))
+            }
             "iterator_count" => {
                 Some(self.execute_iterator_count(values, output, stack, state, compiled))
             }
@@ -4589,6 +4610,131 @@ impl Vm {
                 Some(self.execute_iterator_to_array(values, output, stack, state, compiled))
             }
             _ => None,
+        }
+    }
+
+    fn execute_iterator_apply(
+        &self,
+        values: &[Value],
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> VmResult {
+        if !(2..=3).contains(&values.len()) {
+            let comparator = if values.len() < 2 {
+                "at least"
+            } else {
+                "at most"
+            };
+            let expected = if values.len() < 2 { 2 } else { 3 };
+            let message = format!(
+                "iterator_apply() expects {comparator} {expected} arguments, {} given",
+                values.len()
+            );
+            let diagnostic = RuntimeDiagnostic::new(
+                "E_PHP_RUNTIME_BUILTIN_ARITY",
+                RuntimeSeverity::FatalError,
+                message.clone(),
+                RuntimeSourceSpan::default(),
+                stack_trace(compiled, stack),
+                Some(php_runtime::PhpReferenceClassification::Error),
+            );
+            return VmResult::runtime_error_with_diagnostic(output.clone(), message, diagnostic);
+        }
+        let callback = values[1].clone();
+        let callback_args = match values.get(2).map(effective_value) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(array)) => call_args_from_php_array(array.clone()),
+            Some(other) => {
+                let message = format!(
+                    "iterator_apply(): Argument #3 ($args) must be of type ?array, {} given",
+                    value_type_name(&other)
+                );
+                let diagnostic = RuntimeDiagnostic::new(
+                    "E_PHP_RUNTIME_BUILTIN_TYPE",
+                    RuntimeSeverity::FatalError,
+                    message.clone(),
+                    RuntimeSourceSpan::default(),
+                    stack_trace(compiled, stack),
+                    Some(php_runtime::PhpReferenceClassification::TypeError),
+                );
+                return VmResult::runtime_error_with_diagnostic(
+                    output.clone(),
+                    message,
+                    diagnostic,
+                );
+            }
+        };
+        if let Err(error) = validate_array_callback_arg(
+            compiled,
+            state,
+            "iterator_apply",
+            2,
+            "callback",
+            false,
+            &callback,
+        ) {
+            return match error {
+                ArrayCallbackError::Runtime(result) => *result,
+                ArrayCallbackError::BuiltinType { function, actual } => {
+                    array_callback_type_error(output, compiled, stack, function, &actual)
+                }
+                ArrayCallbackError::Message(message) => {
+                    self.runtime_error(output, compiled, stack, message)
+                }
+            };
+        }
+        let mut iterator = match self.foreach_iterator_from_value(
+            compiled,
+            effective_value(&values[0]),
+            output,
+            stack,
+            state,
+            ForeachInvalidSourceBehavior::Unsupported,
+        ) {
+            Ok(iterator) => {
+                let mut iterators = HashMap::new();
+                iterators.insert(RegId::new(0), iterator);
+                iterators
+            }
+            Err(result) => return result,
+        };
+        let mut count = 0_i64;
+        loop {
+            match self.next_foreach_value(
+                compiled,
+                output,
+                stack,
+                state,
+                &mut iterator,
+                RegId::new(0),
+                false,
+            ) {
+                Ok(Some(_)) => {
+                    let callback_result = self.call_callable_with_by_ref_value_warnings(
+                        compiled,
+                        callback.clone(),
+                        callback_args.clone(),
+                        output,
+                        stack,
+                        state,
+                    );
+                    if !callback_result.status.is_success() {
+                        return callback_result;
+                    }
+                    count += 1;
+                    let should_continue = callback_result
+                        .return_value
+                        .as_ref()
+                        .is_some_and(|value| to_bool(value).unwrap_or(false));
+                    if !should_continue {
+                        return VmResult::success(output.clone(), Some(Value::Int(count)));
+                    }
+                }
+                Ok(None) => return VmResult::success(output.clone(), Some(Value::Int(count))),
+                Err(result) => return result,
+            }
         }
     }
 
@@ -9126,7 +9272,8 @@ impl Vm {
     ) -> Result<Value, VmResult> {
         let base = effective_value(array);
         if let Value::Object(object) = &base
-            && is_spl_container_runtime_class(&object.class_name())
+            && spl_runtime_marker(object)
+                .is_some_and(|class| is_spl_array_access_runtime_class(&class))
         {
             return spl_container_offset_get(object, key_value)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message));
@@ -9917,6 +10064,11 @@ impl Vm {
                             state
                                 .user_constants
                                 .insert(name.clone(), effective_value(&value));
+                        }
+                    }
+                    InstructionKind::DeclareClass { name } => {
+                        if let Err(message) = declare_runtime_class(compiled, state, name) {
+                            return self.runtime_error(output, compiled, stack, message);
                         }
                     }
                     InstructionKind::Move { dst, src } => {
@@ -11361,13 +11513,13 @@ impl Vm {
                             *class_name,
                         ) {
                             Ok(Value::String(value)) => {
-                                let display = value.to_string_lossy();
+                                let display = display_class_name(&value.to_string_lossy());
                                 (normalize_class_name(&display), display)
                             }
-                            Ok(Value::Object(object)) => {
-                                let display = object.class_name();
-                                (normalize_class_name(&display), display)
-                            }
+                            Ok(Value::Object(object)) => (
+                                normalize_class_name(&object.class_name()),
+                                object.display_name(),
+                            ),
                             Ok(other) => {
                                 return self.runtime_error(
                                         output,
@@ -11443,7 +11595,22 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -11578,26 +11745,51 @@ impl Vm {
                             }
                             continue;
                         }
-                        let Some(class) = lookup_class_in_state(compiled, state, &class_name)
-                        else {
-                            match self.raise_runtime_error(
+                        let class = if let Some(class) =
+                            lookup_class_in_state(compiled, state, &class_name)
+                        {
+                            class
+                        } else {
+                            match self.class_like_exists_with_autoload_cache(
                                 compiled,
+                                &display_class_name,
+                                AutoloadClassLookupKind::Class,
+                                true,
+                                Some((
+                                    compiled_unit_cache_key(compiled),
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                )),
                                 output,
                                 stack,
                                 state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                instruction.span,
-                                format!(
-                                    "E_PHP_VM_UNKNOWN_CLASS: Class \"{display_class_name}\" not found"
-                                ),
                             ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
-                                }
-                                RaiseOutcome::Done(result) => return *result,
+                                Ok(_) => {}
+                                Err(result) => return result,
                             }
+                            let Some(class) = lookup_class_in_state(compiled, state, &class_name)
+                            else {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    format!(
+                                        "E_PHP_VM_UNKNOWN_CLASS: Class \"{display_class_name}\" not found"
+                                    ),
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            };
+                            class
                         };
                         let runtime_class = match runtime_class_entry(
                             compiled,
@@ -11645,10 +11837,18 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
+                        let spl_runtime_parent =
+                            spl_runtime_parent_for_class(compiled, state, &class);
                         let object = ObjectRef::new_with_display_name(
                             &runtime_class,
                             class.display_name.clone(),
                         );
+                        if let Some(spl_class) = spl_runtime_parent.as_deref() {
+                            object.set_property(
+                                SPL_RUNTIME_CLASS_PROPERTY,
+                                Value::string(spl_class.as_bytes().to_vec()),
+                            );
+                        }
                         let caller_scope = current_scope_class(compiled, stack);
                         let constructor = match lookup_method_in_hierarchy(
                             compiled,
@@ -11737,15 +11937,15 @@ impl Vm {
                                 );
                             }
                             diagnostics.extend(result.diagnostics);
-                        } else if !values.is_empty() {
-                            return self.runtime_error(
-                                output,
-                                compiled,
-                                stack,
-                                format!(
-                                    "E_PHP_VM_TOO_MANY_ARGS: constructor for class {class_name} does not accept arguments"
-                                ),
-                            );
+                        } else if let Some(spl_class) = spl_runtime_parent
+                            && let Err(message) = initialize_spl_runtime_subclass_storage(
+                                &object,
+                                &spl_class,
+                                values,
+                                &self.options.runtime_context,
+                            )
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
                         }
                         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
                         if let Err(message) = stack
@@ -11759,6 +11959,7 @@ impl Vm {
                     }
                     InstructionKind::NewObject {
                         dst,
+                        display_class_name,
                         class_name,
                         args,
                     } => {
@@ -11871,7 +12072,11 @@ impl Vm {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
                             };
-                            let object = match new_spl_iterator_object(class_name, values) {
+                            let object = match new_spl_iterator_object(
+                                class_name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
                                 Ok(object) => object,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -11895,6 +12100,29 @@ impl Vm {
                                 }
                             };
                             let object = match new_spl_container_object(class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_spl_heap_runtime_class(class_name) {
+                            let values = match read_call_args(unit, stack, args) {
+                                Ok(values) => values,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            let object = match new_spl_heap_object(class_name, values) {
                                 Ok(object) => object,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -12191,7 +12419,11 @@ impl Vm {
                                                 .runtime_error(output, compiled, stack, message);
                                         }
                                     };
-                                    let object = match new_spl_iterator_object(class_name, values) {
+                                    let object = match new_spl_iterator_object(
+                                        class_name,
+                                        values,
+                                        &self.options.runtime_context,
+                                    ) {
                                         Ok(object) => object,
                                         Err(message) => {
                                             return self
@@ -12219,6 +12451,32 @@ impl Vm {
                                     };
                                     let object = match new_spl_container_object(class_name, values)
                                     {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, Value::Object(object))
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                if is_spl_heap_runtime_class(class_name) {
+                                    let values = match read_call_args(unit, stack, args) {
+                                        Ok(values) => values,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    };
+                                    let object = match new_spl_heap_object(class_name, values) {
                                         Ok(object) => object,
                                         Err(message) => {
                                             return self
@@ -12400,7 +12658,7 @@ impl Vm {
                                 }
                                 match self.class_like_exists_with_autoload_cache(
                                     compiled,
-                                    class_name,
+                                    display_class_name,
                                     AutoloadClassLookupKind::Class,
                                     true,
                                     Some((
@@ -12414,7 +12672,23 @@ impl Vm {
                                     state,
                                 ) {
                                     Ok(_) => {}
-                                    Err(result) => return result,
+                                    Err(result) => {
+                                        match self.route_throwable_result(
+                                            compiled,
+                                            output,
+                                            stack,
+                                            state,
+                                            &mut exception_handlers,
+                                            &mut pending_control,
+                                            result,
+                                        ) {
+                                            RaiseOutcome::Caught(target) => {
+                                                block_id = target;
+                                                continue 'dispatch;
+                                            }
+                                            RaiseOutcome::Done(result) => return *result,
+                                        }
+                                    }
                                 }
                                 if let Some(class) =
                                     lookup_class_in_state(compiled, state, class_name)
@@ -12484,10 +12758,18 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        let spl_runtime_parent =
+                            spl_runtime_parent_for_class(compiled, state, &class);
                         let object = ObjectRef::new_with_display_name(
                             &runtime_class,
                             class.display_name.clone(),
                         );
+                        if let Some(spl_class) = spl_runtime_parent.as_deref() {
+                            object.set_property(
+                                SPL_RUNTIME_CLASS_PROPERTY,
+                                Value::string(spl_class.as_bytes().to_vec()),
+                            );
+                        }
                         let caller_scope = current_scope_class(compiled, stack);
                         let constructor = match lookup_method_in_hierarchy(
                             compiled,
@@ -12576,15 +12858,15 @@ impl Vm {
                                 );
                             }
                             diagnostics.extend(result.diagnostics);
-                        } else if !values.is_empty() {
-                            return self.runtime_error(
-                                output,
-                                compiled,
-                                stack,
-                                format!(
-                                    "E_PHP_VM_TOO_MANY_ARGS: constructor for class {class_name} does not accept arguments"
-                                ),
-                            );
+                        } else if let Some(spl_class) = spl_runtime_parent
+                            && let Err(message) = initialize_spl_runtime_subclass_storage(
+                                &object,
+                                &spl_class,
+                                values,
+                                &self.options.runtime_context,
+                            )
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
                         }
                         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
                         if let Err(message) = stack
@@ -12616,6 +12898,20 @@ impl Vm {
                         };
                         let class = match compiled.lookup_class(&object.class_name()) {
                             Some(class) => class.clone(),
+                            None if internal_runtime_class_entry(&object.class_name())
+                                .is_some() =>
+                            {
+                                let copy = object.clone_shallow();
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, Value::Object(copy))
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
                             None => {
                                 return self.runtime_error(
                                     output,
@@ -13851,6 +14147,13 @@ impl Vm {
                             value
                         } else if let Some(value) = xml_class_constant_value(&class.name, constant)
                         {
+                            value
+                        } else if let Some(value) = spl_class_constant_value_in_state(
+                            compiled,
+                            state,
+                            &class.name,
+                            constant,
+                        ) {
                             value
                         } else {
                             let scope = current_scope_class(compiled, stack);
@@ -16544,7 +16847,9 @@ impl Vm {
                             None => {
                                 let base = effective_value(&array);
                                 if let Value::Object(object) = &base
-                                    && is_spl_container_runtime_class(&object.class_name())
+                                    && spl_runtime_marker(object).is_some_and(|class| {
+                                        is_spl_array_access_runtime_class(&class)
+                                    })
                                 {
                                     match spl_container_offset_get(object, &key_value) {
                                         Ok(value) => value,
@@ -18166,7 +18471,10 @@ impl Vm {
                             }
                             continue;
                         }
-                        if is_spl_iterator_runtime_class(&object.class_name()) {
+                        if spl_runtime_marker(&object).is_some_and(|class| {
+                            is_spl_iterator_runtime_class(&class)
+                                && spl_iterator_method_is_supported(method)
+                        }) {
                             let value = match call_spl_iterator_method(object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -18183,7 +18491,10 @@ impl Vm {
                             }
                             continue;
                         }
-                        if is_spl_container_runtime_class(&object.class_name()) {
+                        if spl_runtime_marker(&object).is_some_and(|class| {
+                            is_spl_container_runtime_class(&class)
+                                && spl_container_method_is_supported(method)
+                        }) {
                             let value = match call_spl_container_method(object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -18200,7 +18511,45 @@ impl Vm {
                             }
                             continue;
                         }
-                        if is_spl_file_runtime_class(&object.class_name()) {
+                        if spl_runtime_marker(&object).is_some_and(|class| {
+                            is_spl_heap_runtime_class(&class)
+                                && spl_heap_method_is_supported(method)
+                        }) {
+                            let value = match call_spl_heap_method(object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if spl_runtime_marker(&object).is_some_and(|class| {
+                            is_spl_file_runtime_class(&class)
+                                && spl_file_method_is_supported(method)
+                        }) {
                             let value = match call_spl_file_method(
                                 &object,
                                 method,
@@ -18531,6 +18880,33 @@ impl Vm {
                                         vec!["missing_declared_method"],
                                     ),
                                 );
+                                if let Some(inner) = spl_inner_iterator_delegation_target(&object) {
+                                    let result = self.call_object_method_callable(
+                                        compiled,
+                                        inner,
+                                        method,
+                                        values,
+                                        Some(instruction.span),
+                                        output,
+                                        stack,
+                                        state,
+                                    );
+                                    if !result.status.is_success() {
+                                        return result;
+                                    }
+                                    diagnostics.extend(result.diagnostics);
+                                    let return_value = result.return_value.unwrap_or(Value::Null);
+                                    if let Err(message) = stack
+                                        .current_mut()
+                                        .expect("caller frame is active")
+                                        .registers
+                                        .set(*dst, return_value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
                                 let result = match self.call_magic_instance_method(
                                     compiled,
                                     object.clone(),
@@ -18962,6 +19338,67 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        if normalize_method_name(method) == "__construct"
+                            && is_supported_spl_runtime_class(&class.name)
+                        {
+                            let Some(object) = current_this_object(compiled, stack) else {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_NON_STATIC_METHOD_CALL: Non-static method {}::__construct() cannot be called statically",
+                                        class.display_name
+                                    ),
+                                );
+                            };
+                            if let Err(message) = initialize_spl_runtime_subclass_storage(
+                                &object,
+                                &class.name,
+                                values,
+                                &self.options.runtime_context,
+                            ) {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, Value::Null)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_supported_spl_runtime_class(&class.name)
+                            && let Some(object) = current_this_object(compiled, stack)
+                            && spl_runtime_marker(&object).is_some_and(|spl_class| {
+                                internal_runtime_class_is_or_extends(&spl_class, &class.name)
+                            })
+                            && let Some(result) = call_spl_runtime_method(
+                                &object,
+                                &class.name,
+                                method,
+                                values.clone(),
+                                &self.options.runtime_context,
+                            )
+                        {
+                            let value = match result {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("caller frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if class.flags.is_enum
                             && matches!(
                                 normalize_method_name(method).as_str(),
@@ -19375,7 +19812,7 @@ impl Vm {
                             compiled,
                             state,
                             payload.function,
-                            payload.debug.as_ref(),
+                            payload.debug.as_deref(),
                             payload.context.owner_unit,
                         );
                         let result = self.execute_function(
@@ -20393,7 +20830,7 @@ impl Vm {
                     compiled,
                     state,
                     payload.function,
-                    payload.debug.as_ref(),
+                    payload.debug.as_deref(),
                     payload.context.owner_unit,
                 );
                 if let Some(bound_this) = payload.bound_this
@@ -20446,7 +20883,7 @@ impl Vm {
                 }
                 if is_autoload_builtin_name(&name) || is_symbol_introspection_builtin_name(&name) {
                     return self.call_autoload_builtin(
-                        compiled, &name, args, None, output, stack, state,
+                        compiled, &name, args, None, call_span, output, stack, state,
                     );
                 }
                 if is_config_builtin_name(&name) {
@@ -22599,7 +23036,7 @@ impl Vm {
                     compiled,
                     state,
                     payload.function,
-                    payload.debug.as_ref(),
+                    payload.debug.as_deref(),
                     payload.context.owner_unit,
                 );
                 if let Some(bound_this) = payload.bound_this
@@ -22684,6 +23121,7 @@ impl Vm {
                 &normalized,
                 args,
                 None,
+                call_span,
                 output,
                 stack,
                 state,
@@ -22881,58 +23319,60 @@ impl Vm {
                     state,
                 )
             }
-            FunctionCallCacheTarget::Builtin { kind, name } => match kind {
-                FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection => self
-                    .call_autoload_builtin(compiled, &name, args, call_site, output, stack, state),
-                FunctionCallBuiltinKind::Config => {
-                    self.call_config_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::ErrorHandling => {
-                    self.call_error_handling_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::OutputBuffering => {
-                    self.call_output_buffering_builtin(compiled, &name, args, output, stack)
-                }
-                FunctionCallBuiltinKind::Environment => {
-                    self.call_environment_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::Process => {
-                    self.call_process_builtin(compiled, &name, args, output, stack)
-                }
-                FunctionCallBuiltinKind::PcreCallback => {
-                    self.call_pcre_callback_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::ArrayCallback => {
-                    self.call_array_callback_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::ArraySort => {
-                    self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
-                }
-                FunctionCallBuiltinKind::InternalRegistry => {
-                    let values = match call_builtin_args_to_positional(
-                        compiled, &name, args, output, stack, state,
-                    ) {
-                        Ok(values) => values,
-                        Err(InternalBuiltinArgError::Message(message)) => {
+            FunctionCallCacheTarget::Builtin { kind, name } => {
+                match kind {
+                    FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection => self
+                        .call_autoload_builtin(
+                            compiled, &name, args, call_site, call_span, output, stack, state,
+                        ),
+                    FunctionCallBuiltinKind::Config => {
+                        self.call_config_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::ErrorHandling => self
+                        .call_error_handling_builtin(compiled, &name, args, output, stack, state),
+                    FunctionCallBuiltinKind::OutputBuffering => {
+                        self.call_output_buffering_builtin(compiled, &name, args, output, stack)
+                    }
+                    FunctionCallBuiltinKind::Environment => {
+                        self.call_environment_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::Process => {
+                        self.call_process_builtin(compiled, &name, args, output, stack)
+                    }
+                    FunctionCallBuiltinKind::PcreCallback => {
+                        self.call_pcre_callback_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::ArrayCallback => self
+                        .call_array_callback_builtin(compiled, &name, args, output, stack, state),
+                    FunctionCallBuiltinKind::ArraySort => {
+                        self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::InternalRegistry => {
+                        let values = match call_builtin_args_to_positional(
+                            compiled, &name, args, output, stack, state,
+                        ) {
+                            Ok(values) => values,
+                            Err(InternalBuiltinArgError::Message(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            Err(InternalBuiltinArgError::Fatal(result)) => return *result,
+                        };
+                        if name == "var_dump"
+                            && let Some(message) = debug_info_gap_message(compiled, &values)
+                        {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        Err(InternalBuiltinArgError::Fatal(result)) => return *result,
-                    };
-                    if name == "var_dump"
-                        && let Some(message) = debug_info_gap_message(compiled, &values)
-                    {
-                        return self.runtime_error(output, compiled, stack, message);
+                        if let Some(result) = self.try_execute_serialization_builtin(
+                            compiled, &name, &values, call_span, output, stack, state,
+                        ) {
+                            return result;
+                        }
+                        self.execute_internal_registry_builtin(
+                            &name, values, output, stack, state, compiled,
+                        )
                     }
-                    if let Some(result) = self.try_execute_serialization_builtin(
-                        compiled, &name, &values, call_span, output, stack, state,
-                    ) {
-                        return result;
-                    }
-                    self.execute_internal_registry_builtin(
-                        &name, values, output, stack, state, compiled,
-                    )
                 }
-            },
+            }
         }
     }
 
@@ -23803,6 +24243,11 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => {
+                if let Some(inner) = spl_inner_iterator_delegation_target(&object) {
+                    return self.call_object_method_callable(
+                        compiled, inner, method, args, call_span, output, stack, state,
+                    );
+                }
                 return match self.call_magic_instance_method(
                     compiled,
                     object.clone(),
@@ -23977,19 +24422,89 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        if is_spl_iterator_runtime_class(&object.class_name()) {
+        if let Some(spl_class) = spl_runtime_marker(&object) {
+            let object_display_class = object.display_name();
+            let object_class = normalize_class_name(&object_display_class);
+            if object_class != spl_class {
+                let scope = current_scope_class(compiled, stack);
+                match lookup_resolved_method_in_state(
+                    compiled,
+                    state,
+                    &object_display_class,
+                    method,
+                    scope.as_deref(),
+                ) {
+                    Ok(Some(resolved))
+                        if internal_runtime_class_entry(&normalize_class_name(
+                            &resolved.class.name,
+                        ))
+                        .is_none() =>
+                    {
+                        if let Err(message) = validate_method_callable_in_state_scope(
+                            compiled,
+                            state,
+                            scope.as_deref(),
+                            &resolved.class,
+                            &resolved.method,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        self.record_runtime_trace_event(format!(
+                            "object-dispatch class={} method={} declaring_class={}",
+                            object.class_name(),
+                            resolved.method.name,
+                            resolved.class.name
+                        ));
+                        let class_owner =
+                            class_owner_in_state(compiled, state, &resolved.class.name);
+                        return self.execute_function(
+                            &class_owner,
+                            resolved.method.function,
+                            FunctionCall::new(args, Vec::new())
+                                .with_optional_call_span(call_span)
+                                .with_this(object.clone())
+                                .with_class_context(
+                                    resolved.class.name.clone(),
+                                    object.class_name(),
+                                    resolved.class.name.clone(),
+                                ),
+                            output,
+                            stack,
+                            state,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                }
+            }
+        }
+        if spl_runtime_marker(&object).is_some_and(|class| {
+            is_spl_iterator_runtime_class(&class) && spl_iterator_method_is_supported(method)
+        }) {
             return match call_spl_iterator_method(object, method, args) {
                 Ok(value) => VmResult::success(output.clone(), Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
-        if is_spl_container_runtime_class(&object.class_name()) {
+        if spl_runtime_marker(&object).is_some_and(|class| {
+            is_spl_container_runtime_class(&class) && spl_container_method_is_supported(method)
+        }) {
             return match call_spl_container_method(object, method, args) {
                 Ok(value) => VmResult::success(output.clone(), Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
-        if is_spl_file_runtime_class(&object.class_name()) {
+        if spl_runtime_marker(&object).is_some_and(|class| {
+            is_spl_heap_runtime_class(&class) && spl_heap_method_is_supported(method)
+        }) {
+            return match call_spl_heap_method(object, method, args) {
+                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Err(message) => self.runtime_error(output, compiled, stack, message),
+            };
+        }
+        if spl_runtime_marker(&object).is_some_and(|class| {
+            is_spl_file_runtime_class(&class) && spl_file_method_is_supported(method)
+        }) {
             return match call_spl_file_method(&object, method, args, &self.options.runtime_context)
             {
                 Ok(value) => VmResult::success(output.clone(), Some(value)),
@@ -24040,6 +24555,11 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => {
+                if let Some(inner) = spl_inner_iterator_delegation_target(&object) {
+                    return self.call_object_method_callable(
+                        compiled, inner, method, args, call_span, output, stack, state,
+                    );
+                }
                 return match self.call_magic_instance_method(
                     compiled,
                     object.clone(),
@@ -24279,25 +24799,57 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> Result<ForeachIterator, VmResult> {
         let class_name = object.class_name();
-        if is_spl_iterator_runtime_class(&class_name) {
-            call_spl_iterator_method(object.clone(), "rewind", Vec::new())
-                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        if spl_runtime_marker(&object).is_some_and(|class| is_spl_iterator_runtime_class(&class)) {
+            self.call_object_method_value(
+                compiled,
+                object.clone(),
+                "rewind",
+                output,
+                stack,
+                state,
+            )?;
             return Ok(ForeachIterator::IteratorObject {
                 object,
                 needs_next: false,
             });
         }
-        if is_spl_container_runtime_class(&class_name) {
-            call_spl_container_method(object.clone(), "rewind", Vec::new())
-                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        if spl_runtime_marker(&object).is_some_and(|class| is_spl_container_runtime_class(&class)) {
+            self.call_object_method_value(
+                compiled,
+                object.clone(),
+                "rewind",
+                output,
+                stack,
+                state,
+            )?;
             return Ok(ForeachIterator::IteratorObject {
                 object,
                 needs_next: false,
             });
         }
-        if is_spl_file_runtime_class(&class_name) {
-            call_spl_file_method(&object, "rewind", Vec::new(), &self.options.runtime_context)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        if spl_runtime_marker(&object).is_some_and(|class| is_spl_heap_runtime_class(&class)) {
+            self.call_object_method_value(
+                compiled,
+                object.clone(),
+                "rewind",
+                output,
+                stack,
+                state,
+            )?;
+            return Ok(ForeachIterator::IteratorObject {
+                object,
+                needs_next: false,
+            });
+        }
+        if spl_runtime_marker(&object).is_some_and(|class| is_spl_file_runtime_class(&class)) {
+            self.call_object_method_value(
+                compiled,
+                object.clone(),
+                "rewind",
+                output,
+                stack,
+                state,
+            )?;
             return Ok(ForeachIterator::IteratorObject {
                 object,
                 needs_next: false,
@@ -25061,7 +25613,7 @@ impl Vm {
                 ) {
                     return Ok(Value::Object(object));
                 }
-                self.autoload_class(compiled, &class_name, output, stack, state)?;
+                self.autoload_class(compiled, &class_name, output, stack, state, None)?;
                 if class_like_exists_direct(
                     compiled,
                     state,
@@ -25306,7 +25858,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<Value, VmResult> {
-        self.autoload_class(compiled, &payload.class_name, output, stack, state)?;
+        self.autoload_class(compiled, &payload.class_name, output, stack, state, None)?;
         let Some(class) = lookup_class_in_state(compiled, state, &payload.class_name) else {
             let source = ObjectRef::new_with_display_name(
                 &empty_runtime_class(&payload.class_name),
@@ -26883,12 +27435,120 @@ impl Vm {
         result
     }
 
+    fn spl_autoload_candidate_exists(
+        &self,
+        compiled: &CompiledUnit,
+        path: &str,
+        stack: &CallStack,
+        state: &ExecutionState,
+    ) -> bool {
+        let Some(loader) = &self.options.include_loader else {
+            return false;
+        };
+        let including_file = current_source_path(compiled, stack);
+        let include_path = state_include_path(state);
+        let cwd = state.cwd.clone();
+        if let Some(cache) = &self.options.include_cache {
+            cache
+                .resolve_with_include_path(
+                    loader,
+                    including_file.as_deref(),
+                    path,
+                    &include_path,
+                    Some(&cwd),
+                )
+                .is_ok()
+        } else {
+            loader
+                .resolve_with_include_path(
+                    including_file.as_deref(),
+                    path,
+                    &include_path,
+                    Some(&cwd),
+                )
+                .is_ok()
+        }
+    }
+
+    fn execute_spl_autoload(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.is_empty() || values.len() > 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_AUTOLOAD_ARITY: spl_autoload expects one or two arguments",
+            );
+        }
+        let class_name = match to_string(&values[0]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let extensions = match values.get(1) {
+            Some(Value::Null) => String::new(),
+            Some(value) => match to_string(value) {
+                Ok(value) => value.to_string_lossy(),
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+            None => state.spl_autoload_extensions.clone(),
+        };
+        if extensions.is_empty() {
+            return VmResult::success(output.clone(), Some(Value::Null));
+        }
+
+        let base = class_name.to_ascii_lowercase();
+        let (unit_key, function_id, block_id, instruction_id) = call_site.unwrap_or_else(|| {
+            (
+                compiled_unit_cache_key(compiled),
+                compiled.unit().entry,
+                BlockId::new(0),
+                InstrId::new(0),
+            )
+        });
+        let span = call_span.unwrap_or_else(|| IrSpan::new(php_ir::FileId::new(0), 0, 0));
+        for extension in extensions.split(',') {
+            let path = format!("{base}{extension}");
+            if !self.spl_autoload_candidate_exists(compiled, &path, stack, state) {
+                continue;
+            }
+            let result = self.execute_include(
+                compiled,
+                unit_key,
+                function_id,
+                block_id,
+                instruction_id,
+                span,
+                IncludeKind::IncludeOnce,
+                &Value::string(path),
+                output,
+                stack,
+                state,
+            );
+            if !result.status.is_success() {
+                return result;
+            }
+            if lookup_class_in_state(compiled, state, &class_name).is_some() {
+                break;
+            }
+        }
+        VmResult::success(output.clone(), Some(Value::Null))
+    }
+
     fn call_autoload_builtin(
         &self,
         compiled: &CompiledUnit,
         name: &str,
         args: Vec<CallArgument>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -26902,20 +27562,50 @@ impl Vm {
         };
         match name {
             "spl_autoload_register" => {
-                let Some(callback) = values.first() else {
+                let callback = if let Some(callback) = values.first() {
+                    match autoload_callback_from_value(compiled, state, callback.clone()) {
+                        Ok(callback) => callback,
+                        Err(message) => {
+                            return self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                autoload_invalid_callback_error("spl_autoload_register", &message),
+                            );
+                        }
+                    }
+                } else {
+                    CallableValue::InternalBuiltin {
+                        name: "spl_autoload".to_owned(),
+                    }
+                };
+                if matches!(
+                    &callback,
+                    CallableValue::InternalBuiltin { name } if name == "spl_autoload_call"
+                ) {
                     return self.runtime_error(
                         output,
                         compiled,
                         stack,
-                        "E_PHP_VM_AUTOLOAD_ARITY: spl_autoload_register expects at least 1 argument",
+                        "E_PHP_VM_SPL_VALUE_ERROR: spl_autoload_register(): Argument #1 ($callback) must not be the spl_autoload_call() function",
                     );
-                };
-                let callback = match autoload_callback_from_value(compiled, state, callback.clone())
+                }
+                if values
+                    .get(1)
+                    .is_some_and(|do_throw| !to_bool(do_throw).unwrap_or(true))
+                    && let Err(result) = self.emit_spl_autoload_register_do_throw_notice(
+                        compiled, call_span, output, stack, state,
+                    )
                 {
-                    Ok(callback) => callback,
-                    Err(message) => return self.runtime_error(output, compiled, stack, message),
-                };
-                state.autoload_registry.register(callback);
+                    return result;
+                }
+                let prepend = values
+                    .get(2)
+                    .and_then(|value| to_bool(value).ok())
+                    .unwrap_or(false);
+                state
+                    .autoload_registry
+                    .register_with_prepend(callback, prepend);
                 state.bump_autoload_stack_epoch();
                 VmResult::success(output.clone(), Some(Value::Bool(true)))
             }
@@ -26931,8 +27621,28 @@ impl Vm {
                 let callback = match autoload_callback_from_value(compiled, state, callback.clone())
                 {
                     Ok(callback) => callback,
-                    Err(message) => return self.runtime_error(output, compiled, stack, message),
+                    Err(message) => {
+                        return self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            autoload_invalid_callback_error("spl_autoload_unregister", &message),
+                        );
+                    }
                 };
+                if matches!(
+                    &callback,
+                    CallableValue::InternalBuiltin { name } if name == "spl_autoload_call"
+                ) {
+                    if let Err(result) = self.emit_spl_autoload_call_unregister_deprecation(
+                        compiled, call_span, output, stack, state,
+                    ) {
+                        return result;
+                    }
+                    state.autoload_registry.clear();
+                    state.bump_autoload_stack_epoch();
+                    return VmResult::success(output.clone(), Some(Value::Bool(true)));
+                }
                 let removed = state.autoload_registry.unregister(&callback);
                 if removed {
                     state.bump_autoload_stack_epoch();
@@ -26942,7 +27652,7 @@ impl Vm {
             "spl_autoload_functions" => {
                 let mut array = PhpArray::new();
                 for callback in state.autoload_registry.callbacks() {
-                    array.append(Value::Callable(callback.clone()));
+                    array.append(autoload_callback_public_value(compiled, state, callback));
                 }
                 VmResult::success(output.clone(), Some(Value::Array(array)))
             }
@@ -26959,11 +27669,36 @@ impl Vm {
                     Ok(name) => name.to_string_lossy(),
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
-                match self.autoload_class(compiled, &class_name, output, stack, state) {
+                match self.autoload_class(compiled, &class_name, output, stack, state, None) {
                     Ok(()) => VmResult::success(output.clone(), Some(Value::Null)),
                     Err(result) => result,
                 }
             }
+            "spl_autoload_extensions" => {
+                if values.len() > 1 {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_AUTOLOAD_ARITY: spl_autoload_extensions expects zero or one argument",
+                    );
+                }
+                if let Some(extensions) = values.first() {
+                    let extensions = match to_string(extensions) {
+                        Ok(value) => value.to_string_lossy(),
+                        Err(message) => {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    };
+                    state.spl_autoload_extensions = extensions;
+                }
+                VmResult::success(
+                    output.clone(),
+                    Some(Value::string(state.spl_autoload_extensions.clone())),
+                )
+            }
+            "spl_autoload" => self
+                .execute_spl_autoload(compiled, values, call_site, call_span, output, stack, state),
             "defined" => {
                 let Some(constant_name) = values.first() else {
                     return self.runtime_error(
@@ -27164,6 +27899,11 @@ impl Vm {
             "get_parent_class" => {
                 self.call_get_parent_class_builtin(compiled, values, output, stack, state)
             }
+            "class_parents" => {
+                self.call_class_parents_builtin(compiled, values, call_span, output, stack, state)
+            }
+            "class_implements" => self
+                .call_class_implements_builtin(compiled, values, call_span, output, stack, state),
             "get_declared_classes" | "get_declared_interfaces" | "get_declared_traits" => {
                 self.call_get_declared_builtin(compiled, name, output, state)
             }
@@ -27329,7 +28069,8 @@ impl Vm {
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         if lookup_class_in_state(compiled, state, &class_name).is_none()
-            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
             return result;
         }
@@ -27376,7 +28117,8 @@ impl Vm {
             return VmResult::success(output.clone(), Some(Value::Bool(true)));
         }
         if lookup_class_in_state(compiled, state, &class_name).is_none()
-            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
             return result;
         }
@@ -27469,7 +28211,8 @@ impl Vm {
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         if lookup_class_in_state(compiled, state, &class_name).is_none()
-            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
             return result;
         }
@@ -27504,7 +28247,8 @@ impl Vm {
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         if lookup_class_in_state(compiled, state, &class_name).is_none()
-            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
             return result;
         }
@@ -28023,7 +28767,8 @@ impl Vm {
         };
         for candidate in [&class_name, &target_name] {
             if lookup_class_in_state(compiled, state, candidate).is_none()
-                && let Err(result) = self.autoload_class(compiled, candidate, output, stack, state)
+                && let Err(result) =
+                    self.autoload_class(compiled, candidate, output, stack, state, None)
             {
                 return result;
             }
@@ -28066,7 +28811,8 @@ impl Vm {
                 continue;
             }
             if lookup_class_in_state(compiled, state, candidate).is_none()
-                && let Err(result) = self.autoload_class(compiled, candidate, output, stack, state)
+                && let Err(result) =
+                    self.autoload_class(compiled, candidate, output, stack, state, None)
             {
                 return result;
             }
@@ -28128,7 +28874,8 @@ impl Vm {
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         if lookup_class_in_state(compiled, state, &class_name).is_none()
-            && let Err(result) = self.autoload_class(compiled, &class_name, output, stack, state)
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
             return result;
         }
@@ -28142,6 +28889,264 @@ impl Vm {
             .map(Value::string)
             .unwrap_or(Value::Bool(false));
         VmResult::success(output.clone(), Some(parent))
+    }
+
+    fn call_class_parents_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.is_empty() || values.len() > 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: class_parents expects one or two arguments",
+            );
+        }
+        let class_name = match class_name_from_object_or_string(&values[0]) {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let autoload = values
+            .get(1)
+            .is_none_or(|value| to_bool(value).unwrap_or(true));
+        let should_autoload =
+            autoload && lookup_class_in_state(compiled, state, &class_name).is_none();
+        if should_autoload
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
+        {
+            return result;
+        }
+        let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
+            if let Err(result) = self.emit_class_introspection_missing_warning(
+                compiled,
+                "class_parents",
+                &class_name,
+                should_autoload,
+                call_span,
+                output,
+                stack,
+                state,
+            ) {
+                return result;
+            }
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        };
+        let mut array = PhpArray::new();
+        let mut parent = class.parent;
+        let mut seen = Vec::new();
+        while let Some(parent_name) = parent {
+            let normalized = normalize_class_name(&parent_name);
+            if seen.iter().any(|name| name == &normalized) {
+                break;
+            }
+            seen.push(normalized.clone());
+            let display = lookup_class_in_state(compiled, state, &normalized)
+                .map(|class| class.display_name)
+                .unwrap_or(parent_name);
+            array.insert(string_key(&display), Value::string(display.clone()));
+            parent =
+                lookup_class_in_state(compiled, state, &normalized).and_then(|class| class.parent);
+        }
+        VmResult::success(output.clone(), Some(Value::Array(array)))
+    }
+
+    fn call_class_implements_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.is_empty() || values.len() > 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_SYMBOL_ARITY: class_implements expects one or two arguments",
+            );
+        }
+        let class_name = match class_name_from_object_or_string(&values[0]) {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let autoload = values
+            .get(1)
+            .is_none_or(|value| to_bool(value).unwrap_or(true));
+        let should_autoload =
+            autoload && lookup_class_in_state(compiled, state, &class_name).is_none();
+        if should_autoload
+            && let Err(result) =
+                self.autoload_class(compiled, &class_name, output, stack, state, None)
+        {
+            return result;
+        }
+        let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
+            if let Err(result) = self.emit_class_introspection_missing_warning(
+                compiled,
+                "class_implements",
+                &class_name,
+                should_autoload,
+                call_span,
+                output,
+                stack,
+                state,
+            ) {
+                return result;
+            }
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        };
+        let mut array = PhpArray::new();
+        let mut interfaces = Vec::new();
+        collect_class_interface_display_names(compiled, state, &class.name, &mut interfaces);
+        for (_, display) in interfaces {
+            array.insert(string_key(&display), Value::string(display));
+        }
+        VmResult::success(output.clone(), Some(Value::Array(array)))
+    }
+
+    fn emit_class_introspection_missing_warning(
+        &self,
+        compiled: &CompiledUnit,
+        function_name: &str,
+        class_name: &str,
+        autoload_attempted: bool,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let suffix = if autoload_attempted {
+            "does not exist and could not be loaded"
+        } else {
+            "does not exist"
+        };
+        let message = format!("{function_name}(): Class {class_name} {suffix}");
+        let source_span = call_span
+            .or_else(|| stack.current().and_then(|frame| frame.call_span))
+            .map(|span| runtime_source_span(compiled, span))
+            .unwrap_or_default();
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_SYMBOL_CLASS_WARNING",
+            RuntimeSeverity::Warning,
+            message,
+            source_span,
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    fn emit_spl_autoload_call_unregister_deprecation(
+        &self,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let source_span = call_span
+            .or_else(|| stack.current().and_then(|frame| frame.call_span))
+            .map(|span| runtime_source_span(compiled, span))
+            .unwrap_or_default();
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_SPL_AUTOLOAD_CALL_UNREGISTER_DEPRECATED",
+            RuntimeSeverity::Deprecation,
+            "spl_autoload_unregister(): Using spl_autoload_call() as a callback for spl_autoload_unregister() is deprecated, to remove all registered autoloaders, call spl_autoload_unregister() for all values returned from spl_autoload_functions()"
+                .to_owned(),
+            source_span,
+            stack_trace(compiled, stack),
+            None,
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_DEPRECATED,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_DEPRECATED) {
+            Self::record_last_error(state, php_runtime::PHP_E_DEPRECATED, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Deprecated,
+                php_runtime::PHP_E_DEPRECATED,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    fn emit_spl_autoload_register_do_throw_notice(
+        &self,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let source_span = call_span
+            .or_else(|| stack.current().and_then(|frame| frame.call_span))
+            .map(|span| runtime_source_span(compiled, span))
+            .unwrap_or_default();
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_SPL_AUTOLOAD_REGISTER_DO_THROW_NOTICE",
+            RuntimeSeverity::Notice,
+            "spl_autoload_register(): Argument #2 ($do_throw) has been ignored, spl_autoload_register() will always throw"
+                .to_owned(),
+            source_span,
+            stack_trace(compiled, stack),
+            None,
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_NOTICE,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_NOTICE) {
+            Self::record_last_error(state, php_runtime::PHP_E_NOTICE, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Notice,
+                php_runtime::PHP_E_NOTICE,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
     }
 
     fn call_get_declared_builtin(
@@ -28240,7 +29245,12 @@ impl Vm {
         let may_autoload_with_side_effects =
             autoload && !state.autoload_registry.callbacks().is_empty();
         if autoload {
-            self.autoload_class(compiled, class_name, output, stack, state)?;
+            let trace_origin = autoload_trace_origin_from_call_site(
+                compiled,
+                kind.exists_function_name(),
+                call_site,
+            );
+            self.autoload_class(compiled, class_name, output, stack, state, trace_origin)?;
         }
 
         let exists = class_like_exists_direct(compiled, state, class_name, kind);
@@ -28637,6 +29647,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
+        trace_origin: Option<AutoloadTraceOrigin>,
     ) -> Result<(), VmResult> {
         let normalized = normalize_class_name(class_name);
         if lookup_class_in_state(compiled, state, class_name).is_some()
@@ -28652,7 +29663,7 @@ impl Vm {
         for callback in callbacks {
             let result = self.call_callable(
                 compiled,
-                Value::Callable(callback),
+                Value::Callable(callback.clone()),
                 vec![CallArgument::positional(Value::string(
                     class_name.as_bytes().to_vec(),
                 ))],
@@ -28661,6 +29672,11 @@ impl Vm {
                 state,
             );
             if !result.status.is_success() {
+                if let Some(origin) = trace_origin {
+                    state.pending_trace = Some(capture_autoload_trace(
+                        compiled, stack, &callback, class_name, origin,
+                    ));
+                }
                 let _ = state.autoload_stack.pop();
                 return Err(result);
             }
@@ -30302,6 +31318,14 @@ fn closure_debug_info(compiled: &CompiledUnit, function: FunctionId) -> Option<C
         name: format!("{{closure:{}:{line}}}", file.path),
         file: file.path.clone(),
         line,
+        parameters: function
+            .params
+            .iter()
+            .map(|param| ClosureDebugParameter {
+                name: param.name.clone(),
+                required: param.required,
+            })
+            .collect(),
     })
 }
 
@@ -32649,9 +33673,15 @@ fn emit_serializable_interface_deprecations(
         if class.flags.is_interface || class.flags.is_trait {
             continue;
         }
-        let implements_serializable =
-            class_implements_interface(compiled, &class.name, "Serializable", &mut Vec::new())
-                .unwrap_or(false);
+        let implements_serializable = class.interfaces.iter().any(|interface| {
+            interface_or_extends(
+                compiled,
+                interface,
+                &normalize_class_name("Serializable"),
+                &mut Vec::new(),
+            )
+            .unwrap_or(false)
+        });
         if !implements_serializable || !error_reporting_allows(state, php_runtime::PHP_E_DEPRECATED)
         {
             continue;
@@ -34361,6 +35391,11 @@ fn resolve_static_class_name(
                     "E_PHP_VM_UNKNOWN_CLASS: class {scope} is not defined"
                 ));
             };
+            if let Some(parent) = class.parent.as_deref()
+                && let Some(parent) = internal_runtime_class_entry(&normalize_class_name(parent))
+            {
+                return Ok(parent);
+            }
             let Some(parent) = parent_class(compiled, &class)? else {
                 return Err(format!(
                     "E_PHP_VM_NO_PARENT_CLASS: class {} has no parent",
@@ -34370,6 +35405,7 @@ fn resolve_static_class_name(
             Ok(parent.clone())
         }
         _ => lookup_class_in_state(compiled, state, class_name)
+            .or_else(|| internal_runtime_class_entry(&normalize_class_name(class_name)))
             .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined")),
     }
 }
@@ -34463,10 +35499,14 @@ fn class_is_or_extends(
             ));
         }
         seen.push(current);
-        if let Some(parent_name) = class.parent.as_deref()
-            && let Some(result) = internal_throwable_instanceof(parent_name, &ancestor_name)
-        {
-            return Ok(result);
+        if let Some(parent) = class.parent.as_deref() {
+            let parent = normalize_class_name(parent);
+            if internal_runtime_class_entry(&parent).is_some() {
+                return Ok(internal_runtime_class_is_or_extends(
+                    &parent,
+                    &ancestor_name,
+                ));
+            }
         }
         let Some(parent) = parent_class(compiled, class)? else {
             return Ok(false);
@@ -34484,6 +35524,46 @@ fn class_is_or_implements(
         return Ok(true);
     }
     class_implements_interface(compiled, class_name, target_name, &mut Vec::new())
+}
+
+fn internal_runtime_parent_name(class_name: &str) -> Option<String> {
+    let class_name = normalize_class_name(class_name);
+    if is_spl_iterator_runtime_class(&class_name) {
+        match class_name.as_str() {
+            "recursivearrayiterator" => Some(normalize_class_name("ArrayIterator")),
+            _ => spl_iterator_class(&class_name).parent,
+        }
+    } else if is_spl_container_runtime_class(&class_name) {
+        spl_container_class(&class_name).parent
+    } else if is_spl_heap_runtime_class(&class_name) {
+        spl_heap_class(&class_name).parent
+    } else if is_spl_file_runtime_class(&class_name) {
+        spl_file_class(&class_name).parent
+    } else if internal_throwable_instanceof(&class_name, "throwable").is_some() {
+        internal_throwable_parent(&class_name).map(normalize_class_name)
+    } else {
+        None
+    }
+}
+
+fn internal_runtime_class_is_or_extends(class_name: &str, ancestor_name: &str) -> bool {
+    let mut class_name = normalize_class_name(class_name);
+    let ancestor_name = normalize_class_name(ancestor_name);
+    let mut seen = Vec::new();
+    loop {
+        if class_name == ancestor_name {
+            return true;
+        }
+        if seen.iter().any(|name| name == &class_name) {
+            return false;
+        }
+        seen.push(class_name.clone());
+        let parent = internal_runtime_parent_name(&class_name);
+        let Some(parent) = parent else {
+            return false;
+        };
+        class_name = parent;
+    }
 }
 
 fn class_implements_interface(
@@ -34510,6 +35590,21 @@ fn class_implements_interface(
             return Ok(true);
         }
     }
+    if let Some(parent) = class.parent.as_deref() {
+        let parent = normalize_class_name(parent);
+        if internal_runtime_class_entry(&parent).is_some() {
+            if interface_or_extends(compiled, &parent, &interface_name, &mut Vec::new())? {
+                seen.pop();
+                return Ok(true);
+            }
+            for interface in internal_class_interfaces(&parent) {
+                if interface_or_extends(compiled, &interface, &interface_name, &mut Vec::new())? {
+                    seen.pop();
+                    return Ok(true);
+                }
+            }
+        }
+    }
     if let Some(parent) = parent_class(compiled, class)?
         && class_implements_interface(compiled, &parent.name, &interface_name, seen)?
     {
@@ -34518,6 +35613,55 @@ fn class_implements_interface(
     }
     seen.pop();
     Ok(false)
+}
+
+fn collect_class_interface_display_names(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    seen: &mut Vec<(String, String)>,
+) {
+    let normalized = normalize_class_name(class_name);
+    let Some(class) = lookup_class_in_state(compiled, state, &normalized) else {
+        for interface in internal_class_interfaces(&normalized) {
+            collect_interface_display_names(compiled, &interface, seen);
+        }
+        if let Some(parent) = internal_runtime_parent_name(&normalized) {
+            collect_class_interface_display_names(compiled, state, &parent, seen);
+        }
+        return;
+    };
+    for interface in &class.interfaces {
+        collect_interface_display_names(compiled, interface, seen);
+    }
+    if let Some(parent) = class.parent.as_deref() {
+        collect_class_interface_display_names(compiled, state, parent, seen);
+    }
+}
+
+fn collect_interface_display_names(
+    compiled: &CompiledUnit,
+    interface_name: &str,
+    seen: &mut Vec<(String, String)>,
+) {
+    let normalized = normalize_class_name(interface_name);
+    if seen.iter().any(|(name, _)| name == &normalized) {
+        return;
+    }
+    let display = compiled
+        .lookup_class(&normalized)
+        .map(|class| class.display_name.clone())
+        .unwrap_or_else(|| interface_name.to_owned());
+    seen.push((normalized.clone(), display));
+    if let Some(interface) = compiled.lookup_class(&normalized) {
+        for parent in &interface.interfaces {
+            collect_interface_display_names(compiled, parent, seen);
+        }
+    } else {
+        for parent in internal_class_interfaces(&normalized) {
+            collect_interface_display_names(compiled, &parent, seen);
+        }
+    }
 }
 
 fn interface_or_extends(
@@ -34592,6 +35736,23 @@ fn object_instanceof(
             if let Some(result) = internal_throwable_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
+            if class_is_or_implements(compiled, &object.class_name(), class_name)? {
+                return Ok(true);
+            }
+            if let Some(spl_class) = spl_runtime_marker(object) {
+                if let Some(result) = internal_spl_iterator_instanceof(&spl_class, class_name) {
+                    return Ok(result);
+                }
+                if let Some(result) = internal_spl_container_instanceof(&spl_class, class_name) {
+                    return Ok(result);
+                }
+                if let Some(result) = internal_spl_heap_instanceof(&spl_class, class_name) {
+                    return Ok(result);
+                }
+                if let Some(result) = internal_spl_file_instanceof(&spl_class, class_name) {
+                    return Ok(result);
+                }
+            }
             if let Some(result) = internal_spl_iterator_instanceof(&object.class_name(), class_name)
             {
                 return Ok(result);
@@ -34599,6 +35760,9 @@ fn object_instanceof(
             if let Some(result) =
                 internal_spl_container_instanceof(&object.class_name(), class_name)
             {
+                return Ok(result);
+            }
+            if let Some(result) = internal_spl_heap_instanceof(&object.class_name(), class_name) {
                 return Ok(result);
             }
             if let Some(result) = internal_spl_file_instanceof(&object.class_name(), class_name) {
@@ -35456,7 +36620,7 @@ fn bind_closure_callable_value(callable: CallableValue, bound_this: Option<Objec
             };
             Value::closure(
                 ClosurePayload::new(payload.function, payload.captures)
-                    .with_debug(payload.debug)
+                    .with_debug(payload.debug.map(|debug| *debug))
                     .with_bound_this(bound_this.clone())
                     .with_context(context),
             )
@@ -38922,7 +40086,153 @@ fn is_spl_iterator_runtime_class(class_name: &str) -> bool {
             | "limititerator"
             | "emptyiterator"
             | "appenditerator"
+            | "recursiveiteratoriterator"
+            | "cachingiterator"
+            | "recursivecachingiterator"
+            | "regexiterator"
+            | "recursiveregexiterator"
+            | "norewinditerator"
+            | "infiniteiterator"
+            | "filteriterator"
+            | "recursivefilteriterator"
+            | "parentiterator"
+            | "recursivetreeiterator"
+            | "multipleiterator"
+            | "globiterator"
     )
+}
+
+fn is_supported_spl_runtime_class(class_name: &str) -> bool {
+    is_spl_iterator_runtime_class(class_name)
+        || is_spl_container_runtime_class(class_name)
+        || is_spl_heap_runtime_class(class_name)
+        || is_spl_file_runtime_class(class_name)
+}
+
+fn is_spl_array_access_runtime_class(class_name: &str) -> bool {
+    is_spl_container_runtime_class(class_name)
+        || matches!(
+            normalize_class_name(class_name).as_str(),
+            "arrayiterator" | "recursivearrayiterator"
+        )
+}
+
+fn spl_runtime_marker(object: &ObjectRef) -> Option<String> {
+    let class_name = normalize_class_name(&object.class_name());
+    if is_supported_spl_runtime_class(&class_name) {
+        return Some(class_name);
+    }
+    let marker = object.get_property(SPL_RUNTIME_CLASS_PROPERTY)?;
+    let Value::String(value) = effective_value(&marker) else {
+        return None;
+    };
+    let normalized = normalize_class_name(&value.to_string_lossy());
+    is_supported_spl_runtime_class(&normalized).then_some(normalized)
+}
+
+fn call_spl_runtime_method(
+    object: &ObjectRef,
+    class_name: &str,
+    method: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Option<Result<Value, String>> {
+    let normalized = normalize_class_name(class_name);
+    if is_spl_iterator_runtime_class(&normalized) && spl_iterator_method_is_supported(method) {
+        return Some(call_spl_iterator_method(object.clone(), method, args));
+    }
+    if is_spl_container_runtime_class(&normalized) && spl_container_method_is_supported(method) {
+        return Some(call_spl_container_method(object.clone(), method, args));
+    }
+    if is_spl_heap_runtime_class(&normalized) && spl_heap_method_is_supported(method) {
+        return Some(call_spl_heap_method(object.clone(), method, args));
+    }
+    if is_spl_file_runtime_class(&normalized) && spl_file_method_is_supported(method) {
+        return Some(call_spl_file_method(object, method, args, runtime_context));
+    }
+    None
+}
+
+fn spl_inner_iterator_delegation_target(object: &ObjectRef) -> Option<ObjectRef> {
+    let class = spl_runtime_marker(object)?;
+    if !is_spl_iterator_runtime_class(&class)
+        || !matches!(
+            class.as_str(),
+            "iteratoriterator"
+                | "limititerator"
+                | "recursiveiteratoriterator"
+                | "cachingiterator"
+                | "recursivecachingiterator"
+                | "regexiterator"
+                | "recursiveregexiterator"
+                | "norewinditerator"
+                | "infiniteiterator"
+                | "filteriterator"
+                | "recursivefilteriterator"
+                | "parentiterator"
+                | "recursivetreeiterator"
+        )
+    {
+        return None;
+    }
+    match object
+        .get_property("__inner_iterator")
+        .map(|value| effective_value(&value))
+    {
+        Some(Value::Object(inner)) => Some(inner),
+        _ => None,
+    }
+}
+
+fn spl_runtime_parent_for_class(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class: &php_ir::module::ClassEntry,
+) -> Option<String> {
+    let mut parent = class.parent.as_deref().map(normalize_class_name)?;
+    let mut seen = Vec::new();
+    loop {
+        if is_supported_spl_runtime_class(&parent) {
+            return Some(parent);
+        }
+        if seen.iter().any(|name| name == &parent) {
+            return None;
+        }
+        seen.push(parent.clone());
+        let entry = lookup_class_in_state(compiled, state, &parent)?;
+        parent = entry.parent.as_deref().map(normalize_class_name)?;
+    }
+}
+
+fn initialize_spl_runtime_subclass_storage(
+    object: &ObjectRef,
+    spl_class: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<(), String> {
+    let source = if is_spl_iterator_runtime_class(spl_class) {
+        new_spl_iterator_object(spl_class, args, runtime_context)?
+    } else if is_spl_container_runtime_class(spl_class) {
+        new_spl_container_object(spl_class, args)?
+    } else if is_spl_heap_runtime_class(spl_class) {
+        new_spl_heap_object(spl_class, args)?
+    } else if is_spl_file_runtime_class(spl_class) {
+        new_spl_file_object(spl_class, args, runtime_context)?
+    } else {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_PARENT_CLASS: unsupported SPL runtime parent {spl_class}"
+        ));
+    };
+    for (name, value) in source.properties_snapshot() {
+        if name.starts_with("__") {
+            object.set_property(name, value);
+        }
+    }
+    object.set_property(
+        SPL_RUNTIME_CLASS_PROPERTY,
+        Value::string(normalize_class_name(spl_class).into_bytes()),
+    );
+    Ok(())
 }
 
 fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
@@ -38935,7 +40245,11 @@ fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> O
         "traversable" | "iterator" => true,
         "countable" => matches!(
             object_class.as_str(),
-            "arrayiterator" | "recursivearrayiterator" | "appenditerator"
+            "arrayiterator"
+                | "recursivearrayiterator"
+                | "appenditerator"
+                | "cachingiterator"
+                | "recursivecachingiterator"
         ),
         "arrayaccess" => matches!(
             object_class.as_str(),
@@ -38946,6 +40260,22 @@ fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> O
             "arrayiterator" | "recursivearrayiterator"
         ),
         "recursiveiterator" => object_class == "recursivearrayiterator",
+        "outeriterator" => matches!(
+            object_class.as_str(),
+            "iteratoriterator"
+                | "limititerator"
+                | "recursiveiteratoriterator"
+                | "cachingiterator"
+                | "recursivecachingiterator"
+                | "regexiterator"
+                | "recursiveregexiterator"
+                | "norewinditerator"
+                | "infiniteiterator"
+                | "filteriterator"
+                | "recursivefilteriterator"
+                | "parentiterator"
+                | "recursivetreeiterator"
+        ),
         "appenditerator" => object_class == "appenditerator",
         "arrayiterator" => {
             object_class == "arrayiterator" || object_class == "recursivearrayiterator"
@@ -38954,17 +40284,44 @@ fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> O
         "iteratoriterator" => object_class == "iteratoriterator",
         "limititerator" => object_class == "limititerator",
         "emptyiterator" => object_class == "emptyiterator",
+        "recursiveiteratoriterator" => object_class == "recursiveiteratoriterator",
+        "cachingiterator" => matches!(
+            object_class.as_str(),
+            "cachingiterator" | "recursivecachingiterator"
+        ),
+        "recursivecachingiterator" => object_class == "recursivecachingiterator",
+        "regexiterator" => matches!(
+            object_class.as_str(),
+            "regexiterator" | "recursiveregexiterator"
+        ),
+        "recursiveregexiterator" => object_class == "recursiveregexiterator",
+        "norewinditerator" => object_class == "norewinditerator",
+        "infiniteiterator" => object_class == "infiniteiterator",
+        "filteriterator" => matches!(
+            object_class.as_str(),
+            "filteriterator" | "recursivefilteriterator" | "parentiterator"
+        ),
+        "recursivefilteriterator" => object_class == "recursivefilteriterator",
+        "parentiterator" => object_class == "parentiterator",
+        "recursivetreeiterator" => object_class == "recursivetreeiterator",
+        "multipleiterator" => object_class == "multipleiterator",
+        "globiterator" => object_class == "globiterator",
         _ => false,
     })
 }
 
-fn new_spl_iterator_object(class_name: &str, args: Vec<CallArgument>) -> Result<ObjectRef, String> {
+fn new_spl_iterator_object(
+    class_name: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<ObjectRef, String> {
     if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
         return Err(format!(
             "E_PHP_VM_UNKNOWN_NAMED_ARG: {class_name}::__construct has no builtin parameter ${name}"
         ));
     }
     let normalized = normalize_class_name(class_name);
+    let original_args = args.clone();
     let entries = match normalized.as_str() {
         "emptyiterator" => {
             validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
@@ -38977,9 +40334,28 @@ fn new_spl_iterator_object(class_name: &str, args: Vec<CallArgument>) -> Result<
                 .transpose()?
                 .unwrap_or_default()
         }
-        "iteratoriterator" => {
+        "iteratoriterator"
+        | "norewinditerator"
+        | "infiniteiterator"
+        | "filteriterator"
+        | "recursivefilteriterator"
+        | "parentiterator" => {
             validate_spl_iterator_arg_count(class_name, &args, 1, 1)?;
             spl_entries_from_value(&args[0].value)?
+        }
+        "cachingiterator" | "recursivecachingiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 2)?;
+            spl_entries_from_value(&args[0].value)?
+        }
+        "recursiveiteratoriterator" | "recursivetreeiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 4)?;
+            spl_recursive_entries_from_value(&args[0].value)?
+        }
+        "regexiterator" | "recursiveregexiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 2, 5)?;
+            let entries = spl_entries_from_value(&args[0].value)?;
+            let pattern = to_string(&args[1].value)?.to_string_lossy();
+            spl_regex_filter_entries(entries, &pattern)
         }
         "limititerator" => {
             validate_spl_iterator_arg_count(class_name, &args, 1, 3)?;
@@ -39001,6 +40377,15 @@ fn new_spl_iterator_object(class_name: &str, args: Vec<CallArgument>) -> Result<
             validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
             Vec::new()
         }
+        "multipleiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            Vec::new()
+        }
+        "globiterator" => {
+            validate_spl_iterator_arg_count(class_name, &args, 1, 2)?;
+            let pattern = to_string(&args[0].value)?.to_string_lossy();
+            spl_glob_entries(&pattern, runtime_context)?
+        }
         _ => unreachable!("is_spl_iterator_runtime_class validates class names"),
     };
     let object = ObjectRef::new_with_display_name(
@@ -39009,7 +40394,90 @@ fn new_spl_iterator_object(class_name: &str, args: Vec<CallArgument>) -> Result<
     );
     spl_set_entries(&object, entries);
     spl_set_position(&object, 0);
+    if let Some(inner) = original_args.first() {
+        object.set_property("__inner_iterator", effective_value(&inner.value));
+    }
+    if matches!(
+        normalized.as_str(),
+        "regexiterator" | "recursiveregexiterator"
+    ) {
+        object.set_property("__regex", original_args[1].value.clone());
+        let mode = original_args
+            .get(2)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(0);
+        let flags = original_args
+            .get(3)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(0);
+        let preg_flags = original_args
+            .get(4)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(0);
+        object.set_property("__regex_mode", Value::Int(mode));
+        object.set_property("__regex_flags", Value::Int(flags));
+        object.set_property("__regex_preg_flags", Value::Int(preg_flags));
+    }
     Ok(object)
+}
+
+fn spl_iterator_method_is_supported(method: &str) -> bool {
+    matches!(
+        normalize_method_name(method).as_str(),
+        "rewind"
+            | "valid"
+            | "current"
+            | "key"
+            | "next"
+            | "count"
+            | "getarraycopy"
+            | "getinneriterator"
+            | "getsubiterator"
+            | "getregex"
+            | "getmode"
+            | "setmode"
+            | "getflags"
+            | "setflags"
+            | "getpregflags"
+            | "setpregflags"
+            | "accept"
+            | "haschildren"
+            | "getchildren"
+            | "getcache"
+            | "seek"
+            | "getposition"
+            | "greaterthan"
+            | "getdepth"
+            | "getmaxdepth"
+            | "setmaxdepth"
+            | "callgetchildren"
+            | "beginiteration"
+            | "enditeration"
+            | "nextelement"
+            | "__construct"
+            | "hasnext"
+            | "__tostring"
+            | "offsetget"
+            | "offsetexists"
+            | "offsetset"
+            | "offsetunset"
+            | "append"
+            | "additerator"
+            | "attachiterator"
+            | "containsiterator"
+            | "detachiterator"
+            | "countiterators"
+            | "getarrayiterator"
+            | "getiteratorindex"
+            | "getprefix"
+            | "getpostfix"
+            | "setpostfix"
+            | "getentry"
+            | "setprefixpart"
+    )
 }
 
 fn call_spl_iterator_method(
@@ -39018,6 +40486,8 @@ fn call_spl_iterator_method(
     args: Vec<CallArgument>,
 ) -> Result<Value, String> {
     let class_name = object.class_name();
+    let runtime_class_name =
+        spl_runtime_marker(&object).unwrap_or_else(|| normalize_class_name(&class_name));
     let method = normalize_method_name(method);
     match method.as_str() {
         "rewind" => {
@@ -39056,16 +40526,302 @@ fn call_spl_iterator_method(
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
         }
-        "append" | "additerator" => {
-            if normalize_class_name(&class_name) != "appenditerator" {
+        "getinneriterator" | "getsubiterator" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 1)?;
+            Ok(object
+                .get_property("__inner_iterator")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Null))
+        }
+        "getregex" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__regex")
+                .map(|value| effective_value(&value))
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        "getmode" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__regex_mode")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Int(0)))
+        }
+        "setmode" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            object.set_property("__regex_mode", Value::Int(to_int(&args[0].value)?));
+            Ok(Value::Null)
+        }
+        "getflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__regex_flags")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Int(0)))
+        }
+        "setflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            object.set_property("__regex_flags", Value::Int(to_int(&args[0].value)?));
+            Ok(Value::Null)
+        }
+        "getpregflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__regex_preg_flags")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Int(0)))
+        }
+        "setpregflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            object.set_property("__regex_preg_flags", Value::Int(to_int(&args[0].value)?));
+            Ok(Value::Null)
+        }
+        "accept" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(true))
+        }
+        "haschildren" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(false))
+        }
+        "getchildren" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Null)
+        }
+        "getcache" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
+        }
+        "seek" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let position = to_int(&args[0].value)?.max(0) as usize;
+            spl_set_position(&object, position);
+            Ok(Value::Null)
+        }
+        "getposition" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_position(&object) as i64))
+        }
+        "greaterthan" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            Ok(Value::Bool(
+                spl_position(&object) > to_int(&args[0].value)?.max(0) as usize,
+            ))
+        }
+        "getdepth" | "getmaxdepth" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__max_depth")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Int(0)))
+        }
+        "setmaxdepth" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            object.set_property("__max_depth", Value::Int(to_int(&args[0].value)?));
+            Ok(Value::Null)
+        }
+        "callgetchildren" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            call_spl_iterator_method(object.clone(), "getchildren", Vec::new())
+        }
+        "beginiteration" | "enditeration" | "nextelement" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Null)
+        }
+        "__construct" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, usize::MAX)?;
+            Ok(Value::Null)
+        }
+        "hasnext" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(&object).saturating_add(1) < spl_entries(&object).len(),
+            ))
+        }
+        "__tostring" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_current_entry(&object)
+                .map(|(_, value)| to_string(&value).map(Value::String))
+                .transpose()?
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        "offsetget" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_get(&object, &args[0].value)
+        }
+        "offsetexists" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_exists(&object, &args[0].value)
+        }
+        "offsetset" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            spl_container_offset_set(&object, args[0].value.clone(), args[1].value.clone())?;
+            Ok(Value::Null)
+        }
+        "offsetunset" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            spl_container_offset_unset(&object, &args[0].value)?;
+            Ok(Value::Null)
+        }
+        "append" | "additerator" | "attachiterator" => {
+            if !matches!(
+                runtime_class_name.as_str(),
+                "appenditerator" | "multipleiterator"
+            ) {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 3)?;
+            let mut entries = spl_entries(&object);
+            entries.extend(spl_entries_from_value(&args[0].value)?);
+            spl_set_entries(&object, entries);
+            if runtime_class_name == "multipleiterator" {
+                let count = object
+                    .get_property("__iterator_count")
+                    .and_then(|value| match effective_value(&value) {
+                        Value::Int(value) => Some(value),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                object.set_property("__iterator_count", Value::Int(count));
+                if let Value::Object(iterator) = effective_value(&args[0].value) {
+                    let mut attached = object
+                        .get_property("__attached_iterator_ids")
+                        .and_then(|value| match effective_value(&value) {
+                            Value::Array(array) => Some(array),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    attached.append(Value::Int(iterator.id() as i64));
+                    object.set_property("__attached_iterator_ids", Value::Array(attached));
+                }
+            }
+            Ok(Value::Null)
+        }
+        "containsiterator" => {
+            if runtime_class_name != "multipleiterator" {
                 return Err(format!(
                     "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
                 ));
             }
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
-            let mut entries = spl_entries(&object);
-            entries.extend(spl_entries_from_value(&args[0].value)?);
-            spl_set_entries(&object, entries);
+            let Value::Object(iterator) = effective_value(&args[0].value) else {
+                return Ok(Value::Bool(false));
+            };
+            let target_id = iterator.id() as i64;
+            let contains = object
+                .get_property("__attached_iterator_ids")
+                .and_then(|value| match effective_value(&value) {
+                    Value::Array(array) => Some(array),
+                    _ => None,
+                })
+                .is_some_and(|array| {
+                    array.iter().any(|(_, value)| match effective_value(value) {
+                        Value::Int(id) => id == target_id,
+                        _ => false,
+                    })
+                });
+            Ok(Value::Bool(contains))
+        }
+        "detachiterator" => {
+            if runtime_class_name != "multipleiterator" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let Value::Object(iterator) = effective_value(&args[0].value) else {
+                return Ok(Value::Null);
+            };
+            let target_id = iterator.id() as i64;
+            let mut removed = false;
+            let mut next = PhpArray::new();
+            if let Some(array) = object
+                .get_property("__attached_iterator_ids")
+                .and_then(|value| match effective_value(&value) {
+                    Value::Array(array) => Some(array),
+                    _ => None,
+                })
+            {
+                for (_, value) in array.iter() {
+                    let is_target =
+                        matches!(effective_value(value), Value::Int(id) if id == target_id);
+                    if is_target && !removed {
+                        removed = true;
+                    } else {
+                        next.append(value.clone());
+                    }
+                }
+            }
+            if removed {
+                object.set_property("__attached_iterator_ids", Value::Array(next));
+                let count = object
+                    .get_property("__iterator_count")
+                    .and_then(|value| match effective_value(&value) {
+                        Value::Int(value) => Some(value),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                object.set_property("__iterator_count", Value::Int(count));
+            }
+            Ok(Value::Null)
+        }
+        "countiterators" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(object
+                .get_property("__iterator_count")
+                .map(|value| effective_value(&value))
+                .unwrap_or(Value::Int(0)))
+        }
+        "getarrayiterator" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let iterator = ObjectRef::new_with_display_name(
+                &spl_iterator_class("ArrayIterator"),
+                spl_iterator_display_name("ArrayIterator"),
+            );
+            spl_set_entries(&iterator, spl_entries(&object));
+            spl_set_position(&iterator, 0);
+            Ok(Value::Object(iterator))
+        }
+        "getiteratorindex" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(0))
+        }
+        "getprefix" | "getpostfix" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let property = if method == "getpostfix" {
+                "__postfix"
+            } else {
+                "__prefix"
+            };
+            Ok(object
+                .get_property(property)
+                .map(|value| effective_value(&value))
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        "setpostfix" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            object.set_property("__postfix", args[0].value.clone());
+            Ok(Value::Null)
+        }
+        "getentry" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_current_entry(&object)
+                .map(|(key, value)| {
+                    let key = array_key_to_value(key);
+                    let key = to_string(&key)?.to_string_lossy();
+                    let value = to_string(&value)?.to_string_lossy();
+                    Ok::<Value, String>(Value::string(format!("[{key}] => {value}").into_bytes()))
+                })
+                .transpose()?
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        "setprefixpart" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            object.set_property("__prefix", args[1].value.clone());
             Ok(Value::Null)
         }
         _ => Err(format!(
@@ -39100,7 +40856,12 @@ fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
     let mut interfaces = vec!["Iterator".to_owned(), "Traversable".to_owned()];
     if matches!(
         normalized.as_str(),
-        "arrayiterator" | "recursivearrayiterator" | "appenditerator"
+        "arrayiterator"
+            | "recursivearrayiterator"
+            | "appenditerator"
+            | "cachingiterator"
+            | "recursivecachingiterator"
+            | "globiterator"
     ) {
         interfaces.push("Countable".to_owned());
     }
@@ -39114,9 +40875,35 @@ fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
     if normalized == "recursivearrayiterator" {
         interfaces.push("RecursiveIterator".to_owned());
     }
+    if matches!(
+        normalized.as_str(),
+        "iteratoriterator"
+            | "limititerator"
+            | "recursiveiteratoriterator"
+            | "cachingiterator"
+            | "recursivecachingiterator"
+            | "regexiterator"
+            | "recursiveregexiterator"
+            | "norewinditerator"
+            | "infiniteiterator"
+            | "filteriterator"
+            | "recursivefilteriterator"
+            | "parentiterator"
+            | "recursivetreeiterator"
+    ) {
+        interfaces.push("OuterIterator".to_owned());
+    }
     RuntimeClassEntry {
         name: normalize_class_name(class_name),
-        parent: None,
+        parent: match normalized.as_str() {
+            "recursivecachingiterator" => Some(normalize_class_name("CachingIterator")),
+            "recursiveregexiterator" => Some(normalize_class_name("RegexIterator")),
+            "recursivefilteriterator" | "parentiterator" => {
+                Some(normalize_class_name("FilterIterator"))
+            }
+            "recursivetreeiterator" => Some(normalize_class_name("RecursiveIteratorIterator")),
+            _ => None,
+        },
         interfaces,
         methods: Vec::new(),
         properties: Vec::new(),
@@ -39137,8 +40924,92 @@ fn spl_iterator_display_name(class_name: &str) -> &'static str {
         "limititerator" => "LimitIterator",
         "emptyiterator" => "EmptyIterator",
         "appenditerator" => "AppendIterator",
+        "recursiveiteratoriterator" => "RecursiveIteratorIterator",
+        "cachingiterator" => "CachingIterator",
+        "recursivecachingiterator" => "RecursiveCachingIterator",
+        "regexiterator" => "RegexIterator",
+        "recursiveregexiterator" => "RecursiveRegexIterator",
+        "norewinditerator" => "NoRewindIterator",
+        "infiniteiterator" => "InfiniteIterator",
+        "filteriterator" => "FilterIterator",
+        "recursivefilteriterator" => "RecursiveFilterIterator",
+        "parentiterator" => "ParentIterator",
+        "recursivetreeiterator" => "RecursiveTreeIterator",
+        "multipleiterator" => "MultipleIterator",
+        "globiterator" => "GlobIterator",
         _ => "ArrayIterator",
     }
+}
+
+fn spl_glob_entries(
+    pattern: &str,
+    runtime_context: &RuntimeContext,
+) -> Result<Vec<(ArrayKey, Value)>, String> {
+    let resolved = spl_file_resolve_path(pattern, runtime_context);
+    let directory = resolved.parent().unwrap_or_else(|| Path::new("."));
+    let basename_pattern = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !runtime_context.filesystem.allows_path(directory) {
+        return Err(format!(
+            "E_PHP_VM_SPL_FILE_DENIED: local directory access denied for `{}`",
+            directory.to_string_lossy()
+        ));
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|error| {
+        format!(
+            "E_PHP_VM_SPL_GLOB_READ: failed to read `{}`: {error}",
+            directory.to_string_lossy()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "E_PHP_VM_SPL_GLOB_READ: failed to read `{}`: {error}",
+                directory.to_string_lossy()
+            )
+        })?;
+        let path = entry.path();
+        if !runtime_context.filesystem.allows_path(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+            continue;
+        };
+        if spl_glob_name_matches(&basename_pattern, &name) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                ArrayKey::Int(index as i64),
+                Value::string(path.to_string_lossy().into_owned().into_bytes()),
+            )
+        })
+        .collect())
+}
+
+fn spl_glob_name_matches(pattern: &str, name: &str) -> bool {
+    fn matches_inner(pattern: &[u8], name: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some((&b'*', rest)) => {
+                matches_inner(rest, name)
+                    || (!name.is_empty() && matches_inner(pattern, &name[1..]))
+            }
+            Some((&b'?', rest)) => !name.is_empty() && matches_inner(rest, &name[1..]),
+            Some((&expected, rest)) => {
+                name.first().is_some_and(|actual| *actual == expected)
+                    && matches_inner(rest, &name[1..])
+            }
+        }
+    }
+    matches_inner(pattern.as_bytes(), name.as_bytes())
 }
 
 fn spl_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, String> {
@@ -39147,10 +41018,16 @@ fn spl_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, Strin
             .iter()
             .map(|(key, value)| (key.clone(), effective_value(value)))
             .collect()),
-        Value::Object(object) if is_spl_iterator_runtime_class(&object.class_name()) => {
+        Value::Object(object)
+            if spl_runtime_marker(&object)
+                .is_some_and(|class| is_spl_iterator_runtime_class(&class)) =>
+        {
             Ok(spl_entries(&object))
         }
-        Value::Object(object) if is_spl_container_runtime_class(&object.class_name()) => {
+        Value::Object(object)
+            if spl_runtime_marker(&object)
+                .is_some_and(|class| is_spl_container_runtime_class(&class)) =>
+        {
             Ok(spl_container_entries(&object))
         }
         Value::Object(object) => Ok(object
@@ -39164,6 +41041,48 @@ fn spl_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, Strin
             value_type_name(&other)
         )),
     }
+}
+
+fn spl_recursive_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, String> {
+    let mut flattened = Vec::new();
+    for (key, value) in spl_entries_from_value(value)? {
+        match effective_value(&value) {
+            Value::Array(_) => flattened.extend(spl_recursive_entries_from_value(&value)?),
+            Value::Object(object)
+                if spl_runtime_marker(&object).as_deref() == Some("recursivearrayiterator") =>
+            {
+                flattened.extend(spl_recursive_entries_from_value(&Value::Object(object))?);
+            }
+            _ => flattened.push((key, value)),
+        }
+    }
+    Ok(flattened)
+}
+
+fn spl_regex_filter_entries(
+    entries: Vec<(ArrayKey, Value)>,
+    pattern: &str,
+) -> Vec<(ArrayKey, Value)> {
+    let needle = pattern
+        .trim_matches('/')
+        .trim_start_matches(".*")
+        .trim_end_matches(".*");
+    if needle.is_empty() {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|(key, value)| {
+            let value_text = to_string(value)
+                .map(|text| text.to_string_lossy())
+                .unwrap_or_default();
+            let key_value = array_key_to_value(key.clone());
+            let key_text = to_string(&key_value)
+                .map(|text| text.to_string_lossy())
+                .unwrap_or_default();
+            value_text.contains(needle) || key_text.contains(needle)
+        })
+        .collect()
 }
 
 fn spl_entries_to_php_array(entries: Vec<(ArrayKey, Value)>) -> PhpArray {
@@ -39304,13 +41223,54 @@ fn new_spl_container_object(
     Ok(object)
 }
 
+fn spl_container_method_is_supported(method: &str) -> bool {
+    matches!(
+        normalize_method_name(method).as_str(),
+        "rewind"
+            | "valid"
+            | "current"
+            | "key"
+            | "next"
+            | "count"
+            | "isempty"
+            | "getarraycopy"
+            | "toarray"
+            | "append"
+            | "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "top"
+            | "bottom"
+            | "getsize"
+            | "setsize"
+            | "exchangearray"
+            | "offsetget"
+            | "offsetexists"
+            | "offsetset"
+            | "offsetunset"
+            | "attach"
+            | "detach"
+            | "contains"
+            | "getinfo"
+            | "setinfo"
+            | "getiterator"
+            | "add"
+            | "removeall"
+            | "serialize"
+            | "__debuginfo"
+            | "__unserialize"
+    )
+}
+
 fn call_spl_container_method(
     object: ObjectRef,
     method: &str,
     args: Vec<CallArgument>,
 ) -> Result<Value, String> {
     let class_name = object.class_name();
-    let normalized_class = normalize_class_name(&class_name);
+    let normalized_class =
+        spl_runtime_marker(&object).unwrap_or_else(|| normalize_class_name(&class_name));
     let method = normalize_method_name(method);
     match method.as_str() {
         "rewind" => {
@@ -39506,6 +41466,78 @@ fn call_spl_container_method(
             spl_set_storage_entries(&object, entries);
             Ok(Value::Null)
         }
+        "getiterator" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if normalized_class != "arrayobject" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let iterator = ObjectRef::new_with_display_name(
+                &spl_iterator_class("ArrayIterator"),
+                spl_iterator_display_name("ArrayIterator"),
+            );
+            spl_set_entries(&iterator, spl_entries(&object));
+            spl_set_position(&iterator, 0);
+            Ok(Value::Object(iterator))
+        }
+        "add" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            if !matches!(
+                normalized_class.as_str(),
+                "spldoublylinkedlist" | "splstack" | "splqueue"
+            ) {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let index = to_int(&args[0].value)?.clamp(0, spl_entries(&object).len() as i64);
+            let mut entries = spl_entries(&object);
+            entries.insert(
+                index as usize,
+                (ArrayKey::Int(index), args[1].value.clone()),
+            );
+            spl_reindex_and_set_entries(&object, entries);
+            Ok(Value::Null)
+        }
+        "removeall" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class != "splobjectstorage" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let Value::Object(other) = effective_value(&args[0].value) else {
+                return Ok(Value::Null);
+            };
+            let remove_ids = spl_storage_entries(&other)
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect::<BTreeSet<_>>();
+            let entries = spl_storage_entries(&object)
+                .into_iter()
+                .filter(|(id, _, _)| !remove_ids.contains(id))
+                .collect();
+            spl_set_storage_entries(&object, entries);
+            Ok(Value::Null)
+        }
+        "serialize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::string(Vec::new()))
+        }
+        "__debuginfo" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Array(spl_entries_to_php_array(
+                spl_container_entries(&object),
+            )))
+        }
+        "__unserialize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class == "splfixedarray" {
+                spl_set_entries(&object, spl_entries_from_value(&args[0].value)?);
+            }
+            Ok(Value::Null)
+        }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
         )),
@@ -39556,7 +41588,7 @@ fn spl_container_display_name(class_name: &str) -> &'static str {
 }
 
 fn spl_container_entries(object: &ObjectRef) -> Vec<(ArrayKey, Value)> {
-    if normalize_class_name(&object.class_name()) == "splobjectstorage" {
+    if spl_runtime_marker(object).as_deref() == Some("splobjectstorage") {
         return spl_storage_entries(object)
             .into_iter()
             .enumerate()
@@ -39785,6 +41817,446 @@ fn spl_object_storage_detach(object: &ObjectRef, key: &Value) -> Result<(), Stri
     Ok(())
 }
 
+fn is_spl_heap_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "splheap" | "splmaxheap" | "splminheap" | "splpriorityqueue"
+    )
+}
+
+fn internal_spl_heap_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
+    if !is_spl_heap_runtime_class(object_class) {
+        return None;
+    }
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match target_class.as_str() {
+        "traversable" | "iterator" | "countable" => true,
+        "splheap" => matches!(
+            object_class.as_str(),
+            "splheap" | "splmaxheap" | "splminheap"
+        ),
+        "splmaxheap" => object_class == "splmaxheap",
+        "splminheap" => object_class == "splminheap",
+        "splpriorityqueue" => object_class == "splpriorityqueue",
+        _ => false,
+    })
+}
+
+fn new_spl_heap_object(class_name: &str, args: Vec<CallArgument>) -> Result<ObjectRef, String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: {class_name}::__construct has no builtin parameter ${name}"
+        ));
+    }
+    validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+    let object = ObjectRef::new_with_display_name(
+        &spl_heap_class(class_name),
+        spl_heap_display_name(class_name),
+    );
+    spl_set_entries(&object, Vec::new());
+    spl_set_position(&object, 0);
+    object.set_property("__extract_flags", Value::Int(SPL_PRIORITY_QUEUE_EXTR_DATA));
+    Ok(object)
+}
+
+fn spl_heap_method_is_supported(method: &str) -> bool {
+    matches!(
+        normalize_method_name(method).as_str(),
+        "rewind"
+            | "valid"
+            | "current"
+            | "key"
+            | "next"
+            | "count"
+            | "isempty"
+            | "insert"
+            | "top"
+            | "extract"
+            | "setextractflags"
+            | "getextractflags"
+            | "compare"
+            | "iscorrupted"
+            | "recoverfromcorruption"
+            | "__serialize"
+    )
+}
+
+fn call_spl_heap_method(
+    object: ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    let class_name = object.class_name();
+    let normalized_class =
+        spl_runtime_marker(&object).unwrap_or_else(|| normalize_class_name(&class_name));
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "rewind" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_heap_sort_entries(&object, &normalized_class);
+            spl_set_position(&object, 0);
+            Ok(Value::Null)
+        }
+        "valid" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(
+                spl_position(&object) < spl_entries(&object).len(),
+            ))
+        }
+        "current" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_heap_current_entry(&object, &normalized_class)
+                .map(|(_, value)| value)
+                .unwrap_or(Value::Null))
+        }
+        "key" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(spl_heap_current_entry(&object, &normalized_class)
+                .map(|(key, _)| array_key_to_value(key))
+                .unwrap_or(Value::Null))
+        }
+        "next" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_set_position(&object, spl_position(&object).saturating_add(1));
+            Ok(Value::Null)
+        }
+        "count" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_entries(&object).len() as i64))
+        }
+        "isempty" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(spl_entries(&object).is_empty()))
+        }
+        "insert" => {
+            let expected = if normalized_class == "splpriorityqueue" {
+                2
+            } else {
+                1
+            };
+            validate_spl_iterator_arg_count(&class_name, &args, expected, expected)?;
+            let value = if normalized_class == "splpriorityqueue" {
+                spl_priority_queue_entry(args[0].value.clone(), args[1].value.clone())
+            } else {
+                args[0].value.clone()
+            };
+            let mut entries = spl_entries(&object);
+            entries.push((ArrayKey::Int(entries.len() as i64), value));
+            spl_set_entries(&object, entries);
+            spl_heap_sort_entries(&object, &normalized_class);
+            Ok(Value::Null)
+        }
+        "top" | "extract" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            spl_heap_sort_entries(&object, &normalized_class);
+            let mut entries = spl_entries(&object);
+            if entries.is_empty() {
+                let action = if method == "top" {
+                    "peek at"
+                } else {
+                    "extract from"
+                };
+                return Err(format!(
+                    "E_PHP_VM_SPL_RUNTIME_EXCEPTION: Can't {action} an empty heap"
+                ));
+            }
+            let (_, raw) = if method == "extract" {
+                let entry = entries.remove(0);
+                spl_set_entries(&object, entries);
+                entry
+            } else {
+                entries[0].clone()
+            };
+            Ok(spl_heap_extract_value(&object, &normalized_class, raw))
+        }
+        "setextractflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class != "splpriorityqueue" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let flags = to_int(&args[0].value)?;
+            if !matches!(
+                flags,
+                SPL_PRIORITY_QUEUE_EXTR_DATA
+                    | SPL_PRIORITY_QUEUE_EXTR_PRIORITY
+                    | SPL_PRIORITY_QUEUE_EXTR_BOTH
+            ) {
+                return Err(
+                    "E_PHP_VM_SPL_VALUE_ERROR: extract flags must be EXTR_DATA, EXTR_PRIORITY, or EXTR_BOTH"
+                        .to_owned(),
+                );
+            }
+            object.set_property("__extract_flags", Value::Int(flags));
+            Ok(Value::Null)
+        }
+        "getextractflags" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Int(spl_priority_queue_extract_flags(&object)))
+        }
+        "compare" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            let ordering = compare(
+                &effective_value(&args[0].value),
+                &effective_value(&args[1].value),
+            )
+            .map_err(|message| format!("E_PHP_VM_SPL_COMPARE: {message}"))?;
+            Ok(Value::Int(match ordering {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }))
+        }
+        "iscorrupted" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Bool(false))
+        }
+        "recoverfromcorruption" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Null)
+        }
+        "__serialize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn spl_heap_class(class_name: &str) -> RuntimeClassEntry {
+    let normalized = normalize_class_name(class_name);
+    RuntimeClassEntry {
+        name: normalized.clone(),
+        parent: match normalized.as_str() {
+            "splmaxheap" | "splminheap" => Some(normalize_class_name("SplHeap")),
+            _ => None,
+        },
+        interfaces: vec![
+            "Iterator".to_owned(),
+            "Traversable".to_owned(),
+            "Countable".to_owned(),
+        ],
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: RuntimeClassFlags::default(),
+    }
+}
+
+fn spl_heap_display_name(class_name: &str) -> &'static str {
+    match normalize_class_name(class_name).as_str() {
+        "splheap" => "SplHeap",
+        "splmaxheap" => "SplMaxHeap",
+        "splminheap" => "SplMinHeap",
+        "splpriorityqueue" => "SplPriorityQueue",
+        _ => "SplHeap",
+    }
+}
+
+fn spl_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
+    let class_name = normalize_class_name(class_name);
+    if matches!(
+        class_name.as_str(),
+        "regexiterator" | "recursiveregexiterator"
+    ) {
+        return Some(Value::Int(match normalize_class_name(constant).as_str() {
+            "match" => 0,
+            "get_match" => 1,
+            "all_matches" => 2,
+            "split" => 3,
+            "replace" => 4,
+            "use_key" => 1,
+            _ => return None,
+        }));
+    }
+    if matches!(
+        class_name.as_str(),
+        "cachingiterator" | "recursivecachingiterator"
+    ) {
+        return Some(Value::Int(match normalize_class_name(constant).as_str() {
+            "call_tostring" => 1,
+            "tostring_use_key" => 2,
+            "tostring_use_current" => 4,
+            "tostring_use_inner" => 8,
+            "catch_get_child" => 16,
+            "full_cache" => 256,
+            _ => return None,
+        }));
+    }
+    if matches!(
+        class_name.as_str(),
+        "recursiveiteratoriterator" | "recursivetreeiterator"
+    ) && let Some(value) = match normalize_class_name(constant).as_str() {
+        "leaves_only" => Some(0),
+        "self_first" => Some(1),
+        "child_first" => Some(2),
+        "catch_get_child" => Some(16),
+        _ => None,
+    } {
+        return Some(Value::Int(value));
+    }
+    if class_name == "recursivetreeiterator" {
+        return Some(Value::Int(match normalize_class_name(constant).as_str() {
+            "bypass_current" => 4,
+            "bypass_key" => 8,
+            "prefix_left" => 0,
+            "prefix_mid_has_next" => 1,
+            "prefix_mid_last" => 2,
+            "prefix_end_has_next" => 3,
+            "prefix_end_last" => 4,
+            "prefix_right" => 5,
+            _ => return None,
+        }));
+    }
+    if class_name == "multipleiterator" {
+        return Some(Value::Int(match normalize_class_name(constant).as_str() {
+            "mit_need_any" => 0,
+            "mit_need_all" => 1,
+            "mit_keys_numeric" => 0,
+            "mit_keys_assoc" => 2,
+            _ => return None,
+        }));
+    }
+    if class_name == "splpriorityqueue" {
+        return Some(Value::Int(match normalize_class_name(constant).as_str() {
+            "extr_data" => SPL_PRIORITY_QUEUE_EXTR_DATA,
+            "extr_priority" => SPL_PRIORITY_QUEUE_EXTR_PRIORITY,
+            "extr_both" => SPL_PRIORITY_QUEUE_EXTR_BOTH,
+            _ => return None,
+        }));
+    }
+    None
+}
+
+fn spl_class_constant_value_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    constant: &str,
+) -> Option<Value> {
+    let mut current = normalize_class_name(class_name);
+    let mut seen = Vec::new();
+    loop {
+        if let Some(value) = spl_class_constant_value(&current, constant) {
+            return Some(value);
+        }
+        if seen.iter().any(|name| name == &current) {
+            return None;
+        }
+        seen.push(current.clone());
+        let class = lookup_class_in_state(compiled, state, &current)?;
+        current = class.parent.as_deref().map(normalize_class_name)?;
+    }
+}
+
+fn spl_heap_sort_entries(object: &ObjectRef, class_name: &str) {
+    let normalized_class = normalize_class_name(class_name);
+    let mut entries = spl_entries(object);
+    entries
+        .sort_by(|(_, left), (_, right)| spl_heap_compare_entries(&normalized_class, left, right));
+    spl_set_entries(object, entries);
+}
+
+fn spl_heap_compare_entries(class_name: &str, left: &Value, right: &Value) -> std::cmp::Ordering {
+    let normalized_class = normalize_class_name(class_name);
+    if normalized_class == "splpriorityqueue" {
+        let left_priority = spl_priority_queue_entry_parts(left)
+            .map(|(_, priority)| priority)
+            .unwrap_or(Value::Null);
+        let right_priority = spl_priority_queue_entry_parts(right)
+            .map(|(_, priority)| priority)
+            .unwrap_or(Value::Null);
+        return compare(&right_priority, &left_priority).unwrap_or(std::cmp::Ordering::Equal);
+    }
+    let ordering = compare(&effective_value(left), &effective_value(right))
+        .unwrap_or(std::cmp::Ordering::Equal);
+    if normalized_class == "splminheap" {
+        ordering
+    } else {
+        ordering.reverse()
+    }
+}
+
+fn spl_heap_current_entry(object: &ObjectRef, class_name: &str) -> Option<(ArrayKey, Value)> {
+    let normalized_class = normalize_class_name(class_name);
+    let raw = spl_entries(object).into_iter().nth(spl_position(object))?.1;
+    if normalized_class == "splpriorityqueue" {
+        let (data, priority) = spl_priority_queue_entry_parts(&raw)?;
+        let key = ArrayKey::from_value_mvp(&priority).unwrap_or(ArrayKey::Int(0));
+        return Some((
+            key,
+            spl_priority_queue_extract_value(object, data, priority),
+        ));
+    }
+    Some((ArrayKey::Int(spl_position(object) as i64), raw))
+}
+
+fn spl_heap_extract_value(object: &ObjectRef, class_name: &str, raw: Value) -> Value {
+    if normalize_class_name(class_name) == "splpriorityqueue"
+        && let Some((data, priority)) = spl_priority_queue_entry_parts(&raw)
+    {
+        return spl_priority_queue_extract_value(object, data, priority);
+    }
+    raw
+}
+
+fn spl_priority_queue_entry(data: Value, priority: Value) -> Value {
+    let mut entry = PhpArray::new();
+    entry.insert(ArrayKey::String(PhpString::from_test_str("data")), data);
+    entry.insert(
+        ArrayKey::String(PhpString::from_test_str("priority")),
+        priority,
+    );
+    Value::Array(entry)
+}
+
+fn spl_priority_queue_entry_parts(value: &Value) -> Option<(Value, Value)> {
+    let Value::Array(entry) = effective_value(value) else {
+        return None;
+    };
+    let data = entry
+        .get(&ArrayKey::String(PhpString::from_test_str("data")))
+        .map(effective_value)?;
+    let priority = entry
+        .get(&ArrayKey::String(PhpString::from_test_str("priority")))
+        .map(effective_value)?;
+    Some((data, priority))
+}
+
+fn spl_priority_queue_extract_value(object: &ObjectRef, data: Value, priority: Value) -> Value {
+    spl_priority_queue_extract_value_from_flags(
+        spl_priority_queue_extract_flags(object),
+        data,
+        priority,
+    )
+}
+
+fn spl_priority_queue_extract_value_from_flags(flags: i64, data: Value, priority: Value) -> Value {
+    match flags {
+        SPL_PRIORITY_QUEUE_EXTR_PRIORITY => priority,
+        SPL_PRIORITY_QUEUE_EXTR_BOTH => spl_priority_queue_entry(data, priority),
+        _ => data,
+    }
+}
+
+fn spl_priority_queue_extract_flags(object: &ObjectRef) -> i64 {
+    match object
+        .get_property("__extract_flags")
+        .map(|value| effective_value(&value))
+    {
+        Some(Value::Int(flags)) => flags,
+        _ => SPL_PRIORITY_QUEUE_EXTR_DATA,
+    }
+}
+
 fn is_spl_file_runtime_class(class_name: &str) -> bool {
     matches!(
         normalize_class_name(class_name).as_str(),
@@ -39862,6 +42334,38 @@ fn new_spl_file_object(
     Ok(object)
 }
 
+fn spl_file_method_is_supported(method: &str) -> bool {
+    matches!(
+        normalize_method_name(method).as_str(),
+        "__tostring"
+            | "getpathname"
+            | "getfilename"
+            | "getbasename"
+            | "getextension"
+            | "getpath"
+            | "getpathinfo"
+            | "getrealpath"
+            | "realpath"
+            | "getsize"
+            | "getmtime"
+            | "getlinktarget"
+            | "isfile"
+            | "isdir"
+            | "islink"
+            | "isreadable"
+            | "rewind"
+            | "eof"
+            | "valid"
+            | "key"
+            | "current"
+            | "next"
+            | "fgets"
+            | "fgetcsv"
+            | "ftruncate"
+            | "__construct"
+    )
+}
+
 fn call_spl_file_method(
     object: &ObjectRef,
     method: &str,
@@ -39869,7 +42373,8 @@ fn call_spl_file_method(
     runtime_context: &RuntimeContext,
 ) -> Result<Value, String> {
     let class_name = object.class_name();
-    let normalized_class = normalize_class_name(&class_name);
+    let normalized_class =
+        spl_runtime_marker(object).unwrap_or_else(|| normalize_class_name(&class_name));
     let method = normalize_method_name(method);
     match method.as_str() {
         "__tostring" | "getpathname" => {
@@ -39911,6 +42416,20 @@ fn call_spl_file_method(
                 .unwrap_or_default();
             Ok(Value::string(parent.into_bytes()))
         }
+        "getpathinfo" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 1)?;
+            let path = spl_file_path(object);
+            let parent = Path::new(&path)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let info = ObjectRef::new_with_display_name(
+                &spl_file_class("SplFileInfo"),
+                spl_file_display_name("SplFileInfo"),
+            );
+            spl_file_set_path(&info, &parent);
+            Ok(Value::Object(info))
+        }
         "getrealpath" | "realpath" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
@@ -39941,6 +42460,17 @@ fn call_spl_file_method(
                 .unwrap_or(0);
             Ok(Value::Int(modified))
         }
+        "getlinktarget" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
+            if !runtime_context.filesystem.allows_path(&path) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(fs::read_link(&path)
+                .ok()
+                .map(|path| Value::string(path.to_string_lossy().into_owned().into_bytes()))
+                .unwrap_or(Value::Bool(false)))
+        }
         "isfile" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(Value::Bool(
@@ -39954,6 +42484,18 @@ fn call_spl_file_method(
             Ok(Value::Bool(
                 spl_file_metadata(object, runtime_context)
                     .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false),
+            ))
+        }
+        "islink" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            let path = spl_file_resolve_path(&spl_file_path(object), runtime_context);
+            if !runtime_context.filesystem.allows_path(&path) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(
+                fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_symlink())
                     .unwrap_or(false),
             ))
         }
@@ -40032,6 +42574,18 @@ fn call_spl_file_method(
                 .map(|field| Value::string(field.as_bytes().to_vec()))
                 .collect();
             Ok(Value::packed_array(fields))
+        }
+        "ftruncate" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            let size = to_int(&args[0].value)?.max(0) as usize;
+            let mut content = spl_file_content(object).into_bytes();
+            content.resize(size, 0);
+            spl_file_set_content(object, String::from_utf8_lossy(&content).into_owned());
+            Ok(Value::Bool(true))
+        }
+        "__construct" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, usize::MAX)?;
+            Ok(Value::Null)
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
@@ -40491,7 +43045,9 @@ fn format_include_stack(stack: &[PathBuf]) -> String {
 fn is_autoload_builtin_name(name: &str) -> bool {
     matches!(
         name,
-        "spl_autoload_register"
+        "spl_autoload"
+            | "spl_autoload_extensions"
+            | "spl_autoload_register"
             | "spl_autoload_unregister"
             | "spl_autoload_functions"
             | "spl_autoload_call"
@@ -40528,6 +43084,8 @@ fn is_symbol_introspection_builtin_name(name: &str) -> bool {
             | "get_class_methods"
             | "get_class_vars"
             | "get_parent_class"
+            | "class_parents"
+            | "class_implements"
             | "get_declared_classes"
             | "get_declared_interfaces"
             | "get_declared_traits"
@@ -40654,7 +43212,7 @@ fn autoload_callback_from_value(
                 Ok(CallableValue::UserFunction { name: normalized })
             } else {
                 Err(format!(
-                    "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK: function {name} is not callable"
+                    "function \"{name}\" not found or invalid function name"
                 ))
             }
         }
@@ -40663,28 +43221,149 @@ fn autoload_callback_from_value(
             if BuiltinRegistry::new().contains(&name) {
                 Ok(CallableValue::InternalBuiltin { name })
             } else {
-                Err(format!(
-                    "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK: builtin {name} is not callable"
-                ))
+                Err(format!("builtin {name} is not callable"))
             }
         }
         Value::String(name) => {
-            let name = normalize_function_name(&name.to_string_lossy());
-            if compiled.lookup_function(&name).is_some() {
-                Ok(CallableValue::UserFunction { name })
-            } else if BuiltinRegistry::new().contains(&name) {
-                Ok(CallableValue::InternalBuiltin { name })
+            let name = name.to_string_lossy();
+            if let Some((class_name, method)) = name.split_once("::") {
+                autoload_class_method_callback(compiled, state, class_name, method, true)
+            } else {
+                let normalized = normalize_function_name(&name);
+                if compiled.lookup_function(&normalized).is_some()
+                    || dynamic_function_in_state(state, &normalized).is_some()
+                {
+                    Ok(CallableValue::UserFunction { name: normalized })
+                } else if BuiltinRegistry::new().contains(&normalized)
+                    || is_autoload_builtin_name(&normalized)
+                {
+                    Ok(CallableValue::InternalBuiltin { name: normalized })
+                } else {
+                    Err(format!(
+                        "function \"{name}\" not found or invalid function name"
+                    ))
+                }
+            }
+        }
+        Value::Array(array) => {
+            let elements = array
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            let [target, method]: [Value; 2] = match elements.try_into() {
+                Ok(elements) => elements,
+                Err(_) => {
+                    return Err("callable arrays must contain exactly target and method".to_owned());
+                }
+            };
+            let Some(method) = callable_string_value(method) else {
+                return Err("callable array method must be string".to_owned());
+            };
+            match callable_resolve_reference(target) {
+                Value::Object(object) => {
+                    let class_name = object.class_name();
+                    let resolved = autoload_resolve_method(compiled, state, &class_name, &method)?;
+                    if resolved.method.flags.is_static {
+                        Ok(CallableValue::BoundMethod {
+                            target: CallableMethodTarget::Class(normalize_class_name(&class_name)),
+                            method,
+                            scope: Some(normalize_class_name(&class_name)),
+                        })
+                    } else {
+                        Ok(CallableValue::BoundMethod {
+                            target: CallableMethodTarget::Object(object),
+                            method,
+                            scope: None,
+                        })
+                    }
+                }
+                Value::String(class_name) => {
+                    let class_name = class_name.to_string_lossy();
+                    autoload_class_method_callback(compiled, state, &class_name, &method, true)
+                }
+                other => Err(format!(
+                    "callable array target must be object or class string, got {}",
+                    value_type_name(&other)
+                )),
+            }
+        }
+        Value::Object(object) => {
+            if lookup_method_in_state(compiled, state, &object.class_name(), "__invoke")
+                .map(|method| method.is_some())?
+            {
+                Ok(CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Object(object),
+                    method: "__invoke".to_owned(),
+                    scope: None,
+                })
             } else {
                 Err(format!(
-                    "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK: function {name} is not callable"
+                    "object of class {} is not callable",
+                    object.class_name()
                 ))
             }
         }
         other => Err(format!(
-            "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK: value of type {} is not callable",
+            "value of type {} is not callable",
             value_type_name(&other)
         )),
     }
+}
+
+fn autoload_invalid_callback_error(function_name: &str, reason: &str) -> String {
+    format!(
+        "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK: {function_name}(): Argument #1 ($callback) must be a valid callback or null, {reason}"
+    )
+}
+
+fn autoload_class_method_callback(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    method: &str,
+    require_static: bool,
+) -> Result<CallableValue, String> {
+    let resolved = autoload_resolve_method(compiled, state, class_name, method)?;
+    if require_static && !resolved.method.flags.is_static {
+        return Err(format!(
+            "non-static method {}::{}() cannot be called statically",
+            resolved.class.display_name, method
+        ));
+    }
+    Ok(CallableValue::BoundMethod {
+        target: CallableMethodTarget::Class(normalize_class_name(class_name)),
+        method: method.to_owned(),
+        scope: Some(normalize_class_name(&resolved.class.name)),
+    })
+}
+
+fn autoload_resolve_method(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    method: &str,
+) -> Result<ResolvedMethodOwned, String> {
+    let display_name = callable_class_display_name(compiled, state, class_name);
+    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+        return Err(format!("class {display_name} does not exist"));
+    };
+    let Some(resolved) =
+        lookup_resolved_method_in_state(compiled, state, &class.name, method, None)?
+    else {
+        return Err(format!(
+            "class {} does not have a method \"{method}\"",
+            class.display_name
+        ));
+    };
+    if resolved.method.flags.is_private || resolved.method.flags.is_protected {
+        return Err(format!(
+            "cannot access {} method {}::{}()",
+            method_visibility_name(resolved.method.flags),
+            resolved.class.display_name,
+            method
+        ));
+    }
+    Ok(resolved)
 }
 
 fn register_dynamic_unit(state: &mut ExecutionState, unit: CompiledUnit) -> usize {
@@ -40799,11 +43478,9 @@ fn dynamic_unit_index_for_compiled(
 }
 
 fn register_dynamic_classes(state: &mut ExecutionState, unit_index: usize, unit: &IrUnit) {
-    for class in unit
-        .classes
-        .iter()
-        .filter(|class| class.span != php_ir::source_map::IrSpan::default())
-    {
+    for class in unit.classes.iter().filter(|class| {
+        class.span != php_ir::source_map::IrSpan::default() && !class.flags.is_conditional
+    }) {
         let normalized = normalize_class_name(&class.name);
         if state
             .dynamic_classes
@@ -40844,6 +43521,30 @@ fn block_first_span(block: &php_ir::block::BasicBlock) -> Option<IrSpan> {
         .first()
         .map(|instruction| instruction.span)
         .or_else(|| block.terminator.as_ref().map(|terminator| terminator.span))
+}
+
+fn declare_runtime_class(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    class_name: &str,
+) -> Result<(), String> {
+    let normalized = normalize_class_name(class_name);
+    if lookup_class_in_state(compiled, state, &normalized).is_some() {
+        return Err(format!(
+            "Cannot declare class {class_name}, because the name is already in use"
+        ));
+    }
+    let Some(class) = compiled.lookup_unit_class(&normalized).cloned() else {
+        return Err(format!(
+            "class declaration metadata for {class_name} is missing"
+        ));
+    };
+    let unit_index = dynamic_unit_index_for_compiled(state, compiled).unwrap_or(usize::MAX);
+    state
+        .dynamic_classes
+        .push(DynamicClassEntry { class, unit_index });
+    state.bump_class_table_epoch();
+    Ok(())
 }
 
 fn dynamic_function_in_state(
@@ -40949,6 +43650,9 @@ fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::Clas
     if is_std_class_runtime_class(normalized) {
         return Some(empty_internal_class_entry("stdClass", None, false));
     }
+    if is_supported_spl_runtime_class(normalized) {
+        return Some(internal_spl_class_entry(normalized));
+    }
     if normalize_class_name(normalized) == "throwable"
         || internal_throwable_instanceof(normalized, "throwable").is_some()
     {
@@ -40957,9 +43661,35 @@ fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::Clas
     None
 }
 
-fn internal_runtime_parent_is_known(class: &php_ir::module::ClassEntry, parent_name: &str) -> bool {
-    internal_runtime_class_entry(&normalize_class_name(&class.name)).is_some()
-        && internal_runtime_class_entry(&normalize_class_name(parent_name)).is_some()
+fn internal_runtime_parent_is_known(
+    _class: &php_ir::module::ClassEntry,
+    parent_name: &str,
+) -> bool {
+    internal_runtime_class_entry(&normalize_class_name(parent_name)).is_some()
+}
+
+fn internal_spl_class_entry(normalized: &str) -> php_ir::module::ClassEntry {
+    let runtime_class = if is_spl_iterator_runtime_class(normalized) {
+        spl_iterator_class(normalized)
+    } else if is_spl_container_runtime_class(normalized) {
+        spl_container_class(normalized)
+    } else if is_spl_heap_runtime_class(normalized) {
+        spl_heap_class(normalized)
+    } else {
+        spl_file_class(normalized)
+    };
+    let display_name = if is_spl_iterator_runtime_class(normalized) {
+        spl_iterator_display_name(normalized)
+    } else if is_spl_container_runtime_class(normalized) {
+        spl_container_display_name(normalized)
+    } else if is_spl_heap_runtime_class(normalized) {
+        spl_heap_display_name(normalized)
+    } else {
+        spl_file_display_name(normalized)
+    };
+    let mut entry = empty_internal_class_entry(display_name, runtime_class.parent.clone(), false);
+    entry.interfaces = runtime_class.interfaces.clone();
+    entry
 }
 
 fn internal_throwable_class_entry(normalized: &str) -> php_ir::module::ClassEntry {
@@ -41154,6 +43884,83 @@ fn php_name_tokens(source: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+impl AutoloadClassLookupKind {
+    const fn exists_function_name(self) -> &'static str {
+        match self {
+            Self::ClassLike => "class_exists",
+            Self::Class => "class_exists",
+            Self::Interface => "interface_exists",
+            Self::Trait => "trait_exists",
+            Self::Enum => "enum_exists",
+        }
+    }
+}
+
+fn autoload_trace_origin_from_call_site(
+    compiled: &CompiledUnit,
+    function_name: &'static str,
+    call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+) -> Option<AutoloadTraceOrigin> {
+    let (_, function_id, block_id, instruction_id) = call_site?;
+    let function = compiled.unit().functions.get(function_id.index())?;
+    let block = function.blocks.get(block_id.index())?;
+    let instruction = block
+        .instructions
+        .iter()
+        .find(|instruction| instruction.id == instruction_id)?;
+    Some(AutoloadTraceOrigin {
+        function_name,
+        span: instruction.span,
+    })
+}
+
+fn capture_autoload_trace(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    callback: &CallableValue,
+    class_name: &str,
+    origin: AutoloadTraceOrigin,
+) -> String {
+    let class_arg = format_trace_arg(&Value::string(class_name.as_bytes().to_vec()));
+    let callback = autoload_trace_callback_name(callback);
+    let mut lines = vec![format!("#0 [internal function]: {callback}({class_arg})")];
+    let file = compiled
+        .unit()
+        .files
+        .get(origin.span.file.index())
+        .map(|file| file.path.clone())
+        .unwrap_or_default();
+    let line = source_span_display_line(compiled, origin.span, false)
+        .unwrap_or_else(|| i64::from(origin.span.start));
+    lines.push(format!(
+        "#1 {file}({line}): {}({class_arg})",
+        origin.function_name
+    ));
+    let rest = capture_backtrace_string_from_index(compiled, stack, 2);
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines.join("\n")
+}
+
+fn autoload_trace_callback_name(callback: &CallableValue) -> String {
+    match callback {
+        CallableValue::UserFunction { name } | CallableValue::InternalBuiltin { name } => {
+            name.clone()
+        }
+        CallableValue::Closure(_) => "{closure}".to_owned(),
+        CallableValue::BoundMethod { target, method, .. } => {
+            let target = match target {
+                CallableMethodTarget::Object(object) => object.display_name(),
+                CallableMethodTarget::Class(class_name) => class_name.clone(),
+            };
+            format!("{target}->{method}")
+        }
+        CallableValue::MethodPlaceholder { target }
+        | CallableValue::UnresolvedDynamic { target } => target.clone(),
+    }
 }
 
 fn dynamic_class_owner_in_state(state: &ExecutionState, class_name: &str) -> Option<CompiledUnit> {
@@ -43099,12 +45906,20 @@ fn value_is_callable(
             }
             let method = method.to_string_lossy();
             match effective_value(target) {
-                Value::Object(_) => lookup_method_in_state(compiled, state, &class, &method)
-                    .map(|method| method.is_some())
-                    .unwrap_or(false),
-                _ => lookup_method_in_state(compiled, state, &class, &method)
-                    .map(|method| method.is_some_and(|method| method.flags.is_static))
-                    .unwrap_or(false),
+                Value::Object(_) => {
+                    lookup_method_in_state(compiled, state, &class, &method)
+                        .map(|method| method.is_some())
+                        .unwrap_or(false)
+                        || class_has_public_magic_call_in_state(compiled, state, &class)
+                            .unwrap_or(false)
+                }
+                _ => {
+                    lookup_method_in_state(compiled, state, &class, &method)
+                        .map(|method| method.is_some_and(|method| method.flags.is_static))
+                        .unwrap_or(false)
+                        || class_has_public_magic_call_static_in_state(compiled, state, &class)
+                            .unwrap_or(false)
+                }
             }
         }
         _ => false,
@@ -43171,6 +45986,57 @@ fn callable_array_name_for_is_callable(
         }
         _ => None,
     }
+}
+
+fn autoload_callback_public_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    callback: &CallableValue,
+) -> Value {
+    match callback {
+        CallableValue::UserFunction { name } => {
+            Value::string(user_function_display_name(compiled, state, name))
+        }
+        CallableValue::InternalBuiltin { name } => Value::string(name.clone()),
+        CallableValue::Closure(_) => Value::Callable(callback.clone()),
+        CallableValue::BoundMethod { target, method, .. } => {
+            if method.eq_ignore_ascii_case("__invoke")
+                && let CallableMethodTarget::Object(object) = target
+            {
+                return Value::Object(object.clone());
+            }
+            let target = match target {
+                CallableMethodTarget::Object(object) => Value::Object(object.clone()),
+                CallableMethodTarget::Class(class_name) => {
+                    Value::string(callable_class_display_name(compiled, state, class_name))
+                }
+            };
+            Value::Array(PhpArray::from_packed(vec![
+                target,
+                Value::string(method.clone()),
+            ]))
+        }
+        CallableValue::MethodPlaceholder { target }
+        | CallableValue::UnresolvedDynamic { target } => Value::string(target.clone()),
+    }
+}
+
+fn user_function_display_name(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    normalized_name: &str,
+) -> String {
+    if let Some(function) = compiled.lookup_function(normalized_name)
+        && let Some(function) = compiled.unit().functions.get(function.index())
+    {
+        return function.name.clone();
+    }
+    if let Some((owner, function)) = dynamic_function_in_state(state, normalized_name)
+        && let Some(function) = owner.unit().functions.get(function.index())
+    {
+        return function.name.clone();
+    }
+    normalized_name.to_owned()
 }
 
 fn callable_class_display_name(
@@ -44101,6 +46967,8 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_RUNTIME_BUILTIN_VALUE" => "ValueError",
         "E_PHP_RUNTIME_JSON_EXCEPTION" => "JsonException",
         "E_PHP_VM_PDO_EXCEPTION" => "PDOException",
+        "E_PHP_VM_SPL_RUNTIME_EXCEPTION" => "RuntimeException",
+        "E_PHP_VM_SPL_VALUE_ERROR" => "ValueError",
         "E_PHP_STD_MISSING_ARGUMENT" | "E_PHP_STD_TOO_MANY_ARGUMENTS" => "ArgumentCountError",
         "E_PHP_STD_TYPE_ERROR" => "TypeError",
         "E_PHP_STD_VALUE_ERROR" => "ValueError",
@@ -44113,6 +46981,7 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_VM_STRING_OFFSET_TYPE" => "TypeError",
         "E_PHP_VM_PARAM_TYPE_MISMATCH" => "TypeError",
         "E_PHP_VM_DYNAMIC_CLASS_NAME_TYPE" => "TypeError",
+        "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK" => "TypeError",
         "E_PHP_VM_ARRAY_KEY_CONVERSION" => "Error",
         "E_PHP_VM_PRIVATE_METHOD_ACCESS"
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
@@ -44978,7 +47847,7 @@ fn fetch_dim_value(array: &Value, key: &ArrayKey) -> Result<Option<Value>, Strin
         return fetch_dim_value(&cell.get(), key);
     }
     if let Value::Object(object) = array
-        && is_spl_container_runtime_class(&object.class_name())
+        && spl_runtime_marker(object).is_some_and(|class| is_spl_array_access_runtime_class(&class))
     {
         return spl_container_offset_get(object, &array_key_to_value(key.clone())).map(Some);
     }
@@ -47090,7 +49959,7 @@ fn assign_dim_value(
         return Ok(());
     }
     if let Value::Object(object) = container
-        && is_spl_container_runtime_class(&object.class_name())
+        && spl_runtime_marker(object).is_some_and(|class| is_spl_array_access_runtime_class(&class))
     {
         if dims.len() > 1 {
             return Err(
@@ -47331,7 +50200,7 @@ fn unset_dim_value(container: &mut Value, dims: &[ArrayKey]) {
         return;
     };
     if let Value::Object(object) = container
-        && is_spl_container_runtime_class(&object.class_name())
+        && spl_runtime_marker(object).is_some_and(|class| is_spl_array_access_runtime_class(&class))
         && rest.is_empty()
     {
         let _ = spl_container_offset_unset(object, &array_key_to_value(first.clone()));
@@ -48705,6 +51574,366 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             result.output.to_string_lossy(),
             "2|first:MissingClass|second:MissingClass||removed|1|second:OtherClass|"
         );
+    }
+
+    #[test]
+    fn spl_autoload_register_prepend_orders_callback_before_existing_stack() {
+        let result = execute_source(
+            "<?php
+            function first_loader($name) { echo 'first:', $name, '|'; }
+            function second_loader($name) { echo 'second:', $name, '|'; }
+            function declaring_loader($name) { echo 'declaring:', $name, '|'; eval('class ' . $name . '{}'); }
+            spl_autoload_register('first_loader');
+            spl_autoload_register('second_loader', true, true);
+            spl_autoload_register('declaring_loader');
+            new PrependedAutoloadTarget;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "second:PrependedAutoloadTarget|first:PrependedAutoloadTarget|declaring:PrependedAutoloadTarget|"
+        );
+    }
+
+    #[test]
+    fn spl_autoload_exception_from_new_is_catchable() {
+        let result = execute_source(
+            "<?php
+            function throwing_loader($name) {
+                echo 'autoload:', $name, '|';
+                throw new Exception('first');
+            }
+            spl_autoload_register('throwing_loader');
+            try {
+                new MissingAutoloadTarget;
+            } catch (Exception $e) {
+                echo $e->getMessage();
+            }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "autoload:MissingAutoloadTarget|first"
+        );
+    }
+
+    #[test]
+    fn function_local_class_is_visible_only_after_declaration_executes() {
+        let result = execute_source(
+            "<?php
+            function declare_later() { class LaterDeclared {} }
+            echo class_exists('LaterDeclared', false) ? 'early' : 'missing';
+            declare_later();
+            echo '|', class_exists('LaterDeclared', false) ? 'declared' : 'missing';
+            echo '|', (new LaterDeclared())::class;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "missing|declared|LaterDeclared"
+        );
+    }
+
+    #[test]
+    fn spl_autoload_unregister_spl_autoload_call_warns_and_clears_registry() {
+        let result = execute_source(
+            "<?php
+            function first_loader($name) {}
+            function second_loader($name) {}
+            spl_autoload_register('first_loader');
+            spl_autoload_register('second_loader');
+            var_dump(spl_autoload_unregister('spl_autoload_call'));
+            echo count(spl_autoload_functions()), '|';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains(
+            "Deprecated: spl_autoload_unregister(): Using spl_autoload_call() as a callback for spl_autoload_unregister() is deprecated"
+        ));
+        assert!(output.contains("bool(true)\n0|"));
+    }
+
+    #[test]
+    fn spl_autoload_loads_lowercase_include_once_candidates() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-spl-autoload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("testclass.inc"), "<?php echo 'inc|';\n")
+            .expect("testclass.inc should be written");
+        std::fs::write(root.join("testclass"), "<?php echo 'bare|';\n")
+            .expect("testclass should be written");
+        std::fs::write(
+            root.join("testclass.class.inc"),
+            "<?php echo 'class|'; class TestClass {}\n",
+        )
+        .expect("testclass.class.inc should be written");
+        std::fs::write(
+            root.join("registeredclass.class.inc"),
+            "<?php echo 'registered|'; class RegisteredClass {}\n",
+        )
+        .expect("registeredclass.class.inc should be written");
+        let source = "<?php
+            spl_autoload('TestClass');
+            spl_autoload('TestClass', null);
+            spl_autoload('TestClass', '.inc,,.class.inc');
+            echo class_exists('TestClass', false) ? 'loaded|' : 'missing|';
+            echo spl_autoload_extensions('.class.inc'), '|';
+            spl_autoload_register();
+            echo class_exists('RegisteredClass') ? 'registered-loaded' : 'registered-missing';
+        ";
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "inc|bare|class|loaded|.class.inc|registered|registered-loaded"
+        );
+    }
+
+    #[test]
+    fn spl_autoload_register_do_throw_false_notices_and_rejects_spl_autoload_call() {
+        let result = execute_source(
+            "<?php
+            function loader_for_notice($name) {}
+            spl_autoload_register('loader_for_notice', false);
+            try {
+                spl_autoload_register('spl_autoload_call');
+            } catch (ValueError $e) {
+                echo $e->getMessage(), '|';
+            }
+            echo count(spl_autoload_functions()), '|';
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains(
+            "Notice: spl_autoload_register(): Argument #2 ($do_throw) has been ignored, spl_autoload_register() will always throw"
+        ));
+        assert!(output.contains(
+            "spl_autoload_register(): Argument #1 ($callback) must not be the spl_autoload_call() function|1|"
+        ));
+    }
+
+    #[test]
+    fn spl_autoload_register_canonicalizes_object_static_method_callbacks() {
+        let result = execute_source(
+            "<?php
+            class StaticLoader {
+                static function load($name) { echo __METHOD__, ':', $name, '|'; }
+            }
+            spl_autoload_register(['StaticLoader', 'load']);
+            spl_autoload_register([new StaticLoader(), 'load']);
+            $callbacks = spl_autoload_functions();
+            var_dump(count($callbacks), $callbacks[0]);
+            spl_autoload_call('MissingStaticClass');
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("int(1)\narray(2) {"));
+        assert!(output.contains("string(12) \"StaticLoader\""));
+        assert!(output.contains("string(4) \"load\""));
+        assert!(output.contains("StaticLoader::load:MissingStaticClass|"));
+    }
+
+    #[test]
+    fn spl_autoload_functions_exposes_invokable_objects_as_objects() {
+        let result = execute_source(
+            "<?php
+            class InvokableLoader {
+                private $dir;
+                function __construct($dir) { $this->dir = $dir; }
+                function __invoke($name) {}
+            }
+            $loader = new InvokableLoader('src');
+            spl_autoload_register($loader);
+            $callbacks = spl_autoload_functions();
+            var_dump($callbacks);
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("array(1) {"));
+        assert!(output.contains("object(InvokableLoader)#"));
+        assert!(output.contains("[\"dir\":\"InvokableLoader\":private]=>"));
+        assert!(!output.contains("string(8) \"__invoke\""));
+    }
+
+    #[test]
+    fn spl_autoload_register_invalid_methods_throw_php_type_errors() {
+        let result = execute_source(
+            "<?php
+            class MyAutoLoader {
+                static protected function noAccess($className) {}
+                static function autoLoad($className) {}
+                function dynaLoad($className) {}
+            }
+            $obj = new MyAutoLoader;
+            foreach ([
+                'MyAutoLoader::notExist',
+                'MyAutoLoader::noAccess',
+                'MyAutoLoader::autoLoad',
+                'MyAutoLoader::dynaLoad',
+                ['MyAutoLoader', 'notExist'],
+                ['MyAutoLoader', 'noAccess'],
+                ['MyAutoLoader', 'autoLoad'],
+                ['MyAutoLoader', 'dynaLoad'],
+                [$obj, 'notExist'],
+                [$obj, 'noAccess'],
+                [$obj, 'autoLoad'],
+                [$obj, 'dynaLoad'],
+            ] as $idx => $callback) {
+                try {
+                    spl_autoload_register($callback);
+                    echo $idx, ':ok|';
+                } catch (TypeError $e) {
+                    echo $idx, ':', $e->getMessage(), '|';
+                }
+            }
+            echo 'count=', count(spl_autoload_functions());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains(
+            "0:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, class MyAutoLoader does not have a method \"notExist\"|"
+        ));
+        assert!(output.contains(
+            "1:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, cannot access protected method MyAutoLoader::noAccess()|"
+        ));
+        assert!(output.contains("2:ok|"));
+        assert!(output.contains(
+            "3:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, non-static method MyAutoLoader::dynaLoad() cannot be called statically|"
+        ));
+        assert!(output.contains(
+            "4:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, class MyAutoLoader does not have a method \"notExist\"|"
+        ));
+        assert!(output.contains(
+            "5:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, cannot access protected method MyAutoLoader::noAccess()|"
+        ));
+        assert!(output.contains("6:ok|"));
+        assert!(output.contains(
+            "7:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, non-static method MyAutoLoader::dynaLoad() cannot be called statically|"
+        ));
+        assert!(output.contains(
+            "8:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, class MyAutoLoader does not have a method \"notExist\"|"
+        ));
+        assert!(output.contains(
+            "9:spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, cannot access protected method MyAutoLoader::noAccess()|"
+        ));
+        assert!(output.contains("10:ok|"));
+        assert!(output.contains("11:ok|"));
+        assert!(output.contains("count=2"));
+    }
+
+    #[test]
+    fn spl_autoload_register_preserves_requested_static_class_target() {
+        let result = execute_source(
+            "<?php
+            class Test {
+                public static function register() {
+                    spl_autoload_register([Test::class, 'autoload']);
+                }
+                public static function autoload($class) {
+                    echo 'self=', self::class, ', static=', static::class, '|';
+                }
+            }
+            class Test2 extends Test {
+                public static function register() {
+                    spl_autoload_register([Test2::class, 'autoload']);
+                }
+            }
+            Test::register();
+            Test2::register();
+            spl_autoload_call('MissingAutoloadScopeClass');
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "self=Test, static=Test|self=Test, static=Test2|"
+        );
+    }
+
+    #[test]
+    fn spl_autoload_extensions_and_class_parents_are_request_local_builtins() {
+        let result = execute_source(
+            r#"<?php
+            class BaseParent {}
+            class ChildParent extends BaseParent {}
+            echo spl_autoload_extensions(), "|";
+            echo spl_autoload_extensions(".php"), "|", spl_autoload_extensions(), "|";
+            foreach (class_parents(ChildParent::class) as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            var_dump(class_parents("MissingParent", false));
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.starts_with(".inc,.php|.php|.php|BaseParent=BaseParent|\n"));
+        assert!(output.contains(
+            "Warning: class_parents(): Class MissingParent does not exist in /tmp/phrust-test.php on line "
+        ));
+        assert!(output.ends_with("\nbool(false)\n"));
+    }
+
+    #[test]
+    fn class_implements_reports_userland_and_internal_interfaces() {
+        let result = execute_source(
+            r#"<?php
+            interface BaseIface {}
+            interface ChildIface extends BaseIface {}
+            class ImplParent implements ChildIface {}
+            class ImplChild extends ImplParent {}
+            foreach (class_implements(ImplChild::class) as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            echo class_implements("MissingImpl", false) === false ? "missing|" : "bad|";
+            foreach (class_implements(ArrayIterator::class) as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.starts_with("ChildIface=ChildIface|BaseIface=BaseIface|\n"));
+        assert!(output.contains(
+            "Warning: class_implements(): Class MissingImpl does not exist in /tmp/phrust-test.php on line "
+        ));
+        assert!(output.ends_with(
+            "\nmissing|Iterator=Iterator|Traversable=Traversable|Countable=Countable|ArrayAccess=ArrayAccess|SeekableIterator=SeekableIterator|"
+        ));
     }
 
     #[test]
@@ -50917,6 +54146,16 @@ good"
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"7");
+
+        let constructorless_args = execute_source(
+            "<?php class NoCtor {} $direct = new NoCtor('ignored'); $name = 'NoCtor'; $dynamic = new $name('also ignored'); echo $direct::class, '|', $dynamic::class;",
+        );
+        assert!(
+            constructorless_args.status.is_success(),
+            "{:?}",
+            constructorless_args.status
+        );
+        assert_eq!(constructorless_args.output.as_bytes(), b"NoCtor|NoCtor");
 
         let magic_after_unset = execute_source(
             "<?php class Box { public $value = 1; public function __get($name) { return $name . ':magic'; } } $box = new Box(); unset($box->value); echo $box->value;",
@@ -56904,6 +60143,16 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn braced_property_interpolation_reads_current_object_property() {
+        let result = execute_source(
+            "<?php class A { private $dir; function __construct($dir) { $this->dir = $dir; } function __invoke($class) { echo \"A('{$this->dir}') $class\\n\"; } } $a = new A('d1'); $a('TestX');",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"A('d1') TestX\n");
+    }
+
+    #[test]
     fn runtime_types_check_returns_void_and_properties() {
         let success = execute_source(
             "<?php class Box { public int $value; } function text(): string { return 'ok'; } function done(): void { return; } $box = new Box(); $box->value = 7; echo text(), '|', done(), '|', $box->value;",
@@ -57805,6 +61054,87 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn spl_iterator_apply_calls_callback_args_and_stops_on_false() {
+        let result = execute_source(
+            r#"<?php
+            function apply_tick($prefix) {
+                static $count = 0;
+                echo $prefix, ":", $count, "|";
+                if ($count == 1) {
+                    $count = 2;
+                    return false;
+                }
+                $count = 1;
+                return true;
+            }
+            function apply_true() {
+                return true;
+            }
+            $it = new ArrayIterator(["a" => 1, "b" => 2, "c" => 3]);
+            echo iterator_apply($it, "apply_tick", ["seen"]), "|";
+            echo iterator_apply($it, "apply_true");
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"seen:0|seen:1|2|3");
+    }
+
+    #[test]
+    fn spl_iterator_apply_errors_are_catchable_and_falsey_stops() {
+        let result = execute_source(
+            r#"<?php
+            function returns_null() {}
+            $it = new ArrayIterator([1, 2, 3]);
+            echo iterator_apply($it, "returns_null"), "|";
+            try {
+                iterator_apply($it, "returns_null", "bad");
+            } catch (TypeError $e) {
+                echo "type|";
+            }
+            try {
+                iterator_apply($it, "returns_null", null, 4);
+            } catch (TypeError $e) {
+                echo "arity|";
+            }
+            try {
+                iterator_apply($it, "missing_apply_callback");
+            } catch (TypeError $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"1|type|arity|iterator_apply(): Argument #2 ($callback) must be a valid callback, function \"missing_apply_callback\" not found or invalid function name"
+        );
+    }
+
+    #[test]
+    fn spl_iterator_apply_honors_subclass_rewind_exception() {
+        let result = execute_source(
+            r#"<?php
+            class ThrowingArrayIterator extends ArrayIterator {
+                public function rewind(): void {
+                    throw new Exception("Make the iterator break");
+                }
+            }
+            function no_op_apply() {}
+            try {
+                iterator_apply(new ThrowingArrayIterator([1]), "no_op_apply");
+            } catch (Exception $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"Make the iterator break");
+    }
+
+    #[test]
     fn spl_iterator_wrappers_limit_empty_and_append_iterate() {
         let result = execute_source(
             r#"<?php
@@ -57855,6 +61185,107 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             result.output.as_bytes(),
             b"recursive|array|iterator|traversable|countable|k=v"
         );
+    }
+
+    #[test]
+    fn spl_internal_iterator_subclass_uses_parent_storage_and_methods() {
+        let result = execute_source(
+            r#"<?php
+            class MyArrayIterator extends ArrayIterator {}
+            $it = new MyArrayIterator(["a" => 1, "b" => 2]);
+            echo ($it instanceof MyArrayIterator) ? "self|" : "no|";
+            echo ($it instanceof ArrayIterator) ? "array|": "no|";
+            echo ($it instanceof Iterator) ? "iterator|" : "no|";
+            echo ($it instanceof Countable) ? "countable|" : "no|";
+            echo $it->count(), "|", count($it), "|";
+            foreach ($it as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"self|array|iterator|countable|2|2|a=1|b=2|"
+        );
+    }
+
+    #[test]
+    fn spl_internal_iterator_subclass_can_call_parent_methods() {
+        let result = execute_source(
+            r#"<?php
+            class MyEmptyIterator extends EmptyIterator {
+                public function rewind(): void {
+                    echo __METHOD__, "|";
+                    parent::rewind();
+                }
+
+                public function valid(): false {
+                    echo __METHOD__, "|";
+                    return parent::valid();
+                }
+            }
+
+            foreach (new MyEmptyIterator() as $value) {
+                echo "bad";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"MyEmptyIterator::rewind|MyEmptyIterator::valid|"
+        );
+    }
+
+    #[test]
+    fn spl_internal_container_subclass_uses_parent_storage_and_array_access() {
+        let result = execute_source(
+            r#"<?php
+            class MyArrayObject extends ArrayObject {}
+            $object = new MyArrayObject(["x" => 7]);
+            $object["y"] = 8;
+            echo ($object instanceof MyArrayObject) ? "self|" : "no|";
+            echo ($object instanceof ArrayObject) ? "arrayobject|" : "no|";
+            echo ($object instanceof ArrayAccess) ? "arrayaccess|" : "no|";
+            echo count($object), "|", $object["x"], "|", $object["y"], "|";
+            foreach ($object as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"self|arrayobject|arrayaccess|2|7|8|x=7|y=8|"
+        );
+    }
+
+    #[test]
+    fn spl_internal_subclass_parent_constructor_initializes_storage() {
+        let result = execute_source(
+            r#"<?php
+            class MyConstructedIterator extends ArrayIterator {
+                public function __construct(array $items) {
+                    parent::__construct($items);
+                }
+            }
+            class MyConstructedObject extends ArrayObject {
+                public function __construct(array $items) {
+                    parent::__construct($items);
+                }
+            }
+            $it = new MyConstructedIterator(["i" => 3]);
+            $object = new MyConstructedObject(["o" => 4]);
+            echo $it->count(), "|", $it["i"], "|", count($object), "|", $object["o"];
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|3|1|4");
     }
 
     #[test]
@@ -58025,6 +61456,233 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             result.output.to_string_lossy(),
             "items.csv|items|size|real|name,qty\n0:name,qty\n1:apple,2\n|name:qty|info"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spl_file_info_reports_link_target_created_by_symlink() {
+        let root = std::env::temp_dir().join(format!("phrust-spl-link-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let file = root.join("target.txt");
+        let link = root.join("link.txt");
+        std::fs::write(&file, "payload").expect("fixture should be written");
+        let file_path = file.to_string_lossy().replace('\\', "\\\\");
+        let link_path = link.to_string_lossy().replace('\\', "\\\\");
+        let source = format!(
+            r#"<?php
+            $target = "{file_path}";
+            $link = "{link_path}";
+            echo symlink($target, $link) ? "created|" : "failed|";
+            $info = new SplFileInfo($link);
+            echo $info->isLink() ? "link|" : "not-link|";
+            echo $info->getLinkTarget() === $target ? "target" : "different";
+            unlink($link);
+            "#
+        );
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli(
+                    file.to_string_lossy().into_owned(),
+                    Vec::new(),
+                )
+                .with_filesystem_capabilities(
+                    php_runtime::FilesystemCapabilities::none()
+                        .with_allowed_roots(vec![root.clone()]),
+                ),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"created|link|target");
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
+    fn spl_internal_file_subclass_uses_parent_storage_and_methods() {
+        let root =
+            std::env::temp_dir().join(format!("phrust-spl-file-subclass-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let file = root.join("child.txt");
+        std::fs::write(&file, "payload").expect("fixture should be written");
+        let path = file.to_string_lossy().replace('\\', "\\\\");
+        let source = format!(
+            r#"<?php
+            class MyFileInfo extends SplFileInfo {{}}
+            $info = new MyFileInfo("{path}");
+            echo ($info instanceof MyFileInfo) ? "self|" : "no|";
+            echo ($info instanceof SplFileInfo) ? "info|" : "no|";
+            echo $info->getFilename(), "|", $info->getExtension();
+            "#
+        );
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli(
+                    file.to_string_lossy().into_owned(),
+                    Vec::new(),
+                )
+                .with_filesystem_capabilities(
+                    php_runtime::FilesystemCapabilities::none()
+                        .with_allowed_roots(vec![root.clone()]),
+                ),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"self|info|child.txt|txt");
+    }
+
+    #[test]
+    fn spl_heap_runtime_classes_order_and_count_entries() {
+        let result = execute_source(
+            r#"<?php
+            $max = new SplMaxHeap();
+            $max->insert(1);
+            $max->insert(3);
+            $max->insert(2);
+            echo $max instanceof SplHeap ? "heap|" : "no|";
+            echo count($max), "|", $max->top(), "|", $max->extract(), "|", $max->extract(), "|";
+            $min = new SplMinHeap();
+            $min->insert(2);
+            $min->insert(1);
+            echo $min->extract(), "|", $max->isEmpty() ? "empty" : "items";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"heap|3|3|3|2|1|items");
+    }
+
+    #[test]
+    fn spl_heap_empty_extract_raises_runtime_exception() {
+        let result = execute_source(
+            r#"<?php
+            try {
+                (new SplMaxHeap())->extract();
+            } catch (RuntimeException $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"Can't extract from an empty heap"
+        );
+    }
+
+    #[test]
+    fn spl_heap_user_subclass_uses_parent_storage_and_iteration() {
+        let result = execute_source(
+            r#"<?php
+            class MyHeap extends SplHeap {
+                public function compare($a, $b): int {
+                    return $a <=> $b;
+                }
+            }
+            $heap = new MyHeap();
+            $heap->insert(1);
+            $heap->insert(3);
+            $heap->insert(2);
+            echo ($heap instanceof MyHeap) ? "self|" : "no|";
+            echo ($heap instanceof SplHeap) ? "heap|" : "no|";
+            foreach ($heap as $value) {
+                echo $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"self|heap|3|2|1|");
+    }
+
+    #[test]
+    fn spl_internal_subclass_user_methods_fall_through_after_marker_dispatch() {
+        let result = execute_source(
+            r#"<?php
+            class MyRegexIterator extends RegexIterator {
+                public function show() {
+                    return $this->getRegex();
+                }
+            }
+            $it = new MyRegexIterator(new ArrayIterator(["cat", "dog"]), "/cat/");
+            echo $it->show(), "|";
+            foreach ($it as $value) {
+                echo $value;
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"/cat/|cat");
+    }
+
+    #[test]
+    fn spl_priority_queue_extract_flags_select_output_shape() {
+        let result = execute_source(
+            r#"<?php
+            $pq = new SplPriorityQueue();
+            echo $pq->getExtractFlags(), "|";
+            $pq->insert("a", 1);
+            $pq->insert("b", 2);
+            echo $pq->top(), "|";
+            $pq->setExtractFlags(SplPriorityQueue::EXTR_PRIORITY);
+            echo $pq->top(), "|";
+            $pq->setExtractFlags(SplPriorityQueue::EXTR_BOTH);
+            $both = $pq->top();
+            echo $both["data"], ":", $both["priority"], "|";
+            foreach ($pq as $key => $value) {
+                echo $key, "=", $value["data"], ";";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|b|2|b:2|2=b;1=a;");
+    }
+
+    #[test]
+    fn spl_iterator_flag_constants_include_inherited_internal_parents() {
+        let result = execute_source(
+            r#"<?php
+            class MyRegexIterator extends RegexIterator {}
+            echo MyRegexIterator::USE_KEY, "|";
+            echo CachingIterator::FULL_CACHE, "|", CachingIterator::CALL_TOSTRING, "|";
+            echo RecursiveIteratorIterator::LEAVES_ONLY, "|", RecursiveIteratorIterator::CHILD_FIRST, "|";
+            echo RecursiveTreeIterator::BYPASS_CURRENT, "|", RecursiveTreeIterator::PREFIX_RIGHT, "|";
+            echo MultipleIterator::MIT_NEED_ALL, "|", MultipleIterator::MIT_KEYS_ASSOC;
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|256|1|0|2|4|5|1|2");
+    }
+
+    #[test]
+    fn spl_multiple_iterator_tracks_attached_iterator_identity() {
+        let result = execute_source(
+            r#"<?php
+            $one = new ArrayIterator([1]);
+            $two = new ArrayIterator([2]);
+            $multi = new MultipleIterator();
+            $multi->attachIterator($one);
+            $multi->attachIterator($two);
+            echo $multi->countIterators(), "|";
+            echo $multi->containsIterator($two) ? "yes|" : "no|";
+            $multi->detachIterator($two);
+            echo $multi->countIterators(), "|";
+            echo $multi->containsIterator($two) ? "yes" : "no";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"2|yes|1|no");
     }
 
     #[test]
@@ -58382,6 +62040,53 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 && diagnostic.message().contains("Cannot redeclare function")),
             "{:#?}",
             result
+        );
+    }
+
+    #[test]
+    fn eval_declarations_are_registered_for_later_runtime_lookup() {
+        let result = execute_source(
+            "<?php eval('function eval_runtime_fixture() { return 1; } class EvalRuntimeFixture {}'); echo eval_runtime_fixture(), '|', (new EvalRuntimeFixture())::class;",
+        );
+
+        assert!(result.status.is_success(), "{:#?}", result);
+        assert_eq!(result.output.as_bytes(), b"1|EvalRuntimeFixture");
+    }
+
+    #[test]
+    fn eval_concat_declaration_in_autoload_callback_registers_class() {
+        let result = execute_source(
+            r#"<?php
+class X {
+    public function getClosure() {
+        return function($class) {
+            echo "a2 called\n";
+        };
+    }
+}
+$a = function ($class) {
+    echo "a called\n";
+};
+$x = new X;
+$a2 = $x->getClosure();
+$b = function ($class) {
+    eval('class ' . $class . '{function __construct(){echo "foo\n";}}');
+    echo "b called\n";
+};
+spl_autoload_register($a);
+spl_autoload_register($a2);
+spl_autoload_register($b);
+$c = $a;
+$c2 = $a2;
+spl_autoload_register($c);
+spl_autoload_register($c2);
+$c = new foo;"#,
+        );
+
+        assert!(result.status.is_success(), "{:#?}", result);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"a called\na2 called\nb called\nfoo\n"
         );
     }
 

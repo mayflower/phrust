@@ -419,6 +419,9 @@ fn format_instruction(kind: &InstructionKind) -> String {
         InstructionKind::RegisterConstant { name, value } => {
             format!("register_constant {:?} {}", name, format_operand(value))
         }
+        InstructionKind::DeclareClass { name } => {
+            format!("declare_class {:?}", name)
+        }
         InstructionKind::Move { dst, src } => {
             format!("move r{} {}", dst.raw(), format_operand(src))
         }
@@ -785,12 +788,14 @@ fn format_instruction(kind: &InstructionKind) -> String {
         }
         InstructionKind::NewObject {
             dst,
+            display_class_name,
             class_name,
             args,
         } => format!(
-            "new_object r{} {:?} ({})",
+            "new_object r{} {:?} display={:?} ({})",
             dst.raw(),
             class_name,
+            display_class_name,
             args.iter()
                 .map(format_call_arg)
                 .collect::<Vec<_>>()
@@ -1329,6 +1334,9 @@ mod tests {
             InstructionKind::FetchConst {
                 dst: RegId::new(0),
                 name: "ANSWER".to_string(),
+            },
+            InstructionKind::DeclareClass {
+                name: "RuntimeDeclared".to_string(),
             },
             InstructionKind::Move {
                 dst: RegId::new(1),

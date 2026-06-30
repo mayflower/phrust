@@ -929,6 +929,7 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("sprintf", "standard"))
         .with_function(FunctionDescriptor::php("sqrt", "standard"))
         .with_function(FunctionDescriptor::php("stat", "standard"))
+        .with_function(FunctionDescriptor::php("symlink", "standard"))
         .with_function(FunctionDescriptor::php("stream_context_create", "standard"))
         .with_function(FunctionDescriptor::php(
             "stream_context_get_default",
@@ -2332,6 +2333,8 @@ pub(super) fn standard_library_date_extension() -> ExtensionDescriptor {
 
 pub(super) fn standard_library_spl_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("spl")
+        .with_function(FunctionDescriptor::php("class_implements", "spl"))
+        .with_function(FunctionDescriptor::php("iterator_apply", "spl"))
         .with_function(FunctionDescriptor::php("iterator_count", "spl"))
         .with_function(FunctionDescriptor::php("iterator_to_array", "spl"))
         .with_function(FunctionDescriptor::php("spl_autoload_call", "spl"))

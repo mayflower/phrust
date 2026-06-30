@@ -85,6 +85,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("rename", builtin_rename, BuiltinCompatibility::Php),
     BuiltinEntry::new("rmdir", builtin_rmdir, BuiltinCompatibility::Php),
     BuiltinEntry::new("stat", builtin_stat, BuiltinCompatibility::Php),
+    BuiltinEntry::new("symlink", builtin_symlink, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "sys_get_temp_dir",
         builtin_sys_get_temp_dir,
@@ -649,6 +650,44 @@ pub(in crate::builtins::modules) fn builtin_unlink(
     Ok(Value::Bool(fs::remove_file(path).is_ok()))
 }
 
+pub(in crate::builtins::modules) fn builtin_symlink(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("symlink", &args, 2)?;
+    let target = resolve_runtime_path(context, &string_arg("symlink", &args[0])?.to_string_lossy());
+    let link = resolve_runtime_path(context, &string_arg("symlink", &args[1])?.to_string_lossy());
+    if !context.filesystem_capabilities().allows_path(&target)
+        || !context.filesystem_capabilities().allows_path(&link)
+    {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(create_symlink(&target, &link).is_ok()))
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are not supported on this platform",
+    ))
+}
+
 pub(in crate::builtins::modules) fn builtin_mkdir(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -978,6 +1017,38 @@ mod tests {
         assert!(!destination.exists());
 
         let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
+    fn symlink_creates_link_inside_allowed_roots() {
+        let root = unique_temp_dir("symlink-ok");
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let target = root.join("target.txt");
+        let link = root.join("link.txt");
+        std::fs::write(&target, b"payload").expect("write target");
+        let capabilities = FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]);
+        let mut output = OutputBuffer::new();
+        let mut context =
+            BuiltinContext::with_runtime(&mut output, root.clone(), capabilities, None);
+
+        let result = builtin_symlink(
+            &mut context,
+            vec![
+                Value::string(target.to_string_lossy().to_string()),
+                Value::string("link.txt"),
+            ],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("builtin should return");
+
+        #[cfg(any(unix, windows))]
+        assert_eq!(result, Value::Bool(true));
+        #[cfg(any(unix, windows))]
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
         let _ = std::fs::remove_dir(root);
     }
 

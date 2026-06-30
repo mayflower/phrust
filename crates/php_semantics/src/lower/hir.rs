@@ -14,7 +14,8 @@ use crate::hir::{
 use crate::lower::types::TypeLoweringScope;
 use crate::symbols::resolution::{ResolveContext, ResolvedName};
 use php_ast::{
-    AstToken, ExprNode, Stmt, TokenView, descendant_tokens, syntax_child_nodes, syntax_child_tokens,
+    AstNode, AstToken, ClassDecl, EnumDecl, ExprNode, InterfaceDecl, Stmt, TokenView, TraitDecl,
+    descendant_tokens, syntax_child_nodes, syntax_child_tokens,
 };
 use php_source::TextRange;
 use php_syntax::{SyntaxElement, SyntaxNode, SyntaxToken};
@@ -660,7 +661,7 @@ impl HirLowerer<'_> {
 
     fn stmt_children(&mut self, node: &SyntaxNode) -> Vec<StmtId> {
         syntax_child_nodes(node)
-            .filter(|child| Stmt::cast(child).is_some())
+            .filter(|child| is_statement_list_item(child))
             .map(|child| self.lower_stmt(child))
             .collect()
     }
@@ -2238,6 +2239,14 @@ fn source_text_no_trivia(node: &SyntaxNode) -> String {
         .join("")
 }
 
+fn is_statement_list_item(node: &SyntaxNode) -> bool {
+    Stmt::cast(node).is_some()
+        || ClassDecl::cast(node).is_some()
+        || InterfaceDecl::cast(node).is_some()
+        || TraitDecl::cast(node).is_some()
+        || EnumDecl::cast(node).is_some()
+}
+
 fn assignment_this_target_span(node: &SyntaxNode) -> Option<TextRange> {
     let mut left = String::new();
     let mut this_span = None;
@@ -2466,13 +2475,36 @@ fn array_pair_is_by_ref(node: &SyntaxNode) -> bool {
 }
 
 fn is_quoted_construct_operand(text: &str) -> bool {
-    let Some(first) = text.chars().next() else {
+    let bytes = text.as_bytes();
+    let Some(first) = bytes.first().copied() else {
         return false;
     };
-    if first != '\'' && first != '"' {
+    if first != b'\'' && first != b'"' {
         return false;
     }
-    text.len() >= 2 && text.ends_with(first)
+    if bytes.len() < 2 {
+        return false;
+    }
+    let mut index = 1usize;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == first {
+            return index + 1 == bytes.len();
+        }
+        index += 1;
+    }
+    false
 }
 
 fn is_simple_construct_identifier(text: &str) -> bool {
@@ -3069,6 +3101,50 @@ mod tests {
                 HirExprKind::Binary { operator, .. } if operator == "."
             ),
             "require operand should preserve the concatenated path"
+        );
+        assert!(
+            reporter
+                .into_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.id() != DiagnosticId::HirMissingChild)
+        );
+    }
+
+    #[test]
+    fn lowers_eval_concat_as_evaluated_operand() {
+        let source = "<?php eval('class ' . $class . '{function __construct(){}}');\n";
+        let parse = parse_source_file(source);
+        let root = source_file(parse.root()).expect("source file");
+        let mut database = FrontendDatabase::new();
+        let module_id = database.add_module(HirModule::new("SOURCE_FILE", source.len()));
+        let mut reporter = DiagnosticReporter::new();
+
+        collect_hir_in_node(
+            root.syntax(),
+            &mut database,
+            module_id,
+            &mut reporter,
+            TypeLoweringScope::new(None, Default::default()),
+        );
+
+        let module = database.module(module_id).expect("module");
+        let eval_operand = module
+            .expressions()
+            .iter()
+            .find_map(|(_, expr)| match expr.kind() {
+                HirExprKind::Eval {
+                    expr: Some(expr), ..
+                } => Some(*expr),
+                _ => None,
+            })
+            .expect("eval expression");
+
+        assert!(
+            matches!(
+                module.expressions()[eval_operand].kind(),
+                HirExprKind::Binary { operator, .. } if operator == "."
+            ),
+            "eval operand should preserve the concatenated code expression"
         );
         assert!(
             reporter

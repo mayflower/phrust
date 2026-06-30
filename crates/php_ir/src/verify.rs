@@ -310,6 +310,7 @@ fn verify_instruction(
     verify_span(unit, instruction.span, errors);
     match &instruction.kind {
         InstructionKind::Nop
+        | InstructionKind::DeclareClass { .. }
         | InstructionKind::EmitDiagnostic { .. }
         | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
@@ -1145,6 +1146,7 @@ fn verify_operand(
 fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
     match kind {
         InstructionKind::Nop
+        | InstructionKind::DeclareClass { .. }
         | InstructionKind::LoadConst { .. }
         | InstructionKind::FetchConst { .. }
         | InstructionKind::LoadLocal { .. }
@@ -1464,6 +1466,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
             }
         }
         InstructionKind::Nop
+        | InstructionKind::DeclareClass { .. }
         | InstructionKind::RegisterConstant { .. }
         | InstructionKind::StoreLocal { .. }
         | InstructionKind::BindReference { .. }

@@ -1523,6 +1523,7 @@ fn check_instruction(
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
+        | InstructionKind::BindReferenceStaticProperty { .. }
         | InstructionKind::BindReferenceFromCall { .. } => {
             rejected.push(JitEligibilityReason::instruction(
                 "JIT_ELIGIBILITY_REJECT_REFERENCE_OPCODE",
@@ -1584,6 +1585,7 @@ fn check_instruction(
         | InstructionKind::UnsetDim { .. }
         | InstructionKind::ForeachInit { .. }
         | InstructionKind::ForeachNext { .. }
+        | InstructionKind::ForeachCleanup { .. }
         | InstructionKind::ForeachInitRef { .. }
         | InstructionKind::ForeachNextRef { .. }
         | InstructionKind::ArrayGet { .. } => rejected.push(JitEligibilityReason::instruction(
@@ -1594,6 +1596,7 @@ fn check_instruction(
         )),
         InstructionKind::NewObject { .. }
         | InstructionKind::DynamicNewObject { .. }
+        | InstructionKind::DeclareClass { .. }
         | InstructionKind::CloneObject { .. }
         | InstructionKind::CloneWith { .. }
         | InstructionKind::InstanceOf { .. }

@@ -963,10 +963,9 @@ impl LoweringContext<'_> {
             };
             let display_class_name = class_like_display_name(&class_like, &name);
             let name = normalize_class_name(&name);
-            let span = span_from_range(
-                self.file,
-                self.span_for(SourceMappedId::from(class_like_id)),
-            );
+            let class_range = self.span_for(SourceMappedId::from(class_like_id));
+            let span = span_from_range(self.file, class_range);
+            let declaration_kind = class_declaration_kind(module, &class_like, class_range, &name);
             let parent = class_like.extends().first().map(|name| {
                 normalize_class_name(
                     name.resolved()
@@ -1331,6 +1330,7 @@ impl LoweringContext<'_> {
                     is_interface: class_like.kind() == ClassLikeKind::Interface,
                     is_enum: class_like.kind() == ClassLikeKind::Enum,
                     is_trait: class_like.kind() == ClassLikeKind::Trait,
+                    is_conditional: declaration_kind == Some(DeclarationKind::ConditionalClassLike),
                 },
                 span,
             });
@@ -1414,6 +1414,7 @@ impl LoweringContext<'_> {
                     is_interface: true,
                     is_enum: false,
                     is_trait: false,
+                    is_conditional: false,
                 },
                 span: IrSpan::default(),
             });
@@ -3123,6 +3124,15 @@ impl LoweringContext<'_> {
             }
             kind => {
                 let span = self.span_for(SourceMappedId::from(stmt_id));
+                if let Some(name) = conditional_class_declaration_name_for_span(module, span) {
+                    builder.emit(
+                        function,
+                        block,
+                        InstructionKind::DeclareClass { name },
+                        span_from_range(self.file, span),
+                    );
+                    return block;
+                }
                 self.unsupported(
                     UnsupportedFeature::HirStatement,
                     span,
@@ -5276,9 +5286,9 @@ impl LoweringContext<'_> {
                 block: current,
             });
         };
-        let display_class_name = self
-            .static_class_source_name(class)
-            .unwrap_or_else(|| class_name.clone());
+        let source_display_class_name = self
+            .static_class_display_name(class)
+            .unwrap_or_else(|| display_class_name(&class_name));
         let normalized_class_name = normalize_class_name(&class_name);
         if is_internal_throwable_class(&normalized_class_name) {
             let message = args.first().map(|arg| arg.value);
@@ -5323,7 +5333,8 @@ impl LoweringContext<'_> {
             current,
             InstructionKind::NewObject {
                 dst,
-                class_name: display_class_name,
+                display_class_name: source_display_class_name,
+                class_name: normalize_class_name(&class_name),
                 args: operands,
             },
             site.span,
@@ -10447,18 +10458,6 @@ impl LoweringContext<'_> {
         }
     }
 
-    fn static_class_source_name(&self, expr: ExprId) -> Option<String> {
-        let module = self
-            .frontend
-            .database()
-            .module(self.frontend.module().module_id())?;
-        let expression = module.expressions().get(expr)?;
-        match expression.kind() {
-            HirExprKind::Name { resolution } => Some(resolution.source().to_owned()),
-            _ => None,
-        }
-    }
-
     fn declared_class_display_name(&self, class_name: &str) -> Option<String> {
         let module = self
             .frontend
@@ -11512,6 +11511,51 @@ fn function_declaration_kind(
                 && range_contains(signature.span(), entry.span())
         })
         .map(|entry| entry.kind())
+}
+
+fn class_declaration_kind(
+    module: &HirModule,
+    class_like: &HirClassLike,
+    class_span: TextRange,
+    normalized_name: &str,
+) -> Option<DeclarationKind> {
+    let name = class_like
+        .fqn()
+        .map(|name| name.canonical(NameKind::ClassLike))
+        .or_else(|| class_like.name().map(normalize_class_name))
+        .map(|name| normalize_class_name(&name))
+        .unwrap_or_else(|| normalized_name.to_owned());
+    module
+        .declaration_table()
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.kind(),
+                DeclarationKind::Class
+                    | DeclarationKind::Interface
+                    | DeclarationKind::Trait
+                    | DeclarationKind::Enum
+                    | DeclarationKind::ConditionalClassLike
+            ) && entry.fqn().canonical(NameKind::ClassLike) == name
+                && range_contains(class_span, entry.span())
+        })
+        .map(|entry| entry.kind())
+}
+
+fn conditional_class_declaration_name_for_span(
+    module: &HirModule,
+    span: TextRange,
+) -> Option<String> {
+    module
+        .declaration_table()
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.kind() == DeclarationKind::ConditionalClassLike
+                && range_contains(span, entry.span())
+        })
+        .map(|entry| normalize_class_name(&entry.fqn().canonical(NameKind::ClassLike)))
 }
 
 fn is_internal_throwable_class(normalized: &str) -> bool {
@@ -13783,6 +13827,20 @@ mod tests {
     }
 
     #[test]
+    fn static_new_object_preserves_display_class_name_for_autoload() {
+        let frontend = analyze_source("<?php new TestX;");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("new_object r"), "{snapshot}");
+        assert!(
+            snapshot.contains("\"testx\" display=\"TestX\""),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
     fn locals_lower_variable_assignment_fetch_and_compound_ops() {
         let frontend = analyze_source("<?php $a = 1; $a += 2; echo $a;");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
@@ -14090,12 +14148,14 @@ mod tests {
 
     #[test]
     fn lower_eval_to_ir_instruction() {
-        let frontend = analyze_source("<?php eval('echo 1;');");
+        let frontend = analyze_source("<?php $code = 'echo '; eval($code . '1;');");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
-        assert!(result.unit.to_snapshot_text().contains("eval r"));
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains(" concat "), "{snapshot}");
+        assert!(snapshot.contains("eval r"), "{snapshot}");
     }
 
     #[test]

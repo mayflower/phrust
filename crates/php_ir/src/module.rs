@@ -78,6 +78,8 @@ pub struct ClassFlags {
     pub is_enum: bool,
     /// `trait` declaration.
     pub is_trait: bool,
+    /// Declaration nested in statement context and only visible after execution.
+    pub is_conditional: bool,
 }
 
 /// Class method table entry.

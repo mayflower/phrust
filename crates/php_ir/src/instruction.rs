@@ -212,6 +212,8 @@ pub enum InstructionKind {
     FetchConst { dst: RegId, name: String },
     /// Registers a global constant at runtime.
     RegisterConstant { name: String, value: Operand },
+    /// Registers a class-like declaration when execution reaches it.
+    DeclareClass { name: String },
     /// `dst = src`.
     Move { dst: RegId, src: Operand },
     /// `dst = local`.
@@ -423,6 +425,7 @@ pub enum InstructionKind {
     /// Creates a new object and invokes its constructor when one is declared.
     NewObject {
         dst: RegId,
+        display_class_name: String,
         class_name: String,
         args: Vec<IrCallArg>,
     },

@@ -63,7 +63,7 @@ pub mod api {
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
-        ClosurePayload,
+        ClosureDebugParameter, ClosurePayload,
     };
     pub use crate::context::{
         ErrorReporting, ProcessCapability, RuntimeContext, RuntimeHttpHeader,
@@ -186,7 +186,7 @@ pub use builtins::{
 };
 pub use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
-    ClosurePayload,
+    ClosureDebugParameter, ClosurePayload,
 };
 pub use context::{
     ErrorReporting, ProcessCapability, RuntimeContext, RuntimeHttpHeader,

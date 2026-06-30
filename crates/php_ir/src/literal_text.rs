@@ -395,7 +395,6 @@ fn parse_braced_interpolated_property(
     parsed.end += 1;
     Some(parsed)
 }
-
 fn parse_deprecated_dollar_brace_interpolated_variable(
     bytes: &[u8],
     start: usize,

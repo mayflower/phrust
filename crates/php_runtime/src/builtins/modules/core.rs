@@ -8046,6 +8046,10 @@ mod tests {
                         name: "{closure:/tmp/source.php:7}".to_owned(),
                         file: "/tmp/source.php".to_owned(),
                         line: 7,
+                        parameters: vec![crate::ClosureDebugParameter {
+                            name: "class".to_owned(),
+                            required: true,
+                        }],
                     },
                 ))),
                 Value::closure(
@@ -8060,6 +8064,7 @@ mod tests {
                         name: "{closure:/tmp/source.php:9}".to_owned(),
                         file: "/tmp/source.php".to_owned(),
                         line: 9,
+                        parameters: Vec::new(),
                     })),
                 ),
             ],
@@ -8074,7 +8079,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(closure_headers.len(), 3);
         assert_eq!(closure_headers[0], "object(Closure)#1 (1) {");
-        assert!(closure_headers[1].ends_with(" (3) {"));
+        assert!(closure_headers[1].ends_with(" (4) {"));
         assert!(closure_headers[2].ends_with(" (4) {"));
         assert_ne!(
             closure_debug_id(closure_headers[1]),
@@ -8082,6 +8087,8 @@ mod tests {
         );
         assert!(dumped.contains("string(27) \"{closure:/tmp/source.php:7}\""));
         assert!(dumped.contains("string(27) \"{closure:/tmp/source.php:9}\""));
+        assert!(dumped.contains("[\"parameter\"]=>\n  array(1) {"));
+        assert!(dumped.contains("[\"$class\"]=>\n    string(10) \"<required>\""));
         assert!(dumped.contains("[\"static\"]=>\n  array(1) {"));
     }
 

@@ -522,9 +522,17 @@ fn direct_function_body_statements(
 
 fn direct_body_statement_spans(body: BlockStmt<'_>) -> Vec<TextRange> {
     syntax_child_nodes(body.syntax())
-        .filter(|child| Stmt::cast(child).is_some())
+        .filter(|child| is_direct_body_statement(child))
         .map(|child| child.text_range())
         .collect()
+}
+
+fn is_direct_body_statement(node: &SyntaxNode) -> bool {
+    Stmt::cast(node).is_some()
+        || ClassDecl::cast(node).is_some()
+        || InterfaceDecl::cast(node).is_some()
+        || TraitDecl::cast(node).is_some()
+        || EnumDecl::cast(node).is_some()
 }
 
 fn param_list_is_closure_use(param_list: ParamList<'_>) -> bool {

@@ -11,6 +11,17 @@ pub struct ClosureDebugInfo {
     pub file: String,
     /// Source line where the closure was declared.
     pub line: i64,
+    /// Declaration parameter metadata exposed by `var_dump($closure)`.
+    pub parameters: Vec<ClosureDebugParameter>,
+}
+
+/// One parameter entry exposed by closure debug output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosureDebugParameter {
+    /// Parameter name without the leading `$`.
+    pub name: String,
+    /// True when callers must pass this argument.
+    pub required: bool,
 }
 
 /// Lexical and dynamic class context carried by a runtime closure.
@@ -38,7 +49,7 @@ pub struct ClosurePayload {
     /// Object bound as `$this` when the closure was created.
     pub bound_this: Option<ObjectRef>,
     /// Optional source metadata used by debug output.
-    pub debug: Option<ClosureDebugInfo>,
+    pub debug: Option<Box<ClosureDebugInfo>>,
     /// Lexical and dynamic class context.
     pub context: ClosureContext,
 }
@@ -60,7 +71,7 @@ impl ClosurePayload {
     /// Attaches PHP debug metadata.
     #[must_use]
     pub fn with_debug(mut self, debug: Option<ClosureDebugInfo>) -> Self {
-        self.debug = debug;
+        self.debug = debug.map(Box::new);
         self
     }
 

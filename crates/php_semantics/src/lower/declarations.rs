@@ -281,6 +281,11 @@ impl<'db> ModuleDeclarationCollector<'db> {
                         span,
                         namespace_name.as_ref(),
                     );
+                    for child in syntax_child_nodes(function.syntax()) {
+                        if BlockStmt::cast(child).is_some() {
+                            self.collect_conditional_declarations(child, namespace_name.as_ref());
+                        }
+                    }
                 }
             }
             TopLevelItemKind::Class

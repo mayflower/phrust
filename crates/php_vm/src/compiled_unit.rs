@@ -52,7 +52,12 @@ impl CompiledUnit {
                 value: entry.value,
             })
             .collect();
-        let class_table = unit.classes.clone();
+        let class_table = unit
+            .classes
+            .iter()
+            .filter(|entry| !entry.flags.is_conditional)
+            .cloned()
+            .collect();
         Self {
             unit,
             function_table,
@@ -92,6 +97,16 @@ impl CompiledUnit {
     pub fn lookup_class(&self, name: &str) -> Option<&ClassEntry> {
         let normalized = normalize_class_name(name);
         self.class_table
+            .iter()
+            .find(|entry| normalize_class_name(&entry.name) == normalized)
+    }
+
+    /// Finds any class entry in the underlying IR unit, including conditional declarations.
+    #[must_use]
+    pub fn lookup_unit_class(&self, name: &str) -> Option<&ClassEntry> {
+        let normalized = normalize_class_name(name);
+        self.unit
+            .classes
             .iter()
             .find(|entry| normalize_class_name(&entry.name) == normalized)
     }

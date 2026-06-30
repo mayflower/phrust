@@ -9,6 +9,16 @@ use crate::builtins::{
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
+        "class_implements",
+        builtin_spl_autoload_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "iterator_apply",
+        builtin_spl_autoload_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "iterator_count",
         builtin_spl_autoload_requires_vm,
         BuiltinCompatibility::Php,
