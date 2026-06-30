@@ -41,8 +41,10 @@ MVP while making the array, Copy-on-Write, and reference behavior explicit.
   empty-iteration behavior when lowering reaches runtime. Unsupported
   Traversable-like edge cases are tracked under the mutation and standard
   library gaps below rather than a broad foreach-source diagnostic.
-- `E_PHP_RUNTIME_ARRAYACCESS_STDLIB_GAP` covers ArrayAccess offset indexing and
-  the wider SPL surface. `ArrayAccess` alone is not treated as Traversable.
+- One-dimensional userland `ArrayAccess` offset read/write/append/isset/empty/
+  unset dispatch is executable. `E_PHP_RUNTIME_ARRAYACCESS_STDLIB_GAP` now
+  covers nested/by-reference offset lvalues and object-key edge cases. Plain
+  `ArrayAccess` alone is not treated as Traversable.
 - `E_PHP_RUNTIME_FOREACH_MUTATION_COMPAT` covers the complete PHP mutation
   matrix beyond the committed fixtures, including unset/reindex combinations
   during by-reference iteration and object/Iterator side effects.

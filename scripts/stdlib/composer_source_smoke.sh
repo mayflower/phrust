@@ -66,17 +66,28 @@ from collections import Counter
 from pathlib import Path
 
 report, source, entry, status, stdout, stderr = sys.argv[1:]
+stdout_text = Path(stdout).read_text(encoding="utf-8", errors="replace")
 stderr_text = Path(stderr).read_text(encoding="utf-8", errors="replace")
+combined_text = stdout_text + "\n" + stderr_text
 
 patterns = [
     ("function", re.compile(r"undefined function ([A-Za-z_][A-Za-z0-9_]*)", re.I)),
     ("class", re.compile(r"class ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*) is not defined", re.I)),
     ("class", re.compile(r"undefined class ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)", re.I)),
+    ("method", re.compile(r"call to undefined method ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*)", re.I)),
+    ("method", re.compile(r"unknown method ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*)", re.I)),
+    ("constant", re.compile(r"undefined constant ['\"]?([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)['\"]?", re.I)),
+    ("reflection", re.compile(r"(Reflection[A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*)")),
+    ("spl", re.compile(r"((?:Spl|ArrayObject|ArrayIterator|IteratorIterator|LimitIterator|Recursive[A-Za-z]*Iterator)[A-Za-z0-9_\\\\]*::[A-Za-z_][A-Za-z0-9_]*)")),
+    ("diagnostic", re.compile(r"\b(E_PHP_[A-Z0-9_]+)\b")),
+    ("warning", re.compile(r"\b(?:Warning|Notice|Deprecated|Fatal error):\s*([^\n]+)", re.I)),
 ]
 counts: Counter[tuple[str, str]] = Counter()
 for kind, pattern in patterns:
-    for match in pattern.finditer(stderr_text):
-        counts[(kind, match.group(1))] += 1
+    haystack = combined_text if kind in {"diagnostic", "warning"} else stderr_text
+    for match in pattern.finditer(haystack):
+        name = re.sub(r"\s+", " ", match.group(1).strip())
+        counts[(kind, name)] += 1
 
 missing = [
     {"kind": kind, "name": name, "count": count}
@@ -93,7 +104,16 @@ Path(report).write_text(
             "exit": int(status),
             "stdout": stdout,
             "stderr": stderr,
-            "missing_symbols": missing,
+            "diagnostics": [
+                item
+                for item in missing
+                if item["kind"] in {"diagnostic", "warning"}
+            ],
+            "missing_symbols": [
+                item
+                for item in missing
+                if item["kind"] not in {"diagnostic", "warning"}
+            ],
         },
         indent=2,
         sort_keys=True,

@@ -4608,9 +4608,25 @@ impl Vm {
                 }
             };
         }
+        let source = effective_value(&values[0]);
+        match iterator_function_accepts_source(compiled, state, &source) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_RUNTIME_BUILTIN_TYPE: iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, {} given",
+                        type_error_value_name(&source)
+                    ),
+                );
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        }
         let mut iterator = match self.foreach_iterator_from_value(
             compiled,
-            effective_value(&values[0]),
+            source,
             output,
             stack,
             state,
@@ -4680,9 +4696,25 @@ impl Vm {
                 ),
             );
         }
+        let source = effective_value(&values[0]);
+        match iterator_function_accepts_source(compiled, state, &source) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_RUNTIME_BUILTIN_TYPE: iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, {} given",
+                        type_error_value_name(&source)
+                    ),
+                );
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        }
         let mut iterator = match self.foreach_iterator_from_value(
             compiled,
-            effective_value(&values[0]),
+            source,
             output,
             stack,
             state,
@@ -4739,9 +4771,25 @@ impl Vm {
             },
             None => true,
         };
+        let source = effective_value(&values[0]);
+        match iterator_function_accepts_source(compiled, state, &source) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_RUNTIME_BUILTIN_TYPE: iterator_to_array(): Argument #1 ($iterator) must be of type Traversable|array, {} given",
+                        type_error_value_name(&source)
+                    ),
+                );
+            }
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        }
         let mut iterator = match self.foreach_iterator_from_value(
             compiled,
-            effective_value(&values[0]),
+            source,
             output,
             stack,
             state,
@@ -7637,6 +7685,41 @@ impl Vm {
                         };
                         let local = LocalId::new(local);
                         let append = instruction.opcode == DenseOpcode::AppendDim;
+                        match self.try_userland_arrayaccess_offset_set_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            local,
+                            &dim_values,
+                            append,
+                            value.clone(),
+                            dense
+                                .spans
+                                .get(instruction.span.index())
+                                .copied()
+                                .unwrap_or_default(),
+                        ) {
+                            Ok(true) => {
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("bytecode frame was pushed")
+                                    .registers
+                                    .set(RegId::new(dst), value)
+                                {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(result) => {
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        }
                         let dims = match dim_values_to_array_keys(&dim_values) {
                             Ok(dims) => dims,
                             Err(message) => {
@@ -9215,6 +9298,23 @@ impl Vm {
             return spl_container_offset_get(object, key_value)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message));
         }
+        if let Some(object) = match userland_arrayaccess_object(compiled, state, &base) {
+            Ok(object) => object,
+            Err(message) => {
+                return Err(self.runtime_error(output, compiled, stack, message));
+            }
+        } {
+            return self.call_userland_arrayaccess_method(
+                compiled,
+                output,
+                stack,
+                state,
+                object,
+                "offsetGet",
+                vec![CallArgument::positional(key_value.clone())],
+                span,
+            );
+        }
         let key = array_key_from_value(key_value)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         if let Value::String(string) = &base {
@@ -9314,6 +9414,236 @@ impl Vm {
             }
             Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
         }
+    }
+
+    fn call_userland_arrayaccess_method(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        object: ObjectRef,
+        method: &str,
+        args: Vec<CallArgument>,
+        span: IrSpan,
+    ) -> Result<Value, VmResult> {
+        let result = self.call_object_method_callable(
+            compiled,
+            object,
+            method,
+            args,
+            Some(span),
+            output,
+            stack,
+            state,
+        );
+        if result.status.is_success() {
+            Ok(result.return_value.unwrap_or(Value::Null))
+        } else {
+            Err(result)
+        }
+    }
+
+    fn try_userland_arrayaccess_offset_set_local(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        local: LocalId,
+        dim_values: &[Value],
+        append: bool,
+        value: Value,
+        span: IrSpan,
+    ) -> Result<bool, VmResult> {
+        let Some(local_value) = read_local_value(stack, local) else {
+            return Ok(false);
+        };
+        let object = match userland_arrayaccess_object(compiled, state, &local_value) {
+            Ok(Some(object)) => object,
+            Ok(None) => return Ok(false),
+            Err(message) => {
+                return Err(self.runtime_error(output, compiled, stack, message));
+            }
+        };
+        let key = if append {
+            if !dim_values.is_empty() {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess writes are not implemented",
+                ));
+            }
+            Value::Null
+        } else {
+            let [key] = dim_values else {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_ARRAYACCESS_DIM: ArrayAccess writes require exactly one dimension",
+                ));
+            };
+            key.clone()
+        };
+        self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object,
+            "offsetSet",
+            vec![
+                CallArgument::positional(key),
+                CallArgument::positional(value),
+            ],
+            span,
+        )?;
+        Ok(true)
+    }
+
+    fn try_userland_arrayaccess_offset_exists_local(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        local: LocalId,
+        dims: &[ArrayKey],
+        span: IrSpan,
+    ) -> Result<Option<bool>, VmResult> {
+        let Some(local_value) = read_local_value(stack, local) else {
+            return Ok(None);
+        };
+        let object = match userland_arrayaccess_object(compiled, state, &local_value) {
+            Ok(Some(object)) => object,
+            Ok(None) => return Ok(None),
+            Err(message) => {
+                return Err(self.runtime_error(output, compiled, stack, message));
+            }
+        };
+        let [key] = dims else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess isset/empty is not implemented",
+            ));
+        };
+        let result = self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object,
+            "offsetExists",
+            vec![CallArgument::positional(array_key_to_value(key.clone()))],
+            span,
+        )?;
+        to_bool(&result)
+            .map(Some)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+    }
+
+    fn try_userland_arrayaccess_offset_empty_local(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        local: LocalId,
+        dims: &[ArrayKey],
+        span: IrSpan,
+    ) -> Result<Option<bool>, VmResult> {
+        let Some(local_value) = read_local_value(stack, local) else {
+            return Ok(None);
+        };
+        let object = match userland_arrayaccess_object(compiled, state, &local_value) {
+            Ok(Some(object)) => object,
+            Ok(None) => return Ok(None),
+            Err(message) => {
+                return Err(self.runtime_error(output, compiled, stack, message));
+            }
+        };
+        let [key] = dims else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess isset/empty is not implemented",
+            ));
+        };
+        let key_value = array_key_to_value(key.clone());
+        let exists = self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object.clone(),
+            "offsetExists",
+            vec![CallArgument::positional(key_value.clone())],
+            span,
+        )?;
+        if !to_bool(&exists)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?
+        {
+            return Ok(Some(true));
+        }
+        let value = self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object,
+            "offsetGet",
+            vec![CallArgument::positional(key_value)],
+            span,
+        )?;
+        php_empty(&value)
+            .map(Some)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+    }
+
+    fn try_userland_arrayaccess_offset_unset_local(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        local: LocalId,
+        dims: &[ArrayKey],
+        span: IrSpan,
+    ) -> Result<bool, VmResult> {
+        let Some(local_value) = read_local_value(stack, local) else {
+            return Ok(false);
+        };
+        let object = match userland_arrayaccess_object(compiled, state, &local_value) {
+            Ok(Some(object)) => object,
+            Ok(None) => return Ok(false),
+            Err(message) => {
+                return Err(self.runtime_error(output, compiled, stack, message));
+            }
+        };
+        let [key] = dims else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess unset is not implemented",
+            ));
+        };
+        self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object,
+            "offsetUnset",
+            vec![CallArgument::positional(array_key_to_value(key.clone()))],
+            span,
+        )?;
+        Ok(true)
     }
 
     fn next_foreach_value(
@@ -11560,7 +11890,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -11641,7 +11987,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -11682,7 +12044,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -11703,7 +12081,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -12089,7 +12483,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -12112,7 +12522,23 @@ impl Vm {
                             let object = match new_spl_container_object(class_name, values) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -12135,7 +12561,23 @@ impl Vm {
                             let object = match new_spl_heap_object(class_name, values) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -12162,7 +12604,23 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -12436,8 +12894,23 @@ impl Vm {
                                     ) {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            return self
+                                            let result = self
                                                 .runtime_error(output, compiled, stack, message);
+                                            match self.route_throwable_result(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                result,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
                                         }
                                     };
                                     if let Err(message) = stack
@@ -12463,8 +12936,23 @@ impl Vm {
                                     {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            return self
+                                            let result = self
                                                 .runtime_error(output, compiled, stack, message);
+                                            match self.route_throwable_result(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                result,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
                                         }
                                     };
                                     if let Err(message) = stack
@@ -12489,8 +12977,23 @@ impl Vm {
                                     let object = match new_spl_heap_object(class_name, values) {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            return self
+                                            let result = self
                                                 .runtime_error(output, compiled, stack, message);
+                                            match self.route_throwable_result(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                result,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
                                         }
                                     };
                                     if let Err(message) = stack
@@ -12519,8 +13022,23 @@ impl Vm {
                                     ) {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            return self
+                                            let result = self
                                                 .runtime_error(output, compiled, stack, message);
+                                            match self.route_throwable_result(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                result,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
                                         }
                                     };
                                     if let Err(message) = stack
@@ -17071,7 +17589,43 @@ impl Vm {
                             Some(value) => value,
                             None => {
                                 let base = effective_value(&array);
-                                if let Value::Object(object) = &base
+                                if let Some(object) =
+                                    match userland_arrayaccess_object(compiled, state, &base) {
+                                        Ok(object) => object,
+                                        Err(message) => {
+                                            match self.raise_runtime_error(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                instruction.span,
+                                                message,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
+                                        }
+                                    }
+                                {
+                                    match self.call_userland_arrayaccess_method(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        object,
+                                        "offsetGet",
+                                        vec![CallArgument::positional(key_value.clone())],
+                                        instruction.span,
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(result) => return result,
+                                    }
+                                } else if let Value::Object(object) = &base
                                     && spl_runtime_marker(object).is_some_and(|class| {
                                         is_spl_array_access_runtime_class(&class)
                                     })
@@ -17314,6 +17868,32 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        match self.try_userland_arrayaccess_offset_set_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            *local,
+                            &dim_values,
+                            false,
+                            value.clone(),
+                            instruction.span,
+                        ) {
+                            Ok(true) => {
+                                self.record_lvalue_trace_event("array-write-dim", *local, &[]);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(result) => return result,
+                        }
                         let dims = match dim_values_to_array_keys(&dim_values) {
                             Ok(dims) => dims,
                             Err(message) => {
@@ -17343,6 +17923,31 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        if !is_globals_local(function, *local)
+                            && dims.len() == 1
+                            && let Some(Value::Object(object)) =
+                                read_local_value(stack, *local).map(|value| effective_value(&value))
+                            && spl_runtime_marker(&object)
+                                .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+                        {
+                            if let Err(message) = spl_container_offset_set(
+                                &object,
+                                array_key_to_value(dims[0].clone()),
+                                value.clone(),
+                            ) {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            self.record_lvalue_trace_event("array-write-dim", *local, &dims);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let result = if is_globals_local(function, *local) {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), false)
                         } else {
@@ -17393,6 +17998,69 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
+                        let dim_values: Vec<Value> =
+                            dims.iter().cloned().map(array_key_to_value).collect();
+                        match self.try_userland_arrayaccess_offset_set_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            *local,
+                            &dim_values,
+                            true,
+                            value.clone(),
+                            instruction.span,
+                        ) {
+                            Ok(true) => {
+                                self.record_lvalue_trace_event("array-append-dim", *local, &dims);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(result) => return result,
+                        }
+                        if !is_globals_local(function, *local)
+                            && let Some(Value::Object(object)) =
+                                read_local_value(stack, *local).map(|value| effective_value(&value))
+                            && spl_runtime_marker(&object)
+                                .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+                        {
+                            let key = if dims.is_empty() {
+                                Value::Null
+                            } else if dims.len() == 1 {
+                                array_key_to_value(dims[0].clone())
+                            } else {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    "E_PHP_VM_SPL_CONTAINER_NESTED_DIM: nested ArrayAccess writes are not implemented"
+                                        .to_owned(),
+                                );
+                            };
+                            if let Err(message) =
+                                spl_container_offset_set(&object, key, value.clone())
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            self.record_lvalue_trace_event("array-append-dim", *local, &dims);
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         let result = if is_globals_local(function, *local) {
                             assign_globals_dim(&mut state.globals, &dims, value.clone(), true)
                         } else {
@@ -17530,11 +18198,83 @@ impl Vm {
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
                             stack, *local,
                         ));
+                        match self.try_userland_arrayaccess_offset_exists_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            *local,
+                            &dims,
+                            instruction.span,
+                        ) {
+                            Ok(Some(result)) => {
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, Value::Bool(result))
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(result) => return result,
+                        }
                         let local_value = if is_globals_local(function, *local) {
                             Some(Value::Array(state.globals.globals_array()))
                         } else {
                             read_local_value(stack, *local)
                         };
+                        if let (Some(base_value), [key]) = (local_value.as_ref(), dims.as_slice()) {
+                            let base = effective_value(base_value);
+                            if let Value::Object(object) = &base
+                                && spl_runtime_marker(object)
+                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+                            {
+                                match spl_container_offset_exists(
+                                    object,
+                                    &array_key_to_value(key.clone()),
+                                ) {
+                                    Ok(Value::Bool(result)) => {
+                                        if let Err(message) = stack
+                                            .current_mut()
+                                            .expect("frame was pushed")
+                                            .registers
+                                            .set(*dst, Value::Bool(result))
+                                        {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                        continue;
+                                    }
+                                    Ok(value) => {
+                                        let result = match to_bool(&value) {
+                                            Ok(result) => result,
+                                            Err(message) => {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
+                                        };
+                                        if let Err(message) = stack
+                                            .current_mut()
+                                            .expect("frame was pushed")
+                                            .registers
+                                            .set(*dst, Value::Bool(result))
+                                        {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                        continue;
+                                    }
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                }
+                            }
+                        }
                         let value = if let (Some(base_value), [key]) =
                             (local_value.as_ref(), dims.as_slice())
                         {
@@ -17574,11 +18314,89 @@ impl Vm {
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
                             stack, *local,
                         ));
+                        match self.try_userland_arrayaccess_offset_empty_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            *local,
+                            &dims,
+                            instruction.span,
+                        ) {
+                            Ok(Some(result)) => {
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, Value::Bool(result))
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(result) => return result,
+                        }
                         let local_value = if is_globals_local(function, *local) {
                             Some(Value::Array(state.globals.globals_array()))
                         } else {
                             read_local_value(stack, *local)
                         };
+                        if let (Some(base_value), [key]) = (local_value.as_ref(), dims.as_slice()) {
+                            let base = effective_value(base_value);
+                            if let Value::Object(object) = &base
+                                && spl_runtime_marker(object)
+                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+                            {
+                                let exists = match spl_container_offset_exists(
+                                    object,
+                                    &array_key_to_value(key.clone()),
+                                ) {
+                                    Ok(Value::Bool(result)) => result,
+                                    Ok(value) => match to_bool(&value) {
+                                        Ok(result) => result,
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    },
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
+                                let result = if exists {
+                                    match spl_container_offset_get(
+                                        object,
+                                        &array_key_to_value(key.clone()),
+                                    ) {
+                                        Ok(value) => match php_empty(&value) {
+                                            Ok(result) => result,
+                                            Err(message) => {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
+                                        },
+                                        Err(message) => {
+                                            return self
+                                                .runtime_error(output, compiled, stack, message);
+                                        }
+                                    }
+                                } else {
+                                    true
+                                };
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, Value::Bool(result))
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
+                        }
                         let value = local_value
                             .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
                             .unwrap_or(Value::Uninitialized);
@@ -17612,6 +18430,46 @@ impl Vm {
                         } else {
                             local_array_is_packed_fast(stack, *local)
                         };
+                        match self.try_userland_arrayaccess_offset_unset_local(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            *local,
+                            &dims,
+                            instruction.span,
+                        ) {
+                            Ok(true) => {
+                                self.record_lvalue_trace_event("array-unset-dim", *local, &dims);
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(result) => return result,
+                        }
+                        if let (Some(base_value), [key]) = (
+                            if is_globals_local(function, *local) {
+                                Some(Value::Array(state.globals.globals_array()))
+                            } else {
+                                read_local_value(stack, *local)
+                            }
+                            .as_ref(),
+                            dims.as_slice(),
+                        ) {
+                            let base = effective_value(base_value);
+                            if let Value::Object(object) = &base
+                                && spl_runtime_marker(object)
+                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+                            {
+                                if let Err(message) = spl_container_offset_unset(
+                                    object,
+                                    &array_key_to_value(key.clone()),
+                                ) {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                self.record_lvalue_trace_event("array-unset-dim", *local, &dims);
+                                continue;
+                            }
+                        }
                         let result = if is_globals_local(function, *local) {
                             unset_globals_dim(&mut state.globals, &dims)
                         } else {
@@ -18639,6 +19497,60 @@ impl Vm {
                         if is_reflection_runtime_class(&object.class_name()) {
                             let values =
                                 values.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+                            if normalize_class_name(&object.class_name()) == "reflectionattribute"
+                                && normalize_method_name(method) == "newinstance"
+                            {
+                                let result = self.reflection_attribute_new_instance(
+                                    compiled,
+                                    &object,
+                                    output,
+                                    stack,
+                                    state,
+                                    instruction.span,
+                                );
+                                if !result.status.is_success() {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                                if result.fiber_suspension.is_some() {
+                                    return self.propagate_fiber_suspension(
+                                        result,
+                                        compiled,
+                                        *dst,
+                                        block_id,
+                                        instruction_index + 1,
+                                        &foreach_iterators,
+                                        &exception_handlers,
+                                        &pending_control,
+                                        output,
+                                        stack,
+                                    );
+                                }
+                                diagnostics.extend(result.diagnostics);
+                                let value = result.return_value.unwrap_or(Value::Null);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
                             if let Err(result) = self.preflight_reflection_class_method(
                                 compiled, &object, method, &values, output, stack, state,
                             ) {
@@ -29956,6 +30868,111 @@ impl Vm {
         ))
     }
 
+    fn reflection_attribute_new_instance(
+        &self,
+        compiled: &CompiledUnit,
+        attribute: &ObjectRef,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        call_span: php_ir::IrSpan,
+    ) -> VmResult {
+        let class_name = match reflection_object_string_property(attribute, "name") {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let class = match lookup_class_in_state(compiled, state, &class_name) {
+            Some(class) => class,
+            None => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!("E_PHP_VM_UNKNOWN_CLASS: Class \"{class_name}\" not found"),
+                );
+            }
+        };
+        let runtime_class = match runtime_class_entry(
+            compiled,
+            state,
+            &class,
+            &|value| self.constant_value(compiled.unit(), value),
+            &|reference| class_constant_reference_value(compiled, state, reference),
+            &|reference| named_constant_reference_value(compiled, state, reference),
+        ) {
+            Ok(class) => class,
+            Err(error) => return self.runtime_error(output, compiled, stack, error.into_message()),
+        };
+        if let Err(message) = validate_object_mvp(&runtime_class) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+
+        let args = match reflection_attribute_constructor_args(attribute) {
+            Ok(args) => args,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let object = ObjectRef::new_with_display_name(&runtime_class, class.display_name.clone());
+        let caller_scope = current_scope_class(compiled, stack);
+        let constructor = match lookup_method_in_hierarchy(
+            compiled,
+            &class,
+            "__construct",
+            caller_scope.as_deref(),
+        ) {
+            Ok(constructor) => constructor,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if let Some(constructor) = constructor {
+            if let Err(message) = validate_constructor_callable_in_state_scope(
+                compiled,
+                state,
+                caller_scope.as_deref(),
+                constructor.class,
+                constructor.method,
+            ) {
+                return self.runtime_error(output, compiled, stack, message);
+            }
+            let class_owner = class_owner_in_state(compiled, state, &constructor.class.name);
+            let result = self.execute_function(
+                &class_owner,
+                constructor.method.function,
+                FunctionCall::new(args, Vec::new())
+                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_span(call_span)
+                    .with_this(object.clone())
+                    .with_class_context(
+                        constructor.class.name.clone(),
+                        class.name.clone(),
+                        constructor.class.name.clone(),
+                    ),
+                output,
+                stack,
+                state,
+            );
+            if !result.status.is_success() || result.fiber_suspension.is_some() {
+                return result;
+            }
+            self.register_destructor_if_needed(compiled, &class, object.clone(), state);
+            return VmResult::success_with_diagnostics(
+                output.clone(),
+                Some(Value::Object(object)),
+                result.diagnostics,
+            );
+        }
+        if !args.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: constructor for class {class_name} does not accept arguments"
+                ),
+            );
+        }
+        self.register_destructor_if_needed(compiled, &class, object.clone(), state);
+        VmResult::success(output.clone(), Some(Value::Object(object)))
+    }
+
     fn preflight_reflection_class_method(
         &self,
         compiled: &CompiledUnit,
@@ -33531,6 +34548,22 @@ fn reflection_attribute_object(attribute: RuntimeAttributeEntry) -> ObjectRef {
     )
 }
 
+fn reflection_attribute_constructor_args(object: &ObjectRef) -> Result<Vec<CallArgument>, String> {
+    let Some(arguments) = object.get_property("arguments") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(arguments) = effective_value(&arguments) else {
+        return Err(format!(
+            "E_PHP_VM_REFLECTION_METADATA_TYPE: {} arguments metadata is not an array",
+            object.class_name()
+        ));
+    };
+    Ok(arguments
+        .iter()
+        .map(|(_, value)| CallArgument::positional(effective_value(value)))
+        .collect())
+}
+
 fn reflection_object_string_property(object: &ObjectRef, property: &str) -> Result<String, String> {
     let Some(value) = object.get_property(property) else {
         return Err(format!(
@@ -36354,6 +37387,18 @@ fn object_instanceof_in_state(
             }
             class_is_a_in_state(compiled, state, &object.class_name(), class_name)
         }
+        _ => Ok(false),
+    }
+}
+
+fn iterator_function_accepts_source(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+) -> Result<bool, String> {
+    match effective_value(value) {
+        Value::Array(_) => Ok(true),
+        Value::Object(_) => object_instanceof_in_state(compiled, state, value, "Traversable"),
         _ => Ok(false),
     }
 }
@@ -40621,7 +41666,10 @@ fn is_spl_array_access_runtime_class(class_name: &str) -> bool {
     is_spl_container_runtime_class(class_name)
         || matches!(
             normalize_class_name(class_name).as_str(),
-            "arrayiterator" | "recursivearrayiterator"
+            "arrayiterator"
+                | "recursivearrayiterator"
+                | "cachingiterator"
+                | "recursivecachingiterator"
         )
 }
 
@@ -40761,7 +41809,10 @@ fn internal_spl_iterator_instanceof(object_class: &str, target_class: &str) -> O
         ),
         "arrayaccess" => matches!(
             object_class.as_str(),
-            "arrayiterator" | "recursivearrayiterator"
+            "arrayiterator"
+                | "recursivearrayiterator"
+                | "cachingiterator"
+                | "recursivecachingiterator"
         ),
         "seekableiterator" => matches!(
             object_class.as_str(),
@@ -40832,65 +41883,79 @@ fn new_spl_iterator_object(
     let original_args = args.clone();
     let entries = match normalized.as_str() {
         "emptyiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 0)?;
             Vec::new()
         }
         "arrayiterator" | "recursivearrayiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 1)?;
             args.first()
                 .map(|arg| spl_entries_from_value(&arg.value))
                 .transpose()?
                 .unwrap_or_default()
         }
-        "iteratoriterator"
-        | "norewinditerator"
+        "iteratoriterator" => {
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
+            spl_entries_from_value(&args[0].value)?
+        }
+        "norewinditerator"
         | "infiniteiterator"
         | "filteriterator"
         | "recursivefilteriterator"
         | "parentiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 1, 1)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 1)?;
             spl_entries_from_value(&args[0].value)?
         }
         "cachingiterator" | "recursivecachingiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
             spl_entries_from_value(&args[0].value)?
         }
         "recursiveiteratoriterator" | "recursivetreeiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 1, 4)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 4)?;
             spl_recursive_entries_from_value(&args[0].value)?
         }
         "regexiterator" | "recursiveregexiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 2, 5)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 2, 5)?;
             let entries = spl_entries_from_value(&args[0].value)?;
             let pattern = to_string(&args[1].value)?.to_string_lossy();
             spl_regex_filter_entries(entries, &pattern)
         }
         "limititerator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 1, 3)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 3)?;
             let entries = spl_entries_from_value(&args[0].value)?;
             let offset = args
                 .get(1)
                 .map(|arg| to_int(&arg.value))
                 .transpose()?
-                .unwrap_or(0)
-                .max(0) as usize;
+                .unwrap_or(0);
+            if offset < 0 {
+                return Err(
+                    "E_PHP_VM_SPL_VALUE_ERROR: LimitIterator::__construct(): Argument #2 ($offset) must be greater than or equal to 0"
+                        .to_owned(),
+                );
+            }
             let count = args.get(2).map(|arg| to_int(&arg.value)).transpose()?;
-            let iter = entries.into_iter().skip(offset);
+            if matches!(count, Some(count) if count < -1) {
+                return Err(
+                    "E_PHP_VM_SPL_VALUE_ERROR: LimitIterator::__construct(): Argument #3 ($limit) must be greater than or equal to -1"
+                        .to_owned(),
+                );
+            }
+            let iter = entries.into_iter().skip(offset as usize);
             match count {
                 Some(count) if count >= 0 => iter.take(count as usize).collect(),
                 _ => iter.collect(),
             }
         }
         "appenditerator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 0, 0)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 0)?;
             Vec::new()
         }
         "multipleiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 1)?;
             Vec::new()
         }
         "globiterator" => {
-            validate_spl_iterator_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
             let pattern = to_string(&args[0].value)?.to_string_lossy();
             spl_glob_entries(&pattern, runtime_context)?
         }
@@ -40928,6 +41993,17 @@ fn new_spl_iterator_object(
         object.set_property("__regex_mode", Value::Int(mode));
         object.set_property("__regex_flags", Value::Int(flags));
         object.set_property("__regex_preg_flags", Value::Int(preg_flags));
+    }
+    if matches!(
+        normalized.as_str(),
+        "cachingiterator" | "recursivecachingiterator"
+    ) {
+        let flags = original_args
+            .get(1)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(0);
+        object.set_property("__caching_flags", Value::Int(flags));
     }
     Ok(object)
 }
@@ -41028,6 +42104,17 @@ fn call_spl_iterator_method(
         }
         "count" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if matches!(
+                runtime_class_name.as_str(),
+                "cachingiterator" | "recursivecachingiterator"
+            ) && spl_caching_iterator_has_full_cache(&object)
+            {
+                return Ok(Value::Int(
+                    spl_position(&object)
+                        .saturating_add(1)
+                        .min(spl_entries(&object).len()) as i64,
+                ));
+            }
             Ok(Value::Int(spl_entries(&object).len() as i64))
         }
         "getarraycopy" => {
@@ -41098,7 +42185,23 @@ fn call_spl_iterator_method(
         }
         "getcache" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
-            Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
+            let entries = if matches!(
+                runtime_class_name.as_str(),
+                "cachingiterator" | "recursivecachingiterator"
+            ) && spl_caching_iterator_has_full_cache(&object)
+            {
+                spl_entries(&object)
+                    .into_iter()
+                    .take(
+                        spl_position(&object)
+                            .saturating_add(1)
+                            .min(spl_entries(&object).len()),
+                    )
+                    .collect()
+            } else {
+                spl_entries(&object)
+            };
+            Ok(Value::Array(spl_entries_to_php_array(entries)))
         }
         "seek" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
@@ -41345,18 +42448,30 @@ fn validate_spl_iterator_arg_count(
     max: usize,
 ) -> Result<(), String> {
     if args.len() < min {
+        let word = if min == 1 { "argument" } else { "arguments" };
         return Err(format!(
-            "E_PHP_VM_TOO_FEW_ARGS: {name} expects at least {min} argument(s), {} given",
+            "E_PHP_RUNTIME_BUILTIN_ARITY: {name} expects at least {min} {word}, {} given",
             args.len()
         ));
     }
     if args.len() > max {
+        let word = if max == 1 { "argument" } else { "arguments" };
         return Err(format!(
-            "E_PHP_VM_TOO_MANY_ARGS: {name} expects at most {max} argument(s), {} given",
+            "E_PHP_RUNTIME_BUILTIN_ARITY: {name} expects at most {max} {word}, {} given",
             args.len()
         ));
     }
     Ok(())
+}
+
+fn validate_spl_iterator_constructor_arg_count(
+    class_name: &str,
+    args: &[CallArgument],
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    let name = format!("{}::__construct()", spl_iterator_display_name(class_name));
+    validate_spl_iterator_arg_count(&name, args, min, max)
 }
 
 fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
@@ -41634,6 +42749,16 @@ fn spl_position(object: &ObjectRef) -> usize {
             _ => None,
         })
         .unwrap_or(0)
+}
+
+fn spl_caching_iterator_has_full_cache(object: &ObjectRef) -> bool {
+    const CACHING_ITERATOR_FULL_CACHE: i64 = 256;
+    matches!(
+        object
+            .get_property("__caching_flags")
+            .map(|value| effective_value(&value)),
+        Some(Value::Int(flags)) if flags & CACHING_ITERATOR_FULL_CACHE != 0
+    )
 }
 
 fn spl_set_position(object: &ObjectRef, position: usize) {
@@ -42156,7 +43281,10 @@ fn spl_reindex_and_set_entries(object: &ObjectRef, entries: Vec<(ArrayKey, Value
 }
 
 fn spl_container_offset_get(object: &ObjectRef, key: &Value) -> Result<Value, String> {
-    match normalize_class_name(&object.class_name()).as_str() {
+    match spl_runtime_marker(object)
+        .unwrap_or_else(|| normalize_class_name(&object.class_name()))
+        .as_str()
+    {
         "splobjectstorage" => Ok(spl_object_storage_find(object, key)
             .map(|(_, _, info)| effective_value(&info))
             .unwrap_or(Value::Null)),
@@ -42171,7 +43299,10 @@ fn spl_container_offset_get(object: &ObjectRef, key: &Value) -> Result<Value, St
 }
 
 fn spl_container_offset_exists(object: &ObjectRef, key: &Value) -> Result<Value, String> {
-    let exists = match normalize_class_name(&object.class_name()).as_str() {
+    let exists = match spl_runtime_marker(object)
+        .unwrap_or_else(|| normalize_class_name(&object.class_name()))
+        .as_str()
+    {
         "splobjectstorage" => spl_object_storage_find(object, key).is_some(),
         _ => {
             let key = array_key_from_value(key)?;
@@ -42184,7 +43315,10 @@ fn spl_container_offset_exists(object: &ObjectRef, key: &Value) -> Result<Value,
 }
 
 fn spl_container_offset_set(object: &ObjectRef, key: Value, value: Value) -> Result<(), String> {
-    match normalize_class_name(&object.class_name()).as_str() {
+    match spl_runtime_marker(object)
+        .unwrap_or_else(|| normalize_class_name(&object.class_name()))
+        .as_str()
+    {
         "splobjectstorage" => spl_object_storage_attach(object, &key, value),
         "splfixedarray" => {
             let key = array_key_from_value(&key)?;
@@ -42233,7 +43367,10 @@ fn spl_container_offset_set(object: &ObjectRef, key: Value, value: Value) -> Res
 }
 
 fn spl_container_offset_unset(object: &ObjectRef, key: &Value) -> Result<(), String> {
-    match normalize_class_name(&object.class_name()).as_str() {
+    match spl_runtime_marker(object)
+        .unwrap_or_else(|| normalize_class_name(&object.class_name()))
+        .as_str()
+    {
         "splobjectstorage" => spl_object_storage_detach(object, key),
         _ => {
             let key = array_key_from_value(key)?;
@@ -45927,6 +47064,30 @@ fn class_implements_in_state(
     }
     seen.pop();
     Ok(false)
+}
+
+fn userland_arrayaccess_object(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+) -> Result<Option<ObjectRef>, String> {
+    let Value::Object(object) = effective_value(value) else {
+        return Ok(None);
+    };
+    if spl_runtime_marker(&object).is_some_and(|class| is_spl_array_access_runtime_class(&class)) {
+        return Ok(None);
+    }
+    if class_implements_in_state(
+        compiled,
+        state,
+        &object.class_name(),
+        "ArrayAccess",
+        &mut Vec::new(),
+    )? {
+        Ok(Some(object))
+    } else {
+        Ok(None)
+    }
 }
 
 fn interface_extends_in_state(
@@ -61741,6 +62902,16 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn reflection_attribute_new_instance_constructs_userland_attribute() {
+        let result = execute_source(
+            "<?php #[Attribute] class RouteMeta { public string $path; public int $priority; public function __construct(string $path, int $priority = 0) { $this->path = $path; $this->priority = $priority; } } #[RouteMeta('/health', 10)] class ReflectionRouteTarget {} $attribute = (new ReflectionClass(ReflectionRouteTarget::class))->getAttributes()[0]; $instance = $attribute->newInstance(); echo get_class($instance), '|', $instance->path, '|', $instance->priority;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"RouteMeta|/health|10");
+    }
+
+    #[test]
     fn reflection_enum_backed_cases_are_distinct_and_queryable() {
         let result = execute_source(
             "<?php enum ReflectionStdlib41Status: string { #[CaseMark('ready')] case Ready = 'ready'; case Done = 'done'; } $enum = new ReflectionEnum(ReflectionStdlib41Status::class); echo $enum->hasCase('Ready') ? 'has|' : 'missing|'; $case = $enum->getCase('Ready'); echo get_class($case), '|', $case->getName(), '|', $case->getBackingValue(), '|'; $direct = new ReflectionEnumBackedCase(ReflectionStdlib41Status::class, 'Done'); echo get_class($direct), '|', $direct->getBackingValue(), '|'; $constant = (new ReflectionClass(ReflectionStdlib41Status::class))->getReflectionConstant('Ready'); echo $constant->isEnumCase() ? 'enumcase' : 'constant';",
@@ -61973,6 +63144,55 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn userland_arrayaccess_routes_offset_operations() {
+        let result = execute_source(
+            r#"<?php
+            class Box implements ArrayAccess {
+                public array $items = [];
+                public array $log = [];
+                public function offsetExists($offset): bool {
+                    $this->log[] = "exists:" . (string) $offset;
+                    return array_key_exists($offset, $this->items);
+                }
+                public function offsetGet($offset): mixed {
+                    $this->log[] = "get:" . (string) $offset;
+                    return $this->items[$offset] ?? null;
+                }
+                public function offsetSet($offset, $value): void {
+                    $this->log[] = "set:" . ($offset === null ? "null" : (string) $offset) . "=" . (string) $value;
+                    if ($offset === null) {
+                        $this->items[] = $value;
+                    } else {
+                        $this->items[$offset] = $value;
+                    }
+                }
+                public function offsetUnset($offset): void {
+                    $this->log[] = "unset:" . (string) $offset;
+                    unset($this->items[$offset]);
+                }
+            }
+            $box = new Box();
+            $box["a"] = 0;
+            $box[] = 2;
+            echo $box["a"], "|", $box[0], "|";
+            echo isset($box["a"]) ? "isset|" : "missing|";
+            echo empty($box["a"]) ? "empty|" : "filled|";
+            unset($box["a"]);
+            echo isset($box["a"]) ? "bad|" : "gone|";
+            foreach ($box->log as $entry) {
+                echo $entry, ";";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"0|2|isset|empty|gone|set:a=0;set:null=2;get:a;get:0;exists:a;exists:a;get:a;unset:a;exists:a;"
+        );
+    }
+
+    #[test]
     fn exceptions_catch_exception_object() {
         let result = execute_source(
             "<?php try { throw new Exception(\"boom\"); } catch (Exception $e) { echo \"caught:\", $e->getMessage(); }",
@@ -62149,6 +63369,28 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         assert_eq!(
             result.output.to_string_lossy(),
             "0|2|array(3) {\n  [\"a\"]=>\n  int(1)\n  [\"b\"]=>\n  int(2)\n  [5]=>\n  int(3)\n}\narray(3) {\n  [0]=>\n  int(1)\n  [1]=>\n  int(2)\n  [2]=>\n  int(3)\n}\n2|array(2) {\n  [\"x\"]=>\n  int(7)\n  [\"y\"]=>\n  int(8)\n}\n"
+        );
+    }
+
+    #[test]
+    fn spl_iterator_functions_validate_sources_and_constructor_limits() {
+        let result = execute_source(
+            r#"<?php
+            try { iterator_count('1'); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
+            try { iterator_to_array('test', true); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
+            $arrayIterator = new ArrayIterator([1, 2, 3]);
+            new IteratorIterator($arrayIterator, IteratorIterator::class);
+            try { new IteratorIterator($arrayIterator, 1, 1); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
+            try { new LimitIterator($arrayIterator, -1); } catch (ValueError $e) { echo $e->getMessage(), "|"; }
+            try { new LimitIterator($arrayIterator, 0, -2); } catch (ValueError $e) { echo $e->getMessage(), "|"; }
+            echo iterator_count(new LimitIterator($arrayIterator, 0, -1));
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, string given|iterator_to_array(): Argument #1 ($iterator) must be of type Traversable|array, string given|IteratorIterator::__construct() expects at most 2 arguments, 3 given|LimitIterator::__construct(): Argument #2 ($offset) must be greater than or equal to 0|LimitIterator::__construct(): Argument #3 ($limit) must be greater than or equal to -1|3"
         );
     }
 
@@ -62761,6 +64003,28 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"1|256|1|0|2|4|5|1|2");
+    }
+
+    #[test]
+    fn spl_caching_iterator_supports_array_access_offsets() {
+        let result = execute_source(
+            r#"<?php
+            $it = new CachingIterator(new ArrayIterator([1, 2]), CachingIterator::FULL_CACHE);
+            foreach ($it as $value) {
+                echo $value, ":", $it->count(), "|";
+            }
+            echo isset($it[0]) ? "set|" : "missing|";
+            echo $it[0], "|";
+            $it[2] = "x";
+            $it["name"] = "y";
+            echo $it[2], "|", $it["name"], "|";
+            unset($it[0]);
+            echo isset($it[0]) ? "set" : "missing";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1:1|2:2|set|1|x|y|missing");
     }
 
     #[test]

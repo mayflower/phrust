@@ -224,11 +224,13 @@ builtin, and unresolved dynamic callable reflection report
 callable placeholders.
 
 Reflection objects are VM metadata handles, not userland class instances.
-`ReflectionAttribute::newInstance()` remains an explicit
-`E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE` gap because it requires
-attribute class instantiation and constructor semantics. Attribute target and
-repeatability validation are preserved as metadata or known gaps instead of
-silently instantiating attributes.
+`ReflectionAttribute::newInstance()` is implemented for a bounded userland
+attribute slice: metadata-backed class names are resolved from the request class
+table, positional folded arguments are passed to the attribute constructor, and
+constructor failures use normal VM call semantics. Attribute target and
+repeatability validation, autoload-sensitive lookup, named argument parity,
+internal attributes, and exact diagnostic text remain explicit
+`E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE` gaps.
 
 ## Property Magic
 

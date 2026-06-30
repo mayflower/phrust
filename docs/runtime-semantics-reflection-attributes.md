@@ -20,10 +20,13 @@ Each entry preserves:
 - repeated-on-target marker metadata.
 
 `ReflectionAttribute::getName()` and `getArguments()` read that metadata.
-`ReflectionAttribute::newInstance()` remains
-`E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE` because it requires attribute
-class lookup, constructor invocation, autoload-sensitive errors, and target /
-repeatability validation.
+`ReflectionAttribute::newInstance()` has a bounded userland implementation for
+class attributes whose constructor arguments are already folded into metadata:
+the VM resolves the attribute class from the request class table, constructs the
+object, and invokes the userland constructor through normal call semantics.
+Autoload-sensitive lookup, target masks, repeatability enforcement, named
+argument details, internal attribute classes, and exact diagnostic text remain
+covered by `E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE`.
 
 ## Reflection Metadata
 
@@ -71,8 +74,8 @@ stores it.
 
 Reflection remains incomplete in these areas:
 
-- `ReflectionAttribute::newInstance()` and complete target/repeatability
-  validation;
+- full `ReflectionAttribute::newInstance()` parity, including target and
+  repeatability validation;
 - doc comment retention;
 - full `ReflectionEnum`, `ReflectionClass`, `ReflectionMethod`, and
   `ReflectionParameter` API parity;
