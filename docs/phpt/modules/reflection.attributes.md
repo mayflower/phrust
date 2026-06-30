@@ -12,7 +12,7 @@
 
 ## Non-Scope
 
-- `ReflectionAttribute::newInstance()`
+- full `ReflectionAttribute::newInstance()` parity, including target/repeatability validation
 - Complete target and repeatability validation parity
 
 ## Target Gates

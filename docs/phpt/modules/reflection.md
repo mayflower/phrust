@@ -59,7 +59,7 @@
 - Full generated arginfo parity for every internal symbol and exact default constants
 - Complete internal class, method, property, and class-constant surfaces
 - ReflectionMethod upstream broad cases currently depend on object stringification/interpolation or invocation rather than only metadata
-- `ReflectionAttribute::newInstance()` and complete target/repeatability validation
+- full `ReflectionAttribute::newInstance()` parity, including target/repeatability validation
 - Property hook Reflection object parity
 - Enum serialization and byte-perfect exception gaps
 - Extension versions, dependencies, INI entries, module globals, and Zend ABI metadata

@@ -1,22 +1,22 @@
 <?php
-// runtime-semantics: category=foreach expect=known_gap known_gap=E_PHP_RUNTIME_ARRAYACCESS_STDLIB_GAP
+// runtime-semantics: category=foreach expect=pass
 class ArrayAccessFixture implements ArrayAccess
 {
-    public function offsetExists($offset)
+    public function offsetExists(mixed $offset): bool
     {
         return true;
     }
 
-    public function offsetGet($offset)
+    public function offsetGet(mixed $offset): mixed
     {
         return "value";
     }
 
-    public function offsetSet($offset, $value)
+    public function offsetSet(mixed $offset, mixed $value): void
     {
     }
 
-    public function offsetUnset($offset)
+    public function offsetUnset(mixed $offset): void
     {
     }
 }

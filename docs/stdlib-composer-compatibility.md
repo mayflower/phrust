@@ -128,7 +128,9 @@ performed.
 
 Failures write `stdout.txt`, `stderr.txt`, `report.json`, and
 `missing-symbols.txt`. The missing-symbol list is sorted by frequency and
-currently extracts undefined functions and classes from VM diagnostics so the
+extracts undefined functions, classes, methods, constants, Reflection method
+markers, and SPL method markers from VM diagnostics. `report.json` also records
+diagnostic and warning/fatal frequencies separately from missing symbols so the
 next compatibility gap is visible without requiring Composer PHAR support.
 
 ## Explicit Boundaries

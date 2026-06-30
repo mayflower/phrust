@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VM="${PHRUST_STDLIB_VM:-"$ROOT/target/debug/php-vm"}"
 FIXTURE="$ROOT/tests/fixtures/stdlib/_harness/composer/process_capability_disabled.php"
 
@@ -12,7 +12,7 @@ mkdir -p "$OUT_DIR"
 
 stdout="$OUT_DIR/stdout.txt"
 stderr="$OUT_DIR/stderr.txt"
-"$VM" run "$FIXTURE" >"$stdout" 2>"$stderr"
+"$VM" run --engine-preset baseline "$FIXTURE" >"$stdout" 2>"$stderr"
 
 expected="$OUT_DIR/expected.txt"
 cat >"$expected" <<'EOF'
