@@ -25,11 +25,12 @@ impl ArrayKey {
     /// - `bool` becomes `0` or `1`;
     /// - `null` becomes the empty-string key;
     /// - `float` truncates toward zero;
+    /// - `resource` becomes its numeric resource ID when representable;
     /// - decimal integer strings without a leading plus and without leading
     ///   zeroes become integer keys;
     /// - all other strings remain string keys.
     #[must_use]
-    pub fn from_value_mvp(value: &Value) -> Option<Self> {
+    pub fn from_value(value: &Value) -> Option<Self> {
         match value {
             Value::Int(value) => Some(Self::Int(*value)),
             Value::Bool(false) => Some(Self::Int(0)),
@@ -38,9 +39,9 @@ impl ArrayKey {
             Value::Float(value) => Some(Self::Int(value.to_f64() as i64)),
             Value::String(value) => Some(Self::from_php_string(value.clone())),
             Value::Uninitialized => Some(Self::String(PhpString::from_bytes(Vec::new()))),
+            Value::Resource(resource) => i64::try_from(resource.id().get()).ok().map(Self::Int),
             Value::Array(_)
             | Value::Object(_)
-            | Value::Resource(_)
             | Value::Fiber(_)
             | Value::Generator(_)
             | Value::Callable(_)
@@ -1241,45 +1242,42 @@ mod tests {
     }
 
     #[test]
-    fn array_key_conversion_covers_mvp_value_types() {
+    fn array_key_conversion_covers_runtime_value_types() {
+        assert_eq!(ArrayKey::from_value(&Value::Int(4)), Some(ArrayKey::Int(4)));
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::Int(4)),
-            Some(ArrayKey::Int(4))
-        );
-        assert_eq!(
-            ArrayKey::from_value_mvp(&Value::Bool(true)),
+            ArrayKey::from_value(&Value::Bool(true)),
             Some(ArrayKey::Int(1))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::Null),
+            ArrayKey::from_value(&Value::Null),
             Some(ArrayKey::String(PhpString::from("")))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::float(4.9)),
+            ArrayKey::from_value(&Value::float(4.9)),
             Some(ArrayKey::Int(4))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("42"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("42"))),
             Some(ArrayKey::Int(42))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("042"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("042"))),
             Some(ArrayKey::String(PhpString::from("042")))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("+42"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("+42"))),
             Some(ArrayKey::String(PhpString::from("+42")))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("-42"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("-42"))),
             Some(ArrayKey::Int(-42))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("-0"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("-0"))),
             Some(ArrayKey::String(PhpString::from("-0")))
         );
         assert_eq!(
-            ArrayKey::from_value_mvp(&Value::String(PhpString::from("9223372036854775808"))),
+            ArrayKey::from_value(&Value::String(PhpString::from("9223372036854775808"))),
             Some(ArrayKey::String(PhpString::from("9223372036854775808")))
         );
         assert_eq!(

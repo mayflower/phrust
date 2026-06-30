@@ -108,10 +108,12 @@ The current packed variant still stores full key/value entries so
 `PhpArray::iter()` can yield borrowed keys without changing callers. A
 values-only packed buffer remains a deferred fast path behind the same facade.
 
-String storage exposes `separate_for_write` and `bytes_mut`, but source-level
-string-offset assignment is still a runtime known gap:
-`E_PHP_RUNTIME_COW_STRING_OFFSET_WRITE`. Until the IR/VM has a string-offset
-write instruction, Runtime semantics fixtures document that limitation explicitly.
+String storage exposes `separate_for_write` and `bytes_mut`. Source-level
+string-offset reads and writes are executable for integer and numeric-string
+offsets covered by `fixtures/runtime_semantics/strings/`; writes separate shared
+string payloads before mutation so by-value string copies are not corrupted.
+Warning-channel and exact error-object wording edges remain tracked under the
+general runtime warning/error compatibility gaps.
 
 ## Reference Examples
 

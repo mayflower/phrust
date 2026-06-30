@@ -3820,7 +3820,7 @@ pub(in crate::builtins::modules) fn array_key_arg(
     name: &str,
     value: &Value,
 ) -> Result<ArrayKey, BuiltinError> {
-    ArrayKey::from_value_mvp(&deref_value(value))
+    ArrayKey::from_value(&deref_value(value))
         .ok_or_else(|| type_error(name, "int|string key-compatible value", value))
 }
 

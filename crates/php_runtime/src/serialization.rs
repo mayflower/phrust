@@ -296,7 +296,7 @@ impl Parser<'_> {
         for _ in 0..length {
             let key = self.parse_value(depth + 1)?;
             let value = self.parse_value(depth + 1)?;
-            let key = ArrayKey::from_value_mvp(&key)
+            let key = ArrayKey::from_value(&key)
                 .ok_or_else(|| SerializationError::new("invalid serialized array key"))?;
             array.insert(key, value);
         }

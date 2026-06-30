@@ -374,7 +374,7 @@ pub(in crate::builtins::modules) fn builtin_array_combine(
     }
     let mut output = PhpArray::new();
     for ((_, key), (_, value)) in keys.iter().zip(values.iter()) {
-        let Some(key) = ArrayKey::from_value_mvp(key) else {
+        let Some(key) = ArrayKey::from_value(key) else {
             return Err(type_error("array_combine", "array key", key));
         };
         output.insert(key, value.clone());
@@ -535,7 +535,7 @@ pub(in crate::builtins::modules) fn builtin_array_column(
         };
         if let Some(index_key) = &index_key
             && let Some(index_value) = row.get(index_key)
-            && let Some(output_key) = ArrayKey::from_value_mvp(index_value)
+            && let Some(output_key) = ArrayKey::from_value(index_value)
         {
             output.insert(output_key, value);
             continue;

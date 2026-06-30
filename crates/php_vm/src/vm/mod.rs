@@ -5520,7 +5520,7 @@ impl Vm {
                     let value = self.inline_constant_value(&entry.value);
                     if let Some(key) = &entry.key {
                         let key_value = self.inline_constant_value(key);
-                        if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                        if let Some(key) = ArrayKey::from_value(&key_value) {
                             array.insert(key, value);
                         } else {
                             array.append(value);
@@ -35321,7 +35321,7 @@ fn runtime_inline_constant_value(
                 let value = runtime_inline_constant_value(compiled, state, stack, &entry.value)?;
                 if let Some(key) = &entry.key {
                     let key_value = runtime_inline_constant_value(compiled, state, stack, key)?;
-                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                    if let Some(key) = ArrayKey::from_value(&key_value) {
                         array.insert(key, value);
                     } else {
                         array.append(value);
@@ -35354,7 +35354,7 @@ fn deferred_const_expr_value(
                 let value = deferred_const_expr_value(compiled, state, &entry.value)?;
                 if let Some(key) = &entry.key {
                     let key_value = deferred_const_expr_value(compiled, state, key)?;
-                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                    if let Some(key) = ArrayKey::from_value(&key_value) {
                         array.insert(key, value);
                     } else {
                         array.append(value);
@@ -41162,9 +41162,7 @@ fn spl_entries(object: &ObjectRef) -> Vec<(ArrayKey, Value)> {
             let Value::Array(pair) = effective_value(entry) else {
                 return None;
             };
-            let key = pair
-                .get(&ArrayKey::Int(0))
-                .and_then(ArrayKey::from_value_mvp)?;
+            let key = pair.get(&ArrayKey::Int(0)).and_then(ArrayKey::from_value)?;
             let value = pair.get(&ArrayKey::Int(1)).map(effective_value)?;
             Some((key, value))
         })
@@ -42249,7 +42247,7 @@ fn spl_heap_current_entry(object: &ObjectRef, class_name: &str) -> Option<(Array
     let raw = spl_entries(object).into_iter().nth(spl_position(object))?.1;
     if normalized_class == "splpriorityqueue" {
         let (data, priority) = spl_priority_queue_entry_parts(&raw)?;
-        let key = ArrayKey::from_value_mvp(&priority).unwrap_or(ArrayKey::Int(0));
+        let key = ArrayKey::from_value(&priority).unwrap_or(ArrayKey::Int(0));
         return Some((
             key,
             spl_priority_queue_extract_value(object, data, priority),
@@ -46705,7 +46703,7 @@ fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
     }
     match (spec.kind, values) {
         (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(array)]) => {
-            let key = ArrayKey::from_value_mvp(key)?;
+            let key = ArrayKey::from_value(key)?;
             Some(Value::Bool(array.get(&key).is_some()))
         }
         (BuiltinIntrinsicKind::CountArray, [Value::Array(array)]) => {
@@ -46801,7 +46799,7 @@ fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
 fn builtin_intrinsic_type_match(kind: BuiltinIntrinsicKind, values: &[Value]) -> bool {
     match (kind, values) {
         (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(_)]) => {
-            ArrayKey::from_value_mvp(key).is_some()
+            ArrayKey::from_value(key).is_some()
         }
         (BuiltinIntrinsicKind::CountArray, [Value::Array(_)])
         | (BuiltinIntrinsicKind::StrLen, [Value::String(_)])
@@ -47124,7 +47122,7 @@ fn constant_value(unit: &IrUnit, constant: ConstId) -> Result<Value, String> {
                 let value = inline_constant_value(&entry.value);
                 if let Some(key) = &entry.key {
                     let key_value = inline_constant_value(key);
-                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                    if let Some(key) = ArrayKey::from_value(&key_value) {
                         array.insert(key, value);
                     } else {
                         array.append(value);
@@ -47153,7 +47151,7 @@ fn inline_constant_value(constant: &IrConstant) -> Value {
                 let value = inline_constant_value(&entry.value);
                 if let Some(key) = &entry.key {
                     let key_value = inline_constant_value(key);
-                    if let Some(key) = ArrayKey::from_value_mvp(&key_value) {
+                    if let Some(key) = ArrayKey::from_value(&key_value) {
                         array.insert(key, value);
                     } else {
                         array.append(value);
@@ -47794,7 +47792,7 @@ fn coerce_value_to_runtime_type(value: &Value, runtime_type: &RuntimeType) -> Op
 }
 
 fn array_key_from_value(value: &Value) -> Result<ArrayKey, String> {
-    ArrayKey::from_value_mvp(value).ok_or_else(|| {
+    ArrayKey::from_value(value).ok_or_else(|| {
         if let Value::Object(object) = effective_value(value) {
             return format!(
                 "E_PHP_VM_ARRAY_KEY_CONVERSION: Cannot access offset of type {} on array",
