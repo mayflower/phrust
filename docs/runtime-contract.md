@@ -282,9 +282,10 @@ numeric levels are accepted within the active loop depth, while dynamic or
 out-of-range levels are classified as known gaps. `switch` case bodies preserve
 PHP fallthrough by jumping from an unterminated case body to the next case body.
 `match` is evaluated as an expression with strict identity comparisons. When no
-arm matches and no default exists, the MVP returns a deterministic runtime
-error with diagnostic ID `E_PHP_VM_UNHANDLED_MATCH`; later exception support can
-map that ID to PHP's `UnhandledMatchError`.
+arm matches and no default exists, the VM maps the deterministic
+`E_PHP_VM_UNHANDLED_MATCH` runtime error to an uncaught internal
+`UnhandledMatchError`. Catch matching for this lowered runtime-error path and
+exact stack text remain known gaps.
 
 ## User Function MVP
 

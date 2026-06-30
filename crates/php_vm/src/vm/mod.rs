@@ -79,12 +79,12 @@ use php_runtime::{
     PhpArrayShapeLookupFallback, PhpString, ProcessCapability, ReferenceCell, RuntimeContext,
     RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeHttpResponseState, RuntimeSeverity,
     RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions, UploadRegistry,
-    Value, VmCompileDiagnostic, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
-    error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
-    serialize as serialize_value, set_float_string_precision, to_arithmetic_number, to_bool,
-    to_float, to_int, to_number, to_string, undefined_function, undefined_variable_warning,
-    unserialize as unserialize_value, unsupported_feature, value_matches_runtime_type,
-    value_type_name,
+    Value, VmCompileDiagnostic, array_to_string_warning, compare, division_by_zero_mvp,
+    emit_php_diagnostic, equal, error_reporting_allows_level, identical,
+    reset_float_string_precision, runtime_type_name, serialize as serialize_value,
+    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
+    to_string, undefined_function, undefined_variable_warning, unserialize as unserialize_value,
+    unsupported_feature, value_matches_runtime_type, value_type_name,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -20271,12 +20271,18 @@ impl Vm {
                         diagnostic_id,
                         message,
                     } => {
-                        return self.runtime_error(
+                        let result = self.runtime_error(
                             output,
                             compiled,
                             stack,
                             format!("{diagnostic_id}: {message}"),
                         );
+                        if let Some(throwable) = runtime_error_throwable(&result) {
+                            tag_throwable_location(&throwable, compiled, instruction.span);
+                            state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                            return self.propagate_exception(output, stack, state, throwable);
+                        }
+                        return result;
                     }
                 }
                 if let Some(code) = state.process_exit_code {
@@ -25502,14 +25508,8 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<(), VmResult> {
-        let diagnostic = RuntimeDiagnostic::new(
-            "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING",
-            RuntimeSeverity::Warning,
-            "Array to string conversion",
-            RuntimeSourceSpan::default(),
-            stack_trace(compiled, stack),
-            Some(php_runtime::PhpReferenceClassification::Warning),
-        );
+        let diagnostic =
+            array_to_string_warning(RuntimeSourceSpan::default(), stack_trace(compiled, stack));
         let handled = self.dispatch_error_handler(
             compiled,
             output,
@@ -30151,7 +30151,7 @@ fn runtime_diagnostic_for_message(
         message.to_owned(),
         RuntimeSourceSpan::default(),
         stack_trace(compiled, stack),
-        None,
+        php_runtime::PhpReferenceClassification::from_diagnostic_id(id),
     )
 }
 
@@ -30162,6 +30162,7 @@ fn internal_throwable_display_name(class_name: &str) -> String {
         "error" => "Error".to_owned(),
         "typeerror" => "TypeError".to_owned(),
         "valueerror" => "ValueError".to_owned(),
+        "unhandledmatcherror" => "UnhandledMatchError".to_owned(),
         "argumentcounterror" => "ArgumentCountError".to_owned(),
         "fibererror" => "FiberError".to_owned(),
         "jsonexception" => "JsonException".to_owned(),
@@ -30186,7 +30187,7 @@ fn internal_throwable_display_name(class_name: &str) -> String {
 
 fn internal_throwable_parent(class_name: &str) -> Option<&'static str> {
     match normalize_class_name(class_name).as_str() {
-        "typeerror" | "valueerror" | "fibererror" => Some("Error"),
+        "typeerror" | "valueerror" | "unhandledmatcherror" | "fibererror" => Some("Error"),
         "argumentcounterror" => Some("TypeError"),
         "jsonexception"
         | "pdoexception"
@@ -30217,6 +30218,7 @@ fn internal_throwable_instanceof(object_class: &str, target_class: &str) -> Opti
             | "error"
             | "typeerror"
             | "valueerror"
+            | "unhandledmatcherror"
             | "argumentcounterror"
             | "fibererror"
             | "jsonexception"
@@ -47011,7 +47013,9 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_VM_TOO_FEW_ARGS" | "E_PHP_VM_TOO_MANY_ARGS" => "ArgumentCountError",
         "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE" => "Error",
         "E_PHP_VM_UNKNOWN_NAMED_ARG" | "E_PHP_VM_DUPLICATE_NAMED_ARG" => "Error",
+        "E_PHP_VM_UNHANDLED_MATCH" => "UnhandledMatchError",
         "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP" => "Error",
+        "E_PHP_RUNTIME_NON_NUMERIC_STRING" => "TypeError",
         "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES" => "TypeError",
         "E_PHP_VM_TOSTRING_RETURN_TYPE" => "TypeError",
         "E_PHP_VM_STRING_OFFSET_TYPE" => "TypeError",
@@ -58903,7 +58907,9 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
         assert_eq!(
             result.status.message(),
-            Some("E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number")
+            Some(
+                "E_PHP_VM_UNCAUGHT_EXCEPTION: Uncaught TypeError: non-numeric string cannot be used as a number"
+            )
         );
         let counters = result.counters.expect("counters");
         assert_eq!(counters.numeric_string_classify_calls, 1, "{counters:?}");
@@ -59899,10 +59905,10 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         let result = execute_source("<?php echo match (2) { 0 => \"zero\", 1 => \"one\" };");
 
         assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
-        assert_eq!(
-            result.status.message(),
-            Some("E_PHP_VM_UNHANDLED_MATCH: match expression did not match any arm")
-        );
+        let message = result.status.message().expect("runtime error message");
+        assert!(message.contains("E_PHP_VM_UNCAUGHT_EXCEPTION"));
+        assert!(message.contains("UnhandledMatchError"));
+        assert!(message.contains("match expression did not match any arm"));
     }
 
     #[test]

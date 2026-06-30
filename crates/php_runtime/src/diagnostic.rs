@@ -24,6 +24,38 @@ pub enum RuntimeSeverity {
     UnsupportedFeature,
 }
 
+/// PHP-visible runtime event family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeEventKind {
+    /// PHP warning; execution may continue.
+    Warning,
+    /// PHP notice; execution may continue.
+    Notice,
+    /// PHP deprecation; execution may continue.
+    Deprecation,
+    /// Catchable PHP `Error`/`Exception` object.
+    CatchableException,
+    /// Fatal runtime error that terminates execution.
+    FatalError,
+    /// Explicit unsupported feature.
+    UnsupportedFeature,
+}
+
+impl RuntimeEventKind {
+    /// Stable JSON spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+            Self::Deprecation => "deprecation",
+            Self::CatchableException => "catchable_exception",
+            Self::FatalError => "fatal_error",
+            Self::UnsupportedFeature => "unsupported_feature",
+        }
+    }
+}
+
 impl RuntimeSeverity {
     /// Stable JSON spelling.
     #[must_use]
@@ -57,10 +89,20 @@ impl RuntimeSeverity {
 pub enum PhpReferenceClassification {
     /// PHP warning.
     Warning,
+    /// PHP notice.
+    Notice,
+    /// PHP deprecation.
+    Deprecation,
     /// PHP `TypeError`.
     TypeError,
+    /// PHP `ValueError`.
+    ValueError,
+    /// PHP `ArgumentCountError`.
+    ArgumentCountError,
     /// PHP `DivisionByZeroError`.
     DivisionByZeroError,
+    /// PHP `UnhandledMatchError`.
+    UnhandledMatchError,
     /// PHP `Error`.
     Error,
     /// PHP fatal error.
@@ -75,11 +117,83 @@ impl PhpReferenceClassification {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Warning => "warning",
+            Self::Notice => "notice",
+            Self::Deprecation => "deprecation",
             Self::TypeError => "type_error",
+            Self::ValueError => "value_error",
+            Self::ArgumentCountError => "argument_count_error",
             Self::DivisionByZeroError => "division_by_zero_error",
+            Self::UnhandledMatchError => "unhandled_match_error",
             Self::Error => "error",
             Self::FatalError => "fatal_error",
             Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// Returns the PHP Throwable class used by VM exception propagation.
+    #[must_use]
+    pub const fn throwable_class(self) -> Option<&'static str> {
+        match self {
+            Self::TypeError => Some("TypeError"),
+            Self::ValueError => Some("ValueError"),
+            Self::ArgumentCountError => Some("ArgumentCountError"),
+            Self::DivisionByZeroError => Some("DivisionByZeroError"),
+            Self::UnhandledMatchError => Some("UnhandledMatchError"),
+            Self::Error => Some("Error"),
+            Self::Warning
+            | Self::Notice
+            | Self::Deprecation
+            | Self::FatalError
+            | Self::Unsupported => None,
+        }
+    }
+
+    /// Infers a PHP-reference classification from stable runtime diagnostic IDs.
+    #[must_use]
+    pub fn from_diagnostic_id(id: &str) -> Option<Self> {
+        match id {
+            "E_PHP_RUNTIME_BUILTIN_ARITY"
+            | "E_PHP_STD_MISSING_ARGUMENT"
+            | "E_PHP_STD_TOO_MANY_ARGUMENTS"
+            | "E_PHP_VM_TOO_FEW_ARGS"
+            | "E_PHP_VM_TOO_MANY_ARGS" => Some(Self::ArgumentCountError),
+            "E_PHP_RUNTIME_BUILTIN_TYPE"
+            | "E_PHP_STD_TYPE_ERROR"
+            | "E_PHP_RUNTIME_TYPE_ERROR"
+            | "E_PHP_RUNTIME_NON_NUMERIC_STRING"
+            | "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES"
+            | "E_PHP_VM_TOSTRING_RETURN_TYPE"
+            | "E_PHP_VM_STRING_OFFSET_TYPE"
+            | "E_PHP_VM_PARAM_TYPE_MISMATCH"
+            | "E_PHP_VM_DYNAMIC_CLASS_NAME_TYPE"
+            | "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK"
+            | "E_PHP_VM_PROPERTY_TYPE_MISMATCH"
+            | "E_PHP_VM_FIRST_CLASS_CALLABLE_NOT_CALLABLE"
+            | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_FUNCTION"
+            | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNDEFINED_METHOD"
+            | "E_PHP_VM_FIRST_CLASS_CALLABLE_NON_STATIC_METHOD"
+            | "E_PHP_VM_FIRST_CLASS_CALLABLE_UNRESOLVED_DYNAMIC" => Some(Self::TypeError),
+            "E_PHP_RUNTIME_BUILTIN_VALUE"
+            | "E_PHP_RUNTIME_JSON_EXCEPTION"
+            | "E_PHP_VM_SPL_VALUE_ERROR"
+            | "E_PHP_STD_VALUE_ERROR" => Some(Self::ValueError),
+            "E_PHP_RUNTIME_DIVISION_BY_ZERO" => Some(Self::DivisionByZeroError),
+            "E_PHP_VM_UNHANDLED_MATCH" => Some(Self::UnhandledMatchError),
+            "E_PHP_RUNTIME_UNDEFINED_FUNCTION"
+            | "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP"
+            | "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE"
+            | "E_PHP_VM_UNKNOWN_NAMED_ARG"
+            | "E_PHP_VM_DUPLICATE_NAMED_ARG"
+            | "E_PHP_VM_ARRAY_KEY_CONVERSION" => Some(Self::Error),
+            "E_PHP_RUNTIME_UNDEFINED_VARIABLE_WARNING"
+            | "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING"
+            | "E_PHP_RUNTIME_NON_NUMERIC_STRING_WARNING"
+            | "E_PHP_RUNTIME_OBJECT_NUMERIC_CAST_WARNING"
+            | "E_PHP_RUNTIME_UNDEFINED_ARRAY_KEY_WARNING" => Some(Self::Warning),
+            id if id.contains("_DEPRECATED_") || id.contains("_DEPRECATION") => {
+                Some(Self::Deprecation)
+            }
+            _ => None,
         }
     }
 }
@@ -645,6 +759,31 @@ impl RuntimeDiagnostic {
         self.php_reference
     }
 
+    /// Explicit or ID-inferred PHP-reference classification.
+    #[must_use]
+    pub fn php_reference_or_inferred(&self) -> Option<PhpReferenceClassification> {
+        self.php_reference
+            .or_else(|| PhpReferenceClassification::from_diagnostic_id(self.id()))
+    }
+
+    /// PHP-visible runtime event family.
+    #[must_use]
+    pub fn event_kind(&self) -> RuntimeEventKind {
+        match self.severity {
+            RuntimeSeverity::Warning => RuntimeEventKind::Warning,
+            RuntimeSeverity::Notice => RuntimeEventKind::Notice,
+            RuntimeSeverity::Deprecation => RuntimeEventKind::Deprecation,
+            RuntimeSeverity::RecoverableError => RuntimeEventKind::CatchableException,
+            RuntimeSeverity::FatalError => self
+                .php_reference_or_inferred()
+                .and_then(PhpReferenceClassification::throwable_class)
+                .map_or(RuntimeEventKind::FatalError, |_| {
+                    RuntimeEventKind::CatchableException
+                }),
+            RuntimeSeverity::UnsupportedFeature => RuntimeEventKind::UnsupportedFeature,
+        }
+    }
+
     /// Additional typed diagnostic payload.
     #[must_use]
     pub const fn payload(&self) -> Option<&RuntimeDiagnosticPayload> {
@@ -801,6 +940,40 @@ pub fn type_error_mvp(
     )
 }
 
+/// ValueError MVP helper.
+#[must_use]
+pub fn value_error_mvp(
+    message: impl Into<String>,
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_BUILTIN_VALUE",
+        RuntimeSeverity::FatalError,
+        message,
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::ValueError),
+    )
+}
+
+/// ArgumentCountError MVP helper.
+#[must_use]
+pub fn argument_count_error_mvp(
+    message: impl Into<String>,
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_BUILTIN_ARITY",
+        RuntimeSeverity::FatalError,
+        message,
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::ArgumentCountError),
+    )
+}
+
 /// DivisionByZero MVP helper.
 #[must_use]
 pub fn division_by_zero_mvp(
@@ -814,6 +987,70 @@ pub fn division_by_zero_mvp(
         source_span,
         stack_trace,
         Some(PhpReferenceClassification::DivisionByZeroError),
+    )
+}
+
+/// UnhandledMatchError MVP helper.
+#[must_use]
+pub fn unhandled_match_error_mvp(
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_VM_UNHANDLED_MATCH",
+        RuntimeSeverity::FatalError,
+        "match expression did not match any arm",
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::UnhandledMatchError),
+    )
+}
+
+/// Array-to-string warning helper.
+#[must_use]
+pub fn array_to_string_warning(
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_ARRAY_TO_STRING_WARNING",
+        RuntimeSeverity::Warning,
+        "Array to string conversion",
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::Warning),
+    )
+}
+
+/// Leading numeric-string arithmetic warning helper.
+#[must_use]
+pub fn leading_numeric_string_warning(
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_NON_NUMERIC_STRING_WARNING",
+        RuntimeSeverity::Warning,
+        "A non-numeric value encountered",
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::Warning),
+    )
+}
+
+/// Non-numeric arithmetic TypeError helper.
+#[must_use]
+pub fn non_numeric_string_type_error(
+    source_span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_NON_NUMERIC_STRING",
+        RuntimeSeverity::FatalError,
+        "non-numeric string cannot be used as a number",
+        source_span,
+        stack_trace,
+        Some(PhpReferenceClassification::TypeError),
     )
 }
 
@@ -871,8 +1108,10 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity, RuntimeStackFrame,
-        VmCompileDiagnostic, division_by_zero_mvp, undefined_function, undefined_variable_warning,
+        PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeEventKind,
+        RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic, argument_count_error_mvp,
+        array_to_string_warning, division_by_zero_mvp, leading_numeric_string_warning,
+        undefined_function, undefined_variable_warning, unhandled_match_error_mvp, value_error_mvp,
     };
     use crate::RuntimeSourceSpan;
 
@@ -936,6 +1175,63 @@ mod tests {
         let division = division_by_zero_mvp(RuntimeSourceSpan::default(), Vec::new());
         assert_eq!(division.id(), "E_PHP_RUNTIME_DIVISION_BY_ZERO");
         assert_eq!(division.message(), "division by zero");
+    }
+
+    #[test]
+    fn errors_helpers_cover_runtime_event_and_throwable_mapping() {
+        let span = RuntimeSourceSpan::default();
+        let value = value_error_mvp("bad value", span.clone(), Vec::new());
+        assert_eq!(
+            value.php_reference_or_inferred(),
+            Some(PhpReferenceClassification::ValueError)
+        );
+        assert_eq!(value.event_kind(), RuntimeEventKind::CatchableException);
+
+        let arity = argument_count_error_mvp("too few arguments", span.clone(), Vec::new());
+        assert_eq!(
+            arity
+                .php_reference_or_inferred()
+                .and_then(PhpReferenceClassification::throwable_class),
+            Some("ArgumentCountError")
+        );
+
+        let unhandled_match = unhandled_match_error_mvp(span.clone(), Vec::new());
+        assert_eq!(
+            unhandled_match
+                .php_reference_or_inferred()
+                .and_then(PhpReferenceClassification::throwable_class),
+            Some("UnhandledMatchError")
+        );
+
+        let array_warning = array_to_string_warning(span.clone(), Vec::new());
+        assert_eq!(array_warning.event_kind(), RuntimeEventKind::Warning);
+
+        let numeric_warning = leading_numeric_string_warning(span, Vec::new());
+        assert_eq!(numeric_warning.message(), "A non-numeric value encountered");
+    }
+
+    #[test]
+    fn errors_infer_php_reference_from_legacy_diagnostic_ids() {
+        assert_eq!(
+            PhpReferenceClassification::from_diagnostic_id("E_PHP_RUNTIME_BUILTIN_ARITY"),
+            Some(PhpReferenceClassification::ArgumentCountError)
+        );
+        assert_eq!(
+            PhpReferenceClassification::from_diagnostic_id("E_PHP_RUNTIME_BUILTIN_TYPE"),
+            Some(PhpReferenceClassification::TypeError)
+        );
+        assert_eq!(
+            PhpReferenceClassification::from_diagnostic_id("E_PHP_RUNTIME_NON_NUMERIC_STRING"),
+            Some(PhpReferenceClassification::TypeError)
+        );
+        assert_eq!(
+            PhpReferenceClassification::from_diagnostic_id("E_PHP_RUNTIME_BUILTIN_VALUE"),
+            Some(PhpReferenceClassification::ValueError)
+        );
+        assert_eq!(
+            PhpReferenceClassification::from_diagnostic_id("E_PHP_VM_UNHANDLED_MATCH"),
+            Some(PhpReferenceClassification::UnhandledMatchError)
+        );
     }
 
     #[test]

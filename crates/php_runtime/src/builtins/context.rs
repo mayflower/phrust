@@ -430,7 +430,7 @@ impl<'a> BuiltinContext<'a> {
             message,
             source_span,
             Vec::new(),
-            None,
+            Some(crate::PhpReferenceClassification::Warning),
         );
         emit_php_diagnostic(
             self.output,
@@ -457,7 +457,7 @@ impl<'a> BuiltinContext<'a> {
             message,
             source_span,
             Vec::new(),
-            None,
+            Some(crate::PhpReferenceClassification::Deprecation),
         );
         emit_php_diagnostic(
             self.output,

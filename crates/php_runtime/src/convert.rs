@@ -1,7 +1,7 @@
 //! Scalar conversion and comparison helpers for runtime/5 execution.
 
 use crate::{
-    PhpString, Value,
+    PhpArray, PhpString, Value,
     numeric_string::{NumericStringKind, NumericStringValue, classify_php_string},
 };
 use std::cell::Cell;
@@ -270,6 +270,67 @@ pub fn to_arithmetic_number(value: &Value) -> Result<ArithmeticNumber, String> {
     }
 }
 
+/// Converts a value to PHP truthiness.
+pub fn to_bool_php(value: &Value) -> Result<bool, String> {
+    to_bool(value)
+}
+
+/// Converts a value to PHP string bytes for currently supported runtime values.
+pub fn to_string_php(value: &Value) -> Result<PhpString, String> {
+    to_string(value)
+}
+
+/// Converts a value to a PHP integer cast result.
+pub fn to_int_php(value: &Value) -> Result<i64, String> {
+    to_int(value)
+}
+
+/// Converts a value to a PHP float cast result.
+pub fn to_float_php(value: &Value) -> Result<f64, String> {
+    to_float(value)
+}
+
+/// Converts a value to a PHP numeric value for arithmetic operators.
+pub fn to_number_php(value: &Value) -> Result<NumericValue, String> {
+    to_number(value)
+}
+
+/// Converts a value to a PHP numeric arithmetic operand and warning flag.
+pub fn to_arithmetic_number_php(value: &Value) -> Result<ArithmeticNumber, String> {
+    to_arithmetic_number(value)
+}
+
+/// Converts a value to a PHP array cast result for currently supported values.
+pub fn to_array_php(value: &Value) -> Result<PhpArray, String> {
+    match value {
+        Value::Null => Ok(PhpArray::new()),
+        Value::Array(array) => Ok(array.clone()),
+        Value::Reference(cell) => to_array_php(&cell.get()),
+        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => Err(
+            "E_PHP_RUNTIME_OBJECT_TO_ARRAY_GAP: object to array conversion is not implemented"
+                .to_owned(),
+        ),
+        Value::Uninitialized => Err("cannot convert uninitialized value to array".to_owned()),
+        Value::Callable(_) => Err("callable to array conversion is not implemented".to_owned()),
+        scalar => {
+            let mut array = PhpArray::new();
+            array.append(scalar.clone());
+            Ok(array)
+        }
+    }
+}
+
+/// Object casts are not implemented in the runtime value model yet.
+pub fn to_object_php(value: &Value) -> Result<Value, String> {
+    match value {
+        Value::Object(_) => Ok(value.clone()),
+        Value::Reference(cell) => to_object_php(&cell.get()),
+        _ => Err(
+            "E_PHP_RUNTIME_OBJECT_CAST_GAP: object cast conversion is not implemented".to_owned(),
+        ),
+    }
+}
+
 /// Strict identity for runtime-semantics runtime values.
 pub fn identical(left: &Value, right: &Value) -> bool {
     match (left, right) {
@@ -303,6 +364,16 @@ pub fn equal(left: &Value, right: &Value) -> Result<bool, String> {
         (left, Value::Reference(right)) => equal(left, &right.get()),
         _ => Ok(compare(left, right)? == Ordering::Equal),
     }
+}
+
+/// Strict identity using PHP runtime semantics.
+pub fn identical_php(left: &Value, right: &Value) -> bool {
+    identical(left, right)
+}
+
+/// Loose equality using PHP runtime semantics.
+pub fn equal_php(left: &Value, right: &Value) -> Result<bool, String> {
+    equal(left, right)
 }
 
 /// Loose comparison for runtime-semantics comparison cases.
@@ -352,6 +423,11 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ordering, String> {
             type_name(right)
         )),
     }
+}
+
+/// Loose ordering using PHP runtime semantics.
+pub fn compare_php(left: &Value, right: &Value) -> Result<Ordering, String> {
+    compare(left, right)
 }
 
 fn compare_numbers(left: NumericValue, right: NumericValue) -> Result<Ordering, String> {
@@ -586,6 +662,32 @@ mod tests {
     }
 
     #[test]
+    fn convert_php_named_apis_cover_supported_casts_and_known_gaps() {
+        assert!(to_bool_php(&Value::string(b"1".to_vec())).unwrap());
+        assert_eq!(to_int_php(&Value::string(b"42x".to_vec())).unwrap(), 42);
+        assert_eq!(to_float_php(&Value::string(b"1.5x".to_vec())).unwrap(), 1.5);
+        assert_eq!(to_string_php(&Value::Bool(true)).unwrap().as_bytes(), b"1");
+        assert_eq!(
+            to_number_php(&Value::string(b"2".to_vec())).unwrap(),
+            NumericValue::Int(2)
+        );
+        assert!(
+            to_arithmetic_number_php(&Value::string(b"2x".to_vec()))
+                .unwrap()
+                .leading_numeric_string
+        );
+
+        let null_array = to_array_php(&Value::Null).unwrap();
+        assert!(null_array.is_empty());
+        let scalar_array = to_array_php(&Value::Int(7)).unwrap();
+        assert_eq!(scalar_array.len(), 1);
+        assert_eq!(
+            to_object_php(&Value::Int(7)).unwrap_err(),
+            "E_PHP_RUNTIME_OBJECT_CAST_GAP: object cast conversion is not implemented"
+        );
+    }
+
+    #[test]
     fn convert_scalar_to_string_matches_echo_mvp() {
         assert_eq!(to_string(&Value::Null).unwrap().as_bytes(), b"");
         assert_eq!(to_string(&Value::Bool(false)).unwrap().as_bytes(), b"");
@@ -729,11 +831,17 @@ mod tests {
     #[test]
     fn convert_comparison_handles_safe_scalar_mvp() {
         assert!(equal(&Value::Int(1), &Value::float(1.0)).unwrap());
+        assert!(equal_php(&Value::Int(1), &Value::float(1.0)).unwrap());
         assert!(identical(&Value::Int(1), &Value::Int(1)));
+        assert!(identical_php(&Value::Int(1), &Value::Int(1)));
         assert!(!identical(&Value::Int(1), &Value::float(1.0)));
         assert!(!identical(&Value::float(f64::NAN), &Value::float(f64::NAN)));
         assert_eq!(
             compare(&Value::string(b"2".to_vec()), &Value::Int(10)).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_php(&Value::string(b"2".to_vec()), &Value::Int(10)).unwrap(),
             Ordering::Less
         );
     }

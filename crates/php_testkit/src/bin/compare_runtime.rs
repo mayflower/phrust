@@ -150,7 +150,7 @@ fn run() -> Result<RuntimeReport, String> {
         render_markdown_report(&report),
     )
     .map_err(|error| format!("failed to write runtime markdown report: {error}"))?;
-    if options.out_dir == PathBuf::from("target/runtime/runtime-diff") {
+    if options.out_dir == Path::new("target/runtime/runtime-diff") {
         write_docs_reports(&report)?;
     }
     println!(
@@ -254,14 +254,16 @@ fn compare_fixture(
     if fixture.expect == RuntimeFixtureExpectation::Skip {
         return result(
             fixture,
-            None,
-            None,
-            RuntimeComparisonStatus::Skipped,
-            None,
-            Vec::new(),
-            None,
-            known_gaps.find_for_fixture_metadata(fixture),
-            Some("fixture metadata requested skip".to_string()),
+            RuntimeComparisonParts {
+                reference: None,
+                rust: None,
+                status: RuntimeComparisonStatus::Skipped,
+                category: None,
+                diagnostic_ids: Vec::new(),
+                known_gap_id: None,
+                known_gap_match: known_gaps.find_for_fixture_metadata(fixture),
+                message: Some("fixture metadata requested skip".to_string()),
+            },
         );
     }
 
@@ -282,14 +284,16 @@ fn compare_fixture(
         if rust.is_err() {
             return result(
                 fixture,
-                run_reference_side(fixture).ok().flatten(),
-                rust_side,
-                RuntimeComparisonStatus::Fail,
-                Some(MismatchCategory::HarnessError),
-                diagnostic_ids,
-                None,
-                known_gaps.find_for_fixture_metadata(fixture),
-                rust.err(),
+                RuntimeComparisonParts {
+                    reference: run_reference_side(fixture).ok().flatten(),
+                    rust: rust_side,
+                    status: RuntimeComparisonStatus::Fail,
+                    category: Some(MismatchCategory::HarnessError),
+                    diagnostic_ids,
+                    known_gap_id: None,
+                    known_gap_match: known_gaps.find_for_fixture_metadata(fixture),
+                    message: rust.err(),
+                },
             );
         }
         let reference = run_reference_side(fixture).ok().flatten();
@@ -316,14 +320,16 @@ fn compare_fixture(
         };
         return result(
             fixture,
-            reference,
-            rust_side,
-            status,
-            category,
-            diagnostic_ids,
-            None,
-            gap_match,
-            message,
+            RuntimeComparisonParts {
+                reference,
+                rust: rust_side,
+                status,
+                category,
+                diagnostic_ids,
+                known_gap_id: None,
+                known_gap_match: gap_match,
+                message,
+            },
         );
     }
 
@@ -342,15 +348,17 @@ fn compare_fixture(
         };
         return result(
             fixture,
-            run_reference_side(fixture).ok().flatten(),
-            rust_side,
-            status,
-            (status == RuntimeComparisonStatus::Fail)
-                .then_some(MismatchCategory::RuntimeExitMismatch),
-            diagnostic_ids,
-            fixture.known_gap_id.clone(),
-            known_gaps.find_for_fixture_metadata(fixture),
-            message.or_else(|| rust.err()),
+            RuntimeComparisonParts {
+                reference: run_reference_side(fixture).ok().flatten(),
+                rust: rust_side,
+                status,
+                category: (status == RuntimeComparisonStatus::Fail)
+                    .then_some(MismatchCategory::RuntimeExitMismatch),
+                diagnostic_ids,
+                known_gap_id: fixture.known_gap_id.clone(),
+                known_gap_match: known_gaps.find_for_fixture_metadata(fixture),
+                message: message.or_else(|| rust.err()),
+            },
         );
     }
 
@@ -359,14 +367,16 @@ fn compare_fixture(
         Err(message) => {
             return result(
                 fixture,
-                None,
-                rust_side,
-                RuntimeComparisonStatus::Fail,
-                Some(MismatchCategory::HarnessError),
-                diagnostic_ids,
-                None,
-                None,
-                Some(message),
+                RuntimeComparisonParts {
+                    reference: None,
+                    rust: rust_side,
+                    status: RuntimeComparisonStatus::Fail,
+                    category: Some(MismatchCategory::HarnessError),
+                    diagnostic_ids,
+                    known_gap_id: None,
+                    known_gap_match: None,
+                    message: Some(message),
+                },
             );
         }
     };
@@ -378,14 +388,17 @@ fn compare_fixture(
         };
         return result(
             fixture,
-            None,
-            rust_side,
-            status,
-            (status == RuntimeComparisonStatus::Fail).then_some(MismatchCategory::HarnessError),
-            diagnostic_ids,
-            None,
-            None,
-            Some("REFERENCE_PHP is not set".to_string()),
+            RuntimeComparisonParts {
+                reference: None,
+                rust: rust_side,
+                status,
+                category: (status == RuntimeComparisonStatus::Fail)
+                    .then_some(MismatchCategory::HarnessError),
+                diagnostic_ids,
+                known_gap_id: None,
+                known_gap_match: None,
+                message: Some("REFERENCE_PHP is not set".to_string()),
+            },
         );
     };
     let gap_match = known_gaps.find(fixture, &diagnostic_ids);
@@ -427,14 +440,16 @@ fn compare_fixture(
     };
     result(
         fixture,
-        Some(reference),
-        rust_side,
-        status,
-        category,
-        diagnostic_ids,
-        None,
-        gap_match,
-        message.or_else(|| rust.err()),
+        RuntimeComparisonParts {
+            reference: Some(reference),
+            rust: rust_side,
+            status,
+            category,
+            diagnostic_ids,
+            known_gap_id: None,
+            known_gap_match: gap_match,
+            message: message.or_else(|| rust.err()),
+        },
     )
 }
 
@@ -546,8 +561,7 @@ fn diff_message(reference: &RuntimeSideResult, rust: Option<&RuntimeSideResult>)
     parts.join("; ")
 }
 
-fn result(
-    fixture: &RuntimeFixture,
+struct RuntimeComparisonParts {
     reference: Option<RuntimeSideResult>,
     rust: Option<RuntimeSideResult>,
     status: RuntimeComparisonStatus,
@@ -556,7 +570,19 @@ fn result(
     known_gap_id: Option<String>,
     known_gap_match: Option<KnownGapMatch>,
     message: Option<String>,
-) -> RuntimeComparisonResult {
+}
+
+fn result(fixture: &RuntimeFixture, parts: RuntimeComparisonParts) -> RuntimeComparisonResult {
+    let RuntimeComparisonParts {
+        reference,
+        rust,
+        status,
+        category,
+        diagnostic_ids,
+        known_gap_id,
+        known_gap_match,
+        message,
+    } = parts;
     let known_gap_id =
         known_gap_id.or_else(|| known_gap_match.as_ref().map(|matched| matched.id.clone()));
     let feature_area = known_gap_match

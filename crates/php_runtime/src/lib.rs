@@ -72,9 +72,11 @@ pub mod api {
         StrictTypesInfo, parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
     };
     pub use crate::convert::{
-        ArithmeticNumber, NumericValue, compare, equal, identical, reset_float_string_precision,
-        set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
-        to_string,
+        ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, identical,
+        identical_php, reset_float_string_precision, set_float_string_precision,
+        to_arithmetic_number, to_arithmetic_number_php, to_array_php, to_bool, to_bool_php,
+        to_float, to_float_php, to_int, to_int_php, to_number, to_number_php, to_object_php,
+        to_string, to_string_php,
     };
     pub use crate::db::mysql::{
         MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_SQLITE_COMPAT_ENV,
@@ -83,8 +85,11 @@ pub mod api {
     };
     pub use crate::diagnostic::{
         PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError,
-        RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic, division_by_zero_mvp,
-        type_error_mvp, undefined_function, undefined_variable_warning, unsupported_feature,
+        RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
+        argument_count_error_mvp, array_to_string_warning, division_by_zero_mvp,
+        leading_numeric_string_warning, non_numeric_string_type_error, type_error_mvp,
+        undefined_function, undefined_variable_warning, unhandled_match_error_mvp,
+        unsupported_feature, value_error_mvp,
     };
     pub use crate::error_output::{
         PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,
@@ -200,9 +205,10 @@ pub use context::{
     parse_form_urlencoded_body, parse_query_string,
 };
 pub use convert::{
-    ArithmeticNumber, NumericValue, compare, equal, identical, reset_float_string_precision,
-    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
-    to_string,
+    ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, identical,
+    identical_php, reset_float_string_precision, set_float_string_precision, to_arithmetic_number,
+    to_arithmetic_number_php, to_array_php, to_bool, to_bool_php, to_float, to_float_php, to_int,
+    to_int_php, to_number, to_number_php, to_object_php, to_string, to_string_php,
 };
 pub use db::mysql::{
     MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_SQLITE_COMPAT_ENV, MysqlCell,
@@ -211,8 +217,11 @@ pub use db::mysql::{
 };
 pub use diagnostic::{
     PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError,
-    RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic, division_by_zero_mvp, type_error_mvp,
-    undefined_function, undefined_variable_warning, unsupported_feature,
+    RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
+    argument_count_error_mvp, array_to_string_warning, division_by_zero_mvp,
+    leading_numeric_string_warning, non_numeric_string_type_error, type_error_mvp,
+    undefined_function, undefined_variable_warning, unhandled_match_error_mvp, unsupported_feature,
+    value_error_mvp,
 };
 pub use error_output::{
     PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,

@@ -308,8 +308,9 @@ case body blocks, an optional default fallback, and ordinary fallthrough from
 one case body to the next unless a `break` terminates the block. `match` lowers
 as an expression with strict `Identical` comparisons and result blocks that move
 the selected arm value into a shared destination register. A no-arm `match`
-emits `RuntimeError` with diagnostic ID `E_PHP_VM_UNHANDLED_MATCH`, which is
-stable now and can later be mapped to PHP's `UnhandledMatchError`.
+emits `RuntimeError` with diagnostic ID `E_PHP_VM_UNHANDLED_MATCH`; VM runtime
+diagnostic mapping renders the uncaught error as `UnhandledMatchError` while
+catch matching for this lowered path remains a known gap.
 
 Short-circuit expressions lower to blocks that avoid RHS evaluation when PHP
 would avoid it: `&&`/`and`, `||`/`or`, `??`, and ternary `?:`/`? :` write a
