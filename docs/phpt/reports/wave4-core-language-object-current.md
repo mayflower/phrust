@@ -27,7 +27,7 @@ nix develop -c just phpt-dev-module MODULE=<module>
 
 | Module | Reference | Target | Source integrity | Result |
 | --- | ---: | ---: | ---: | --- |
-| `objects.classes` | 246 pass, 0 non-green | 183 pass, 63 fail | 24475 checked, 0 skipped | red |
+| `objects.classes` | 246 pass, 0 non-green | 246 pass, 0 non-green | 24475 checked, 0 skipped | green |
 | `zend.functions` | 29 pass, 0 non-green | 29 pass, 0 non-green | 24475 checked, 0 skipped | green |
 | `zend.basic` | 10 pass, 0 non-green | 10 pass, 0 non-green | 24475 checked, 0 skipped | green |
 
@@ -116,17 +116,17 @@ Closeout promotion probe:
 
 ## Failure Clusters
 
-The current `objects.classes` selected target failures cluster as follows:
+The current `objects.classes` selected target run has no non-green rows.
 
-| Cluster | Count | Representative PHPTs | Owner layer |
-| --- | ---: | --- | --- |
-| Autoload, reflection, and missing declaration lookup | 13 | `autoload_006`, `autoload_009`-`autoload_018`, `autoload_020`, `autoload_021` | `php_vm`, `php_semantics`, `php_runtime` |
-| Visibility, private/protected access, abstract/interface fatal formatting | 18 | `protected_*`, `private_*`, `class_abstract`, `interface_instantiate`, `interfaces_003`, `ctor_visibility`, `destructor_visibility_001` | `php_vm`, diagnostics renderer |
-| Static properties and reference/property slot semantics | 10 | `static_properties_003_error*`, `static_properties_004`, `static_properties_undeclared_*` | `php_ir`, `php_runtime`, `php_vm` |
-| Class constants and dynamic constant lookup | 6 | `constants_basic_001`, `constants_error_*`, `constants_visibility_*` | `php_semantics`, `php_vm` |
-| Serialization, object ids, and formatting | 5 | `serialize_001`, `tostring_001`, `bug23951`, `bug65768`, `bug75765` | `php_runtime`, `php_vm`, diagnostics renderer |
-| Callable/type-error/uncaught-exception output parity | 8 | `type_hinting_*`, `bug27504`, `factory_and_singleton_003`-`006` | `php_runtime`, diagnostics renderer |
-| Iterator lowering gaps | 3 | `iterators_002`, `iterators_007`, `iterators_008` | `php_semantics`, `php_ir`, `php_vm` |
+The final magic/lifetime/reflection fixes closed the last two selected
+blockers:
+
+- `tests/classes/autoload_021.phpt`: invalid path-like dynamic class names no
+  longer trigger registered autoload callbacks before the unresolved-class
+  fatal.
+- `tests/classes/constants_error_003.phpt`: class constants passed to
+  by-reference parameters keep PHP's catchable `Error` behavior and render the
+  uncaught fatal with the caller-only trace.
 
 ## Prompt 1.2 Routing
 
@@ -202,8 +202,8 @@ Prompt 1.6 and closeout promotion fixes:
 
 ## Acceptance Evidence
 
-- `objects.classes` selected run after current Prompt 1.2-1.6 fixes and
-  closeout promotion: 246 reference-clean rows, target 183 pass / 63 fail.
+- `objects.classes` selected run after current Wave 4 object fixes:
+  246 reference-clean rows, target 246 pass / 0 fail.
 - `zend.functions` selected run: 29 reference pass / 29 target pass.
 - `zend.basic` selected run: 10 reference pass / 10 target pass.
 - `standard.serialization` selected run: 5 reference pass / 5 target pass.
@@ -252,10 +252,13 @@ Prompt 1.6 and closeout promotion fixes:
   `bug26737.phpt`.
 - Additional focused object-formatting PHPT now green:
   `tests/classes/array_conversion_keys.phpt`.
+- Additional magic/lifetime/reflection upstream PHPTs now green:
+  `tests/classes/autoload_021.phpt` and
+  `tests/classes/constants_error_003.phpt`.
 - Current module gates:
-  `objects.classes` remains red at 246 reference pass / 183 target pass /
-  63 target fail; `zend.functions`, `zend.basic`, `standard.serialization`,
-  and `standard.variables` remain green for their selected manifests.
+  `objects.classes` is green at 246 reference pass / 246 target pass;
+  `zend.functions`, `zend.basic`, `standard.serialization`, and
+  `standard.variables` remain green for their selected manifests.
 
 ## End Report
 
@@ -263,21 +266,15 @@ Prompt 1.6 and closeout promotion fixes:
 - Selected manifest before this branch: 200 rows.
 - Selected manifest after this branch: 246 rows.
 - Current selected module count:
-  `objects.classes` reference 246 pass / target 183 pass / 63 fail.
+  `objects.classes` reference 246 pass / target 246 pass / 0 fail.
 - Behavioral fixes moved these already-selected upstream rows to green:
   `constants_basic_006.phpt`, `constants_basic_003.phpt`,
-  `static_properties_003.phpt`, `destructor_and_exceptions.phpt`, and
-  `bug26737.phpt`.
+  `static_properties_003.phpt`, `destructor_and_exceptions.phpt`,
+  `bug26737.phpt`, `autoload_021.phpt`, and `constants_error_003.phpt`.
 
 Remaining blocker clusters:
 
-- Autoload, reflection, and missing declaration lookup: 13.
-- Visibility, private/protected access, abstract/interface fatal formatting: 18.
-- Static properties and reference/property slot semantics: 10.
-- Class constants and dynamic constant lookup: 6.
-- Serialization, object ids, and formatting: 5.
-- Callable/type-error/uncaught-exception output parity: 8.
-- Iterator lowering gaps: 3.
+- None in the current selected `objects.classes` gate.
 
 Next 10 upstream PHPTs to promote:
 
