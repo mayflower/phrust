@@ -68,6 +68,7 @@ if [[ -n "${PHPT_REQUIRE_FOCUS:-}" && "${PHPT_REQUIRE_FOCUS:-}" != "0" && -z "$f
   exit 2
 fi
 
+module="$(phpt_normalize_module "$module")"
 safe_module="$(printf '%s' "$module" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 selected_manifest="tests/phpt/manifests/modules/${safe_module}.selected.jsonl"
 generated_manifest="tests/phpt/manifests/${safe_module}-generated.jsonl"

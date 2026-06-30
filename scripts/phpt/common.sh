@@ -21,3 +21,14 @@ phpt_default_jobs() {
   fi
   printf '%s\n' "$detected"
 }
+
+phpt_normalize_module() {
+  case "$1" in
+    closure.core-runtime)
+      printf '%s\n' 'closure.core'
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh"
+
 module="${MODULE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +31,7 @@ if [[ -z "$module" ]]; then
   exit 2
 fi
 
+module="$(phpt_normalize_module "$module")"
 safe_module="$(printf '%s' "$module" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 work_root="${PHPT_WORK_DIR:-target/phpt-work}"
 module_dir="$work_root/module-runs/${safe_module}"

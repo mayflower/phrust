@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh"
+
 module="${MODULE:-}"
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     MODULE=*)
       module="${1#MODULE=}"
-      args+=("$1")
       shift
       ;;
     --module)
       module="${2:-}"
-      args+=("$1" "$2")
       shift 2
       ;;
     --module=*)
       module="${1#--module=}"
-      args+=("$1")
       shift
       ;;
     *)
@@ -32,6 +32,7 @@ if [[ -z "$module" ]]; then
   exit 2
 fi
 
+module="$(phpt_normalize_module "$module")"
 safe_module="$(printf '%s' "$module" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
 
 php_src="${PHP_SRC_DIR:-}"
