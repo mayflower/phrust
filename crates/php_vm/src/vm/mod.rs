@@ -4391,8 +4391,8 @@ impl Vm {
         {
             return result;
         }
-        if let Some(result) =
-            self.try_execute_iterator_function(name, &values, output, stack, state, compiled)
+        if let Some(result) = self
+            .try_execute_iterator_function(name, &values, call_span, output, stack, state, compiled)
         {
             return result;
         }
@@ -4517,6 +4517,7 @@ impl Vm {
         &self,
         name: &str,
         values: &[Value],
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -4527,11 +4528,11 @@ impl Vm {
                 Some(self.execute_iterator_apply(values, output, stack, state, compiled))
             }
             "iterator_count" => {
-                Some(self.execute_iterator_count(values, output, stack, state, compiled))
+                Some(self.execute_iterator_count(values, call_span, output, stack, state, compiled))
             }
-            "iterator_to_array" => {
-                Some(self.execute_iterator_to_array(values, output, stack, state, compiled))
-            }
+            "iterator_to_array" => Some(
+                self.execute_iterator_to_array(values, call_span, output, stack, state, compiled),
+            ),
             _ => None,
         }
     }
@@ -4680,6 +4681,7 @@ impl Vm {
     fn execute_iterator_count(
         &self,
         values: &[Value],
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -4697,20 +4699,17 @@ impl Vm {
             );
         }
         let source = effective_value(&values[0]);
-        match iterator_function_accepts_source(compiled, state, &source) {
-            Ok(true) => {}
-            Ok(false) => {
-                return self.runtime_error(
-                    output,
-                    compiled,
-                    stack,
-                    format!(
-                        "E_PHP_RUNTIME_BUILTIN_TYPE: iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, {} given",
-                        type_error_value_name(&source)
-                    ),
-                );
-            }
-            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        if let Err(result) = self.validate_iterator_function_iterable_arg(
+            "iterator_count",
+            values,
+            source.clone(),
+            call_span,
+            output,
+            stack,
+            state,
+            compiled,
+        ) {
+            return result;
         }
         let mut iterator = match self.foreach_iterator_from_value(
             compiled,
@@ -4748,6 +4747,7 @@ impl Vm {
     fn execute_iterator_to_array(
         &self,
         values: &[Value],
+        call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
@@ -4763,6 +4763,18 @@ impl Vm {
                     values.len()
                 ),
             );
+        }
+        if let Err(result) = self.validate_iterator_function_iterable_arg(
+            "iterator_to_array",
+            values,
+            effective_value(&values[0]),
+            call_span,
+            output,
+            stack,
+            state,
+            compiled,
+        ) {
+            return result;
         }
         let preserve_keys = match values.get(1) {
             Some(value) => match to_bool(value) {
@@ -4834,6 +4846,56 @@ impl Vm {
                 Err(result) => return result,
             }
         }
+    }
+
+    fn validate_iterator_function_iterable_arg(
+        &self,
+        function: &str,
+        values: &[Value],
+        value: Value,
+        call_span: Option<php_ir::IrSpan>,
+        output: &OutputBuffer,
+        stack: &CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> Result<(), VmResult> {
+        if iterator_function_accepts_iterable(compiled, state, &value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?
+        {
+            return Ok(());
+        }
+        let message = format!(
+            "{function}(): Argument #1 ($iterator) must be of type Traversable|array, {} given",
+            type_error_value_name(&value)
+        );
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_RUNTIME_BUILTIN_TYPE",
+            RuntimeSeverity::FatalError,
+            message.clone(),
+            RuntimeSourceSpan::default(),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::TypeError),
+        );
+        if let Some(call_span) = call_span {
+            let result = VmResult::runtime_error_with_diagnostic(
+                output.clone(),
+                message.clone(),
+                diagnostic.clone(),
+            );
+            if let Some(throwable) = runtime_error_throwable(&result) {
+                tag_throwable_location(&throwable, compiled, call_span);
+                state.pending_trace = Some(capture_backtrace_string_with_builtin_failed_call(
+                    compiled, stack, function, values, call_span,
+                ));
+                state.pending_throw = Some(throwable);
+                return Err(result);
+            }
+        }
+        Err(VmResult::runtime_error_with_diagnostic(
+            output.clone(),
+            message,
+            diagnostic,
+        ))
     }
 
     fn coerce_internal_builtin_string_args(
@@ -9295,8 +9357,16 @@ impl Vm {
             && spl_runtime_marker(object)
                 .is_some_and(|class| is_spl_array_access_runtime_class(&class))
         {
-            return spl_container_offset_get(object, key_value)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            return self.call_array_access_dim_method(
+                compiled,
+                object.clone(),
+                "offsetGet",
+                key_value.clone(),
+                Some(span),
+                output,
+                stack,
+                state,
+            );
         }
         if let Some(object) = match userland_arrayaccess_object(compiled, state, &base) {
             Ok(object) => object,
@@ -9437,11 +9507,37 @@ impl Vm {
             stack,
             state,
         );
-        if result.status.is_success() {
-            Ok(result.return_value.unwrap_or(Value::Null))
-        } else {
-            Err(result)
+        if !result.status.is_success()
+            || result.yielded.is_some()
+            || result.fiber_suspension.is_some()
+        {
+            return Err(result);
         }
+        Ok(result.return_value.unwrap_or(Value::Null))
+    }
+
+    fn call_array_access_dim_method(
+        &self,
+        compiled: &CompiledUnit,
+        object: ObjectRef,
+        method: &str,
+        key: Value,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, VmResult> {
+        let span = call_span.unwrap_or(IrSpan::default());
+        self.call_userland_arrayaccess_method(
+            compiled,
+            output,
+            stack,
+            state,
+            object,
+            method,
+            vec![CallArgument::positional(key)],
+            span,
+        )
     }
 
     fn try_userland_arrayaccess_offset_set_local(
@@ -10592,27 +10688,53 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value =
-                            match self.execute_cast(compiled, *kind, &src, output, stack, state) {
-                                Ok(value) => value,
-                                Err(result) => {
-                                    match self.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        result,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
-                                        }
-                                        RaiseOutcome::Done(result) => return *result,
+                        let value = match self
+                            .execute_cast(compiled, *kind, &src, output, stack, state)
+                        {
+                            Ok(value) => value,
+                            Err(result) => {
+                                if let Some(throwable) = runtime_error_throwable(&result) {
+                                    tag_throwable_location(&throwable, compiled, instruction.span);
+                                    if matches!(*kind, CastKind::String)
+                                        && matches!(
+                                            &src,
+                                            Value::Object(object)
+                                                if spl_runtime_marker(object)
+                                                    .is_some_and(|class| is_spl_caching_iterator_class(&class))
+                                        )
+                                    {
+                                        state.pending_trace = Some(
+                                            capture_backtrace_string_with_builtin_failed_call(
+                                                compiled,
+                                                stack,
+                                                "CachingIterator->__toString",
+                                                &[],
+                                                instruction.span,
+                                            ),
+                                        );
+                                    } else {
+                                        state.pending_trace =
+                                            Some(capture_backtrace_string(compiled, stack));
                                     }
+                                    state.pending_throw = Some(throwable);
                                 }
-                            };
+                                match self.route_throwable_result(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    result,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                        };
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -11890,16 +12012,15 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    let result =
-                                        self.runtime_error(output, compiled, stack, message);
-                                    match self.route_throwable_result(
+                                    match self.raise_runtime_error(
                                         compiled,
                                         output,
                                         stack,
                                         state,
                                         &mut exception_handlers,
                                         &mut pending_control,
-                                        result,
+                                        instruction.span,
+                                        message,
                                     ) {
                                         RaiseOutcome::Caught(target) => {
                                             block_id = target;
@@ -11987,16 +12108,15 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    let result =
-                                        self.runtime_error(output, compiled, stack, message);
-                                    match self.route_throwable_result(
+                                    match self.raise_runtime_error(
                                         compiled,
                                         output,
                                         stack,
                                         state,
                                         &mut exception_handlers,
                                         &mut pending_control,
-                                        result,
+                                        instruction.span,
+                                        message,
                                     ) {
                                         RaiseOutcome::Caught(target) => {
                                             block_id = target;
@@ -12349,7 +12469,22 @@ impl Vm {
                                 &self.options.runtime_context,
                             )
                         {
-                            return self.runtime_error(output, compiled, stack, message);
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
                         }
                         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
                         if let Err(message) = stack
@@ -12483,16 +12618,15 @@ impl Vm {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    let result =
-                                        self.runtime_error(output, compiled, stack, message);
-                                    match self.route_throwable_result(
+                                    match self.raise_runtime_error(
                                         compiled,
                                         output,
                                         stack,
                                         state,
                                         &mut exception_handlers,
                                         &mut pending_control,
-                                        result,
+                                        instruction.span,
+                                        message,
                                     ) {
                                         RaiseOutcome::Caught(target) => {
                                             block_id = target;
@@ -12894,16 +13028,15 @@ impl Vm {
                                     ) {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            let result = self
-                                                .runtime_error(output, compiled, stack, message);
-                                            match self.route_throwable_result(
+                                            match self.raise_runtime_error(
                                                 compiled,
                                                 output,
                                                 stack,
                                                 state,
                                                 &mut exception_handlers,
                                                 &mut pending_control,
-                                                result,
+                                                instruction.span,
+                                                message,
                                             ) {
                                                 RaiseOutcome::Caught(target) => {
                                                     block_id = target;
@@ -13395,7 +13528,22 @@ impl Vm {
                                 &self.options.runtime_context,
                             )
                         {
-                            return self.runtime_error(output, compiled, stack, message);
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
                         }
                         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
                         if let Err(message) = stack
@@ -18226,56 +18374,47 @@ impl Vm {
                         } else {
                             read_local_value(stack, *local)
                         };
-                        if let (Some(base_value), [key]) = (local_value.as_ref(), dims.as_slice()) {
-                            let base = effective_value(base_value);
-                            if let Value::Object(object) = &base
-                                && spl_runtime_marker(object)
-                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
-                            {
-                                match spl_container_offset_exists(
-                                    object,
-                                    &array_key_to_value(key.clone()),
-                                ) {
-                                    Ok(Value::Bool(result)) => {
-                                        if let Err(message) = stack
-                                            .current_mut()
-                                            .expect("frame was pushed")
-                                            .registers
-                                            .set(*dst, Value::Bool(result))
-                                        {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
+                        let value = if let Some((object, key_value)) = local_value
+                            .as_ref()
+                            .and_then(|value| spl_array_access_dim_target(value, &dims))
+                        {
+                            let exists = match self.call_array_access_dim_method(
+                                compiled,
+                                object,
+                                "offsetExists",
+                                key_value,
+                                Some(instruction.span),
+                                output,
+                                stack,
+                                state,
+                            ) {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
                                         }
-                                        continue;
-                                    }
-                                    Ok(value) => {
-                                        let result = match to_bool(&value) {
-                                            Ok(result) => result,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        };
-                                        if let Err(message) = stack
-                                            .current_mut()
-                                            .expect("frame was pushed")
-                                            .registers
-                                            .set(*dst, Value::Bool(result))
-                                        {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
-                                        }
-                                        continue;
-                                    }
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
+                                        RaiseOutcome::Done(result) => return *result,
                                     }
                                 }
+                            };
+                            match to_bool(&exists) {
+                                Ok(true) => Some(Value::Bool(true)),
+                                Ok(false) => None,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
                             }
-                        }
-                        let value = if let (Some(base_value), [key]) =
+                        } else if let (Some(base_value), [key]) =
                             (local_value.as_ref(), dims.as_slice())
                         {
                             let base = effective_value(base_value);
@@ -18342,64 +18481,85 @@ impl Vm {
                         } else {
                             read_local_value(stack, *local)
                         };
-                        if let (Some(base_value), [key]) = (local_value.as_ref(), dims.as_slice()) {
-                            let base = effective_value(base_value);
-                            if let Value::Object(object) = &base
-                                && spl_runtime_marker(object)
-                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
-                            {
-                                let exists = match spl_container_offset_exists(
-                                    object,
-                                    &array_key_to_value(key.clone()),
-                                ) {
-                                    Ok(Value::Bool(result)) => result,
-                                    Ok(value) => match to_bool(&value) {
-                                        Ok(result) => result,
-                                        Err(message) => {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
-                                        }
-                                    },
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                };
-                                let result = if exists {
-                                    match spl_container_offset_get(
-                                        object,
-                                        &array_key_to_value(key.clone()),
+                        let value = if let Some((object, key_value)) = local_value
+                            .as_ref()
+                            .and_then(|value| spl_array_access_dim_target(value, &dims))
+                        {
+                            let exists = match self.call_array_access_dim_method(
+                                compiled,
+                                object.clone(),
+                                "offsetExists",
+                                key_value.clone(),
+                                Some(instruction.span),
+                                output,
+                                stack,
+                                state,
+                            ) {
+                                Ok(value) => value,
+                                Err(result) => {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
                                     ) {
-                                        Ok(value) => match php_empty(&value) {
-                                            Ok(result) => result,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        },
-                                        Err(message) => {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
                                         }
+                                        RaiseOutcome::Done(result) => return *result,
                                     }
-                                } else {
-                                    true
-                                };
-                                if let Err(message) = stack
-                                    .current_mut()
-                                    .expect("frame was pushed")
-                                    .registers
-                                    .set(*dst, Value::Bool(result))
-                                {
+                                }
+                            };
+                            let exists = match to_bool(&exists) {
+                                Ok(value) => value,
+                                Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
-                                continue;
+                            };
+                            if exists {
+                                match self.call_array_access_dim_method(
+                                    compiled,
+                                    object,
+                                    "offsetGet",
+                                    key_value,
+                                    Some(instruction.span),
+                                    output,
+                                    stack,
+                                    state,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(result) => {
+                                        match self.route_throwable_result(
+                                            compiled,
+                                            output,
+                                            stack,
+                                            state,
+                                            &mut exception_handlers,
+                                            &mut pending_control,
+                                            result,
+                                        ) {
+                                            RaiseOutcome::Caught(target) => {
+                                                block_id = target;
+                                                continue 'dispatch;
+                                            }
+                                            RaiseOutcome::Done(result) => return *result,
+                                        }
+                                    }
+                                }
+                            } else {
+                                Value::Uninitialized
                             }
-                        }
-                        let value = local_value
-                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
-                            .unwrap_or(Value::Uninitialized);
+                        } else {
+                            local_value
+                                .and_then(|value| {
+                                    fetch_dim_path_value(&value, &dims).ok().flatten()
+                                })
+                                .unwrap_or(Value::Uninitialized)
+                        };
                         let result = match php_empty(&value) {
                             Ok(value) => value,
                             Err(message) => {
@@ -18446,28 +18606,50 @@ impl Vm {
                             Ok(false) => {}
                             Err(result) => return result,
                         }
-                        if let (Some(base_value), [key]) = (
-                            if is_globals_local(function, *local) {
-                                Some(Value::Array(state.globals.globals_array()))
-                            } else {
-                                read_local_value(stack, *local)
-                            }
-                            .as_ref(),
-                            dims.as_slice(),
-                        ) {
-                            let base = effective_value(base_value);
-                            if let Value::Object(object) = &base
-                                && spl_runtime_marker(object)
-                                    .is_some_and(|class| is_spl_array_access_runtime_class(&class))
-                            {
-                                if let Err(message) = spl_container_offset_unset(
-                                    object,
-                                    &array_key_to_value(key.clone()),
-                                ) {
-                                    return self.runtime_error(output, compiled, stack, message);
+                        let local_value = if is_globals_local(function, *local) {
+                            Some(Value::Array(state.globals.globals_array()))
+                        } else {
+                            read_local_value(stack, *local)
+                        };
+                        if let Some((object, key_value)) = local_value
+                            .as_ref()
+                            .and_then(|value| spl_array_access_dim_target(value, &dims))
+                        {
+                            match self.call_array_access_dim_method(
+                                compiled,
+                                object,
+                                "offsetUnset",
+                                key_value,
+                                Some(instruction.span),
+                                output,
+                                stack,
+                                state,
+                            ) {
+                                Ok(_) => {
+                                    self.record_lvalue_trace_event(
+                                        "array-unset-dim",
+                                        *local,
+                                        &dims,
+                                    );
+                                    continue;
                                 }
-                                self.record_lvalue_trace_event("array-unset-dim", *local, &dims);
-                                continue;
+                                Err(result) => {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
                             }
                         }
                         let result = if is_globals_local(function, *local) {
@@ -19637,7 +19819,22 @@ impl Vm {
                             let value = match call_spl_iterator_method(object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -20039,7 +20236,11 @@ impl Vm {
                                         vec!["missing_declared_method"],
                                     ),
                                 );
-                                if let Some(inner) = spl_inner_iterator_delegation_target(&object) {
+                                if let Some(inner) = spl_inner_iterator_delegation_target(&object)
+                                    && spl_delegation_target_supports_method(
+                                        compiled, state, &inner, method,
+                                    )
+                                {
                                     let result = self.call_object_method_callable(
                                         compiled,
                                         inner,
@@ -20079,16 +20280,27 @@ impl Vm {
                                 ) {
                                     Ok(Some(result)) => result,
                                     Ok(None) => {
-                                        return self.runtime_error(
-                                            output,
-                                            compiled,
-                                            stack,
-                                            format!(
-                                                "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
-                                                object.class_name(),
-                                                method
-                                            ),
+                                        let message = format!(
+                                            "E_PHP_VM_UNKNOWN_METHOD: Call to undefined method {}::{}()",
+                                            object.display_name(),
+                                            method
                                         );
+                                        match self.raise_runtime_error(
+                                            compiled,
+                                            output,
+                                            stack,
+                                            state,
+                                            &mut exception_handlers,
+                                            &mut pending_control,
+                                            instruction.span,
+                                            message,
+                                        ) {
+                                            RaiseOutcome::Caught(target) => {
+                                                block_id = target;
+                                                continue 'dispatch;
+                                            }
+                                            RaiseOutcome::Done(result) => return *result,
+                                        }
                                     }
                                     Err(result) => return result,
                                 };
@@ -20548,7 +20760,22 @@ impl Vm {
                                 values,
                                 &self.options.runtime_context,
                             ) {
-                                return self.runtime_error(output, compiled, stack, message);
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
                             }
                             if let Err(message) = stack
                                 .current_mut()
@@ -20576,7 +20803,22 @@ impl Vm {
                             let value = match result {
                                 Ok(value) => value,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -25467,7 +25709,9 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => {
-                if let Some(inner) = spl_inner_iterator_delegation_target(&object) {
+                if let Some(inner) = spl_inner_iterator_delegation_target(&object)
+                    && spl_delegation_target_supports_method(compiled, state, &inner, method)
+                {
                     return self.call_object_method_callable(
                         compiled, inner, method, args, call_span, output, stack, state,
                     );
@@ -25489,8 +25733,8 @@ impl Vm {
                         compiled,
                         stack,
                         format!(
-                            "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
-                            object.class_name(),
+                            "E_PHP_VM_UNKNOWN_METHOD: Call to undefined method {}::{}()",
+                            object.display_name(),
                             method
                         ),
                     ),
@@ -27226,6 +27470,30 @@ impl Vm {
                 throwable_string(&object).into_bytes(),
             ));
         }
+        if spl_runtime_marker(&object).is_some_and(|class| is_spl_caching_iterator_class(&class)) {
+            return self.spl_caching_iterator_to_string(compiled, &object, output, stack, state);
+        }
+        if is_spl_file_runtime_class(&object.class_name()) {
+            return match call_spl_file_method(
+                &object,
+                "__toString",
+                Vec::new(),
+                &self.options.runtime_context,
+            ) {
+                Ok(Value::String(value)) => Ok(value),
+                Ok(other) => Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_TOSTRING_RETURN_TYPE: {}::__toString(): Return value must be of type string, {} returned",
+                        object.class_name(),
+                        value_type_name(&other)
+                    ),
+                )),
+                Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
+            };
+        }
         if normalize_class_name(&object.class_name()) == "simplexmlelement" {
             return match php_runtime::xml::simplexml_text(&object) {
                 Value::String(value) => Ok(value),
@@ -27434,6 +27702,64 @@ impl Vm {
                 })
             }
         }
+    }
+
+    fn spl_caching_iterator_to_string(
+        &self,
+        compiled: &CompiledUnit,
+        object: &ObjectRef,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<PhpString, VmResult> {
+        let flags = spl_caching_iterator_flags(object);
+        let Some((key, value)) = spl_current_entry(object) else {
+            return Ok(PhpString::from_bytes(Vec::new()));
+        };
+        spl_caching_iterator_note_current_seen(object);
+        if flags & SPL_CACHING_CALL_TOSTRING != 0 {
+            return self.value_to_string(compiled, &value, output, stack, state);
+        }
+        if flags & SPL_CACHING_TOSTRING_USE_KEY != 0 {
+            return self.value_to_string(compiled, &array_key_to_value(key), output, stack, state);
+        }
+        if flags & SPL_CACHING_TOSTRING_USE_CURRENT != 0 {
+            return self.value_to_string(compiled, &value, output, stack, state);
+        }
+        if flags & SPL_CACHING_TOSTRING_USE_INNER != 0 {
+            if let Some(Value::Object(inner)) = object
+                .get_property("__inner_iterator")
+                .map(|value| effective_value(&value))
+            {
+                let previous_position = inner.get_property("__position");
+                spl_set_position(&inner, spl_position(object));
+                let result = self.object_to_string(compiled, inner.clone(), output, stack, state);
+                match previous_position {
+                    Some(value) => inner.set_property("__position", value),
+                    None => {
+                        inner.unset_property("__position");
+                    }
+                }
+                return result;
+            }
+            let mut bytes = self
+                .value_to_string(compiled, &array_key_to_value(key), output, stack, state)?
+                .as_bytes()
+                .to_vec();
+            bytes.push(b':');
+            bytes.extend_from_slice(
+                self.value_to_string(compiled, &value, output, stack, state)?
+                    .as_bytes(),
+            );
+            return Ok(PhpString::from_bytes(bytes));
+        }
+        Err(self.runtime_error(
+            output,
+            compiled,
+            stack,
+            "E_PHP_VM_SPL_BAD_METHOD_CALL: CachingIterator does not fetch string value (see CachingIterator::__construct)"
+                .to_owned(),
+        ))
     }
 
     fn inaccessible_destructor_warning(
@@ -41691,6 +42017,23 @@ fn spl_runtime_marker(object: &ObjectRef) -> Option<String> {
     is_supported_spl_runtime_class(&normalized).then_some(normalized)
 }
 
+fn spl_runtime_display_name(class_name: &str) -> String {
+    let normalized = normalize_class_name(class_name);
+    if is_spl_iterator_runtime_class(&normalized) {
+        return spl_iterator_display_name(&normalized).to_owned();
+    }
+    if is_spl_container_runtime_class(&normalized) {
+        return spl_container_display_name(&normalized).to_owned();
+    }
+    if is_spl_heap_runtime_class(&normalized) {
+        return spl_heap_display_name(&normalized).to_owned();
+    }
+    if is_spl_file_runtime_class(&normalized) {
+        return spl_file_display_name(&normalized).to_owned();
+    }
+    class_name.to_owned()
+}
+
 fn call_spl_runtime_method(
     object: &ObjectRef,
     class_name: &str,
@@ -41743,6 +42086,32 @@ fn spl_inner_iterator_delegation_target(object: &ObjectRef) -> Option<ObjectRef>
         Some(Value::Object(inner)) => Some(inner),
         _ => None,
     }
+}
+
+fn spl_delegation_target_supports_method(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    object: &ObjectRef,
+    method: &str,
+) -> bool {
+    if let Some(class) = spl_runtime_marker(object) {
+        if is_spl_iterator_runtime_class(&class) && spl_iterator_method_is_supported(method) {
+            return true;
+        }
+        if is_spl_container_runtime_class(&class) && spl_container_method_is_supported(method) {
+            return true;
+        }
+        if is_spl_heap_runtime_class(&class) && spl_heap_method_is_supported(method) {
+            return true;
+        }
+        if is_spl_file_runtime_class(&class) && spl_file_method_is_supported(method) {
+            return true;
+        }
+    }
+    lookup_resolved_method_in_state(compiled, state, &object.class_name(), method, None)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn spl_runtime_parent_for_class(
@@ -41888,45 +42257,50 @@ fn new_spl_iterator_object(
     let original_args = args.clone();
     let entries = match normalized.as_str() {
         "emptyiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 0)?;
+            validate_spl_constructor_arg_count(class_name, &args, 0, 0)?;
             Vec::new()
         }
         "arrayiterator" | "recursivearrayiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 1)?;
+            validate_spl_constructor_arg_count(class_name, &args, 0, 1)?;
             args.first()
                 .map(|arg| spl_entries_from_value(&arg.value))
                 .transpose()?
                 .unwrap_or_default()
         }
         "iteratoriterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_constructor_arg_count(class_name, &args, 1, 2)?;
             spl_entries_from_value(&args[0].value)?
         }
-        "norewinditerator"
-        | "infiniteiterator"
+        "infiniteiterator"
         | "filteriterator"
         | "recursivefilteriterator"
-        | "parentiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 1)?;
+        | "parentiterator"
+        | "norewinditerator" => {
+            validate_spl_constructor_arg_count(class_name, &args, 1, 1)?;
             spl_entries_from_value(&args[0].value)?
         }
         "cachingiterator" | "recursivecachingiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_constructor_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_caching_iterator_flags(class_name, &args)?;
             spl_entries_from_value(&args[0].value)?
         }
         "recursiveiteratoriterator" | "recursivetreeiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 4)?;
+            validate_spl_constructor_arg_count(class_name, &args, 1, 4)?;
+            if normalized == "recursivetreeiterator" {
+                validate_recursive_tree_iterator_source(&args[0].value)?;
+            }
             spl_recursive_entries_from_value(&args[0].value)?
         }
         "regexiterator" | "recursiveregexiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 2, 5)?;
+            validate_spl_constructor_arg_count(class_name, &args, 2, 5)?;
             let entries = spl_entries_from_value(&args[0].value)?;
             let pattern = to_string(&args[1].value)?.to_string_lossy();
             spl_regex_filter_entries(entries, &pattern)
         }
         "limititerator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 3)?;
+            validate_spl_constructor_arg_count(class_name, &args, 1, 3)?;
             let entries = spl_entries_from_value(&args[0].value)?;
+            let source_len = entries.len();
             let offset = args
                 .get(1)
                 .map(|arg| to_int(&arg.value))
@@ -41938,8 +42312,15 @@ fn new_spl_iterator_object(
                         .to_owned(),
                 );
             }
+            if offset as usize > source_len {
+                return Err(format!(
+                    "E_PHP_VM_SPL_OUT_OF_BOUNDS: Seek position {offset} is out of range"
+                ));
+            }
             let count = args.get(2).map(|arg| to_int(&arg.value)).transpose()?;
-            if matches!(count, Some(count) if count < -1) {
+            if let Some(count) = count
+                && count < -1
+            {
                 return Err(
                     "E_PHP_VM_SPL_VALUE_ERROR: LimitIterator::__construct(): Argument #3 ($limit) must be greater than or equal to -1"
                         .to_owned(),
@@ -41952,15 +42333,15 @@ fn new_spl_iterator_object(
             }
         }
         "appenditerator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 0)?;
+            validate_spl_constructor_arg_count(class_name, &args, 0, 0)?;
             Vec::new()
         }
         "multipleiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 0, 1)?;
+            validate_spl_constructor_arg_count(class_name, &args, 0, 1)?;
             Vec::new()
         }
         "globiterator" => {
-            validate_spl_iterator_constructor_arg_count(class_name, &args, 1, 2)?;
+            validate_spl_constructor_arg_count(class_name, &args, 1, 2)?;
             let pattern = to_string(&args[0].value)?.to_string_lossy();
             spl_glob_entries(&pattern, runtime_context)?
         }
@@ -42007,8 +42388,24 @@ fn new_spl_iterator_object(
             .get(1)
             .map(|arg| to_int(&arg.value))
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or(1);
         object.set_property("__caching_flags", Value::Int(flags));
+        object.set_property("__caching_seen_count", Value::Int(0));
+        object.set_property("__caching_cache", Value::Array(PhpArray::new()));
+    }
+    if normalized == "limititerator" {
+        let offset = original_args
+            .get(1)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(0);
+        let count = original_args
+            .get(2)
+            .map(|arg| to_int(&arg.value))
+            .transpose()?
+            .unwrap_or(-1);
+        object.set_property("__limit_offset", Value::Int(offset));
+        object.set_property("__limit_count", Value::Int(count));
     }
     Ok(object)
 }
@@ -42081,7 +42478,13 @@ fn call_spl_iterator_method(
     match method.as_str() {
         "rewind" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
-            spl_set_position(&object, 0);
+            if runtime_class_name != "norewinditerator" {
+                spl_set_position(&object, 0);
+            }
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                object.set_property("__caching_seen_count", Value::Int(0));
+                object.set_property("__caching_cache", Value::Array(PhpArray::new()));
+            }
             Ok(Value::Null)
         }
         "valid" => {
@@ -42092,12 +42495,26 @@ fn call_spl_iterator_method(
         }
         "current" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
-            Ok(spl_current_entry(&object)
-                .map(|(_, value)| value)
-                .unwrap_or(Value::Null))
+            if runtime_class_name == "emptyiterator" {
+                return Err(
+                    "E_PHP_VM_SPL_BAD_METHOD_CALL: Accessing the value of an EmptyIterator"
+                        .to_owned(),
+                );
+            }
+            let entry = spl_current_entry(&object);
+            if entry.is_some() && is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_note_current_seen(&object);
+            }
+            Ok(entry.map(|(_, value)| value).unwrap_or(Value::Null))
         }
         "key" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if runtime_class_name == "emptyiterator" {
+                return Err(
+                    "E_PHP_VM_SPL_BAD_METHOD_CALL: Accessing the key of an EmptyIterator"
+                        .to_owned(),
+                );
+            }
             Ok(spl_current_entry(&object)
                 .map(|(key, _)| array_key_to_value(key))
                 .unwrap_or(Value::Null))
@@ -42112,15 +42529,18 @@ fn call_spl_iterator_method(
             if matches!(
                 runtime_class_name.as_str(),
                 "cachingiterator" | "recursivecachingiterator"
-            ) && spl_caching_iterator_has_full_cache(&object)
+            ) && !spl_caching_iterator_uses_full_cache(&object)
             {
-                return Ok(Value::Int(
-                    spl_position(&object)
-                        .saturating_add(1)
-                        .min(spl_entries(&object).len()) as i64,
+                return Err(format!(
+                    "E_PHP_VM_SPL_BAD_METHOD_CALL: {} does not use a full cache (see CachingIterator::__construct)",
+                    object.display_name()
                 ));
             }
-            Ok(Value::Int(spl_entries(&object).len() as i64))
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                Ok(Value::Int(spl_caching_iterator_cache(&object).len() as i64))
+            } else {
+                Ok(Value::Int(spl_entries(&object).len() as i64))
+            }
         }
         "getarraycopy" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
@@ -42149,11 +42569,25 @@ fn call_spl_iterator_method(
         }
         "setmode" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
-            object.set_property("__regex_mode", Value::Int(to_int(&args[0].value)?));
+            let mode = to_int(&args[0].value)?;
+            if matches!(
+                runtime_class_name.as_str(),
+                "regexiterator" | "recursiveregexiterator"
+            ) && !(0..=4).contains(&mode)
+            {
+                return Err(
+                    "E_PHP_VM_SPL_VALUE_ERROR: RegexIterator::setMode(): Argument #1 ($mode) must be RegexIterator::MATCH, RegexIterator::GET_MATCH, RegexIterator::ALL_MATCHES, RegexIterator::SPLIT, or RegexIterator::REPLACE"
+                        .to_owned(),
+                );
+            }
+            object.set_property("__regex_mode", Value::Int(mode));
             Ok(Value::Null)
         }
         "getflags" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                return Ok(Value::Int(spl_caching_iterator_flags(&object)));
+            }
             Ok(object
                 .get_property("__regex_flags")
                 .map(|value| effective_value(&value))
@@ -42161,7 +42595,35 @@ fn call_spl_iterator_method(
         }
         "setflags" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
-            object.set_property("__regex_flags", Value::Int(to_int(&args[0].value)?));
+            let flags = to_int(&args[0].value)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                validate_spl_caching_string_flags(
+                    &class_name,
+                    "setFlags",
+                    "Argument #1 ($flags)",
+                    flags,
+                )?;
+                let old_flags = spl_caching_iterator_flags(&object);
+                if old_flags & SPL_CACHING_CALL_TOSTRING != 0
+                    && flags & SPL_CACHING_CALL_TOSTRING == 0
+                {
+                    return Err(
+                        "E_PHP_VM_SPL_BAD_METHOD_CALL: Unsetting flag CALL_TO_STRING is not possible"
+                            .to_owned(),
+                    );
+                }
+                if old_flags & SPL_CACHING_TOSTRING_USE_INNER != 0
+                    && flags & SPL_CACHING_TOSTRING_USE_INNER == 0
+                {
+                    return Err(
+                        "E_PHP_VM_SPL_BAD_METHOD_CALL: Unsetting flag TOSTRING_USE_INNER is not possible"
+                            .to_owned(),
+                    );
+                }
+                object.set_property("__caching_flags", Value::Int(flags));
+            } else {
+                object.set_property("__regex_flags", Value::Int(flags));
+            }
             Ok(Value::Null)
         }
         "getpregflags" => {
@@ -42190,33 +42652,54 @@ fn call_spl_iterator_method(
         }
         "getcache" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
-            let entries = if matches!(
+            if matches!(
                 runtime_class_name.as_str(),
                 "cachingiterator" | "recursivecachingiterator"
-            ) && spl_caching_iterator_has_full_cache(&object)
+            ) && !spl_caching_iterator_uses_full_cache(&object)
             {
-                spl_entries(&object)
-                    .into_iter()
-                    .take(
-                        spl_position(&object)
-                            .saturating_add(1)
-                            .min(spl_entries(&object).len()),
-                    )
-                    .collect()
+                return Err(format!(
+                    "E_PHP_VM_SPL_BAD_METHOD_CALL: {} does not use a full cache (see CachingIterator::__construct)",
+                    object.display_name()
+                ));
+            }
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                Ok(Value::Array(spl_caching_iterator_cache(&object)))
             } else {
-                spl_entries(&object)
-            };
-            Ok(Value::Array(spl_entries_to_php_array(entries)))
+                Ok(Value::Array(spl_entries_to_php_array(spl_entries(&object))))
+            }
         }
         "seek" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
             let position = to_int(&args[0].value)?.max(0) as usize;
-            spl_set_position(&object, position);
+            if runtime_class_name == "limititerator" {
+                let offset = spl_limit_offset(&object);
+                if position < offset {
+                    return Err(format!(
+                        "E_PHP_VM_SPL_OUT_OF_BOUNDS: Cannot seek to {position} which is below the offset {offset}"
+                    ));
+                }
+                if let Some(count) = spl_limit_count(&object) {
+                    let upper = offset.saturating_add(count);
+                    if position >= upper {
+                        return Err(format!(
+                            "E_PHP_VM_SPL_OUT_OF_BOUNDS: Cannot seek to {position} which is behind offset {offset} plus count {count}"
+                        ));
+                    }
+                }
+                spl_set_position(&object, position - offset);
+            } else {
+                spl_set_position(&object, position);
+            }
             Ok(Value::Null)
         }
         "getposition" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
-            Ok(Value::Int(spl_position(&object) as i64))
+            let position = if runtime_class_name == "limititerator" {
+                spl_limit_offset(&object).saturating_add(spl_position(&object))
+            } else {
+                spl_position(&object)
+            };
+            Ok(Value::Int(position as i64))
         }
         "greaterthan" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
@@ -42256,6 +42739,10 @@ fn call_spl_iterator_method(
         }
         "__tostring" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_note_current_seen(&object);
+                return spl_caching_iterator_to_string_value(&object);
+            }
             Ok(spl_current_entry(&object)
                 .map(|(_, value)| to_string(&value).map(Value::String))
                 .transpose()?
@@ -42263,19 +42750,37 @@ fn call_spl_iterator_method(
         }
         "offsetget" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_require_full_cache(&object, &object.display_name())?;
+                return spl_caching_iterator_offset_get(&object, &args[0].value);
+            }
             spl_container_offset_get(&object, &args[0].value)
         }
         "offsetexists" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_require_full_cache(&object, &object.display_name())?;
+                return spl_caching_iterator_offset_exists(&object, &args[0].value);
+            }
             spl_container_offset_exists(&object, &args[0].value)
         }
         "offsetset" => {
             validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_require_full_cache(&object, &object.display_name())?;
+                spl_caching_iterator_offset_set(&object, &args[0].value, args[1].value.clone())?;
+                return Ok(Value::Null);
+            }
             spl_container_offset_set(&object, args[0].value.clone(), args[1].value.clone())?;
             Ok(Value::Null)
         }
         "offsetunset" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if is_spl_caching_iterator_class(&runtime_class_name) {
+                spl_caching_iterator_require_full_cache(&object, &object.display_name())?;
+                spl_caching_iterator_offset_unset(&object, &args[0].value)?;
+                return Ok(Value::Null);
+            }
             spl_container_offset_unset(&object, &args[0].value)?;
             Ok(Value::Null)
         }
@@ -42469,14 +42974,36 @@ fn validate_spl_iterator_arg_count(
     Ok(())
 }
 
-fn validate_spl_iterator_constructor_arg_count(
+fn validate_spl_constructor_arg_count(
     class_name: &str,
     args: &[CallArgument],
     min: usize,
     max: usize,
 ) -> Result<(), String> {
-    let name = format!("{}::__construct()", spl_iterator_display_name(class_name));
-    validate_spl_iterator_arg_count(&name, args, min, max)
+    let display = spl_runtime_display_name(class_name);
+    if args.len() < min {
+        let expectation = if min == max {
+            format!("exactly {min} argument")
+        } else {
+            format!("at least {min} argument")
+        };
+        return Err(format!(
+            "E_PHP_VM_SPL_TYPE_ERROR: {display}::__construct() expects {expectation}, {} given",
+            args.len()
+        ));
+    }
+    if args.len() > max {
+        let expectation = if min == max {
+            format!("exactly {max} argument")
+        } else {
+            format!("at most {max} arguments")
+        };
+        return Err(format!(
+            "E_PHP_VM_SPL_TYPE_ERROR: {display}::__construct() expects {expectation}, {} given",
+            args.len()
+        ));
+    }
+    Ok(())
 }
 
 fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
@@ -42567,6 +43094,201 @@ fn spl_iterator_display_name(class_name: &str) -> &'static str {
         "globiterator" => "GlobIterator",
         _ => "ArrayIterator",
     }
+}
+
+fn validate_spl_caching_iterator_flags(
+    class_name: &str,
+    args: &[CallArgument],
+) -> Result<(), String> {
+    let Some(flags_arg) = args.get(1) else {
+        return Ok(());
+    };
+    let flags = to_int(&flags_arg.value)?;
+    validate_spl_caching_string_flags(class_name, "__construct", "Argument #2 ($flags)", flags)
+}
+
+const SPL_CACHING_CALL_TOSTRING: i64 = 1;
+const SPL_CACHING_TOSTRING_USE_KEY: i64 = 2;
+const SPL_CACHING_TOSTRING_USE_CURRENT: i64 = 4;
+const SPL_CACHING_TOSTRING_USE_INNER: i64 = 8;
+const SPL_CACHING_FULL_CACHE: i64 = 256;
+const SPL_CACHING_STRING_FLAGS: i64 = SPL_CACHING_CALL_TOSTRING
+    | SPL_CACHING_TOSTRING_USE_KEY
+    | SPL_CACHING_TOSTRING_USE_CURRENT
+    | SPL_CACHING_TOSTRING_USE_INNER;
+
+fn is_spl_caching_iterator_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "cachingiterator" | "recursivecachingiterator"
+    )
+}
+
+fn validate_spl_caching_string_flags(
+    class_name: &str,
+    method: &str,
+    argument: &str,
+    flags: i64,
+) -> Result<(), String> {
+    let string_mode_bits = flags & SPL_CACHING_STRING_FLAGS;
+    if string_mode_bits.count_ones() > 1 {
+        return Err(format!(
+            "E_PHP_VM_SPL_VALUE_ERROR: {}::{method}(): {argument} must contain only one of CachingIterator::CALL_TOSTRING, CachingIterator::TOSTRING_USE_KEY, CachingIterator::TOSTRING_USE_CURRENT, or CachingIterator::TOSTRING_USE_INNER",
+            spl_iterator_display_name(class_name),
+        ));
+    }
+    Ok(())
+}
+
+fn spl_caching_iterator_flags(object: &ObjectRef) -> i64 {
+    object
+        .get_property("__caching_flags")
+        .map(|flags| effective_value(&flags))
+        .and_then(|flags| match flags {
+            Value::Int(flags) => Some(flags),
+            _ => None,
+        })
+        .unwrap_or(SPL_CACHING_CALL_TOSTRING)
+}
+
+fn spl_caching_iterator_uses_full_cache(object: &ObjectRef) -> bool {
+    spl_caching_iterator_flags(object) & SPL_CACHING_FULL_CACHE != 0
+}
+
+fn spl_caching_iterator_require_full_cache(
+    object: &ObjectRef,
+    class_name: &str,
+) -> Result<(), String> {
+    if spl_caching_iterator_uses_full_cache(object) {
+        Ok(())
+    } else {
+        Err(format!(
+            "E_PHP_VM_SPL_BAD_METHOD_CALL: {} does not use a full cache (see CachingIterator::__construct)",
+            class_name
+        ))
+    }
+}
+
+fn spl_caching_iterator_cache(object: &ObjectRef) -> PhpArray {
+    object
+        .get_property("__caching_cache")
+        .map(|value| effective_value(&value))
+        .and_then(|value| match value {
+            Value::Array(array) => Some(array),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn spl_set_caching_iterator_cache(object: &ObjectRef, cache: PhpArray) {
+    object.set_property("__caching_cache", Value::Array(cache));
+}
+
+fn spl_caching_iterator_seen_count(object: &ObjectRef) -> usize {
+    let len = spl_entries(object).len();
+    object
+        .get_property("__caching_seen_count")
+        .map(|value| effective_value(&value))
+        .and_then(|value| match value {
+            Value::Int(value) if value > 0 => Some(value as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
+        .min(len)
+}
+
+fn spl_caching_iterator_note_current_seen(object: &ObjectRef) {
+    let len = spl_entries(object).len();
+    let seen = spl_caching_iterator_seen_count(object);
+    let position = spl_position(object);
+    let position_seen = position.saturating_add(1).min(len);
+    if let Some((key, value)) = spl_entries(object).into_iter().nth(position) {
+        let mut cache = spl_caching_iterator_cache(object);
+        cache.insert(key, value);
+        spl_set_caching_iterator_cache(object, cache);
+    }
+    object.set_property(
+        "__caching_seen_count",
+        Value::Int(seen.max(position_seen) as i64),
+    );
+}
+
+fn spl_caching_iterator_offset_get(object: &ObjectRef, key: &Value) -> Result<Value, String> {
+    let key = array_key_from_value(key)?;
+    Ok(spl_caching_iterator_cache(object)
+        .get(&key)
+        .map(effective_value)
+        .unwrap_or(Value::Null))
+}
+
+fn spl_caching_iterator_offset_exists(object: &ObjectRef, key: &Value) -> Result<Value, String> {
+    let key = array_key_from_value(key)?;
+    Ok(Value::Bool(
+        spl_caching_iterator_cache(object)
+            .get(&key)
+            .is_some_and(|value| !matches!(effective_value(value), Value::Null)),
+    ))
+}
+
+fn spl_caching_iterator_offset_set(
+    object: &ObjectRef,
+    key: &Value,
+    value: Value,
+) -> Result<(), String> {
+    let key = array_key_from_value(key)?;
+    let mut cache = spl_caching_iterator_cache(object);
+    cache.insert(key, value);
+    spl_set_caching_iterator_cache(object, cache);
+    Ok(())
+}
+
+fn spl_caching_iterator_offset_unset(object: &ObjectRef, key: &Value) -> Result<(), String> {
+    let key = array_key_from_value(key)?;
+    let mut cache = spl_caching_iterator_cache(object);
+    cache.remove(&key);
+    spl_set_caching_iterator_cache(object, cache);
+    Ok(())
+}
+
+fn spl_caching_iterator_to_string_value(object: &ObjectRef) -> Result<Value, String> {
+    let flags = spl_caching_iterator_flags(object);
+    let Some((key, value)) = spl_current_entry(object) else {
+        return Ok(Value::string(Vec::new()));
+    };
+    if flags & SPL_CACHING_CALL_TOSTRING != 0 {
+        return Ok(to_string(&value)
+            .map(Value::String)
+            .unwrap_or_else(|_| Value::string(Vec::new())));
+    }
+    if flags & SPL_CACHING_TOSTRING_USE_KEY != 0 {
+        return to_string(&array_key_to_value(key)).map(Value::String);
+    }
+    if flags & SPL_CACHING_TOSTRING_USE_CURRENT != 0 {
+        return to_string(&value).map(Value::String);
+    }
+    if flags & SPL_CACHING_TOSTRING_USE_INNER != 0 {
+        let mut bytes = to_string(&array_key_to_value(key))?.as_bytes().to_vec();
+        bytes.push(b':');
+        bytes.extend_from_slice(to_string(&value)?.as_bytes());
+        return Ok(Value::String(PhpString::from_bytes(bytes)));
+    }
+    Err(
+        "E_PHP_VM_SPL_BAD_METHOD_CALL: CachingIterator does not fetch string value (see CachingIterator::__construct)"
+            .to_owned(),
+    )
+}
+
+fn validate_recursive_tree_iterator_source(value: &Value) -> Result<(), String> {
+    let Value::Object(object) = effective_value(value) else {
+        return Ok(());
+    };
+    if spl_runtime_marker(&object).as_deref() == Some("arrayiterator") {
+        return Err(format!(
+            "E_PHP_VM_SPL_TYPE_ERROR: RecursiveCachingIterator::__construct(): Argument #1 ($iterator) must be of type RecursiveIterator, {} given",
+            type_error_value_name(&Value::Object(object))
+        ));
+    }
+    Ok(())
 }
 
 fn spl_glob_entries(
@@ -42672,6 +43394,16 @@ fn spl_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, Strin
 }
 
 fn spl_recursive_entries_from_value(value: &Value) -> Result<Vec<(ArrayKey, Value)>, String> {
+    if let Value::Object(object) = effective_value(value)
+        && spl_runtime_marker(&object).as_deref() == Some("arrayobject")
+        && normalize_class_name(&spl_array_object_iterator_class(&object))
+            != "recursivearrayiterator"
+    {
+        return Err(
+            "E_PHP_VM_SPL_INVALID_ARGUMENT: An instance of RecursiveIterator or IteratorAggregate creating it is required"
+                .to_owned(),
+        );
+    }
     let mut flattened = Vec::new();
     for (key, value) in spl_entries_from_value(value)? {
         match effective_value(&value) {
@@ -42756,18 +43488,27 @@ fn spl_position(object: &ObjectRef) -> usize {
         .unwrap_or(0)
 }
 
-fn spl_caching_iterator_has_full_cache(object: &ObjectRef) -> bool {
-    const CACHING_ITERATOR_FULL_CACHE: i64 = 256;
-    matches!(
-        object
-            .get_property("__caching_flags")
-            .map(|value| effective_value(&value)),
-        Some(Value::Int(flags)) if flags & CACHING_ITERATOR_FULL_CACHE != 0
-    )
-}
-
 fn spl_set_position(object: &ObjectRef, position: usize) {
     object.set_property("__position", Value::Int(position as i64));
+}
+
+fn spl_limit_offset(object: &ObjectRef) -> usize {
+    object
+        .get_property("__limit_offset")
+        .and_then(|value| match effective_value(&value) {
+            Value::Int(value) if value > 0 => Some(value as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn spl_limit_count(object: &ObjectRef) -> Option<usize> {
+    object
+        .get_property("__limit_count")
+        .and_then(|value| match effective_value(&value) {
+            Value::Int(value) if value >= 0 => Some(value as usize),
+            _ => None,
+        })
 }
 
 fn spl_current_entry(object: &ObjectRef) -> Option<(ArrayKey, Value)> {
@@ -42827,13 +43568,28 @@ fn new_spl_container_object(
     );
     match normalized.as_str() {
         "arrayobject" => {
-            validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
+            validate_spl_constructor_arg_count(class_name, &args, 0, 3)?;
             let entries = args
                 .first()
                 .map(|arg| spl_entries_from_value(&arg.value))
                 .transpose()?
                 .unwrap_or_default();
+            let flags = args
+                .get(1)
+                .map(|arg| to_int(&arg.value))
+                .transpose()?
+                .unwrap_or(0);
+            let iterator_class = args
+                .get(2)
+                .map(|arg| to_string(&arg.value).map(|value| value.to_string_lossy()))
+                .transpose()?
+                .unwrap_or_else(|| "ArrayIterator".to_owned());
             spl_set_entries(&object, entries);
+            object.set_property("__flags", Value::Int(flags));
+            object.set_property(
+                "__iterator_class",
+                Value::string(iterator_class.into_bytes()),
+            );
         }
         "splfixedarray" => {
             validate_spl_iterator_arg_count(class_name, &args, 0, 1)?;
@@ -42891,12 +43647,47 @@ fn spl_container_method_is_supported(method: &str) -> bool {
             | "getinfo"
             | "setinfo"
             | "getiterator"
+            | "getiteratorclass"
+            | "setiteratorclass"
             | "add"
             | "removeall"
             | "serialize"
+            | "__serialize"
             | "__debuginfo"
             | "__unserialize"
     )
+}
+
+fn spl_array_object_iterator_class(object: &ObjectRef) -> String {
+    object
+        .get_property("__iterator_class")
+        .and_then(|value| match effective_value(&value) {
+            Value::String(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "ArrayIterator".to_owned())
+}
+
+fn spl_object_user_properties_array(object: &ObjectRef) -> PhpArray {
+    let mut properties = PhpArray::new();
+    for (name, value) in object.properties_snapshot() {
+        if name.starts_with("__") || name == SPL_RUNTIME_CLASS_PROPERTY {
+            continue;
+        }
+        let key = if let Some(rest) = name.strip_prefix("private:") {
+            if let Some((class_name, property)) = rest.split_once(':') {
+                format!("\0{class_name}\0{property}")
+            } else {
+                name
+            }
+        } else if let Some(property) = name.strip_prefix("protected:") {
+            format!("\0*\0{property}")
+        } else {
+            name
+        };
+        properties.insert(ArrayKey::String(PhpString::from_test_str(&key)), value);
+    }
+    properties
 }
 
 fn call_spl_container_method(
@@ -43109,13 +43900,48 @@ fn call_spl_container_method(
                     "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
                 ));
             }
+            let iterator_class = spl_array_object_iterator_class(&object);
+            if !matches!(
+                normalize_class_name(&iterator_class).as_str(),
+                "arrayiterator" | "recursivearrayiterator"
+            ) {
+                return Err(
+                    "E_PHP_VM_SPL_TYPE_ERROR: An instance of RecursiveIterator or IteratorAggregate creating it is required"
+                        .to_owned(),
+                );
+            }
             let iterator = ObjectRef::new_with_display_name(
-                &spl_iterator_class("ArrayIterator"),
-                spl_iterator_display_name("ArrayIterator"),
+                &spl_iterator_class(&iterator_class),
+                spl_iterator_display_name(&iterator_class),
             );
             spl_set_entries(&iterator, spl_entries(&object));
             spl_set_position(&iterator, 0);
             Ok(Value::Object(iterator))
+        }
+        "getiteratorclass" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if normalized_class != "arrayobject" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            Ok(Value::string(
+                spl_array_object_iterator_class(&object).into_bytes(),
+            ))
+        }
+        "setiteratorclass" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
+            if normalized_class != "arrayobject" {
+                return Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                ));
+            }
+            let iterator_class = to_string(&args[0].value)?.to_string_lossy();
+            object.set_property(
+                "__iterator_class",
+                Value::string(iterator_class.into_bytes()),
+            );
+            Ok(Value::Null)
         }
         "add" => {
             validate_spl_iterator_arg_count(&class_name, &args, 2, 2)?;
@@ -43160,6 +43986,43 @@ fn call_spl_container_method(
         "serialize" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(Value::string(Vec::new()))
+        }
+        "__serialize" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            match normalized_class.as_str() {
+                "arrayobject" => Ok(Value::packed_array(vec![
+                    object.get_property("__flags").unwrap_or(Value::Int(0)),
+                    Value::Array(spl_entries_to_php_array(spl_entries(&object))),
+                    Value::Array(spl_object_user_properties_array(&object)),
+                    if spl_array_object_iterator_class(&object) == "ArrayIterator" {
+                        Value::Null
+                    } else {
+                        Value::string(spl_array_object_iterator_class(&object).into_bytes())
+                    },
+                ])),
+                "spldoublylinkedlist" | "splstack" | "splqueue" => Ok(Value::packed_array(vec![
+                    object.get_property("__flags").unwrap_or(Value::Int(0)),
+                    Value::Array(spl_entries_to_php_array(spl_entries(&object))),
+                    Value::Array(spl_object_user_properties_array(&object)),
+                ])),
+                "splobjectstorage" => Ok(Value::packed_array(vec![
+                    Value::Array(spl_entries_to_php_array(
+                        spl_storage_entries(&object)
+                            .into_iter()
+                            .map(|(_, object, info)| {
+                                (
+                                    ArrayKey::Int(0),
+                                    Value::packed_array(vec![Value::Object(object), info]),
+                                )
+                            })
+                            .collect(),
+                    )),
+                    Value::Array(spl_object_user_properties_array(&object)),
+                ])),
+                _ => Err(format!(
+                    "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+                )),
+            }
         }
         "__debuginfo" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
@@ -43835,16 +44698,19 @@ fn spl_heap_compare_entries(class_name: &str, left: &Value, right: &Value) -> st
 
 fn spl_heap_current_entry(object: &ObjectRef, class_name: &str) -> Option<(ArrayKey, Value)> {
     let normalized_class = normalize_class_name(class_name);
-    let raw = spl_entries(object).into_iter().nth(spl_position(object))?.1;
+    let entries = spl_entries(object);
+    let position = spl_position(object);
+    let len = entries.len();
+    let raw = entries.into_iter().nth(position)?.1;
+    let iteration_key = ArrayKey::Int(len.saturating_sub(position + 1) as i64);
     if normalized_class == "splpriorityqueue" {
         let (data, priority) = spl_priority_queue_entry_parts(&raw)?;
-        let key = ArrayKey::from_value(&priority).unwrap_or(ArrayKey::Int(0));
         return Some((
-            key,
+            iteration_key,
             spl_priority_queue_extract_value(object, data, priority),
         ));
     }
-    Some((ArrayKey::Int(spl_position(object) as i64), raw))
+    Some((iteration_key, raw))
 }
 
 fn spl_heap_extract_value(object: &ObjectRef, class_name: &str, raw: Value) -> Value {
@@ -44025,7 +44891,20 @@ fn call_spl_file_method(
         spl_runtime_marker(object).unwrap_or_else(|| normalize_class_name(&class_name));
     let method = normalize_method_name(method);
     match method.as_str() {
-        "__tostring" | "getpathname" => {
+        "__tostring" => {
+            validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
+            if matches!(
+                normalized_class.as_str(),
+                "splfileobject" | "spltempfileobject"
+            ) {
+                return Ok(spl_file_lines(object)
+                    .get(spl_position(object))
+                    .map(|line| Value::string(line.as_bytes().to_vec()))
+                    .unwrap_or_else(|| Value::string(Vec::new())));
+            }
+            Ok(Value::string(spl_file_path(object).into_bytes()))
+        }
+        "getpathname" => {
             validate_spl_iterator_arg_count(&class_name, &args, 0, 0)?;
             Ok(Value::string(spl_file_path(object).into_bytes()))
         }
@@ -44225,9 +45104,15 @@ fn call_spl_file_method(
         }
         "ftruncate" => {
             validate_spl_iterator_arg_count(&class_name, &args, 1, 1)?;
-            let size = to_int(&args[0].value)?.max(0) as usize;
+            let size = to_int(&args[0].value)?;
+            if size < 0 {
+                return Err(
+                    "E_PHP_VM_SPL_VALUE_ERROR: SplFileObject::ftruncate(): Argument #1 ($size) must be greater than or equal to 0"
+                        .to_owned(),
+                );
+            }
             let mut content = spl_file_content(object).into_bytes();
-            content.resize(size, 0);
+            content.resize(size as usize, 0);
             spl_file_set_content(object, String::from_utf8_lossy(&content).into_owned());
             Ok(Value::Bool(true))
         }
@@ -46981,6 +47866,31 @@ fn class_is_a_in_state(
     class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
 }
 
+fn iterator_function_accepts_iterable(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+) -> Result<bool, String> {
+    match effective_value(value) {
+        Value::Array(_) | Value::Generator(_) => Ok(true),
+        Value::Object(object) => {
+            let class_name = object.class_name();
+            if let Some(spl_class) = spl_runtime_marker(&object) {
+                return Ok(internal_spl_iterator_instanceof(&spl_class, "Traversable")
+                    .or_else(|| internal_spl_container_instanceof(&spl_class, "Traversable"))
+                    .or_else(|| internal_spl_heap_instanceof(&spl_class, "Traversable"))
+                    .or_else(|| internal_spl_file_instanceof(&spl_class, "Traversable"))
+                    .unwrap_or(false));
+            }
+            Ok(
+                class_is_a_in_state(compiled, state, &class_name, "Iterator")?
+                    || class_is_a_in_state(compiled, state, &class_name, "IteratorAggregate")?,
+            )
+        }
+        _ => Ok(false),
+    }
+}
+
 fn class_exists_for_is_a(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -47749,6 +48659,34 @@ fn capture_backtrace_string_with_failed_call(
         function.name.clone()
     };
     let mut lines = vec![format!("#0 {file}({line}): {name}()")];
+    let rest = capture_backtrace_string_from_index(compiled, stack, 1);
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines.join("\n")
+}
+
+fn capture_backtrace_string_with_builtin_failed_call(
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    function: &str,
+    values: &[Value],
+    call_span: php_ir::IrSpan,
+) -> String {
+    let file = compiled
+        .unit()
+        .files
+        .get(call_span.file.index())
+        .map(|file| file.path.clone())
+        .unwrap_or_default();
+    let line = source_span_display_line(compiled, call_span, false)
+        .unwrap_or_else(|| i64::from(call_span.start));
+    let args = values
+        .iter()
+        .map(format_trace_arg)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![format!("#0 {file}({line}): {function}({args})")];
     let rest = capture_backtrace_string_from_index(compiled, stack, 1);
     if !rest.is_empty() {
         lines.push(rest);
@@ -48936,7 +49874,11 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_RUNTIME_JSON_EXCEPTION" => "JsonException",
         "E_PHP_VM_PDO_EXCEPTION" => "PDOException",
         "E_PHP_VM_SPL_RUNTIME_EXCEPTION" => "RuntimeException",
+        "E_PHP_VM_SPL_BAD_METHOD_CALL" => "BadMethodCallException",
+        "E_PHP_VM_SPL_INVALID_ARGUMENT" => "InvalidArgumentException",
+        "E_PHP_VM_SPL_OUT_OF_BOUNDS" => "OutOfBoundsException",
         "E_PHP_VM_SPL_VALUE_ERROR" => "ValueError",
+        "E_PHP_VM_SPL_TYPE_ERROR" => "TypeError",
         "E_PHP_STD_MISSING_ARGUMENT" | "E_PHP_STD_TOO_MANY_ARGUMENTS" => "ArgumentCountError",
         "E_PHP_STD_TYPE_ERROR" => "TypeError",
         "E_PHP_STD_VALUE_ERROR" => "ValueError",
@@ -48972,6 +49914,7 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         | "E_PHP_VM_THIS_OUTSIDE_METHOD"
         | "E_PHP_VM_DYNAMIC_PROPERTY_ERROR"
         | "E_PHP_VM_PIPE_RHS_NOT_CALLABLE"
+        | "E_PHP_VM_UNKNOWN_METHOD"
         | "E_PHP_VM_UNKNOWN_CLASS"
         | "E_PHP_VM_UNKNOWN_CLASS_CONSTANT"
         | "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS"
@@ -49913,6 +50856,18 @@ fn fetch_dim_path_value(value: &Value, dims: &[ArrayKey]) -> Result<Option<Value
         }
     }
     Ok(Some(current))
+}
+
+fn spl_array_access_dim_target(value: &Value, dims: &[ArrayKey]) -> Option<(ObjectRef, Value)> {
+    let [key] = dims else {
+        return None;
+    };
+    let Value::Object(object) = effective_value(value) else {
+        return None;
+    };
+    spl_runtime_marker(&object)
+        .is_some_and(|class| is_spl_array_access_runtime_class(&class))
+        .then(|| (object, array_key_to_value(key.clone())))
 }
 
 fn read_dim_operands(
@@ -63426,24 +64381,243 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
-    fn spl_iterator_functions_validate_sources_and_constructor_limits() {
+    fn spl_iterator_functions_reject_non_iterables_with_type_error() {
         let result = execute_source(
             r#"<?php
-            try { iterator_count('1'); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
-            try { iterator_to_array('test', true); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
-            $arrayIterator = new ArrayIterator([1, 2, 3]);
-            new IteratorIterator($arrayIterator, IteratorIterator::class);
-            try { new IteratorIterator($arrayIterator, 1, 1); } catch (TypeError $e) { echo $e->getMessage(), "|"; }
-            try { new LimitIterator($arrayIterator, -1); } catch (ValueError $e) { echo $e->getMessage(), "|"; }
-            try { new LimitIterator($arrayIterator, 0, -2); } catch (ValueError $e) { echo $e->getMessage(), "|"; }
-            echo iterator_count(new LimitIterator($arrayIterator, 0, -1));
+            try {
+                iterator_count("1");
+            } catch (TypeError $e) {
+                echo $e->getMessage(), "|";
+            }
+            try {
+                iterator_to_array("test", "test");
+            } catch (TypeError $e) {
+                echo $e->getMessage();
+            }
             "#,
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
-            result.output.to_string_lossy(),
-            "iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, string given|iterator_to_array(): Argument #1 ($iterator) must be of type Traversable|array, string given|IteratorIterator::__construct() expects at most 2 arguments, 3 given|LimitIterator::__construct(): Argument #2 ($offset) must be greater than or equal to 0|LimitIterator::__construct(): Argument #3 ($limit) must be greater than or equal to -1|3"
+            result.output.as_bytes(),
+            b"iterator_count(): Argument #1 ($iterator) must be of type Traversable|array, string given|iterator_to_array(): Argument #1 ($iterator) must be of type Traversable|array, string given"
+        );
+    }
+
+    #[test]
+    fn spl_limit_iterator_rejects_invalid_bounds() {
+        let result = execute_source(
+            r#"<?php
+            $it = new ArrayIterator([1, 2, 3]);
+            try {
+                new LimitIterator($it, -1);
+            } catch (ValueError $e) {
+                echo $e->getMessage(), "|";
+            }
+            try {
+                new LimitIterator($it, 0, -2);
+            } catch (ValueError $e) {
+                echo $e->getMessage(), "|";
+            }
+            new LimitIterator($it, 0, -1);
+            echo "ok";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"LimitIterator::__construct(): Argument #2 ($offset) must be greater than or equal to 0|LimitIterator::__construct(): Argument #3 ($limit) must be greater than or equal to -1|ok"
+        );
+    }
+
+    #[test]
+    fn spl_limit_iterator_get_position_and_seek_use_absolute_offsets() {
+        let result = execute_source(
+            r#"<?php
+            $it = new LimitIterator(new ArrayIterator([1, 2, 3, 4]), 1, 2);
+            foreach ($it as $key => $value) {
+                echo $key, "=", $value, ":", $it->getPosition(), "|";
+            }
+            try {
+                $it->seek(0);
+            } catch (OutOfBoundsException $e) {
+                echo $e->getMessage(), "|";
+            }
+            $it->seek(2);
+            echo $it->current(), "|";
+            try {
+                $it->seek(3);
+            } catch (OutOfBoundsException $e) {
+                echo $e->getMessage(), "|";
+            }
+            $it->next();
+            echo $it->valid() ? "valid" : "invalid";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"1=2:1|2=3:2|Cannot seek to 0 which is below the offset 1|3|Cannot seek to 3 which is behind offset 1 plus count 2|invalid"
+        );
+    }
+
+    #[test]
+    fn spl_limit_iterator_rejects_offsets_beyond_source_length() {
+        let result = execute_source(
+            r#"<?php
+            try {
+                new LimitIterator(new ArrayIterator([1, 2, 3]), PHP_INT_MAX, PHP_INT_MAX);
+            } catch (OutOfBoundsException $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"Seek position 9223372036854775807 is out of range"
+        );
+    }
+
+    #[test]
+    fn spl_iterator_diagnostics_reject_invalid_modes_and_flags() {
+        let result = execute_source(
+            r#"<?php
+            $it = new ArrayIterator(["foo"]);
+            $regex = new RegexIterator($it, "/foo/");
+            try {
+                $regex->setMode(7);
+            } catch (ValueError $e) {
+                echo $e->getMessage(), "|";
+            }
+            try {
+                new CachingIterator($it, CachingIterator::CALL_TOSTRING | CachingIterator::TOSTRING_USE_KEY);
+            } catch (ValueError $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"RegexIterator::setMode(): Argument #1 ($mode) must be RegexIterator::MATCH, RegexIterator::GET_MATCH, RegexIterator::ALL_MATCHES, RegexIterator::SPLIT, or RegexIterator::REPLACE|CachingIterator::__construct(): Argument #2 ($flags) must contain only one of CachingIterator::CALL_TOSTRING, CachingIterator::TOSTRING_USE_KEY, CachingIterator::TOSTRING_USE_CURRENT, or CachingIterator::TOSTRING_USE_INNER"
+        );
+    }
+
+    #[test]
+    fn spl_caching_iterator_cache_access_requires_full_cache() {
+        let result = execute_source(
+            r#"<?php
+            $plain = new CachingIterator(new ArrayIterator([1, 2]));
+            try {
+                $plain->count();
+            } catch (BadMethodCallException $e) {
+                echo "count|";
+            }
+            try {
+                $plain->getCache();
+            } catch (BadMethodCallException $e) {
+                echo "cache|";
+            }
+            $full = new CachingIterator(new ArrayIterator([1, 2]), CachingIterator::FULL_CACHE);
+            echo $full->count(), "|", count($full->getCache()), "|";
+            foreach ($full as $value) {
+                echo $full->count(), ":", count($full->getCache()), "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"count|cache|0|0|1:1|2:2|");
+    }
+
+    #[test]
+    fn spl_caching_iterator_to_string_modes_and_flag_errors() {
+        let result = execute_source(
+            r#"<?php
+            class MyItem {
+                function __construct(public $value) {}
+                function __toString() { return (string) $this->value; }
+            }
+            class MyArrayIterator extends ArrayIterator {
+                function __toString() { return $this->key() . ':' . $this->current(); }
+            }
+            foreach ([CachingIterator::CALL_TOSTRING, CachingIterator::TOSTRING_USE_KEY, CachingIterator::TOSTRING_USE_CURRENT] as $flag) {
+                $it = new CachingIterator(new ArrayIterator([1, 2]), 0);
+                $it->setFlags($flag);
+                foreach ($it as $value) {
+                    echo (string) $it, '|';
+                }
+            }
+            $it = new CachingIterator(new MyArrayIterator([new MyItem(1), new MyItem(2)]), 0);
+            $it->setFlags(CachingIterator::TOSTRING_USE_INNER);
+            foreach ($it as $value) {
+                echo (string) $it, '|';
+            }
+            $it = new CachingIterator(new ArrayIterator([1]), 0);
+            try {
+                $it->setFlags(CachingIterator::CALL_TOSTRING | CachingIterator::TOSTRING_USE_KEY);
+            } catch (ValueError $e) {
+                echo $it->getFlags(), '|';
+            }
+            $it = new CachingIterator(new ArrayIterator([1]), CachingIterator::CALL_TOSTRING);
+            try {
+                $it->setFlags(0);
+            } catch (BadMethodCallException $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"1|2|0|1|1|2|0:1|1:2|0|Unsetting flag CALL_TO_STRING is not possible"
+        );
+    }
+
+    #[test]
+    fn spl_recursive_tree_iterator_rejects_non_recursive_iterator_source() {
+        let result = execute_source(
+            r#"<?php
+            try {
+                new RecursiveTreeIterator(new ArrayIterator([]));
+            } catch (TypeError $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"RecursiveCachingIterator::__construct(): Argument #1 ($iterator) must be of type RecursiveIterator, ArrayIterator given"
+        );
+    }
+
+    #[test]
+    fn spl_subclass_constructor_arity_errors_are_type_errors() {
+        let result = execute_source(
+            r#"<?php
+            class MyFilterIterator extends FilterIterator {
+                function accept(): bool { return true; }
+            }
+            try {
+                new MyFilterIterator();
+            } catch (TypeError $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"FilterIterator::__construct() expects exactly 1 argument, 0 given"
         );
     }
 
@@ -63559,6 +64733,49 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn spl_empty_iterator_key_and_current_throw_bad_method_call() {
+        let result = execute_source(
+            r#"<?php
+            $it = new EmptyIterator();
+            echo $it->valid() ? "bad|" : "invalid|";
+            try {
+                $it->key();
+            } catch (BadMethodCallException $e) {
+                echo $e->getMessage(), "|";
+            }
+            try {
+                $it->current();
+            } catch (BadMethodCallException $e) {
+                echo $e->getMessage();
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"invalid|Accessing the key of an EmptyIterator|Accessing the value of an EmptyIterator"
+        );
+    }
+
+    #[test]
+    fn spl_no_rewind_iterator_rewind_keeps_current_position() {
+        let result = execute_source(
+            r#"<?php
+            $it = new NoRewindIterator(new ArrayIterator(["A", "B", "C"]));
+            echo $it->key(), "=>", $it->current(), "|";
+            $it->next();
+            foreach ($it as $key => $value) {
+                echo $key, "=>", $value, "|";
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"0=>A|1=>B|2=>C|");
+    }
+
+    #[test]
     fn spl_recursive_array_iterator_and_type_checks_use_internal_metadata() {
         let result = execute_source(
             r#"<?php
@@ -63659,6 +64876,50 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn spl_array_access_empty_uses_userland_offset_get_override() {
+        let result = execute_source(
+            r#"<?php
+            class MyArrayObjectForEmpty extends ArrayObject {
+                public function offsetGet($offset): mixed {
+                    return [1];
+                }
+            }
+            $object = new MyArrayObjectForEmpty(["qux" => 1]);
+            echo empty($object["qux"]) ? "empty" : "filled";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"filled");
+    }
+
+    #[test]
+    fn spl_iterator_wrapper_unknown_method_stays_on_wrapper() {
+        let result = execute_source(
+            r#"<?php
+            $it = new CachingIterator(new ArrayIterator([1]), CachingIterator::FULL_CACHE);
+            $it->doesnotexist("x");
+            "#,
+        );
+
+        assert!(!result.status.is_success());
+        let diagnostic = result
+            .diagnostics
+            .first()
+            .map(|diagnostic| diagnostic.message())
+            .unwrap_or_default();
+        assert!(
+            diagnostic.contains("CachingIterator::doesnotexist"),
+            "{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("ArrayIterator::doesnotexist")
+                && !diagnostic.contains("arrayiterator::doesnotexist"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
     fn spl_internal_subclass_parent_constructor_initializes_storage() {
         let result = execute_source(
             r#"<?php
@@ -63714,11 +64975,24 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             }
             $old = $object->exchangeArray(["z" => 9]);
             echo count($object), "|", $old["a"], "|", $object["z"];
+            $recursive = new ArrayObject([1, [2]], 0, "RecursiveArrayIterator");
+            echo "|", $recursive->getIteratorClass(), "|";
+            echo $recursive->getIterator() instanceof RecursiveArrayIterator ? "recursive|" : "plain|";
+            try {
+                new RecursiveIteratorIterator(new ArrayObject([1]));
+            } catch (InvalidArgumentException $e) {
+                echo $e->getMessage(), "|";
+            }
+            $payload = (new ArrayObject([1], 1))->__serialize();
+            echo count($payload), "|", $payload[0], "|", $payload[3] === null ? "null" : "class";
             "#,
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.as_bytes(), b"1|yes|a=1|b=2|0=3|1|1|9");
+        assert_eq!(
+            result.output.as_bytes(),
+            b"1|yes|a=1|b=2|0=3|1|1|9|RecursiveArrayIterator|recursive|An instance of RecursiveIterator or IteratorAggregate creating it is required|4|1|null"
+        );
     }
 
     #[test]
@@ -63821,13 +65095,21 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             $file = new SplFileObject("{path}");
             echo $file->fgets();
             $file->rewind();
+            echo (string) $file;
             foreach ($file as $line => $text) {{
                 echo $line, ":", $text;
             }}
             $file->rewind();
             $row = $file->fgetcsv();
             echo "|", $row[0], ":", $row[1], "|";
-            echo ($file instanceof SplFileInfo) ? "info" : "no";
+            echo ($file instanceof SplFileInfo) ? "info|" : "no|";
+            $temp = new SplTempFileObject();
+            echo (string) $temp, "temp";
+            try {{
+                $temp->ftruncate(-1);
+            }} catch (ValueError $e) {{
+                echo "|", $e->getMessage();
+            }}
             "#
         );
         let result = execute_source_with_options(
@@ -63848,7 +65130,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "items.csv|items|size|real|name,qty\n0:name,qty\n1:apple,2\n|name:qty|info"
+            "items.csv|items|size|real|name,qty\nname,qty\n0:name,qty\n1:apple,2\n|name:qty|info|temp|SplFileObject::ftruncate(): Argument #1 ($size) must be greater than or equal to 0"
         );
     }
 
@@ -63944,12 +65226,15 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             $min = new SplMinHeap();
             $min->insert(2);
             $min->insert(1);
-            echo $min->extract(), "|", $max->isEmpty() ? "empty" : "items";
+            echo $min->extract(), "|", $max->isEmpty() ? "empty|" : "items|";
+            foreach ($max as $key => $value) {
+                echo $key, "=", $value, "|";
+            }
             "#,
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.as_bytes(), b"heap|3|3|3|2|1|items");
+        assert_eq!(result.output.as_bytes(), b"heap|3|3|3|2|1|items|0=1|");
     }
 
     #[test]
@@ -64038,7 +65323,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         );
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.as_bytes(), b"1|b|2|b:2|2=b;1=a;");
+        assert_eq!(result.output.as_bytes(), b"1|b|2|b:2|1=b;0=a;");
     }
 
     #[test]

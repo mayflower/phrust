@@ -159,6 +159,7 @@ impl PhpReferenceClassification {
             | "E_PHP_VM_TOO_MANY_ARGS" => Some(Self::ArgumentCountError),
             "E_PHP_RUNTIME_BUILTIN_TYPE"
             | "E_PHP_STD_TYPE_ERROR"
+            | "E_PHP_VM_SPL_TYPE_ERROR"
             | "E_PHP_RUNTIME_TYPE_ERROR"
             | "E_PHP_RUNTIME_NON_NUMERIC_STRING"
             | "E_PHP_RUNTIME_UNSUPPORTED_OPERAND_TYPES"
