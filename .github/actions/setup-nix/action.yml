@@ -4,6 +4,37 @@ description: Install Nix and enable the shared CI cache.
 runs:
   using: composite
   steps:
+    - name: Ensure xz is available
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if command -v xz >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        if command -v sudo >/dev/null 2>&1; then
+          SUDO=sudo
+        else
+          SUDO=
+        fi
+
+        if command -v apt-get >/dev/null 2>&1; then
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends xz-utils
+        elif command -v apk >/dev/null 2>&1; then
+          $SUDO apk add --no-cache xz
+        elif command -v dnf >/dev/null 2>&1; then
+          $SUDO dnf install -y xz
+        elif command -v yum >/dev/null 2>&1; then
+          $SUDO yum install -y xz
+        elif command -v microdnf >/dev/null 2>&1; then
+          $SUDO microdnf install -y xz
+        else
+          echo "No supported package manager found to install xz." >&2
+          exit 1
+        fi
+
     - name: Install Nix
       uses: cachix/install-nix-action@v31
       with:
