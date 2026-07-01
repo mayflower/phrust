@@ -1249,7 +1249,7 @@ fn property_load_candidate_is_eligible(
             "property-load parameter must be required by-value",
         ));
     }
-    let Some(IrReturnType::Class { name }) = param.type_.as_ref() else {
+    let Some(IrReturnType::Class { name, .. }) = param.type_.as_ref() else {
         return Err(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_PROPERTY_LOAD_PARAM_TYPE",
             "property-load parameter must have a class type",

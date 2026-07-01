@@ -41,7 +41,13 @@ pub enum IrReturnType {
     True,
     /// Class-like return type. Runtime object checking is a known gap until
     /// object storage exists.
-    Class { name: String },
+    Class {
+        /// Normalized lookup name.
+        name: String,
+        /// Source-spelled type name for PHP-visible diagnostics/reflection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
     /// Nullable simple type from `?T` or normalized `T|null`.
     Nullable { inner: Box<IrReturnType> },
     /// Union type in source order.

@@ -4401,6 +4401,14 @@ impl Vm {
             Ok(values) => values,
             Err(result) => return result,
         };
+        let values = if name == "var_dump" {
+            match self.prepare_var_dump_values(values, output, stack, state, compiled) {
+                Ok(values) => values,
+                Err(result) => return result,
+            }
+        } else {
+            values
+        };
         execute_builtin_entry(
             entry,
             values,
@@ -4409,6 +4417,146 @@ impl Vm {
             state,
             builtin_source_span(compiled, call_span),
         )
+    }
+
+    fn prepare_var_dump_values(
+        &self,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> Result<Vec<Value>, VmResult> {
+        values
+            .into_iter()
+            .map(|value| self.prepare_var_dump_value(value, output, stack, state, compiled))
+            .collect()
+    }
+
+    fn prepare_var_dump_value(
+        &self,
+        value: Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> Result<Value, VmResult> {
+        match value {
+            Value::Object(object) => self
+                .debug_info_object_value(&object, output, stack, state, compiled)
+                .map(|debug_value| debug_value.unwrap_or(Value::Object(object))),
+            Value::Reference(cell) => {
+                let Value::Object(object) = cell.get() else {
+                    return Ok(Value::Reference(cell));
+                };
+                self.debug_info_object_value(&object, output, stack, state, compiled)
+                    .map(|debug_value| {
+                        debug_value
+                            .map(|value| Value::Reference(ReferenceCell::new(value)))
+                            .unwrap_or(Value::Reference(cell))
+                    })
+            }
+            value => Ok(value),
+        }
+    }
+
+    fn debug_info_object_value(
+        &self,
+        object: &ObjectRef,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+    ) -> Result<Option<Value>, VmResult> {
+        let Some(return_value) =
+            self.call_debug_info_method(compiled, object, output, stack, state)?
+        else {
+            return Ok(None);
+        };
+        let Value::Array(properties) = return_value else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_DEBUGINFO_RETURN_TYPE: {}::__debugInfo() must return an array",
+                    object.display_name()
+                ),
+            ));
+        };
+        Ok(Some(Value::Object(debug_info_object(object, properties))))
+    }
+
+    fn call_debug_info_method(
+        &self,
+        compiled: &CompiledUnit,
+        object: &ObjectRef,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Option<Value>, VmResult> {
+        let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
+            return Ok(None);
+        };
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            "__debugInfo",
+            None,
+        ) {
+            Ok(Some(method)) => method,
+            Ok(None) => return Ok(None),
+            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+        };
+        if resolved.method.flags.is_static
+            || resolved.method.flags.is_private
+            || resolved.method.flags.is_protected
+        {
+            return Ok(None);
+        }
+        let guard = MagicMethodCall {
+            receiver: format!("object:{}", object.id()),
+            magic_method: normalize_method_name("__debugInfo"),
+            called_method: normalize_method_name("var_dump"),
+        };
+        if state
+            .magic_method_stack
+            .iter()
+            .any(|active| active == &guard)
+        {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive __debugInfo for {}::var_dump",
+                    object.class_name()
+                ),
+            ));
+        }
+        state.magic_method_stack.push(guard);
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        let result = self.execute_function(
+            &class_owner,
+            resolved.method.function,
+            FunctionCall::new(Vec::new(), Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_this(object.clone())
+                .with_class_context(
+                    resolved.class.name.clone(),
+                    object.class_name(),
+                    resolved.class.name.clone(),
+                ),
+            output,
+            stack,
+            state,
+        );
+        let _ = state.magic_method_stack.pop();
+        if !result.status.is_success() {
+            return Err(result);
+        }
+        Ok(Some(result.return_value.unwrap_or(Value::Null)))
     }
 
     fn try_execute_fast_builtin_stub(
@@ -22986,11 +23134,6 @@ impl Vm {
                     }
                     Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                 };
-                if name == "var_dump"
-                    && let Some(message) = debug_info_gap_message(compiled, &values)
-                {
-                    return self.runtime_error(output, compiled, stack, message);
-                }
                 if let Some(result) = self.try_execute_serialization_builtin(
                     compiled, &name, &values, call_span, output, stack, state,
                 ) {
@@ -25271,11 +25414,6 @@ impl Vm {
                 }
                 Err(InternalBuiltinArgError::Fatal(result)) => return *result,
             };
-            if normalized == "var_dump"
-                && let Some(message) = debug_info_gap_message(compiled, &values)
-            {
-                return self.runtime_error(output, compiled, stack, message);
-            }
             if let Some(result) = self.try_execute_serialization_builtin(
                 compiled,
                 &normalized,
@@ -25437,11 +25575,6 @@ impl Vm {
                             }
                             Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                         };
-                        if name == "var_dump"
-                            && let Some(message) = debug_info_gap_message(compiled, &values)
-                        {
-                            return self.runtime_error(output, compiled, stack, message);
-                        }
                         if let Some(result) = self.try_execute_serialization_builtin(
                             compiled, &name, &values, call_span, output, stack, state,
                         ) {
@@ -34448,7 +34581,9 @@ fn ir_type_name(type_: &IrReturnType) -> String {
         IrReturnType::Never => "never".to_owned(),
         IrReturnType::False => "false".to_owned(),
         IrReturnType::True => "true".to_owned(),
-        IrReturnType::Class { name } => name.clone(),
+        IrReturnType::Class { name, display_name } => {
+            display_name.clone().unwrap_or_else(|| name.clone())
+        }
         IrReturnType::Nullable { inner } => ir_type_name(inner),
         IrReturnType::Union { members } => members
             .iter()
@@ -36633,33 +36768,18 @@ fn magic_args_array(args: Vec<CallArgument>) -> Value {
     Value::Array(array)
 }
 
-fn debug_info_gap_message(compiled: &CompiledUnit, values: &[Value]) -> Option<String> {
-    for value in values {
-        let value = match value {
-            Value::Reference(cell) => cell.get(),
-            value => value.clone(),
-        };
-        let Value::Object(object) = value else {
-            continue;
-        };
-        let Some(class) = compiled.lookup_class(&object.class_name()) else {
-            continue;
-        };
-        let Ok(Some(resolved)) = lookup_method_in_hierarchy(compiled, class, "__debugInfo", None)
-        else {
-            continue;
-        };
-        if !resolved.method.flags.is_static
-            && !resolved.method.flags.is_private
-            && !resolved.method.flags.is_protected
-        {
-            return Some(format!(
-                "E_PHP_RUNTIME_UNSUPPORTED_DEBUGINFO: var_dump __debugInfo for {} is not implemented",
-                object.class_name()
-            ));
-        }
-    }
-    None
+fn debug_info_object(source: &ObjectRef, properties: PhpArray) -> ObjectRef {
+    let properties = properties
+        .iter()
+        .map(|(key, value)| match key {
+            ArrayKey::Int(index) => (index.to_string(), index.to_string(), value.clone()),
+            ArrayKey::String(name) => {
+                let name = name.to_string_lossy();
+                (name.clone(), format!("\"{name}\""), value.clone())
+            }
+        })
+        .collect();
+    ObjectRef::debug_view_with_properties(source, properties)
 }
 
 #[derive(Clone, Debug)]
@@ -37490,7 +37610,9 @@ fn method_type_display(type_: &IrReturnType) -> String {
         IrReturnType::Never => "never".to_owned(),
         IrReturnType::False => "false".to_owned(),
         IrReturnType::True => "true".to_owned(),
-        IrReturnType::Class { name } => name.clone(),
+        IrReturnType::Class { name, display_name } => {
+            display_name.clone().unwrap_or_else(|| name.clone())
+        }
         IrReturnType::Nullable { inner } => format!("?{}", method_type_display(inner)),
         IrReturnType::Union { members } => members
             .iter()
@@ -52302,9 +52424,11 @@ fn param_type_mismatch_message(
 
 fn runtime_type_error_name(compiled: &CompiledUnit, runtime_type: &RuntimeType) -> String {
     match runtime_type {
-        RuntimeType::Class { name } => {
+        RuntimeType::Class { name, display_name } => {
             let normalized = normalize_class_name(name);
-            class_display_name(compiled, &normalized).unwrap_or_else(|| name.clone())
+            class_display_name(compiled, &normalized)
+                .or_else(|| display_name.clone())
+                .unwrap_or_else(|| name.clone())
         }
         RuntimeType::Nullable { inner } => format!("?{}", runtime_type_error_name(compiled, inner)),
         RuntimeType::Union { members } => members
@@ -52616,7 +52740,7 @@ fn vm_value_matches_runtime_type(
             || value_matches_runtime_type(value, runtime_type),
             |state| value_is_callable(compiled, state, value, false),
         ),
-        RuntimeType::Class { name } => match state {
+        RuntimeType::Class { name, .. } => match state {
             Some(state) => object_instanceof_in_state(compiled, state, value, name)?,
             None => object_instanceof(compiled, value, name)?,
         },
@@ -52684,7 +52808,7 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
                 Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_)
             )
         }
-        RuntimeType::Class { name } => {
+        RuntimeType::Class { name, .. } => {
             matches!(
                 value,
                 Value::Object(object) if object.class_name().eq_ignore_ascii_case(name)
@@ -52730,7 +52854,10 @@ fn ir_runtime_type(return_type: Option<&IrReturnType>) -> Option<RuntimeType> {
         IrReturnType::Never => RuntimeType::Never,
         IrReturnType::False => RuntimeType::False,
         IrReturnType::True => RuntimeType::True,
-        IrReturnType::Class { name } => RuntimeType::Class { name: name.clone() },
+        IrReturnType::Class { name, display_name } => RuntimeType::Class {
+            name: name.clone(),
+            display_name: display_name.clone(),
+        },
         IrReturnType::Nullable { inner } => RuntimeType::Nullable {
             inner: Box::new(ir_runtime_type(Some(inner))?),
         },
@@ -60545,6 +60672,27 @@ good"
     }
 
     #[test]
+    fn var_dump_uses_debug_info_with_original_object_handle() {
+        let result = execute_source(
+            r#"<?php
+class DebugInfoBox {
+    public $hidden = 99;
+    public function __debugInfo(): array {
+        return ["visible" => 1, 0 => "zero"];
+    }
+}
+var_dump(new DebugInfoBox());
+"#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "object(DebugInfoBox)#1 (2) {\n  [\"visible\"]=>\n  int(1)\n  [0]=>\n  string(4) \"zero\"\n}\n"
+        );
+    }
+
+    #[test]
     fn methods_execute_instance_calls_and_this_property() {
         let result = execute_source(
             "<?php class Box { public $value; function __construct($value) { $this->value = $value; } function get() { return $this->value; } function plus($value) { return $this->get() + $value; } } $box = new Box(7); echo $box->get(), '|', $box->plus(5);",
@@ -60719,6 +60867,25 @@ good"
                 ..
             } if class_name == "Child" && method_name == "accept"
         ));
+
+        let class_type_name_preserves_source_case = execute_source(
+            "<?php class SomeClass {} class Base { public function accept(SomeClass $value) {} } class Child extends Base { public function accept(array $value) {} }",
+        );
+        assert_eq!(
+            class_type_name_preserves_source_case.status.exit_status(),
+            ExitStatus::CompileError
+        );
+        assert!(
+            class_type_name_preserves_source_case
+                .status
+                .message()
+                .expect("compile message")
+                .contains(
+                    "E_PHP_VM_METHOD_SIGNATURE_OVERRIDE: Declaration of Child::accept(array $value) must be compatible with Base::accept(SomeClass $value)"
+                ),
+            "{:?}",
+            class_type_name_preserves_source_case.status
+        );
 
         let removed_optional_parameter = execute_source(
             "<?php class Base { public function accept($value = 1) {} } class Child extends Base { public function accept() {} }",

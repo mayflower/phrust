@@ -1962,7 +1962,7 @@ fn property_load_candidate(
             "property-load parameter must be required and by-value",
         ));
     }
-    let Some(IrReturnType::Class { name }) = param.type_.as_ref() else {
+    let Some(IrReturnType::Class { name, .. }) = param.type_.as_ref() else {
         return Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_PROPERTY_LOAD_PARAM_TYPE",
             "property-load parameter must have a class type",

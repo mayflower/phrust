@@ -2916,6 +2916,7 @@ impl LoweringContext<'_> {
             .database()
             .module(self.frontend.module().module_id())?;
         let ty = module.types().get(type_id)?;
+        let source_form = ty.source_form();
         match ty.kind() {
             HirTypeKind::Builtin(BuiltinType::Int) => Some(IrReturnType::Int),
             HirTypeKind::Builtin(BuiltinType::Float) => Some(IrReturnType::Float),
@@ -2936,6 +2937,7 @@ impl LoweringContext<'_> {
                     .as_ref()
                     .map(|resolved| resolved.canonical(NameKind::ClassLike))
                     .unwrap_or_else(|| name.original().to_owned()),
+                display_name: (!source_form.is_empty()).then(|| source_form.to_owned()),
             }),
             HirTypeKind::Nullable { inner, .. } => {
                 let inner = self.lower_runtime_type(Some(*inner))?;

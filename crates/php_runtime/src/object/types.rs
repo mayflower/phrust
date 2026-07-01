@@ -30,7 +30,12 @@ pub enum RuntimeType {
     /// Literal `true`.
     True,
     /// Class-like type.
-    Class { name: String },
+    Class {
+        /// Normalized lookup name.
+        name: String,
+        /// Source-spelled type name for PHP-visible diagnostics/reflection.
+        display_name: Option<String>,
+    },
     /// Nullable simple type.
     Nullable { inner: Box<RuntimeType> },
     /// Union type; matches when any member matches.

@@ -31,7 +31,7 @@ pub fn value_matches_runtime_type(value: &Value, runtime_type: &RuntimeType) -> 
         RuntimeType::Never => false,
         RuntimeType::False => matches!(value, Value::Bool(false)),
         RuntimeType::True => matches!(value, Value::Bool(true)),
-        RuntimeType::Class { name } => {
+        RuntimeType::Class { name, .. } => {
             matches!(
                 value,
                 Value::Object(object) if object.class_name().eq_ignore_ascii_case(name)
@@ -76,7 +76,9 @@ pub fn runtime_type_name(runtime_type: &RuntimeType) -> String {
         RuntimeType::Never => "never".to_owned(),
         RuntimeType::False => "false".to_owned(),
         RuntimeType::True => "true".to_owned(),
-        RuntimeType::Class { name } => name.clone(),
+        RuntimeType::Class { name, display_name } => {
+            display_name.clone().unwrap_or_else(|| name.clone())
+        }
         RuntimeType::Nullable { inner } => format!("?{}", runtime_type_name(inner)),
         RuntimeType::Union { members } => members
             .iter()
@@ -175,7 +177,8 @@ mod tests {
         assert!(value_matches_runtime_type(
             &object,
             &RuntimeType::Class {
-                name: "box".to_owned()
+                name: "box".to_owned(),
+                display_name: None,
             }
         ));
         assert!(value_matches_runtime_type(
@@ -184,7 +187,8 @@ mod tests {
                 members: vec![
                     RuntimeType::Object,
                     RuntimeType::Class {
-                        name: "Box".to_owned()
+                        name: "Box".to_owned(),
+                        display_name: None,
                     }
                 ]
             }
@@ -206,7 +210,8 @@ mod tests {
                         members: vec![
                             RuntimeType::Object,
                             RuntimeType::Class {
-                                name: "Box".to_owned()
+                                name: "Box".to_owned(),
+                                display_name: None,
                             }
                         ]
                     },
@@ -214,6 +219,13 @@ mod tests {
                 ]
             }),
             "(object&Box)|null"
+        );
+        assert_eq!(
+            runtime_type_name(&RuntimeType::Class {
+                name: "someclass".to_owned(),
+                display_name: Some("SomeClass".to_owned()),
+            }),
+            "SomeClass"
         );
     }
 }

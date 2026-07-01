@@ -1,5 +1,5 @@
 <?php
-// runtime-semantics: expect=known_gap known_gap=E_PHP_IR_UNSUPPORTED_STATIC_PROPERTY
+// runtime-semantics: category=types expect=pass
 class Counter {
     public static int $value = 1;
 }

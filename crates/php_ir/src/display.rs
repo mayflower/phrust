@@ -247,7 +247,7 @@ fn format_return_type(return_type: &IrReturnType) -> String {
         IrReturnType::Never => "never".to_string(),
         IrReturnType::False => "false".to_string(),
         IrReturnType::True => "true".to_string(),
-        IrReturnType::Class { name } => format!("class {name:?}"),
+        IrReturnType::Class { name, .. } => format!("class {name:?}"),
         IrReturnType::Nullable { inner } => format!("?{}", format_return_type(inner)),
         IrReturnType::Union { members } => members
             .iter()

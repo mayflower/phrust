@@ -324,10 +324,11 @@ as packed array elements and named arguments as string-keyed elements. Active
 method-magic dispatch is guarded by `(receiver, magic method, called method)`
 and raises `E_PHP_VM_MAGIC_METHOD_RECURSION` on re-entry.
 
-`__debugInfo` is not executed by the minimal `var_dump` builtin yet. If an
-object declares a public instance `__debugInfo`, `var_dump` emits the explicit
-`E_PHP_RUNTIME_UNSUPPORTED_DEBUGINFO` gap instead of printing a misleading
-ordinary object placeholder.
+`__debugInfo` is executed for `var_dump` when an object declares a public
+instance method. The returned array is formatted as debug properties on the
+original object handle, preserving string and integer property labels for the
+fixture-covered path. Wider recursion and exact diagnostic parity remain tracked
+under the broader magic-method gap.
 
 ## Clone and Clone-With
 

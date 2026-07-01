@@ -106,6 +106,40 @@ impl ObjectRef {
         }
     }
 
+    /// Creates a formatter-only object view with an existing PHP-visible object
+    /// handle and a custom property list.
+    ///
+    /// This is used for `__debugInfo()` output, where PHP formats the returned
+    /// property map as the original object without allocating a new visible
+    /// object handle.
+    #[must_use]
+    pub fn debug_view_with_properties(
+        source: &Self,
+        properties: Vec<(String, String, Value)>,
+    ) -> Self {
+        let mut property_order = Vec::with_capacity(properties.len());
+        let mut property_values = HashMap::with_capacity(properties.len());
+        let mut property_debug_labels = HashMap::with_capacity(properties.len());
+        for (name, debug_label, value) in properties {
+            if !property_values.contains_key(&name) {
+                property_order.push(name.clone());
+            }
+            property_debug_labels.insert(name.clone(), debug_label);
+            property_values.insert(name, value);
+        }
+        Self {
+            id: source.id,
+            storage: Rc::new(RefCell::new(ObjectStorage {
+                class_name: source.class_name(),
+                display_name: source.display_name(),
+                id_guard: None,
+                properties: property_values,
+                property_order,
+                property_debug_labels,
+            })),
+        }
+    }
+
     /// Returns the stable object identity for tests and diagnostics.
     #[must_use]
     pub const fn id(&self) -> u64 {

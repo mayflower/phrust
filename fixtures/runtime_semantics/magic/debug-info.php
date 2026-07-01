@@ -1,5 +1,5 @@
 <?php
-// runtime-semantics: category=magic expect=known_gap known_gap=E_PHP_RUNTIME_UNSUPPORTED_DEBUGINFO
+// runtime-semantics: category=magic expect=pass
 class MagicDebugInfoGap {
     public function __debugInfo(): array {
         return ["visible" => 1];

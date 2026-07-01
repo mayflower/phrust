@@ -11,24 +11,24 @@ IDs present in the manifest.
 ## Summary
 
 - Total runtime gap rows: 97
-- Open rows: 80
-- Implemented rows retained for historical coverage: 17
+- Open rows: 79
+- Implemented rows retained for historical coverage: 18
 - Machine-readable report: `target/runtime-gap-report/runtime-gap-report.json`
 
 ## Required Risk Classes
 
 | Class | Total | Open | Implemented |
 | --- | ---: | ---: | ---: |
-| references and Copy-on-Write | 2 | 2 | 0 |
-| arrays and array-key conversion | 18 | 15 | 3 |
+| references and Copy-on-Write | 3 | 3 | 0 |
+| arrays and array-key conversion | 19 | 15 | 4 |
 | foreach mutation/reference behavior | 7 | 5 | 2 |
 | warning channel and exact warning continuation | 14 | 13 | 1 |
 | Throwable/Error hierarchy and stack traces | 12 | 10 | 2 |
 | weak/strict type coercion | 6 | 6 | 0 |
-| include scope and cross-file declarations | 18 | 13 | 5 |
+| include scope and cross-file declarations | 17 | 12 | 5 |
 | superglobals and $GLOBALS | 1 | 1 | 0 |
 | standard-library/extension routing | 10 | 9 | 1 |
-| runtime object/control-flow compatibility | 9 | 6 | 3 |
+| runtime object/control-flow compatibility | 8 | 5 | 3 |
 
 ## Highest Priority Open Gaps
 
@@ -40,6 +40,7 @@ IDs present in the manifest.
 | `E_PHP_IR_UNSUPPORTED_OBJECT_PROPERTY_MODIFIER` | Throwable/Error hierarchy and stack traces | high | high | `fixtures/runtime/known_gaps/objects/clone-with-private.php`, `fixtures/runtime/known_gaps/objects/clone-with-readonly.php` |
 | `E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS` | warning channel and exact warning continuation | high | high | `fixtures/runtime/valid/property_hooks/get-hook.php`, `fixtures/runtime_semantics/property_hooks/clone-with-set-hook.php`, `fixtures/runtime_semantics/property_hooks/error-recursion.php`, and 6 more |
 | `E_PHP_IR_UNSUPPORTED_PROPERTY_REFERENCE` | arrays and array-key conversion | high | high | `fixtures/runtime_semantics/functions/return-by-ref-property-known-gap.php`, `fixtures/runtime_semantics/magic/reference-get-known-gap.php`, `fixtures/runtime_semantics/types/property-by-ref-invalid-known-gap.php` |
+| `E_PHP_IR_UNSUPPORTED_STATIC_PROPERTY` | references and Copy-on-Write | high | high | `fixtures/runtime_semantics/types/static-property-read.php` |
 | `E_PHP_RUNTIME_ARRAYACCESS_STDLIB_GAP` | arrays and array-key conversion | high | high | `fixtures/runtime_semantics/foreach/arrayaccess-known-gap.php` |
 | `E_PHP_RUNTIME_ARRAY_REFERENCE_COW` | foreach mutation/reference behavior | high | high | `fixtures/runtime/valid/references/array-element-ref.php`, `fixtures/runtime_semantics/arrays/cow-element-reference-separates.php`, `fixtures/runtime_semantics/arrays/nested-reference-copy-matrix.php`, and 1 more |
 | `E_PHP_RUNTIME_FOREACH_MUTATION_COMPAT` | foreach mutation/reference behavior | high | high | `fixtures/runtime/valid/foreach/by-ref-break-continue.php`, `fixtures/runtime/valid/foreach/snapshot-mutation.php`, `fixtures/runtime_semantics/foreach/arrayaccess-known-gap.php`, and 17 more |
@@ -53,7 +54,6 @@ IDs present in the manifest.
 | `E_PHP_RUNTIME_UNSUPPORTED_THROWABLE_HIERARCHY` | Throwable/Error hierarchy and stack traces | high | high | `fixtures/runtime/invalid/exceptions/rethrow.php`, `fixtures/runtime/invalid/exceptions/throw-uncaught.php`, `fixtures/runtime_semantics/errors/catch-error-parent.php`, and 5 more |
 | `E_PHP_RUNTIME_VAR_DUMP_FORMAT_MATRIX` | arrays and array-key conversion | high | high | `fixtures/runtime/valid/arrays/var-dump-mixed.php`, `fixtures/runtime/valid/builtins/var-dump-array.php`, `fixtures/runtime/valid/builtins/var-dump-scalars.php` |
 | `E_PHP_RUNTIME_WEAK_STRICT_TYPES_COERCION` | weak/strict type coercion | high | high | `fixtures/runtime/invalid/runtime_types/param-int-fail.php`, `fixtures/runtime/invalid/runtime_types/return-string-fail.php`, `fixtures/runtime/valid/runtime_types/param-int.php`, and 4 more |
-| `E_PHP_VM_PARAM_TYPE_MISMATCH` | weak/strict type coercion | high | high | `fixtures/runtime/invalid/runtime_types/param-int-fail.php`, `fixtures/runtime_semantics/callables/callable-param-matrix.php`, `fixtures/runtime_semantics/callables/error-callable-param-unresolved.php`, and 1 more |
 
 ## Closure Rules
 

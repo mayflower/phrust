@@ -1,5 +1,5 @@
 <?php
-// runtime-semantics: category=enums expect=known_gap known_gap=E_PHP_IR_UNSUPPORTED_REFLECTION
+// runtime-semantics: category=enums expect=pass
 enum ReflectableStatus {
     case Ready;
 }

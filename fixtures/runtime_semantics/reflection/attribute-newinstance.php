@@ -1,5 +1,5 @@
 <?php
-// runtime-semantics: category=reflection expect=known_gap known_gap=E_PHP_RUNTIME_UNSUPPORTED_ATTRIBUTE_NEWINSTANCE
+// runtime-semantics: category=reflection expect=pass
 #[Attribute]
 class InstantiableAttribute {
 }
