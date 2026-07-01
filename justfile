@@ -56,6 +56,7 @@ help:
       '  just runtime-diff         Compare runtime output with PHP reference when configured' \
       '  just runtime-known-gaps   Validate runtime known-gap catalog' \
       '  just runtime-gap-report   Regenerate runtime gap closure report' \
+      '  just wp-language-vm       Run WordPress language/VM core fixtures' \
       '' \
       'Server:' \
       '  just verify-server        Run integrated web server verification' \
@@ -881,6 +882,10 @@ real-world-fixtures:
 wordpress-blockers:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py --category wordpress_blockers --out target/runtime-semantics/wordpress-blockers
+
+wp-language-vm:
+    cargo build -p php_vm_cli
+    scripts/runtime_semantics_diff.py --category wp_language_vm --out target/runtime-semantics/wp-language-vm
 
 regression-fixtures:
     cargo build -p php_vm_cli

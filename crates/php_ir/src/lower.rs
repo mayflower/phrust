@@ -568,6 +568,13 @@ enum DestructuringTarget {
     Local(LocalId),
     Property(PropertyAssignmentTarget),
     Dim(DimAssignmentTarget),
+    Nested(Vec<(IrConstant, DestructuringTarget)>),
+}
+
+#[derive(Clone, Debug)]
+enum DestructuringPattern {
+    Expr(ExprId),
+    Nested(Vec<(IrConstant, DestructuringPattern)>),
 }
 
 #[derive(Clone, Debug)]
@@ -4038,44 +4045,41 @@ impl LoweringContext<'_> {
         function: FunctionId,
         value_target: ExprId,
     ) -> Option<Vec<(IrConstant, DestructuringTarget)>> {
-        let target_exprs = {
+        let patterns = {
             let module = self
                 .frontend
                 .database()
                 .module(self.frontend.module().module_id())?;
-            let expression = module.expressions().get(value_target)?;
-            let elements = match expression.kind().clone() {
-                HirExprKind::Array { elements } | HirExprKind::List { elements } => elements,
-                _ => return None,
-            };
-            let mut target_exprs = Vec::new();
-            for (index, element) in elements.into_iter().enumerate() {
-                let element_expression = module.expressions().get(element)?;
-                let (key, target) = match element_expression.kind().clone() {
-                    HirExprKind::ArrayPair {
-                        key,
-                        value: Some(value),
-                        unpack: false,
-                        by_ref: false,
-                    } => (destructuring_key(module, index, key)?, value),
-                    HirExprKind::ArrayPair { .. } => return None,
-                    _ => (IrConstant::Int(index.try_into().ok()?), element),
-                };
-                target_exprs.push((key, target));
-            }
-            target_exprs
+            destructuring_patterns(module, value_target)?
         };
+        self.destructuring_targets_from_patterns(builder, function, patterns)
+    }
+
+    fn destructuring_targets_from_patterns(
+        &mut self,
+        builder: &mut IrBuilder,
+        function: FunctionId,
+        patterns: Vec<(IrConstant, DestructuringPattern)>,
+    ) -> Option<Vec<(IrConstant, DestructuringTarget)>> {
         let mut targets = Vec::new();
-        for (key, target) in target_exprs {
-            if let Some(local) = self.variable_local(builder, function, target) {
-                targets.push((key, DestructuringTarget::Local(local)));
-            } else if let Some(property) = self.property_assignment_target(target) {
-                targets.push((key, DestructuringTarget::Property(property)));
-            } else if let Some(dim) = self.dim_assignment_target(builder, function, target) {
-                targets.push((key, DestructuringTarget::Dim(dim)));
-            } else {
-                return None;
-            }
+        for (key, pattern) in patterns {
+            let target = match pattern {
+                DestructuringPattern::Expr(expr) => {
+                    if let Some(local) = self.variable_local(builder, function, expr) {
+                        DestructuringTarget::Local(local)
+                    } else if let Some(property) = self.property_assignment_target(expr) {
+                        DestructuringTarget::Property(property)
+                    } else if let Some(dim) = self.dim_assignment_target(builder, function, expr) {
+                        DestructuringTarget::Dim(dim)
+                    } else {
+                        return None;
+                    }
+                }
+                DestructuringPattern::Nested(children) => DestructuringTarget::Nested(
+                    self.destructuring_targets_from_patterns(builder, function, children)?,
+                ),
+            };
+            targets.push((key, target));
         }
         Some(targets)
     }
@@ -4164,6 +4168,11 @@ impl LoweringContext<'_> {
                         }
                     };
                     builder.emit(function, current, kind, span);
+                }
+                DestructuringTarget::Nested(targets) => {
+                    current = self.lower_foreach_value_destructure(
+                        builder, function, current, fetched, targets, span,
+                    );
                 }
             }
         }
@@ -9328,38 +9337,89 @@ impl LoweringContext<'_> {
         site: LowerSite,
         left: ExprId,
     ) -> Option<LoweredExpr> {
-        let module = self
-            .frontend
-            .database()
-            .module(self.frontend.module().module_id())?;
-        let expression = module.expressions().get(left)?;
-        match expression.kind() {
-            HirExprKind::Variable { name } => {
-                let local = builder.intern_local(site.function, local_name(name));
-                let dst = builder.alloc_register(site.function);
-                let range = self.span_for(SourceMappedId::from(left));
-                let span = span_from_range(self.file, range);
-                let instruction = builder.emit(
-                    site.function,
-                    site.block,
-                    InstructionKind::LoadLocalQuiet { dst, local },
-                    span,
-                );
-                self.add_expr_source_map(
-                    builder,
-                    site.function,
-                    site.block,
-                    instruction,
-                    left,
-                    span,
-                );
-                Some(LoweredExpr {
-                    register: dst,
-                    block: site.block,
-                })
+        let variable_name = {
+            let module = self
+                .frontend
+                .database()
+                .module(self.frontend.module().module_id())?;
+            let expression = module.expressions().get(left)?;
+            match expression.kind() {
+                HirExprKind::Variable { name } => Some(local_name(name).to_owned()),
+                _ => None,
             }
-            _ => self.lower_expr_to_register(builder, site.function, site.block, left),
+        };
+        if let Some(name) = variable_name {
+            let local = builder.intern_local(site.function, name);
+            let dst = builder.alloc_register(site.function);
+            let range = self.span_for(SourceMappedId::from(left));
+            let span = span_from_range(self.file, range);
+            let instruction = builder.emit(
+                site.function,
+                site.block,
+                InstructionKind::LoadLocalQuiet { dst, local },
+                span,
+            );
+            self.add_expr_source_map(builder, site.function, site.block, instruction, left, span);
+            return Some(LoweredExpr {
+                register: dst,
+                block: site.block,
+            });
         }
+        if let Some(target) = self.dim_assignment_target(builder, site.function, left) {
+            if !target.append && !target.dims.is_empty() {
+                return self.lower_quiet_dim_target_to_register(builder, site, target, left);
+            }
+        }
+        self.lower_expr_to_register(builder, site.function, site.block, left)
+    }
+
+    fn lower_quiet_dim_target_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: DimAssignmentTarget,
+        expr: ExprId,
+    ) -> Option<LoweredExpr> {
+        let range = self.span_for(SourceMappedId::from(expr));
+        let span = span_from_range(self.file, range);
+        let mut current = site.block;
+        let mut dims = Vec::with_capacity(target.dims.len());
+        for dim in target.dims {
+            let dim_value = self.lower_expr_to_register(builder, site.function, current, dim)?;
+            current = dim_value.block;
+            dims.push(Operand::Register(dim_value.register));
+        }
+        let mut value = builder.alloc_register(site.function);
+        let load = builder.emit(
+            site.function,
+            current,
+            InstructionKind::LoadLocalQuiet {
+                dst: value,
+                local: target.local,
+            },
+            span,
+        );
+        self.add_expr_source_map(builder, site.function, current, load, expr, span);
+        for dim in dims {
+            let fetched = builder.alloc_register(site.function);
+            let fetch = builder.emit(
+                site.function,
+                current,
+                InstructionKind::FetchDim {
+                    dst: fetched,
+                    array: Operand::Register(value),
+                    key: dim,
+                    quiet: true,
+                },
+                span,
+            );
+            self.add_expr_source_map(builder, site.function, current, fetch, expr, span);
+            value = fetched;
+        }
+        Some(LoweredExpr {
+            register: value,
+            block: current,
+        })
     }
 
     fn lower_error_suppression_to_register(
@@ -9776,6 +9836,11 @@ impl LoweringContext<'_> {
         right: Option<ExprId>,
     ) -> Option<LoweredExpr> {
         if let Some(left) = left
+            && let Some(target) = self.property_assignment_target(left)
+        {
+            return self.lower_property_coalesce_assign_to_register(builder, site, target, right);
+        }
+        if let Some(left) = left
             && let Some(target) = self.dim_assignment_target(builder, site.function, left)
             && !target.append
             && !target.dims.is_empty()
@@ -9864,6 +9929,95 @@ impl LoweringContext<'_> {
                 dst,
                 src: Operand::Register(value.register),
             },
+            site.span,
+        );
+        self.jump_if_open(builder, site.function, value.block, after_block, site.span);
+
+        Some(LoweredExpr {
+            register: dst,
+            block: after_block,
+        })
+    }
+
+    fn lower_property_coalesce_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: PropertyAssignmentTarget,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(right) = right else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "property null coalescing assignment is missing its right operand",
+            );
+            return None;
+        };
+
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+        let dst = builder.alloc_register(site.function);
+        let present = builder.alloc_register(site.function);
+        builder.emit(
+            site.function,
+            object.block,
+            InstructionKind::IssetProperty {
+                dst: present,
+                object: Operand::Register(object.register),
+                property: target.property.clone(),
+            },
+            site.span,
+        );
+
+        let existing_block = builder.append_block(site.function);
+        let assign_block = builder.append_block(site.function);
+        let after_block = builder.append_block(site.function);
+        builder.terminate_jump_if(
+            site.function,
+            object.block,
+            Operand::Register(present),
+            existing_block,
+            assign_block,
+            site.span,
+        );
+
+        builder.emit(
+            site.function,
+            existing_block,
+            InstructionKind::FetchProperty {
+                dst,
+                object: Operand::Register(object.register),
+                property: target.property.clone(),
+            },
+            site.span,
+        );
+        self.jump_if_open(
+            builder,
+            site.function,
+            existing_block,
+            after_block,
+            site.span,
+        );
+
+        let value = self.lower_expr_to_register(builder, site.function, assign_block, right)?;
+        let assign = builder.emit(
+            site.function,
+            value.block,
+            InstructionKind::AssignProperty {
+                dst,
+                object: Operand::Register(object.register),
+                property: target.property,
+                value: Operand::Register(value.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            value.block,
+            assign,
+            site.expr,
             site.span,
         );
         self.jump_if_open(builder, site.function, value.block, after_block, site.span);
@@ -11431,7 +11585,7 @@ impl LoweringContext<'_> {
         site: LowerSite,
         target: DimAssignmentTarget,
         operator: &str,
-        left: ExprId,
+        _left: ExprId,
         right: Option<ExprId>,
     ) -> Option<LoweredExpr> {
         let Some(right) = right else {
@@ -11450,8 +11604,42 @@ impl LoweringContext<'_> {
             );
             return None;
         };
-        let old = self.lower_expr_to_register(builder, site.function, site.block, left)?;
-        let rhs = self.lower_expr_to_register(builder, site.function, old.block, right)?;
+        let mut current = site.block;
+        let mut dims = Vec::with_capacity(target.dims.len());
+        for dim in target.dims {
+            let dim_value = self.lower_expr_to_register(builder, site.function, current, dim)?;
+            current = dim_value.block;
+            dims.push(Operand::Register(dim_value.register));
+        }
+        let array = builder.alloc_register(site.function);
+        let load = builder.emit(
+            site.function,
+            current,
+            InstructionKind::LoadLocal {
+                dst: array,
+                local: target.local,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, load, site.expr, site.span);
+        let mut old = array;
+        for dim in &dims {
+            let fetched = builder.alloc_register(site.function);
+            let fetch = builder.emit(
+                site.function,
+                current,
+                InstructionKind::FetchDim {
+                    dst: fetched,
+                    array: Operand::Register(old),
+                    key: *dim,
+                    quiet: false,
+                },
+                site.span,
+            );
+            self.add_expr_source_map(builder, site.function, current, fetch, site.expr, site.span);
+            old = fetched;
+        }
+        let rhs = self.lower_expr_to_register(builder, site.function, current, right)?;
         let value = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
@@ -11459,7 +11647,7 @@ impl LoweringContext<'_> {
             InstructionKind::Binary {
                 dst: value,
                 op: binary,
-                lhs: Operand::Register(old.register),
+                lhs: Operand::Register(old),
                 rhs: Operand::Register(rhs.register),
             },
             site.span,
@@ -11472,14 +11660,30 @@ impl LoweringContext<'_> {
             site.expr,
             site.span,
         );
-        self.lower_dim_assign_value_to_register(
-            builder,
-            site,
+        let dst = builder.alloc_register(site.function);
+        let assign = builder.emit(
+            site.function,
             rhs.block,
-            target,
-            Operand::Register(value),
-            value,
-        )
+            InstructionKind::AssignDim {
+                dst,
+                local: target.local,
+                dims,
+                value: Operand::Register(value),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            rhs.block,
+            assign,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: value,
+            block: rhs.block,
+        })
     }
 
     fn lower_dim_assign_to_register(
@@ -14960,6 +15164,38 @@ fn destructuring_key(module: &HirModule, index: usize, key: Option<ExprId>) -> O
         HirExprKind::Literal { text } => literal_constant(text),
         _ => None,
     }
+}
+
+fn destructuring_patterns(
+    module: &HirModule,
+    expr: ExprId,
+) -> Option<Vec<(IrConstant, DestructuringPattern)>> {
+    let expression = module.expressions().get(expr)?;
+    let elements = match expression.kind().clone() {
+        HirExprKind::Array { elements } | HirExprKind::List { elements } => elements,
+        _ => return None,
+    };
+    let mut patterns = Vec::new();
+    for (index, element) in elements.into_iter().enumerate() {
+        let element_expression = module.expressions().get(element)?;
+        let (key, value) = match element_expression.kind().clone() {
+            HirExprKind::ArrayPair {
+                key,
+                value: Some(value),
+                unpack: false,
+                by_ref: false,
+            } => (destructuring_key(module, index, key)?, value),
+            HirExprKind::ArrayPair { .. } => return None,
+            _ => (IrConstant::Int(index.try_into().ok()?), element),
+        };
+        let pattern = if let Some(children) = destructuring_patterns(module, value) {
+            DestructuringPattern::Nested(children)
+        } else {
+            DestructuringPattern::Expr(value)
+        };
+        patterns.push((key, pattern));
+    }
+    Some(patterns)
 }
 
 fn negate_ir_constant(value: IrConstant) -> Option<IrConstant> {

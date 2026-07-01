@@ -1666,7 +1666,7 @@ impl FunctionCall<'_> {
         declaring_class: impl Into<String>,
     ) -> Self {
         self.scope_class = Some(normalize_class_name(&scope_class.into()));
-        self.called_class = Some(normalize_class_name(&called_class.into()));
+        self.called_class = Some(display_class_name(&called_class.into()));
         self.declaring_class = Some(normalize_class_name(&declaring_class.into()));
         self
     }
@@ -15406,6 +15406,21 @@ impl Vm {
                         class_name,
                         constant,
                     } => {
+                        if constant.eq_ignore_ascii_case("class")
+                            && normalize_class_name(class_name) == "static"
+                            && let Some(called_class) =
+                                current_called_class_display(compiled, stack)
+                        {
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::String(PhpString::from_test_str(&called_class)))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if let Err(result) = self.autoload_static_class_if_missing(
                             compiled,
                             class_name,
@@ -26359,7 +26374,7 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => {
-                let called_class = normalize_class_name(class_name);
+                let called_class = class.display_name.clone();
                 return match self.call_magic_static_method(
                     compiled,
                     &class,
@@ -26415,7 +26430,7 @@ impl Vm {
                 .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_class_context(
                     resolved.class.name.clone(),
-                    normalize_class_name(class_name),
+                    class.display_name.clone(),
                     resolved.class.name.clone(),
                 )
                 .with_optional_call_span(call_span),
@@ -38272,10 +38287,10 @@ fn called_class_for_static_call(
     resolved_class: &php_ir::module::ClassEntry,
 ) -> String {
     match normalize_class_name(class_name).as_str() {
-        "self" | "static" | "parent" => current_called_class(compiled, stack)
-            .or_else(|| current_scope_class(compiled, stack))
-            .unwrap_or_else(|| normalize_class_name(&resolved_class.name)),
-        _ => normalize_class_name(&resolved_class.name),
+        "self" | "static" | "parent" => current_called_class_display(compiled, stack)
+            .or_else(|| current_scope_class_display(compiled, stack))
+            .unwrap_or_else(|| resolved_class.display_name.clone()),
+        _ => resolved_class.display_name.clone(),
     }
 }
 
@@ -38292,9 +38307,13 @@ fn method_lookup_scope_for_static_call(
 }
 
 fn current_scope_class(compiled: &CompiledUnit, stack: &CallStack) -> Option<String> {
+    current_scope_class_display(compiled, stack).map(|class| normalize_class_name(&class))
+}
+
+fn current_scope_class_display(compiled: &CompiledUnit, stack: &CallStack) -> Option<String> {
     let frame = stack.current()?;
     if let Some(scope) = frame.scope_class.as_deref() {
-        return Some(normalize_class_name(scope));
+        return Some(scope.to_owned());
     }
     let function = compiled.unit().functions.get(frame.function.index())?;
     function
@@ -38304,7 +38323,7 @@ fn current_scope_class(compiled: &CompiledUnit, stack: &CallStack) -> Option<Str
             function
                 .name
                 .split_once("::")
-                .map(|(class, _)| normalize_class_name(class))
+                .map(|(class, _)| class.to_owned())
         })
         .flatten()
 }
@@ -38324,12 +38343,16 @@ fn current_this_object(compiled: &CompiledUnit, stack: &CallStack) -> Option<Obj
 }
 
 fn current_called_class(compiled: &CompiledUnit, stack: &CallStack) -> Option<String> {
+    current_called_class_display(compiled, stack).map(|class| normalize_class_name(&class))
+}
+
+fn current_called_class_display(compiled: &CompiledUnit, stack: &CallStack) -> Option<String> {
     let frame = stack.current()?;
     frame
         .called_class
         .as_deref()
-        .map(normalize_class_name)
-        .or_else(|| current_scope_class(compiled, stack))
+        .map(ToOwned::to_owned)
+        .or_else(|| current_scope_class_display(compiled, stack))
 }
 
 fn class_is_or_extends(
@@ -46837,7 +46860,7 @@ fn autoload_callback_from_value(
                     let resolved = autoload_resolve_method(compiled, state, &class_name, &method)?;
                     if resolved.method.flags.is_static {
                         Ok(CallableValue::BoundMethod {
-                            target: CallableMethodTarget::Class(normalize_class_name(&class_name)),
+                            target: CallableMethodTarget::Class(object.display_name()),
                             method,
                             scope: Some(normalize_class_name(&class_name)),
                         })
@@ -46902,8 +46925,11 @@ fn autoload_class_method_callback(
             resolved.class.display_name, method
         ));
     }
+    let target_display = lookup_class_in_state(compiled, state, class_name)
+        .map(|class| class.display_name)
+        .unwrap_or_else(|| display_class_name(class_name));
     Ok(CallableValue::BoundMethod {
-        target: CallableMethodTarget::Class(normalize_class_name(class_name)),
+        target: CallableMethodTarget::Class(target_display),
         method: method.to_owned(),
         scope: Some(normalize_class_name(&resolved.class.name)),
     })

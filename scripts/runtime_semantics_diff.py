@@ -52,6 +52,7 @@ CATEGORIES = (
     "statics",
     "real_world",
     "wordpress_blockers",
+    "wp_language_vm",
     "regressions",
     "known_gaps",
 )
@@ -238,6 +239,24 @@ def load_fixture(path: Path, fixtures_root: Path) -> Fixture:
 
 
 def validate_fixture_metadata(fixture: Fixture) -> None:
+    if fixture.category == "wp_language_vm":
+        required = ("wordpress_error_class", "fixture_id", "wp_area")
+        missing = [key for key in required if key not in fixture.metadata]
+        if missing:
+            raise HarnessError(
+                f"{fixture.path}: wp_language_vm fixture missing metadata: {', '.join(missing)}"
+            )
+        supported_classes = {
+            "frontend_lowering",
+            "runtime_dispatch",
+            "runtime_semantics",
+        }
+        error_class = fixture.metadata["wordpress_error_class"]
+        if error_class not in supported_classes:
+            raise HarnessError(
+                f"{fixture.path}: unsupported wordpress_error_class {error_class!r}"
+            )
+
     if fixture.category != "regressions":
         return
     required = ("regression_category", "reference_behavior", "regression_case")
@@ -393,12 +412,19 @@ def result(
     rust: dict | None,
     message: str | None,
 ) -> dict:
+    diagnostics = diagnostic_entries(rust)
     return {
         "file": str(fixture.path),
         "category": fixture.category,
         "expect": fixture.expect,
         "status": status,
         "failure_category": failure_category(fixture, status, reference, rust, message),
+        "wordpress_error_class": fixture.metadata.get("wordpress_error_class"),
+        "fixture_id": fixture.metadata.get("fixture_id"),
+        "diagnostic_ids": [entry["id"] for entry in diagnostics if entry.get("id")],
+        "primary_diagnostic": diagnostics[0] if diagnostics else None,
+        "unsupported_operation": first_unsupported_operation(diagnostics, rust, message),
+        "reduced_fixture": fixture.category == "wp_language_vm",
         "known_gap_id": fixture.known_gap_id,
         "metadata": fixture.metadata,
         "reference": reference,
@@ -444,6 +470,59 @@ def failure_category(
     if rust and rust.get("status") == "error":
         return "vm_runtime"
     return "vm_runtime"
+
+
+def diagnostic_entries(rust: dict | None) -> list[dict]:
+    if not rust:
+        return []
+    entries: list[dict] = []
+    text = "\n".join(
+        str(value or "")
+        for value in (rust.get("stderr_normalized"), rust.get("stderr"))
+    )
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if "runtime-diagnostic:" not in line:
+            continue
+        payload = line.split("runtime-diagnostic:", 1)[1].strip()
+        try:
+            entry = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        key = json.dumps(entry, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+    for diagnostic_id in re.findall(r"\bE_PHP_[A-Z0-9_]+\b", text):
+        if any(entry.get("id") == diagnostic_id for entry in entries):
+            continue
+        entries.append({"id": diagnostic_id})
+    return entries
+
+
+def first_unsupported_operation(
+    diagnostics: list[dict],
+    rust: dict | None,
+    message: str | None,
+) -> str | None:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            message,
+            *(entry.get("message") for entry in diagnostics),
+            rust.get("stderr_normalized") if rust else None,
+            rust.get("stderr") if rust else None,
+        )
+    )
+    match = re.search(
+        r"(unsupported [^.;\n]+|not implemented[^.;\n]*|unknown [^.;\n]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def summarize(results: list[dict]) -> dict:
