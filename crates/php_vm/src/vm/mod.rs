@@ -9558,7 +9558,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<Value, VmResult> {
-        let span = call_span.unwrap_or(IrSpan::default());
+        let span = call_span.unwrap_or_default();
         self.call_userland_arrayaccess_method(
             compiled,
             output,

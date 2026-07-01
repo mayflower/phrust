@@ -9491,10 +9491,11 @@ impl LoweringContext<'_> {
                 block: site.block,
             });
         }
-        if let Some(target) = self.dim_assignment_target(builder, site.function, left) {
-            if !target.append && !target.dims.is_empty() {
-                return self.lower_quiet_dim_target_to_register(builder, site, target, left);
-            }
+        if let Some(target) = self.dim_assignment_target(builder, site.function, left)
+            && !target.append
+            && !target.dims.is_empty()
+        {
+            return self.lower_quiet_dim_target_to_register(builder, site, target, left);
         }
         self.lower_expr_to_register(builder, site.function, site.block, left)
     }

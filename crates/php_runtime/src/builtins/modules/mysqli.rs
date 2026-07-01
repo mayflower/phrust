@@ -338,14 +338,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_query(
     let Some(id) = mysqli_connection_id(&object) else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_QUERY_FAILED",
-            "mysqli_query",
-            "query",
-            "invalid_handle",
-            MysqliDiagnosticTarget::default(),
-            1,
-            "HY000",
-            "not an open MySQL connection",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_QUERY_FAILED",
+                "mysqli_query",
+                "query",
+                "invalid_handle",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(1, "HY000", "not an open MySQL connection"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -354,14 +354,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_query(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_query",
-            "query",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_query",
+                "query",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -383,11 +383,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_query(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_QUERY_FAILED",
-                "mysqli_query",
-                "query",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_QUERY_FAILED",
+                    "mysqli_query",
+                    "query",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -446,7 +448,7 @@ pub(in crate::builtins::modules) fn builtin_mysqli_fetch_object(
     let object = ObjectRef::new_with_display_name(&mysqli_runtime_class(&class_name), &class_name);
     for (key, value) in row.iter() {
         if let ArrayKey::String(name) = key {
-            object.set_property(&name.to_string_lossy(), value.clone());
+            object.set_property(name.to_string_lossy(), value.clone());
         }
     }
     Ok(Value::Object(object))
@@ -756,14 +758,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_select_db(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_select_db",
-            "select_db",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_select_db",
+                "select_db",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -775,11 +777,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_select_db(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_QUERY_FAILED",
-                "mysqli_select_db",
-                "select_db",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_QUERY_FAILED",
+                    "mysqli_select_db",
+                    "select_db",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -802,14 +806,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_set_charset(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_set_charset",
-            "set_charset",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_set_charset",
+                "set_charset",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -821,11 +825,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_set_charset(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_QUERY_FAILED",
-                "mysqli_set_charset",
-                "set_charset",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_QUERY_FAILED",
+                    "mysqli_set_charset",
+                    "set_charset",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -848,14 +854,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_prepare(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_prepare",
-            "prepare",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_prepare",
+                "prepare",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -868,11 +874,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_prepare(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_PREPARE_FAILED",
-                "mysqli_prepare",
-                "prepare",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_PREPARE_FAILED",
+                    "mysqli_prepare",
+                    "prepare",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -914,14 +922,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_stmt_prepare(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_stmt_prepare",
-            "stmt_prepare",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_stmt_prepare",
+                "stmt_prepare",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -937,11 +945,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_stmt_prepare(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_PREPARE_FAILED",
-                "mysqli_stmt_prepare",
-                "stmt_prepare",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_PREPARE_FAILED",
+                    "mysqli_stmt_prepare",
+                    "stmt_prepare",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -961,14 +971,18 @@ pub(in crate::builtins::modules) fn builtin_mysqli_stmt_bind_param(
     if types.chars().count() != args.len().saturating_sub(2) {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_STMT_BIND_FAILED",
-            "mysqli_stmt_bind_param",
-            "stmt_bind_param",
-            "enabled",
-            MysqliDiagnosticTarget::default_enabled(),
-            1,
-            "HY000",
-            "mysqli_stmt_bind_param type string length does not match bound parameters",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_STMT_BIND_FAILED",
+                "mysqli_stmt_bind_param",
+                "stmt_bind_param",
+                "enabled",
+                MysqliDiagnosticTarget::default_enabled(),
+            )
+            .with_mysql_error(
+                1,
+                "HY000",
+                "mysqli_stmt_bind_param type string length does not match bound parameters",
+            ),
             span,
         );
         return Ok(Value::Bool(false));
@@ -1003,14 +1017,14 @@ pub(in crate::builtins::modules) fn builtin_mysqli_stmt_execute(
     let Some(state) = context.mysql_state() else {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            "mysqli_stmt_execute",
-            "stmt_execute",
-            "runtime_state_unavailable",
-            MysqliDiagnosticTarget::default(),
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                "mysqli_stmt_execute",
+                "stmt_execute",
+                "runtime_state_unavailable",
+                MysqliDiagnosticTarget::default(),
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -1026,11 +1040,13 @@ pub(in crate::builtins::modules) fn builtin_mysqli_stmt_execute(
             let _ = state;
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_STMT_EXECUTE_FAILED",
-                "mysqli_stmt_execute",
-                "stmt_execute",
-                "enabled",
-                MysqliDiagnosticTarget::default_enabled(),
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_STMT_EXECUTE_FAILED",
+                    "mysqli_stmt_execute",
+                    "stmt_execute",
+                    "enabled",
+                    MysqliDiagnosticTarget::default_enabled(),
+                ),
                 &error,
                 span,
             );
@@ -1218,14 +1234,14 @@ fn connect_from_mysqli_args(
     if context.mysql_state().is_none() {
         record_mysqli_diagnostic(
             context,
-            "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-            function_name,
-            "connect",
-            "runtime_state_unavailable",
-            target,
-            2002,
-            "HY000",
-            "mysqli runtime state is unavailable",
+            mysqli_diagnostic_meta(
+                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                function_name,
+                "connect",
+                "runtime_state_unavailable",
+                target,
+            )
+            .with_mysql_error(2002, "HY000", "mysqli runtime state is unavailable"),
             span,
         );
         return Ok(Value::Bool(false));
@@ -1240,11 +1256,13 @@ fn connect_from_mysqli_args(
             Err(error) => {
                 record_mysqli_error_diagnostic(
                     context,
-                    "E_PHP_MYSQLI_CONNECTION_FAILED",
-                    function_name,
-                    "connect",
-                    "sqlite_compat_enabled",
-                    target,
+                    mysqli_diagnostic_meta(
+                        "E_PHP_MYSQLI_CONNECTION_FAILED",
+                        function_name,
+                        "connect",
+                        "sqlite_compat_enabled",
+                        target,
+                    ),
                     &error,
                     span,
                 );
@@ -1262,14 +1280,14 @@ fn connect_from_mysqli_args(
             }
             record_mysqli_diagnostic(
                 context,
-                "E_PHP_MYSQLI_CAPABILITY_DISABLED",
-                function_name,
-                "connect",
-                "disabled",
-                target,
-                2002,
-                "HY000",
-                message,
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_CAPABILITY_DISABLED",
+                    function_name,
+                    "connect",
+                    "disabled",
+                    target,
+                )
+                .with_mysql_error(2002, "HY000", message),
                 span,
             );
             return Ok(Value::Bool(false));
@@ -1289,11 +1307,13 @@ fn connect_from_mysqli_args(
                 Err(error) => {
                     record_mysqli_error_diagnostic(
                         context,
-                        "E_PHP_MYSQLI_CONNECTION_FAILED",
-                        function_name,
-                        "connect",
-                        "enabled",
-                        target,
+                        mysqli_diagnostic_meta(
+                            "E_PHP_MYSQLI_CONNECTION_FAILED",
+                            function_name,
+                            "connect",
+                            "enabled",
+                            target,
+                        ),
                         &error,
                         span,
                     );
@@ -1307,11 +1327,13 @@ fn connect_from_mysqli_args(
             }
             record_mysqli_error_diagnostic(
                 context,
-                "E_PHP_MYSQLI_CONNECTION_FAILED",
-                function_name,
-                "connect",
-                "enabled",
-                target,
+                mysqli_diagnostic_meta(
+                    "E_PHP_MYSQLI_CONNECTION_FAILED",
+                    function_name,
+                    "connect",
+                    "enabled",
+                    target,
+                ),
                 &error,
                 span,
             );
@@ -1375,42 +1397,88 @@ fn diagnostic_int_arg(value: &Value) -> Option<i64> {
     }
 }
 
-fn record_mysqli_error_diagnostic(
-    context: &mut BuiltinContext<'_>,
+struct MysqliDiagnosticMeta {
     diagnostic_id: &'static str,
     function_name: &'static str,
     operation: &'static str,
     capability_state: &'static str,
     target: MysqliDiagnosticTarget,
-    error: &MysqlError,
-    span: RuntimeSourceSpan,
-) {
-    record_mysqli_diagnostic(
-        context,
+}
+
+impl MysqliDiagnosticMeta {
+    fn with_mysql_error(
+        self,
+        mysql_error_code: i64,
+        mysql_sqlstate: impl Into<String>,
+        mysql_error_message: impl Into<String>,
+    ) -> MysqliDiagnostic {
+        MysqliDiagnostic {
+            meta: self,
+            mysql_error_code,
+            mysql_sqlstate: mysql_sqlstate.into(),
+            mysql_error_message: mysql_error_message.into(),
+        }
+    }
+
+    fn with_error_detail(self, error: &MysqlError) -> MysqliDiagnostic {
+        self.with_mysql_error(
+            error.mysql_errno(),
+            error.mysql_sqlstate(),
+            error.message.clone(),
+        )
+    }
+}
+
+fn mysqli_diagnostic_meta(
+    diagnostic_id: &'static str,
+    function_name: &'static str,
+    operation: &'static str,
+    capability_state: &'static str,
+    target: MysqliDiagnosticTarget,
+) -> MysqliDiagnosticMeta {
+    MysqliDiagnosticMeta {
         diagnostic_id,
         function_name,
         operation,
         capability_state,
         target,
-        error.mysql_errno(),
-        error.mysql_sqlstate(),
-        &error.message,
-        span,
-    );
+    }
+}
+
+struct MysqliDiagnostic {
+    meta: MysqliDiagnosticMeta,
+    mysql_error_code: i64,
+    mysql_sqlstate: String,
+    mysql_error_message: String,
+}
+
+fn record_mysqli_error_diagnostic(
+    context: &mut BuiltinContext<'_>,
+    diagnostic: MysqliDiagnosticMeta,
+    error: &MysqlError,
+    span: RuntimeSourceSpan,
+) {
+    record_mysqli_diagnostic(context, diagnostic.with_error_detail(error), span);
 }
 
 fn record_mysqli_diagnostic(
     context: &mut BuiltinContext<'_>,
-    diagnostic_id: &'static str,
-    function_name: &'static str,
-    operation: &'static str,
-    capability_state: &'static str,
-    target: MysqliDiagnosticTarget,
-    mysql_error_code: i64,
-    mysql_sqlstate: &str,
-    mysql_error_message: impl AsRef<str>,
+    diagnostic: MysqliDiagnostic,
     span: RuntimeSourceSpan,
 ) {
+    let MysqliDiagnostic {
+        meta,
+        mysql_error_code,
+        mysql_sqlstate,
+        mysql_error_message,
+    } = diagnostic;
+    let MysqliDiagnosticMeta {
+        diagnostic_id,
+        function_name,
+        operation,
+        capability_state,
+        target,
+    } = meta;
     let report_flags = context
         .mysql_state()
         .map_or(0, |state| state.report_flags());
@@ -1419,7 +1487,7 @@ fn record_mysqli_diagnostic(
     } else {
         RuntimeSeverity::Warning
     };
-    let mysql_error_message = sanitize_mysql_error(mysql_error_message.as_ref());
+    let mysql_error_message = sanitize_mysql_error(&mysql_error_message);
     let payload = WordPressDiagnosticContext::new("db_network")
         .with_field("diagnostic_id", diagnostic_id)
         .with_field("function_name", function_name)

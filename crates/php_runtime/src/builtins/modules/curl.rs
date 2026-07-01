@@ -305,13 +305,15 @@ pub(in crate::builtins::modules) fn builtin_curl_setopt(
             set_curl_error(&handle, 48, "unsupported cURL option");
             record_curl_diagnostic(
                 context,
-                "E_PHP_CURL_OPTION_UNSUPPORTED",
-                "curl_setopt",
-                "set_option",
-                "enabled",
                 &handle,
-                48,
-                "unsupported cURL option",
+                CurlDiagnostic::new(
+                    "E_PHP_CURL_OPTION_UNSUPPORTED",
+                    "curl_setopt",
+                    "set_option",
+                    "enabled",
+                    48,
+                    "unsupported cURL option",
+                ),
                 span.clone(),
             );
             return Ok(Value::Bool(false));
@@ -345,13 +347,15 @@ pub(in crate::builtins::modules) fn builtin_curl_setopt_array(
         if !matches!(ok, Value::Bool(true)) {
             record_curl_diagnostic(
                 context,
-                "E_PHP_CURL_OPTION_UNSUPPORTED",
-                "curl_setopt_array",
-                "set_option",
-                "enabled",
                 &handle,
-                48,
-                "unsupported cURL option",
+                CurlDiagnostic::new(
+                    "E_PHP_CURL_OPTION_UNSUPPORTED",
+                    "curl_setopt_array",
+                    "set_option",
+                    "enabled",
+                    48,
+                    "unsupported cURL option",
+                ),
                 span,
             );
             return Ok(Value::Bool(false));
@@ -375,13 +379,15 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
         );
         record_curl_diagnostic(
             context,
-            "E_PHP_CURL_CAPABILITY_DISABLED",
-            "curl_exec",
-            "http_request",
-            "disabled",
             &handle,
-            1,
-            format!("network cURL requests require {PHRUST_NET_TESTS_ENV}=1"),
+            CurlDiagnostic::new(
+                "E_PHP_CURL_CAPABILITY_DISABLED",
+                "curl_exec",
+                "http_request",
+                "disabled",
+                1,
+                format!("network cURL requests require {PHRUST_NET_TESTS_ENV}=1"),
+            ),
             span,
         );
         return Ok(Value::Bool(false));
@@ -392,13 +398,15 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
             set_curl_error(&handle, code, message.clone());
             record_curl_diagnostic(
                 context,
-                "E_PHP_CURL_REQUEST_FAILED",
-                "curl_exec",
-                "build_request",
-                "enabled",
                 &handle,
-                code,
-                message,
+                CurlDiagnostic::new(
+                    "E_PHP_CURL_REQUEST_FAILED",
+                    "curl_exec",
+                    "build_request",
+                    "enabled",
+                    code,
+                    message,
+                ),
                 span,
             );
             return Ok(Value::Bool(false));
@@ -411,13 +419,15 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
             set_curl_error(&handle, code, message.clone());
             record_curl_diagnostic(
                 context,
-                "E_PHP_CURL_REQUEST_FAILED",
-                "curl_exec",
-                "execute_request",
-                "enabled",
                 &handle,
-                code,
-                message,
+                CurlDiagnostic::new(
+                    "E_PHP_CURL_REQUEST_FAILED",
+                    "curl_exec",
+                    "execute_request",
+                    "enabled",
+                    code,
+                    message,
+                ),
                 span,
             );
             return Ok(Value::Bool(false));
@@ -427,13 +437,15 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
         set_curl_error(&handle, 22, "HTTP response code said error");
         record_curl_diagnostic(
             context,
-            "E_PHP_CURL_REQUEST_FAILED",
-            "curl_exec",
-            "http_status",
-            "enabled",
             &handle,
-            22,
-            "HTTP response code said error",
+            CurlDiagnostic::new(
+                "E_PHP_CURL_REQUEST_FAILED",
+                "curl_exec",
+                "http_status",
+                "enabled",
+                22,
+                "HTTP response code said error",
+            ),
             span,
         );
         return Ok(Value::Bool(false));
@@ -995,24 +1007,52 @@ fn set_curl_error(handle: &ObjectRef, errno: i64, error: impl Into<String>) {
     );
 }
 
-fn record_curl_diagnostic(
-    context: &mut BuiltinContext<'_>,
+struct CurlDiagnostic {
     diagnostic_id: &'static str,
     function_name: &'static str,
     operation: &'static str,
     capability_state: &'static str,
-    handle: &ObjectRef,
     error_code: i64,
-    error_message: impl AsRef<str>,
+    error_message: String,
+}
+
+impl CurlDiagnostic {
+    fn new(
+        diagnostic_id: &'static str,
+        function_name: &'static str,
+        operation: &'static str,
+        capability_state: &'static str,
+        error_code: i64,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            diagnostic_id,
+            function_name,
+            operation,
+            capability_state,
+            error_code,
+            error_message: error_message.into(),
+        }
+    }
+}
+
+fn record_curl_diagnostic(
+    context: &mut BuiltinContext<'_>,
+    handle: &ObjectRef,
+    diagnostic: CurlDiagnostic,
     span: RuntimeSourceSpan,
 ) {
     let (host, port) = curl_diagnostic_endpoint(handle);
-    let error_message = error_message.as_ref().chars().take(512).collect::<String>();
+    let error_message = diagnostic
+        .error_message
+        .chars()
+        .take(512)
+        .collect::<String>();
     let payload = WordPressDiagnosticContext::new("db_network")
-        .with_field("diagnostic_id", diagnostic_id)
-        .with_field("function_name", function_name)
-        .with_field("operation", operation)
-        .with_field("capability_state", capability_state)
+        .with_field("diagnostic_id", diagnostic.diagnostic_id)
+        .with_field("function_name", diagnostic.function_name)
+        .with_field("operation", diagnostic.operation)
+        .with_field("capability_state", diagnostic.capability_state)
         .with_field("dsn_present_boolean", "false")
         .with_field("host", host)
         .with_field(
@@ -1020,13 +1060,13 @@ fn record_curl_diagnostic(
             port.map(|port| port.to_string()).unwrap_or_default(),
         )
         .with_field("database_name_if_nonsecret", "")
-        .with_field("mysql_error_code", error_code.to_string())
+        .with_field("mysql_error_code", diagnostic.error_code.to_string())
         .with_field("mysql_sqlstate", "")
         .with_field("mysql_error_message", error_message.clone())
-        .with_field("curl_error_code", error_code.to_string());
+        .with_field("curl_error_code", diagnostic.error_code.to_string());
     context.record_diagnostic(
         RuntimeDiagnostic::new(
-            diagnostic_id,
+            diagnostic.diagnostic_id,
             RuntimeSeverity::Warning,
             error_message,
             span,

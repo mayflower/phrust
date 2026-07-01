@@ -874,12 +874,14 @@ async fn handle(
                 &state,
                 &parts,
                 Some(&request_id),
-                "E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED",
-                "routing",
-                "server could not resolve a PHP script for the request",
-                "resolve_route",
-                parts.uri.path(),
-                "",
+                RequestDiagnostic::new(
+                    "E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED",
+                    "routing",
+                    "server could not resolve a PHP script for the request",
+                    "resolve_route",
+                    parts.uri.path(),
+                    "",
+                ),
             );
             (
                 response::text(StatusCode::NOT_FOUND, "not found\n"),
@@ -892,12 +894,14 @@ async fn handle(
                 &state,
                 &parts,
                 Some(&request_id),
-                "E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT",
-                "routing",
-                "server rejected a path outside the document root",
-                "resolve_route",
-                parts.uri.path(),
-                "",
+                RequestDiagnostic::new(
+                    "E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT",
+                    "routing",
+                    "server rejected a path outside the document root",
+                    "resolve_route",
+                    parts.uri.path(),
+                    "",
+                ),
             );
             (
                 response::text(StatusCode::FORBIDDEN, "forbidden\n"),
@@ -910,12 +914,14 @@ async fn handle(
                 &state,
                 &parts,
                 Some(&request_id),
-                "E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED",
-                "routing",
-                "server could not parse the request path for script resolution",
-                "resolve_route",
-                parts.uri.path(),
-                "",
+                RequestDiagnostic::new(
+                    "E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED",
+                    "routing",
+                    "server could not parse the request path for script resolution",
+                    "resolve_route",
+                    parts.uri.path(),
+                    "",
+                ),
             );
             (
                 response::text(StatusCode::BAD_REQUEST, "bad request\n"),
@@ -1001,16 +1007,40 @@ fn header_debug_value(headers: &HeaderMap, name: HeaderName) -> String {
     }
 }
 
+struct RequestDiagnostic<'a> {
+    code: &'a str,
+    phase: &'a str,
+    message: &'a str,
+    function_name: &'a str,
+    path_attempted: &'a str,
+    script_filename: &'a str,
+}
+
+impl<'a> RequestDiagnostic<'a> {
+    fn new(
+        code: &'a str,
+        phase: &'a str,
+        message: &'a str,
+        function_name: &'a str,
+        path_attempted: &'a str,
+        script_filename: &'a str,
+    ) -> Self {
+        Self {
+            code,
+            phase,
+            message,
+            function_name,
+            path_attempted,
+            script_filename,
+        }
+    }
+}
+
 fn emit_request_diagnostic(
     state: &AppState,
     parts: &Parts,
     request_id: Option<&str>,
-    code: &str,
-    phase: &str,
-    message: &str,
-    function_name: &str,
-    path_attempted: &str,
-    script_filename: &str,
+    diagnostic: RequestDiagnostic<'_>,
 ) {
     let uri = parts.uri.path_and_query().map_or_else(
         || parts.uri.path().to_string(),
@@ -1025,18 +1055,27 @@ fn emit_request_diagnostic(
     emit_server_debug(
         state,
         request_id,
-        code,
-        phase,
-        message,
+        diagnostic.code,
+        diagnostic.phase,
+        diagnostic.message,
         BTreeMap::from([
             ("method".to_string(), parts.method.to_string()),
             ("uri".to_string(), uri),
-            ("script_filename".to_string(), script_filename.to_string()),
+            (
+                "script_filename".to_string(),
+                diagnostic.script_filename.to_string(),
+            ),
             ("document_root".to_string(), document_root.clone()),
             ("cwd".to_string(), document_root),
-            ("path_attempted".to_string(), path_attempted.to_string()),
+            (
+                "path_attempted".to_string(),
+                diagnostic.path_attempted.to_string(),
+            ),
             ("allowed_roots".to_string(), allowed_roots),
-            ("function_name".to_string(), function_name.to_string()),
+            (
+                "function_name".to_string(),
+                diagnostic.function_name.to_string(),
+            ),
         ]),
     );
 }
@@ -1607,12 +1646,14 @@ async fn execute_php_request(
                 &state,
                 &parts,
                 Some(&request_id),
-                "E_PHP_REQUEST_BODY_PARSE_FAILED",
-                "body_read",
-                "server could not read the request body",
-                "read_limited_body",
-                parts.uri.path(),
-                &script_filename,
+                RequestDiagnostic::new(
+                    "E_PHP_REQUEST_BODY_PARSE_FAILED",
+                    "body_read",
+                    "server could not read the request body",
+                    "read_limited_body",
+                    parts.uri.path(),
+                    &script_filename,
+                ),
             );
             warn!(%peer, "failed to read request body");
             return (
@@ -1798,12 +1839,14 @@ async fn execute_php_request(
                 &state,
                 &parts,
                 Some(&request_id),
-                "E_PHP_SESSION_STORE_UNAVAILABLE",
-                "session",
-                "server session store failed while preparing request state",
-                "seed_session_state",
-                parts.uri.path(),
-                &script_path.display().to_string(),
+                RequestDiagnostic::new(
+                    "E_PHP_SESSION_STORE_UNAVAILABLE",
+                    "session",
+                    "server session store failed while preparing request state",
+                    "seed_session_state",
+                    parts.uri.path(),
+                    &script_path.display().to_string(),
+                ),
             );
             emit_server_debug(
                 &state,
@@ -1905,12 +1948,14 @@ async fn execute_php_request(
                     &state,
                     &parts,
                     Some(&request_id),
-                    "E_PHP_SESSION_STORE_UNAVAILABLE",
-                    "session",
-                    "server session store failed while finalizing request state",
-                    "finalize_session_state",
-                    parts.uri.path(),
-                    &script_log_path.display().to_string(),
+                    RequestDiagnostic::new(
+                        "E_PHP_SESSION_STORE_UNAVAILABLE",
+                        "session",
+                        "server session store failed while finalizing request state",
+                        "finalize_session_state",
+                        parts.uri.path(),
+                        &script_log_path.display().to_string(),
+                    ),
                 );
                 emit_server_debug(
                     &state,
@@ -2147,12 +2192,14 @@ fn multipart_error_response(
         state,
         parts,
         Some(request_id),
-        "E_PHP_REQUEST_BODY_PARSE_FAILED",
-        "multipart",
-        "server could not parse multipart request body",
-        "parse_multipart_into_context",
-        parts.uri.path(),
-        &script_path.display().to_string(),
+        RequestDiagnostic::new(
+            "E_PHP_REQUEST_BODY_PARSE_FAILED",
+            "multipart",
+            "server could not parse multipart request body",
+            "parse_multipart_into_context",
+            parts.uri.path(),
+            &script_path.display().to_string(),
+        ),
     );
     match error {
         MultipartError::Malformed => {
