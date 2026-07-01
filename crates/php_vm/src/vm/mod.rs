@@ -9126,6 +9126,7 @@ impl Vm {
         let property_type = ir_runtime_type(resolved.property.type_.as_ref());
         if let Err(message) = check_property_type(
             compiled,
+            Some(state),
             resolved.class.display_name.as_str(),
             property,
             &property_type,
@@ -9506,7 +9507,13 @@ impl Vm {
                 ));
                 Ok(Value::Null)
             }
-            Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => Err(self.runtime_error_with_source_span(
+                output,
+                compiled,
+                stack,
+                runtime_source_span(compiled, span),
+                message,
+            )),
         }
     }
 
@@ -11648,6 +11655,7 @@ impl Vm {
                         let property_type = ir_runtime_type(entry.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             property,
                             &property_type,
@@ -11816,6 +11824,7 @@ impl Vm {
                         let property_type = ir_runtime_type(resolved.property.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             resolved.property.name.as_str(),
                             &property_type,
@@ -14195,6 +14204,7 @@ impl Vm {
                             };
                             if let Err(message) = check_property_type(
                                 compiled,
+                                Some(state),
                                 class.display_name.as_str(),
                                 &property,
                                 &entry.type_,
@@ -17045,6 +17055,7 @@ impl Vm {
                         let property_type = ir_runtime_type(entry.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             property,
                             &property_type,
@@ -17515,6 +17526,7 @@ impl Vm {
                         let property_type = ir_runtime_type(entry.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             &property,
                             &property_type,
@@ -17861,6 +17873,7 @@ impl Vm {
                         let property_type = ir_runtime_type(entry.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             property,
                             &property_type,
@@ -18020,6 +18033,7 @@ impl Vm {
                         let property_type = ir_runtime_type(resolved.property.type_.as_ref());
                         if let Err(message) = check_property_type(
                             compiled,
+                            Some(state),
                             resolved.class.display_name.as_str(),
                             resolved.property.name.as_str(),
                             &property_type,
@@ -18453,8 +18467,15 @@ impl Vm {
                                                     Value::Null
                                                 }
                                                 Err(message) => {
-                                                    return self.runtime_error(
-                                                        output, compiled, stack, message,
+                                                    return self.runtime_error_with_source_span(
+                                                        output,
+                                                        compiled,
+                                                        stack,
+                                                        runtime_source_span(
+                                                            compiled,
+                                                            instruction.span,
+                                                        ),
+                                                        message,
                                                     );
                                                 }
                                             },
@@ -18471,8 +18492,12 @@ impl Vm {
                                                 Value::Null
                                             }
                                             Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
+                                                return self.runtime_error_with_source_span(
+                                                    output,
+                                                    compiled,
+                                                    stack,
+                                                    runtime_source_span(compiled, instruction.span),
+                                                    message,
                                                 );
                                             }
                                         }
@@ -25638,6 +25663,7 @@ impl Vm {
         let property_type = ir_runtime_type(property.type_.as_ref());
         if check_property_type(
             &owner,
+            Some(state),
             declaring_class.display_name.as_str(),
             property.name.as_str(),
             &property_type,
@@ -52243,6 +52269,7 @@ fn coerce_return_value(
 
 fn check_property_type(
     compiled: &CompiledUnit,
+    state: Option<&ExecutionState>,
     class_name: &str,
     property: &str,
     runtime_type: &Option<RuntimeType>,
@@ -52252,7 +52279,7 @@ fn check_property_type(
     let Some(runtime_type) = runtime_type else {
         return Ok(());
     };
-    if vm_value_matches_runtime_type(compiled, None, value, runtime_type, typecheck)? {
+    if vm_value_matches_runtime_type(compiled, state, value, runtime_type, typecheck)? {
         Ok(())
     } else {
         Err(format!(
@@ -52292,7 +52319,10 @@ fn vm_value_matches_runtime_type(
             || value_matches_runtime_type(value, runtime_type),
             |state| value_is_callable(compiled, state, value, false),
         ),
-        RuntimeType::Class { name } => object_instanceof(compiled, value, name)?,
+        RuntimeType::Class { name } => match state {
+            Some(state) => object_instanceof_in_state(compiled, state, value, name)?,
+            None => object_instanceof(compiled, value, name)?,
+        },
         RuntimeType::Nullable { inner } => {
             matches!(value, Value::Null)
                 || vm_value_matches_runtime_type(compiled, state, value, inner, fallback_typecheck)?
@@ -58266,6 +58296,79 @@ good"
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"int(2)\n");
+    }
+
+    #[test]
+    fn param_type_checks_use_runtime_interfaces_from_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-runtime-interface-type-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("contract.php"), "<?php interface I {}\n")
+            .expect("contract include should be written");
+        std::fs::write(
+            root.join("implementation.php"),
+            "<?php class C implements I {}\n",
+        )
+        .expect("implementation include should be written");
+        let source = "<?php
+            include 'contract.php';
+            include 'implementation.php';
+            function accept(?I $value): void {
+                echo $value instanceof I ? 'ok' : 'bad';
+            }
+            accept(new C());
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"ok");
+    }
+
+    #[test]
+    fn property_type_checks_use_runtime_interfaces_from_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-runtime-interface-property-type-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(root.join("contract.php"), "<?php interface I {}\n")
+            .expect("contract include should be written");
+        std::fs::write(
+            root.join("implementation.php"),
+            "<?php class C implements I {}\n",
+        )
+        .expect("implementation include should be written");
+        let source = "<?php
+            include 'contract.php';
+            include 'implementation.php';
+            class Holder {
+                public static ?I $value = null;
+            }
+            Holder::$value = new C();
+            echo Holder::$value instanceof I ? 'ok' : 'bad';
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"ok");
     }
 
     #[test]

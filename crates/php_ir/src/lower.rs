@@ -40,6 +40,7 @@ use php_semantics::hir::{
 use php_semantics::scopes::CaptureMode;
 use php_semantics::symbols::declarations::DeclarationKind;
 use php_semantics::symbols::imports::ImportKind;
+use php_semantics::symbols::resolution::{ResolveContext, ResolvedName};
 use php_semantics::{FrontendResult, SourceMappedId};
 use php_source::{BytePos, SourceText, TextRange};
 use serde::{Deserialize, Serialize};
@@ -632,6 +633,7 @@ struct ClassConstantTarget {
     class_name: String,
     display_class_name: Option<String>,
     constant: String,
+    target_expr: ExprId,
 }
 
 type ClassConstantInitializerMap = HashMap<String, HashMap<String, ConstExprId>>;
@@ -2929,8 +2931,11 @@ impl LoweringContext<'_> {
             HirTypeKind::Never => Some(IrReturnType::Never),
             HirTypeKind::False => Some(IrReturnType::False),
             HirTypeKind::True => Some(IrReturnType::True),
-            HirTypeKind::Named { name, .. } => Some(IrReturnType::Class {
-                name: name.original().to_owned(),
+            HirTypeKind::Named { name, resolved } => Some(IrReturnType::Class {
+                name: resolved
+                    .as_ref()
+                    .map(|resolved| resolved.canonical(NameKind::ClassLike))
+                    .unwrap_or_else(|| name.original().to_owned()),
             }),
             HirTypeKind::Nullable { inner, .. } => {
                 let inner = self.lower_runtime_type(Some(*inner))?;
@@ -6075,9 +6080,10 @@ impl LoweringContext<'_> {
             }
             if target.constant.eq_ignore_ascii_case("class") && !relative_class_name {
                 let dst = builder.alloc_register(site.function);
-                let constant = builder.intern_constant(IrConstant::String(
-                    target.display_class_name.unwrap_or(target.class_name),
-                ));
+                let class_name = self
+                    .class_name_constant_value(target.target_expr)
+                    .unwrap_or_else(|| target.display_class_name.unwrap_or(target.class_name));
+                let constant = builder.intern_constant(IrConstant::String(class_name));
                 let instruction = builder.emit(
                     site.function,
                     site.block,
@@ -6690,6 +6696,15 @@ impl LoweringContext<'_> {
         let (kind, current) =
             if let Some(name) = callee.and_then(|callee| self.static_function_call_name(callee)) {
                 let normalized_name = normalize_function_name(&name);
+                if let Some(lowered) = self.lower_static_property_first_arg_by_ref_call(
+                    builder,
+                    site,
+                    &normalized_name,
+                    &args,
+                    dst,
+                ) {
+                    return Some(lowered);
+                }
                 let (operands, current) =
                     self.lower_call_args_for_function(builder, site, &normalized_name, &args)?;
                 (
@@ -6728,6 +6743,117 @@ impl LoweringContext<'_> {
             current,
             instruction,
             site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: current,
+        })
+    }
+
+    fn lower_static_property_first_arg_by_ref_call(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        normalized_name: &str,
+        args: &[HirCallArg],
+        dst: RegId,
+    ) -> Option<LoweredExpr> {
+        if normalized_function_basename(normalized_name) != "array_unshift" {
+            return None;
+        }
+        let (first, rest) = args.split_first()?;
+        if first.unpack {
+            return None;
+        }
+        let target = self.static_property_target(first.value)?;
+        let mut current = site.block;
+        let property_value = builder.alloc_register(site.function);
+        let fetch = builder.emit(
+            site.function,
+            current,
+            InstructionKind::FetchStaticProperty {
+                dst: property_value,
+                class_name: target.class_name.clone(),
+                property: target.property.clone(),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            current,
+            fetch,
+            first.value,
+            site.span,
+        );
+
+        let local = builder.intern_local(
+            site.function,
+            format!(
+                "__phrust:{normalized_name}-static-property:{}",
+                first.value.raw()
+            ),
+        );
+        builder.emit(
+            site.function,
+            current,
+            InstructionKind::StoreLocal {
+                local,
+                src: Operand::Register(property_value),
+            },
+            site.span,
+        );
+
+        let rest_site = LowerSite {
+            block: current,
+            ..site
+        };
+        let (rest_args, rest_current) =
+            self.lower_call_args_for_function(builder, rest_site, normalized_name, rest)?;
+        current = rest_current;
+        let mut operands = Vec::with_capacity(args.len());
+        operands.push(IrCallArg {
+            name: first.name.clone(),
+            value: Operand::Local(local),
+            unpack: false,
+            value_kind: IrCallArgValueKind::Direct,
+            by_ref_local: Some(local),
+            by_ref_dim: None,
+            by_ref_property: None,
+            by_ref_property_dim: None,
+        });
+        operands.extend(rest_args);
+
+        let call = builder.emit(
+            site.function,
+            current,
+            InstructionKind::CallFunction {
+                dst,
+                name: normalized_name.to_owned(),
+                args: operands,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(builder, site.function, current, call, site.expr, site.span);
+        let writeback = builder.alloc_register(site.function);
+        let assign = builder.emit(
+            site.function,
+            current,
+            InstructionKind::AssignStaticProperty {
+                dst: writeback,
+                class_name: target.class_name,
+                property: target.property,
+                value: Operand::Local(local),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            current,
+            assign,
+            first.value,
             site.span,
         );
         Some(LoweredExpr {
@@ -13041,7 +13167,80 @@ impl LoweringContext<'_> {
             class_name: self.static_class_name((*target)?)?,
             display_class_name: self.static_class_display_name((*target)?),
             constant: self.static_property_name(member_expr)?,
+            target_expr: (*target)?,
         })
+    }
+
+    fn class_name_constant_value(&self, expr: ExprId) -> Option<String> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        let HirExprKind::Name { resolution } = expression.kind() else {
+            return None;
+        };
+        let source = display_class_name(resolution.source());
+        let source_without_namespace = source
+            .strip_prefix("namespace\\")
+            .or_else(|| source.strip_prefix("NAMESPACE\\"))
+            .unwrap_or(&source);
+        if resolution.source().starts_with('\\') {
+            return Some(source_without_namespace.to_owned());
+        }
+
+        let range = self.span_for(SourceMappedId::from(expr));
+        let namespace = module
+            .namespaces()
+            .values()
+            .filter(|namespace| range_contains(namespace.span(), range))
+            .min_by_key(|namespace| {
+                namespace
+                    .span()
+                    .end()
+                    .to_usize()
+                    .saturating_sub(namespace.span().start().to_usize())
+            });
+        if let Some(display_name) = resolved_class_like_display_name(module, resolution) {
+            return Some(display_name);
+        }
+        let first_part = source_without_namespace
+            .split('\\')
+            .next()
+            .unwrap_or_default();
+        if let Some(import) = namespace.and_then(|namespace| {
+            namespace
+                .imports()
+                .lookup(ImportKind::ClassLike, first_part)
+        }) {
+            let mut parts = import
+                .name()
+                .parts()
+                .iter()
+                .map(|part| part.original().to_owned())
+                .collect::<Vec<_>>();
+            parts.extend(
+                source_without_namespace
+                    .split('\\')
+                    .skip(1)
+                    .filter(|part| !part.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+            return Some(parts.join("\\"));
+        }
+
+        if let Some(namespace_name) = namespace.and_then(|namespace| namespace.name()) {
+            if source_without_namespace.is_empty() {
+                return Some(namespace_name.text().to_owned());
+            }
+            return Some(format!(
+                "{}\\{}",
+                namespace_name.text(),
+                source_without_namespace
+            ));
+        }
+
+        Some(source_without_namespace.to_owned())
     }
 
     fn object_class_name_target(&self, expr: ExprId) -> Option<ObjectClassNameTarget> {
@@ -13980,6 +14179,10 @@ fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
 
+fn normalized_function_basename(name: &str) -> &str {
+    name.rsplit('\\').next().unwrap_or(name)
+}
+
 fn qualified_function_name(
     module: &HirModule,
     signature: &FunctionSignature,
@@ -14720,6 +14923,17 @@ fn constant_from_expr_with_class_constants(
                 class_parents,
             )?;
             let member = class_constant_initializer_member_name(module, (*member)?)?;
+            if member.eq_ignore_ascii_case("class") {
+                return Some(IrConstant::String(
+                    class_constant_initializer_target_display_class(
+                        module,
+                        (*target)?,
+                        current_class,
+                        class_parents,
+                    )
+                    .unwrap_or_else(|| target_class.clone()),
+                ));
+            }
             resolve_class_constant_initializer(
                 module,
                 &target_class,
@@ -14910,6 +15124,17 @@ fn constant_from_expr_with_runtime_constants(
                 class_parents,
             )?;
             let member = class_constant_initializer_member_name(module, (*member)?)?;
+            if member.eq_ignore_ascii_case("class") {
+                return Some(IrConstant::String(
+                    class_constant_initializer_target_display_class(
+                        module,
+                        (*target)?,
+                        current_class,
+                        class_parents,
+                    )
+                    .unwrap_or_else(|| target_class.clone()),
+                ));
+            }
             resolve_class_constant_initializer(
                 module,
                 &target_class,
@@ -14995,7 +15220,34 @@ fn class_constant_initializer_target_display_class(
             .map(normalize_class_name)
             .and_then(|class| class_parents.get(&class).cloned().flatten());
     }
-    Some(source.trim_start_matches('\\').to_owned())
+    resolved_class_like_display_name(module, resolution)
+        .or_else(|| Some(source.trim_start_matches('\\').to_owned()))
+}
+
+fn resolved_class_like_display_name(
+    module: &HirModule,
+    resolution: &HirNameResolution,
+) -> Option<String> {
+    let resolved = normalize_class_name(resolution.resolved()?);
+    module.namespaces().values().find_map(|namespace| {
+        namespace.resolved_names().iter().find_map(|record| {
+            if record.context() != ResolveContext::ClassLike
+                || record.source().original() != resolution.source()
+            {
+                return None;
+            }
+            let ResolvedName::FullyQualified(name) = record.result() else {
+                return None;
+            };
+            (name.canonical(NameKind::ClassLike) == resolved).then(|| {
+                name.parts()
+                    .iter()
+                    .map(|part| part.original())
+                    .collect::<Vec<_>>()
+                    .join("\\")
+            })
+        })
+    })
 }
 
 fn runtime_named_constant_name(resolution: &HirNameResolution) -> Option<String> {
@@ -15599,6 +15851,61 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_external_class_name_constant_uses_resolved_fqn_display() {
+        let frontend = analyze_source(
+            "<?php namespace WordPress\\AiClientDependencies\\Http\\Discovery; echo Strategy\\GeneratedDiscoveryStrategy::class;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains(
+                "string \"WordPress\\\\AiClientDependencies\\\\Http\\\\Discovery\\\\Strategy\\\\GeneratedDiscoveryStrategy\""
+            ),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("fetch_class_constant"), "{snapshot}");
+    }
+
+    #[test]
+    fn imported_qualified_class_name_constant_expands_alias_prefix() {
+        let frontend = analyze_source(
+            "<?php namespace Foo; use Vendor\\Package as PackageAlias; echo PackageAlias\\Generated::class;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains("string \"Vendor\\\\Package\\\\Generated\""),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("fetch_class_constant"), "{snapshot}");
+    }
+
+    #[test]
+    fn static_property_class_name_constant_initializer_lowers_to_string() {
+        let frontend = analyze_source(
+            "<?php namespace WordPress\\AiClientDependencies\\Http\\Discovery; abstract class ClassDiscovery { private static $strategies = [Strategy\\GeneratedDiscoveryStrategy::class]; }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains(
+                "array [append=>string \"WordPress\\\\AiClientDependencies\\\\Http\\\\Discovery\\\\Strategy\\\\GeneratedDiscoveryStrategy\"]"
+            ),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("class_const"), "{snapshot}");
+    }
+
+    #[test]
     fn class_constant_forward_references_lower_to_ir_constants() {
         let frontend = analyze_source(
             "<?php class C { const CONST_2 = self::CONST_1; const CONST_1 = self::BASE_CONST; const BASE_CONST = 'hello'; }",
@@ -16181,6 +16488,80 @@ mod tests {
             "{snapshot}"
         );
         assert!(snapshot.contains("c::$p"), "{snapshot}");
+    }
+
+    #[test]
+    fn array_unshift_static_property_arg_lowers_through_hidden_local_and_assign() {
+        let frontend = analyze_source(
+            "<?php class C { private static $items = array(); function f($value) { array_unshift(self::$items, $value); } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("fetch_static_property r"), "{snapshot}");
+        assert!(
+            snapshot.contains("__phrust:array_unshift-static-property"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("call_function r") && snapshot.contains("array_unshift"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("by_ref=local") || snapshot.contains("by_ref=local:"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("assign_static_property r"), "{snapshot}");
+        assert!(snapshot.contains("self::$items"), "{snapshot}");
+    }
+
+    #[test]
+    fn namespaced_array_unshift_static_property_arg_lowers_through_hidden_local_and_assign() {
+        let frontend = analyze_source(
+            "<?php namespace WordPress\\AiClientDependencies\\Http\\Discovery; abstract class ClassDiscovery { private static $strategies = array(); function f($strategy) { array_unshift(self::$strategies, $strategy); } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("fetch_static_property r"), "{snapshot}");
+        assert!(
+            snapshot.contains("__phrust:wordpress\\aiclientdependencies\\http\\discovery\\array_unshift-static-property"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("call_function r")
+                && snapshot
+                    .contains("wordpress\\aiclientdependencies\\http\\discovery\\array_unshift"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("by_ref=local") || snapshot.contains("by_ref=local:"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("assign_static_property r"), "{snapshot}");
+        assert!(snapshot.contains("self::$strategies"), "{snapshot}");
+    }
+
+    #[test]
+    fn imported_nullable_parameter_type_lowers_to_resolved_class_name() {
+        let frontend = analyze_source(
+            "<?php namespace App; use Vendor\\Contracts\\CacheInterface; function set_cache(?CacheInterface $cache): void {}",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains(
+                "param \"cache\" local:0 required=true variadic=false by_ref=false type=?class \"vendor\\\\contracts\\\\cacheinterface\""
+            ),
+            "{snapshot}"
+        );
     }
 
     #[test]
