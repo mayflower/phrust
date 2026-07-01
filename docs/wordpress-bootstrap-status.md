@@ -70,19 +70,27 @@ skips for equivalent paths, `functions=1`, `classes=8`, `constants=0`,
 `entry_instructions=7`, included-file `instructions_executed=5`, and total
 counter `includes=3`.
 
-## Optional Real WordPress Smoke
+## Real WordPress Smoke
 
-After building `target/debug/php-vm`, a local WordPress checkout can be probed
-without adding WordPress-specific behavior:
+The reduced canary suite is not a complete WordPress bootstrap. Use the real
+smoke gate for a local WordPress checkout:
 
 ```bash
-nix develop -c env REFERENCE_PHP=/path/to/php-8.5.7/sapi/cli/php scripts/runtime_semantics_diff.py --dir /path/to/wordpress --out target/runtime-semantics/wordpress-real --stop-on-fail
+export PHRUST_WORDPRESS_DIR=/path/to/wordpress
+nix develop -c just wordpress-real-smoke
 ```
 
-The report keeps the same stable JSON schema as the reduced canary and includes
-failure categories for compile, IR, runtime, error-reporting, predefined
-constant, and inclusion/cache failures. Use the first failing file to extract a
-reduced fixture before changing runtime behavior.
+DB-backed install smoke also needs the local MariaDB DSN:
+
+```bash
+export PHRUST_MYSQL_TEST_DSN='mysql://wordpress:secret@127.0.0.1:3306/wordpress'
+nix develop -c just wordpress-real-install-smoke
+```
+
+The real smoke writes reports under `target/wordpress-real/` and records
+environment blockers separately from phrust runtime, stdlib, web, database,
+diagnostics, and timeout failures. See `docs/wordpress-real-smoke.md` for the
+full workflow and first-failure reduction process.
 
 ## Remaining Blockers
 
@@ -93,8 +101,8 @@ outside this reduced suite.
 
 ## Explicit Non-Goals
 
-The reduced canary suite is not a complete WordPress bootstrap. It does not
-claim coverage for WordPress' full standard-library, database, HTTP, plugin,
-theme, or filesystem behavior. Wider bootstrap work should add new reduced
-fixtures first, then promote a real WordPress smoke only once failures can be
-categorized without hiding runtime, optimizer, include-cache, or JIT defects.
+The reduced canary suite does not claim coverage for WordPress' full
+standard-library, database, HTTP, plugin, theme, or filesystem behavior. Wider
+bootstrap work should keep adding reduced fixtures for generic PHP behavior,
+while the real smoke gate tracks the first unclassified failure from a complete
+local checkout.

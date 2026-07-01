@@ -57,6 +57,9 @@ help:
       '  just runtime-known-gaps   Validate runtime known-gap catalog' \
       '  just runtime-gap-report   Regenerate runtime gap closure report' \
       '  just wp-language-vm       Run WordPress language/VM core fixtures' \
+      '  just wordpress-preflight  Classify local real WordPress smoke prerequisites' \
+      '  just wordpress-real-smoke Run no-DB real WordPress frontpage smoke' \
+      '  just wordpress-real-install-smoke Run DB-backed real WordPress install smoke' \
       '' \
       'Server:' \
       '  just verify-server        Run integrated web server verification' \
@@ -891,6 +894,20 @@ wp-autoload-stdlib:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py --category wp_autoload_stdlib --out target/runtime-semantics/wp-autoload-stdlib
     scripts/wordpress_builtin_heatmap.py --input target/runtime-semantics/wp-autoload-stdlib/runtime-semantics-diff-report.json --out target/wordpress-bringup
+
+wordpress-preflight:
+    scripts/wordpress/preflight.py --wordpress-dir "${PHRUST_WORDPRESS_DIR:-}" --docroot "${PHRUST_WORDPRESS_DOCROOT:-${PHRUST_WORDPRESS_DIR:-}}" --reference-php "${REFERENCE_PHP:-}" --phrust-binary "${PHP_VM_CLI:-target/debug/php-vm}" --phrust-server "${PHRUST_SERVER:-target/debug/phrust-server}" --out target/wordpress-real/preflight.json
+
+wordpress-real-smoke:
+    cargo build -p php_vm_cli -p php_server
+    scripts/wordpress/smoke.py --phase web-frontpage --wordpress-dir "${PHRUST_WORDPRESS_DIR:-}" --docroot "${PHRUST_WORDPRESS_DOCROOT:-${PHRUST_WORDPRESS_DIR:-}}" --reference-php "${REFERENCE_PHP:-}" --phrust-binary "${PHP_VM_CLI:-target/debug/php-vm}" --phrust-server "${PHRUST_SERVER:-target/debug/phrust-server}" --stop-on-fail
+
+wordpress-real-install-smoke:
+    cargo build -p php_vm_cli -p php_server
+    scripts/wordpress/smoke.py --phase db-install --phase admin-login-page --phase post-install-frontpage --wordpress-dir "${PHRUST_WORDPRESS_DIR:-}" --docroot "${PHRUST_WORDPRESS_DOCROOT:-${PHRUST_WORDPRESS_DIR:-}}" --reference-php "${REFERENCE_PHP:-}" --phrust-binary "${PHP_VM_CLI:-target/debug/php-vm}" --phrust-server "${PHRUST_SERVER:-target/debug/phrust-server}" --stop-on-fail
+
+wordpress-real-extract-first-failure:
+    scripts/wordpress/extract_failure.py --failure "${PHRUST_WORDPRESS_FIRST_FAILURE:-}"
 
 regression-fixtures:
     cargo build -p php_vm_cli
