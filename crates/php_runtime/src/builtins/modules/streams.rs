@@ -6,6 +6,7 @@ use crate::builtins::{
     RuntimeSourceSpan,
 };
 use crate::{ArrayKey, ResourceRef, StreamSeekWhence, StreamWrapperRegistry, Value};
+use std::io::Write;
 use std::path::Path;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
@@ -221,6 +222,8 @@ fn write_stream_bytes(
         .map_err(|error| value_error(function_name, &error.to_string()))?;
     if resource.metadata().uri == "php://stdout" {
         context.output().write_bytes(&bytes[..written]);
+    } else if resource.metadata().uri == "php://stderr" {
+        let _ = std::io::stderr().lock().write_all(&bytes[..written]);
     }
     Ok(written)
 }

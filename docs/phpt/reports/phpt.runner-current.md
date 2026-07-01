@@ -1,11 +1,11 @@
 # phpt.runner current report
 
-Last focused run: 2026-06-28.
+Last focused run: 2026-07-01.
 
 ## Commands
 
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just phpt-triage`: PASS.
-- `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just phpt-runner-smoke`: PASS, 19 PHPT runner-smoke cases with 12 PASS, 6 SKIP, 1 XFAIL, and 0 non-green outcomes.
+- `TARGET_PHP=target/debug/phrust-php PHPT_TARGET_MODE=php-cli REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just phpt-runner-smoke`: PASS, 19 PHPT runner-smoke cases with 12 PASS, 6 SKIP, 1 XFAIL, and 0 non-green outcomes.
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src nix develop -c just verify-phpt`: PASS, 21,548 corpus entries and 20,428 accepted non-green fingerprints verified.
 
 ## BORK subclasses

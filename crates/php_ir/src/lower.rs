@@ -4273,6 +4273,55 @@ impl LoweringContext<'_> {
             builder.terminate_return_ref(function, block, local, span);
             return block;
         }
+        if builder.returns_by_ref(function)
+            && let Some(target) = self.dim_assignment_target(builder, function, expr)
+        {
+            if target.append || target.dims.is_empty() {
+                self.unsupported(
+                    UnsupportedFeature::ArrayElementReference,
+                    range,
+                    "array-element by-reference returns require an existing array element",
+                );
+                builder.terminate_return(function, block, None, span);
+                return block;
+            }
+            let mut current = block;
+            let mut dims = Vec::with_capacity(target.dims.len());
+            for dim in target.dims {
+                let Some(dim_value) = self.lower_expr_to_register(builder, function, current, dim)
+                else {
+                    builder.terminate_return(function, current, None, span);
+                    return current;
+                };
+                current = dim_value.block;
+                dims.push(Operand::Register(dim_value.register));
+            }
+            let local = builder.intern_local(
+                function,
+                format!("__phrust:return-ref-dim:{}", stmt_id.raw()),
+            );
+            let bind = builder.emit(
+                function,
+                current,
+                InstructionKind::BindReferenceFromDim {
+                    target: local,
+                    local: target.local,
+                    dims,
+                },
+                span,
+            );
+            builder.add_source_map(
+                IrSourceMapTarget::Instruction {
+                    function,
+                    block: current,
+                    instruction: bind,
+                },
+                format!("hir:stmt:{}", stmt_id.raw()),
+                span,
+            );
+            builder.terminate_return_ref(function, current, local, span);
+            return current;
+        }
         if builder.returns_by_ref(function) && self.contains_dim_fetch_expr(expr) {
             self.unsupported(
                 UnsupportedFeature::ArrayElementReference,
@@ -7158,19 +7207,7 @@ impl LoweringContext<'_> {
     ) -> Option<LoweredExpr> {
         let (operands, current) = self.lower_call_args(builder, site, &args)?;
         let dst = builder.alloc_register(site.function);
-        let display_normalized = target
-            .display_class_name
-            .as_deref()
-            .map(normalize_class_name)
-            .unwrap_or_else(|| normalize_class_name(&target.class_name));
-        let class_name = if display_normalized == "self" {
-            self.class_names
-                .get(&site.function)
-                .cloned()
-                .unwrap_or(target.class_name)
-        } else {
-            target.display_class_name.unwrap_or(target.class_name)
-        };
+        let class_name = target.display_class_name.unwrap_or(target.class_name);
         let instruction = builder.emit(
             site.function,
             current,

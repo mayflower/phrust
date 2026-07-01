@@ -40,10 +40,14 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
+def load_jsonl(path: Path, *, allow_empty: bool = False) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    if not path.is_file() or path.stat().st_size == 0:
-        fail(f"missing or empty manifest: {path.relative_to(ROOT)}")
+    if not path.is_file():
+        fail(f"missing manifest: {path.relative_to(ROOT)}")
+    if path.stat().st_size == 0:
+        if allow_empty:
+            return rows
+        fail(f"empty manifest: {path.relative_to(ROOT)}")
     with path.open(encoding="utf-8") as handle:
         for lineno, line in enumerate(handle, 1):
             line = line.strip()
@@ -233,7 +237,7 @@ def validate_doc_coverage(rows_by_manifest: dict[str, dict[str, dict[str, Any]]]
 def validate_phpt_accepted(rows: list[dict[str, Any]]) -> None:
     expected = {
         (row["path"], row["outcome"], row["reason"])
-        for row in load_jsonl(PHPT_ACCEPTED_NON_GREEN)
+        for row in load_jsonl(PHPT_ACCEPTED_NON_GREEN, allow_empty=True)
     }
     actual: set[tuple[str, str, str]] = set()
     for row in rows:

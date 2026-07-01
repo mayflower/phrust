@@ -894,6 +894,30 @@ impl ResourceTable {
         )
     }
 
+    /// Registers a deterministic CLI stdout stream.
+    pub fn register_stdout(&mut self) -> ResourceRef {
+        self.register_stream_data(
+            StreamFlags::new(false, true, false),
+            StreamMetadata::new("PHP", "stream", "w", "php://stdout"),
+            StreamData::Stdio {
+                buffer: Vec::new(),
+                cursor: 0,
+            },
+        )
+    }
+
+    /// Registers a deterministic CLI stderr stream.
+    pub fn register_stderr(&mut self) -> ResourceRef {
+        self.register_stream_data(
+            StreamFlags::new(false, true, false),
+            StreamMetadata::new("PHP", "stream", "w", "php://stderr"),
+            StreamData::Stdio {
+                buffer: Vec::new(),
+                cursor: 0,
+            },
+        )
+    }
+
     fn register_stream_data(
         &mut self,
         flags: StreamFlags,

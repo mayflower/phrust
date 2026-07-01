@@ -4,8 +4,12 @@ Generated from baseline `20260624T210848Z` with 20428 known non-green fingerprin
 
 Each row carries the hard-rule fields required for a known gap: ID, reference behavior, current Rust behavior, fixture or PHPT example, and planned solution layer.
 
-PHPT runner-smoke accepted non-green outcomes are tracked separately in
+PHPT runner-smoke closure status is tracked separately in
 `docs/known_gaps/phpt-runner-smoke.jsonl` and validated by `just known-gaps`.
+Accepted runner-smoke non-green outcomes must also be listed in
+`tests/phpt/manifests/runner-smoke-known-non-green.jsonl`; that manifest stays
+empty when the focused smoke gate is green apart from intentional skips and
+XFAILs.
 
 | ID | Baseline count | Reference behavior | Current Rust behavior | Fixture or PHPT example | Planned solution layer |
 | --- | ---: | --- | --- | --- | --- |

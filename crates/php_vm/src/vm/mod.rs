@@ -946,6 +946,8 @@ struct ExecutionState {
     env: Vec<(String, String)>,
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
+    stdout: Option<php_runtime::ResourceRef>,
+    stderr: Option<php_runtime::ResourceRef>,
     strtok_state: php_runtime::StrtokState,
     iconv_state: php_runtime::IconvEncodingState,
     apcu_state: php_runtime::ApcuState,
@@ -10560,14 +10562,31 @@ impl Vm {
                         }
                     }
                     InstructionKind::FetchConst { dst, name } => {
-                        let value = if name == "STDIN" {
-                            let resource = state
-                                .stdin
-                                .get_or_insert_with(|| state.resources.register_stdin(Vec::new()))
-                                .clone();
-                            Value::Resource(resource)
-                        } else {
-                            match global_constant_value(compiled, state, stack, name) {
+                        let value = match name.as_str() {
+                            "STDIN" => {
+                                let resource = state
+                                    .stdin
+                                    .get_or_insert_with(|| {
+                                        state.resources.register_stdin(Vec::new())
+                                    })
+                                    .clone();
+                                Value::Resource(resource)
+                            }
+                            "STDOUT" => {
+                                let resource = state
+                                    .stdout
+                                    .get_or_insert_with(|| state.resources.register_stdout())
+                                    .clone();
+                                Value::Resource(resource)
+                            }
+                            "STDERR" => {
+                                let resource = state
+                                    .stderr
+                                    .get_or_insert_with(|| state.resources.register_stderr())
+                                    .clone();
+                                Value::Resource(resource)
+                            }
+                            _ => match global_constant_value(compiled, state, stack, name) {
                                 Ok(Some(value)) => value,
                                 Ok(None) => {
                                     return self.runtime_error(
@@ -10582,7 +10601,7 @@ impl Vm {
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
-                            }
+                            },
                         };
                         if let Err(message) = stack
                             .current_mut()
@@ -12806,10 +12825,8 @@ impl Vm {
                         }
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
-                        let object = ObjectRef::new_with_display_name(
-                            &runtime_class,
-                            class.display_name.clone(),
-                        );
+                        let object =
+                            ObjectRef::new_with_display_name(&runtime_class, display_class_name);
                         if let Some(spl_class) = spl_runtime_parent.as_deref() {
                             object.set_property(
                                 SPL_RUNTIME_CLASS_PROPERTY,
@@ -12866,7 +12883,7 @@ impl Vm {
                                     .with_this(object.clone())
                                     .with_class_context(
                                         constructor.class.name.clone(),
-                                        class.name.clone(),
+                                        object.display_name(),
                                         constructor.class.name.clone(),
                                     )
                                     .inherit_fiber_context(&running_fiber),
@@ -13901,10 +13918,8 @@ impl Vm {
                         };
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
-                        let object = ObjectRef::new_with_display_name(
-                            &runtime_class,
-                            class.display_name.clone(),
-                        );
+                        let object =
+                            ObjectRef::new_with_display_name(&runtime_class, display_class_name);
                         if let Some(spl_class) = spl_runtime_parent.as_deref() {
                             object.set_property(
                                 SPL_RUNTIME_CLASS_PROPERTY,
@@ -13961,7 +13976,7 @@ impl Vm {
                                     .with_this(object.clone())
                                     .with_class_context(
                                         constructor.class.name.clone(),
-                                        class.name.clone(),
+                                        object.display_name(),
                                         constructor.class.name.clone(),
                                     )
                                     .inherit_fiber_context(&running_fiber),
@@ -21244,7 +21259,7 @@ impl Vm {
                                 .with_this(object.clone())
                                 .with_class_context(
                                     declaring_class.name.clone(),
-                                    object.class_name(),
+                                    object.display_name(),
                                     declaring_class.name.clone(),
                                 )
                                 .inherit_fiber_context(&running_fiber),
@@ -23064,7 +23079,7 @@ impl Vm {
                             .unwrap_or_else(|| scope_class.clone()),
                     );
                 } else if let Some(this_value) = call.this_value.as_ref() {
-                    let scope_class = this_value.class_name();
+                    let scope_class = this_value.display_name();
                     call =
                         call.with_class_context(scope_class.clone(), scope_class.clone(), scope_class);
                 }
@@ -25272,7 +25287,7 @@ impl Vm {
                             .unwrap_or_else(|| scope_class.clone()),
                     );
                 } else if let Some(this_value) = call.this_value.as_ref() {
-                    let scope_class = this_value.class_name();
+                    let scope_class = this_value.display_name();
                     call = call.with_class_context(
                         scope_class.clone(),
                         scope_class.clone(),
@@ -25999,7 +26014,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     declaring_class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     declaring_class.name,
                 )
                 .inherit_fiber_context(running_fiber),
@@ -26511,7 +26526,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     resolved.class.name.clone(),
                 ),
             output,
@@ -26685,7 +26700,7 @@ impl Vm {
                                 .with_this(object.clone())
                                 .with_class_context(
                                     resolved.class.name.clone(),
-                                    object.class_name(),
+                                    object.display_name(),
                                     resolved.class.name.clone(),
                                 ),
                             output,
@@ -26860,7 +26875,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     declaring_class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     declaring_class.name.clone(),
                 ),
             output,
@@ -27194,7 +27209,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     resolved.class.name.clone(),
                 ),
             output,
@@ -27985,7 +28000,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     resolved.class.name.clone(),
                 )
                 .with_optional_call_span(call_span),
@@ -28395,7 +28410,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     resolved.class.name.clone(),
                 ),
             output,
@@ -28675,7 +28690,7 @@ impl Vm {
                         .with_this(entry.object.clone())
                         .with_class_context(
                             entry.class_name.clone(),
-                            entry.object.class_name(),
+                            entry.object.display_name(),
                             entry.class_name.clone(),
                         ),
                     output,
@@ -28784,7 +28799,7 @@ impl Vm {
                     .with_this(entry.object.clone())
                     .with_class_context(
                         entry.class_name.clone(),
-                        entry.object.class_name(),
+                        entry.object.display_name(),
                         entry.class_name.clone(),
                     ),
                 output,
@@ -29152,7 +29167,7 @@ impl Vm {
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
-                    object.class_name(),
+                    object.display_name(),
                     resolved.class.name.clone(),
                 ),
             output,
@@ -29206,7 +29221,11 @@ impl Vm {
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_this(object.clone())
-                .with_class_context(class.name.clone(), object.class_name(), class.name.clone()),
+                .with_class_context(
+                    class.name.clone(),
+                    object.display_name(),
+                    class.name.clone(),
+                ),
             output,
             stack,
             state,
