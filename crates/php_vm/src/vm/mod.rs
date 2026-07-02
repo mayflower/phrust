@@ -60207,11 +60207,14 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             "<?php
             #[AllowDynamicProperties]
             abstract class IncludedFactoryBase {
-                final public static function get_instance() {
+                protected function __construct(public int $user_id) {}
+                final public static function get_instance(int $user_id) {
                     $manager = 'IncludedFactoryChild';
-                    return new $manager();
+                    return new $manager($user_id);
                 }
-                public function value(): string { return 'base'; }
+                final public function verify(string $token): string {
+                    return 'base:' . $this->user_id . ':' . $token;
+                }
             }
             ",
         )
@@ -60220,7 +60223,6 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             root.join("Child.php"),
             "<?php
             class IncludedFactoryChild extends IncludedFactoryBase {
-                public function value(): string { return parent::value() . '|child'; }
             }
             ",
         )
@@ -60228,7 +60230,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
         let source = "<?php
             require __DIR__ . '/Base.php';
             require __DIR__ . '/Child.php';
-            echo IncludedFactoryBase::get_instance()->value();
+            echo IncludedFactoryBase::get_instance(7)->verify('token');
         ";
         std::fs::write(root.join("index.php"), source).expect("entry source should be written");
         let result = execute_source_with_options_and_path(
@@ -60243,7 +60245,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "base|child");
+        assert_eq!(result.output.to_string_lossy(), "base:7:token");
     }
 
     #[test]
