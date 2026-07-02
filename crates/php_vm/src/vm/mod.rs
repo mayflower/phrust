@@ -25284,6 +25284,24 @@ impl Vm {
                     .unwrap_or(Value::Bool(false));
                 VmResult::success(output.clone(), Some(value))
             }
+            "ob_get_flush" => {
+                if !values.is_empty() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_flush expects no arguments",
+                    );
+                }
+                let value = output
+                    .current_buffer_bytes()
+                    .map(|bytes| Value::string(bytes.to_vec()))
+                    .unwrap_or(Value::Bool(false));
+                if !matches!(value, Value::Bool(false)) {
+                    output.pop_buffer_flush();
+                }
+                VmResult::success(output.clone(), Some(value))
+            }
             "ob_end_clean" => {
                 if !values.is_empty() {
                     return self.runtime_error(
@@ -50561,6 +50579,7 @@ fn is_output_buffering_builtin_name(name: &str) -> bool {
         "ob_start"
             | "ob_get_contents"
             | "ob_get_clean"
+            | "ob_get_flush"
             | "ob_get_length"
             | "ob_get_level"
             | "ob_end_clean"
@@ -62142,6 +62161,27 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.to_string_lossy(), "root|ac|2:1:b:b:2");
+    }
+
+    #[test]
+    fn output_buffering_ob_get_flush_returns_and_flushes_active_buffer() {
+        let result = execute_source(
+            "<?php
+            echo 'root|';
+            ob_start();
+            echo 'a';
+            ob_start();
+            echo 'b';
+            $flushed = ob_get_flush();
+            echo 'c';
+            $outer = ob_get_clean();
+            var_dump(ob_get_flush());
+            echo '|', $flushed, ':', $outer;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "root|bool(false)\n|b:abc");
     }
 
     #[test]

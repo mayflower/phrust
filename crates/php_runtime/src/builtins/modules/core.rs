@@ -227,6 +227,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "ob_get_flush",
+        builtin_output_buffering_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "ob_get_contents",
         builtin_output_buffering_requires_vm,
         BuiltinCompatibility::Php,
