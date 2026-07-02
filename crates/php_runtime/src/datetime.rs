@@ -231,16 +231,32 @@ pub fn format_timestamp(timestamp: i64, timezone: &str, format: &str) -> String 
         match marker {
             'Y' => output.push_str(&format!("{:04}", parts.year)),
             'y' => output.push_str(&format!("{:02}", parts.year.rem_euclid(100))),
+            'F' => output.push_str(full_month_name(parts.month)),
             'M' => output.push_str(short_month_name(parts.month)),
             'm' => output.push_str(&format!("{:02}", parts.month)),
             'n' => output.push_str(&parts.month.to_string()),
+            't' => output.push_str(&days_in_month(parts.year, parts.month).to_string()),
+            'L' => output.push(if is_leap_year(parts.year) { '1' } else { '0' }),
+            'l' => output.push_str(full_weekday_name(timestamp.saturating_add(offset))),
             'D' => output.push_str(short_weekday_name(timestamp.saturating_add(offset))),
+            'N' => {
+                output.push_str(&iso_weekday_number(timestamp.saturating_add(offset)).to_string())
+            }
+            'w' => output.push_str(&weekday_number(timestamp.saturating_add(offset)).to_string()),
+            'z' => output.push_str(&day_of_year(parts.year, parts.month, parts.day).to_string()),
             'd' => output.push_str(&format!("{:02}", parts.day)),
             'j' => output.push_str(&parts.day.to_string()),
+            'a' => output.push_str(if parts.hour < 12 { "am" } else { "pm" }),
+            'A' => output.push_str(if parts.hour < 12 { "AM" } else { "PM" }),
+            'g' => output.push_str(&hour_12(parts.hour).to_string()),
+            'h' => output.push_str(&format!("{:02}", hour_12(parts.hour))),
             'H' => output.push_str(&format!("{:02}", parts.hour)),
             'G' => output.push_str(&parts.hour.to_string()),
             'i' => output.push_str(&format!("{:02}", parts.minute)),
             's' => output.push_str(&format!("{:02}", parts.second)),
+            'e' => output.push_str(timezone),
+            'I' => output.push('0'),
+            'Z' => output.push_str(&offset.to_string()),
             'U' => output.push_str(&timestamp.to_string()),
             'c' => output.push_str(&format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
@@ -255,10 +271,39 @@ pub fn format_timestamp(timestamp: i64, timezone: &str, format: &str) -> String 
             'O' => output.push_str(&timezone_offset_text(offset).replace(':', "")),
             'P' => output.push_str(&timezone_offset_text(offset)),
             'T' => output.push_str(&timezone_abbreviation(timezone)),
+            'r' => output.push_str(&format!(
+                "{}, {:02} {} {:04} {:02}:{:02}:{:02} {}",
+                short_weekday_name(timestamp.saturating_add(offset)),
+                parts.day,
+                short_month_name(parts.month),
+                parts.year,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                timezone_offset_text(offset).replace(':', "")
+            )),
             _ => output.push(marker),
         }
     }
     output
+}
+
+fn full_month_name(month: u8) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "",
+    }
 }
 
 fn short_month_name(month: u8) -> &'static str {
@@ -279,8 +324,21 @@ fn short_month_name(month: u8) -> &'static str {
     }
 }
 
+fn full_weekday_name(timestamp: i64) -> &'static str {
+    match weekday_number(timestamp) {
+        0 => "Sunday",
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        6 => "Saturday",
+        _ => "",
+    }
+}
+
 fn short_weekday_name(timestamp: i64) -> &'static str {
-    match timestamp.div_euclid(86_400).saturating_add(4).rem_euclid(7) {
+    match weekday_number(timestamp) {
         0 => "Sun",
         1 => "Mon",
         2 => "Tue",
@@ -290,6 +348,46 @@ fn short_weekday_name(timestamp: i64) -> &'static str {
         6 => "Sat",
         _ => "",
     }
+}
+
+fn weekday_number(timestamp: i64) -> u8 {
+    timestamp.div_euclid(86_400).saturating_add(4).rem_euclid(7) as u8
+}
+
+fn iso_weekday_number(timestamp: i64) -> u8 {
+    match weekday_number(timestamp) {
+        0 => 7,
+        day => day,
+    }
+}
+
+fn hour_12(hour: u8) -> u8 {
+    match hour % 12 {
+        0 => 12,
+        value => value,
+    }
+}
+
+fn day_of_year(year: i32, month: u8, day: u8) -> u16 {
+    let mut total = 0u16;
+    for candidate in 1..month {
+        total += u16::from(days_in_month(year, candidate));
+    }
+    total + u16::from(day.saturating_sub(1))
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 /// Reads a timestamp from a runtime DateTime-like object.
@@ -687,7 +785,7 @@ fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::format_interval;
+    use super::{format_interval, format_timestamp};
 
     #[test]
     fn interval_format_supports_unpadded_and_padded_fields() {
@@ -696,6 +794,22 @@ mod tests {
         assert_eq!(
             format_interval(seconds, "%y/%Y %m/%M %d/%D %h/%H %i/%I %s/%S"),
             "1/01 2/02 0/00 3/03 4/04 5/05"
+        );
+    }
+
+    #[test]
+    fn timestamp_format_supports_common_php_date_markers() {
+        assert_eq!(
+            format_timestamp(
+                1_704_164_885,
+                "UTC",
+                "l D w N F M t L z g h G H a A i:s e I Z r"
+            ),
+            "Tuesday Tue 2 2 January Jan 31 1 1 3 03 3 03 am AM 08:05 UTC 0 0 Tue, 02 Jan 2024 03:08:05 +0000"
+        );
+        assert_eq!(
+            format_timestamp(1_704_198_485, "UTC", "g h a A"),
+            "12 12 pm PM"
         );
     }
 }
