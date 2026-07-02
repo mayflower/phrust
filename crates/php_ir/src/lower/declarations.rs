@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::ids::FunctionId;
 use crate::module::ClassMethodFlags;
-use php_semantics::hir::{ClassLikeId, ConstExprId, FunctionSignature, HirModule};
+use php_semantics::hir::{ClassLikeId, ConstExprId, FunctionSignature, HirModule, HirProperty};
 
 use super::expressions::*;
 use super::*;
@@ -312,6 +312,7 @@ impl LoweringContext<'_> {
                     class_parents: &class_parents,
                 },
                 &mut methods,
+                &mut properties,
             );
             for member in class_like.members() {
                 match member.id() {
@@ -384,98 +385,15 @@ impl LoweringContext<'_> {
                         let Some(property) = module.properties().get(property_id) else {
                             continue;
                         };
-                        let property_type = self.lower_runtime_type(property.type_id());
-                        let hooks = self.lower_property_hooks(
+                        self.push_lowered_property_entries(
                             builder,
+                            &mut properties,
                             &name,
                             &display_class_name,
                             property,
+                            &class_constant_initializers,
+                            &class_parents,
                         );
-                        let set_visibility = property.modifiers().set_visibility();
-                        for item in property.items() {
-                            let default = self
-                                .lower_property_default(
-                                    item.default(),
-                                    Some(&name),
-                                    Some(&display_class_name),
-                                    &class_constant_initializers,
-                                    &class_parents,
-                                )
-                                .map(|constant| builder.intern_constant(constant));
-                            let default_class_constant = if default.is_none() {
-                                self.lower_const_expr_class_constant_reference(
-                                    item.default(),
-                                    |context| {
-                                        matches!(
-                                            context,
-                                            ConstExprContext::PropertyDefault
-                                                | ConstExprContext::PromotedPropertyDefault
-                                        )
-                                    },
-                                    Some(&name),
-                                    &class_parents,
-                                )
-                            } else {
-                                None
-                            };
-                            let default_named_constant =
-                                if default.is_none() && default_class_constant.is_none() {
-                                    self.lower_const_expr_named_constant_reference(
-                                        item.default(),
-                                        |context| {
-                                            matches!(
-                                                context,
-                                                ConstExprContext::PropertyDefault
-                                                    | ConstExprContext::PromotedPropertyDefault
-                                            )
-                                        },
-                                    )
-                                } else {
-                                    None
-                                };
-                            let default_expr = if default.is_none()
-                                && default_class_constant.is_none()
-                                && default_named_constant.is_none()
-                            {
-                                self.lower_deferred_property_default(
-                                    item.default(),
-                                    Some(&name),
-                                    Some(&display_class_name),
-                                    &class_constant_initializers,
-                                    &class_parents,
-                                )
-                            } else {
-                                None
-                            };
-                            properties.push(ClassPropertyEntry {
-                                name: local_name(item.name()).to_owned(),
-                                default,
-                                default_class_constant,
-                                default_named_constant,
-                                default_expr,
-                                type_: property_type.clone(),
-                                flags: ClassPropertyFlags {
-                                    is_static: property.modifiers().is_static(),
-                                    is_private: property.modifiers().visibility().is_some_and(
-                                        |visibility| visibility == Visibility::Private,
-                                    ),
-                                    is_protected: property.modifiers().visibility().is_some_and(
-                                        |visibility| visibility == Visibility::Protected,
-                                    ),
-                                    set_is_private: set_visibility.is_some_and(|visibility| {
-                                        visibility == Visibility::Private
-                                    }),
-                                    set_is_protected: set_visibility.is_some_and(|visibility| {
-                                        visibility == Visibility::Protected
-                                    }),
-                                    is_readonly: property.modifiers().is_readonly(),
-                                    is_typed: property.type_id().is_some(),
-                                },
-                                hooks: hooks.clone(),
-                                attributes: self
-                                    .lower_attribute_ids(builder, property.attributes()),
-                            });
-                        }
                     }
                     Some(ClassLikeMemberId::ClassConstant(const_id)) => {
                         let Some(constant) = module.class_consts().get(const_id) else {
@@ -628,6 +546,108 @@ impl LoweringContext<'_> {
                 },
                 hooks: ClassPropertyHooks::default(),
                 attributes: self.lower_parameter_attributes(builder, param.attributes()),
+            });
+        }
+    }
+
+    pub(super) fn push_lowered_property_entries(
+        &mut self,
+        builder: &mut IrBuilder,
+        properties: &mut Vec<ClassPropertyEntry>,
+        class_name: &str,
+        display_class_name: &str,
+        property: &HirProperty,
+        class_constant_initializers: &ClassConstantInitializerMap,
+        class_parents: &ClassParentMap,
+    ) {
+        let property_type = self.lower_runtime_type(property.type_id());
+        let hooks = self.lower_property_hooks(builder, class_name, display_class_name, property);
+        let set_visibility = property.modifiers().set_visibility();
+        let attributes = self.lower_attribute_ids(builder, property.attributes());
+        for item in property.items() {
+            let property_name = local_name(item.name()).to_owned();
+            if properties
+                .iter()
+                .any(|existing| existing.name == property_name)
+            {
+                continue;
+            }
+            let default = self
+                .lower_property_default(
+                    item.default(),
+                    Some(class_name),
+                    Some(display_class_name),
+                    class_constant_initializers,
+                    class_parents,
+                )
+                .map(|constant| builder.intern_constant(constant));
+            let default_class_constant = if default.is_none() {
+                self.lower_const_expr_class_constant_reference(
+                    item.default(),
+                    |context| {
+                        matches!(
+                            context,
+                            ConstExprContext::PropertyDefault
+                                | ConstExprContext::PromotedPropertyDefault
+                        )
+                    },
+                    Some(class_name),
+                    class_parents,
+                )
+            } else {
+                None
+            };
+            let default_named_constant = if default.is_none() && default_class_constant.is_none() {
+                self.lower_const_expr_named_constant_reference(item.default(), |context| {
+                    matches!(
+                        context,
+                        ConstExprContext::PropertyDefault
+                            | ConstExprContext::PromotedPropertyDefault
+                    )
+                })
+            } else {
+                None
+            };
+            let default_expr = if default.is_none()
+                && default_class_constant.is_none()
+                && default_named_constant.is_none()
+            {
+                self.lower_deferred_property_default(
+                    item.default(),
+                    Some(class_name),
+                    Some(display_class_name),
+                    class_constant_initializers,
+                    class_parents,
+                )
+            } else {
+                None
+            };
+            properties.push(ClassPropertyEntry {
+                name: property_name,
+                default,
+                default_class_constant,
+                default_named_constant,
+                default_expr,
+                type_: property_type.clone(),
+                flags: ClassPropertyFlags {
+                    is_static: property.modifiers().is_static(),
+                    is_private: property
+                        .modifiers()
+                        .visibility()
+                        .is_some_and(|visibility| visibility == Visibility::Private),
+                    is_protected: property
+                        .modifiers()
+                        .visibility()
+                        .is_some_and(|visibility| visibility == Visibility::Protected),
+                    set_is_private: set_visibility
+                        .is_some_and(|visibility| visibility == Visibility::Private),
+                    set_is_protected: set_visibility
+                        .is_some_and(|visibility| visibility == Visibility::Protected),
+                    is_readonly: property.modifiers().is_readonly(),
+                    is_typed: property.type_id().is_some(),
+                },
+                hooks: hooks.clone(),
+                attributes: attributes.clone(),
             });
         }
     }
@@ -1030,6 +1050,7 @@ impl LoweringContext<'_> {
         builder: &mut IrBuilder,
         input: TraitCompositionInput<'_>,
         methods: &mut Vec<ClassMethodEntry>,
+        properties: &mut Vec<ClassPropertyEntry>,
     ) {
         let TraitCompositionInput {
             module,
@@ -1065,11 +1086,17 @@ impl LoweringContext<'_> {
                     );
                     continue;
                 };
-                self.collect_trait_method_candidates(
+                self.collect_trait_composition_members(
+                    builder,
                     module,
                     trait_class_like,
                     &trait_name,
+                    class_name,
+                    display_class_name,
+                    class_constant_initializers,
+                    class_parents,
                     &mut candidates,
+                    properties,
                 );
             }
             for adaptation in trait_use.adaptations() {
@@ -1192,12 +1219,18 @@ impl LoweringContext<'_> {
         }
     }
 
-    pub(super) fn collect_trait_method_candidates(
+    pub(super) fn collect_trait_composition_members(
         &mut self,
+        builder: &mut IrBuilder,
         module: &HirModule,
         trait_class_like: &php_semantics::hir::HirClassLike,
         trait_name: &str,
+        class_name: &str,
+        display_class_name: &str,
+        class_constant_initializers: &ClassConstantInitializerMap,
+        class_parents: &ClassParentMap,
         candidates: &mut Vec<TraitMethodCandidate>,
+        properties: &mut Vec<ClassPropertyEntry>,
     ) {
         let display_trait_name = trait_class_like
             .name()
@@ -1232,10 +1265,17 @@ impl LoweringContext<'_> {
                     });
                 }
                 Some(ClassLikeMemberId::Property(property_id)) => {
-                    self.unsupported(
-                        UnsupportedFeature::TraitRuntime,
-                        self.span_for(SourceMappedId::from(property_id)),
-                        "trait properties are not executable in the trait-composition trait-method composition layer",
+                    let Some(property) = module.properties().get(property_id) else {
+                        continue;
+                    };
+                    self.push_lowered_property_entries(
+                        builder,
+                        properties,
+                        class_name,
+                        display_class_name,
+                        property,
+                        class_constant_initializers,
+                        class_parents,
                     );
                 }
                 Some(ClassLikeMemberId::ClassConstant(const_id)) => {

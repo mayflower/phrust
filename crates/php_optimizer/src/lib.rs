@@ -994,6 +994,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::IssetPropertyDim { dst, .. }
         | InstructionKind::EmptyPropertyDim { dst, .. }
         | InstructionKind::FetchStaticProperty { dst, .. }
+        | InstructionKind::FetchDynamicStaticProperty { dst, .. }
         | InstructionKind::IssetStaticProperty { dst, .. }
         | InstructionKind::EmptyStaticProperty { dst, .. }
         | InstructionKind::IssetStaticPropertyDim { dst, .. }
@@ -1004,6 +1005,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::AssignPropertyDim { dst, .. }
         | InstructionKind::AssignDynamicProperty { dst, .. }
         | InstructionKind::AssignStaticProperty { dst, .. }
+        | InstructionKind::AssignDynamicStaticProperty { dst, .. }
         | InstructionKind::NewArray { dst }
         | InstructionKind::FetchDim { dst, .. }
         | InstructionKind::AssignDim { dst, .. }
@@ -1053,6 +1055,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::BindReferenceProperty { .. }
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
+        | InstructionKind::BindReferenceFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
         | InstructionKind::BindReferenceStaticProperty { .. }
@@ -1281,6 +1284,9 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
             remap_operand_constants(object, remap);
             remap_call_args_constants(args, remap);
         }
+        InstructionKind::BindReferenceFromProperty { object, .. } => {
+            remap_operand_constants(object, remap);
+        }
         InstructionKind::CallMethod { object, args, .. } => {
             remap_operand_constants(object, remap);
             remap_call_args_constants(args, remap);
@@ -1367,6 +1373,15 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
             remap_operands_constants(dims, remap);
         }
         InstructionKind::AssignStaticProperty { value, .. } => {
+            remap_operand_constants(value, remap);
+        }
+        InstructionKind::FetchDynamicStaticProperty { class_name, .. } => {
+            remap_operand_constants(class_name, remap);
+        }
+        InstructionKind::AssignDynamicStaticProperty {
+            class_name, value, ..
+        } => {
+            remap_operand_constants(class_name, remap);
             remap_operand_constants(value, remap);
         }
         InstructionKind::FetchObjectClassName { object, .. } => {
@@ -1585,6 +1600,9 @@ fn rewrite_instruction_register_operands(
             rewrite_operand_registers(object, aliases);
             rewrite_call_args_registers(args, aliases);
         }
+        InstructionKind::BindReferenceFromProperty { object, .. } => {
+            rewrite_operand_registers(object, aliases);
+        }
         InstructionKind::CallMethod { object, args, .. } => {
             rewrite_operand_registers(object, aliases);
             rewrite_call_args_registers(args, aliases);
@@ -1671,6 +1689,15 @@ fn rewrite_instruction_register_operands(
             rewrite_operands_registers(dims, aliases);
         }
         InstructionKind::AssignStaticProperty { value, .. } => {
+            rewrite_operand_registers(value, aliases);
+        }
+        InstructionKind::FetchDynamicStaticProperty { class_name, .. } => {
+            rewrite_operand_registers(class_name, aliases);
+        }
+        InstructionKind::AssignDynamicStaticProperty {
+            class_name, value, ..
+        } => {
+            rewrite_operand_registers(class_name, aliases);
             rewrite_operand_registers(value, aliases);
         }
         InstructionKind::FetchObjectClassName { object, .. } => {

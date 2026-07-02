@@ -442,7 +442,8 @@ impl VmCounters {
             | InstructionKind::UnsetDim { .. } => self.array_dim_fetches += 1,
             InstructionKind::FetchProperty { .. }
             | InstructionKind::FetchDynamicProperty { .. }
-            | InstructionKind::FetchStaticProperty { .. } => {
+            | InstructionKind::FetchStaticProperty { .. }
+            | InstructionKind::FetchDynamicStaticProperty { .. } => {
                 self.property_fetches += 1;
                 self.property_accesses += 1;
             }
@@ -460,7 +461,9 @@ impl VmCounters {
             | InstructionKind::AssignDynamicProperty { .. }
             | InstructionKind::BindReferenceProperty { .. }
             | InstructionKind::BindReferenceStaticProperty { .. }
-            | InstructionKind::AssignStaticProperty { .. } => self.property_accesses += 1,
+            | InstructionKind::BindReferenceFromProperty { .. }
+            | InstructionKind::AssignStaticProperty { .. }
+            | InstructionKind::AssignDynamicStaticProperty { .. } => self.property_accesses += 1,
             InstructionKind::InstanceOf { .. } | InstructionKind::DynamicInstanceOf { .. } => {
                 self.type_checks += 1
             }
@@ -3947,6 +3950,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::BindReferenceProperty { .. } => "bind_reference_property",
         InstructionKind::BindReferencePropertyDim { .. } => "bind_reference_property_dim",
         InstructionKind::BindReferenceDimFromProperty { .. } => "bind_reference_dim_from_property",
+        InstructionKind::BindReferenceFromProperty { .. } => "bind_reference_from_property",
         InstructionKind::BindReferenceFromDim { .. } => "bind_reference_from_dim",
         InstructionKind::BindReferenceFromStaticPropertyDim { .. } => {
             "bind_reference_from_static_property_dim"
@@ -4003,6 +4007,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::UnsetPropertyDim { .. } => "unset_property_dim",
         InstructionKind::UnsetDynamicProperty { .. } => "unset_dynamic_property",
         InstructionKind::FetchStaticProperty { .. } => "fetch_static_property",
+        InstructionKind::FetchDynamicStaticProperty { .. } => "fetch_dynamic_static_property",
         InstructionKind::IssetStaticProperty { .. } => "isset_static_property",
         InstructionKind::EmptyStaticProperty { .. } => "empty_static_property",
         InstructionKind::IssetStaticPropertyDim { .. } => "isset_static_property_dim",
@@ -4015,6 +4020,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::AssignDynamicProperty { .. } => "assign_dynamic_property",
         InstructionKind::BindReferenceStaticProperty { .. } => "bind_reference_static_property",
         InstructionKind::AssignStaticProperty { .. } => "assign_static_property",
+        InstructionKind::AssignDynamicStaticProperty { .. } => "assign_dynamic_static_property",
         InstructionKind::NewArray { .. } => "new_array",
         InstructionKind::ArrayInsert { .. } => "array_insert",
         InstructionKind::ArraySpread { .. } => "array_spread",

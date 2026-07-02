@@ -865,9 +865,12 @@ impl<'a> Planner<'a> {
             | InstructionKind::EmptyStaticPropertyDim { class_name, .. }
             | InstructionKind::UnsetStaticPropertyDim { class_name, .. }
             | InstructionKind::BindReferenceStaticProperty { class_name, .. }
+            | InstructionKind::BindReferenceFromStaticPropertyDim { class_name, .. }
             | InstructionKind::AssignStaticProperty { class_name, .. } => {
                 self.add_lookup_edge(owner, "class", &class_name);
             }
+            InstructionKind::FetchDynamicStaticProperty { .. }
+            | InstructionKind::AssignDynamicStaticProperty { .. } => {}
             InstructionKind::ResolveCallable { callable, .. } => match callable {
                 CallableKind::FunctionName { name } => {
                     self.add_lookup_edge(owner, "function", &name)

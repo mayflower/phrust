@@ -390,6 +390,10 @@ fn verify_instruction(
                 verify_operand(dim, function, unit, errors);
             }
         }
+        InstructionKind::BindReferenceFromProperty { target, object, .. } => {
+            verify_local(*target, function.local_count, errors);
+            verify_operand(object, function, unit, errors);
+        }
         InstructionKind::BindReferenceFromDim {
             target,
             local,
@@ -669,6 +673,12 @@ fn verify_instruction(
         | InstructionKind::FetchClassConstant { dst, .. } => {
             verify_register(*dst, function.register_count, errors);
         }
+        InstructionKind::FetchDynamicStaticProperty {
+            dst, class_name, ..
+        } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(class_name, function, unit, errors);
+        }
         InstructionKind::IssetStaticPropertyDim { dst, dims, .. }
         | InstructionKind::EmptyStaticPropertyDim { dst, dims, .. } => {
             verify_register(*dst, function.register_count, errors);
@@ -720,6 +730,16 @@ fn verify_instruction(
         }
         InstructionKind::AssignStaticProperty { dst, value, .. } => {
             verify_register(*dst, function.register_count, errors);
+            verify_operand(value, function, unit, errors);
+        }
+        InstructionKind::AssignDynamicStaticProperty {
+            dst,
+            class_name,
+            value,
+            ..
+        } => {
+            verify_register(*dst, function.register_count, errors);
+            verify_operand(class_name, function, unit, errors);
             verify_operand(value, function, unit, errors);
         }
         InstructionKind::NewArray { dst } => {
@@ -1316,6 +1336,9 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
                 operand_register_uses(dim, uses);
             }
         }
+        InstructionKind::BindReferenceFromProperty { object, .. } => {
+            operand_register_uses(object, uses);
+        }
         InstructionKind::Binary { lhs, rhs, .. }
         | InstructionKind::Compare { lhs, rhs, .. }
         | InstructionKind::ArrayGet {
@@ -1407,6 +1430,15 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
             operand_register_uses(value, uses);
         }
         InstructionKind::AssignStaticProperty { value, .. } => operand_register_uses(value, uses),
+        InstructionKind::AssignDynamicStaticProperty {
+            class_name, value, ..
+        } => {
+            operand_register_uses(class_name, uses);
+            operand_register_uses(value, uses);
+        }
+        InstructionKind::FetchDynamicStaticProperty { class_name, .. } => {
+            operand_register_uses(class_name, uses);
+        }
         InstructionKind::IssetStaticPropertyDim { dims, .. }
         | InstructionKind::EmptyStaticPropertyDim { dims, .. }
         | InstructionKind::UnsetStaticPropertyDim { dims, .. }
@@ -1498,6 +1530,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::IssetPropertyDim { dst, .. }
         | InstructionKind::EmptyPropertyDim { dst, .. }
         | InstructionKind::FetchStaticProperty { dst, .. }
+        | InstructionKind::FetchDynamicStaticProperty { dst, .. }
         | InstructionKind::IssetStaticProperty { dst, .. }
         | InstructionKind::EmptyStaticProperty { dst, .. }
         | InstructionKind::IssetStaticPropertyDim { dst, .. }
@@ -1508,6 +1541,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::AssignPropertyDim { dst, .. }
         | InstructionKind::AssignDynamicProperty { dst, .. }
         | InstructionKind::AssignStaticProperty { dst, .. }
+        | InstructionKind::AssignDynamicStaticProperty { dst, .. }
         | InstructionKind::NewArray { dst }
         | InstructionKind::FetchDim { dst, .. }
         | InstructionKind::AssignDim { dst, .. }
@@ -1548,6 +1582,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::BindReferenceProperty { .. }
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
+        | InstructionKind::BindReferenceFromProperty { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceStaticProperty { .. }
         | InstructionKind::BindReferenceFromCall { .. }

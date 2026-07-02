@@ -98,6 +98,12 @@ pub(super) struct StaticPropertyTarget {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct DynamicStaticPropertyTarget {
+    pub(super) class_name: ExprId,
+    pub(super) property: String,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct StaticPropertyDimTarget {
     pub(super) class_name: String,
     pub(super) property: String,
@@ -1802,6 +1808,9 @@ impl LoweringContext<'_> {
         if let Some(target) = self.static_property_target(site.expr) {
             return self.lower_static_property_fetch_to_register(builder, site, target);
         }
+        if let Some(target) = self.dynamic_static_property_target(site.expr) {
+            return self.lower_dynamic_static_property_fetch_to_register(builder, site, target);
+        }
         if let Some(target) = self.class_constant_target(site.expr) {
             let normalized_class_name = normalize_class_name(&target.class_name);
             let normalized_display_class_name = target
@@ -1866,12 +1875,20 @@ impl LoweringContext<'_> {
                 });
             }
             let dst = builder.alloc_register(site.function);
+            let class_name = if matches!(
+                normalize_class_name(&target.class_name).as_str(),
+                "self" | "static" | "parent"
+            ) {
+                target.class_name
+            } else {
+                target.display_class_name.unwrap_or(target.class_name)
+            };
             let instruction = builder.emit(
                 site.function,
                 site.block,
                 InstructionKind::FetchClassConstant {
                     dst,
-                    class_name: target.class_name,
+                    class_name,
                     constant: target.constant,
                 },
                 site.span,
@@ -1951,6 +1968,39 @@ impl LoweringContext<'_> {
         Some(LoweredExpr {
             register: dst,
             block: site.block,
+        })
+    }
+
+    pub(super) fn lower_dynamic_static_property_fetch_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: DynamicStaticPropertyTarget,
+    ) -> Option<LoweredExpr> {
+        let class_name =
+            self.lower_expr_to_register(builder, site.function, site.block, target.class_name)?;
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            class_name.block,
+            InstructionKind::FetchDynamicStaticProperty {
+                dst,
+                class_name: Operand::Register(class_name.register),
+                property: target.property,
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            class_name.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: class_name.block,
         })
     }
 
@@ -2112,6 +2162,61 @@ impl LoweringContext<'_> {
                             target: local,
                             local: target.local,
                             dims,
+                        },
+                        site.span,
+                    );
+                    self.add_expr_source_map(
+                        builder,
+                        site.function,
+                        current,
+                        bind,
+                        element,
+                        site.span,
+                    );
+                    let register = builder.alloc_register(site.function);
+                    let load = builder.emit(
+                        site.function,
+                        current,
+                        InstructionKind::LoadLocal {
+                            dst: register,
+                            local,
+                        },
+                        site.span,
+                    );
+                    self.add_expr_source_map(
+                        builder,
+                        site.function,
+                        current,
+                        load,
+                        element,
+                        site.span,
+                    );
+                    (
+                        LoweredExpr {
+                            register,
+                            block: current,
+                        },
+                        Some(local),
+                    )
+                } else if let Some(target) = self.property_assignment_target(value) {
+                    let object = self.lower_expr_to_register(
+                        builder,
+                        site.function,
+                        current,
+                        target.receiver,
+                    )?;
+                    current = object.block;
+                    let local = builder.intern_local(
+                        site.function,
+                        format!("__phrust:array-ref-property:{}", element.raw()),
+                    );
+                    let bind = builder.emit(
+                        site.function,
+                        current,
+                        InstructionKind::BindReferenceFromProperty {
+                            target: local,
+                            object: Operand::Register(object.register),
+                            property: target.property,
                         },
                         site.span,
                     );
@@ -5329,6 +5434,12 @@ impl LoweringContext<'_> {
         {
             return self.lower_quiet_dim_target_to_register(builder, site, target, left);
         }
+        if let Some(target) = self.property_dim_target(left)
+            && !target.append
+            && !target.dims.is_empty()
+        {
+            return self.lower_quiet_property_dim_target_to_register(builder, site, target, left);
+        }
         self.lower_expr_to_register(builder, site.function, site.block, left)
     }
 
@@ -5359,6 +5470,58 @@ impl LoweringContext<'_> {
             span,
         );
         self.add_expr_source_map(builder, site.function, current, load, expr, span);
+        for dim in dims {
+            let fetched = builder.alloc_register(site.function);
+            let fetch = builder.emit(
+                site.function,
+                current,
+                InstructionKind::FetchDim {
+                    dst: fetched,
+                    array: Operand::Register(value),
+                    key: dim,
+                    quiet: true,
+                },
+                span,
+            );
+            self.add_expr_source_map(builder, site.function, current, fetch, expr, span);
+            value = fetched;
+        }
+        Some(LoweredExpr {
+            register: value,
+            block: current,
+        })
+    }
+
+    pub(super) fn lower_quiet_property_dim_target_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: PropertyDimTarget,
+        expr: ExprId,
+    ) -> Option<LoweredExpr> {
+        let range = self.span_for(SourceMappedId::from(expr));
+        let span = span_from_range(self.file, range);
+        let object =
+            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+        let mut current = object.block;
+        let mut dims = Vec::with_capacity(target.dims.len());
+        for dim in target.dims {
+            let dim_value = self.lower_expr_to_register(builder, site.function, current, dim)?;
+            current = dim_value.block;
+            dims.push(Operand::Register(dim_value.register));
+        }
+        let mut value = builder.alloc_register(site.function);
+        let fetch_property = builder.emit(
+            site.function,
+            current,
+            InstructionKind::FetchProperty {
+                dst: value,
+                object: Operand::Register(object.register),
+                property: target.property,
+            },
+            span,
+        );
+        self.add_expr_source_map(builder, site.function, current, fetch_property, expr, span);
         for dim in dims {
             let fetched = builder.alloc_register(site.function);
             let fetch = builder.emit(
@@ -5606,6 +5769,13 @@ impl LoweringContext<'_> {
             && let Some(target) = self.static_property_target(left)
         {
             return self.lower_static_property_assign_to_register(builder, site, target, right);
+        }
+        if operator == "="
+            && let Some(left) = left
+            && let Some(target) = self.dynamic_static_property_target(left)
+        {
+            return self
+                .lower_dynamic_static_property_assign_to_register(builder, site, target, right);
         }
         if operator == "="
             && let Some(left) = left
@@ -6534,6 +6704,50 @@ impl LoweringContext<'_> {
             InstructionKind::AssignStaticProperty {
                 dst,
                 class_name: target.class_name,
+                property: target.property,
+                value: Operand::Register(value.register),
+            },
+            site.span,
+        );
+        self.add_expr_source_map(
+            builder,
+            site.function,
+            value.block,
+            instruction,
+            site.expr,
+            site.span,
+        );
+        Some(LoweredExpr {
+            register: dst,
+            block: value.block,
+        })
+    }
+
+    pub(super) fn lower_dynamic_static_property_assign_to_register(
+        &mut self,
+        builder: &mut IrBuilder,
+        site: LowerSite,
+        target: DynamicStaticPropertyTarget,
+        right: Option<ExprId>,
+    ) -> Option<LoweredExpr> {
+        let Some(right) = right else {
+            self.unsupported(
+                UnsupportedFeature::HirStatement,
+                site.range,
+                "dynamic static property assignment is missing its right operand",
+            );
+            return None;
+        };
+        let class_name =
+            self.lower_expr_to_register(builder, site.function, site.block, target.class_name)?;
+        let value = self.lower_expr_to_register(builder, site.function, class_name.block, right)?;
+        let dst = builder.alloc_register(site.function);
+        let instruction = builder.emit(
+            site.function,
+            value.block,
+            InstructionKind::AssignDynamicStaticProperty {
+                dst,
+                class_name: Operand::Register(class_name.register),
                 property: target.property,
                 value: Operand::Register(value.register),
             },
@@ -8898,6 +9112,32 @@ impl LoweringContext<'_> {
         })
     }
 
+    pub(super) fn dynamic_static_property_target(
+        &self,
+        expr: ExprId,
+    ) -> Option<DynamicStaticPropertyTarget> {
+        let module = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())?;
+        let expression = module.expressions().get(expr)?;
+        let HirExprKind::StaticAccess { target, member } = expression.kind() else {
+            return None;
+        };
+        let target_expr = (*target)?;
+        if self.static_class_name(target_expr).is_some() {
+            return None;
+        }
+        let member_expr = (*member)?;
+        if !self.static_member_is_property(member_expr) {
+            return None;
+        }
+        Some(DynamicStaticPropertyTarget {
+            class_name: target_expr,
+            property: self.static_property_member_name(member_expr)?,
+        })
+    }
+
     pub(super) fn static_property_dim_target(
         &self,
         expr: ExprId,
@@ -9387,13 +9627,45 @@ impl LoweringContext<'_> {
     }
 
     pub(super) fn method_call_uses_dynamic_member(&self, expr: ExprId) -> bool {
-        let range = self.span_for(SourceMappedId::from(expr));
-        self.source_text.slice(range).is_some_and(|source| {
-            source.contains("->$")
-                || source.contains("->{")
-                || source.contains("?->$")
-                || source.contains("?->{")
-        })
+        let Some(module) = self
+            .frontend
+            .database()
+            .module(self.frontend.module().module_id())
+        else {
+            return false;
+        };
+        let Some(expression) = module.expressions().get(expr) else {
+            return false;
+        };
+        let HirExprKind::MethodCall { method, .. } = expression.kind() else {
+            return false;
+        };
+        let Some(method) = *method else {
+            return false;
+        };
+        if self.property_fetch_uses_dynamic_member(method) {
+            return true;
+        }
+        let Some(method_expr) = module.expressions().get(method) else {
+            return false;
+        };
+        match method_expr.kind() {
+            HirExprKind::Variable { .. } => true,
+            HirExprKind::Literal { text } => text.starts_with('$'),
+            HirExprKind::Name { resolution } => resolution.source().starts_with('$'),
+            HirExprKind::PropertyFetch { .. } => false,
+            _ => {
+                let range = self.span_for(SourceMappedId::from(method));
+                self.source_text.slice(range).is_some_and(|source| {
+                    let source = source.trim();
+                    source.starts_with('$')
+                        || source.contains("->$")
+                        || source.contains("->{")
+                        || source.contains("?->$")
+                        || source.contains("?->{")
+                })
+            }
+        }
     }
 
     pub(super) fn static_access_uses_dynamic_member(&self, expr: ExprId) -> bool {

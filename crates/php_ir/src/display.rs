@@ -534,6 +534,18 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 property
             )
         }
+        InstructionKind::BindReferenceFromProperty {
+            target,
+            object,
+            property,
+        } => {
+            format!(
+                "bind_reference_from_property local:{} {} ${}",
+                target.raw(),
+                format_operand(object),
+                property
+            )
+        }
         InstructionKind::BindReferenceFromDim {
             target,
             local,
@@ -994,6 +1006,16 @@ fn format_instruction(kind: &InstructionKind) -> String {
             class_name,
             property
         ),
+        InstructionKind::FetchDynamicStaticProperty {
+            dst,
+            class_name,
+            property,
+        } => format!(
+            "fetch_dynamic_static_property r{} {}::${}",
+            dst.raw(),
+            format_operand(class_name),
+            property
+        ),
         InstructionKind::IssetStaticProperty {
             dst,
             class_name,
@@ -1116,6 +1138,18 @@ fn format_instruction(kind: &InstructionKind) -> String {
             "assign_static_property r{} {}::${} {}",
             dst.raw(),
             class_name,
+            property,
+            format_operand(value)
+        ),
+        InstructionKind::AssignDynamicStaticProperty {
+            dst,
+            class_name,
+            property,
+            value,
+        } => format!(
+            "assign_dynamic_static_property r{} {}::${} {}",
+            dst.raw(),
+            format_operand(class_name),
             property,
             format_operand(value)
         ),

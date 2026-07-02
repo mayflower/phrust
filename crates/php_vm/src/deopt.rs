@@ -1217,6 +1217,7 @@ fn rejection_for_ir_instruction(kind: &InstructionKind) -> Option<VmDeoptReason>
         | InstructionKind::BindGlobal { .. }
         | InstructionKind::BindReferenceDim { .. }
         | InstructionKind::BindReferenceFromDim { .. }
+        | InstructionKind::BindReferenceFromProperty { .. }
         | InstructionKind::BindReferenceFromCall { .. }
         | InstructionKind::BindReferenceFromMethodCall { .. }
         | InstructionKind::ForeachInitRef { .. }

@@ -14,9 +14,9 @@ use crate::hir::{
 use crate::lower::types::TypeLoweringScope;
 use crate::symbols::resolution::{ResolveContext, ResolvedName};
 use php_ast::{
-    AstNode, AstToken, BlockStmt, ClassDecl, EnumDecl, ExprNode, FunctionDecl, InterfaceDecl,
-    MethodDecl, Stmt, TokenView, TraitDecl, descendant_tokens, syntax_child_nodes,
-    syntax_child_tokens,
+    AstNode, AstToken, BlockStmt, ClassConstDecl, ClassDecl, EnumCase, EnumDecl, ExprNode,
+    FunctionDecl, InterfaceDecl, MethodDecl, Stmt, TokenView, TraitDecl, descendant_tokens,
+    syntax_child_nodes, syntax_child_tokens,
 };
 use php_source::TextRange;
 use php_syntax::{SyntaxElement, SyntaxNode, SyntaxToken};
@@ -127,6 +127,18 @@ impl HirLowerer<'_> {
         }
     }
 
+    fn collect_runtime_declaration_constant_expressions(&mut self, node: &SyntaxNode) {
+        if ClassConstDecl::cast(node).is_some() || EnumCase::cast(node).is_some() {
+            for child in syntax_child_nodes(node).filter(|child| ExprNode::cast(child).is_some()) {
+                self.lower_expr(child, ResolveContext::ConstantFetch);
+            }
+            return;
+        }
+        for child in syntax_child_nodes(node) {
+            self.collect_runtime_declaration_constant_expressions(child);
+        }
+    }
+
     fn lower_stmt(&mut self, node: &SyntaxNode) -> StmtId {
         let key = NodeKey::new(node);
         if let Some(id) = self.stmts.get(&key) {
@@ -135,6 +147,7 @@ impl HirLowerer<'_> {
 
         self.collect_closure_body_statements(node);
         self.collect_declaration_body_statements(node);
+        self.collect_runtime_declaration_constant_expressions(node);
 
         let kind = match Stmt::cast(node) {
             Some(Stmt::InlineHtml(_)) => HirStmtKind::InlineHtml {

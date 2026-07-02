@@ -270,6 +270,12 @@ pub enum InstructionKind {
         object: Operand,
         property: String,
     },
+    /// `target =& object->property`.
+    BindReferenceFromProperty {
+        target: LocalId,
+        object: Operand,
+        property: String,
+    },
     /// `target =& local[dims...]`.
     BindReferenceFromDim {
         target: LocalId,
@@ -544,6 +550,12 @@ pub enum InstructionKind {
         class_name: String,
         property: String,
     },
+    /// Fetches a static property through a runtime class string or object.
+    FetchDynamicStaticProperty {
+        dst: RegId,
+        class_name: Operand,
+        property: String,
+    },
     /// Tests whether a static property exists and is not null.
     IssetStaticProperty {
         dst: RegId,
@@ -611,6 +623,13 @@ pub enum InstructionKind {
     AssignStaticProperty {
         dst: RegId,
         class_name: String,
+        property: String,
+        value: Operand,
+    },
+    /// Assigns a static property through a runtime class string or object.
+    AssignDynamicStaticProperty {
+        dst: RegId,
+        class_name: Operand,
         property: String,
         value: Operand,
     },

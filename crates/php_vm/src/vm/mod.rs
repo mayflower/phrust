@@ -11597,6 +11597,53 @@ impl Vm {
                             }
                         }
                     }
+                    InstructionKind::BindReferenceFromProperty {
+                        target,
+                        object,
+                        property,
+                    } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_REF_SOURCE_NON_OBJECT: cannot reference property on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let cell = match ensure_property_reference_cell(
+                            compiled, stack, &object, property,
+                        ) {
+                            Ok(cell) => cell,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .locals
+                            .bind_reference_cell(*target, cell)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        self.record_counter_alias_state(local_alias_state(stack, *target));
+                    }
                     InstructionKind::BindReferenceFromDim {
                         target,
                         local,
@@ -15586,6 +15633,183 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }
+                    InstructionKind::FetchDynamicStaticProperty {
+                        dst,
+                        class_name,
+                        property,
+                    } => {
+                        let class_name_value = match read_operand(unit, stack, *class_name) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let class_name =
+                            match dynamic_static_class_name_from_value(&class_name_value) {
+                                Ok(name) => name,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                        if let Err(result) = self.autoload_static_class_if_missing(
+                            compiled,
+                            &class_name,
+                            instruction.span,
+                            Some((
+                                compiled_unit_cache_key(compiled),
+                                function_id,
+                                block_id,
+                                instruction.id,
+                            )),
+                            output,
+                            stack,
+                            state,
+                        ) {
+                            match self.route_throwable_result(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                result,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
+                        let class =
+                            match resolve_static_class_name(compiled, state, stack, &class_name) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                            };
+                        let scope = current_scope_class(compiled, stack);
+                        let resolved = match lookup_resolved_property_in_state(
+                            compiled,
+                            state,
+                            &class,
+                            property,
+                            scope.as_deref(),
+                        ) {
+                            Ok(Some(resolved)) => resolved,
+                            Ok(None) => {
+                                let message = format!(
+                                    "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
+                                    class.display_name
+                                );
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if !resolved.property.flags.is_static {
+                            return self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!(
+                                    "E_PHP_VM_NON_STATIC_PROPERTY_ACCESS: property {}::${} is not static",
+                                    resolved.class.name, resolved.property.name
+                                ),
+                            );
+                        }
+                        if let Err(message) = validate_property_access_in_state(
+                            compiled,
+                            state,
+                            stack,
+                            &resolved.class,
+                            &resolved.property,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        let key = static_property_key(&resolved.class, &resolved.property);
+                        if !state.static_properties.contains_key(&key) {
+                            let default = match static_property_default(
+                                compiled,
+                                state,
+                                stack,
+                                &resolved.class,
+                                &resolved.property,
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            state.static_properties.insert(key.clone(), default);
+                        }
+                        let value = state
+                            .static_properties
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or(Value::Uninitialized);
+                        if matches!(value, Value::Uninitialized) {
+                            let message = format!(
+                                "E_PHP_VM_UNINITIALIZED_STATIC_PROPERTY: typed static property {}::${} must not be accessed before initialization",
+                                resolved.class.display_name, resolved.property.name
+                            );
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .registers
+                            .set(*dst, value)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
                     InstructionKind::IssetStaticProperty {
                         dst,
                         class_name,
@@ -18608,6 +18832,225 @@ impl Vm {
                         }
                         let class =
                             match resolve_static_class_name(compiled, state, stack, class_name) {
+                                Ok(class) => class,
+                                Err(message) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                            };
+                        let scope = current_scope_class(compiled, stack);
+                        let resolved = match lookup_resolved_property_in_state(
+                            compiled,
+                            state,
+                            &class,
+                            property,
+                            scope.as_deref(),
+                        ) {
+                            Ok(Some(resolved)) => resolved,
+                            Ok(None) => {
+                                let message = format!(
+                                    "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
+                                    class.display_name
+                                );
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    instruction.span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if !resolved.property.flags.is_static {
+                            return self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!(
+                                    "E_PHP_VM_NON_STATIC_PROPERTY_ACCESS: property {}::${} is not static",
+                                    resolved.class.name, resolved.property.name
+                                ),
+                            );
+                        }
+                        if let Err(message) = validate_property_access_in_state(
+                            compiled,
+                            state,
+                            stack,
+                            &resolved.class,
+                            &resolved.property,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        let value = match read_operand(unit, stack, *value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let property_type = ir_runtime_type(resolved.property.type_.as_ref());
+                        if let Err(message) = check_property_type(
+                            compiled,
+                            Some(state),
+                            resolved.class.display_name.as_str(),
+                            resolved.property.name.as_str(),
+                            &property_type,
+                            &value,
+                            self.typecheck_fast_path_context(),
+                        ) {
+                            match self.raise_runtime_error(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                instruction.span,
+                                message,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
+                        let key = static_property_key(&resolved.class, &resolved.property);
+                        let current = if let Some(value) = state.static_properties.get(&key) {
+                            value.clone()
+                        } else {
+                            match static_property_default(
+                                compiled,
+                                state,
+                                stack,
+                                &resolved.class,
+                                &resolved.property,
+                            ) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        };
+                        if let Err(message) = validate_static_property_write(
+                            compiled,
+                            stack,
+                            &resolved.class,
+                            &resolved.property,
+                            &current,
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        if let Err(message) = write_static_property_lvalue(
+                            &mut state.static_properties,
+                            key,
+                            current.clone(),
+                            value.clone(),
+                        ) {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        if let Some(outcome) = self.run_destructors_for_unreferenced_value(
+                            compiled,
+                            output,
+                            stack,
+                            state,
+                            &mut exception_handlers,
+                            &mut pending_control,
+                            &current,
+                        ) {
+                            match outcome {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .registers
+                            .set(*dst, value)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                    }
+                    InstructionKind::AssignDynamicStaticProperty {
+                        dst,
+                        class_name,
+                        property,
+                        value,
+                    } => {
+                        let class_name_value = match read_operand(unit, stack, *class_name) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let class_name =
+                            match dynamic_static_class_name_from_value(&class_name_value) {
+                                Ok(name) => name,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                        if let Err(result) = self.autoload_static_class_if_missing(
+                            compiled,
+                            &class_name,
+                            instruction.span,
+                            Some((
+                                compiled_unit_cache_key(compiled),
+                                function_id,
+                                block_id,
+                                instruction.id,
+                            )),
+                            output,
+                            stack,
+                            state,
+                        ) {
+                            match self.route_throwable_result(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                result,
+                            ) {
+                                RaiseOutcome::Caught(target) => {
+                                    block_id = target;
+                                    continue 'dispatch;
+                                }
+                                RaiseOutcome::Done(result) => return *result,
+                            }
+                        }
+                        let class =
+                            match resolve_static_class_name(compiled, state, stack, &class_name) {
                                 Ok(class) => class,
                                 Err(message) => {
                                     match self.raise_runtime_error(
@@ -51596,6 +52039,17 @@ fn class_name_from_object_or_string(value: &Value) -> Result<String, String> {
     to_string(value).map(|name| name.to_string_lossy())
 }
 
+fn dynamic_static_class_name_from_value(value: &Value) -> Result<String, String> {
+    match effective_value(value) {
+        Value::String(name) => Ok(display_class_name(&name.to_string_lossy())),
+        Value::Object(object) => Ok(object.class_name()),
+        other => Err(format!(
+            "E_PHP_VM_INVALID_DYNAMIC_CLASS_NAME: class name must be string or object, {} given",
+            value_type_name(&other)
+        )),
+    }
+}
+
 fn lookup_method_in_state(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -60198,6 +60652,39 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
     }
 
     #[test]
+    fn imported_class_constant_preserves_display_name_for_autoload() {
+        let result = execute_source(
+            r#"<?php
+            namespace WpOrg\Requests;
+            spl_autoload_register(function ($class) {
+                echo "autoload:$class|";
+                if ($class === 'WpOrg\Requests\Capability') {
+                    interface Capability {
+                        public const SSL = 'ssl';
+                    }
+                }
+            });
+            final class Requests {
+                public static function request() {
+                    return [Capability::SSL => true];
+                }
+            }
+            $capabilities = Requests::request();
+            echo Capability::SSL, '|';
+            foreach ($capabilities as $key => $value) {
+                echo $key, '=', $value ? 'true' : 'false';
+            }
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "autoload:WpOrg\\Requests\\Capability|ssl|ssl=true"
+        );
+    }
+
+    #[test]
     fn spl_autoload_extensions_and_class_parents_are_request_local_builtins() {
         let result = execute_source(
             r#"<?php
@@ -64048,6 +64535,16 @@ var_dump($box);
             result.output.as_bytes(),
             b"no|empty|yes|empty|no|empty|yes|filled"
         );
+    }
+
+    #[test]
+    fn dynamic_class_static_property_fetch_and_assign_execute() {
+        let result = execute_source(
+            "<?php class Mailer { public static $validator = 'old'; } $phpmailer = new Mailer(); $phpmailer::$validator = 'new'; echo Mailer::$validator, '|', $phpmailer::$validator;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"new|new");
     }
 
     #[test]
@@ -68906,6 +69403,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                         InstructionKind::BindReferenceProperty { .. }
                             | InstructionKind::BindReferencePropertyDim { .. }
                             | InstructionKind::BindReferenceDimFromProperty { .. }
+                            | InstructionKind::BindReferenceFromProperty { .. }
                     )
                 })
             })
@@ -68963,6 +69461,51 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             property_source.status
         );
         assert_eq!(property_source.output.as_bytes(), b"4|7");
+    }
+
+    #[test]
+    fn array_literal_property_reference_elements_bind_property_cell() {
+        let result = execute_source(
+            "<?php
+            class Hooks {
+                public function dispatch($args) {
+                    $args[0] = 'changed';
+                }
+            }
+            class Transport {
+                public $handle = 'initial';
+                public function send($hooks) {
+                    $hooks->dispatch([&$this->handle]);
+                    return $this->handle;
+                }
+            }
+            echo (new Transport())->send(new Hooks());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"changed");
+    }
+
+    #[test]
+    fn by_ref_property_return_binds_property_cell() {
+        let result = execute_source(
+            "<?php
+            class Transport {
+                public $handle = 'initial';
+                public function &get_handle() {
+                    return $this->handle;
+                }
+            }
+            $transport = new Transport();
+            $alias =& $transport->get_handle();
+            $alias = 'changed';
+            echo $transport->handle;
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"changed");
     }
 
     #[test]
@@ -69325,6 +69868,21 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             result.output.to_string_lossy()
         );
         assert_eq!(result.output.as_bytes(), b"false|fallback|fallback");
+    }
+
+    #[test]
+    fn coalesce_property_nested_dim_fetch_treats_missing_dynamic_key_as_null() {
+        let result = execute_source(
+            "<?php class Registry { protected $all = []; public function run($domain, $locale) { echo $this->all[$domain][$locale] ?? 'fallback'; } } (new Registry())->run('default', 'en_US');",
+        );
+
+        assert!(
+            result.status.is_success(),
+            "{:?}\n{}",
+            result.status,
+            result.output.to_string_lossy()
+        );
+        assert_eq!(result.output.as_bytes(), b"fallback");
     }
 
     #[test]

@@ -28,9 +28,9 @@ use php_semantics::hir::{
     AttributeId, AttributeTarget, BuiltinType, ClassLikeId, ClassLikeKind, ClassLikeMemberId,
     ConstExprContext, ConstExprId, ConstValue, DeclareValue, DefaultValueRef, ExprId,
     FunctionSignature, HirCallArg, HirClassLike, HirExprKind, HirMatchArm, HirModule,
-    HirNameResolution, HirProperty, HirPropertyHookBody, HirStmtKind, HirSwitchCase,
-    HirTraitAdaptationKind, HirTypeKind, MagicMethodKind, ModifierSet, NameKind, Parameter,
-    ParameterAttribute, ReturnType, SignatureKind, StmtId, TopLevelItemKind, TypeId, Visibility,
+    HirNameResolution, HirPropertyHookBody, HirStmtKind, HirSwitchCase, HirTraitAdaptationKind,
+    HirTypeKind, MagicMethodKind, ModifierSet, NameKind, Parameter, ParameterAttribute, ReturnType,
+    SignatureKind, StmtId, TopLevelItemKind, TypeId, Visibility,
 };
 use php_semantics::scopes::CaptureMode;
 use php_semantics::symbols::declarations::DeclarationKind;
@@ -2496,6 +2496,24 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_class_static_property_assignment_lowers() {
+        let frontend = analyze_source(
+            "<?php class Mailer { public static $validator; } $phpmailer = new Mailer(); $phpmailer::$validator = static function ($email) { return true; };",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains("assign_dynamic_static_property r"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("::$validator"), "{snapshot}");
+        assert!(!snapshot.contains("E_PHP_IR_UNSUPPORTED"), "{snapshot}");
+    }
+
+    #[test]
     fn static_property_dimension_isset_and_unset_lower_to_static_property_dim_instructions() {
         let frontend = analyze_source(
             "<?php class C { private static $map = ['id' => 'ID']; function f($key) { var_dump(isset(self::$map[$key])); unset(self::$map[$key]); } }",
@@ -2609,6 +2627,27 @@ mod tests {
     }
 
     #[test]
+    fn class_constant_uses_import_display_name_for_autoload() {
+        let frontend = analyze_source(
+            "<?php namespace WpOrg\\Requests; use WpOrg\\Requests\\Capability; final class Requests { public static function request() { return [Capability::SSL => true]; } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains("WpOrg\\Requests\\Capability::SSL"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains(" Capability::SSL"), "{snapshot}");
+        assert!(
+            !snapshot.contains("wporg\\requests\\capability::SSL"),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
     fn construct_isset_braced_dynamic_property_lowers_to_dynamic_property_instruction() {
         let frontend = analyze_source(
             "<?php function matches($obj, $m_key) { return isset($obj->{$m_key}); }",
@@ -2656,6 +2695,22 @@ mod tests {
             !snapshot.contains("E_PHP_IR_UNSUPPORTED_LITERAL"),
             "{snapshot}"
         );
+    }
+
+    #[test]
+    fn method_call_with_dynamic_property_argument_is_not_dynamic_method_call() {
+        let frontend = analyze_source(
+            "<?php class U { function download_package($x, $y) {} function f($current, $to_download) { $download = $this->download_package($current->packages->$to_download, false); } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("call_method r"), "{snapshot}");
+        assert!(snapshot.contains("fetch_dynamic_property r"), "{snapshot}");
+        assert!(!snapshot.contains("call_callable"), "{snapshot}");
+        assert!(!snapshot.contains("E_PHP_IR_UNSUPPORTED"), "{snapshot}");
     }
 
     #[test]
@@ -3594,13 +3649,17 @@ mod tests {
         let parts = interpolated_literal_parts("\"($this->counter)\"").expect("parts");
         assert!(matches!(
             &parts[1],
-            InterpolatedPart::Property { receiver, property }
+            InterpolatedPart::Property {
+                receiver, property, ..
+            }
                 if receiver == "this" && property == "counter"
         ));
         let parts = interpolated_literal_parts("\"({$this->counter})\"").expect("parts");
         assert!(matches!(
             &parts[1],
-            InterpolatedPart::Property { receiver, property }
+            InterpolatedPart::Property {
+                receiver, property, ..
+            }
                 if receiver == "this" && property == "counter"
         ));
     }

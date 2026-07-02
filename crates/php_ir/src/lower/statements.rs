@@ -1382,6 +1382,41 @@ impl LoweringContext<'_> {
             builder.terminate_return_ref(function, current, local, span);
             return current;
         }
+        if builder.returns_by_ref(function)
+            && let Some(target) = self.property_assignment_target(expr)
+        {
+            let Some(object) =
+                self.lower_expr_to_register(builder, function, block, target.receiver)
+            else {
+                builder.terminate_return(function, block, None, span);
+                return block;
+            };
+            let local = builder.intern_local(
+                function,
+                format!("__phrust:return-ref-property:{}", stmt_id.raw()),
+            );
+            let bind = builder.emit(
+                function,
+                object.block,
+                InstructionKind::BindReferenceFromProperty {
+                    target: local,
+                    object: Operand::Register(object.register),
+                    property: target.property,
+                },
+                span,
+            );
+            builder.add_source_map(
+                IrSourceMapTarget::Instruction {
+                    function,
+                    block: object.block,
+                    instruction: bind,
+                },
+                format!("hir:stmt:{}", stmt_id.raw()),
+                span,
+            );
+            builder.terminate_return_ref(function, object.block, local, span);
+            return object.block;
+        }
         if builder.returns_by_ref(function) && self.contains_dim_fetch_expr(expr) {
             self.unsupported(
                 UnsupportedFeature::ArrayElementReference,
@@ -1593,7 +1628,6 @@ impl LoweringContext<'_> {
         let default_index = cases.iter().position(|case| case.is_default);
         let fallback = default_index
             .map(|index| case_blocks[index])
-            .or_else(|| case_blocks.first().copied())
             .unwrap_or(after_block);
         let conditional_cases = cases
             .iter()
