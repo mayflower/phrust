@@ -16665,21 +16665,50 @@ impl Vm {
                                         &resolved.class,
                                         &resolved.property,
                                     ) {
-                                        match self.raise_runtime_error(
+                                        match self.call_magic_property_method(
                                             compiled,
+                                            object.clone(),
+                                            "__get",
+                                            &property,
+                                            vec![CallArgument::positional(Value::String(
+                                                PhpString::from_test_str(&property),
+                                            ))],
                                             output,
                                             stack,
                                             state,
-                                            &mut exception_handlers,
-                                            &mut pending_control,
-                                            instruction.span,
-                                            access_error,
                                         ) {
-                                            RaiseOutcome::Caught(target) => {
-                                                block_id = target;
-                                                continue 'dispatch;
+                                            Ok(Some(value)) => {
+                                                if let Err(message) = stack
+                                                    .current_mut()
+                                                    .expect("frame was pushed")
+                                                    .registers
+                                                    .set(*dst, value)
+                                                {
+                                                    return self.runtime_error(
+                                                        output, compiled, stack, message,
+                                                    );
+                                                }
+                                                continue;
                                             }
-                                            RaiseOutcome::Done(result) => return *result,
+                                            Ok(None) => {
+                                                match self.raise_runtime_error(
+                                                    compiled,
+                                                    output,
+                                                    stack,
+                                                    state,
+                                                    &mut exception_handlers,
+                                                    &mut pending_control,
+                                                    instruction.span,
+                                                    access_error,
+                                                ) {
+                                                    RaiseOutcome::Caught(target) => {
+                                                        block_id = target;
+                                                        continue 'dispatch;
+                                                    }
+                                                    RaiseOutcome::Done(result) => return *result,
+                                                }
+                                            }
+                                            Err(result) => return result,
                                         }
                                     }
                                 }
@@ -64639,6 +64668,20 @@ good"
             magic_after_unset.status
         );
         assert_eq!(magic_after_unset.output.as_bytes(), b"value:magic");
+
+        let magic_private_dynamic = execute_source(
+            "<?php class BlockTypeProbe { private $uses_context = array('postId'); public function __isset($name) { echo 'isset:' . $name . '|'; return $name === 'uses_context'; } public function __get($name) { echo 'get:' . $name . '|'; return 'magic:' . $name; } } $field = 'uses_context'; $probe = new BlockTypeProbe(); echo isset($probe->{$field}) ? 'yes|' : 'no|'; echo $probe->{$field};",
+        );
+        assert!(
+            magic_private_dynamic.status.is_success(),
+            "{:?}\n{}",
+            magic_private_dynamic.status,
+            magic_private_dynamic.output.to_string_lossy()
+        );
+        assert_eq!(
+            magic_private_dynamic.output.as_bytes(),
+            b"isset:uses_context|yes|get:uses_context|magic:uses_context"
+        );
 
         let magic_set_after_unset = execute_source(
             "<?php class Box { public $value = 1; public function __set($name, $value) { echo $name, ':set|'; $this->$name = $value; } } $box = new Box(); unset($box->value); $box->value = 3; echo $box->value;",
