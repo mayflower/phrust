@@ -33,7 +33,9 @@ Commands:
 `oracle-smoke` is the cheap CI-style gate: it refreshes the API index, runs the
 bounded smoke probes when `REFERENCE_PHP` is available, and fails on new
 unclassified oracle failures. `verify-oracle` runs the full generated probe set
-under the same strict-reference rule.
+under the same strict-reference rule. `oracle-gap-report` uses deterministic
+oracle/API/probe inputs by default; pass `--full` only after refreshing the
+broader runtime, stdlib, PHPT, and application-smoke reports under `target/`.
 
 `oracle-next-gap-prompt` reads `target/oracle/gap-report.json` and emits one
 family-level implementation prompt for the highest-priority open gap family.

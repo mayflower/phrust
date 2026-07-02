@@ -267,7 +267,10 @@ Once OP-1A through OP-1C exist, the normal compatibility workflow is:
 4. Implement the generic layer fix using the existing engine pipeline.
 5. Add or promote reduced fixtures/probes with source provenance.
 6. Run the focused target for the owner layer.
-7. Rerun `oracle-gap-report` and remove or narrow closed known gaps.
+7. Rerun `oracle-gap-report` and remove or narrow closed known gaps. The default
+   checked report uses deterministic oracle/API/probe inputs. Use
+   `oracle-gap-report --full` only after refreshing the broader runtime,
+   stdlib, PHPT, and application-smoke artifacts under `target/`.
 8. Run app-level smoke only as final evidence.
 
 `oracle-smoke` may later join `quality-fast`, `verify-runtime`, or

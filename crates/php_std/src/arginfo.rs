@@ -847,7 +847,7 @@ mod tests {
         let closure = Value::Callable(CallableValue::Closure(ClosurePayload::new(7, Vec::new())));
 
         let validated = ArgumentValidator::new(CoercionMode::Strict)
-            .validate(&info, &[closure.clone()], span())
+            .validate(&info, std::slice::from_ref(&closure), span())
             .expect("closure object validates");
 
         assert_eq!(validated.values(), &[closure]);

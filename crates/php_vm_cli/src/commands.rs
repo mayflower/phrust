@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -87,19 +87,44 @@ impl PhaseTimingCollector {
 }
 
 pub(crate) fn main_entry() {
-    let code = run(env::args().skip(1), &mut io::stdout(), &mut io::stderr());
+    let mut stdin = io::stdin();
+    let stdin_is_terminal = stdin.is_terminal();
+    let code = run_with_stdin(
+        env::args().skip(1),
+        &mut stdin,
+        stdin_is_terminal,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    );
     if code != EXIT_SUCCESS {
         std::process::exit(code);
     }
 }
 
+#[cfg(test)]
 fn run<I, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> i32
 where
     I: IntoIterator<Item = String>,
     W: Write,
     E: Write,
 {
-    match run_inner(args, stdout, stderr) {
+    run_with_stdin(args, &mut io::empty(), true, stdout, stderr)
+}
+
+fn run_with_stdin<I, R, W, E>(
+    args: I,
+    stdin: &mut R,
+    stdin_is_terminal: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> i32
+where
+    I: IntoIterator<Item = String>,
+    R: Read,
+    W: Write,
+    E: Write,
+{
+    match run_inner(args, stdin, stdin_is_terminal, stdout, stderr) {
         Ok(code) => code,
         Err(error) => {
             let format = error_format_from_env("PHRUST_ERROR_FORMAT");
@@ -110,9 +135,16 @@ where
     }
 }
 
-fn run_inner<I, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> Result<i32, String>
+fn run_inner<I, R, W, E>(
+    args: I,
+    stdin: &mut R,
+    stdin_is_terminal: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
 where
     I: IntoIterator<Item = String>,
+    R: Read,
     W: Write,
     E: Write,
 {
@@ -138,7 +170,7 @@ where
         "dump-copy-patch-stencils" => dump_copy_patch_stencils_command(&args[1..], stdout, stderr),
         "dump-mid-tier-plan" => dump_mid_tier_plan_command(&args[1..], stdout, stderr),
         "dump-cranelift-clif" => dump_cranelift_clif_command(&args[1..], stdout, stderr),
-        "run" => run_command(&args[1..], stdout, stderr),
+        "run" => run_command(&args[1..], stdin, stdin_is_terminal, stdout, stderr),
         "report" => report_command(&args[1..], stdout, stderr),
         "compare" => {
             writeln!(
@@ -686,12 +718,24 @@ where
     Ok(EXIT_SUCCESS)
 }
 
-fn run_command<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32, String>
+fn run_command<R, W, E>(
+    args: &[String],
+    stdin: &mut R,
+    stdin_is_terminal: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32, String>
 where
+    R: Read,
     W: Write,
     E: Write,
 {
     let mut run_options = parse_run_args(args)?;
+    if !stdin_is_terminal {
+        stdin
+            .read_to_end(&mut run_options.stdin)
+            .map_err(|error| format!("stdin: {error}"))?;
+    }
     if run_options.debug {
         run_options.trace = true;
         run_options.trace_runtime = true;
@@ -834,10 +878,13 @@ where
         (pipeline.lowering.unit.clone(), Some(pipeline))
     };
     let include_loader = include_loader_for(path).ok();
+    let cwd = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let runtime_context = runtime_context_for(
         path,
         run_options.script_args.clone(),
         run_options.env.clone(),
+        cwd.clone(),
+        run_options.stdin.clone(),
         include_loader.as_ref(),
     );
     let jit_eligibility_json = build_jit_eligibility_json(&unit, run_options.jit);
@@ -1115,8 +1162,11 @@ where
     )?;
     let jit_eligibility_json = build_jit_eligibility_json(compiled.ir_unit(), run_options.jit);
     let persistent_feedback = load_persistent_feedback(run_options, path, compiled.ir_unit())?;
+    let cwd = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
     let runtime_context = RuntimeContext::controlled_cli(path, run_options.script_args.clone())
-        .with_env(run_options.env.clone());
+        .with_env(run_options.env.clone())
+        .with_cwd(cwd.clone())
+        .with_stdin(run_options.stdin.clone());
     emit_debug_event(
         stderr,
         run_options,
@@ -1130,7 +1180,7 @@ where
         &compiled,
         PhpRequestExecutionInput {
             real_path: Some(real_path),
-            cwd: std::env::current_dir().map_err(|error| format!("current directory: {error}"))?,
+            cwd,
             include_roots: Vec::new(),
             runtime_context,
             collect_counters,
@@ -1285,8 +1335,15 @@ where
 
     let vm_result = if pipeline.ok() {
         let include_loader = include_loader_for(path).ok();
-        let runtime_context =
-            runtime_context_for(path, Vec::new(), Vec::new(), include_loader.as_ref());
+        let cwd = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+        let runtime_context = runtime_context_for(
+            path,
+            Vec::new(),
+            Vec::new(),
+            cwd,
+            Vec::new(),
+            include_loader.as_ref(),
+        );
         let vm = Vm::with_options(VmOptions {
             include_loader,
             runtime_context,
@@ -1489,13 +1546,13 @@ fn compile_pipeline_with_optimization_timed(
 ) -> Result<Pipeline, String> {
     let started = Instant::now();
     let source = read_source_to_string(path)?;
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = &mut timings {
         timings.record_phase("source_read_ms", started);
         timings.count("source_bytes", source.len() as u64);
     }
     let started = Instant::now();
     let frontend = analyze_source(&source);
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = &mut timings {
         timings.record_phase("frontend_analyze_ms", started);
     }
     let source_path = fs::canonicalize(path)
@@ -1510,7 +1567,7 @@ fn compile_pipeline_with_optimization_timed(
             ..LoweringOptions::default()
         },
     );
-    if let Some(timings) = timings.as_deref_mut() {
+    if let Some(timings) = &mut timings {
         timings.record_phase("ir_lower_ms", started);
         timings.count("functions", lowering.unit.functions.len() as u64);
         timings.count("classes", lowering.unit.classes.len() as u64);
@@ -1529,12 +1586,12 @@ fn compile_pipeline_with_optimization_timed(
         let report = PassPipeline::performance()
             .run(&mut lowering.unit, &PassContext::new(opt_level))
             .map_err(|error| format!("{path}: optimizer failed: {error}"))?;
-        if let Some(timings) = timings.as_deref_mut() {
+        if let Some(timings) = &mut timings {
             timings.record_phase("optimizer_ms", started);
         }
         let started = Instant::now();
         lowering.verification = verify_unit(&lowering.unit);
-        if let Some(timings) = timings.as_deref_mut() {
+        if let Some(timings) = &mut timings {
             timings.record_phase("ir_verify_ms", started);
             timings.count(
                 "instructions_or_ir_ops",
@@ -1597,9 +1654,14 @@ fn runtime_context_for(
     path: &str,
     script_args: Vec<String>,
     env: Vec<(String, String)>,
+    cwd: PathBuf,
+    stdin: Vec<u8>,
     include_loader: Option<&IncludeLoader>,
 ) -> RuntimeContext {
-    let context = RuntimeContext::controlled_cli(path, script_args).with_env(env);
+    let context = RuntimeContext::controlled_cli(path, script_args)
+        .with_env(env)
+        .with_cwd(cwd)
+        .with_stdin(stdin);
     let Some(loader) = include_loader else {
         return context;
     };
@@ -1828,10 +1890,9 @@ fn runtime_diagnostic_was_rendered(diagnostic: &RuntimeDiagnostic, php_output: &
     if matches!(
         diagnostic.id(),
         "E_PHP_VM_INCLUDE_MISSING" | "E_PHP_VM_INCLUDE_READ"
-    ) {
-        if let Some(target) = include_diagnostic_target(diagnostic.message()) {
-            return php_output.contains(target) && php_output.contains("Failed to open stream");
-        }
+    ) && let Some(target) = include_diagnostic_target(diagnostic.message())
+    {
+        return php_output.contains(target) && php_output.contains("Failed to open stream");
     }
     false
 }
@@ -4157,6 +4218,7 @@ mod tests {
         EXIT_SUCCESS, EXIT_USAGE, JitStatsMode, OptimizationLevel, PersistentFeedbackOptions,
         QuickeningMode, cache_file_for, compile_pipeline_with_optimization, parse_compile_args,
         parse_dump_dependency_units_args, parse_dump_rule_selection_args, parse_run_args, run,
+        run_with_stdin,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
     use php_runtime::api::RuntimeContext;
@@ -4165,6 +4227,7 @@ mod tests {
         SuperinstructionMode,
     };
     use serde_json::Value;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::{env, fs};
@@ -5262,6 +5325,38 @@ mod tests {
 
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
         assert_eq!(stdout, b"3|alpha|beta\n");
+    }
+
+    #[test]
+    fn run_file_exposes_piped_stdin_and_process_cwd() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let root =
+            std::env::temp_dir().join(format!("phrust-vm-cli-stdin-cwd-{}", std::process::id()));
+        let script = root.join("stdin-cwd.php");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            &script,
+            "<?php\nfile_put_contents('runner-clean.txt', 'x');\necho stream_get_contents(STDIN), '|', file_exists('runner-clean.txt') ? 'made' : 'missing', \"\\n\";\n",
+        )
+        .expect("write temporary PHP source");
+        let previous_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&root).expect("set temp cwd");
+        let mut stdin = Cursor::new(b"hello stdin".to_vec());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with_stdin(
+            ["run".to_string(), script.display().to_string()],
+            &mut stdin,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        std::env::set_current_dir(previous_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"hello stdin|made\n");
     }
 
     #[test]

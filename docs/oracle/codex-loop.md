@@ -29,6 +29,12 @@ gap queue. Use it as the discovery path before relying on WordPress smoke.
 8. Remove, narrow, or update known-gap rows only after the focused fixture is
    green and the report confirms the gap family shrank.
 
+`oracle-gap-report` defaults to the deterministic cheap input set: the PHP
+source API index plus generated oracle probe reports under `target/oracle/`.
+Use `nix develop -c just oracle-gap-report --full` only after intentionally
+refreshing the broader runtime, stdlib, PHPT, and application-smoke reports
+that live under `target/`.
+
 ## Ratchets
 
 - `oracle-smoke` fails on unclassified oracle failures.
