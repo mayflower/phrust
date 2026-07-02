@@ -216,9 +216,46 @@ fn class_resolution_display_name(
     class_likes: &[(ClassLikeId, HirClassLike)],
     source_path: &str,
 ) -> String {
-    imported_class_resolution_display_name(module, resolution)
+    source_imported_class_resolution_display_name(module, resolution)
+        .or_else(|| imported_class_resolution_display_name(module, resolution))
         .or_else(|| declared_class_resolution_display_name(class_likes, source_path, resolution))
+        .or_else(|| {
+            resolution
+                .resolved()
+                .or_else(|| resolution.fallback())
+                .map(display_class_name)
+        })
         .unwrap_or_else(|| display_class_name(resolution.source()))
+}
+
+fn source_imported_class_resolution_display_name(
+    module: &HirModule,
+    resolution: &HirNameResolution,
+) -> Option<String> {
+    let source = resolution.source().trim_start_matches('\\');
+    let first_part = source.split('\\').next().unwrap_or_default();
+    if first_part.is_empty() {
+        return None;
+    }
+    module.namespaces().values().find_map(|namespace| {
+        let import = namespace
+            .imports()
+            .lookup(ImportKind::ClassLike, first_part)?;
+        let mut parts = import
+            .name()
+            .parts()
+            .iter()
+            .map(|part| part.original().to_owned())
+            .collect::<Vec<_>>();
+        parts.extend(
+            source
+                .split('\\')
+                .skip(1)
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        Some(parts.join("\\"))
+    })
 }
 
 fn imported_class_resolution_display_name(
@@ -3906,6 +3943,27 @@ mod tests {
         assert!(
             snapshot.contains(r#""simplepie\\exception" display="SimplePie\\Exception""#),
             "{snapshot}"
+        );
+    }
+
+    #[test]
+    fn aliased_parent_declaration_preserves_imported_display_name_for_autoload() {
+        let frontend = analyze_source(
+            "<?php namespace SimplePie\\HTTP; use SimplePie\\Exception as SimplePieException; final class ClientException extends SimplePieException {}",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        let class = result
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == "simplepie\\http\\clientexception")
+            .expect("client exception class should be lowered");
+        assert_eq!(class.parent.as_deref(), Some("simplepie\\exception"));
+        assert_eq!(
+            class.parent_display_name.as_deref(),
+            Some("SimplePie\\Exception")
         );
     }
 

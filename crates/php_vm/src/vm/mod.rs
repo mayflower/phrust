@@ -51517,6 +51517,14 @@ fn class_dependency_display_name(
     normalized_dependency: &str,
 ) -> String {
     let normalized_dependency = normalize_class_name(normalized_dependency);
+    if class
+        .parent
+        .as_deref()
+        .is_some_and(|parent| normalize_class_name(parent) == normalized_dependency)
+        && let Some(display) = class.parent_display_name.as_deref()
+    {
+        return display.to_owned();
+    }
     let Some(file) = compiled.unit().files.get(class.span.file.index()) else {
         return normalized_dependency;
     };
@@ -61459,6 +61467,62 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
         assert_eq!(
             result.output.to_string_lossy(),
             "autoload:SimplePie\\Exception|ok"
+        );
+    }
+
+    #[test]
+    fn aliased_parent_declaration_preserves_display_name_for_autoload() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-parent-alias-autoload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(
+            root.join("Exception.php"),
+            "<?php
+            namespace SimplePie;
+            class Exception extends \\Exception {}
+            ",
+        )
+        .expect("parent class target should be written");
+        let source = r#"<?php
+            namespace SimplePie\HTTP;
+            use SimplePie\Exception as SimplePieException;
+            spl_autoload_register(function ($class) {
+                echo "autoload:$class|";
+                if ($class === 'SimplePie\Exception') {
+                    require __DIR__ . '/Exception.php';
+                }
+            });
+            final class ClientException extends SimplePieException {}
+            echo 'ok';
+        "#;
+        std::fs::write(root.join("index.php"), source).expect("entry source should be written");
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(
+            output.contains("autoload:SimplePie\\Exception|"),
+            "{output}"
+        );
+        assert!(output.contains("ok"), "{output}");
+        assert!(
+            !output.contains("autoload:simplepie\\exception|"),
+            "{output}"
         );
     }
 
