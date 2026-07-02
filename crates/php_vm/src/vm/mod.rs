@@ -5161,7 +5161,7 @@ impl Vm {
             let Some(value) = values.get(index).cloned() else {
                 continue;
             };
-            if !value_needs_vm_string_coercion(compiled, &value) {
+            if !value_needs_vm_string_coercion_in_state(compiled, state, &value) {
                 continue;
             }
             let coerced = self.value_to_string(compiled, &value, output, stack, state)?;
@@ -5172,7 +5172,7 @@ impl Vm {
                 let Some(value) = values.get(index).cloned() else {
                     continue;
                 };
-                if !value_needs_vm_string_coercion(compiled, &value) {
+                if !value_needs_vm_string_coercion_in_state(compiled, state, &value) {
                     continue;
                 }
                 let coerced = self.value_to_string(compiled, &value, output, stack, state)?;
@@ -29402,10 +29402,12 @@ impl Vm {
                 ),
             ));
         }
+        let owner = class_owner_in_state(compiled, state, &resolved.class.name);
         let result = self.execute_function(
-            compiled,
+            &owner,
             resolved.method.function,
             FunctionCall::new(Vec::new(), Vec::new())
+                .with_call_site_strict_types(owner.unit().strict_types)
                 .with_this(object.clone())
                 .with_class_context(
                     resolved.class.name.clone(),
@@ -29773,7 +29775,13 @@ impl Vm {
                 ),
             ));
         };
-        let resolved = match lookup_method_in_hierarchy(compiled, &class, "__toString", None) {
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &class.name,
+            "__toString",
+            None,
+        ) {
             Ok(Some(method)) => method,
             Ok(None) => {
                 return Err(self.runtime_error_with_source_span(
@@ -29812,16 +29820,12 @@ impl Vm {
                 ),
             ));
         }
-        let result = self.execute_function(
+        let result = self.call_object_method_callable(
             compiled,
-            resolved.method.function,
-            FunctionCall::new(Vec::new(), Vec::new())
-                .with_this(object.clone())
-                .with_class_context(
-                    resolved.class.name.clone(),
-                    object.display_name(),
-                    resolved.class.name.clone(),
-                ),
+            object.clone(),
+            "__toString",
+            Vec::new(),
+            None,
             output,
             stack,
             state,
@@ -45608,6 +45612,14 @@ fn call_date_time_like_method(
                 .unwrap_or_else(|| php_runtime::datetime::DEFAULT_TIMEZONE.to_owned());
             Ok(php_runtime::datetime::datetimezone_object(&timezone).unwrap_or(Value::Bool(false)))
         }
+        "getoffset" => {
+            validate_date_time_arg_count(&format!("{class_name}::getOffset"), values.len(), 0, 0)?;
+            let timezone = php_runtime::datetime::object_timezone(&object)
+                .unwrap_or_else(|| php_runtime::datetime::DEFAULT_TIMEZONE.to_owned());
+            Ok(Value::Int(php_runtime::datetime::timezone_offset_seconds(
+                &timezone,
+            )))
+        }
         "settimezone" => {
             validate_date_time_arg_count(
                 &format!("{class_name}::setTimezone"),
@@ -45679,6 +45691,29 @@ fn call_date_timezone_method(
             validate_date_time_arg_count("DateTimeZone::getName", values.len(), 0, 0)?;
             Ok(php_runtime::datetime::object_timezone(&object)
                 .map_or(Value::Bool(false), Value::string))
+        }
+        "getoffset" => {
+            validate_date_time_arg_count("DateTimeZone::getOffset", values.len(), 1, 1)?;
+            let Value::Object(datetime) = effective_value(&values[0]) else {
+                return Err(format!(
+                    "E_PHP_VM_DATETIMEZONE_ARG_TYPE: DateTimeZone::getOffset expects DateTimeInterface, {} given",
+                    value_type_name(&values[0])
+                ));
+            };
+            if !matches!(
+                normalize_class_name(&datetime.class_name()).as_str(),
+                "datetime" | "datetimeimmutable"
+            ) {
+                return Err(format!(
+                    "E_PHP_VM_DATETIMEZONE_ARG_TYPE: DateTimeZone::getOffset expects DateTimeInterface, {} given",
+                    datetime.class_name()
+                ));
+            }
+            let timezone = php_runtime::datetime::object_timezone(&object)
+                .unwrap_or_else(|| php_runtime::datetime::DEFAULT_TIMEZONE.to_owned());
+            Ok(Value::Int(php_runtime::datetime::timezone_offset_seconds(
+                &timezone,
+            )))
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
@@ -54015,10 +54050,16 @@ fn value_is_numeric_string_key_ambiguity(value: &Value) -> bool {
     php_runtime::numeric_string::array_key_has_numeric_string_ambiguity(&string)
 }
 
-fn value_needs_vm_string_coercion(compiled: &CompiledUnit, value: &Value) -> bool {
+fn value_needs_vm_string_coercion_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    value: &Value,
+) -> bool {
     match value {
-        Value::Object(object) => object_has_public_to_string(compiled, object),
-        Value::Reference(cell) => value_needs_vm_string_coercion(compiled, &cell.get()),
+        Value::Object(object) => object_has_public_to_string_in_state(compiled, state, object),
+        Value::Reference(cell) => {
+            value_needs_vm_string_coercion_in_state(compiled, state, &cell.get())
+        }
         _ => false,
     }
 }
@@ -59024,6 +59065,21 @@ fn object_has_public_to_string(compiled: &CompiledUnit, object: &ObjectRef) -> b
         && !resolved.method.flags.is_protected
 }
 
+fn object_has_public_to_string_in_state(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    object: &ObjectRef,
+) -> bool {
+    let Ok(Some(resolved)) =
+        lookup_resolved_method_in_state(compiled, state, &object.class_name(), "__toString", None)
+    else {
+        return false;
+    };
+    !resolved.method.flags.is_static
+        && !resolved.method.flags.is_private
+        && !resolved.method.flags.is_protected
+}
+
 fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
     match op {
         BinaryOp::BitAnd => lhs
@@ -61041,6 +61097,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             echo $date->format('Y-m-d H:i:s T U'), \"\\n\";
             echo $date->getTimestamp(), \"\\n\";
             echo $date->getTimezone()->getName(), \"\\n\";
+            echo $date->getOffset(), '|', $zone->getOffset($date), \"\\n\";
             echo DateTimeZone::ALL_WITH_BC, \"\\n\";
             echo (new datetimezone('UTC'))->getName(), \"\\n\";
             $offsetZone = new DateTimeZone('+00:00');
@@ -61063,7 +61120,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(
             result.output.to_string_lossy(),
-            "UTC\n2024-01-02 03:04:05 UTC 1704164645\n1704164645\nUTC\n4095\nUTC\n+00:00\n19800 -05:30 -0530 GMT-0530\n2024-01-02 03:04:05 CET 1704161045\n1|2|1 2 0 0\n2024-01-03 05:04:05\n2024-01-02|2024-01-03\n86400|0\n"
+            "UTC\n2024-01-02 03:04:05 UTC 1704164645\n1704164645\nUTC\n0|0\n4095\nUTC\n+00:00\n19800 -05:30 -0530 GMT-0530\n2024-01-02 03:04:05 CET 1704161045\n1|2|1 2 0 0\n2024-01-03 05:04:05\n2024-01-02|2024-01-03\n86400|0\n"
         );
     }
 
@@ -61828,6 +61885,51 @@ printf-to-string:BadString::__toString(): Return value must be of type string, a
 array-key:Cannot access offset of type Plain on array\n\
 good-call:\n\
 good"
+        );
+    }
+
+    #[test]
+    fn included_object_to_string_resolves_dynamic_class_method_for_sprintf() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-include-tostring-sprintf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        std::fs::write(
+            root.join("Theme.php"),
+            "<?php
+            class IncludedTheme {
+                public function __toString(): string {
+                    return 'Twenty Twenty-Five';
+                }
+            }
+            ",
+        )
+        .expect("theme class should be written");
+        let source = "<?php
+            require __DIR__ . '/Theme.php';
+            echo sprintf('<a href=\"themes.php\">%1$s</a>', new IncludedTheme());
+        ";
+        std::fs::write(root.join("index.php"), source).expect("entry source should be written");
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+                runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+                ..VmOptions::default()
+            },
+            root.join("index.php").to_string_lossy().into_owned(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "<a href=\"themes.php\">Twenty Twenty-Five</a>"
         );
     }
 

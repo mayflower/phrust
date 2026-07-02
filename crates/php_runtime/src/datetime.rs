@@ -542,7 +542,8 @@ fn object_timezone_or_utc(object: &ObjectRef) -> String {
     object_timezone(object).unwrap_or_else(|| DEFAULT_TIMEZONE.to_string())
 }
 
-fn timezone_offset_seconds(timezone: &str) -> i64 {
+#[must_use]
+pub fn timezone_offset_seconds(timezone: &str) -> i64 {
     if let Some(offset) = fixed_timezone_offset_seconds(timezone) {
         return offset;
     }
