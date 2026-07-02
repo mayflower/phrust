@@ -3176,8 +3176,7 @@ mod tests {
 
     #[test]
     fn property_dimension_increment_lowers_through_assign_property_dim() {
-        let frontend =
-            analyze_source("<?php class C {} $c = new C; ++$c->p['n']; $c->p['n']--;");
+        let frontend = analyze_source("<?php class C {} $c = new C; ++$c->p['n']; $c->p['n']--;");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);

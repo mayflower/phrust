@@ -267,6 +267,19 @@ pub const PHP_URL_QUERY: i64 = 6;
 /// `parse_url()` component selector for the URL fragment.
 pub const PHP_URL_FRAGMENT: i64 = 7;
 
+/// GD GIF image-type bit.
+pub const IMG_GIF: i64 = 1;
+/// GD JPEG image-type bit.
+pub const IMG_JPG: i64 = 2;
+/// GD JPEG image-type alias bit.
+pub const IMG_JPEG: i64 = 2;
+/// GD PNG image-type bit.
+pub const IMG_PNG: i64 = 4;
+/// GD WebP image-type bit.
+pub const IMG_WEBP: i64 = 32;
+/// GD AVIF image-type bit.
+pub const IMG_AVIF: i64 = 256;
+
 /// PHP `PASSWORD_DEFAULT` algorithm marker.
 pub const PASSWORD_DEFAULT: &str = "2y";
 /// PHP `PASSWORD_BCRYPT` algorithm marker.

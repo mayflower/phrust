@@ -1567,7 +1567,9 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let handle = builtin_curl_init(
             &mut context,
-            vec![Value::string(format!("http://127.0.0.1:{port}/site-health"))],
+            vec![Value::string(format!(
+                "http://127.0.0.1:{port}/site-health"
+            ))],
             RuntimeSourceSpan::default(),
         )
         .expect("init");

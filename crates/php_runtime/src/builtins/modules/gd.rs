@@ -15,6 +15,10 @@ use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
 use std::fs;
 use std::io::Cursor;
 
+const IMG_JPG: i64 = 2;
+const IMG_PNG: i64 = 4;
+const SUPPORTED_IMAGE_TYPES: i64 = IMG_JPG | IMG_PNG;
+
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("gd_info", builtin_gd_info, BuiltinCompatibility::Php),
     BuiltinEntry::new(
@@ -42,6 +46,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_imagecreatetruecolor,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("imagetypes", builtin_imagetypes, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "imagedestroy",
         builtin_imagedestroy,
@@ -71,6 +76,17 @@ fn builtin_gd_info(
     insert(&mut array, "WebP Support", Value::Bool(false));
     insert(&mut array, "AVIF Support", Value::Bool(false));
     Ok(Value::Array(array))
+}
+
+fn builtin_imagetypes(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !args.is_empty() {
+        return Err(arity_error("imagetypes", "no arguments"));
+    }
+    Ok(Value::Int(SUPPORTED_IMAGE_TYPES))
 }
 
 fn builtin_imagecreatefromstring(
@@ -365,4 +381,55 @@ fn gd_runtime_class() -> ClassEntry {
 
 fn insert(array: &mut PhpArray, key: &str, value: Value) {
     array.insert(string_array_key(key), value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OutputBuffer;
+
+    #[test]
+    fn imagetypes_reports_bounded_jpeg_and_png_support() {
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+
+        assert_eq!(
+            builtin_imagetypes(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("imagetypes succeeds"),
+            Value::Int(IMG_JPG | IMG_PNG)
+        );
+    }
+
+    #[test]
+    fn gd_info_matches_bounded_image_type_support() {
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        let Value::Array(info) =
+            builtin_gd_info(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("gd_info succeeds")
+        else {
+            panic!("expected GD info array");
+        };
+
+        assert_eq!(
+            info.get(&string_array_key("JPEG Support")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            info.get(&string_array_key("PNG Support")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            info.get(&string_array_key("GIF Read Support")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            info.get(&string_array_key("WebP Support")),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            info.get(&string_array_key("AVIF Support")),
+            Some(&Value::Bool(false))
+        );
+    }
 }

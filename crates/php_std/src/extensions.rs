@@ -2549,12 +2549,43 @@ pub(super) fn standard_library_exif_extension() -> ExtensionDescriptor {
 
 pub(super) fn standard_library_gd_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("gd")
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_GIF",
+            "gd",
+            ConstantValue::Int(constants::IMG_GIF),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_JPG",
+            "gd",
+            ConstantValue::Int(constants::IMG_JPG),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_JPEG",
+            "gd",
+            ConstantValue::Int(constants::IMG_JPEG),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_PNG",
+            "gd",
+            ConstantValue::Int(constants::IMG_PNG),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_WEBP",
+            "gd",
+            ConstantValue::Int(constants::IMG_WEBP),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "IMG_AVIF",
+            "gd",
+            ConstantValue::Int(constants::IMG_AVIF),
+        ))
         .with_function(FunctionDescriptor::php("gd_info", "gd"))
         .with_function(FunctionDescriptor::php("imagecopyresampled", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefromjpeg", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefrompng", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefromstring", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatetruecolor", "gd"))
+        .with_function(FunctionDescriptor::php("imagetypes", "gd"))
         .with_function(FunctionDescriptor::php("imagedestroy", "gd"))
         .with_function(FunctionDescriptor::php("imagejpeg", "gd"))
         .with_function(FunctionDescriptor::php("imagepng", "gd"))

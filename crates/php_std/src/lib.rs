@@ -780,6 +780,48 @@ mod tests {
     }
 
     #[test]
+    fn standard_registry_tracks_bounded_gd_image_capabilities() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "gd_info",
+            "imagecopyresampled",
+            "imagecreatefromjpeg",
+            "imagecreatefrompng",
+            "imagecreatefromstring",
+            "imagecreatetruecolor",
+            "imagetypes",
+            "imagedestroy",
+            "imagejpeg",
+            "imagepng",
+            "imagesx",
+            "imagesy",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a GD function"
+            );
+        }
+
+        for (name, expected) in [
+            ("IMG_GIF", constants::IMG_GIF),
+            ("IMG_JPG", constants::IMG_JPG),
+            ("IMG_JPEG", constants::IMG_JPEG),
+            ("IMG_PNG", constants::IMG_PNG),
+            ("IMG_WEBP", constants::IMG_WEBP),
+            ("IMG_AVIF", constants::IMG_AVIF),
+        ] {
+            assert_eq!(
+                registry
+                    .enabled_constant(name)
+                    .and_then(ConstantDescriptor::value),
+                Some(ConstantValue::Int(expected)),
+                "{name} should be registered with its PHP GD bit value"
+            );
+        }
+    }
+
+    #[test]
     fn standard_registry_tracks_stdlib_formatting_functions() {
         let registry = ExtensionRegistry::standard_library();
 
