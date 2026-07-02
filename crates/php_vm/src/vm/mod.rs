@@ -149,6 +149,27 @@ const JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT: i32 = 23;
 #[cfg(feature = "jit-cranelift")]
 const JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT: i32 = 24;
 
+enum DenseOperandRead<'a> {
+    Borrowed(&'a Value),
+    Owned(Value),
+}
+
+impl DenseOperandRead<'_> {
+    fn as_value(&self) -> &Value {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+
+    fn into_owned(self) -> Value {
+        match self {
+            Self::Borrowed(value) => value.clone(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
 #[cfg(feature = "jit-cranelift")]
 fn jit_guard_kind_for_side_exit(reason: php_jit::SideExitReason) -> Option<GuardKind> {
     match reason {
@@ -7888,7 +7909,12 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let array = match self.read_dense_operand(compiled, stack, array) {
+                        let span = dense
+                            .spans
+                            .get(instruction.span.index())
+                            .copied()
+                            .unwrap_or_default();
+                        let array_ref = match self.read_dense_operand_ref(compiled, stack, array) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -7896,7 +7922,7 @@ impl Vm {
                                 return result;
                             }
                         };
-                        let key_value = match self.read_dense_operand(compiled, stack, key) {
+                        let key_ref = match self.read_dense_operand_ref(compiled, stack, key) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -7908,30 +7934,37 @@ impl Vm {
                             function_id,
                             BlockId::new(block_index),
                             InstrId::new(dense_instruction_index),
-                            &array,
-                            &key_value,
+                            array_ref.as_value(),
+                            key_ref.as_value(),
                         );
                         let value = match value {
                             Some(value) => value,
-                            None => match self.fetch_dim_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut diagnostics,
-                                &array,
-                                &key_value,
+                            None => match self.try_dense_array_fetch_dim_borrowed(
+                                array_ref.as_value(),
+                                key_ref.as_value(),
                                 quiet,
-                                dense
-                                    .spans
-                                    .get(instruction.span.index())
-                                    .copied()
-                                    .unwrap_or_default(),
                             ) {
-                                Ok(value) => value,
-                                Err(result) => {
-                                    stack.pop_recycle();
-                                    return result;
+                                Some(value) => value,
+                                None => {
+                                    let array = array_ref.into_owned();
+                                    let key_value = key_ref.into_owned();
+                                    match self.fetch_dim_value(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut diagnostics,
+                                        &array,
+                                        &key_value,
+                                        quiet,
+                                        span,
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(result) => {
+                                            stack.pop_recycle();
+                                            return result;
+                                        }
+                                    }
                                 }
                             },
                         };
@@ -9525,6 +9558,61 @@ impl Vm {
             DenseOperandKind::Constant => {
                 self.constant_value(compiled.unit(), ConstId::new(operand.index))
             }
+        }
+    }
+
+    fn read_dense_operand_ref<'a>(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &'a CallStack,
+        operand: DenseOperand,
+    ) -> Result<DenseOperandRead<'a>, String> {
+        match operand.kind {
+            DenseOperandKind::Register => {
+                let frame = stack.current().ok_or("no active frame")?;
+                let Some(value) = frame.registers.get(RegId::new(operand.index)) else {
+                    return Err(format!("invalid register r{}", operand.index));
+                };
+                if value.is_uninitialized() {
+                    return Err(format!("read uninitialized register r{}", operand.index));
+                }
+                Ok(DenseOperandRead::Borrowed(value))
+            }
+            DenseOperandKind::Local => {
+                let frame = stack.current().ok_or("no active frame")?;
+                let Some(slot) = frame.locals.get_slot(LocalId::new(operand.index)) else {
+                    return Err(format!("invalid local local:{}", operand.index));
+                };
+                match slot {
+                    Slot::Value(value) if value.is_uninitialized() => {
+                        Ok(DenseOperandRead::Owned(Value::Null))
+                    }
+                    Slot::Value(value) => Ok(DenseOperandRead::Borrowed(value)),
+                    Slot::Reference(cell) => Ok(DenseOperandRead::Owned(cell.get())),
+                }
+            }
+            DenseOperandKind::Constant => self
+                .constant_value(compiled.unit(), ConstId::new(operand.index))
+                .map(DenseOperandRead::Owned),
+        }
+    }
+
+    fn try_dense_array_fetch_dim_borrowed(
+        &self,
+        array: &Value,
+        key_value: &Value,
+        quiet: bool,
+    ) -> Option<Value> {
+        let Value::Array(array) = array else {
+            return None;
+        };
+        let Ok(key) = array_key_from_value(key_value) else {
+            return None;
+        };
+        match array.get(&key) {
+            Some(value) => Some(effective_value(value)),
+            None if quiet => Some(Value::Null),
+            None => None,
         }
     }
 
@@ -19319,19 +19407,19 @@ impl Vm {
                         key,
                         quiet,
                     } => {
-                        let array = if let Operand::Local(local) = array
+                        let array_ref = if let Operand::Local(local) = array
                             && is_globals_local(function, *local)
                         {
-                            Value::Array(state.globals.globals_array())
+                            DenseOperandRead::Owned(Value::Array(state.globals.globals_array()))
                         } else {
-                            match read_operand(unit, stack, *array) {
+                            match read_operand_ref(unit, stack, *array) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
                             }
                         };
-                        let key_value = match read_operand(unit, stack, *key) {
+                        let key_ref = match read_operand_ref(unit, stack, *key) {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -19341,186 +19429,196 @@ impl Vm {
                             function_id,
                             block_id,
                             instruction.id,
-                            &array,
-                            &key_value,
+                            array_ref.as_value(),
+                            key_ref.as_value(),
                         );
                         let value = match value {
                             Some(value) => value,
                             None => {
-                                let base = effective_value(&array);
-                                if let Some(object) =
-                                    match userland_arrayaccess_object(compiled, state, &base) {
-                                        Ok(object) => object,
-                                        Err(message) => {
-                                            match self.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut exception_handlers,
-                                                &mut pending_control,
-                                                instruction.span,
-                                                message,
-                                            ) {
-                                                RaiseOutcome::Caught(target) => {
-                                                    block_id = target;
-                                                    continue 'dispatch;
-                                                }
-                                                RaiseOutcome::Done(result) => return *result,
-                                            }
-                                        }
-                                    }
-                                {
-                                    match self.call_userland_arrayaccess_method(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        object,
-                                        "offsetGet",
-                                        vec![CallArgument::positional(key_value.clone())],
-                                        instruction.span,
-                                    ) {
-                                        Ok(value) => value,
-                                        Err(result) => return result,
-                                    }
-                                } else if let Value::Object(object) = &base
-                                    && spl_runtime_marker(object).is_some_and(|class| {
-                                        is_spl_array_access_runtime_class(&class)
-                                    })
-                                {
-                                    match spl_container_offset_get(object, &key_value) {
-                                        Ok(value) => value,
-                                        Err(message) => {
-                                            match self.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut exception_handlers,
-                                                &mut pending_control,
-                                                instruction.span,
-                                                message,
-                                            ) {
-                                                RaiseOutcome::Caught(target) => {
-                                                    block_id = target;
-                                                    continue 'dispatch;
-                                                }
-                                                RaiseOutcome::Done(result) => return *result,
-                                            }
-                                        }
-                                    }
+                                if let Some(value) = self.try_dense_array_fetch_dim_borrowed(
+                                    array_ref.as_value(),
+                                    key_ref.as_value(),
+                                    *quiet,
+                                ) {
+                                    value
                                 } else {
-                                    let key = match array_key_from_value(&key_value) {
-                                        Ok(key) => key,
-                                        Err(message) => {
-                                            match self.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut exception_handlers,
-                                                &mut pending_control,
-                                                instruction.span,
-                                                message,
-                                            ) {
-                                                RaiseOutcome::Caught(target) => {
-                                                    block_id = target;
-                                                    continue 'dispatch;
+                                    let array = array_ref.into_owned();
+                                    let key_value = key_ref.into_owned();
+                                    let base = effective_value(&array);
+                                    if let Some(object) =
+                                        match userland_arrayaccess_object(compiled, state, &base) {
+                                            Ok(object) => object,
+                                            Err(message) => {
+                                                match self.raise_runtime_error(
+                                                    compiled,
+                                                    output,
+                                                    stack,
+                                                    state,
+                                                    &mut exception_handlers,
+                                                    &mut pending_control,
+                                                    instruction.span,
+                                                    message,
+                                                ) {
+                                                    RaiseOutcome::Caught(target) => {
+                                                        block_id = target;
+                                                        continue 'dispatch;
+                                                    }
+                                                    RaiseOutcome::Done(result) => return *result,
                                                 }
-                                                RaiseOutcome::Done(result) => return *result,
                                             }
                                         }
-                                    };
-                                    if let Value::String(string) = &base {
-                                        match string_offset_for_read(string, &key) {
-                                            StringOffsetRead::Byte(value) => value,
-                                            StringOffsetRead::Illegal { value, key_bytes } => {
-                                                if !*quiet {
-                                                    let diagnostic = illegal_string_offset_warning(
-                                                        &key_bytes,
-                                                        runtime_source_span(
+                                    {
+                                        match self.call_userland_arrayaccess_method(
+                                            compiled,
+                                            output,
+                                            stack,
+                                            state,
+                                            object,
+                                            "offsetGet",
+                                            vec![CallArgument::positional(key_value.clone())],
+                                            instruction.span,
+                                        ) {
+                                            Ok(value) => value,
+                                            Err(result) => return result,
+                                        }
+                                    } else if let Value::Object(object) = &base
+                                        && spl_runtime_marker(object).is_some_and(|class| {
+                                            is_spl_array_access_runtime_class(&class)
+                                        })
+                                    {
+                                        match spl_container_offset_get(object, &key_value) {
+                                            Ok(value) => value,
+                                            Err(message) => {
+                                                match self.raise_runtime_error(
+                                                    compiled,
+                                                    output,
+                                                    stack,
+                                                    state,
+                                                    &mut exception_handlers,
+                                                    &mut pending_control,
+                                                    instruction.span,
+                                                    message,
+                                                ) {
+                                                    RaiseOutcome::Caught(target) => {
+                                                        block_id = target;
+                                                        continue 'dispatch;
+                                                    }
+                                                    RaiseOutcome::Done(result) => return *result,
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let key = match array_key_from_value(&key_value) {
+                                            Ok(key) => key,
+                                            Err(message) => {
+                                                match self.raise_runtime_error(
+                                                    compiled,
+                                                    output,
+                                                    stack,
+                                                    state,
+                                                    &mut exception_handlers,
+                                                    &mut pending_control,
+                                                    instruction.span,
+                                                    message,
+                                                ) {
+                                                    RaiseOutcome::Caught(target) => {
+                                                        block_id = target;
+                                                        continue 'dispatch;
+                                                    }
+                                                    RaiseOutcome::Done(result) => return *result,
+                                                }
+                                            }
+                                        };
+                                        if let Value::String(string) = &base {
+                                            match string_offset_for_read(string, &key) {
+                                                StringOffsetRead::Byte(value) => value,
+                                                StringOffsetRead::Illegal { value, key_bytes } => {
+                                                    if !*quiet {
+                                                        let diagnostic =
+                                                            illegal_string_offset_warning(
+                                                                &key_bytes,
+                                                                runtime_source_span(
+                                                                    compiled,
+                                                                    instruction.span,
+                                                                ),
+                                                                stack_trace(compiled, stack),
+                                                            );
+                                                        match self.dispatch_error_handler(
                                                             compiled,
-                                                            instruction.span,
-                                                        ),
-                                                        stack_trace(compiled, stack),
-                                                    );
-                                                    match self.dispatch_error_handler(
-                                                        compiled,
-                                                        output,
-                                                        stack,
-                                                        state,
-                                                        php_runtime::PHP_E_WARNING,
-                                                        &diagnostic,
-                                                    ) {
-                                                        Ok(false)
-                                                            if error_reporting_allows(
-                                                                state,
-                                                                php_runtime::PHP_E_WARNING,
-                                                            ) =>
-                                                        {
-                                                            emit_vm_diagnostic(
+                                                            output,
+                                                            stack,
+                                                            state,
+                                                            php_runtime::PHP_E_WARNING,
+                                                            &diagnostic,
+                                                        ) {
+                                                            Ok(false)
+                                                                if error_reporting_allows(
+                                                                    state,
+                                                                    php_runtime::PHP_E_WARNING,
+                                                                ) =>
+                                                            {
+                                                                emit_vm_diagnostic(
                                                             output,
                                                             state,
                                                             &diagnostic,
                                                             php_runtime::PhpDiagnosticChannel::Warning,
                                                             php_runtime::PHP_E_WARNING,
                                                         );
-                                                            diagnostics.push(diagnostic);
+                                                                diagnostics.push(diagnostic);
+                                                            }
+                                                            Ok(_) => {}
+                                                            Err(result) => return result,
                                                         }
-                                                        Ok(_) => {}
-                                                        Err(result) => return result,
                                                     }
+                                                    value
                                                 }
-                                                value
-                                            }
-                                            StringOffsetRead::OutOfRange(index) => {
-                                                if *quiet {
-                                                    Value::Null
-                                                } else {
-                                                    let diagnostic =
-                                                        uninitialized_string_offset_warning(
-                                                            index,
-                                                            runtime_source_span(
-                                                                compiled,
-                                                                instruction.span,
-                                                            ),
-                                                            stack_trace(compiled, stack),
-                                                        );
-                                                    match self.dispatch_error_handler(
-                                                        compiled,
-                                                        output,
-                                                        stack,
-                                                        state,
-                                                        php_runtime::PHP_E_WARNING,
-                                                        &diagnostic,
-                                                    ) {
-                                                        Ok(false)
-                                                            if error_reporting_allows(
-                                                                state,
-                                                                php_runtime::PHP_E_WARNING,
-                                                            ) =>
-                                                        {
-                                                            emit_vm_diagnostic(
+                                                StringOffsetRead::OutOfRange(index) => {
+                                                    if *quiet {
+                                                        Value::Null
+                                                    } else {
+                                                        let diagnostic =
+                                                            uninitialized_string_offset_warning(
+                                                                index,
+                                                                runtime_source_span(
+                                                                    compiled,
+                                                                    instruction.span,
+                                                                ),
+                                                                stack_trace(compiled, stack),
+                                                            );
+                                                        match self.dispatch_error_handler(
+                                                            compiled,
+                                                            output,
+                                                            stack,
+                                                            state,
+                                                            php_runtime::PHP_E_WARNING,
+                                                            &diagnostic,
+                                                        ) {
+                                                            Ok(false)
+                                                                if error_reporting_allows(
+                                                                    state,
+                                                                    php_runtime::PHP_E_WARNING,
+                                                                ) =>
+                                                            {
+                                                                emit_vm_diagnostic(
                                                             output,
                                                             state,
                                                             &diagnostic,
                                                             php_runtime::PhpDiagnosticChannel::Warning,
                                                             php_runtime::PHP_E_WARNING,
                                                         );
-                                                            diagnostics.push(diagnostic);
+                                                                diagnostics.push(diagnostic);
+                                                            }
+                                                            Ok(_) => {}
+                                                            Err(result) => return result,
                                                         }
-                                                        Ok(_) => {}
-                                                        Err(result) => return result,
+                                                        Value::string(Vec::new())
                                                     }
-                                                    Value::string(Vec::new())
                                                 }
-                                            }
-                                            StringOffsetRead::NonNumeric => {
-                                                if *quiet {
-                                                    Value::Null
-                                                } else {
-                                                    let result = self.runtime_error_with_source_span(
+                                                StringOffsetRead::NonNumeric => {
+                                                    if *quiet {
+                                                        Value::Null
+                                                    } else {
+                                                        let result = self.runtime_error_with_source_span(
                                                     output,
                                                     compiled,
                                                     stack,
@@ -19531,51 +19629,90 @@ impl Vm {
                                                     "E_PHP_VM_STRING_OFFSET_TYPE: Cannot access offset of type string on string"
                                                         .to_owned(),
                                                 );
-                                                    if let Some(throwable) =
-                                                        state.pending_throw.take().or_else(|| {
-                                                            runtime_error_throwable(&result)
-                                                        })
-                                                    {
-                                                        tag_throwable_location(
-                                                            &throwable,
-                                                            compiled,
-                                                            instruction.span,
+                                                        if let Some(throwable) =
+                                                            state.pending_throw.take().or_else(
+                                                                || runtime_error_throwable(&result),
+                                                            )
+                                                        {
+                                                            tag_throwable_location(
+                                                                &throwable,
+                                                                compiled,
+                                                                instruction.span,
+                                                            );
+                                                            state.pending_trace =
+                                                                Some(capture_backtrace_string(
+                                                                    compiled, stack,
+                                                                ));
+                                                            if let Some(target) = handle_throw(
+                                                                compiled,
+                                                                throwable.clone(),
+                                                                stack,
+                                                                state,
+                                                                &mut exception_handlers,
+                                                                &mut pending_control,
+                                                            ) {
+                                                                block_id = target;
+                                                                continue 'dispatch;
+                                                            }
+                                                            return self.propagate_exception(
+                                                                output, stack, state, throwable,
+                                                            );
+                                                        }
+                                                        return result;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Value::Array(array_value) = &base {
+                                            match self.try_array_shape_lookup(array_value, &key) {
+                                                Some(Some(value)) => value,
+                                                Some(None) if *quiet => Value::Null,
+                                                Some(None) => {
+                                                    diagnostics.push(undefined_array_key_warning(
+                                                        &key,
+                                                        stack_trace(compiled, stack),
+                                                    ));
+                                                    Value::Null
+                                                }
+                                                None => match fetch_dim_value(&array, &key) {
+                                                    Ok(Some(value)) => value,
+                                                    Ok(None) if *quiet => Value::Null,
+                                                    Ok(None) => {
+                                                        diagnostics.push(
+                                                            undefined_array_key_warning(
+                                                                &key,
+                                                                stack_trace(compiled, stack),
+                                                            ),
                                                         );
-                                                        state.pending_trace =
-                                                            Some(capture_backtrace_string(
-                                                                compiled, stack,
-                                                            ));
-                                                        if let Some(target) = handle_throw(
+                                                        Value::Null
+                                                    }
+                                                    Err(message) => {
+                                                        match self.raise_runtime_error(
                                                             compiled,
-                                                            throwable.clone(),
+                                                            output,
                                                             stack,
                                                             state,
                                                             &mut exception_handlers,
                                                             &mut pending_control,
+                                                            instruction.span,
+                                                            message,
                                                         ) {
-                                                            block_id = target;
-                                                            continue 'dispatch;
+                                                            RaiseOutcome::Caught(target) => {
+                                                                block_id = target;
+                                                                continue 'dispatch;
+                                                            }
+                                                            RaiseOutcome::Done(result) => {
+                                                                return *result;
+                                                            }
                                                         }
-                                                        return self.propagate_exception(
-                                                            output, stack, state, throwable,
-                                                        );
                                                     }
-                                                    return result;
-                                                }
+                                                },
                                             }
-                                        }
-                                    } else if let Value::Array(array_value) = &base {
-                                        match self.try_array_shape_lookup(array_value, &key) {
-                                            Some(Some(value)) => value,
-                                            Some(None) if *quiet => Value::Null,
-                                            Some(None) => {
-                                                diagnostics.push(undefined_array_key_warning(
-                                                    &key,
-                                                    stack_trace(compiled, stack),
-                                                ));
-                                                Value::Null
-                                            }
-                                            None => match fetch_dim_value(&array, &key) {
+                                        } else if *quiet
+                                            && quiet_dim_fetch_scalar_returns_null(&base)
+                                        {
+                                            Value::Null
+                                        } else {
+                                            match fetch_dim_value(&array, &key) {
                                                 Ok(Some(value)) => value,
                                                 Ok(None) if *quiet => Value::Null,
                                                 Ok(None) => {
@@ -19604,38 +19741,6 @@ impl Vm {
                                                             return *result;
                                                         }
                                                     }
-                                                }
-                                            },
-                                        }
-                                    } else if *quiet && quiet_dim_fetch_scalar_returns_null(&base) {
-                                        Value::Null
-                                    } else {
-                                        match fetch_dim_value(&array, &key) {
-                                            Ok(Some(value)) => value,
-                                            Ok(None) if *quiet => Value::Null,
-                                            Ok(None) => {
-                                                diagnostics.push(undefined_array_key_warning(
-                                                    &key,
-                                                    stack_trace(compiled, stack),
-                                                ));
-                                                Value::Null
-                                            }
-                                            Err(message) => {
-                                                match self.raise_runtime_error(
-                                                    compiled,
-                                                    output,
-                                                    stack,
-                                                    state,
-                                                    &mut exception_handlers,
-                                                    &mut pending_control,
-                                                    instruction.span,
-                                                    message,
-                                                ) {
-                                                    RaiseOutcome::Caught(target) => {
-                                                        block_id = target;
-                                                        continue 'dispatch;
-                                                    }
-                                                    RaiseOutcome::Done(result) => return *result,
                                                 }
                                             }
                                         }
@@ -58227,6 +58332,39 @@ fn read_operand(unit: &IrUnit, stack: &CallStack, operand: Operand) -> Result<Va
     }
 }
 
+fn read_operand_ref<'a>(
+    unit: &IrUnit,
+    stack: &'a CallStack,
+    operand: Operand,
+) -> Result<DenseOperandRead<'a>, String> {
+    match operand {
+        Operand::Register(id) => {
+            let frame = stack.current().ok_or("no active frame")?;
+            let Some(value) = frame.registers.get(id) else {
+                return Err(format!("invalid register r{}", id.raw()));
+            };
+            if value.is_uninitialized() {
+                return Err(format!("read uninitialized register r{}", id.raw()));
+            }
+            Ok(DenseOperandRead::Borrowed(value))
+        }
+        Operand::Constant(id) => constant_value(unit, id).map(DenseOperandRead::Owned),
+        Operand::Local(id) => {
+            let frame = stack.current().ok_or("no active frame")?;
+            let Some(slot) = frame.locals.get_slot(id) else {
+                return Err(format!("invalid local local:{}", id.raw()));
+            };
+            match slot {
+                Slot::Value(value) if value.is_uninitialized() => {
+                    Ok(DenseOperandRead::Owned(Value::Null))
+                }
+                Slot::Value(value) => Ok(DenseOperandRead::Borrowed(value)),
+                Slot::Reference(cell) => Ok(DenseOperandRead::Owned(cell.get())),
+            }
+        }
+    }
+}
+
 fn unset_register_operand(stack: &mut CallStack, operand: Operand) -> Result<(), String> {
     let Operand::Register(id) = operand else {
         return Ok(());
@@ -68321,6 +68459,38 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
         assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
         assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
         assert!(counters.bytecode_instructions_executed > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn dense_mixed_array_fetch_reuses_borrowed_receiver() {
+        let source = "<?php
+            $row = ['score' => 7, 'name' => 'x'];
+            $sum = 0;
+            for ($i = 0; $i < 200; $i++) {
+                $sum += $row['score'];
+            }
+            echo $sum;
+        ";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Auto,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1400");
+        assert_eq!(result.diagnostics, Vec::<RuntimeDiagnostic>::new());
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
+        assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+        assert!(counters.bytecode_instructions_executed > 0, "{counters:?}");
+        assert!(
+            counters.array_handle_clones <= 300,
+            "mixed array reads should not clone the receiver per fetch: {counters:?}"
+        );
     }
 
     #[test]
