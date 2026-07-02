@@ -1,7 +1,7 @@
 # phrust
 
 `phrust` is an experiment in recreating an existing program, PHP, by extracting
-specifications from the original implementation and then implementing those
+specifications from the original documentation and tests and then implementing those
 specifications with enough initial structure, validation gates, and feedback
 loops to steadily close the remaining gaps.
 
