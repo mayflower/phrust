@@ -17,6 +17,18 @@ pub struct RuntimeLayoutStats {
     pub reference_cell_creations: u64,
     /// Runtime object storage allocations.
     pub object_allocations: u64,
+    /// Array reads satisfied by direct packed integer indexing.
+    pub array_packed_direct_gets: u64,
+    /// Array reads satisfied by the mixed-storage key index.
+    pub array_mixed_indexed_gets: u64,
+    /// Array reads that used a remaining linear fallback path.
+    pub array_linear_scan_fallbacks: u64,
+    /// Full array metadata recomputes after structural repair.
+    pub array_metadata_recomputes: u64,
+    /// Compiled-unit symbol lookups satisfied by maps.
+    pub symbol_map_lookups: u64,
+    /// Compiled-unit symbol lookups that used a linear fallback.
+    pub symbol_linear_fallbacks: u64,
 }
 
 thread_local! {
@@ -46,6 +58,30 @@ pub(crate) fn record_reference_cell_creation() {
 
 pub(crate) fn record_object_allocation() {
     LAYOUT_STATS.with(|stats| stats.borrow_mut().object_allocations += 1);
+}
+
+pub(crate) fn record_array_packed_direct_get() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_packed_direct_gets += 1);
+}
+
+pub(crate) fn record_array_mixed_indexed_get() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_mixed_indexed_gets += 1);
+}
+
+pub(crate) fn record_array_linear_scan_fallback() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_linear_scan_fallbacks += 1);
+}
+
+pub(crate) fn record_array_metadata_recompute() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_metadata_recomputes += 1);
+}
+
+pub fn record_symbol_map_lookup() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().symbol_map_lookups += 1);
+}
+
+pub fn record_symbol_linear_fallback() {
+    LAYOUT_STATS.with(|stats| stats.borrow_mut().symbol_linear_fallbacks += 1);
 }
 
 /// Clears layout counters for deterministic VM executions.
@@ -86,5 +122,25 @@ mod tests {
         assert!(stats.array_handle_clones >= 2, "{stats:?}");
         assert!(stats.cow_separations >= 1, "{stats:?}");
         assert_eq!(stats.reference_cell_creations, 1);
+    }
+
+    #[test]
+    fn layout_stats_record_array_and_symbol_hot_paths() {
+        layout_stats::reset_layout_stats();
+
+        layout_stats::record_array_packed_direct_get();
+        layout_stats::record_array_mixed_indexed_get();
+        layout_stats::record_array_linear_scan_fallback();
+        layout_stats::record_array_metadata_recompute();
+        layout_stats::record_symbol_map_lookup();
+        layout_stats::record_symbol_linear_fallback();
+
+        let stats = layout_stats::take_layout_stats();
+        assert_eq!(stats.array_packed_direct_gets, 1);
+        assert_eq!(stats.array_mixed_indexed_gets, 1);
+        assert_eq!(stats.array_linear_scan_fallbacks, 1);
+        assert_eq!(stats.array_metadata_recomputes, 1);
+        assert_eq!(stats.symbol_map_lookups, 1);
+        assert_eq!(stats.symbol_linear_fallbacks, 1);
     }
 }

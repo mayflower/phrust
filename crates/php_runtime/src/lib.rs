@@ -51,10 +51,10 @@ pub mod xml;
 /// JIT ABI helpers, and measurement-only counters.
 pub mod api {
     pub use crate::array::{
-        ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary,
-        PhpArrayKind, PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, PhpArrayShapeKind,
-        PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata,
-        PhpArrayWriteIntent,
+        ArrayEntry, ArrayKey, PackedArrayValues, PhpArray, PhpArrayElementSummary,
+        PhpArrayKeyKindSummary, PhpArrayKind, PhpArrayPackedIntReductionError,
+        PhpArrayPackedMetadata, PhpArrayShapeKind, PhpArrayShapeLookup,
+        PhpArrayShapeLookupFallback, PhpArrayShapeMetadata, PhpArrayValueMut, PhpArrayWriteIntent,
     };
     pub use crate::autoload::AutoloadRegistry;
     pub use crate::builtins::{
@@ -186,10 +186,10 @@ pub mod experimental {
 }
 
 pub use array::{
-    ArrayEntry, ArrayKey, PhpArray, PhpArrayElementSummary, PhpArrayKeyKindSummary, PhpArrayKind,
-    PhpArrayPackedIntReductionError, PhpArrayPackedMetadata, PhpArrayShapeKind,
-    PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata, PhpArrayWriteIntent,
-    WeakArrayHandle,
+    ArrayEntry, ArrayKey, PackedArrayValues, PhpArray, PhpArrayElementSummary,
+    PhpArrayKeyKindSummary, PhpArrayKind, PhpArrayPackedIntReductionError, PhpArrayPackedMetadata,
+    PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpArrayShapeMetadata,
+    PhpArrayValueMut, PhpArrayWriteIntent, WeakArrayHandle,
 };
 pub use autoload::AutoloadRegistry;
 pub use builtins::{

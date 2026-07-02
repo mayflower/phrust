@@ -6,10 +6,14 @@ use crate::{
         NumericStringArrayKey, array_key_has_numeric_string_ambiguity, classify_array_key,
     },
 };
-use std::rc::{Rc, Weak};
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    rc::{Rc, Weak},
+};
 
 /// PHP array key after runtime-semantics key normalization.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ArrayKey {
     /// Integer array key.
     Int(i64),
@@ -238,13 +242,31 @@ impl PhpArrayWriteIntent {
 }
 
 /// One ordered array slot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ArrayEntry {
     key: ArrayKey,
     value: Value,
+    string_key_shared_for_shape: bool,
 }
 
+impl PartialEq for ArrayEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.value == other.value
+    }
+}
+
+impl Eq for ArrayEntry {}
+
 impl ArrayEntry {
+    fn new(key: ArrayKey, value: Value) -> Self {
+        let string_key_shared_for_shape = matches!(&key, ArrayKey::String(key) if key.is_shared());
+        Self {
+            key,
+            value,
+            string_key_shared_for_shape,
+        }
+    }
+
     /// Array key.
     #[must_use]
     pub const fn key(&self) -> &ArrayKey {
@@ -255,6 +277,194 @@ impl ArrayEntry {
     #[must_use]
     pub const fn value(&self) -> &Value {
         &self.value
+    }
+}
+
+/// Non-allocating borrowed iterator over proven packed-array values.
+pub struct PackedArrayValues<'a> {
+    entries: std::slice::Iter<'a, ArrayEntry>,
+}
+
+impl<'a> Iterator for PackedArrayValues<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next().map(ArrayEntry::value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl ExactSizeIterator for PackedArrayValues<'_> {}
+
+/// Mutable array slot guard that refreshes value-dependent metadata when the
+/// caller finishes mutating the value.
+pub struct PhpArrayValueMut<'a> {
+    storage: &'a mut ArrayStorage,
+    index: usize,
+    old_is_reference: bool,
+    old_is_int: bool,
+}
+
+impl Deref for PhpArrayValueMut<'_> {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage.entries()[self.index].value
+    }
+}
+
+impl DerefMut for PhpArrayValueMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage.entries_mut()[self.index].value
+    }
+}
+
+impl Drop for PhpArrayValueMut<'_> {
+    fn drop(&mut self) {
+        let value = &self.storage.entries()[self.index].value;
+        let new_is_reference = matches!(value, Value::Reference(_));
+        let new_is_int = matches!(value, Value::Int(_));
+        self.storage.metadata_mut().replace_value_flags(
+            self.old_is_reference,
+            new_is_reference,
+            self.old_is_int,
+            new_is_int,
+        );
+        self.storage.debug_assert_consistent();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ArrayCachedMetadata {
+    len: usize,
+    reference_values: usize,
+    int_values: usize,
+    int_keys: usize,
+    string_keys: usize,
+    numeric_string_ambiguous_keys: usize,
+    shared_string_keys: usize,
+}
+
+impl ArrayCachedMetadata {
+    fn from_entries(entries: &[ArrayEntry]) -> Self {
+        crate::layout_stats::record_array_metadata_recompute();
+        Self::from_entries_without_counter(entries)
+    }
+
+    fn from_entries_for_debug(entries: &[ArrayEntry]) -> Self {
+        Self::from_entries_without_counter(entries)
+    }
+
+    fn from_entries_without_counter(entries: &[ArrayEntry]) -> Self {
+        let mut metadata = Self::default();
+        for entry in entries {
+            metadata.add_entry(entry);
+        }
+        metadata
+    }
+
+    fn add_entry(&mut self, entry: &ArrayEntry) {
+        self.len += 1;
+        if matches!(entry.value, Value::Reference(_)) {
+            self.reference_values += 1;
+        }
+        if matches!(entry.value, Value::Int(_)) {
+            self.int_values += 1;
+        }
+        match &entry.key {
+            ArrayKey::Int(_) => self.int_keys += 1,
+            ArrayKey::String(key) => {
+                self.string_keys += 1;
+                if array_key_has_numeric_string_ambiguity(key) {
+                    self.numeric_string_ambiguous_keys += 1;
+                }
+                if entry.string_key_shared_for_shape {
+                    self.shared_string_keys += 1;
+                }
+            }
+        }
+    }
+
+    fn remove_entry(&mut self, entry: &ArrayEntry) {
+        self.len -= 1;
+        if matches!(entry.value, Value::Reference(_)) {
+            self.reference_values -= 1;
+        }
+        if matches!(entry.value, Value::Int(_)) {
+            self.int_values -= 1;
+        }
+        match &entry.key {
+            ArrayKey::Int(_) => self.int_keys -= 1,
+            ArrayKey::String(key) => {
+                self.string_keys -= 1;
+                if array_key_has_numeric_string_ambiguity(key) {
+                    self.numeric_string_ambiguous_keys -= 1;
+                }
+                if entry.string_key_shared_for_shape {
+                    self.shared_string_keys -= 1;
+                }
+            }
+        }
+    }
+
+    fn replace_value_flags(
+        &mut self,
+        old_is_reference: bool,
+        new_is_reference: bool,
+        old_is_int: bool,
+        new_is_int: bool,
+    ) {
+        if old_is_reference {
+            self.reference_values -= 1;
+        }
+        if new_is_reference {
+            self.reference_values += 1;
+        }
+        if old_is_int {
+            self.int_values -= 1;
+        }
+        if new_is_int {
+            self.int_values += 1;
+        }
+    }
+
+    const fn contains_references(self) -> bool {
+        self.reference_values > 0
+    }
+
+    const fn element_summary(self) -> PhpArrayElementSummary {
+        if self.len == 0 {
+            PhpArrayElementSummary::Empty
+        } else if self.int_values == self.len {
+            PhpArrayElementSummary::AllInt
+        } else {
+            PhpArrayElementSummary::Mixed
+        }
+    }
+
+    const fn key_kind_summary(self, is_packed: bool) -> PhpArrayKeyKindSummary {
+        if self.len == 0 {
+            PhpArrayKeyKindSummary::Empty
+        } else if is_packed {
+            PhpArrayKeyKindSummary::SequentialInt
+        } else if self.int_keys == self.len {
+            PhpArrayKeyKindSummary::IntOnly
+        } else if self.string_keys == self.len {
+            PhpArrayKeyKindSummary::StringOnly
+        } else {
+            PhpArrayKeyKindSummary::Mixed
+        }
+    }
+
+    const fn has_numeric_string_key_ambiguity(self) -> bool {
+        self.numeric_string_ambiguous_keys > 0
+    }
+
+    const fn string_keys_share_storage(self) -> bool {
+        self.string_keys == self.shared_string_keys
     }
 }
 
@@ -271,15 +481,18 @@ struct PackedArrayStorage {
     next_append_key: Option<i64>,
     internal_pointer: Option<usize>,
     mutation_epoch: u64,
+    cached_metadata: ArrayCachedMetadata,
 }
 
 /// Mixed array storage for holes, string keys, and non-sequential integer keys.
 #[derive(Clone, Debug)]
 struct MixedArrayStorage {
     entries: Vec<ArrayEntry>,
+    index: HashMap<ArrayKey, usize>,
     next_append_key: Option<i64>,
     internal_pointer: Option<usize>,
     mutation_epoch: u64,
+    cached_metadata: ArrayCachedMetadata,
 }
 
 /// Ordered PHP array storage.
@@ -299,6 +512,7 @@ impl Default for ArrayStorage {
             next_append_key: None,
             internal_pointer: None,
             mutation_epoch: 0,
+            cached_metadata: ArrayCachedMetadata::default(),
         })
     }
 }
@@ -325,6 +539,20 @@ impl ArrayStorage {
         match self {
             Self::Packed(storage) => &mut storage.entries,
             Self::Mixed(storage) => &mut storage.entries,
+        }
+    }
+
+    fn metadata(&self) -> ArrayCachedMetadata {
+        match self {
+            Self::Packed(storage) => storage.cached_metadata,
+            Self::Mixed(storage) => storage.cached_metadata,
+        }
+    }
+
+    fn metadata_mut(&mut self) -> &mut ArrayCachedMetadata {
+        match self {
+            Self::Packed(storage) => &mut storage.cached_metadata,
+            Self::Mixed(storage) => &mut storage.cached_metadata,
         }
     }
 
@@ -386,14 +614,107 @@ impl ArrayStorage {
         let Self::Packed(storage) = self else {
             return;
         };
+        let entries = std::mem::take(&mut storage.entries);
+        let index = build_index(&entries);
         let mixed = MixedArrayStorage {
-            entries: std::mem::take(&mut storage.entries),
+            entries,
+            index,
             next_append_key: storage.next_append_key,
             internal_pointer: storage.internal_pointer,
             mutation_epoch: storage.mutation_epoch,
+            cached_metadata: storage.cached_metadata,
         };
         *self = Self::Mixed(mixed);
     }
+
+    fn find_index(&self, key: &ArrayKey) -> Option<usize> {
+        match self {
+            Self::Packed(storage) => packed_key_index(&storage.entries, key),
+            Self::Mixed(storage) => storage.index.get(key).copied(),
+        }
+    }
+
+    fn push_entry(&mut self, entry: ArrayEntry) {
+        match self {
+            Self::Packed(storage) => {
+                storage.cached_metadata.add_entry(&entry);
+                storage.entries.push(entry);
+            }
+            Self::Mixed(storage) => {
+                let index = storage.entries.len();
+                let old = storage.index.insert(entry.key.clone(), index);
+                debug_assert!(old.is_none(), "mixed array index must be unique");
+                storage.entries.push(entry);
+                storage.cached_metadata.add_entry(&storage.entries[index]);
+            }
+        }
+        self.debug_assert_consistent();
+    }
+
+    fn replace_value(&mut self, index: usize, value: Value) -> Value {
+        let old = {
+            let entries = self.entries_mut();
+            std::mem::replace(&mut entries[index].value, value)
+        };
+        let new = &self.entries()[index].value;
+        let old_is_reference = matches!(old, Value::Reference(_));
+        let new_is_reference = matches!(new, Value::Reference(_));
+        let old_is_int = matches!(old, Value::Int(_));
+        let new_is_int = matches!(new, Value::Int(_));
+        self.metadata_mut().replace_value_flags(
+            old_is_reference,
+            new_is_reference,
+            old_is_int,
+            new_is_int,
+        );
+        old
+    }
+
+    fn remove_index(&mut self, index: usize) -> ArrayEntry {
+        let entry = self.entries_mut().remove(index);
+        self.metadata_mut().remove_entry(&entry);
+        if let Self::Mixed(storage) = self {
+            storage.index.remove(&entry.key);
+            for value in storage.index.values_mut() {
+                if *value > index {
+                    *value -= 1;
+                }
+            }
+        }
+        self.debug_assert_consistent();
+        entry
+    }
+
+    fn debug_assert_consistent(&self) {
+        debug_assert_eq!(self.metadata().len, self.entries().len());
+        debug_assert_eq!(
+            self.metadata(),
+            ArrayCachedMetadata::from_entries_for_debug(self.entries())
+        );
+        if let Self::Mixed(storage) = self {
+            debug_assert_eq!(storage.index.len(), storage.entries.len());
+            for (index, entry) in storage.entries.iter().enumerate() {
+                debug_assert_eq!(storage.index.get(&entry.key), Some(&index));
+            }
+        }
+    }
+}
+
+fn packed_key_index(entries: &[ArrayEntry], key: &ArrayKey) -> Option<usize> {
+    let ArrayKey::Int(index) = key else {
+        return None;
+    };
+    let index = usize::try_from(*index).ok()?;
+    (index < entries.len()).then_some(index)
+}
+
+fn build_index(entries: &[ArrayEntry]) -> HashMap<ArrayKey, usize> {
+    let mut index = HashMap::with_capacity(entries.len());
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let old = index.insert(entry.key.clone(), entry_index);
+        debug_assert!(old.is_none(), "mixed array contains duplicate key");
+    }
+    index
 }
 
 /// Copy-on-write ordered PHP array facade.
@@ -453,6 +774,7 @@ impl PhpArray {
                 next_append_key: None,
                 internal_pointer: None,
                 mutation_epoch: 0,
+                cached_metadata: ArrayCachedMetadata::default(),
             })),
         }
     }
@@ -464,17 +786,16 @@ impl PhpArray {
         let entries = elements
             .into_iter()
             .enumerate()
-            .map(|(index, value)| ArrayEntry {
-                key: ArrayKey::Int(index as i64),
-                value,
-            })
+            .map(|(index, value)| ArrayEntry::new(ArrayKey::Int(index as i64), value))
             .collect::<Vec<_>>();
+        let cached_metadata = ArrayCachedMetadata::from_entries(&entries);
         Self {
             storage: Rc::new(ArrayStorage::Packed(PackedArrayStorage {
                 entries,
                 next_append_key: (len > 0).then(|| i64::try_from(len).ok()).flatten(),
                 internal_pointer: (len > 0).then_some(0),
                 mutation_epoch: len as u64,
+                cached_metadata,
             })),
         }
     }
@@ -523,67 +844,28 @@ impl PhpArray {
     /// Returns true when any direct array slot stores a PHP reference.
     #[must_use]
     pub fn contains_references_fast(&self) -> bool {
-        self.storage
-            .entries()
-            .iter()
-            .any(|entry| matches!(entry.value, Value::Reference(_)))
+        self.storage.metadata().contains_references()
     }
 
     /// Returns a cheap direct-element summary.
     #[must_use]
     pub fn element_summary_fast(&self) -> PhpArrayElementSummary {
-        if self.storage.is_empty() {
-            return PhpArrayElementSummary::Empty;
-        }
-        if self
-            .storage
-            .entries()
-            .iter()
-            .all(|entry| matches!(entry.value, Value::Int(_)))
-        {
-            PhpArrayElementSummary::AllInt
-        } else {
-            PhpArrayElementSummary::Mixed
-        }
+        self.storage.metadata().element_summary()
     }
 
     /// Returns a cheap key-shape summary.
     #[must_use]
     pub fn key_kind_summary_fast(&self) -> PhpArrayKeyKindSummary {
-        if self.storage.is_empty() {
-            return PhpArrayKeyKindSummary::Empty;
-        }
-        if self.is_packed_fast() {
-            return PhpArrayKeyKindSummary::SequentialInt;
-        }
-        let has_int = self
-            .storage
-            .entries()
-            .iter()
-            .any(|entry| matches!(entry.key, ArrayKey::Int(_)));
-        let has_string = self
-            .storage
-            .entries()
-            .iter()
-            .any(|entry| matches!(entry.key, ArrayKey::String(_)));
-        match (has_int, has_string) {
-            (true, false) => PhpArrayKeyKindSummary::IntOnly,
-            (false, true) => PhpArrayKeyKindSummary::StringOnly,
-            (true, true) => PhpArrayKeyKindSummary::Mixed,
-            (false, false) => PhpArrayKeyKindSummary::Empty,
-        }
+        self.storage
+            .metadata()
+            .key_kind_summary(self.is_packed_fast())
     }
 
     /// Returns true when string keys look numeric but intentionally remain
     /// strings under PHP key-normalization rules.
     #[must_use]
     pub fn has_numeric_string_key_ambiguity_fast(&self) -> bool {
-        self.storage.entries().iter().any(|entry| {
-            matches!(
-                &entry.key,
-                ArrayKey::String(key) if array_key_has_numeric_string_ambiguity(key)
-            )
-        })
+        self.storage.metadata().has_numeric_string_key_ambiguity()
     }
 
     /// Returns the current structural/content mutation epoch.
@@ -690,12 +972,7 @@ impl PhpArray {
     }
 
     fn string_keys_share_storage_fast(&self) -> bool {
-        self.storage.entries().iter().all(|entry| {
-            matches!(
-                &entry.key,
-                ArrayKey::String(key) if key.is_shared()
-            )
-        })
+        self.storage.metadata().string_keys_share_storage()
     }
 
     /// Sums a packed all-int array only when COW/reference/overflow guards pass.
@@ -774,12 +1051,9 @@ impl PhpArray {
         };
         let storage = self.storage_mut_for(intent);
         bump_append_key(storage, &key);
-        if let Some(index) = storage.entries().iter().position(|entry| entry.key == key) {
+        if let Some(index) = storage.find_index(&key) {
             bump_mutation_epoch(storage);
-            return Some(std::mem::replace(
-                &mut storage.entries_mut()[index].value,
-                value,
-            ));
+            return Some(storage.replace_value(index, value));
         }
         let old_len = storage.len();
         let remains_packed =
@@ -787,7 +1061,7 @@ impl PhpArray {
         if !remains_packed {
             storage.make_mixed();
         }
-        storage.entries_mut().push(ArrayEntry { key, value });
+        storage.push_entry(ArrayEntry::new(key, value));
         if storage.internal_pointer().is_none() {
             storage.set_internal_pointer(Some(0));
         }
@@ -811,10 +1085,7 @@ impl PhpArray {
         if !remains_packed {
             storage.make_mixed();
         }
-        storage.entries_mut().push(ArrayEntry {
-            key: key.clone(),
-            value,
-        });
+        storage.push_entry(ArrayEntry::new(key.clone(), value));
         if storage.internal_pointer().is_none() {
             storage.set_internal_pointer(Some(0));
         }
@@ -840,41 +1111,49 @@ impl PhpArray {
     /// Returns a value by normalized key.
     #[must_use]
     pub fn get(&self, key: &ArrayKey) -> Option<&Value> {
-        self.storage
-            .entries()
-            .iter()
-            .find(|entry| &entry.key == key)
-            .map(ArrayEntry::value)
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(storage) => {
+                let index = packed_key_index(&storage.entries, key)?;
+                crate::layout_stats::record_array_packed_direct_get();
+                storage.entries.get(index).map(ArrayEntry::value)
+            }
+            ArrayStorage::Mixed(storage) => {
+                let index = storage.index.get(key).copied()?;
+                crate::layout_stats::record_array_mixed_indexed_get();
+                storage.entries.get(index).map(ArrayEntry::value)
+            }
+        }
     }
 
     /// Returns a mutable value by normalized key without exposing storage.
-    pub fn get_mut(&mut self, key: &ArrayKey) -> Option<&mut Value> {
+    pub fn get_mut(&mut self, key: &ArrayKey) -> Option<PhpArrayValueMut<'_>> {
         let storage = self.storage_mut_for(PhpArrayWriteIntent::NestedDimensionWrite);
-        if let Some(index) = storage.entries().iter().position(|entry| &entry.key == key) {
-            bump_mutation_epoch(storage);
-            return Some(&mut storage.entries_mut()[index].value);
-        }
-        None
+        let index = storage.find_index(key)?;
+        let value = &storage.entries()[index].value;
+        let old_is_reference = matches!(value, Value::Reference(_));
+        let old_is_int = matches!(value, Value::Int(_));
+        bump_mutation_epoch(storage);
+        Some(PhpArrayValueMut {
+            storage,
+            index,
+            old_is_reference,
+            old_is_int,
+        })
     }
 
     /// Removes a value by normalized key.
     pub fn remove(&mut self, key: &ArrayKey) -> Option<Value> {
         let storage = self.storage_mut_for(PhpArrayWriteIntent::Remove);
-        storage
-            .entries()
-            .iter()
-            .position(|entry| &entry.key == key)
-            .map(|index| {
-                let was_packed = storage.is_packed();
-                let old_len = storage.len();
-                let value = storage.entries_mut().remove(index).value;
-                if was_packed && index + 1 != old_len {
-                    storage.make_mixed();
-                }
-                adjust_pointer_after_remove(storage, index);
-                bump_mutation_epoch(storage);
-                value
-            })
+        let index = storage.find_index(key)?;
+        let was_packed = storage.is_packed();
+        let old_len = storage.len();
+        let value = storage.remove_index(index).value;
+        if was_packed && index + 1 != old_len {
+            storage.make_mixed();
+        }
+        adjust_pointer_after_remove(storage, index);
+        bump_mutation_epoch(storage);
+        Some(value)
     }
 
     /// Removes and returns the last element, mirroring PHP's `array_pop`
@@ -979,14 +1258,9 @@ impl PhpArray {
     #[must_use]
     pub fn packed_elements(&self) -> Option<Vec<&Value>> {
         if self.is_packed_fast() {
-            return Some(
-                self.storage
-                    .entries()
-                    .iter()
-                    .map(ArrayEntry::value)
-                    .collect(),
-            );
+            return Some(self.packed_values_fast()?.collect());
         }
+        crate::layout_stats::record_array_linear_scan_fallback();
         let mut elements = Vec::with_capacity(self.storage.len());
         for (index, entry) in self.storage.entries().iter().enumerate() {
             if entry.key != ArrayKey::Int(index as i64) {
@@ -997,9 +1271,22 @@ impl PhpArray {
         Some(elements)
     }
 
+    /// Iterates packed values without allocation when tracked metadata proves
+    /// keys are exactly `0..len`.
+    #[must_use]
+    pub fn packed_values_fast(&self) -> Option<PackedArrayValues<'_>> {
+        let ArrayStorage::Packed(storage) = self.storage.as_ref() else {
+            return None;
+        };
+        Some(PackedArrayValues {
+            entries: storage.entries.iter(),
+        })
+    }
+
     /// Returns one packed element only when the keys are exactly `0..len`.
     #[must_use]
     pub fn packed_element(&self, index: usize) -> Option<&Value> {
+        crate::layout_stats::record_array_linear_scan_fallback();
         for (entry_index, entry) in self.storage.entries().iter().enumerate() {
             if entry.key != ArrayKey::Int(entry_index as i64) {
                 return None;
@@ -1190,6 +1477,150 @@ mod tests {
         assert_eq!(array.remove(&ArrayKey::Int(0)), Some(Value::Int(1)));
         assert_eq!(array.len(), 1);
         assert_eq!(array.get(&ArrayKey::Int(0)), None);
+    }
+
+    #[test]
+    fn mixed_array_index_survives_overwrite_remove_cow_and_spread() {
+        crate::layout_stats::reset_layout_stats();
+
+        let mut array = PhpArray::new();
+        array.insert(ArrayKey::String(PhpString::from("a")), Value::Int(1));
+        array.insert(ArrayKey::String(PhpString::from("b")), Value::Int(2));
+        array.insert(ArrayKey::String(PhpString::from("a")), Value::Int(3));
+        assert_eq!(
+            array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+            vec![
+                ArrayKey::String(PhpString::from("a")),
+                ArrayKey::String(PhpString::from("b")),
+            ]
+        );
+        assert_eq!(
+            array.get(&ArrayKey::String(PhpString::from("a"))),
+            Some(&Value::Int(3))
+        );
+        assert_eq!(
+            array.remove(&ArrayKey::String(PhpString::from("b"))),
+            Some(Value::Int(2))
+        );
+        assert_eq!(array.get(&ArrayKey::String(PhpString::from("b"))), None);
+
+        let mut copy = array.clone();
+        copy.insert(ArrayKey::String(PhpString::from("c")), Value::Int(4));
+        assert_eq!(array.get(&ArrayKey::String(PhpString::from("c"))), None);
+        assert_eq!(
+            copy.get(&ArrayKey::String(PhpString::from("c"))),
+            Some(&Value::Int(4))
+        );
+
+        let mut spread = PhpArray::new();
+        spread.append(Value::Int(10));
+        spread.insert(ArrayKey::String(PhpString::from("a")), Value::Int(30));
+        spread.insert(ArrayKey::String(PhpString::from("d")), Value::Int(40));
+        copy.spread_extend(&spread);
+        assert_eq!(copy.get(&ArrayKey::Int(0)), Some(&Value::Int(10)));
+        assert_eq!(
+            copy.get(&ArrayKey::String(PhpString::from("a"))),
+            Some(&Value::Int(30))
+        );
+        assert_eq!(
+            copy.get(&ArrayKey::String(PhpString::from("d"))),
+            Some(&Value::Int(40))
+        );
+
+        if let ArrayStorage::Mixed(storage) = copy.storage.as_ref() {
+            for (index, entry) in storage.entries.iter().enumerate() {
+                assert_eq!(storage.index.get(entry.key()), Some(&index));
+            }
+        } else {
+            panic!("copy should use indexed mixed storage");
+        }
+
+        let stats = crate::layout_stats::take_layout_stats();
+        assert!(stats.array_mixed_indexed_gets >= 4, "{stats:?}");
+        assert_eq!(stats.array_linear_scan_fallbacks, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn packed_get_uses_direct_index_and_mixed_transition_rebuilds_index() {
+        crate::layout_stats::reset_layout_stats();
+
+        let mut array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(array.get(&ArrayKey::Int(1)), Some(&Value::Int(2)));
+        assert_eq!(array.remove(&ArrayKey::Int(1)), Some(Value::Int(2)));
+        assert_eq!(array.get(&ArrayKey::Int(2)), Some(&Value::Int(3)));
+
+        if let ArrayStorage::Mixed(storage) = array.storage.as_ref() {
+            assert_eq!(storage.index.get(&ArrayKey::Int(0)), Some(&0));
+            assert_eq!(storage.index.get(&ArrayKey::Int(2)), Some(&1));
+        } else {
+            panic!("middle removal should transition to mixed storage");
+        }
+
+        let stats = crate::layout_stats::take_layout_stats();
+        assert_eq!(stats.array_packed_direct_gets, 1, "{stats:?}");
+        assert_eq!(stats.array_mixed_indexed_gets, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn mixed_index_preserves_numeric_string_references_pointer_and_pop() {
+        crate::layout_stats::reset_layout_stats();
+
+        let cell = crate::ReferenceCell::new(Value::Int(42));
+        let mut array = PhpArray::new();
+        array.insert(ArrayKey::String(PhpString::from("a")), Value::Int(1));
+        array.insert(
+            ArrayKey::from_php_string(PhpString::from("1")),
+            Value::Int(10),
+        );
+        array.insert(
+            ArrayKey::from_php_string(PhpString::from("01")),
+            Value::Reference(cell.clone()),
+        );
+        array.insert(ArrayKey::String(PhpString::from("z")), Value::Int(99));
+
+        assert_eq!(array.get(&ArrayKey::Int(1)), Some(&Value::Int(10)));
+        assert_eq!(
+            array.get(&ArrayKey::String(PhpString::from("01"))),
+            Some(&Value::Reference(cell))
+        );
+        assert!(array.contains_references_fast());
+
+        assert_eq!(array.reset_pointer(), Some(Value::Int(1)));
+        assert_eq!(array.next_pointer(), Some(Value::Int(10)));
+        assert_eq!(
+            array.remove(&ArrayKey::String(PhpString::from("a"))),
+            Some(Value::Int(1))
+        );
+        assert_eq!(array.pointer_key(), Some(ArrayKey::Int(1)));
+        assert_eq!(array.remove(&ArrayKey::Int(1)), Some(Value::Int(10)));
+        assert_eq!(
+            array.pointer_key(),
+            Some(ArrayKey::String(PhpString::from("01")))
+        );
+        assert_eq!(array.pop(), Some(Value::Int(99)));
+        assert_eq!(array.get(&ArrayKey::String(PhpString::from("z"))), None);
+        assert!(matches!(
+            array.get(&ArrayKey::String(PhpString::from("01"))),
+            Some(Value::Reference(_))
+        ));
+        assert_eq!(
+            array.pointer_key(),
+            Some(ArrayKey::String(PhpString::from("01")))
+        );
+
+        if let ArrayStorage::Mixed(storage) = array.storage.as_ref() {
+            assert_eq!(storage.entries.len(), 1);
+            assert_eq!(
+                storage.index.get(&ArrayKey::String(PhpString::from("01"))),
+                Some(&0)
+            );
+        } else {
+            panic!("numeric-string key should keep mixed storage");
+        }
+
+        let stats = crate::layout_stats::take_layout_stats();
+        assert!(stats.array_mixed_indexed_gets >= 3, "{stats:?}");
+        assert_eq!(stats.array_linear_scan_fallbacks, 0, "{stats:?}");
     }
 
     #[test]
@@ -1495,6 +1926,48 @@ mod tests {
         assert_eq!(array.mutation_epoch(), 4);
         assert_eq!(array.remove(&ArrayKey::Int(99)), None);
         assert_eq!(array.mutation_epoch(), 4);
+    }
+
+    #[test]
+    fn get_mut_guard_updates_cached_value_metadata_on_drop() {
+        let mut array = PhpArray::from_packed(vec![Value::Int(1)]);
+        assert!(!array.contains_references_fast());
+        assert_eq!(array.element_summary_fast(), PhpArrayElementSummary::AllInt);
+
+        {
+            let mut slot = array.get_mut(&ArrayKey::Int(0)).expect("entry");
+            *slot = Value::Reference(crate::ReferenceCell::new(Value::Int(1)));
+        }
+
+        assert!(array.contains_references_fast());
+        assert_eq!(array.element_summary_fast(), PhpArrayElementSummary::Mixed);
+    }
+
+    #[test]
+    fn cached_metadata_updates_without_recompute_on_repeated_reads() {
+        crate::layout_stats::reset_layout_stats();
+
+        let cell = crate::ReferenceCell::new(Value::Int(7));
+        let mut array = PhpArray::new();
+        array.insert(ArrayKey::String(PhpString::from("01")), Value::Int(1));
+        array.insert(
+            ArrayKey::String(PhpString::from("ref")),
+            Value::Reference(cell),
+        );
+
+        for _ in 0..8 {
+            let metadata = array.shape_metadata();
+            assert!(metadata.contains_references);
+            assert_eq!(
+                metadata.key_kind_summary,
+                PhpArrayKeyKindSummary::StringOnly
+            );
+            assert!(metadata.numeric_string_key_ambiguity);
+            assert_eq!(array.element_summary_fast(), PhpArrayElementSummary::Mixed);
+        }
+
+        let stats = crate::layout_stats::take_layout_stats();
+        assert_eq!(stats.array_metadata_recomputes, 0, "{stats:?}");
     }
 
     #[test]

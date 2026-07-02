@@ -2,7 +2,7 @@
 
 use crate::{
     CallableMethodTarget, CallableValue, ClosurePayload, FiberRef, GeneratorRef, ObjectRef,
-    PhpArray, ReferenceCell, ResourceRef, string::PhpString,
+    PackedArrayValues, PhpArray, ReferenceCell, ResourceRef, string::PhpString,
 };
 use std::fmt;
 
@@ -122,6 +122,16 @@ impl Value {
     pub fn packed_elements(&self) -> Option<Vec<&Value>> {
         match self {
             Self::Array(array) => array.packed_elements(),
+            _ => None,
+        }
+    }
+
+    /// Returns a non-allocating packed-array value iterator when tracked
+    /// metadata proves the keys are exactly `0..len`.
+    #[must_use]
+    pub fn packed_values_fast(&self) -> Option<PackedArrayValues<'_>> {
+        match self {
+            Self::Array(array) => array.packed_values_fast(),
             _ => None,
         }
     }

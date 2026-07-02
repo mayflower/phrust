@@ -5,7 +5,10 @@ use php_ir::ids::FunctionId;
 use php_ir::module::{ClassEntry, normalize_class_name};
 use php_ir::source_map::IrSpan;
 use php_ir::{ConstId, IrUnit};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 /// VM-facing function lookup entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +39,10 @@ struct CompiledUnitInner {
     function_table: Vec<CompiledFunctionEntry>,
     constant_table: Vec<CompiledConstantEntry>,
     class_table: Vec<ClassEntry>,
+    function_lookup: HashMap<String, FunctionId>,
+    constant_lookup: HashMap<String, ConstId>,
+    class_lookup: HashMap<String, usize>,
+    unit_class_lookup: HashMap<String, usize>,
     source_line_cache: Mutex<Vec<Option<SourceLineIndex>>>,
 }
 
@@ -80,6 +87,13 @@ impl CompiledUnit {
                 function: entry.function,
             })
             .collect();
+        let function_lookup = unit.function_table.iter().fold(
+            HashMap::with_capacity(unit.function_table.len()),
+            |mut lookup, entry| {
+                lookup.entry(entry.name.clone()).or_insert(entry.function);
+                lookup
+            },
+        );
         let constant_table = unit
             .constant_table
             .iter()
@@ -88,18 +102,47 @@ impl CompiledUnit {
                 value: entry.value,
             })
             .collect();
+        let constant_lookup = unit.constant_table.iter().fold(
+            HashMap::with_capacity(unit.constant_table.len()),
+            |mut lookup, entry| {
+                lookup.entry(entry.name.clone()).or_insert(entry.value);
+                lookup
+            },
+        );
         let class_table = unit
             .classes
             .iter()
             .filter(|entry| !entry.flags.is_conditional)
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        let class_lookup = class_table.iter().enumerate().fold(
+            HashMap::with_capacity(class_table.len()),
+            |mut lookup, (index, entry)| {
+                lookup
+                    .entry(normalize_class_name(&entry.name))
+                    .or_insert(index);
+                lookup
+            },
+        );
+        let unit_class_lookup = unit.classes.iter().enumerate().fold(
+            HashMap::with_capacity(unit.classes.len()),
+            |mut lookup, (index, entry)| {
+                lookup
+                    .entry(normalize_class_name(&entry.name))
+                    .or_insert(index);
+                lookup
+            },
+        );
         Self {
             inner: Arc::new(CompiledUnitInner {
                 unit,
                 function_table,
                 constant_table,
                 class_table,
+                function_lookup,
+                constant_lookup,
+                class_lookup,
+                unit_class_lookup,
                 source_line_cache: Mutex::new(vec![None; file_count]),
             }),
         }
@@ -120,44 +163,34 @@ impl CompiledUnit {
     /// Finds a user function by normalized name.
     #[must_use]
     pub fn lookup_function(&self, name: &str) -> Option<FunctionId> {
-        self.inner
-            .function_table
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.function)
+        php_runtime::layout_stats::record_symbol_map_lookup();
+        self.inner.function_lookup.get(name).copied()
     }
 
     /// Finds a user constant by canonical name.
     #[must_use]
     pub fn lookup_constant(&self, name: &str) -> Option<&IrConstant> {
-        let value = self
-            .inner
-            .constant_table
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.value)?;
+        php_runtime::layout_stats::record_symbol_map_lookup();
+        let value = self.inner.constant_lookup.get(name).copied()?;
         self.inner.unit.constants.get(value.index())
     }
 
     /// Finds a class by normalized name.
     #[must_use]
     pub fn lookup_class(&self, name: &str) -> Option<&ClassEntry> {
+        php_runtime::layout_stats::record_symbol_map_lookup();
         let normalized = normalize_class_name(name);
-        self.inner
-            .class_table
-            .iter()
-            .find(|entry| normalize_class_name(&entry.name) == normalized)
+        let index = self.inner.class_lookup.get(&normalized).copied()?;
+        self.inner.class_table.get(index)
     }
 
     /// Finds any class entry in the underlying IR unit, including conditional declarations.
     #[must_use]
     pub fn lookup_unit_class(&self, name: &str) -> Option<&ClassEntry> {
+        php_runtime::layout_stats::record_symbol_map_lookup();
         let normalized = normalize_class_name(name);
-        self.inner
-            .unit
-            .classes
-            .iter()
-            .find(|entry| normalize_class_name(&entry.name) == normalized)
+        let index = self.inner.unit_class_lookup.get(&normalized).copied()?;
+        self.inner.unit.classes.get(index)
     }
 
     /// Returns the VM lookup table.
@@ -246,8 +279,31 @@ impl From<IrUnit> for CompiledUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use php_ir::ids::{FileId, UnitId};
-    use php_ir::module::FileEntry;
+    use php_ir::ids::{ClassId, FileId, UnitId};
+    use php_ir::module::{ClassFlags, FileEntry, FunctionEntry, GlobalConstantEntry};
+
+    fn class_entry(id: u32, name: &str, is_conditional: bool) -> ClassEntry {
+        ClassEntry {
+            id: ClassId::new(id),
+            name: name.to_owned(),
+            display_name: name.to_owned(),
+            parent: None,
+            parent_display_name: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            properties: Vec::new(),
+            constants: Vec::new(),
+            enum_cases: Vec::new(),
+            attributes: Vec::new(),
+            enum_backing_type: None,
+            constructor: None,
+            flags: ClassFlags {
+                is_conditional,
+                ..ClassFlags::default()
+            },
+            span: IrSpan::default(),
+        }
+    }
 
     #[test]
     fn source_display_line_uses_cached_byte_offset_index() {
@@ -291,5 +347,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn symbol_lookups_use_maps_and_preserve_first_duplicate() {
+        php_runtime::layout_stats::reset_layout_stats();
+
+        let mut unit = IrUnit::new(UnitId::new(0));
+        unit.constants.push(IrConstant::Int(10));
+        unit.constants.push(IrConstant::Int(20));
+        unit.function_table.push(FunctionEntry {
+            name: "app\\boot".to_owned(),
+            function: FunctionId::new(1),
+        });
+        unit.function_table.push(FunctionEntry {
+            name: "app\\boot".to_owned(),
+            function: FunctionId::new(2),
+        });
+        unit.constant_table.push(GlobalConstantEntry {
+            name: "APP_CONST".to_owned(),
+            value: ConstId::new(0),
+            span: IrSpan::default(),
+        });
+        unit.constant_table.push(GlobalConstantEntry {
+            name: "APP_CONST".to_owned(),
+            value: ConstId::new(1),
+            span: IrSpan::default(),
+        });
+        unit.classes.push(class_entry(0, "App\\Thing", false));
+        unit.classes.push(class_entry(1, "APP\\THING", false));
+
+        let compiled = CompiledUnit::new(unit);
+        assert_eq!(
+            compiled.lookup_function("app\\boot"),
+            Some(FunctionId::new(1))
+        );
+        assert_eq!(
+            compiled.lookup_constant("APP_CONST"),
+            Some(&IrConstant::Int(10))
+        );
+        assert_eq!(
+            compiled.lookup_class("\\app\\thing").map(|class| class.id),
+            Some(ClassId::new(0))
+        );
+        assert!(compiled.lookup_function("missing").is_none());
+        assert!(compiled.lookup_constant("MISSING").is_none());
+        assert!(compiled.lookup_class("Missing").is_none());
+
+        let stats = php_runtime::layout_stats::take_layout_stats();
+        assert_eq!(stats.symbol_map_lookups, 6, "{stats:?}");
+        assert_eq!(stats.symbol_linear_fallbacks, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn unit_class_lookup_keeps_conditional_entries_separate() {
+        let mut unit = IrUnit::new(UnitId::new(0));
+        unit.classes.push(class_entry(0, "AlwaysVisible", true));
+        unit.classes.push(class_entry(1, "Declared", false));
+
+        let compiled = CompiledUnit::new(unit);
+        assert!(compiled.lookup_class("AlwaysVisible").is_none());
+        assert_eq!(
+            compiled
+                .lookup_unit_class("alwaysvisible")
+                .map(|class| class.id),
+            Some(ClassId::new(0))
+        );
+        assert_eq!(
+            compiled.lookup_class("\\declared").map(|class| class.id),
+            Some(ClassId::new(1))
+        );
     }
 }

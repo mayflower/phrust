@@ -949,14 +949,20 @@ fn insert_input_at(array: &mut PhpArray, segments: &[InputKeySegment], value: Va
             if !matches!(array.get(key), Some(Value::Array(_))) {
                 array.insert(key.clone(), Value::Array(PhpArray::new()));
             }
-            let Some(Value::Array(child)) = array.get_mut(key) else {
+            let Some(mut child_slot) = array.get_mut(key) else {
+                unreachable!("input child was just initialized as an array")
+            };
+            let Value::Array(child) = &mut *child_slot else {
                 unreachable!("input child was just initialized as an array")
             };
             insert_input_at(child, tail, value);
         }
         InputKeySegment::Append => {
             let key = array.append(Value::Array(PhpArray::new()));
-            let Some(Value::Array(child)) = array.get_mut(&key) else {
+            let Some(mut child_slot) = array.get_mut(&key) else {
+                unreachable!("input append child was just initialized as an array")
+            };
+            let Value::Array(child) = &mut *child_slot else {
                 unreachable!("input append child was just initialized as an array")
             };
             insert_input_at(child, tail, value);
@@ -1000,7 +1006,10 @@ fn insert_uploaded_file(
     if !matches!(array.get(root_key), Some(Value::Array(_))) {
         array.insert(root_key.clone(), Value::Array(uploaded_file_group()));
     }
-    let Some(Value::Array(group)) = array.get_mut(root_key) else {
+    let Some(mut group_slot) = array.get_mut(root_key) else {
+        unreachable!("uploaded file root was just initialized as an array")
+    };
+    let Value::Array(group) = &mut *group_slot else {
         unreachable!("uploaded file root was just initialized as an array")
     };
     insert_uploaded_file_attribute(
@@ -1064,7 +1073,10 @@ fn insert_uploaded_file_attribute(
     if !matches!(group.get(&key), Some(Value::Array(_))) {
         group.insert(key.clone(), Value::Array(PhpArray::new()));
     }
-    let Some(Value::Array(values)) = group.get_mut(&key) else {
+    let Some(mut values_slot) = group.get_mut(&key) else {
+        unreachable!("uploaded file attribute was just initialized as an array")
+    };
+    let Value::Array(values) = &mut *values_slot else {
         unreachable!("uploaded file attribute was just initialized as an array")
     };
     insert_input_at(values, tail, value);

@@ -2,11 +2,12 @@
 
 Date: 2026-06-28.
 
-FPE-23 adds runtime-owned metadata for non-packed array shapes without changing
-the PHP array representation. The VM observes shapes through `PhpArray`
-helpers, records counters, and only uses guarded reads when the helper can
-preserve PHP key coercion, insertion order, COW, references, and foreach
-semantics.
+FPE-23 adds runtime-owned metadata for non-packed array shapes. Mixed arrays now
+use ordered storage plus an index map, so key lookup and overwrite keep PHP
+insertion order while avoiding repeated linear scans. The VM observes shapes
+through `PhpArray` helpers, records counters, and only uses guarded reads when
+the helper can preserve PHP key coercion, insertion order, COW, references, and
+foreach semantics.
 
 ## Shape Kinds
 
@@ -23,8 +24,10 @@ semantics.
 - `cow_or_reference_fallback`
 
 The classifier also exposes length, mutation epoch, sharing, reference
-presence, key-kind summary, and numeric-string-key ambiguity. Consumers must use
-the metadata and lookup helpers instead of reimplementing array layout checks.
+presence, key-kind summary, and numeric-string-key ambiguity. Those summaries
+are maintained incrementally on array mutation, so repeated metadata reads stay
+O(1). Consumers must use the metadata and lookup helpers instead of
+reimplementing array layout checks.
 
 ## Guarded Reads
 
@@ -43,6 +46,10 @@ packed-array metadata and fast paths from the earlier array slice.
 
 VM counters now include:
 
+- `array_packed_direct_gets`
+- `array_mixed_indexed_gets`
+- `array_linear_scan_fallbacks`
+- `array_metadata_recomputes`
 - `array_shape_observed_by_kind`
 - `record_shape_hits`
 - `record_shape_misses`
@@ -54,6 +61,9 @@ VM counters now include:
 
 `scripts/performance/perf_report.py` renders the shape counters and observed
 shape map when benchmark or framework-smoke JSON includes them.
+
+Compiled-unit symbol lookups also expose `symbol_map_lookups` and
+`symbol_linear_fallbacks` through the VM counter JSON.
 
 ## Covered Fixtures
 

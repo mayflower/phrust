@@ -54986,7 +54986,7 @@ fn coerce_or_check_variadic_param_type(
             ));
         }
         materialize_int_to_float_runtime_type(&mut element, runtime_type);
-        if let Some(slot) = array.get_mut(&key) {
+        if let Some(mut slot) = array.get_mut(&key) {
             *slot = element;
         }
     }
@@ -56606,10 +56606,10 @@ fn array_walk_reference_entries(
             let keys = array.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
             let mut entries = Vec::with_capacity(keys.len());
             for key in keys {
-                let Some(value) = array.get_mut(&key) else {
+                let Some(mut value) = array.get_mut(&key) else {
                     continue;
                 };
-                entries.push((key, ensure_value_reference_cell(value)));
+                entries.push((key, ensure_value_reference_cell(&mut value)));
             }
             cell.set(Value::Array(array));
             Ok(entries)
@@ -57901,8 +57901,8 @@ fn assign_dim_value(
         return Err("E_PHP_VM_ARRAY_ASSIGN_DIM: missing array dimension".to_owned());
     };
     if rest.is_empty() && !append {
-        if let Some(existing) = array.get_mut(first) {
-            write_lvalue(existing, value);
+        if let Some(mut existing) = array.get_mut(first) {
+            write_lvalue(&mut existing, value);
         } else {
             array.insert(first.clone(), value);
         }
@@ -57911,13 +57911,13 @@ fn assign_dim_value(
     if array.get(first).is_none() {
         array.insert(first.clone(), Value::Array(PhpArray::new()));
     }
-    let Some(child) = array.get_mut(first) else {
+    let Some(mut child) = array.get_mut(first) else {
         return Err("E_PHP_VM_ARRAY_ASSIGN_DIM: failed to create nested array".to_owned());
     };
-    if matches!(child, Value::Uninitialized | Value::Null) {
+    if matches!(*child, Value::Uninitialized | Value::Null) {
         *child = Value::Array(PhpArray::new());
     }
-    assign_dim_value(child, rest, value, append)
+    assign_dim_value(&mut child, rest, value, append)
 }
 
 fn bind_dim_local_to_reference_cell(
@@ -57972,13 +57972,13 @@ fn bind_dim_value_to_reference_cell(
     if array.get(first).is_none() {
         array.insert(first.clone(), Value::Array(PhpArray::new()));
     }
-    let Some(child) = array.get_mut(first) else {
+    let Some(mut child) = array.get_mut(first) else {
         return Err("E_PHP_VM_ARRAY_BIND_DIM: failed to create nested array".to_owned());
     };
-    if matches!(child, Value::Uninitialized | Value::Null) {
+    if matches!(*child, Value::Uninitialized | Value::Null) {
         *child = Value::Array(PhpArray::new());
     }
-    bind_dim_value_to_reference_cell(child, rest, append, cell)
+    bind_dim_value_to_reference_cell(&mut child, rest, append, cell)
 }
 
 fn bind_property_dim_to_reference_cell(
@@ -58045,16 +58045,16 @@ fn ensure_dim_reference_cell_value(
     if array.get(first).is_none() {
         array.insert(first.clone(), Value::Null);
     }
-    let Some(child) = array.get_mut(first) else {
+    let Some(mut child) = array.get_mut(first) else {
         return Err("E_PHP_VM_ARRAY_REF_DIM: failed to create array element".to_owned());
     };
     if rest.is_empty() {
-        return Ok(ensure_value_reference_cell(child));
+        return Ok(ensure_value_reference_cell(&mut child));
     }
-    if matches!(child, Value::Uninitialized | Value::Null) {
+    if matches!(*child, Value::Uninitialized | Value::Null) {
         *child = Value::Array(PhpArray::new());
     }
-    ensure_dim_reference_cell_value(child, rest)
+    ensure_dim_reference_cell_value(&mut child, rest)
 }
 
 fn ensure_value_reference_cell(value: &mut Value) -> ReferenceCell {
@@ -58110,8 +58110,8 @@ fn unset_dim_value(container: &mut Value, dims: &[ArrayKey]) {
         array.remove(first);
         return;
     }
-    if let Some(child) = array.get_mut(first) {
-        unset_dim_value(child, rest);
+    if let Some(mut child) = array.get_mut(first) {
+        unset_dim_value(&mut child, rest);
     }
 }
 
@@ -58185,7 +58185,7 @@ fn undefined_array_key_warning(
 }
 
 fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
-    let Some(elements) = array.packed_elements() else {
+    let Value::Array(array) = array else {
         return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
     };
     let NumericValue::Int(index) = to_number(index)? else {
@@ -58194,9 +58194,9 @@ fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
     if index < 0 {
         return Ok(Value::Null);
     }
-    Ok(elements
-        .get(index as usize)
-        .map(|value| (*value).clone())
+    Ok(array
+        .packed_element_fast(index as usize)
+        .cloned()
         .unwrap_or(Value::Null))
 }
 

@@ -182,6 +182,12 @@ pub struct VmCounters {
     pub cow_separations: u64,
     pub reference_cell_creations: u64,
     pub object_allocations: u64,
+    pub array_packed_direct_gets: u64,
+    pub array_mixed_indexed_gets: u64,
+    pub array_linear_scan_fallbacks: u64,
+    pub array_metadata_recomputes: u64,
+    pub symbol_map_lookups: u64,
+    pub symbol_linear_fallbacks: u64,
     pub array_dim_fetches: u64,
     pub packed_dim_fast_path_hits: u64,
     pub packed_dim_fast_path_misses: u64,
@@ -692,6 +698,12 @@ impl VmCounters {
         self.cow_separations += stats.cow_separations;
         self.reference_cell_creations += stats.reference_cell_creations;
         self.object_allocations += stats.object_allocations;
+        self.array_packed_direct_gets += stats.array_packed_direct_gets;
+        self.array_mixed_indexed_gets += stats.array_mixed_indexed_gets;
+        self.array_linear_scan_fallbacks += stats.array_linear_scan_fallbacks;
+        self.array_metadata_recomputes += stats.array_metadata_recomputes;
+        self.symbol_map_lookups += stats.symbol_map_lookups;
+        self.symbol_linear_fallbacks += stats.symbol_linear_fallbacks;
     }
 
     pub(crate) fn record_bytecode_lower_attempt(&mut self) {
@@ -2294,6 +2306,42 @@ impl VmCounters {
             &mut json,
             "object_allocations",
             self.object_allocations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "array_packed_direct_gets",
+            self.array_packed_direct_gets,
+            true,
+        );
+        push_field(
+            &mut json,
+            "array_mixed_indexed_gets",
+            self.array_mixed_indexed_gets,
+            true,
+        );
+        push_field(
+            &mut json,
+            "array_linear_scan_fallbacks",
+            self.array_linear_scan_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "array_metadata_recomputes",
+            self.array_metadata_recomputes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbol_map_lookups",
+            self.symbol_map_lookups,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbol_linear_fallbacks",
+            self.symbol_linear_fallbacks,
             true,
         );
         push_field(&mut json, "array_dim_fetches", self.array_dim_fetches, true);
@@ -4161,6 +4209,12 @@ mod tests {
             cow_separations: 3,
             reference_cell_creations: 2,
             object_allocations: 1,
+            array_packed_direct_gets: 13,
+            array_mixed_indexed_gets: 17,
+            array_linear_scan_fallbacks: 19,
+            array_metadata_recomputes: 23,
+            symbol_map_lookups: 29,
+            symbol_linear_fallbacks: 31,
         });
         counters.record_autoload();
         counters.record_literal_intern(false);
@@ -4415,6 +4469,12 @@ mod tests {
         assert_eq!(counters.cow_separations, 3);
         assert_eq!(counters.reference_cell_creations, 2);
         assert_eq!(counters.object_allocations, 1);
+        assert_eq!(counters.array_packed_direct_gets, 13);
+        assert_eq!(counters.array_mixed_indexed_gets, 17);
+        assert_eq!(counters.array_linear_scan_fallbacks, 19);
+        assert_eq!(counters.array_metadata_recomputes, 23);
+        assert_eq!(counters.symbol_map_lookups, 29);
+        assert_eq!(counters.symbol_linear_fallbacks, 31);
         assert_eq!(counters.string_concats, 1);
         assert_eq!(counters.packed_dim_fast_path_hits, 1);
         assert_eq!(counters.packed_dim_fast_path_misses, 1);
@@ -4900,6 +4960,12 @@ mod tests {
         assert!(json.contains("\"cow_separations\": 0"));
         assert!(json.contains("\"reference_cell_creations\": 0"));
         assert!(json.contains("\"object_allocations\": 0"));
+        assert!(json.contains("\"array_packed_direct_gets\": 0"));
+        assert!(json.contains("\"array_mixed_indexed_gets\": 0"));
+        assert!(json.contains("\"array_linear_scan_fallbacks\": 0"));
+        assert!(json.contains("\"array_metadata_recomputes\": 0"));
+        assert!(json.contains("\"symbol_map_lookups\": 0"));
+        assert!(json.contains("\"symbol_linear_fallbacks\": 0"));
         assert!(json.contains("\"packed_dim_fast_path_hits\": 0"));
         assert!(json.contains("\"packed_dim_fast_path_misses\": 0"));
         assert!(json.contains("\"array_packed_append_fast_path_hits\": 0"));
