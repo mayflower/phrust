@@ -387,16 +387,19 @@ impl HirLowerer<'_> {
     fn binary_expr_kind(&mut self, node: &SyntaxNode) -> HirExprKind {
         let operands = self.expr_operands(node, ResolveContext::ConstantFetch);
         if operands.len() <= 2 {
+            let operator = first_operator_text(node).unwrap_or_else(|| "binary".to_owned());
+            let right = operands
+                .get(1)
+                .copied()
+                .map(|right| self.reclassify_binary_right_operand(&operator, right))
+                .or_else(|| Some(self.missing_expr(node, "missing expression child")));
             return HirExprKind::Binary {
-                operator: first_operator_text(node).unwrap_or_else(|| "binary".to_owned()),
+                operator,
                 left: operands
                     .first()
                     .copied()
                     .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
-                right: operands
-                    .get(1)
-                    .copied()
-                    .or_else(|| Some(self.missing_expr(node, "missing expression child"))),
+                right,
             };
         }
 
@@ -408,6 +411,7 @@ impl HirLowerer<'_> {
                 .or_else(|| operators.first())
                 .cloned()
                 .unwrap_or_else(|| "binary".to_owned());
+            let right = self.reclassify_binary_right_operand(&operator, right);
             let span = TextRange::new(
                 self.frontend_span(left)
                     .map(|span| span.start().to_usize())
@@ -2589,6 +2593,7 @@ impl HirLowerer<'_> {
                 .or_else(|| operators.first())
                 .cloned()
                 .unwrap_or_else(|| "binary".to_owned());
+            let right = self.reclassify_binary_right_operand(&operator, right);
             let span = TextRange::new(
                 self.frontend_span(left)
                     .map(|span| span.start().to_usize())
@@ -2607,6 +2612,56 @@ impl HirLowerer<'_> {
             );
         }
         left
+    }
+
+    fn reclassify_binary_right_operand(&mut self, operator: &str, right: ExprId) -> ExprId {
+        if operator != "instanceof" {
+            return right;
+        }
+        self.reclassify_name_expr(right, ResolveContext::ClassLike)
+    }
+
+    fn reclassify_name_expr(&mut self, expr: ExprId, context: ResolveContext) -> ExprId {
+        let Some(span) = self.frontend_span(expr) else {
+            return expr;
+        };
+        let Some(source) = self
+            .database
+            .module(self.module_id)
+            .and_then(|module| module.expressions().get(expr))
+            .and_then(|expr| match expr.kind() {
+                HirExprKind::Name { resolution } => Some(resolution.source().to_owned()),
+                _ => None,
+            })
+        else {
+            return expr;
+        };
+        let qualified = QualifiedName::parse(&source);
+        let result = self.scope.resolver().resolve(&qualified, context);
+        let name_kind = crate::symbols::resolution::NameResolver::name_kind(context);
+        let (resolved, fallback) = match &result {
+            ResolvedName::FullyQualified(name) => (Some(name.canonical(name_kind)), None),
+            ResolvedName::MaybeRuntimeFallback {
+                namespaced,
+                fallback,
+            } => (
+                Some(namespaced.canonical(name_kind)),
+                Some(fallback.canonical(name_kind)),
+            ),
+            ResolvedName::Dynamic | ResolvedName::Unresolved => (None, None),
+        };
+        self.alloc_expr(
+            HirExprKind::Name {
+                resolution: HirNameResolution::new(
+                    source,
+                    context.as_str(),
+                    result.classification(),
+                    resolved,
+                    fallback,
+                ),
+            },
+            span,
+        )
     }
 
     fn first_expr_child_or_placeholder(&mut self, node: &SyntaxNode) -> Option<ExprId> {

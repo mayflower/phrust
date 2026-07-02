@@ -1540,6 +1540,7 @@ fn check_instruction(
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromProperty { .. }
+        | InstructionKind::BindReferenceFromPropertyDim { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
         | InstructionKind::BindReferenceStaticProperty { .. }

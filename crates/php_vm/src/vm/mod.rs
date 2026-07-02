@@ -410,7 +410,7 @@ enum ForeachIterator {
     },
     ByReference {
         local: LocalId,
-        position: usize,
+        visited_keys: Vec<ArrayKey>,
     },
     Generator {
         generator: GeneratorRef,
@@ -1018,6 +1018,7 @@ struct DynamicFunctionEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 struct DynamicClassEntry {
+    lookup_name: String,
     class: php_ir::module::ClassEntry,
     unit_index: usize,
     origin: DeclarationOrigin,
@@ -11732,6 +11733,60 @@ impl Vm {
                         }
                         self.record_counter_alias_state(local_alias_state(stack, *target));
                     }
+                    InstructionKind::BindReferenceFromPropertyDim {
+                        target,
+                        object,
+                        property,
+                        dims,
+                    } => {
+                        self.record_counter_alias_state_transition(
+                            AliasState::NoReferencesObserved,
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        self.record_counter_fast_path_disabled_by_reference(
+                            AliasState::PropertyOrArrayDimReference,
+                        );
+                        let object = match read_operand(unit, stack, *object) {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                return self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_REF_DIM_SOURCE_NON_OBJECT: cannot reference property dimension on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let dims = match read_dim_operands(unit, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        let cell = match ensure_property_dim_reference_cell(
+                            compiled, stack, &object, property, &dims,
+                        ) {
+                            Ok(cell) => cell,
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("frame was pushed")
+                            .locals
+                            .bind_reference_cell(*target, cell)
+                        {
+                            return self.runtime_error(output, compiled, stack, message);
+                        }
+                        self.record_counter_alias_state(local_alias_state(stack, *target));
+                    }
                     InstructionKind::BindReferenceFromDim {
                         target,
                         local,
@@ -20898,7 +20953,7 @@ impl Vm {
                             *iterator,
                             ForeachIterator::ByReference {
                                 local: *local,
-                                position: 0,
+                                visited_keys: Vec::new(),
                             },
                         );
                         self.record_runtime_trace_event(format!(
@@ -20913,8 +20968,10 @@ impl Vm {
                         key,
                         value_local,
                     } => {
-                        let Some(ForeachIterator::ByReference { local, position }) =
-                            foreach_iterators.get(iterator).cloned()
+                        let Some(ForeachIterator::ByReference {
+                            local,
+                            visited_keys,
+                        }) = foreach_iterators.get(iterator).cloned()
                         else {
                             return self.runtime_error(
                                 output,
@@ -20932,7 +20989,10 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let Some(entry_key) = keys.get(position).cloned() else {
+                        let Some(entry_key) = keys
+                            .into_iter()
+                            .find(|candidate| !visited_keys.contains(candidate))
+                        else {
                             self.record_runtime_trace_event(format!(
                                 "foreach next-ref iterator=r{} status=done",
                                 iterator.raw()
@@ -20947,7 +21007,7 @@ impl Vm {
                             }
                             continue;
                         };
-                        let Some(ForeachIterator::ByReference { position, .. }) =
+                        let Some(ForeachIterator::ByReference { visited_keys, .. }) =
                             foreach_iterators.get_mut(iterator)
                         else {
                             return self.runtime_error(
@@ -20960,7 +21020,7 @@ impl Vm {
                                 ),
                             );
                         };
-                        *position += 1;
+                        visited_keys.push(entry_key.clone());
                         self.record_runtime_trace_event(format!(
                             "foreach next-ref iterator=r{} status=value key={}",
                             iterator.raw(),
@@ -21544,6 +21604,65 @@ impl Vm {
                         if is_reflection_runtime_class(&object.class_name()) {
                             let values =
                                 values.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+                            if normalize_class_name(&object.class_name()) == "reflectionclass"
+                                && matches!(
+                                    normalize_method_name(method).as_str(),
+                                    "newinstance" | "newinstanceargs"
+                                )
+                            {
+                                let result = self.reflection_class_new_instance(
+                                    compiled,
+                                    &object,
+                                    method,
+                                    values,
+                                    output,
+                                    stack,
+                                    state,
+                                    instruction.span,
+                                );
+                                if !result.status.is_success() {
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                                if result.fiber_suspension.is_some() {
+                                    return self.propagate_fiber_suspension(
+                                        result,
+                                        compiled,
+                                        *dst,
+                                        block_id,
+                                        instruction_index + 1,
+                                        &foreach_iterators,
+                                        &exception_handlers,
+                                        &pending_control,
+                                        output,
+                                        stack,
+                                    );
+                                }
+                                diagnostics.extend(result.diagnostics);
+                                let value = result.return_value.unwrap_or(Value::Null);
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("caller frame is active")
+                                    .registers
+                                    .set(*dst, value)
+                                {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                                continue;
+                            }
                             if normalize_class_name(&object.class_name()) == "reflectionattribute"
                                 && normalize_method_name(method) == "newinstance"
                             {
@@ -27364,9 +27483,13 @@ impl Vm {
         };
         // A static method reached through an instance/callable runs as a static
         // call; PHP allows this, so do not reject it here.
-        if let Err(message) =
-            validate_method_callable(&owner, stack, &declaring_class, &method_entry)
-        {
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            current_scope_class(compiled, stack).as_deref(),
+            &declaring_class,
+            &method_entry,
+        ) {
             return self.runtime_error(output, compiled, stack, message);
         }
         self.execute_function(
@@ -31871,6 +31994,9 @@ impl Vm {
                 };
                 VmResult::success(output.clone(), Some(Value::Bool(exists)))
             }
+            "class_alias" => self.call_class_alias_builtin(
+                compiled, values, call_site, call_span, output, stack, state,
+            ),
             "method_exists" => {
                 self.call_method_exists_builtin(compiled, values, output, stack, state)
             }
@@ -33215,6 +33341,49 @@ impl Vm {
         Ok(())
     }
 
+    fn emit_class_alias_warning(
+        &self,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        message: String,
+    ) -> Result<(), VmResult> {
+        let source_span = call_span
+            .or_else(|| stack.current().and_then(|frame| frame.call_span))
+            .map(|span| runtime_source_span(compiled, span))
+            .unwrap_or_default();
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLASS_ALIAS_WARNING",
+            RuntimeSeverity::Warning,
+            message,
+            source_span,
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            Self::record_last_error(state, php_runtime::PHP_E_WARNING, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
     fn emit_spl_autoload_call_unregister_deprecation(
         &self,
         compiled: &CompiledUnit,
@@ -33502,6 +33671,110 @@ impl Vm {
             Value::Array(standard)
         };
         VmResult::success(output.clone(), Some(value))
+    }
+
+    fn call_class_alias_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        values: Vec<Value>,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if values.len() < 2 || values.len() > 3 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_CLASS_ALIAS_ARITY: class_alias expects two or three arguments",
+            );
+        }
+        let source_name = match to_string(&values[0]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let alias_name = match to_string(&values[1]) {
+            Ok(name) => name.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let autoload = values
+            .get(2)
+            .is_none_or(|value| to_bool(value).unwrap_or(true));
+        let exists = match self.class_like_exists_with_autoload_cache(
+            compiled,
+            &source_name,
+            AutoloadClassLookupKind::ClassLike,
+            autoload,
+            call_site,
+            output,
+            stack,
+            state,
+        ) {
+            Ok(exists) => exists,
+            Err(result) => return result,
+        };
+        if !exists {
+            if let Err(result) = self.emit_class_alias_warning(
+                compiled,
+                call_span,
+                output,
+                stack,
+                state,
+                format!("Class \"{source_name}\" not found"),
+            ) {
+                return result;
+            }
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        }
+        if lookup_class_in_state(compiled, state, &alias_name).is_some()
+            || php_std::ExtensionRegistry::standard_library()
+                .enabled_class(&alias_name)
+                .is_some()
+        {
+            if let Err(result) = self.emit_class_alias_warning(
+                compiled,
+                call_span,
+                output,
+                stack,
+                state,
+                format!("Cannot redeclare class {}", display_class_name(&alias_name)),
+            ) {
+                return result;
+            }
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        }
+
+        let Some(class) = lookup_class_in_state(compiled, state, &source_name) else {
+            if let Err(result) = self.emit_class_alias_warning(
+                compiled,
+                call_span,
+                output,
+                stack,
+                state,
+                format!("Class \"{source_name}\" not found"),
+            ) {
+                return result;
+            }
+            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+        };
+        let unit_index = dynamic_class_owner_index_in_state(state, &class.name)
+            .unwrap_or_else(|| dynamic_or_retain_unit_index(state, compiled));
+        state.dynamic_classes.push(DynamicClassEntry {
+            lookup_name: normalize_class_name(&alias_name),
+            class,
+            unit_index,
+            origin: declaration_origin(
+                compiled,
+                call_span.unwrap_or_default(),
+                &alias_name,
+                DeclarationKind::ClassLike,
+                DeclarationLoadKind::Conditional,
+            ),
+        });
+        state.bump_class_table_epoch();
+        VmResult::success(output.clone(), Some(Value::Bool(true)))
     }
 
     fn class_like_exists_with_autoload_cache(
@@ -34012,6 +34285,151 @@ impl Vm {
                     .with_class_context(
                         constructor.class.name.clone(),
                         class.name.clone(),
+                        constructor.class.name.clone(),
+                    ),
+                output,
+                stack,
+                state,
+            );
+            if !result.status.is_success() || result.fiber_suspension.is_some() {
+                return result;
+            }
+            self.register_destructor_if_needed(compiled, &class, object.clone(), state);
+            return VmResult::success_with_diagnostics(
+                output.clone(),
+                Some(Value::Object(object)),
+                result.diagnostics,
+            );
+        }
+        if !args.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: constructor for class {class_name} does not accept arguments"
+                ),
+            );
+        }
+        self.register_destructor_if_needed(compiled, &class, object.clone(), state);
+        VmResult::success(output.clone(), Some(Value::Object(object)))
+    }
+
+    fn reflection_class_new_instance(
+        &self,
+        compiled: &CompiledUnit,
+        reflection_class: &ObjectRef,
+        method: &str,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        call_span: php_ir::IrSpan,
+    ) -> VmResult {
+        let class_name = match reflection_object_string_property(reflection_class, "class") {
+            Ok(name) => name,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let args = match normalize_method_name(method).as_str() {
+            "newinstance" => values.into_iter().map(CallArgument::positional).collect(),
+            "newinstanceargs" => match reflection_new_instance_args(values) {
+                Ok(args) => args,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+            _ => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_UNKNOWN_METHOD: method {}::{} is not defined",
+                        reflection_class.class_name(),
+                        method
+                    ),
+                );
+            }
+        };
+        self.reflection_instantiate_class(
+            compiled,
+            &class_name,
+            args,
+            output,
+            stack,
+            state,
+            call_span,
+        )
+    }
+
+    fn reflection_instantiate_class(
+        &self,
+        compiled: &CompiledUnit,
+        class_name: &str,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        call_span: php_ir::IrSpan,
+    ) -> VmResult {
+        let class = match lookup_class_in_state(compiled, state, class_name) {
+            Some(class) => class,
+            None => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!("E_PHP_VM_UNKNOWN_CLASS: Class \"{class_name}\" not found"),
+                );
+            }
+        };
+        let class_owner = class_owner_in_state(compiled, state, &class.name);
+        let runtime_class = match runtime_class_entry(
+            &class_owner,
+            state,
+            &class,
+            &|value| self.constant_value(class_owner.unit(), value),
+            &|reference| class_constant_reference_value(&class_owner, state, reference),
+            &|reference| named_constant_reference_value(&class_owner, state, reference),
+        ) {
+            Ok(class) => class,
+            Err(error) => return self.runtime_error(output, compiled, stack, error.into_message()),
+        };
+        if let Err(message) = validate_object_mvp(&runtime_class) {
+            return self.runtime_error(output, compiled, stack, message);
+        }
+
+        let object = ObjectRef::new_with_display_name(&runtime_class, class.display_name.clone());
+        let caller_scope = current_scope_class(compiled, stack);
+        let constructor = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &class.name,
+            "__construct",
+            caller_scope.as_deref(),
+        ) {
+            Ok(constructor) => constructor,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if let Some(constructor) = constructor {
+            if let Err(message) = validate_constructor_callable_in_state_scope(
+                compiled,
+                state,
+                caller_scope.as_deref(),
+                &constructor.class,
+                &constructor.method,
+            ) {
+                return self.runtime_error(output, compiled, stack, message);
+            }
+            let class_owner = class_owner_in_state(compiled, state, &constructor.class.name);
+            let result = self.execute_function(
+                &class_owner,
+                constructor.method.function,
+                FunctionCall::new(args, Vec::new())
+                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_span(call_span)
+                    .with_this(object.clone())
+                    .with_class_context(
+                        constructor.class.name.clone(),
+                        object.display_name(),
                         constructor.class.name.clone(),
                     ),
                 output,
@@ -38179,6 +38597,22 @@ fn reflection_attribute_constructor_args(object: &ObjectRef) -> Result<Vec<CallA
         .collect())
 }
 
+fn reflection_new_instance_args(values: Vec<Value>) -> Result<Vec<CallArgument>, String> {
+    let Some(arguments) = values.first() else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(arguments) = effective_value(arguments) else {
+        return Err(format!(
+            "E_PHP_VM_TYPE_ERROR: ReflectionClass::newInstanceArgs(): Argument #1 ($args) must be of type array, {} given",
+            value_type_name(arguments)
+        ));
+    };
+    Ok(arguments
+        .iter()
+        .map(|(_, value)| CallArgument::positional(effective_value(value)))
+        .collect())
+}
+
 fn reflection_object_string_property(object: &ObjectRef, property: &str) -> Result<String, String> {
     let Some(value) = object.get_property(property) else {
         return Err(format!(
@@ -39498,57 +39932,6 @@ struct ResolvedConstant<'a> {
 struct ResolvedConstantOwned {
     class: php_ir::module::ClassEntry,
     constant: php_ir::module::ClassConstantEntry,
-}
-
-fn validate_method_callable(
-    compiled: &CompiledUnit,
-    stack: &CallStack,
-    class: &php_ir::module::ClassEntry,
-    method: &php_ir::module::ClassMethodEntry,
-) -> Result<(), String> {
-    validate_method_callable_in_scope(
-        compiled,
-        current_scope_class(compiled, stack).as_deref(),
-        class,
-        method,
-    )
-}
-
-fn validate_method_callable_in_scope(
-    compiled: &CompiledUnit,
-    scope: Option<&str>,
-    class: &php_ir::module::ClassEntry,
-    method: &php_ir::module::ClassMethodEntry,
-) -> Result<(), String> {
-    if method.flags.is_abstract {
-        return Err(format!(
-            "E_PHP_VM_ABSTRACT_METHOD_CALL: Cannot call abstract method {}::{}()",
-            class.display_name, method.name
-        ));
-    }
-    if method.flags.is_private && scope != Some(normalize_class_name(&class.name).as_str()) {
-        return Err(format!(
-            "E_PHP_VM_PRIVATE_METHOD_ACCESS: Call to private method {}::{}() from {}",
-            class.display_name,
-            method.name,
-            scope_description(scope)
-        ));
-    }
-    if method.flags.is_protected {
-        let allowed = match scope {
-            Some(scope) => protected_scope_is_related(compiled, scope, &class.name)?,
-            None => false,
-        };
-        if !allowed {
-            return Err(format!(
-                "E_PHP_VM_PROTECTED_METHOD_ACCESS: Call to protected method {}::{}() from {}",
-                class.display_name,
-                method.name,
-                scope_description(scope)
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_method_callable_in_state_scope(
@@ -50112,6 +50495,7 @@ fn is_symbol_introspection_builtin_name(name: &str) -> bool {
             | "function_exists"
             | "compact"
             | "class_exists"
+            | "class_alias"
             | "call_user_func"
             | "call_user_func_array"
             | "forward_static_call"
@@ -50702,6 +51086,7 @@ fn register_dynamic_classes(
             continue;
         }
         state.dynamic_classes.push(DynamicClassEntry {
+            lookup_name: normalized,
             class: class.clone(),
             unit_index,
             origin: declaration_origin(
@@ -50760,6 +51145,7 @@ fn declare_runtime_class(
     };
     let unit_index = dynamic_or_retain_unit_index(state, compiled);
     state.dynamic_classes.push(DynamicClassEntry {
+        lookup_name: normalized,
         origin: declaration_origin(
             compiled,
             class.span,
@@ -50810,7 +51196,7 @@ fn dynamic_class_entry_in_state<'a>(
     state
         .dynamic_classes
         .iter()
-        .find(|entry| normalize_class_name(&entry.class.name) == normalized)
+        .find(|entry| entry.lookup_name == normalized)
 }
 
 fn dynamic_class_in_loaded_units(
@@ -50892,7 +51278,7 @@ fn lookup_class_in_state(
     if let Some(class) = state
         .dynamic_classes
         .iter()
-        .find(|entry| normalize_class_name(&entry.class.name) == normalized)
+        .find(|entry| entry.lookup_name == normalized)
         .map(|entry| entry.class.clone())
     {
         return Some(class);
@@ -51443,7 +51829,7 @@ fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) 
     if let Some(entry) = state
         .dynamic_classes
         .iter()
-        .find(|entry| normalize_class_name(&entry.class.name) == normalized)
+        .find(|entry| entry.lookup_name == normalized)
         && state.dynamic_units.get(entry.unit_index).is_some()
     {
         return Some(entry.unit_index);
@@ -51716,26 +52102,40 @@ fn lookup_class_constant_in_state_inner(
         seen.pop();
         return Ok(Some((class, constant)));
     }
-    let Some(parent_name) = class.parent.as_deref() else {
-        seen.pop();
-        return Ok(None);
-    };
-    let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
-        return Err(format!(
-            "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
-            class.name, parent_name
-        ));
-    };
-    let resolved =
-        lookup_class_constant_in_state_inner(compiled, state, parent, constant_name, seen)?;
-    seen.pop();
-    if resolved
-        .as_ref()
-        .is_some_and(|(_, constant)| constant.flags.is_private)
-    {
-        return Ok(None);
+    if let Some(parent_name) = class.parent.as_deref() {
+        let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
+            return Err(format!(
+                "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
+                class.name, parent_name
+            ));
+        };
+        let resolved =
+            lookup_class_constant_in_state_inner(compiled, state, parent, constant_name, seen)?;
+        if resolved
+            .as_ref()
+            .is_some_and(|(_, constant)| constant.flags.is_private)
+        {
+            seen.pop();
+            return Ok(None);
+        }
+        if resolved.is_some() {
+            seen.pop();
+            return Ok(resolved);
+        }
     }
-    Ok(resolved)
+    for interface_name in &class.interfaces {
+        let Some(interface) = lookup_class_in_state(compiled, state, interface_name) else {
+            continue;
+        };
+        if let Some(resolved) =
+            lookup_class_constant_in_state_inner(compiled, state, interface, constant_name, seen)?
+        {
+            seen.pop();
+            return Ok(Some(resolved));
+        }
+    }
+    seen.pop();
+    Ok(None)
 }
 
 fn class_constant_reference_display_class(reference: &ClassConstantReference) -> String {
@@ -59856,6 +60256,66 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
     }
 
     #[test]
+    fn call_user_func_method_can_call_inherited_protected_parent_method() {
+        let result = execute_source(
+            "<?php
+            class RestBaseProbe {
+                protected function add_additional_fields_schema($schema) {
+                    return $schema . ':parent';
+                }
+            }
+            class RestPostsProbe extends RestBaseProbe {
+                public function get_item_schema() {
+                    return $this->add_additional_fields_schema('schema');
+                }
+            }
+            $controller = new RestPostsProbe();
+            echo call_user_func(array($controller, 'get_item_schema'));
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "schema:parent");
+    }
+
+    #[test]
+    fn call_user_func_route_schema_callback_keeps_child_scope_for_protected_parent_method() {
+        let result = execute_source(
+            "<?php
+            class RestRouteBaseProbe {
+                protected function add_additional_fields_schema($schema) {
+                    return $schema . ':parent';
+                }
+            }
+            class RestRoutePostsProbe extends RestRouteBaseProbe {
+                private $schema = '';
+                public function get_item_schema() {
+                    if ($this->schema) {
+                        return $this->add_additional_fields_schema($this->schema);
+                    }
+                    $this->schema = 'schema';
+                    return $this->add_additional_fields_schema($this->schema);
+                }
+                public function get_public_item_schema() {
+                    return $this->get_item_schema();
+                }
+            }
+            $controller = new RestRoutePostsProbe();
+            $routes = array(
+                '/wp/v2/posts' => array(
+                    'schema' => array($controller, 'get_public_item_schema'),
+                ),
+            );
+            $options = $routes['/wp/v2/posts'];
+            echo call_user_func($options['schema']);
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "schema:parent");
+    }
+
+    #[test]
     fn symbol_introspection_respects_autoload_flag() {
         let result = execute_source(
             "<?php
@@ -62559,6 +63019,16 @@ good"
     }
 
     #[test]
+    fn implemented_interface_constants_are_fetchable_through_class() {
+        let result = execute_source(
+            "<?php namespace SimplePie\\HTTP; interface Client { public const METHOD_GET = 'GET'; } final class FileClient implements Client { public static function check() { echo self::METHOD_GET, '|'; } } echo FileClient::METHOD_GET, '|'; FileClient::check();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"GET|GET|");
+    }
+
+    #[test]
     fn missing_class_constant_initializer_fails_when_class_is_used() {
         let result = execute_source(
             "<?php class C { const c1 = D::hello; } $a = new C(); echo 'unreachable';",
@@ -64253,6 +64723,7 @@ good"
             source,
             VmOptions {
                 include_loader: Some(loader),
+                execution_format: ExecutionFormat::Bytecode,
                 ..VmOptions::default()
             },
             main_path.to_string_lossy().into_owned(),
@@ -64303,6 +64774,104 @@ good"
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"WP_Post|4");
+    }
+
+    #[test]
+    fn included_child_can_call_protected_parent_method_case_insensitively() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-included-protected-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        let parent_path = root.join("parent.php");
+        std::fs::write(
+            &parent_path,
+            "<?php class WP_REST_Controller { protected function add_additional_fields_schema($schema) { return $schema . '|parent'; } }",
+        )
+        .expect("parent source should be writable");
+        let child_path = root.join("child.php");
+        std::fs::write(
+            &child_path,
+            "<?php require_once __DIR__ . '/parent.php'; class WP_REST_Posts_Controller extends WP_REST_Controller { public function get_item_schema() { return $this->add_additional_fields_schema('schema'); } }",
+        )
+        .expect("child source should be writable");
+        let main_path = root.join("main.php");
+        let source = "<?php require_once __DIR__ . '/child.php'; $controller = new wp_rest_posts_controller(); echo $controller->get_item_schema();";
+        std::fs::write(&main_path, source).expect("main source should be writable");
+        let loader = IncludeLoader::for_root(root.clone()).expect("include loader");
+
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(loader),
+                ..VmOptions::default()
+            },
+            main_path.to_string_lossy().into_owned(),
+        );
+
+        let _ = std::fs::remove_file(parent_path);
+        let _ = std::fs::remove_file(child_path);
+        let _ = std::fs::remove_file(main_path);
+        let _ = std::fs::remove_dir(root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"schema|parent");
+    }
+
+    #[test]
+    fn included_child_protected_parent_call_stays_valid_after_method_cache_warms() {
+        let root = std::env::temp_dir().join(format!(
+            "phrust-vm-included-protected-parent-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp include root should be created");
+        let parent_path = root.join("parent.php");
+        std::fs::write(
+            &parent_path,
+            "<?php class WP_REST_Controller { protected function add_additional_fields_schema($schema) { return $schema . '|parent'; } }",
+        )
+        .expect("parent source should be writable");
+        let child_path = root.join("child.php");
+        std::fs::write(
+            &child_path,
+            "<?php require_once __DIR__ . '/parent.php'; class WP_REST_Posts_Controller extends WP_REST_Controller { public function get_item_schema($schema) { return $this->add_additional_fields_schema($schema); } }",
+        )
+        .expect("child source should be writable");
+        let main_path = root.join("main.php");
+        let source = "<?php
+            require_once __DIR__ . '/child.php';
+            $controller = new wp_rest_posts_controller();
+            for ($i = 0; $i < 16; $i++) {
+                echo $controller->get_item_schema('schema'), ';';
+            }
+        ";
+        std::fs::write(&main_path, source).expect("main source should be writable");
+        let loader = IncludeLoader::for_root(root.clone()).expect("include loader");
+
+        let result = execute_source_with_options_and_path(
+            source,
+            VmOptions {
+                include_loader: Some(loader),
+                ..VmOptions::default()
+            },
+            main_path.to_string_lossy().into_owned(),
+        );
+
+        let _ = std::fs::remove_file(parent_path);
+        let _ = std::fs::remove_file(child_path);
+        let _ = std::fs::remove_file(main_path);
+        let _ = std::fs::remove_dir(root);
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "schema|parent;".repeat(16));
     }
 
     #[test]
@@ -66984,6 +67553,26 @@ echo perf_jit_unstable_types_debug(4), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"3");
+    }
+
+    #[test]
+    fn function_calls_fallback_to_global_class_alias_from_namespace() {
+        let result = execute_source(
+            "<?php namespace SimplePie; class SourceClass {} echo class_alias(SourceClass::class, 'SimplePie_Alias') ? 'alias' : 'missing';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"alias");
+    }
+
+    #[test]
+    fn function_calls_fallback_to_global_assert_from_namespace() {
+        let result = execute_source(
+            "<?php namespace SimplePie; echo assert(true) ? 'asserted' : 'missing';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"asserted");
     }
 
     #[test]
@@ -69796,6 +70385,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                             | InstructionKind::BindReferencePropertyDim { .. }
                             | InstructionKind::BindReferenceDimFromProperty { .. }
                             | InstructionKind::BindReferenceFromProperty { .. }
+                            | InstructionKind::BindReferenceFromPropertyDim { .. }
                     )
                 })
             })
@@ -69853,6 +70443,29 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             property_source.status
         );
         assert_eq!(property_source.output.as_bytes(), b"4|7");
+    }
+
+    #[test]
+    fn property_dimension_reference_assignment_binds_property_dimension_source() {
+        let result = execute_source(
+            "<?php
+            class C {
+                public $data = ['links' => ['base' => ['a']]];
+                public function run() {
+                    $this->data['links']['alias'] =& $this->data['links']['base'];
+                    $this->data['links']['base'][] = 'b';
+                    $this->data['links']['alias'][] = 'c';
+                    echo implode(',', $this->data['links']['base']);
+                    echo '|';
+                    echo implode(',', $this->data['links']['alias']);
+                }
+            }
+            (new C())->run();
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"a,b,c|a,b,c");
     }
 
     #[test]
@@ -70761,6 +71374,36 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn braced_property_chain_interpolation_reads_nested_property() {
+        let result = execute_source(
+            "<?php class Screen { public $id = 'dashboard'; } class Table { public $screen; function __construct() { $this->screen = new Screen(); } function hook() { echo \"manage_{$this->screen->id}_columns\"; } } (new Table())->hook();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"manage_dashboard_columns");
+    }
+
+    #[test]
+    fn interpolated_dynamic_method_name_calls_resolved_method() {
+        let result = execute_source(
+            "<?php class IriProbe { function __get($name) { return $this->{\"get_$name\"}(); } function get_iri() { return 'iri'; } } echo (new IriProbe())->iri;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"iri");
+    }
+
+    #[test]
+    fn braced_array_dim_chain_interpolation_reads_nested_dimension() {
+        let result = execute_source(
+            "<?php $submenu_items = [[0, 1, 'index.php']]; echo \"{$submenu_items[0][2]}\";",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"index.php");
+    }
+
+    #[test]
     fn braced_property_dim_interpolation_reads_dimension() {
         let result = execute_source(
             "<?php class A { public $rewrite = ['slug' => 'category']; function render() { echo \"{$this->rewrite['slug']}\"; } } (new A())->render();",
@@ -71284,6 +71927,52 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"RouteMeta|/health|10");
+    }
+
+    #[test]
+    fn reflection_class_new_instance_args_constructs_with_array_arguments() {
+        let result = execute_source(
+            "<?php class ReflectionNewInstanceArgsProbe { public string $value; public function __construct(string $a, string $b = 'b') { $this->value = $a . $b; } } $class = new ReflectionClass(ReflectionNewInstanceArgsProbe::class); $object = $class->newInstanceArgs(['a', 'c']); echo get_class($object), '|', $object->value;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"ReflectionNewInstanceArgsProbe|ac"
+        );
+    }
+
+    #[test]
+    fn reflection_class_new_instance_constructs_with_variadic_arguments() {
+        let result = execute_source(
+            "<?php class ReflectionNewInstanceProbe { public string $value; public function __construct(string $a, string $b = 'b') { $this->value = $a . $b; } } $class = new ReflectionClass(ReflectionNewInstanceProbe::class); $object = $class->newInstance('x', 'y'); echo get_class($object), '|', $object->value;",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"ReflectionNewInstanceProbe|xy");
+    }
+
+    #[test]
+    fn namespaced_instanceof_matches_implemented_interface() {
+        let result = execute_source(
+            "<?php namespace SimplePie\\Cache; interface NameFilter {} final class CallableNameFilter implements NameFilter {} $filter = new CallableNameFilter(); echo $filter instanceof NameFilter ? 'local|' : 'local-miss|'; echo $filter instanceof \\SimplePie\\Cache\\NameFilter ? 'fqcn' : 'fqcn-miss';",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"local|fqcn");
+    }
+
+    #[test]
+    fn object_property_keeps_namespaced_interface_implementation() {
+        let result = execute_source(
+            "<?php namespace SimplePie\\Cache; interface NameFilter {} final class CallableNameFilter implements NameFilter {} namespace SimplePie; use SimplePie\\Cache\\CallableNameFilter; use SimplePie\\Cache\\NameFilter; class SimplePie { public $cache_name_function = 'md5'; public $cache_namefilter; public function __construct() { $this->cache_namefilter = new CallableNameFilter(); } public function pass(Sanitize $sanitize): void { $sanitize->pass_cache_data($this->cache_namefilter); } } class Sanitize { public function pass_cache_data($cache_name_function): void { echo get_class($cache_name_function), '|'; echo is_string($cache_name_function) ? 'string|' : 'not-string|'; echo $cache_name_function instanceof \\SimplePie\\Cache\\NameFilter ? 'fqcn|' : 'fqcn-miss|'; echo $cache_name_function instanceof NameFilter ? 'filter' : gettype($cache_name_function); } } $feed = new SimplePie(); $feed->pass(new Sanitize());",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"SimplePie\\Cache\\CallableNameFilter|not-string|fqcn|filter"
+        );
     }
 
     #[test]
@@ -73029,6 +73718,16 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
 
         assert!(result.status.is_success(), "{:?}", result.status);
         assert_eq!(result.output.as_bytes(), b"11;12;");
+    }
+
+    #[test]
+    fn nested_by_ref_foreach_unset_normalizes_rest_route_options() {
+        let result = execute_source(
+            "<?php class RestRouteFixture { public $endpoints = array(); public $route_options = array(); public function run() { $this->endpoints = array('/wp/v2/users/me' => array(0 => array('methods' => 'GET'), 1 => array('methods' => 'POST'), 2 => array('methods' => 'DELETE'), 'namespace' => 'wp/v2')); $endpoints = $this->endpoints; foreach ($endpoints as $route => &$handlers) { if (!isset($this->route_options[$route])) { $this->route_options[$route] = array(); } foreach ($handlers as $key => &$handler) { if (!is_numeric($key)) { $this->route_options[$route][$key] = $handler; unset($handlers[$key]); continue; } } } foreach ($endpoints['/wp/v2/users/me'] as $key => $handler) { echo $key, ':', gettype($handler), ';'; } echo '|', $this->route_options['/wp/v2/users/me']['namespace']; } } (new RestRouteFixture())->run();",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"0:array;1:array;2:array;|wp/v2");
     }
 
     #[test]

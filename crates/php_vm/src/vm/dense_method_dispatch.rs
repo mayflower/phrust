@@ -384,8 +384,13 @@ impl Vm {
             );
         }
         if (method_entry.flags.is_private || method_entry.flags.is_protected)
-            && let Err(inaccessible) =
-                validate_method_callable(compiled, stack, declaring_class, method_entry)
+            && let Err(inaccessible) = validate_method_callable_in_state_scope(
+                compiled,
+                state,
+                current_scope_class(compiled, stack).as_deref(),
+                declaring_class,
+                method_entry,
+            )
         {
             self.record_counter_dense_call_fallback("visibility");
             return match self.call_magic_static_method(
@@ -412,9 +417,13 @@ impl Vm {
                 Err(result) => result,
             };
         }
-        if let Err(message) =
-            validate_method_callable(compiled, stack, declaring_class, method_entry)
-        {
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            current_scope_class(compiled, stack).as_deref(),
+            declaring_class,
+            method_entry,
+        ) {
             return self.runtime_error_at_optional_span(
                 compiled, output, stack, state, call_span, message,
             );
@@ -549,9 +558,13 @@ impl Vm {
                 ),
             );
         }
-        if let Err(message) =
-            validate_method_callable(&owner, stack, &declaring_class, &method_entry)
-        {
+        if let Err(message) = validate_method_callable_in_state_scope(
+            compiled,
+            state,
+            current_scope_class(compiled, stack).as_deref(),
+            &declaring_class,
+            &method_entry,
+        ) {
             return self.runtime_error_at_optional_span(
                 compiled, output, stack, state, call_span, message,
             );

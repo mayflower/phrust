@@ -394,6 +394,18 @@ fn verify_instruction(
             verify_local(*target, function.local_count, errors);
             verify_operand(object, function, unit, errors);
         }
+        InstructionKind::BindReferenceFromPropertyDim {
+            target,
+            object,
+            dims,
+            ..
+        } => {
+            verify_local(*target, function.local_count, errors);
+            verify_operand(object, function, unit, errors);
+            for dim in dims {
+                verify_operand(dim, function, unit, errors);
+            }
+        }
         InstructionKind::BindReferenceFromDim {
             target,
             local,
@@ -1339,6 +1351,12 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
         InstructionKind::BindReferenceFromProperty { object, .. } => {
             operand_register_uses(object, uses);
         }
+        InstructionKind::BindReferenceFromPropertyDim { object, dims, .. } => {
+            operand_register_uses(object, uses);
+            for dim in dims {
+                operand_register_uses(dim, uses);
+            }
+        }
         InstructionKind::Binary { lhs, rhs, .. }
         | InstructionKind::Compare { lhs, rhs, .. }
         | InstructionKind::ArrayGet {
@@ -1583,6 +1601,7 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromProperty { .. }
+        | InstructionKind::BindReferenceFromPropertyDim { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceStaticProperty { .. }
         | InstructionKind::BindReferenceFromCall { .. }

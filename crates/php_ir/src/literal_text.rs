@@ -74,6 +74,7 @@ pub(crate) enum InterpolatedPart {
     Variable {
         name: String,
         dim: Option<InterpolatedDim>,
+        dim_tail: Vec<InterpolatedDim>,
         deprecated_dollar_brace: bool,
     },
     MethodCall {
@@ -83,6 +84,7 @@ pub(crate) enum InterpolatedPart {
     Property {
         receiver: String,
         property: String,
+        property_tail: Vec<String>,
         dim: Option<InterpolatedDim>,
     },
 }
@@ -98,6 +100,7 @@ pub(crate) enum InterpolatedDim {
 struct ParsedInterpolatedVariable {
     name: String,
     dim: Option<InterpolatedDim>,
+    dim_tail: Vec<InterpolatedDim>,
     end: usize,
     deprecated_dollar_brace: bool,
 }
@@ -113,6 +116,7 @@ struct ParsedInterpolatedMethodCall {
 struct ParsedInterpolatedProperty {
     receiver: String,
     property: String,
+    property_tail: Vec<String>,
     dim: Option<InterpolatedDim>,
     end: usize,
 }
@@ -176,6 +180,7 @@ fn parse_interpolated_double_quoted_body(
             parts.push(InterpolatedPart::Property {
                 receiver: parsed.receiver,
                 property: parsed.property,
+                property_tail: parsed.property_tail,
                 dim: parsed.dim,
             });
             index = parsed.end;
@@ -183,7 +188,7 @@ fn parse_interpolated_double_quoted_body(
             continue;
         }
         if body[index] == b'$'
-            && let Some(parsed) = parse_simple_interpolated_property(body, index)
+            && let Some(parsed) = parse_simple_interpolated_property(body, index, false)
         {
             parts.push(InterpolatedPart::Bytes(
                 unescape_double_quoted_php_string_with_quote_mode(
@@ -194,6 +199,7 @@ fn parse_interpolated_double_quoted_body(
             parts.push(InterpolatedPart::Property {
                 receiver: parsed.receiver,
                 property: parsed.property,
+                property_tail: parsed.property_tail,
                 dim: parsed.dim,
             });
             index = parsed.end;
@@ -202,7 +208,7 @@ fn parse_interpolated_double_quoted_body(
         }
         let parsed = if body[index] == b'$' {
             parse_deprecated_dollar_brace_interpolated_variable(body, index).or_else(|| {
-                parse_simple_interpolated_variable(body, index).map(|mut parsed| {
+                parse_simple_interpolated_variable(body, index, false).map(|mut parsed| {
                     parsed.deprecated_dollar_brace = false;
                     parsed
                 })
@@ -225,6 +231,7 @@ fn parse_interpolated_double_quoted_body(
         parts.push(InterpolatedPart::Variable {
             name: parsed.name,
             dim: parsed.dim,
+            dim_tail: parsed.dim_tail,
             deprecated_dollar_brace: parsed.deprecated_dollar_brace,
         });
         index = parsed.end;
@@ -245,6 +252,7 @@ fn parse_interpolated_double_quoted_body(
 fn parse_simple_interpolated_variable(
     bytes: &[u8],
     start: usize,
+    allow_dim_chain: bool,
 ) -> Option<ParsedInterpolatedVariable> {
     let mut index = start + 1;
     if !is_php_variable_start(bytes.get(index).copied()?) {
@@ -261,12 +269,20 @@ fn parse_simple_interpolated_variable(
     let name = std::str::from_utf8(&bytes[start + 1..index])
         .ok()?
         .to_string();
-    let (dim, end) = parse_interpolated_dim(bytes, index)
+    let (dim, mut end) = parse_interpolated_dim(bytes, index)
         .map(|(dim, end)| (Some(dim), end))
         .unwrap_or((None, index));
+    let mut dim_tail = Vec::new();
+    if allow_dim_chain {
+        while let Some((dim, next_end)) = parse_interpolated_dim(bytes, end) {
+            dim_tail.push(dim);
+            end = next_end;
+        }
+    }
     Some(ParsedInterpolatedVariable {
         name,
         dim,
+        dim_tail,
         end,
         deprecated_dollar_brace: false,
     })
@@ -276,7 +292,7 @@ fn parse_braced_interpolated_variable(
     bytes: &[u8],
     start: usize,
 ) -> Option<ParsedInterpolatedVariable> {
-    let mut parsed = parse_simple_interpolated_variable(bytes, start + 1)?;
+    let mut parsed = parse_simple_interpolated_variable(bytes, start + 1, true)?;
     if bytes.get(parsed.end).copied() != Some(b'}') {
         return None;
     }
@@ -341,6 +357,7 @@ fn parse_braced_interpolated_method_call(
 fn parse_simple_interpolated_property(
     bytes: &[u8],
     start: usize,
+    allow_chain: bool,
 ) -> Option<ParsedInterpolatedProperty> {
     if bytes.get(start).copied() != Some(b'$') {
         return None;
@@ -379,12 +396,37 @@ fn parse_simple_interpolated_property(
     let property = std::str::from_utf8(&bytes[property_start..index])
         .ok()?
         .to_string();
+    let mut property_tail = Vec::new();
+    if allow_chain {
+        while bytes.get(index).copied() == Some(b'-') && bytes.get(index + 1).copied() == Some(b'>')
+        {
+            index += 2;
+            let property_start = index;
+            if !is_php_variable_start(bytes.get(index).copied()?) {
+                return None;
+            }
+            index += 1;
+            while bytes
+                .get(index)
+                .copied()
+                .is_some_and(is_php_variable_continue)
+            {
+                index += 1;
+            }
+            property_tail.push(
+                std::str::from_utf8(&bytes[property_start..index])
+                    .ok()?
+                    .to_string(),
+            );
+        }
+    }
     let (dim, end) = parse_interpolated_dim(bytes, index)
         .map(|(dim, end)| (Some(dim), end))
         .unwrap_or((None, index));
     Some(ParsedInterpolatedProperty {
         receiver,
         property,
+        property_tail,
         dim,
         end,
     })
@@ -397,7 +439,7 @@ fn parse_braced_interpolated_property(
     if bytes.get(start).copied() != Some(b'{') || bytes.get(start + 1).copied() != Some(b'$') {
         return None;
     }
-    let mut parsed = parse_simple_interpolated_property(bytes, start + 1)?;
+    let mut parsed = parse_simple_interpolated_property(bytes, start + 1, true)?;
     if bytes.get(parsed.end).copied() != Some(b'}') {
         return None;
     }
@@ -431,6 +473,7 @@ fn parse_deprecated_dollar_brace_interpolated_variable(
             .ok()?
             .to_string(),
         dim: None,
+        dim_tail: Vec::new(),
         end: index + 1,
         deprecated_dollar_brace: true,
     })
@@ -449,7 +492,7 @@ fn parse_interpolated_dim(bytes: &[u8], start: usize) -> Option<(InterpolatedDim
         return None;
     }
     let dim = if inner.first().copied() == Some(b'$') {
-        let parsed = parse_simple_interpolated_variable(inner, 0)?;
+        let parsed = parse_simple_interpolated_variable(inner, 0, false)?;
         if parsed.end != inner.len() || parsed.dim.is_some() {
             return None;
         }

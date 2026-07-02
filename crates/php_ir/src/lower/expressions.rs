@@ -4669,6 +4669,7 @@ impl LoweringContext<'_> {
                 InterpolatedPart::Variable {
                     name,
                     dim,
+                    dim_tail,
                     deprecated_dollar_brace,
                 } => {
                     if deprecated_dollar_brace {
@@ -4771,7 +4772,7 @@ impl LoweringContext<'_> {
                                 site.span,
                             );
                         }
-                        let register = builder.alloc_register(site.function);
+                        let mut register = builder.alloc_register(site.function);
                         let instruction = builder.emit(
                             site.function,
                             current,
@@ -4791,6 +4792,73 @@ impl LoweringContext<'_> {
                             site.expr,
                             site.span,
                         );
+                        for dim in dim_tail {
+                            let key_register = builder.alloc_register(site.function);
+                            let key_constant = match dim {
+                                InterpolatedDim::Variable(name) => {
+                                    let local = builder.intern_local(site.function, name);
+                                    let instruction = builder.emit(
+                                        site.function,
+                                        current,
+                                        InstructionKind::LoadLocal {
+                                            dst: key_register,
+                                            local,
+                                        },
+                                        site.span,
+                                    );
+                                    self.add_expr_source_map(
+                                        builder,
+                                        site.function,
+                                        current,
+                                        instruction,
+                                        site.expr,
+                                        site.span,
+                                    );
+                                    None
+                                }
+                                InterpolatedDim::Int(value) => Some(IrConstant::Int(value)),
+                                InterpolatedDim::String(value) => Some(IrConstant::String(value)),
+                            };
+                            if let Some(constant) = key_constant {
+                                let constant = builder.intern_constant(constant);
+                                let instruction = builder.emit_load_const(
+                                    site.function,
+                                    current,
+                                    key_register,
+                                    constant,
+                                    site.span,
+                                );
+                                self.add_expr_source_map(
+                                    builder,
+                                    site.function,
+                                    current,
+                                    instruction,
+                                    site.expr,
+                                    site.span,
+                                );
+                            }
+                            let dim_register = builder.alloc_register(site.function);
+                            let instruction = builder.emit(
+                                site.function,
+                                current,
+                                InstructionKind::FetchDim {
+                                    dst: dim_register,
+                                    array: Operand::Register(register),
+                                    key: Operand::Register(key_register),
+                                    quiet: false,
+                                },
+                                site.span,
+                            );
+                            self.add_expr_source_map(
+                                builder,
+                                site.function,
+                                current,
+                                instruction,
+                                site.expr,
+                                site.span,
+                            );
+                            register = dim_register;
+                        }
                         register
                     } else {
                         base_register
@@ -4841,6 +4909,7 @@ impl LoweringContext<'_> {
                 InterpolatedPart::Property {
                     receiver,
                     property,
+                    property_tail,
                     dim,
                 } => {
                     let object_register = builder.alloc_register(site.function);
@@ -4862,7 +4931,7 @@ impl LoweringContext<'_> {
                         site.expr,
                         site.span,
                     );
-                    let register = builder.alloc_register(site.function);
+                    let mut register = builder.alloc_register(site.function);
                     let instruction = builder.emit(
                         site.function,
                         current,
@@ -4881,6 +4950,28 @@ impl LoweringContext<'_> {
                         site.expr,
                         site.span,
                     );
+                    for property in property_tail {
+                        let next_register = builder.alloc_register(site.function);
+                        let instruction = builder.emit(
+                            site.function,
+                            current,
+                            InstructionKind::FetchProperty {
+                                dst: next_register,
+                                object: Operand::Register(register),
+                                property,
+                            },
+                            site.span,
+                        );
+                        self.add_expr_source_map(
+                            builder,
+                            site.function,
+                            current,
+                            instruction,
+                            site.expr,
+                            site.span,
+                        );
+                        register = next_register;
+                    }
                     if let Some(dim) = dim {
                         let key_register = builder.alloc_register(site.function);
                         let key_constant = match dim {
@@ -7563,9 +7654,52 @@ impl LoweringContext<'_> {
         target: PropertyDimTarget,
         right: Option<ExprId>,
     ) -> Option<LoweredExpr> {
-        let Some(source) =
+        let (source, current) = if let Some(source) =
             right.and_then(|right| self.variable_local(builder, site.function, right))
-        else {
+        {
+            (source, site.block)
+        } else if let Some(source_target) = right.and_then(|right| self.property_dim_target(right))
+        {
+            if source_target.append {
+                self.unsupported(
+                    UnsupportedFeature::HirStatement,
+                    site.range,
+                    "property-dimension by-reference assignment source cannot be append",
+                );
+                return None;
+            }
+            let object = self.lower_expr_to_register(
+                builder,
+                site.function,
+                site.block,
+                source_target.receiver,
+            )?;
+            let mut current = object.block;
+            let mut dims = Vec::with_capacity(source_target.dims.len());
+            for dim in source_target.dims {
+                let dim_value =
+                    self.lower_expr_to_register(builder, site.function, current, dim)?;
+                current = dim_value.block;
+                dims.push(Operand::Register(dim_value.register));
+            }
+            let source = builder.intern_local(
+                site.function,
+                format!("__phrust:property-dim-ref-source:{}", site.expr.raw()),
+            );
+            let bind = builder.emit(
+                site.function,
+                current,
+                InstructionKind::BindReferenceFromPropertyDim {
+                    target: source,
+                    object: Operand::Register(object.register),
+                    property: source_target.property,
+                    dims,
+                },
+                site.span,
+            );
+            self.add_expr_source_map(builder, site.function, current, bind, site.expr, site.span);
+            (source, current)
+        } else {
             self.unsupported(
                 UnsupportedFeature::HirStatement,
                 site.range,
@@ -7574,7 +7708,7 @@ impl LoweringContext<'_> {
             return None;
         };
         let object =
-            self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            self.lower_expr_to_register(builder, site.function, current, target.receiver)?;
         let mut current = object.block;
         let mut dims = Vec::with_capacity(target.dims.len());
         for dim in target.dims {
@@ -8938,6 +9072,9 @@ impl LoweringContext<'_> {
             && self
                 .unary_assignment_target(builder, function, right)
                 .is_none()
+            && self
+                .comparison_assignment_target(builder, function, right)
+                .is_none()
         {
             return None;
         }
@@ -9760,7 +9897,9 @@ impl LoweringContext<'_> {
         };
         match property.kind() {
             HirExprKind::Variable { .. } => true,
-            HirExprKind::Literal { text } => text.starts_with('$'),
+            HirExprKind::Literal { text } => {
+                text.starts_with('$') || interpolated_literal_parts(text).is_some()
+            }
             HirExprKind::Name { resolution } => resolution.source().starts_with('$'),
             _ => self.static_property_name(*property_id).is_none(),
         }
@@ -9791,7 +9930,9 @@ impl LoweringContext<'_> {
         };
         match method_expr.kind() {
             HirExprKind::Variable { .. } => true,
-            HirExprKind::Literal { text } => text.starts_with('$'),
+            HirExprKind::Literal { text } => {
+                text.starts_with('$') || interpolated_literal_parts(text).is_some()
+            }
             HirExprKind::Name { resolution } => resolution.source().starts_with('$'),
             HirExprKind::PropertyFetch { .. } => false,
             _ => {

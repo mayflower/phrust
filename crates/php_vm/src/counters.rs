@@ -468,6 +468,7 @@ impl VmCounters {
             | InstructionKind::BindReferenceProperty { .. }
             | InstructionKind::BindReferenceStaticProperty { .. }
             | InstructionKind::BindReferenceFromProperty { .. }
+            | InstructionKind::BindReferenceFromPropertyDim { .. }
             | InstructionKind::AssignStaticProperty { .. }
             | InstructionKind::AssignDynamicStaticProperty { .. } => self.property_accesses += 1,
             InstructionKind::InstanceOf { .. } | InstructionKind::DynamicInstanceOf { .. } => {
@@ -3999,6 +4000,7 @@ fn opcode_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::BindReferencePropertyDim { .. } => "bind_reference_property_dim",
         InstructionKind::BindReferenceDimFromProperty { .. } => "bind_reference_dim_from_property",
         InstructionKind::BindReferenceFromProperty { .. } => "bind_reference_from_property",
+        InstructionKind::BindReferenceFromPropertyDim { .. } => "bind_reference_from_property_dim",
         InstructionKind::BindReferenceFromDim { .. } => "bind_reference_from_dim",
         InstructionKind::BindReferenceFromStaticPropertyDim { .. } => {
             "bind_reference_from_static_property_dim"

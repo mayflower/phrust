@@ -1056,6 +1056,7 @@ fn defined_registers(kind: &InstructionKind) -> Vec<RegId> {
         | InstructionKind::BindReferencePropertyDim { .. }
         | InstructionKind::BindReferenceDimFromProperty { .. }
         | InstructionKind::BindReferenceFromProperty { .. }
+        | InstructionKind::BindReferenceFromPropertyDim { .. }
         | InstructionKind::BindReferenceFromDim { .. }
         | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
         | InstructionKind::BindReferenceStaticProperty { .. }
@@ -1286,6 +1287,10 @@ fn remap_instruction_constants(kind: &mut InstructionKind, remap: &[ConstId]) {
         }
         InstructionKind::BindReferenceFromProperty { object, .. } => {
             remap_operand_constants(object, remap);
+        }
+        InstructionKind::BindReferenceFromPropertyDim { object, dims, .. } => {
+            remap_operand_constants(object, remap);
+            remap_operands_constants(dims, remap);
         }
         InstructionKind::CallMethod { object, args, .. } => {
             remap_operand_constants(object, remap);
@@ -1602,6 +1607,10 @@ fn rewrite_instruction_register_operands(
         }
         InstructionKind::BindReferenceFromProperty { object, .. } => {
             rewrite_operand_registers(object, aliases);
+        }
+        InstructionKind::BindReferenceFromPropertyDim { object, dims, .. } => {
+            rewrite_operand_registers(object, aliases);
+            rewrite_operands_registers(dims, aliases);
         }
         InstructionKind::CallMethod { object, args, .. } => {
             rewrite_operand_registers(object, aliases);

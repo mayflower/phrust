@@ -276,6 +276,13 @@ pub enum InstructionKind {
         object: Operand,
         property: String,
     },
+    /// `target =& object->property[dims...]`.
+    BindReferenceFromPropertyDim {
+        target: LocalId,
+        object: Operand,
+        property: String,
+        dims: Vec<Operand>,
+    },
     /// `target =& local[dims...]`.
     BindReferenceFromDim {
         target: LocalId,

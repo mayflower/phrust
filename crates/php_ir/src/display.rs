@@ -546,6 +546,20 @@ fn format_instruction(kind: &InstructionKind) -> String {
                 property
             )
         }
+        InstructionKind::BindReferenceFromPropertyDim {
+            target,
+            object,
+            property,
+            dims,
+        } => {
+            format!(
+                "bind_reference_from_property_dim local:{} {} ${} [{}]",
+                target.raw(),
+                format_operand(object),
+                property,
+                format_operands(dims)
+            )
+        }
         InstructionKind::BindReferenceFromDim {
             target,
             local,

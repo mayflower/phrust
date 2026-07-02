@@ -659,6 +659,7 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
             ClassKind::Enum,
         ))
         .with_function(FunctionDescriptor::php("abs", "standard"))
+        .with_function(FunctionDescriptor::php("assert", "standard"))
         .with_function(FunctionDescriptor::php("acos", "standard"))
         .with_function(FunctionDescriptor::php("acosh", "standard"))
         .with_function(FunctionDescriptor::php("addcslashes", "standard"))

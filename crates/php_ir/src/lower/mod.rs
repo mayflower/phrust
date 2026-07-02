@@ -3721,6 +3721,34 @@ mod tests {
     }
 
     #[test]
+    fn braced_array_dim_chain_interpolation_lowers_fetch_dim_chain() {
+        let frontend = analyze_source(
+            "<?php $submenu_items = [[0, 1, 'index.php']]; echo \"{$submenu_items[0][2]}\";",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.matches("fetch_dim r").count() >= 2, "{snapshot}");
+        assert!(snapshot.contains("local:0 $submenu_items"), "{snapshot}");
+        assert!(snapshot.contains("int 0"), "{snapshot}");
+        assert!(snapshot.contains("int 2"), "{snapshot}");
+
+        let parts = interpolated_literal_parts("\"{$submenu_items[0][2]}\"").expect("parts");
+        assert!(matches!(
+            &parts[1],
+            InterpolatedPart::Variable {
+                name,
+                dim: Some(InterpolatedDim::Int(0)),
+                dim_tail,
+                ..
+            } if name == "submenu_items"
+                && matches!(dim_tail.as_slice(), [InterpolatedDim::Int(2)])
+        ));
+    }
+
+    #[test]
     fn braced_method_call_interpolation_lowers_call_method() {
         let frontend = analyze_source(
             "<?php try { throw new Error('bad'); } catch (Error $ex) { echo \"{$ex->getCode()}: {$ex->getMessage()}\"; }",
@@ -3746,6 +3774,23 @@ mod tests {
             InterpolatedPart::MethodCall { receiver, method }
                 if receiver == "ex" && method == "getMessage"
         ));
+    }
+
+    #[test]
+    fn interpolated_dynamic_method_name_lowers_to_callable_pair() {
+        let frontend = analyze_source(
+            "<?php class IriProbe { function __get($name) { return $this->{\"get_$name\"}(); } function get_iri() { return 'iri'; } } echo (new IriProbe())->iri;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("call_callable r"), "{snapshot}");
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+        assert!(snapshot.contains("concat"), "{snapshot}");
+        assert!(snapshot.contains("string \"get_\""), "{snapshot}");
+        assert!(!snapshot.contains("\"get_$name\""), "{snapshot}");
     }
 
     #[test]
@@ -3801,8 +3846,39 @@ mod tests {
             InterpolatedPart::Property {
                 receiver,
                 property,
+                property_tail,
                 dim: Some(InterpolatedDim::String(dim)),
-            } if receiver == "this" && property == "rewrite" && dim == "slug"
+            } if receiver == "this" && property == "rewrite" && property_tail.is_empty() && dim == "slug"
+        ));
+    }
+
+    #[test]
+    fn braced_property_chain_interpolation_lowers_fetch_property_chain() {
+        let frontend = analyze_source(
+            "<?php class Screen { public $id = 'dashboard'; } class D { public $screen; function __construct() { $this->screen = new Screen(); } function f() { echo \"manage_{$this->screen->id}_columns\"; } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.matches("fetch_property r").count() >= 2,
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("$screen"), "{snapshot}");
+        assert!(snapshot.contains("$id"), "{snapshot}");
+
+        let parts =
+            interpolated_literal_parts("\"manage_{$this->screen->id}_columns\"").expect("parts");
+        assert!(matches!(
+            &parts[1],
+            InterpolatedPart::Property {
+                receiver,
+                property,
+                property_tail,
+                dim: None,
+            } if receiver == "this" && property == "screen" && property_tail.len() == 1 && property_tail[0] == "id"
         ));
     }
 
@@ -4335,6 +4411,23 @@ mod tests {
     }
 
     #[test]
+    fn logical_or_strict_comparison_assignment_lowers_with_short_circuit() {
+        let frontend = analyze_source(
+            "<?php if (empty($url) || !is_readable($url) || false === $filebody = file_get_contents($url)) { echo 'bad'; }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("call_function r"), "{snapshot}");
+        assert!(snapshot.contains("store_local local:"), "{snapshot}");
+        assert!(snapshot.contains("compare r"), "{snapshot}");
+        assert!(snapshot.contains("identical"), "{snapshot}");
+        assert!(snapshot.contains("jump_if"), "{snapshot}");
+    }
+
+    #[test]
     fn unary_not_assignment_idiom_lowers_assignment_then_not() {
         let frontend = analyze_source(
             "<?php function maybe_post($id) { if ( !$post = get_post($id) ) { return false; } return $post; }",
@@ -4417,8 +4510,9 @@ mod tests {
 
     #[test]
     fn keyed_dimension_then_append_assignment_lowers_directly() {
-        let frontend =
-            analyze_source("<?php $cache = array(); $id = 1; $key = 'x'; $cache[$id][$key][] = 'v';");
+        let frontend = analyze_source(
+            "<?php $cache = array(); $id = 1; $key = 'x'; $cache[$id][$key][] = 'v';",
+        );
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
 
         assert!(result.verification.is_ok(), "{:#?}", result.verification);
@@ -4459,6 +4553,30 @@ mod tests {
         assert!(snapshot.contains("fetch_property"), "{snapshot}");
         assert!(snapshot.contains("bind_reference_from_dim"), "{snapshot}");
         assert!(snapshot.contains("bind_reference_dim"), "{snapshot}");
+    }
+
+    #[test]
+    fn property_dim_to_property_dim_reference_assignment_lowers_through_hidden_source() {
+        let frontend = analyze_source(
+            "<?php class C { public $data = array('links' => array()); function run($key) { $this->data['links'][$key] =& $this->data['links']['base' . $key]; } }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            snapshot.contains("__phrust:property-dim-ref-source"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("bind_reference_from_property_dim"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("bind_reference_property_dim"),
+            "{snapshot}"
+        );
     }
 
     #[test]

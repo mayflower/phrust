@@ -52,6 +52,7 @@ pub(in crate::builtins::modules) const SORT_NATURAL: i64 = 6;
 pub(in crate::builtins::modules) const SORT_FLAG_CASE: i64 = 8;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new("assert", builtin_assert, BuiltinCompatibility::Php),
     BuiltinEntry::new("boolval", builtin_boolval, BuiltinCompatibility::Php),
     BuiltinEntry::new("uniqid", builtin_uniqid, BuiltinCompatibility::Php),
     BuiltinEntry::new("usleep", builtin_usleep, BuiltinCompatibility::Php),
@@ -855,6 +856,25 @@ pub(in crate::builtins::modules) fn builtin_boolval(
     to_bool(&value)
         .map(Value::Bool)
         .map_err(|message| conversion_error("boolval", message))
+}
+
+pub(in crate::builtins::modules) fn builtin_assert(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(1..=2).contains(&args.len()) {
+        return Err(arity_error("assert", "one or two argument(s)"));
+    }
+    let assertion = to_bool(&args[0]).map_err(|message| conversion_error("assert", message))?;
+    if assertion {
+        Ok(Value::Bool(true))
+    } else {
+        Err(BuiltinError::new(
+            "E_PHP_RUNTIME_ASSERTION_ERROR",
+            "Uncaught AssertionError: assert(false)",
+        ))
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_intval(
