@@ -3,7 +3,7 @@
 use super::core::*;
 use crate::builtins::{BuiltinCompatibility, BuiltinEntry};
 use crate::builtins::{BuiltinContext, BuiltinError, BuiltinResult, RuntimeSourceSpan};
-use crate::{ArrayKey, PhpArray, Value, to_bool};
+use crate::{ArrayKey, NumericValue, PhpArray, Value, to_bool, to_number};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
@@ -174,6 +174,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_array_splice,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("array_sum", builtin_array_sum, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "array_unshift",
         builtin_array_unshift,
@@ -407,6 +408,49 @@ pub(in crate::builtins::modules) fn builtin_array_values(
     Ok(Value::packed_array(
         array.iter().map(|(_, value)| value.clone()).collect(),
     ))
+}
+
+pub(in crate::builtins::modules) fn builtin_array_sum(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("array_sum", &args, 1)?;
+    let Value::Array(array) = deref_value(&args[0]) else {
+        return Err(type_error("array_sum", "array", &args[0]));
+    };
+
+    let mut int_total = 0i64;
+    let mut float_total = 0.0f64;
+    let mut use_float = false;
+    for (_, value) in array.iter() {
+        match to_number(value).map_err(|message| conversion_error("array_sum", message))? {
+            NumericValue::Int(value) if !use_float => {
+                if let Some(total) = int_total.checked_add(value) {
+                    int_total = total;
+                } else {
+                    use_float = true;
+                    float_total = int_total as f64 + value as f64;
+                }
+            }
+            NumericValue::Int(value) => {
+                float_total += value as f64;
+            }
+            NumericValue::Float(value) if !use_float => {
+                use_float = true;
+                float_total = int_total as f64 + value;
+            }
+            NumericValue::Float(value) => {
+                float_total += value;
+            }
+        }
+    }
+
+    if use_float {
+        Ok(Value::float(float_total))
+    } else {
+        Ok(Value::Int(int_total))
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_array_combine(

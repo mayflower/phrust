@@ -319,6 +319,14 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("random_int", builtin_random_int, BuiltinCompatibility::Php),
+    BuiltinEntry::new("rand", builtin_rand, BuiltinCompatibility::Php),
+    BuiltinEntry::new("mt_rand", builtin_mt_rand, BuiltinCompatibility::Php),
+    BuiltinEntry::new("getrandmax", builtin_getrandmax, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "mt_getrandmax",
+        builtin_mt_getrandmax,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new(
         "restore_error_handler",
         builtin_error_handling_requires_vm,
@@ -486,6 +494,64 @@ pub(in crate::builtins::modules) fn builtin_random_int(
             "max must be greater than or equal to min",
         ));
     }
+    random_int_inclusive("random_int", min, max).map(Value::Int)
+}
+
+pub(in crate::builtins::modules) fn builtin_rand(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    random_range_builtin("rand", args)
+}
+
+pub(in crate::builtins::modules) fn builtin_mt_rand(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    random_range_builtin("mt_rand", args)
+}
+
+fn random_range_builtin(name: &str, args: Vec<Value>) -> BuiltinResult {
+    if args.len() != 0 && args.len() != 2 {
+        return Err(arity_error(name, "zero or two argument(s)"));
+    }
+    let (min, max) = if args.is_empty() {
+        (0, i64::from(PHP_RAND_MAX))
+    } else {
+        (int_arg(name, &args[0])?, int_arg(name, &args[1])?)
+    };
+    if max < min {
+        return Err(value_error(
+            name,
+            "max must be greater than or equal to min",
+        ));
+    }
+    random_int_inclusive(name, min, max).map(Value::Int)
+}
+
+pub(in crate::builtins::modules) fn builtin_getrandmax(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("getrandmax", &args, 0)?;
+    Ok(Value::Int(i64::from(PHP_RAND_MAX)))
+}
+
+pub(in crate::builtins::modules) fn builtin_mt_getrandmax(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("mt_getrandmax", &args, 0)?;
+    Ok(Value::Int(i64::from(PHP_RAND_MAX)))
+}
+
+const PHP_RAND_MAX: i32 = i32::MAX;
+
+fn random_int_inclusive(name: &str, min: i64, max: i64) -> Result<i64, BuiltinError> {
     let range = (i128::from(max) - i128::from(min) + 1) as u128;
     let zone = u128::MAX - (u128::MAX % range);
     loop {
@@ -493,13 +559,13 @@ pub(in crate::builtins::modules) fn builtin_random_int(
         getrandom::fill(&mut bytes).map_err(|error| {
             BuiltinError::new(
                 "E_PHP_RUNTIME_RANDOM_FAILURE",
-                format!("random_int(): failed to read random bytes: {error}"),
+                format!("{name}(): failed to read random bytes: {error}"),
             )
         })?;
         let sample = u128::from_le_bytes(bytes);
         if sample < zone {
             let offset = (sample % range) as i128;
-            return Ok(Value::Int((i128::from(min) + offset) as i64));
+            return Ok((i128::from(min) + offset) as i64);
         }
     }
 }
@@ -5682,8 +5748,8 @@ mod tests {
     use super::super::debug_output::{php_float_debug_string, php_float_export_string};
     use super::{
         BuiltinCompatibility, BuiltinContext, JSON_ERROR_SYNTAX, JSON_PRESERVE_ZERO_FRACTION,
-        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, RuntimeSourceSpan, SORT_FLAG_CASE,
-        SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
+        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, PHP_RAND_MAX, RuntimeSourceSpan,
+        SORT_FLAG_CASE, SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
     };
     use crate::builtins::context::{
         JSON_BIGINT_AS_STRING, JSON_ERROR_CTRL_CHAR, JSON_ERROR_DEPTH, JSON_ERROR_NONE,
@@ -5787,6 +5853,39 @@ mod tests {
             ),
             Value::string(hostname)
         );
+    }
+
+    #[test]
+    fn legacy_random_builtins_return_bounded_ints() {
+        let mut output = OutputBuffer::new();
+        assert_eq!(
+            call("getrandmax", vec![], &mut output),
+            Value::Int(i64::from(PHP_RAND_MAX))
+        );
+        assert_eq!(
+            call("mt_getrandmax", vec![], &mut output),
+            Value::Int(i64::from(PHP_RAND_MAX))
+        );
+        for name in ["rand", "mt_rand"] {
+            for _ in 0..8 {
+                let Value::Int(value) = call(name, vec![Value::Int(3), Value::Int(5)], &mut output)
+                else {
+                    panic!("{name} should return an int");
+                };
+                assert!(
+                    (3..=5).contains(&value),
+                    "{name} returned value outside requested range: {value}"
+                );
+            }
+            let Value::Int(value) = call(name, vec![], &mut output) else {
+                panic!("{name} without args should return an int");
+            };
+            assert!((0..=i64::from(PHP_RAND_MAX)).contains(&value));
+            assert_eq!(
+                call_error(name, vec![Value::Int(2), Value::Int(1)], &mut output),
+                format!("builtin {name}: max must be greater than or equal to min")
+            );
+        }
     }
 
     #[test]
@@ -10785,6 +10884,26 @@ mod tests {
                 Value::string("zero-one"),
                 Value::string("n")
             ])
+        );
+        assert_eq!(
+            call(
+                "array_sum",
+                vec![Value::packed_array(vec![
+                    Value::Int(2),
+                    Value::string("3"),
+                    Value::Bool(true)
+                ])],
+                &mut output
+            ),
+            Value::Int(6)
+        );
+        assert_eq!(
+            call(
+                "array_sum",
+                vec![Value::packed_array(vec![Value::Int(2), Value::float(0.5)])],
+                &mut output
+            ),
+            Value::float(2.5)
         );
         assert_eq!(
             call(
