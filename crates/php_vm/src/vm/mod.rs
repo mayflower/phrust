@@ -71394,6 +71394,19 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn arrays_execute_keyed_nested_append_assignment() {
+        let result = execute_source(
+            "<?php $cache = []; $id = 1; $key = 'session_tokens'; $cache[$id] = []; $cache[$id][$key] = []; $cache[$id][$key][] = 'token'; var_export($cache);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "array (\n  1 => \n  array (\n    'session_tokens' => \n    array (\n      0 => 'token',\n    ),\n  ),\n)"
+        );
+    }
+
+    #[test]
     fn null_coalescing_assignment_executes_for_locals_and_dimensions() {
         let result = execute_source(
             "<?php $value ??= 'fallback'; $value ??= 'ignored'; $a = ['path' => 'ok', 'null' => null]; echo $value, '|'; echo ($a['path'] ??= 'bad'), '|'; echo ($a['missing'] ??= 'new'), '|', $a['missing'], '|'; echo ($a['null'] ??= 'filled'), '|', $a['null'];",

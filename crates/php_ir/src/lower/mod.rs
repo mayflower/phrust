@@ -4416,6 +4416,22 @@ mod tests {
     }
 
     #[test]
+    fn keyed_dimension_then_append_assignment_lowers_directly() {
+        let frontend =
+            analyze_source("<?php $cache = array(); $id = 1; $key = 'x'; $cache[$id][$key][] = 'v';");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(
+            !snapshot.contains("__phrust:append-nested-dim"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("append_dim"), "{snapshot}");
+    }
+
+    #[test]
     fn dim_to_dim_reference_assignment_lowers_through_hidden_source() {
         let frontend =
             analyze_source("<?php $types[$name] =& $icon_files[$file]; $icon_files[$file] = 'x';");

@@ -41,6 +41,7 @@ pub(super) struct DimAssignmentTarget {
     pub(super) local: LocalId,
     pub(super) dims: Vec<ExprId>,
     pub(super) append: bool,
+    pub(super) append_before_dims: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +785,7 @@ impl LoweringContext<'_> {
                 local: builder.intern_local(function, local_name(&name)),
                 dims: Vec::new(),
                 append: false,
+                append_before_dims: false,
             }),
             HirExprKind::DimFetch { receiver, dim } => {
                 let receiver = receiver?;
@@ -792,6 +794,9 @@ impl LoweringContext<'_> {
                     return None;
                 }
                 if let Some(dim) = dim {
+                    if target.append {
+                        target.append_before_dims = true;
+                    }
                     target.dims.push(dim);
                 } else {
                     target.append = true;
@@ -7960,7 +7965,7 @@ impl LoweringContext<'_> {
             return None;
         };
         let value = self.lower_expr_to_register(builder, site.function, site.block, right)?;
-        if target.append && !target.dims.is_empty() {
+        if target.append && target.append_before_dims {
             return self.lower_append_nested_dim_assign_value_to_register(
                 builder,
                 site,
