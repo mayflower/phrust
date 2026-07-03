@@ -132,15 +132,22 @@ impl NumericString {
 /// same.
 #[must_use]
 pub fn classify_php_string(value: &PhpString) -> NumericString {
-    CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().classify_calls += 1);
+    // Stats share the layout-stats enable gate so uninstrumented executions
+    // skip the thread-local stat traffic on this hot conversion path.
+    let stats_enabled = crate::layout_stats::stats_enabled();
+    if stats_enabled {
+        CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().classify_calls += 1);
+    }
     let key = NumericStringCacheKey {
         storage_id: value.storage_id(),
         len: value.len(),
         fingerprint: fingerprint(value.as_bytes()),
     };
     if let Some(classified) = CLASSIFICATION_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
-        CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().hits += 1);
-        record_sensitive_classification(classified);
+        if stats_enabled {
+            CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().hits += 1);
+            record_sensitive_classification(classified);
+        }
         return classified;
     }
     let classified = classify(value.as_bytes());
@@ -151,8 +158,10 @@ pub fn classify_php_string(value: &PhpString) -> NumericString {
         }
         cache.insert(key, classified);
     });
-    CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().misses += 1);
-    record_sensitive_classification(classified);
+    if stats_enabled {
+        CLASSIFICATION_STATS.with(|stats| stats.borrow_mut().misses += 1);
+        record_sensitive_classification(classified);
+    }
     classified
 }
 
@@ -183,13 +192,15 @@ pub fn array_key_has_numeric_string_ambiguity(value: &PhpString) -> bool {
 }
 
 /// Clears cache contents and hit/miss stats for deterministic VM executions.
+/// Also enables stats recording (sticky; see `layout_stats` module docs).
 pub fn reset_cache_and_stats() {
     CLASSIFICATION_CACHE.with(|cache| cache.borrow_mut().clear());
     reset_cache_stats();
 }
 
-/// Clears only numeric-string cache hit/miss stats.
+/// Clears only numeric-string cache hit/miss stats and enables recording.
 pub fn reset_cache_stats() {
+    crate::layout_stats::enable_stats();
     CLASSIFICATION_STATS.with(|stats| *stats.borrow_mut() = NumericStringCacheStats::default());
 }
 

@@ -1,6 +1,17 @@
 //! Request-local runtime layout and allocation counters.
+//!
+//! Recording is disabled by default so hot paths (`Value::clone`, string and
+//! array handle allocation) pay only one relaxed atomic load plus a predicted
+//! branch. The VM enables recording through [`reset_layout_stats`] exactly
+//! when counter collection is requested. The enable flag is process-global
+//! and sticky: it is never cleared once set, because a concurrent
+//! counters-enabled execution in another thread must not lose events. The
+//! stats themselves stay thread-local, and every collector resets them before
+//! measuring, so stale increments from non-counter executions never leak into
+//! a collected snapshot.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime value/layout counters collected by the VM when counters are enabled.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -31,61 +42,99 @@ pub struct RuntimeLayoutStats {
     pub symbol_linear_fallbacks: u64,
 }
 
+static LAYOUT_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     static LAYOUT_STATS: RefCell<RuntimeLayoutStats> =
         RefCell::new(RuntimeLayoutStats::default());
 }
 
-pub(crate) fn record_value_clone() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().value_clones += 1);
+/// Returns true when layout/allocation stats recording is enabled.
+#[inline(always)]
+pub(crate) fn stats_enabled() -> bool {
+    LAYOUT_STATS_ENABLED.load(Ordering::Relaxed)
 }
 
-pub(crate) fn record_string_allocation() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().string_allocations += 1);
+/// Enables stats recording (sticky; see module docs). Shared by the layout
+/// and numeric-string stat collectors so either reset path opts in.
+pub(crate) fn enable_stats() {
+    LAYOUT_STATS_ENABLED.store(true, Ordering::Relaxed);
 }
 
-pub(crate) fn record_array_handle_clone() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_handle_clones += 1);
+macro_rules! layout_recorder {
+    ($vis:vis $name:ident, $slow:ident, $field:ident) => {
+        #[inline(always)]
+        $vis fn $name() {
+            if stats_enabled() {
+                $slow();
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn $slow() {
+            LAYOUT_STATS.with(|stats| stats.borrow_mut().$field += 1);
+        }
+    };
 }
 
-pub(crate) fn record_cow_separation() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().cow_separations += 1);
-}
+layout_recorder!(pub(crate) record_value_clone, record_value_clone_slow, value_clones);
+layout_recorder!(
+    pub(crate) record_string_allocation,
+    record_string_allocation_slow,
+    string_allocations
+);
+layout_recorder!(
+    pub(crate) record_array_handle_clone,
+    record_array_handle_clone_slow,
+    array_handle_clones
+);
+layout_recorder!(
+    pub(crate) record_cow_separation,
+    record_cow_separation_slow,
+    cow_separations
+);
+layout_recorder!(
+    pub(crate) record_reference_cell_creation,
+    record_reference_cell_creation_slow,
+    reference_cell_creations
+);
+layout_recorder!(
+    pub(crate) record_object_allocation,
+    record_object_allocation_slow,
+    object_allocations
+);
+layout_recorder!(
+    pub(crate) record_array_packed_direct_get,
+    record_array_packed_direct_get_slow,
+    array_packed_direct_gets
+);
+layout_recorder!(
+    pub(crate) record_array_mixed_indexed_get,
+    record_array_mixed_indexed_get_slow,
+    array_mixed_indexed_gets
+);
+layout_recorder!(
+    pub(crate) record_array_linear_scan_fallback,
+    record_array_linear_scan_fallback_slow,
+    array_linear_scan_fallbacks
+);
+layout_recorder!(
+    pub(crate) record_array_metadata_recompute,
+    record_array_metadata_recompute_slow,
+    array_metadata_recomputes
+);
+layout_recorder!(pub record_symbol_map_lookup, record_symbol_map_lookup_slow, symbol_map_lookups);
+layout_recorder!(
+    pub record_symbol_linear_fallback,
+    record_symbol_linear_fallback_slow,
+    symbol_linear_fallbacks
+);
 
-pub(crate) fn record_reference_cell_creation() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().reference_cell_creations += 1);
-}
-
-pub(crate) fn record_object_allocation() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().object_allocations += 1);
-}
-
-pub(crate) fn record_array_packed_direct_get() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_packed_direct_gets += 1);
-}
-
-pub(crate) fn record_array_mixed_indexed_get() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_mixed_indexed_gets += 1);
-}
-
-pub(crate) fn record_array_linear_scan_fallback() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_linear_scan_fallbacks += 1);
-}
-
-pub(crate) fn record_array_metadata_recompute() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().array_metadata_recomputes += 1);
-}
-
-pub fn record_symbol_map_lookup() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().symbol_map_lookups += 1);
-}
-
-pub fn record_symbol_linear_fallback() {
-    LAYOUT_STATS.with(|stats| stats.borrow_mut().symbol_linear_fallbacks += 1);
-}
-
-/// Clears layout counters for deterministic VM executions.
+/// Clears layout counters for deterministic VM executions and enables
+/// recording (sticky; see module docs).
 pub fn reset_layout_stats() {
+    enable_stats();
     LAYOUT_STATS.with(|stats| *stats.borrow_mut() = RuntimeLayoutStats::default());
 }
 
