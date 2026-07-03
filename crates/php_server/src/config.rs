@@ -17,6 +17,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_UPLOAD_FILES: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
+const DEFAULT_MAX_VM_STEPS: usize = 100_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
 const DEFAULT_SCRIPT_CACHE_MAX_ENTRIES: usize = 4096;
 const DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS: u64 = 0;
@@ -44,6 +45,7 @@ pub struct ServerConfig {
     pub max_in_flight: usize,
     pub request_timeout_ms: u64,
     pub max_execution_ms: u64,
+    pub max_vm_steps: usize,
     pub execution_deadline_enabled: bool,
     pub engine_preset: EngineProfileName,
     pub metrics_endpoint_enabled: bool,
@@ -168,6 +170,9 @@ impl ServerConfig {
         let mut max_execution_ms = file_config
             .positive_u64("max_execution_ms")?
             .unwrap_or(DEFAULT_MAX_EXECUTION_MS);
+        let mut max_vm_steps = file_config
+            .positive_usize("max_vm_steps")?
+            .unwrap_or(DEFAULT_MAX_VM_STEPS);
         let mut execution_deadline_enabled = file_config
             .bool("execution_deadline_enabled")?
             .unwrap_or(true);
@@ -265,6 +270,9 @@ impl ServerConfig {
                 "--max-execution-ms" => {
                     max_execution_ms = parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
                 }
+                "--max-vm-steps" => {
+                    max_vm_steps = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                }
                 "--disable-execution-deadline" => execution_deadline_enabled = false,
                 "--engine-preset" => {
                     engine_preset = parse_engine_preset(&arg, &required_value(&arg, &mut args)?)?;
@@ -343,6 +351,7 @@ impl ServerConfig {
                 max_in_flight,
                 request_timeout_ms,
                 max_execution_ms,
+                max_vm_steps,
                 execution_deadline_enabled,
                 engine_preset,
                 metrics_endpoint_enabled,
@@ -384,6 +393,7 @@ impl ServerConfig {
             max_in_flight,
             request_timeout_ms,
             max_execution_ms,
+            max_vm_steps,
             execution_deadline_enabled,
             engine_preset,
             metrics_endpoint_enabled,
@@ -423,6 +433,7 @@ Options:\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
+  --max-vm-steps <n>           maximum VM dispatches per request (default: 100000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
   --engine-preset <name>       default managed-fast, baseline oracle, fast alias, or experimental-jit diagnostics\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
@@ -781,6 +792,7 @@ mod tests {
         assert!(config.sessions_enabled);
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.max_execution_ms, 30_000);
+        assert_eq!(config.max_vm_steps, 100_000);
         assert!(config.execution_deadline_enabled);
         assert_eq!(config.engine_preset, EngineProfileName::Default);
         assert!(config.metrics_endpoint_enabled);
@@ -832,6 +844,8 @@ mod tests {
             "250",
             "--max-execution-ms",
             "125",
+            "--max-vm-steps",
+            "250000",
             "--disable-execution-deadline",
             "--engine-preset",
             "experimental-jit",
@@ -877,6 +891,7 @@ mod tests {
         assert_eq!(config.max_in_flight, 2);
         assert_eq!(config.request_timeout_ms, 250);
         assert_eq!(config.max_execution_ms, 125);
+        assert_eq!(config.max_vm_steps, 250_000);
         assert!(!config.execution_deadline_enabled);
         assert_eq!(config.engine_preset, EngineProfileName::ExperimentalJit);
         assert!(!config.metrics_endpoint_enabled);
@@ -921,6 +936,7 @@ tls_key = "key.pem"
 script_cache_max_entries = 12
 strict_preload = true
 engine_preset = "baseline"
+max_vm_steps = 333000
 "#,
         );
 
@@ -954,6 +970,7 @@ engine_preset = "baseline"
         assert_eq!(config.script_cache_max_entries, 12);
         assert!(config.strict_preload);
         assert_eq!(config.engine_preset, EngineProfileName::Default);
+        assert_eq!(config.max_vm_steps, 333_000);
     }
 
     #[test]

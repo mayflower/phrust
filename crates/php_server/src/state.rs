@@ -47,6 +47,7 @@ pub(crate) struct AppState {
 #[derive(Clone, Debug)]
 pub(crate) struct ServerEngineState {
     pub(crate) engine_profile: EngineProfileName,
+    pub(crate) max_vm_steps: usize,
     pub(crate) script_cache: Arc<CompiledScriptCache>,
     pub(crate) include_cache: Arc<IncludeCache>,
     pub(crate) compile_optimization_level: OptimizationLevel,
@@ -55,6 +56,7 @@ pub(crate) struct ServerEngineState {
 impl ServerEngineState {
     pub(crate) fn new(
         engine_profile: EngineProfileName,
+        max_vm_steps: usize,
         script_cache: Arc<CompiledScriptCache>,
         include_cache: Arc<IncludeCache>,
     ) -> Self {
@@ -65,6 +67,7 @@ impl ServerEngineState {
         };
         Self {
             engine_profile,
+            max_vm_steps,
             script_cache,
             include_cache,
             compile_optimization_level: base_options.optimization_level,
@@ -73,9 +76,13 @@ impl ServerEngineState {
 
     pub(crate) fn executor_options(&self) -> PhpExecutorOptions {
         if self.engine_profile == EngineProfileName::Default {
-            PhpExecutorOptions::managed_fast_runtime()
+            let mut options = PhpExecutorOptions::managed_fast_runtime();
+            options.vm_options.max_steps = self.max_vm_steps;
+            options
         } else {
-            PhpExecutorOptions::for_profile(self.engine_profile)
+            let mut options = PhpExecutorOptions::for_profile(self.engine_profile);
+            options.vm_options.max_steps = self.max_vm_steps;
+            options
         }
     }
 

@@ -187,6 +187,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let include_cache = Arc::new(IncludeCache::new(config.script_cache_shards));
     let engine = Arc::new(ServerEngineState::new(
         engine_profile,
+        config.max_vm_steps,
         script_cache,
         include_cache,
     ));
@@ -714,6 +715,7 @@ mod tests {
             metrics: Arc::new(ServerMetrics::default()),
             engine: Arc::new(ServerEngineState::new(
                 EngineProfileName::Default,
+                100_000,
                 cache,
                 Arc::new(IncludeCache::new(1)),
             )),
