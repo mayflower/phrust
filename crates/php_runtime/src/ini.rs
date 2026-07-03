@@ -90,19 +90,24 @@ impl IniRegistry {
     }
 }
 
-fn default_entries() -> [(&'static str, &'static str); 11] {
+fn default_entries() -> [(&'static str, &'static str); 16] {
     [
         ("date.timezone", "UTC"),
         ("default_charset", "UTF-8"),
         ("display_errors", "1"),
         ("error_reporting", "-1"),
+        ("file_uploads", "1"),
         ("ignore_user_abort", "0"),
         ("include_path", "."),
+        ("max_file_uploads", "20"),
         ("max_input_nesting_level", "64"),
         ("max_input_vars", "1000"),
         ("memory_limit", "128M"),
+        ("post_max_size", "8M"),
         ("precision", "14"),
         ("serialize_precision", "-1"),
+        ("upload_max_filesize", "2M"),
+        ("upload_tmp_dir", ""),
     ]
 }
 
@@ -119,6 +124,11 @@ mod tests {
         assert_eq!(registry.set("include_path", "lib"), Some(".".to_owned()));
         assert_eq!(registry.get("include_path"), Some("lib"));
         assert_eq!(registry.cfg_var("include_path"), Some("."));
+        assert_eq!(registry.get("file_uploads"), Some("1"));
+        assert_eq!(registry.get("upload_tmp_dir"), Some(""));
+        assert_eq!(registry.get("upload_max_filesize"), Some("2M"));
+        assert_eq!(registry.get("post_max_size"), Some("8M"));
+        assert_eq!(registry.get("max_file_uploads"), Some("20"));
         assert_eq!(registry.set("missing", "value"), None);
     }
 
@@ -138,13 +148,18 @@ mod tests {
                 "default_charset",
                 "display_errors",
                 "error_reporting",
+                "file_uploads",
                 "ignore_user_abort",
                 "include_path",
+                "max_file_uploads",
                 "max_input_nesting_level",
                 "max_input_vars",
                 "memory_limit",
+                "post_max_size",
                 "precision",
-                "serialize_precision"
+                "serialize_precision",
+                "upload_max_filesize",
+                "upload_tmp_dir"
             ]
         );
     }

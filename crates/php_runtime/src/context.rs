@@ -1243,6 +1243,12 @@ mod tests {
         assert_eq!(context.ini_registry().get("include_path"), Some("."));
         assert_eq!(context.ini_registry().get("max_input_vars"), Some("1000"));
         assert_eq!(
+            context.ini_registry().get("upload_max_filesize"),
+            Some("2M")
+        );
+        assert_eq!(context.ini_registry().get("post_max_size"), Some("8M"));
+        assert_eq!(context.ini_registry().get("max_file_uploads"), Some("20"));
+        assert_eq!(
             context.ini_registry().get("max_input_nesting_level"),
             Some("64")
         );
