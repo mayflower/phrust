@@ -10,7 +10,7 @@ use crate::{
     RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity, Value,
     WordPressDiagnosticContext, normalize_class_name,
 };
-use openssl::ssl::{SslConnector, SslMethod};
+use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslStream};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(test)]
@@ -868,14 +868,11 @@ fn execute_single_http_request(request: &CurlRequest) -> Result<CurlResponse, (i
         .set_write_timeout(Some(request.timeout))
         .map_err(|error| (28, format!("failed to set cURL write timeout: {error}")))?;
     let mut stream: Box<dyn CurlStream> = if request.https {
-        let connector = SslConnector::builder(SslMethod::tls())
-            .map_err(|error| (35, format!("failed to initialize cURL TLS: {error}")))?
-            .build();
-        Box::new(
-            connector
-                .connect(&request.host, tcp_stream)
-                .map_err(|error| (35, format!("failed cURL TLS handshake: {error}")))?,
-        )
+        Box::new(connect_tls(
+            &request.host,
+            tcp_stream,
+            request.connect_timeout,
+        )?)
     } else {
         Box::new(tcp_stream)
     };
@@ -904,6 +901,38 @@ fn execute_single_http_request(request: &CurlRequest) -> Result<CurlResponse, (i
     let mut response = parse_http_response(&bytes)?;
     response.effective_url = request.url.clone();
     Ok(response)
+}
+
+fn connect_tls(
+    host: &str,
+    stream: TcpStream,
+    timeout: Duration,
+) -> Result<SslStream<TcpStream>, (i64, String)> {
+    let connector = SslConnector::builder(SslMethod::tls())
+        .map_err(|error| (35, format!("failed to initialize cURL TLS: {error}")))?
+        .build();
+    match connector.connect(host, stream) {
+        Ok(stream) => Ok(stream),
+        Err(HandshakeError::WouldBlock(mut handshake)) => {
+            let start = Instant::now();
+            loop {
+                if start.elapsed() >= timeout {
+                    return Err((28, "cURL TLS handshake timed out".to_owned()));
+                }
+                match handshake.handshake() {
+                    Ok(stream) => return Ok(stream),
+                    Err(HandshakeError::WouldBlock(next)) => {
+                        handshake = next;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        return Err((35, format!("failed cURL TLS handshake: {error}")));
+                    }
+                }
+            }
+        }
+        Err(error) => Err((35, format!("failed cURL TLS handshake: {error}"))),
+    }
 }
 
 fn read_http_response(

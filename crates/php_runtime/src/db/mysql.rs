@@ -1,12 +1,13 @@
 //! Capability-gated MySQL/MariaDB client layer.
 
 use crate::{ArrayKey, PhpArray, PhpString, Value, convert};
-use mysql::{Conn, Opts, Params, Row, Value as MysqlValue, prelude::Queryable};
+use mysql::{Conn, Opts, OptsBuilder, Params, Row, Value as MysqlValue, prelude::Queryable};
 use rusqlite::types::{Value as SqliteValue, ValueRef as SqliteValueRef};
 use rusqlite::{Connection as SqliteConnection, OpenFlags, params_from_iter};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::time::Duration;
 
 /// Environment variable that enables live MySQL/MariaDB tests.
 pub const MYSQL_TEST_DSN_ENV: &str = "PHRUST_MYSQL_TEST_DSN";
@@ -16,6 +17,9 @@ pub const MYSQLI_SQLITE_COMPAT_ENV: &str = "PHRUST_MYSQLI_SQLITE_COMPAT";
 pub const MYSQLND_CLIENT_INFO: &str = "mysqlnd 8.5.7";
 /// `mysqlnd`-style client version reported by the mysqli MVP.
 pub const MYSQLND_CLIENT_VERSION: i64 = 80507;
+const DEFAULT_MYSQL_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_MYSQL_READ_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_MYSQL_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `mysqli_fetch_array()` associative columns.
 pub const MYSQLI_ASSOC: i64 = 1;
@@ -735,7 +739,8 @@ impl MysqlConnection {
     /// Opens a live connection. Callers must enforce capability policy before
     /// invoking this constructor.
     pub fn connect(options: &MysqlConnectOptions) -> Result<Self, MysqlError> {
-        let conn = Conn::new(options.opts()?).map_err(MysqlError::from_client)?;
+        let conn = Conn::new(mysql_opts_with_default_timeouts(options.opts()?))
+            .map_err(MysqlError::from_client)?;
         Ok(Self { conn })
     }
 
@@ -841,6 +846,25 @@ impl MysqlConnection {
             last_insert_id: self.conn.last_insert_id().try_into().unwrap_or(i64::MAX),
         })
     }
+}
+
+fn mysql_opts_with_default_timeouts(opts: Opts) -> OptsBuilder {
+    let read_timeout = opts
+        .get_read_timeout()
+        .copied()
+        .or(Some(DEFAULT_MYSQL_READ_TIMEOUT));
+    let write_timeout = opts
+        .get_write_timeout()
+        .copied()
+        .or(Some(DEFAULT_MYSQL_WRITE_TIMEOUT));
+    let tcp_connect_timeout = opts
+        .get_tcp_connect_timeout()
+        .or(Some(DEFAULT_MYSQL_TCP_CONNECT_TIMEOUT));
+
+    OptsBuilder::from_opts(opts)
+        .read_timeout(read_timeout)
+        .write_timeout(write_timeout)
+        .tcp_connect_timeout(tcp_connect_timeout)
 }
 
 impl MysqlConnectionBackend {
@@ -1225,6 +1249,37 @@ mod tests {
         let options = MysqlConnectOptions::from_dsn("mysql://user:pass@127.0.0.1:3306/db")
             .expect("valid DSN");
         assert_eq!(options.dsn, "mysql://user:pass@127.0.0.1:3306/db");
+    }
+
+    #[test]
+    fn applies_default_connection_timeouts() {
+        let options = MysqlConnectOptions::from_dsn("mysql://user:pass@127.0.0.1:3306/db")
+            .expect("valid DSN");
+        let opts = Opts::from(mysql_opts_with_default_timeouts(
+            options.opts().expect("valid options"),
+        ));
+
+        assert_eq!(
+            opts.get_tcp_connect_timeout(),
+            Some(DEFAULT_MYSQL_TCP_CONNECT_TIMEOUT)
+        );
+        assert_eq!(opts.get_read_timeout(), Some(&DEFAULT_MYSQL_READ_TIMEOUT));
+        assert_eq!(opts.get_write_timeout(), Some(&DEFAULT_MYSQL_WRITE_TIMEOUT));
+    }
+
+    #[test]
+    fn preserves_explicit_connection_timeouts() {
+        let options = MysqlConnectOptions::from_dsn(
+            "mysql://user:pass@127.0.0.1:3306/db?tcp_connect_timeout_ms=7000",
+        )
+        .expect("valid DSN");
+        let opts = Opts::from(mysql_opts_with_default_timeouts(
+            options.opts().expect("valid options"),
+        ));
+
+        assert_eq!(opts.get_tcp_connect_timeout(), Some(Duration::from_secs(7)));
+        assert_eq!(opts.get_read_timeout(), Some(&DEFAULT_MYSQL_READ_TIMEOUT));
+        assert_eq!(opts.get_write_timeout(), Some(&DEFAULT_MYSQL_WRITE_TIMEOUT));
     }
 
     #[test]

@@ -4820,7 +4820,7 @@ impl Vm {
         let callback = values[1].clone();
         let callback_args = match values.get(2).map(effective_value) {
             None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(array)) => call_args_from_php_array(array.clone()),
+            Some(Value::Array(array)) => call_args_from_php_array(&array),
             Some(other) => {
                 let message = format!(
                     "iterator_apply(): Argument #3 ($args) must be of type ?array, {} given",
@@ -33572,7 +33572,7 @@ impl Vm {
     fn call_user_func_array_builtin(
         &self,
         compiled: &CompiledUnit,
-        values: Vec<Value>,
+        mut values: Vec<Value>,
         call_span: Option<php_ir::IrSpan>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
@@ -33586,8 +33586,9 @@ impl Vm {
                 "E_PHP_VM_CALLABLE_ARITY: call_user_func_array expects two arguments",
             );
         }
-        let callback = values[0].clone();
-        let Value::Array(array) = callable_resolve_reference(values[1].clone()) else {
+        let arguments = values.pop().expect("arity checked");
+        let callback = values.pop().expect("arity checked");
+        let Value::Array(array) = callable_resolve_reference(arguments) else {
             return self.runtime_error(
                 output,
                 compiled,
@@ -33595,7 +33596,7 @@ impl Vm {
                 "E_PHP_VM_CALLABLE_TYPE: call_user_func_array expects array arguments",
             );
         };
-        let args = call_args_from_php_array(array);
+        let args = call_args_from_php_array(&array);
         if let Err(result) = self.preflight_user_callback(
             compiled,
             &callback,
@@ -33620,7 +33621,11 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<(), VmResult> {
-        match callable_resolve_reference(callback.clone()) {
+        match callback {
+            Value::Reference(cell) => {
+                let resolved = cell.get();
+                self.preflight_user_callback(compiled, &resolved, builtin, output, stack, state)?;
+            }
             Value::String(name) => {
                 let name = name.to_string_lossy();
                 if let Some((class_name, method)) = name.split_once("::") {
@@ -33630,18 +33635,15 @@ impl Vm {
                 }
             }
             Value::Array(array) => {
-                let elements = array
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .collect::<Vec<_>>();
-                let [target, method]: [Value; 2] = match elements.try_into() {
-                    Ok(elements) => elements,
-                    Err(_) => return Ok(()),
-                };
-                let Some(method) = callable_string_value(method) else {
+                let (Some(target), Some(method)) =
+                    (array.get(&ArrayKey::Int(0)), array.get(&ArrayKey::Int(1)))
+                else {
                     return Ok(());
                 };
-                match callable_resolve_reference(target) {
+                let Some(method) = callable_string_ref(method) else {
+                    return Ok(());
+                };
+                match callable_resolve_reference(target.clone()) {
                     Value::Object(object) => self.preflight_object_user_callback(
                         compiled, &object, &method, builtin, output, stack, state,
                     )?,
@@ -39862,6 +39864,14 @@ fn callable_string_value(value: Value) -> Option<String> {
     }
 }
 
+fn callable_string_ref(value: &Value) -> Option<String> {
+    match value {
+        Value::Reference(cell) => callable_string_value(cell.get()),
+        Value::String(value) => Some(value.to_string_lossy()),
+        _ => None,
+    }
+}
+
 fn magic_args_array(args: Vec<CallArgument>) -> Value {
     let mut array = PhpArray::new();
     for arg in args {
@@ -40948,6 +40958,27 @@ struct ResolvedProperty<'a> {
 struct ResolvedPropertyOwned {
     class: php_ir::module::ClassEntry,
     property: php_ir::module::ClassPropertyEntry,
+}
+
+enum ClassLookup<'a> {
+    Borrowed(&'a php_ir::module::ClassEntry),
+    Owned(php_ir::module::ClassEntry),
+}
+
+impl<'a> ClassLookup<'a> {
+    fn as_ref(&self) -> &php_ir::module::ClassEntry {
+        match self {
+            Self::Borrowed(class) => class,
+            Self::Owned(class) => class,
+        }
+    }
+
+    fn into_owned(self) -> php_ir::module::ClassEntry {
+        match self {
+            Self::Borrowed(class) => class.clone(),
+            Self::Owned(class) => class,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -52350,15 +52381,14 @@ fn dynamic_class_entry_in_state<'a>(
         .find(|entry| entry.lookup_name == normalized)
 }
 
-fn dynamic_class_in_loaded_units(
-    state: &ExecutionState,
+fn dynamic_class_in_loaded_units<'a>(
+    state: &'a ExecutionState,
     class_name: &str,
-) -> Option<php_ir::module::ClassEntry> {
+) -> Option<&'a php_ir::module::ClassEntry> {
     let normalized = normalize_class_name(class_name);
     state.dynamic_units.iter().rev().find_map(|unit| {
         unit.lookup_class(&normalized)
             .filter(|class| normalize_class_name(&class.name) == normalized)
-            .cloned()
     })
 }
 
@@ -52425,25 +52455,30 @@ fn lookup_class_in_state(
     state: &ExecutionState,
     class_name: &str,
 ) -> Option<php_ir::module::ClassEntry> {
+    lookup_class_in_state_ref(compiled, state, class_name).map(ClassLookup::into_owned)
+}
+
+fn lookup_class_in_state_ref<'a>(
+    compiled: &'a CompiledUnit,
+    state: &'a ExecutionState,
+    class_name: &str,
+) -> Option<ClassLookup<'a>> {
     let normalized = normalize_class_name(class_name);
-    if let Some(class) = state
-        .dynamic_classes
-        .iter()
-        .find(|entry| entry.lookup_name == normalized)
-        .map(|entry| entry.class.clone())
-    {
-        return Some(class);
+    if let Some(entry) = dynamic_class_entry_in_state(state, &normalized) {
+        return Some(ClassLookup::Borrowed(&entry.class));
     }
-    if let Some(class) = compiled.lookup_class(class_name).cloned() {
-        return Some(class);
+    if let Some(class) = compiled.lookup_class(class_name) {
+        return Some(ClassLookup::Borrowed(class));
     }
     if let Some(class) = dynamic_class_in_loaded_units(state, &normalized) {
-        return Some(class);
+        return Some(ClassLookup::Borrowed(class));
     }
     if state.failed_class_declarations.contains(&normalized) {
         return None;
     }
-    internal_runtime_class_entry(&normalized).or_else(|| internal_enum_class_entry(&normalized))
+    internal_runtime_class_entry(&normalized)
+        .or_else(|| internal_enum_class_entry(&normalized))
+        .map(ClassLookup::Owned)
 }
 
 fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
@@ -53761,7 +53796,7 @@ fn class_member_visible(
     true
 }
 
-fn call_args_from_php_array(array: PhpArray) -> Vec<CallArgument> {
+fn call_args_from_php_array(array: &PhpArray) -> Vec<CallArgument> {
     array
         .iter()
         .map(|(key, value)| {
@@ -53809,13 +53844,13 @@ fn lookup_resolved_method_in_state(
     method: &str,
     caller_scope: Option<&str>,
 ) -> Result<Option<ResolvedMethodOwned>, String> {
-    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+    let Some(class) = lookup_class_in_state_ref(compiled, state, class_name) else {
         return Ok(None);
     };
     if let Some(resolved) = lookup_private_method_in_caller_scope_in_state(
         compiled,
         state,
-        &class,
+        class.as_ref(),
         method,
         caller_scope,
     )? {
@@ -53824,7 +53859,7 @@ fn lookup_resolved_method_in_state(
     lookup_resolved_method_in_state_inner(
         compiled,
         state,
-        &class,
+        class.as_ref(),
         method,
         caller_scope,
         &mut Vec::new(),
@@ -53844,20 +53879,21 @@ fn lookup_private_method_in_caller_scope_in_state(
     if !class_is_a_in_state(compiled, state, &class.name, scope)? {
         return Ok(None);
     }
-    let Some(scope_class) = lookup_class_in_state(compiled, state, scope) else {
+    let Some(scope_class) = lookup_class_in_state_ref(compiled, state, scope) else {
         return Ok(None);
     };
     let normalized = normalize_method_name(method);
     let Some(scope_method) = scope_class
+        .as_ref()
         .methods
         .iter()
         .find(|entry| entry.flags.is_private && normalize_method_name(&entry.name) == normalized)
+        .cloned()
     else {
         return Ok(None);
     };
-    let scope_method = scope_method.clone();
     Ok(Some(ResolvedMethodOwned {
-        class: scope_class,
+        class: scope_class.into_owned(),
         method: scope_method,
     }))
 }
@@ -53887,14 +53923,14 @@ fn lookup_resolved_method_in_state_inner(
         if method.flags.is_private
             && caller_scope.is_some_and(|scope| normalize_class_name(scope) != class_name)
             && class.parent.is_some()
-            && let Some(parent) = class
+            && let Some(parent_class) = class
                 .parent
                 .as_deref()
-                .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+                .and_then(|parent| lookup_class_in_state_ref(compiled, state, parent))
             && let Some(parent_method) = lookup_resolved_method_in_state_inner(
                 compiled,
                 state,
-                &parent,
+                parent_class.as_ref(),
                 method.name.as_str(),
                 caller_scope,
                 seen,
@@ -53909,15 +53945,15 @@ fn lookup_resolved_method_in_state_inner(
             method: method.clone(),
         }));
     }
-    if let Some(parent) = class
+    if let Some(parent_class) = class
         .parent
         .as_deref()
-        .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+        .and_then(|parent| lookup_class_in_state_ref(compiled, state, parent))
     {
         let resolved = lookup_resolved_method_in_state_inner(
             compiled,
             state,
-            &parent,
+            parent_class.as_ref(),
             method,
             caller_scope,
             seen,
@@ -53935,10 +53971,10 @@ fn lookup_property_in_state(
     class_name: &str,
     property: &str,
 ) -> Result<Option<php_ir::module::ClassPropertyEntry>, String> {
-    let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
+    let Some(class) = lookup_class_in_state_ref(compiled, state, class_name) else {
         return Ok(None);
     };
-    lookup_property_in_state_inner(compiled, state, &class, property, &mut Vec::new())
+    lookup_property_in_state_inner(compiled, state, class.as_ref(), property, &mut Vec::new())
 }
 
 fn lookup_resolved_property_in_state(
@@ -53960,7 +53996,7 @@ fn lookup_resolved_property_in_state(
     lookup_resolved_property_in_state_inner(
         compiled,
         state,
-        class.clone(),
+        class,
         property,
         caller_scope,
         &mut Vec::new(),
@@ -53982,10 +54018,11 @@ fn lookup_private_property_in_state_caller_scope(
     {
         return Ok(None);
     }
-    let Some(scope_class) = lookup_class_in_state(compiled, state, scope) else {
+    let Some(scope_class) = lookup_class_in_state_ref(compiled, state, scope) else {
         return Ok(None);
     };
     let Some(scope_property) = scope_class
+        .as_ref()
         .properties
         .iter()
         .find(|entry| entry.flags.is_private && entry.name == property)
@@ -53994,7 +54031,7 @@ fn lookup_private_property_in_state_caller_scope(
         return Ok(None);
     };
     Ok(Some(ResolvedPropertyOwned {
-        class: scope_class,
+        class: scope_class.into_owned(),
         property: scope_property,
     }))
 }
@@ -54002,7 +54039,7 @@ fn lookup_private_property_in_state_caller_scope(
 fn lookup_resolved_property_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: php_ir::module::ClassEntry,
+    class: &php_ir::module::ClassEntry,
     property: &str,
     caller_scope: Option<&str>,
     seen: &mut Vec<String>,
@@ -54015,23 +54052,18 @@ fn lookup_resolved_property_in_state_inner(
         ));
     }
     seen.push(class_name.clone());
-    if let Some(entry) = class
-        .properties
-        .iter()
-        .find(|entry| entry.name == property)
-        .cloned()
-    {
+    if let Some(entry) = class.properties.iter().find(|entry| entry.name == property) {
         if entry.flags.is_private
             && caller_scope.is_some_and(|scope| normalize_class_name(scope) != class_name)
             && class.parent.is_some()
-            && let Some(parent) = class
+            && let Some(parent_class) = class
                 .parent
                 .as_deref()
-                .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+                .and_then(|parent| lookup_class_in_state_ref(compiled, state, parent))
             && let Some(parent_property) = lookup_resolved_property_in_state_inner(
                 compiled,
                 state,
-                parent,
+                parent_class.as_ref(),
                 entry.name.as_str(),
                 caller_scope,
                 seen,
@@ -54042,12 +54074,12 @@ fn lookup_resolved_property_in_state_inner(
         }
         seen.pop();
         return Ok(Some(ResolvedPropertyOwned {
-            class,
-            property: entry,
+            class: class.clone(),
+            property: entry.clone(),
         }));
     }
     if let Some(parent_name) = class.parent.as_deref() {
-        let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
+        let Some(parent_class) = lookup_class_in_state_ref(compiled, state, parent_name) else {
             return Err(format!(
                 "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
                 class.name, parent_name
@@ -54056,7 +54088,7 @@ fn lookup_resolved_property_in_state_inner(
         let resolved = lookup_resolved_property_in_state_inner(
             compiled,
             state,
-            parent,
+            parent_class.as_ref(),
             property,
             caller_scope,
             seen,
@@ -54087,12 +54119,13 @@ fn lookup_property_in_state_inner(
         seen.pop();
         return Ok(Some(property.clone()));
     }
-    if let Some(parent) = class
+    if let Some(parent_class) = class
         .parent
         .as_deref()
-        .and_then(|parent| lookup_class_in_state(compiled, state, parent))
+        .and_then(|parent| lookup_class_in_state_ref(compiled, state, parent))
     {
-        let resolved = lookup_property_in_state_inner(compiled, state, &parent, property, seen)?;
+        let resolved =
+            lookup_property_in_state_inner(compiled, state, parent_class.as_ref(), property, seen)?;
         seen.pop();
         return Ok(resolved);
     }

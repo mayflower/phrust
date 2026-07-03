@@ -67,6 +67,9 @@ pub fn resolve_route(method: &str, path: &str, config: &RouteConfig) -> Resolved
     if candidate.exists() {
         return resolve_existing_path(method, &candidate, None, config);
     }
+    if is_missing_browser_static_probe(&relative_path) {
+        return ResolvedRoute::NotFound;
+    }
     if let Some(route) = resolve_path_info_script(method, &relative_segments, config) {
         return route;
     }
@@ -80,6 +83,10 @@ pub fn resolve_route(method: &str, path: &str, config: &RouteConfig) -> Resolved
     }
 
     ResolvedRoute::NotFound
+}
+
+fn is_missing_browser_static_probe(path: &Path) -> bool {
+    path == Path::new("favicon.ico")
 }
 
 fn resolve_path_info_script(
@@ -454,6 +461,35 @@ mod tests {
             panic!("expected front controller script");
         };
         assert_eq!(path_info.as_deref(), Some("/users/1"));
+    }
+
+    #[test]
+    fn skips_front_controller_for_missing_favicon_probe() {
+        let fixture = Fixture::new();
+        fixture.write("index.php", "<?php echo \"front\";");
+        let mut config = fixture.config("index.php");
+        config.front_controller = Some(PathBuf::from("index.php"));
+
+        for path in ["/favicon.ico", "/favicon.ico/"] {
+            assert!(
+                matches!(resolve_route("GET", path, &config), ResolvedRoute::NotFound),
+                "{path} should not route through the front controller"
+            );
+        }
+    }
+
+    #[test]
+    fn serves_existing_favicon_probe_as_static_file() {
+        let fixture = Fixture::new();
+        fixture.write("index.php", "<?php echo \"front\";");
+        fixture.write("favicon.ico", "ico");
+        let mut config = fixture.config("index.php");
+        config.front_controller = Some(PathBuf::from("index.php"));
+
+        assert!(matches!(
+            resolve_route("GET", "/favicon.ico", &config),
+            ResolvedRoute::StaticFile { .. }
+        ));
     }
 
     #[test]
