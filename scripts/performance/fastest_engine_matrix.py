@@ -323,7 +323,7 @@ def command_for(
     fixture: Path,
     counters_path: Path | None,
     run_dir: Path | None = None,
-    iteration: int = 0,
+    label: str = "0",
 ) -> list[str]:
     if row.kind == "phrust":
         counters_args: list[str] = []
@@ -335,7 +335,7 @@ def command_for(
                 "--persistent-feedback-read",
                 str(run_dir / "advisory-feedback.pff"),
                 "--persistent-feedback-stats-json",
-                str(run_dir / f"iter-{iteration}.persistent-feedback.json"),
+                str(run_dir / f"iter-{label}.persistent-feedback.json"),
             ]
         return [
             str(row.engine),
@@ -363,16 +363,24 @@ def run_process(
     row: MatrixRow,
     fixture: Fixture,
     out_dir: Path,
-    iteration: int,
+    label: str,
     timeout: float,
+    *,
+    instrumented: bool = False,
 ) -> ProcessSample:
     stem = rel(fixture.path).replace("/", "__")
     run_dir = out_dir / "runs" / stem / row.label
     run_dir.mkdir(parents=True, exist_ok=True)
-    counters_path = run_dir / f"iter-{iteration}.counters.json" if row.collect_counters else None
+    # Timed iterations stay uninstrumented; counters come from one dedicated
+    # instrumented run so counter collection cannot inflate wall times.
+    counters_path = (
+        run_dir / f"iter-{label}.counters.json"
+        if instrumented and row.collect_counters
+        else None
+    )
     if counters_path is not None:
         counters_path.unlink(missing_ok=True)
-    command = command_for(row, fixture.path, counters_path, run_dir, iteration)
+    command = command_for(row, fixture.path, counters_path, run_dir, label)
     started = time.perf_counter_ns()
     completed = subprocess.run(
         command,
@@ -387,8 +395,8 @@ def run_process(
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
     stdout = completed.stdout.replace("\r\n", "\n").replace("\r", "\n")
     stderr = normalize(completed.stderr)
-    (run_dir / f"iter-{iteration}.stdout").write_text(stdout, encoding="utf-8")
-    (run_dir / f"iter-{iteration}.stderr").write_text(stderr, encoding="utf-8")
+    (run_dir / f"iter-{label}.stdout").write_text(stdout, encoding="utf-8")
+    (run_dir / f"iter-{label}.stderr").write_text(stderr, encoding="utf-8")
     counters: dict[str, Any] = {}
     if counters_path is not None and counters_path.is_file():
         data = json.loads(counters_path.read_text(encoding="utf-8"))
@@ -415,13 +423,24 @@ def run_samples(
     warmups: int,
     iterations: int,
     timeout: float,
-) -> list[ProcessSample]:
+) -> tuple[list[ProcessSample], ProcessSample | None]:
+    """Run warmups, clean timed iterations, and one instrumented sample.
+
+    Returns `(timed_samples, instrumented_sample)`; the instrumented sample
+    (phrust counter rows only) supplies counters without polluting timings.
+    """
     for warmup in range(warmups):
-        run_process(row, fixture, out_dir, -(warmup + 1), timeout)
-    return [
-        run_process(row, fixture, out_dir, iteration, timeout)
+        run_process(row, fixture, out_dir, f"-{warmup + 1}", timeout)
+    timed = [
+        run_process(row, fixture, out_dir, str(iteration), timeout)
         for iteration in range(iterations)
     ]
+    instrumented: ProcessSample | None = None
+    if row.kind == "phrust" and row.collect_counters:
+        instrumented = run_process(
+            row, fixture, out_dir, "instrumented", timeout, instrumented=True
+        )
+    return timed, instrumented
 
 
 def measure_compile_ms(
@@ -674,7 +693,7 @@ def main() -> int:
     skipped = 0
     known_gaps = 0
     for fixture in fixtures:
-        baseline_samples = run_samples(
+        baseline_samples, baseline_instrumented = run_samples(
             baseline,
             fixture,
             out_dir,
@@ -695,7 +714,11 @@ def main() -> int:
                 "compile_ms": baseline_compile_ms,
                 "execution_median_ms": median_ms(baseline_samples),
                 "total_median_ms": (baseline_compile_ms or 0.0) + median_ms(baseline_samples),
-                "counter_focus": counter_focus(baseline_samples[-1].counters),
+                "counter_focus": counter_focus(
+                    baseline_instrumented.counters
+                    if baseline_instrumented is not None
+                    else {}
+                ),
                 "flags": list(baseline.run_flags),
                 "engine": rel(baseline.engine),
                 "command": baseline_samples[-1].command,
@@ -714,7 +737,7 @@ def main() -> int:
                 output_rows.append(row_summary(row, fixture, "skip", reason))
                 skipped += 1
                 continue
-            samples = run_samples(
+            samples, instrumented = run_samples(
                 row,
                 fixture,
                 out_dir,
@@ -725,6 +748,9 @@ def main() -> int:
             differences: list[str] = []
             for sample in samples:
                 differences.extend(behavior_differences(baseline_sample, sample))
+            if instrumented is not None:
+                # Counter collection must not change PHP-visible behavior.
+                differences.extend(behavior_differences(baseline_sample, instrumented))
             differences = sorted(set(differences))
             if differences and row.kind == "phrust":
                 raise SystemExit(
@@ -749,7 +775,9 @@ def main() -> int:
                     "compile_ms": compile_ms,
                     "execution_median_ms": execution_ms,
                     "total_median_ms": (compile_ms or 0.0) + execution_ms,
-                    "counter_focus": counter_focus(samples[-1].counters),
+                    "counter_focus": counter_focus(
+                        instrumented.counters if instrumented is not None else {}
+                    ),
                     "flags": list(row.run_flags if row.kind == "phrust" else row.reference_flags),
                     "engine": rel(row.engine) if row.engine is not None else None,
                     "command": samples[-1].command,

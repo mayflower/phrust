@@ -1142,6 +1142,7 @@ app-flow-smoke:
 
 app-flow-matrix:
     cargo build -p php_vm_cli --bin php-vm
+    cargo build --release -p php_vm_cli --bin php-vm
     scripts/performance/app_flow_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --iterations "${PHRUST_APP_FLOW_ITERATIONS:-5}" --warmups "${PHRUST_APP_FLOW_WARMUPS:-1}" --scale "${PHRUST_APP_FLOW_SCALE:-2}" --timeout "${PHRUST_APP_FLOW_TIMEOUT:-30.0}"
 
 perf-ratchet-prereq:

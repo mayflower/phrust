@@ -253,25 +253,54 @@ def normalized_env(out_dir: Path, scenario: Scenario, row: Row, scale: int) -> d
     return env
 
 
+def build_command(
+    row: Row,
+    fixture: str,
+    scale: int,
+    *,
+    instrumented: bool,
+    counters_path: Path,
+    timings_path: Path,
+) -> list[str]:
+    """Build the per-run command.
+
+    Timed iterations must stay uninstrumented: `--timings-json` alone forces
+    counter collection inside the CLI, which measurably inflates wall time.
+    Phase timings and counters come from one dedicated instrumented run.
+    """
+    command = [*row.command_prefix]
+    if row.kind == "phrust":
+        command.extend(["--env", f"PHRUST_APP_FLOW_SCALE={scale}"])
+        if instrumented:
+            command.extend(["--timings-json", str(timings_path)])
+            if row.counters:
+                command.extend(["--counters-json", str(counters_path)])
+    command.append(fixture)
+    return command
+
+
 def run_once(
     scenario: Scenario,
     row: Row,
     out_dir: Path,
-    iteration: int,
+    label: str,
     scale: int,
     timeout: float,
+    *,
+    instrumented: bool = False,
 ) -> RunSample:
     run_dir = out_dir / "runs" / safe_name(scenario.id) / safe_name(row.label)
     run_dir.mkdir(parents=True, exist_ok=True)
-    command = [*row.command_prefix]
-    counters_path = run_dir / f"iter-{iteration}.counters.json"
-    timings_path = run_dir / f"iter-{iteration}.timings.json"
-    if row.kind == "phrust":
-        command.extend(["--env", f"PHRUST_APP_FLOW_SCALE={scale}"])
-        command.extend(["--timings-json", str(timings_path)])
-    if row.counters:
-        command.extend(["--counters-json", str(counters_path)])
-    command.append(rel(scenario.fixture))
+    counters_path = run_dir / f"iter-{label}.counters.json"
+    timings_path = run_dir / f"iter-{label}.timings.json"
+    command = build_command(
+        row,
+        rel(scenario.fixture),
+        scale,
+        instrumented=instrumented,
+        counters_path=counters_path,
+        timings_path=timings_path,
+    )
     start = time.perf_counter_ns()
     timed_out = False
     try:
@@ -302,20 +331,20 @@ def run_once(
         timeout_line = f"timed out after {timeout:.3f}s"
         stderr = f"{stderr}\n{timeout_line}\n" if stderr else f"{timeout_line}\n"
     elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
-    (run_dir / f"iter-{iteration}.stdout").write_text(stdout, encoding="utf-8")
-    (run_dir / f"iter-{iteration}.stderr").write_text(stderr, encoding="utf-8")
-    (run_dir / f"iter-{iteration}.status").write_text(f"{returncode}\n", encoding="utf-8")
-    (run_dir / f"iter-{iteration}.command.json").write_text(
+    (run_dir / f"iter-{label}.stdout").write_text(stdout, encoding="utf-8")
+    (run_dir / f"iter-{label}.stderr").write_text(stderr, encoding="utf-8")
+    (run_dir / f"iter-{label}.status").write_text(f"{returncode}\n", encoding="utf-8")
+    (run_dir / f"iter-{label}.command.json").write_text(
         json.dumps(command, indent=2) + "\n", encoding="utf-8"
     )
     counters: dict[str, Any] = {}
-    if counters_path.is_file():
+    if instrumented and counters_path.is_file():
         counters = json.loads(counters_path.read_text(encoding="utf-8"))
     if not isinstance(counters, dict):
         raise SystemExit(f"{rel(counters_path)}: counters root is not an object")
     timings: dict[str, Any] = {}
     timing_warning = None
-    if row.kind == "phrust":
+    if row.kind == "phrust" and instrumented:
         if not timings_path.is_file():
             timing_warning = f"timings missing: {rel(timings_path)}"
         else:
@@ -349,13 +378,25 @@ def run_samples(
     iterations: int,
     scale: int,
     timeout: float,
-) -> list[RunSample]:
+) -> tuple[list[RunSample], RunSample | None]:
+    """Run warmups, clean timed iterations, and one instrumented sample.
+
+    Returns `(timed_samples, instrumented_sample)`. Timed samples carry wall
+    times only; the instrumented sample (phrust rows only) supplies counters
+    and phase timings without polluting the timed measurements.
+    """
     for warmup in range(warmups):
-        run_once(scenario, row, out_dir, -(warmup + 1), scale, timeout)
-    return [
-        run_once(scenario, row, out_dir, iteration, scale, timeout)
+        run_once(scenario, row, out_dir, f"-{warmup + 1}", scale, timeout)
+    timed = [
+        run_once(scenario, row, out_dir, str(iteration), scale, timeout)
         for iteration in range(iterations)
     ]
+    instrumented: RunSample | None = None
+    if row.kind == "phrust":
+        instrumented = run_once(
+            scenario, row, out_dir, "instrumented", scale, timeout, instrumented=True
+        )
+    return timed, instrumented
 
 
 def median_ms(samples: list[RunSample]) -> float:
@@ -431,16 +472,21 @@ def compile_total_ms(timings: dict[str, Any]) -> float:
     )
 
 
-def phase_summary(samples: list[RunSample]) -> dict[str, float]:
-    timing_samples = [sample for sample in samples if sample.timings]
-    if not timing_samples:
+def phase_summary(
+    timed: list[RunSample], instrumented: RunSample | None
+) -> dict[str, float]:
+    """Combine clean timed walls with the instrumented run's phase internals.
+
+    `external_wall_ms` is the median of the uninstrumented timed runs;
+    the phase breakdown comes from the dedicated instrumented run (whose own
+    wall time is not part of the timed statistics).
+    """
+    if instrumented is None or not instrumented.timings or not timed:
         return {}
-    external = statistics.median(sample.elapsed_ms for sample in timing_samples)
-    internal = statistics.median(
-        float(sample.timings.get("total_internal_ms", 0.0)) for sample in timing_samples
-    )
-    compile_total = statistics.median(compile_total_ms(sample.timings) for sample in timing_samples)
-    execute = statistics.median(phase_ms(sample.timings, "execute_ms") for sample in timing_samples)
+    external = statistics.median(sample.elapsed_ms for sample in timed)
+    internal = float(instrumented.timings.get("total_internal_ms", 0.0))
+    compile_total = compile_total_ms(instrumented.timings)
+    execute = phase_ms(instrumented.timings, "execute_ms")
     return {
         "external_wall_ms": external,
         "internal_total_ms": internal,
@@ -450,6 +496,16 @@ def phase_summary(samples: list[RunSample]) -> dict[str, float]:
         "compile_share_percent": (compile_total / internal * 100.0) if internal > 0 else 0.0,
         "execute_share_percent": (execute / internal * 100.0) if internal > 0 else 0.0,
     }
+
+
+def should_write_summary_doc(mode: str) -> bool:
+    """Only the full matrix refreshes the committed summary doc.
+
+    Smoke runs use scale 1, one iteration, and the debug binary; letting them
+    overwrite `docs/performance-app-flow-results.md` replaced the committed
+    full-matrix numbers with debug-build noise.
+    """
+    return mode == "full"
 
 
 def compare_sample(
@@ -548,14 +604,18 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# Application-Flow Performance Results",
         "",
-        "Generated by `nix develop -c just app-flow-smoke` or",
-        "`nix develop -c just app-flow-matrix`.",
+        "Generated by `nix develop -c just app-flow-matrix` (full mode only;",
+        "`just app-flow-smoke` writes local artifacts without touching this doc).",
         "Raw stdout, stderr, command, status, and counter artifacts are local-only",
         "under `target/performance/app-flows/` and must not be committed.",
         "",
         "Correctness is mandatory. When reference PHP is available, Phrust rows",
         "must match reference stdout, normalized stderr, and exit status before",
         "timing data is reported. Wall-clock timings are advisory host-local data.",
+        "",
+        "Timed iterations run uninstrumented. Startup/Compile/Execute columns and",
+        "counter highlights come from one dedicated instrumented run per row and",
+        "are not part of the timed medians.",
         "",
         "## Summary",
         "",
@@ -574,13 +634,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Matrix",
         "",
-        "| Scenario | Row | Correctness | Median ms | Ratio vs ref | Compile ms | Execute ms | Counter highlights | Skip/failure reason |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Scenario | Row | Correctness | Median ms | Ratio vs ref | Startup ms | Compile ms | Execute ms | Counter highlights | Skip/failure reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in summary["rows"]:
         if row["status"] == "skip":
             lines.append(
-                f"| `{row['scenario']}` | `{row['row']}` | skip | n/a | n/a | n/a | n/a | n/a | {row['reason']} |"
+                f"| `{row['scenario']}` | `{row['row']}` | skip | n/a | n/a | n/a | n/a | n/a | n/a | {row['reason']} |"
             )
             continue
         counters = row.get("counter_highlights", {})
@@ -588,6 +648,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
         ratio = row["ratio_vs_reference"]
         ratio_text = "n/a" if ratio is None else f"{ratio:.3f}"
         phases = row.get("phase_summary", {})
+        startup_text = (
+            f"{phases['startup_external_ms']:.3f}"
+            if isinstance(phases, dict) and "startup_external_ms" in phases
+            else "n/a"
+        )
         compile_text = (
             f"{phases['compile_total_ms']:.3f}"
             if isinstance(phases, dict) and "compile_total_ms" in phases
@@ -601,7 +666,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
         reason = row.get("reason", "")
         lines.append(
             f"| `{row['scenario']}` | `{row['row']}` | `{row['correctness']}` | "
-            f"{row['median_ms']:.3f} | {ratio_text} | {compile_text} | {execute_text} | "
+            f"{row['median_ms']:.3f} | {ratio_text} | {startup_text} | {compile_text} | {execute_text} | "
             f"{focus or 'n/a'} | {reason or 'n/a'} |"
         )
     if summary["failures"]:
@@ -642,12 +707,21 @@ def ratchet_from_summary(summary: dict[str, Any], run_id: str) -> dict[str, Any]
             for sample in samples
             if isinstance(sample, dict) and isinstance(sample.get("elapsed_ms"), (int, float))
         ]
+        # Timed samples are uninstrumented; phase timings come from the row's
+        # dedicated instrumented run (row["phase_timings"]). Wall distributions
+        # are computed from clean timed samples only.
         timings = [
             sample["phase_timings"]
             for sample in samples
-            if isinstance(sample, dict) and isinstance(sample.get("phase_timings"), dict)
+            if isinstance(sample, dict)
+            and isinstance(sample.get("phase_timings"), dict)
+            and sample["phase_timings"]
         ]
-        metrics = timing_metrics(external or [float(row.get("median_ms", 0.0))], timings)
+        if not timings:
+            row_timings = row.get("phase_timings")
+            if isinstance(row_timings, dict) and row_timings:
+                timings = [row_timings]
+        metrics = timing_metrics(external or [float(row.get("median_ms", 0.0))], [])
         phase_summary_value = row.get("phase_summary")
         if isinstance(phase_summary_value, dict):
             for key in ("compile_total_ms", "execute_ms", "internal_total_ms", "startup_external_ms"):
@@ -767,7 +841,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                 continue
             if row.optional and row.kind == "reference":
                 try:
-                    samples = run_samples(
+                    samples, instrumented = run_samples(
                         scenario,
                         row,
                         out_dir,
@@ -788,7 +862,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                     )
                     continue
             else:
-                samples = run_samples(
+                samples, instrumented = run_samples(
                     scenario,
                     row,
                     out_dir,
@@ -812,6 +886,17 @@ def run_matrix(args: argparse.Namespace) -> int:
             correctness, reason = compare_sample(scenario, row, sample, expected, scale)
             if correctness == "fail":
                 failures.append(f"{scenario.id} {row.label}: {reason}")
+            elif instrumented is not None and not instrumented.timed_out:
+                # Instrumentation must not change PHP-visible behavior.
+                if (
+                    instrumented.stdout != sample.stdout
+                    or instrumented.returncode != sample.returncode
+                ):
+                    correctness, reason = (
+                        "fail",
+                        "instrumented run output differs from timed run",
+                    )
+                    failures.append(f"{scenario.id} {row.label}: {reason}")
             row_median = median_ms(samples)
             ratio = None
             if reference_median and row_median > 0:
@@ -844,13 +929,28 @@ def run_matrix(args: argparse.Namespace) -> int:
                         }
                         for item in samples
                     ],
-                    "counters": samples[-1].counters,
-                    "phase_timings": samples[-1].timings,
-                    "phase_summary": phase_summary(samples),
+                    "instrumented_sample": (
+                        {
+                            "elapsed_ms": instrumented.elapsed_ms,
+                            "exit_code": instrumented.returncode,
+                            "timed_out": instrumented.timed_out,
+                            "phase_timings": instrumented.timings,
+                            "timing_warning": instrumented.timing_warning,
+                        }
+                        if instrumented is not None
+                        else None
+                    ),
+                    "counters": instrumented.counters if instrumented is not None else {},
+                    "phase_timings": instrumented.timings if instrumented is not None else {},
+                    "phase_summary": phase_summary(samples, instrumented),
                     "timing_warnings": [
-                        item.timing_warning for item in samples if item.timing_warning
+                        item.timing_warning
+                        for item in (*samples, *((instrumented,) if instrumented else ()))
+                        if item.timing_warning
                     ],
-                    "counter_highlights": counter_focus(samples[-1].counters),
+                    "counter_highlights": counter_focus(
+                        instrumented.counters if instrumented is not None else {}
+                    ),
                 }
             )
 
@@ -883,7 +983,8 @@ def run_matrix(args: argparse.Namespace) -> int:
     rendered = render_markdown(summary)
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     markdown_path.write_text(rendered, encoding="utf-8")
-    SUMMARY_DOC.write_text(rendered, encoding="utf-8")
+    if should_write_summary_doc(mode):
+        SUMMARY_DOC.write_text(rendered, encoding="utf-8")
     if args.ratchet_out is not None:
         ratchet_path = args.ratchet_out if args.ratchet_out.is_absolute() else ROOT / args.ratchet_out
         ratchet = ratchet_from_summary(summary, "app-flow-ratchet-smoke" if args.smoke else "app-flow-ratchet")
@@ -932,7 +1033,11 @@ def self_test() -> int:
                 "max_ms": 1.0,
                 "ratio_vs_reference": None,
                 "counter_highlights": {"instructions_executed": 1},
-                "phase_summary": {"compile_total_ms": 1.0, "execute_ms": 2.0},
+                "phase_summary": {
+                    "startup_external_ms": 0.5,
+                    "compile_total_ms": 1.0,
+                    "execute_ms": 2.0,
+                },
             }
         ],
         skipped_rows=0,
@@ -948,8 +1053,39 @@ def self_test() -> int:
     rendered = render_markdown(sample_summary)
     if "Application-Flow Performance Results" not in rendered:
         raise SystemExit("self-test markdown render failed")
-    if "Compile ms" not in rendered or "Execute ms" not in rendered:
+    if (
+        "Startup ms" not in rendered
+        or "Compile ms" not in rendered
+        or "Execute ms" not in rendered
+    ):
         raise SystemExit("self-test phase summary render failed")
+    header_line = next(line for line in rendered.splitlines() if line.startswith("| Scenario |"))
+    divider_line = rendered.splitlines()[rendered.splitlines().index(header_line) + 1]
+    if header_line.count("|") != divider_line.count("|"):
+        raise SystemExit("self-test matrix header/divider column mismatch")
+    phrust_row = Row("self-test", "phrust", ("php-vm", "run"), counters=True)
+    timed_command = build_command(
+        phrust_row,
+        "fixture.php",
+        1,
+        instrumented=False,
+        counters_path=Path("counters.json"),
+        timings_path=Path("timings.json"),
+    )
+    if any(flag in " ".join(timed_command) for flag in ("--counters-json", "--timings-json")):
+        raise SystemExit("self-test: timed command must be uninstrumented")
+    instrumented_command = build_command(
+        phrust_row,
+        "fixture.php",
+        1,
+        instrumented=True,
+        counters_path=Path("counters.json"),
+        timings_path=Path("timings.json"),
+    )
+    if "--counters-json" not in instrumented_command or "--timings-json" not in instrumented_command:
+        raise SystemExit("self-test: instrumented command must carry instrumentation flags")
+    if should_write_summary_doc("smoke") or not should_write_summary_doc("full"):
+        raise SystemExit("self-test: summary doc gating incorrect")
     print(f"[pass] app-flow matrix self-test validated {len(scenarios)} scenarios")
     return 0
 
