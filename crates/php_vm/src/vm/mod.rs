@@ -40943,7 +40943,8 @@ struct ResolvedPropertyOwned {
 
 enum ClassLookup<'a> {
     Borrowed(&'a php_ir::module::ClassEntry),
-    Owned(php_ir::module::ClassEntry),
+    /// Boxed: `ClassEntry` is ~272 bytes and would dominate the enum size.
+    Owned(Box<php_ir::module::ClassEntry>),
 }
 
 impl<'a> ClassLookup<'a> {
@@ -40957,7 +40958,7 @@ impl<'a> ClassLookup<'a> {
     fn into_owned(self) -> php_ir::module::ClassEntry {
         match self {
             Self::Borrowed(class) => class.clone(),
-            Self::Owned(class) => class,
+            Self::Owned(class) => *class,
         }
     }
 }
@@ -52471,7 +52472,7 @@ fn lookup_class_in_state_ref<'a>(
     }
     internal_runtime_class_entry(&normalized)
         .or_else(|| internal_enum_class_entry(&normalized))
-        .map(ClassLookup::Owned)
+        .map(|class| ClassLookup::Owned(Box::new(class)))
 }
 
 fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
