@@ -293,6 +293,11 @@ def run_once(
     run_dir.mkdir(parents=True, exist_ok=True)
     counters_path = run_dir / f"iter-{label}.counters.json"
     timings_path = run_dir / f"iter-{label}.timings.json"
+    if instrumented:
+        # out_dir is a fixed path, so a crashed/timed-out run must not let a
+        # previous invocation's artifacts pass as this run's counters/timings.
+        counters_path.unlink(missing_ok=True)
+        timings_path.unlink(missing_ok=True)
     command = build_command(
         row,
         rel(scenario.fixture),
@@ -477,9 +482,12 @@ def phase_summary(
 ) -> dict[str, float]:
     """Combine clean timed walls with the instrumented run's phase internals.
 
-    `external_wall_ms` is the median of the uninstrumented timed runs;
-    the phase breakdown comes from the dedicated instrumented run (whose own
-    wall time is not part of the timed statistics).
+    `external_wall_ms` is the median of the uninstrumented timed runs. The
+    phase breakdown - and `startup_external_ms` - come from the dedicated
+    instrumented run: startup is that run's own wall minus its own internal
+    total, so instrumentation overhead cancels out instead of biasing the
+    subtraction (mixing the clean wall with the instrumented internal
+    understated startup, clamping it to 0.0 on some rows).
     """
     if instrumented is None or not instrumented.timings or not timed:
         return {}
@@ -490,7 +498,7 @@ def phase_summary(
     return {
         "external_wall_ms": external,
         "internal_total_ms": internal,
-        "startup_external_ms": max(external - internal, 0.0),
+        "startup_external_ms": max(instrumented.elapsed_ms - internal, 0.0),
         "compile_total_ms": compile_total,
         "execute_ms": execute,
         "compile_share_percent": (compile_total / internal * 100.0) if internal > 0 else 0.0,
@@ -708,20 +716,32 @@ def ratchet_from_summary(summary: dict[str, Any], run_id: str) -> dict[str, Any]
             if isinstance(sample, dict) and isinstance(sample.get("elapsed_ms"), (int, float))
         ]
         # Timed samples are uninstrumented; phase timings come from the row's
-        # dedicated instrumented run (row["phase_timings"]). Wall distributions
-        # are computed from clean timed samples only.
-        timings = [
-            sample["phase_timings"]
-            for sample in samples
-            if isinstance(sample, dict)
-            and isinstance(sample.get("phase_timings"), dict)
-            and sample["phase_timings"]
-        ]
-        if not timings:
-            row_timings = row.get("phase_timings")
-            if isinstance(row_timings, dict) and row_timings:
-                timings = [row_timings]
+        # dedicated instrumented run. Wall distributions are computed from
+        # clean timed samples only, while the internal/compile/execute/startup
+        # metric families are derived from the instrumented run against its
+        # own wall so instrumentation overhead cancels out. Single-sample
+        # distributions keep the metric keys ratchet-comparable.
+        timings = []
+        row_timings = row.get("phase_timings")
+        if isinstance(row_timings, dict) and row_timings:
+            timings = [row_timings]
         metrics = timing_metrics(external or [float(row.get("median_ms", 0.0))], [])
+        instrumented_sample = row.get("instrumented_sample")
+        if (
+            timings
+            and isinstance(instrumented_sample, dict)
+            and isinstance(instrumented_sample.get("elapsed_ms"), (int, float))
+        ):
+            instrumented_metrics = timing_metrics(
+                [float(instrumented_sample["elapsed_ms"])], timings
+            )
+            metrics.update(
+                {
+                    key: value
+                    for key, value in instrumented_metrics.items()
+                    if not key.startswith("external_wall_ms")
+                }
+            )
         phase_summary_value = row.get("phase_summary")
         if isinstance(phase_summary_value, dict):
             for key in ("compile_total_ms", "execute_ms", "internal_total_ms", "startup_external_ms"):
@@ -886,10 +906,19 @@ def run_matrix(args: argparse.Namespace) -> int:
             correctness, reason = compare_sample(scenario, row, sample, expected, scale)
             if correctness == "fail":
                 failures.append(f"{scenario.id} {row.label}: {reason}")
-            elif instrumented is not None and not instrumented.timed_out:
-                # Instrumentation must not change PHP-visible behavior.
-                if (
+            elif instrumented is not None:
+                # The instrumented run is the sole source of the published
+                # counters and phase timings, so it must complete and must
+                # not change PHP-visible behavior (stdout, stderr, exit).
+                if instrumented.timed_out:
+                    correctness, reason = (
+                        "fail",
+                        "instrumented run timed out; counters/phase timings unavailable",
+                    )
+                    failures.append(f"{scenario.id} {row.label}: {reason}")
+                elif (
                     instrumented.stdout != sample.stdout
+                    or instrumented.stderr != sample.stderr
                     or instrumented.returncode != sample.returncode
                 ):
                     correctness, reason = (

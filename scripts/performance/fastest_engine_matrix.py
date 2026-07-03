@@ -702,6 +702,15 @@ def main() -> int:
             args.timeout,
         )
         baseline_sample = baseline_samples[0]
+        if baseline_instrumented is not None:
+            # Counter collection must not change baseline behavior either;
+            # its output feeds the published counter_focus.
+            differences = sorted(set(behavior_differences(baseline_sample, baseline_instrumented)))
+            if differences:
+                raise SystemExit(
+                    "[fail] fastest-engine matrix counter collection changed baseline "
+                    f"behavior for {rel(fixture.path)}: " + "; ".join(differences)
+                )
         baseline_compile_ms = measure_compile_ms(baseline, fixture, out_dir, args.timeout)
         output_rows.append(
             {
