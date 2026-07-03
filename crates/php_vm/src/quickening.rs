@@ -81,6 +81,10 @@ struct QuickeningEntry {
     executions: u64,
     specialization: Option<QuickeningSpecialization>,
     stats: FallbackProtocolStats,
+    /// Mirrors map-entry presence from the previous BTreeMap storage: dense
+    /// slots live in pre-grown vectors, and only slots a writer has handed
+    /// out (observe or candidate observation) read as present.
+    present: bool,
 }
 
 impl Default for QuickeningEntry {
@@ -90,19 +94,17 @@ impl Default for QuickeningEntry {
             executions: 0,
             specialization: None,
             stats: FallbackProtocolStats::default(),
+            present: false,
         }
     }
 }
 
 impl QuickeningEntry {
-    /// Returns true once this site has recorded any adaptive activity.
-    ///
-    /// Dense sites live in pre-grown vectors, so untouched slots must read
-    /// as absent to preserve the previous map-lookup semantics.
+    /// Returns true once a writer has handed out this site, matching the
+    /// previous BTreeMap storage where any write-path access inserted the
+    /// entry (including candidate observations on cold sites).
     fn is_touched(&self) -> bool {
-        self.executions > 0
-            || self.state != QuickeningState::Uninitialized
-            || self.specialization.is_some()
+        self.present
     }
 
     fn observe(&mut self) -> QuickeningObservation {
@@ -201,13 +203,26 @@ struct DenseFunctionQuickening {
 ///
 /// Rich-IR sites keep the ordered map; dense sites are O(1) flat vectors
 /// indexed by instruction index, with a last-function cache so consecutive
-/// instructions in the same function skip the function lookup entirely.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// instructions in the same function skip the function lookup entirely and
+/// an index map so cross-function switches stay O(1).
+#[derive(Clone, Debug, Default)]
 pub struct QuickeningTable {
     entries: BTreeMap<QuickeningKey, QuickeningEntry>,
     dense_functions: Vec<DenseFunctionQuickening>,
+    dense_index: std::collections::HashMap<(u32, u32), usize>,
     dense_last: std::cell::Cell<usize>,
 }
+
+/// Equality covers quickening state only; the interior-mutable lookup cache
+/// and the derived index are excluded so read-only queries cannot make two
+/// logically identical tables compare unequal.
+impl PartialEq for QuickeningTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.dense_functions == other.dense_functions
+    }
+}
+
+impl Eq for QuickeningTable {}
 
 impl QuickeningTable {
     /// Observes one instruction dispatch and updates metadata only.
@@ -235,14 +250,16 @@ impl QuickeningTable {
     }
 
     fn entry_mut(&mut self, key: QuickeningKey) -> &mut QuickeningEntry {
-        match key {
+        let entry = match key {
             QuickeningKey::Ir { .. } => self.entries.entry(key).or_default(),
             QuickeningKey::Dense {
                 unit,
                 function,
                 instruction,
             } => self.dense_entry_mut(unit, function, instruction),
-        }
+        };
+        entry.present = true;
+        entry
     }
 
     fn entry_if_touched(&self, key: QuickeningKey) -> Option<&QuickeningEntry> {
@@ -281,10 +298,7 @@ impl QuickeningTable {
         {
             return Some(last);
         }
-        let index = self
-            .dense_functions
-            .iter()
-            .position(|slot| slot.unit == unit && slot.function == function)?;
+        let index = *self.dense_index.get(&(unit, function))?;
         self.dense_last.set(index);
         Some(index)
     }
@@ -312,6 +326,7 @@ impl QuickeningTable {
                     entries: Vec::new(),
                 });
                 let index = self.dense_functions.len() - 1;
+                self.dense_index.insert((unit, function), index);
                 self.dense_last.set(index);
                 index
             }

@@ -8830,6 +8830,57 @@ mod tests {
     }
 
     #[test]
+    fn var_dump_orders_closure_debug_fields_like_reference_php() {
+        // Reference PHP 8.5 emits name, file, line, static, this, parameter.
+        // Keep this asserted without the reference oracle so CI catches a
+        // reorder even when REFERENCE_PHP is unavailable.
+        let mut output = OutputBuffer::new();
+        let bound_this = ObjectRef::new(&empty_class("BoundTarget"));
+        call(
+            "var_dump",
+            vec![Value::closure(
+                crate::ClosurePayload::new(
+                    11,
+                    vec![crate::ClosureCaptureValue::by_value(
+                        "captured".to_owned(),
+                        Value::Int(5),
+                    )],
+                )
+                .with_bound_this(Some(bound_this))
+                .with_debug(Some(crate::ClosureDebugInfo {
+                    name: "{closure:/tmp/order.php:3}".to_owned(),
+                    file: "/tmp/order.php".to_owned(),
+                    line: 3,
+                    parameters: vec![crate::ClosureDebugParameter {
+                        name: "p".to_owned(),
+                        required: true,
+                    }],
+                })),
+            )],
+            &mut output,
+        );
+
+        let dumped = output.to_string_lossy();
+        let order = [
+            "[\"name\"]",
+            "[\"file\"]",
+            "[\"line\"]",
+            "[\"static\"]",
+            "[\"this\"]",
+            "[\"parameter\"]",
+        ]
+        .map(|field| {
+            dumped
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} missing from closure var_dump:\n{dumped}"))
+        });
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "closure var_dump fields out of reference order:\n{dumped}"
+        );
+    }
+
+    #[test]
     fn print_r_marks_array_references_to_active_arrays_as_recursion() {
         let outer_cell = ReferenceCell::new(Value::Null);
         let inner_cell = ReferenceCell::new(Value::Null);

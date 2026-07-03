@@ -462,7 +462,16 @@ impl VmCounters {
     pub(crate) fn record_instruction(&mut self, kind: &InstructionKind) {
         self.instructions_executed += 1;
         // O(1) enum-indexed count: no allocation or map walk per instruction.
-        self.ir_opcode_counts.0[ir_opcode_index(kind)] += 1;
+        let index = ir_opcode_index(kind);
+        if let Some(count) = self.ir_opcode_counts.0.get_mut(index) {
+            *count += 1;
+        } else {
+            debug_assert!(
+                false,
+                "ir_opcode_index returned {index}; extend IR_OPCODE_NAMES/IR_OPCODE_COUNT \
+                 alongside the ir_opcode_index match"
+            );
+        }
         match kind {
             InstructionKind::BindReferenceFromCall { .. }
             | InstructionKind::CallFunction { .. }
@@ -855,12 +864,17 @@ impl VmCounters {
         // O(1) discriminant-indexed count; the `bytecode_` prefix and family
         // projections are applied once per distinct opcode at fold time.
         let index = opcode as usize;
-        debug_assert!(index < DENSE_OPCODE_SLOTS);
-        let count = &mut self.dense_opcode_counts.0[index];
-        if *count == 0 {
-            self.dense_opcode_seen.push(opcode);
+        if let Some(count) = self.dense_opcode_counts.0.get_mut(index) {
+            if *count == 0 {
+                self.dense_opcode_seen.push(opcode);
+            }
+            *count += 1;
+        } else {
+            debug_assert!(
+                false,
+                "DenseOpcode discriminant {index} exceeds DENSE_OPCODE_SLOTS; grow the array"
+            );
         }
-        *count += 1;
     }
 
     pub(crate) fn record_dense_block_entry(&mut self, function: u32, block: u32) {

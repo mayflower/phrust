@@ -55901,8 +55901,8 @@ fn fast_builtin_stub_supported(name: &str) -> bool {
 }
 
 fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
-    let spec = builtin_intrinsic_spec(name)?;
-    if fast_builtin_stub_fallback_reason_for_spec(spec, values).is_some() {
+    let (spec_index, spec) = builtin_intrinsic_spec(name)?;
+    if fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).is_some() {
         return None;
     }
     match (spec.kind, values) {
@@ -55948,14 +55948,17 @@ fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
 
 #[cold]
 fn fast_builtin_stub_fallback_reason(name: &str, values: &[Value]) -> &'static str {
-    let Some(spec) = builtin_intrinsic_spec(name) else {
+    let Some((spec_index, spec)) = builtin_intrinsic_spec(name) else {
         return "unsupported";
     };
-    fast_builtin_stub_fallback_reason_for_spec(spec, values).unwrap_or("type")
+    fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).unwrap_or("type")
 }
 
-fn builtin_intrinsic_spec(name: &str) -> Option<&'static BuiltinIntrinsicSpec> {
-    BUILTIN_INTRINSICS.iter().find(|spec| spec.name == name)
+fn builtin_intrinsic_spec(name: &str) -> Option<(usize, &'static BuiltinIntrinsicSpec)> {
+    BUILTIN_INTRINSICS
+        .iter()
+        .enumerate()
+        .find(|(_, spec)| spec.name == name)
 }
 
 /// Memoized per-spec result of `builtin_intrinsic_metadata_matches`.
@@ -55963,25 +55966,22 @@ fn builtin_intrinsic_spec(name: &str) -> Option<&'static BuiltinIntrinsicSpec> {
 /// The check compares the static intrinsic spec against the static generated
 /// arginfo table (a linear scan over ~2.3k entries), so recomputing it on
 /// every intrinsic builtin call dominated the fast-stub dispatch cost.
-fn builtin_intrinsic_metadata_matches_cached(spec: &'static BuiltinIntrinsicSpec) -> bool {
+fn builtin_intrinsic_metadata_matches_cached(spec_index: usize) -> bool {
     static RESULTS: std::sync::LazyLock<Vec<bool>> = std::sync::LazyLock::new(|| {
         BUILTIN_INTRINSICS
             .iter()
             .map(builtin_intrinsic_metadata_matches)
             .collect()
     });
-    let base = BUILTIN_INTRINSICS.as_ptr() as usize;
-    let offset = spec as *const BuiltinIntrinsicSpec as usize - base;
-    let index = offset / std::mem::size_of::<BuiltinIntrinsicSpec>();
-    debug_assert!(index < BUILTIN_INTRINSICS.len());
-    RESULTS[index]
+    RESULTS[spec_index]
 }
 
 fn fast_builtin_stub_fallback_reason_for_spec(
+    spec_index: usize,
     spec: &'static BuiltinIntrinsicSpec,
     values: &[Value],
 ) -> Option<&'static str> {
-    if !builtin_intrinsic_metadata_matches_cached(spec) {
+    if !builtin_intrinsic_metadata_matches_cached(spec_index) {
         return Some("metadata");
     }
     if values.len() != spec.exact_arity {
