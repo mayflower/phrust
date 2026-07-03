@@ -24,7 +24,7 @@ impl Vm {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
-                return VmResult::success(output.clone(), Some(value));
+                return VmResult::success_no_output(Some(value));
             }
             Value::Fiber(fiber) => {
                 self.record_counter_dense_call_fallback("fiber_method_receiver");
@@ -34,7 +34,7 @@ impl Vm {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
-                return VmResult::success(output.clone(), Some(value));
+                return VmResult::success_no_output(Some(value));
             }
             Value::Object(object) => object,
             other => {
@@ -293,7 +293,7 @@ impl Vm {
             return match enum_static_method(compiled, state, &class, method, args, &|value| {
                 self.constant_value(compiled.unit(), value)
             }) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }

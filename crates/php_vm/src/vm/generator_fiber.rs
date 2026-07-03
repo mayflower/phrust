@@ -35,7 +35,7 @@ impl Vm {
             }
             input = FiberResumeInput::Value(result.return_value.unwrap_or(Value::Null));
         }
-        VmResult::success(output.clone(), Some(Value::Null))
+        VmResult::success_no_output(Some(Value::Null))
     }
 
     pub(super) fn call_generator_method(

@@ -4494,7 +4494,7 @@ impl Vm {
         {
             return result;
         }
-        VmResult::success_with_diagnostics(output.clone(), original_return_value, diagnostics)
+        VmResult::success_with_diagnostics_no_output(original_return_value, diagnostics)
     }
 
     fn call_curl_response_callback(
@@ -4674,7 +4674,7 @@ impl Vm {
         &self,
         name: &str,
         values: &[Value],
-        output: &OutputBuffer,
+        _output: &OutputBuffer,
     ) -> Option<VmResult> {
         if !fast_builtin_stub_supported(name) {
             return None;
@@ -4694,14 +4694,14 @@ impl Vm {
             self.record_counter_array_count_fast_path_hit();
             self.record_counter_internal_count_array_direct_fast_path_hit();
         }
-        Some(VmResult::success(output.clone(), Some(result)))
+        Some(VmResult::success_no_output(Some(result)))
     }
 
     fn try_execute_direct_count_array(
         &self,
         name: &str,
         values: &[Value],
-        output: &OutputBuffer,
+        _output: &OutputBuffer,
     ) -> Option<VmResult> {
         if name != "count" || values.len() != 1 {
             return None;
@@ -4711,10 +4711,9 @@ impl Vm {
         };
         self.record_counter_array_count_fast_path_hit();
         self.record_counter_internal_count_array_direct_fast_path_hit();
-        Some(VmResult::success(
-            output.clone(),
-            Some(Value::Int(array.len() as i64)),
-        ))
+        Some(VmResult::success_no_output(Some(Value::Int(
+            array.len() as i64
+        ))))
     }
 
     fn try_execute_countable_object(
@@ -4920,10 +4919,10 @@ impl Vm {
                         .as_ref()
                         .is_some_and(|value| to_bool(value).unwrap_or(false));
                     if !should_continue {
-                        return VmResult::success(output.clone(), Some(Value::Int(count)));
+                        return VmResult::success_no_output(Some(Value::Int(count)));
                     }
                 }
-                Ok(None) => return VmResult::success(output.clone(), Some(Value::Int(count))),
+                Ok(None) => return VmResult::success_no_output(Some(Value::Int(count))),
                 Err(result) => return result,
             }
         }
@@ -4989,7 +4988,7 @@ impl Vm {
                 false,
             ) {
                 Ok(Some(_)) => count += 1,
-                Ok(None) => return VmResult::success(output.clone(), Some(Value::Int(count))),
+                Ok(None) => return VmResult::success_no_output(Some(Value::Int(count))),
                 Err(result) => return result,
             }
         }
@@ -5093,7 +5092,7 @@ impl Vm {
                         result.append(value);
                     }
                 }
-                Ok(None) => return VmResult::success(output.clone(), Some(Value::Array(result))),
+                Ok(None) => return VmResult::success_no_output(Some(Value::Array(result))),
                 Err(result) => return result,
             }
         }
@@ -9501,7 +9500,7 @@ impl Vm {
                         };
                         stack.pop_recycle();
                         let mut result =
-                            VmResult::success_with_diagnostics(output.clone(), value, diagnostics);
+                            VmResult::success_with_diagnostics_no_output(value, diagnostics);
                         result.returned_explicitly = !is_synthetic_eof_return(
                             ir_function,
                             dense_instruction_span(dense, instruction),
@@ -11532,14 +11531,13 @@ impl Vm {
                     call_site_strict_types: call.call_site_strict_types,
                 };
                 let generator_args = args.into_iter().map(|arg| arg.value).collect();
-                return VmResult::success(
-                    output.clone(),
-                    Some(Value::Generator(GeneratorRef::new_with_context(
+                return VmResult::success_no_output(Some(Value::Generator(
+                    GeneratorRef::new_with_context(
                         function_id.raw(),
                         generator_args,
                         generator_context,
-                    ))),
-                );
+                    ),
+                )));
             }
             if let Some(value) = self.try_execute_jit_leaf(
                 compiled,
@@ -11550,7 +11548,7 @@ impl Vm {
                 jit_call_shape_supported,
                 &args,
             ) {
-                return VmResult::success(output.clone(), Some(value));
+                return VmResult::success_no_output(Some(value));
             }
             let activation_context = FrameActivationContext {
                 scope_class: call.scope_class.take(),
@@ -13670,8 +13668,7 @@ impl Vm {
                                 export_shared_locals(function, stack, shared);
                             }
                             stack.pop_recycle();
-                            return VmResult::success_with_diagnostics(
-                                output.clone(),
+                            return VmResult::success_with_diagnostics_no_output(
                                 value,
                                 diagnostics,
                             );
@@ -22177,7 +22174,7 @@ impl Vm {
                             );
                         }
                         let mut result =
-                            VmResult::success_with_diagnostics(output.clone(), None, diagnostics);
+                            VmResult::success_with_diagnostics_no_output(None, diagnostics);
                         result.yielded = Some(GeneratorYield { key, value });
                         return result;
                     }
@@ -22228,11 +22225,8 @@ impl Vm {
                                         pending_control: pending_control.clone(),
                                     },
                                 );
-                                let mut result = VmResult::success_with_diagnostics(
-                                    output.clone(),
-                                    None,
-                                    diagnostics,
-                                );
+                                let mut result =
+                                    VmResult::success_with_diagnostics_no_output(None, diagnostics);
                                 result.yielded = Some(GeneratorYield { key, value });
                                 return result;
                             }
@@ -24986,7 +24980,7 @@ impl Vm {
                         }
                     }
                     let mut result =
-                        VmResult::success_with_diagnostics(output.clone(), value, diagnostics);
+                        VmResult::success_with_diagnostics_no_output(value, diagnostics);
                     result.return_ref = return_ref;
                     result.returned_explicitly = !is_synthetic_eof_return(
                         function,
@@ -25613,7 +25607,7 @@ impl Vm {
                     };
                     let _ = state.ini.set("ignore_user_abort", next);
                 }
-                VmResult::success(output.clone(), Some(Value::Int(i64::from(previous))))
+                VmResult::success_no_output(Some(Value::Int(i64::from(previous))))
             }
             "ini_get" => {
                 if values.len() != 1 {
@@ -25633,7 +25627,7 @@ impl Vm {
                     .get(&option)
                     .map(Value::string)
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "ini_set" => {
                 if values.len() != 2 {
@@ -25663,7 +25657,7 @@ impl Vm {
                 if option.eq_ignore_ascii_case("precision") {
                     apply_float_string_precision(&state.ini);
                 }
-                VmResult::success(output.clone(), Some(previous))
+                VmResult::success_no_output(Some(previous))
             }
             "ini_get_all" => {
                 if values.len() > 2 {
@@ -25686,16 +25680,15 @@ impl Vm {
                     if !extension.eq_ignore_ascii_case("standard")
                         && !extension.eq_ignore_ascii_case("core")
                     {
-                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                        return VmResult::success_no_output(Some(Value::Bool(false)));
                     }
                 }
                 let details = values
                     .get(1)
                     .is_none_or(|value| to_bool(value).unwrap_or(true));
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Array(ini_get_all_array(&state.ini, details))),
-                )
+                VmResult::success_no_output(Some(Value::Array(ini_get_all_array(
+                    &state.ini, details,
+                ))))
             }
             "get_cfg_var" => {
                 if values.len() != 1 {
@@ -25715,7 +25708,7 @@ impl Vm {
                     .cfg_var(&option)
                     .map(Value::string)
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             _ => self.runtime_error(
                 output,
@@ -25763,10 +25756,10 @@ impl Vm {
                     None => 0,
                 };
                 match message_type {
-                    0 | 4 => VmResult::success(output.clone(), Some(Value::Bool(true))),
+                    0 | 4 => VmResult::success_no_output(Some(Value::Bool(true))),
                     3 => {
                         let Some(destination) = values.get(2) else {
-                            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                            return VmResult::success_no_output(Some(Value::Bool(false)));
                         };
                         let destination = match to_string(destination) {
                             Ok(destination) => destination.to_string_lossy(),
@@ -25775,7 +25768,7 @@ impl Vm {
                             }
                         };
                         if destination.is_empty() {
-                            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                            return VmResult::success_no_output(Some(Value::Bool(false)));
                         }
                         match std::fs::OpenOptions::new()
                             .create(true)
@@ -25785,12 +25778,12 @@ impl Vm {
                                 use std::io::Write;
                                 file.write_all(message.as_bytes())
                             }) {
-                            Ok(()) => VmResult::success(output.clone(), Some(Value::Bool(true))),
-                            Err(_) => VmResult::success(output.clone(), Some(Value::Bool(false))),
+                            Ok(()) => VmResult::success_no_output(Some(Value::Bool(true))),
+                            Err(_) => VmResult::success_no_output(Some(Value::Bool(false))),
                         }
                     }
-                    1 => VmResult::success(output.clone(), Some(Value::Bool(false))),
-                    _ => VmResult::success(output.clone(), Some(Value::Bool(false))),
+                    1 => VmResult::success_no_output(Some(Value::Bool(false))),
+                    _ => VmResult::success_no_output(Some(Value::Bool(false))),
                 }
             }
             "error_reporting" => {
@@ -25812,7 +25805,7 @@ impl Vm {
                     };
                     let _ = state.ini.set("error_reporting", next.to_string());
                 }
-                VmResult::success(output.clone(), Some(Value::Int(previous)))
+                VmResult::success_no_output(Some(Value::Int(previous)))
             }
             "set_error_handler" => {
                 if !(1..=2).contains(&values.len()) {
@@ -25845,7 +25838,7 @@ impl Vm {
                 state
                     .error_handlers
                     .push(ErrorHandlerEntry { callback, levels });
-                VmResult::success(output.clone(), Some(previous))
+                VmResult::success_no_output(Some(previous))
             }
             "restore_error_handler" => {
                 if !values.is_empty() {
@@ -25857,7 +25850,7 @@ impl Vm {
                     );
                 }
                 let _ = state.error_handlers.pop();
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "error_get_last" => {
                 if !values.is_empty() {
@@ -25868,7 +25861,7 @@ impl Vm {
                         "E_PHP_VM_ERROR_ARITY: error_get_last expects no arguments",
                     );
                 }
-                VmResult::success(output.clone(), Some(Self::error_get_last_value(state)))
+                VmResult::success_no_output(Some(Self::error_get_last_value(state)))
             }
             "set_exception_handler" => {
                 if values.len() != 1 {
@@ -25890,7 +25883,7 @@ impl Vm {
                     .map(|callback| Value::Callable(callback.clone()))
                     .unwrap_or(Value::Null);
                 state.exception_handlers.push(callback);
-                VmResult::success(output.clone(), Some(previous))
+                VmResult::success_no_output(Some(previous))
             }
             "restore_exception_handler" => {
                 if !values.is_empty() {
@@ -25902,7 +25895,7 @@ impl Vm {
                     );
                 }
                 let _ = state.exception_handlers.pop();
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "register_shutdown_function" => {
                 if values.is_empty() {
@@ -25928,7 +25921,7 @@ impl Vm {
                 state
                     .shutdown_functions
                     .push(ShutdownFunctionEntry { callback, args });
-                VmResult::success(output.clone(), Some(Value::Null))
+                VmResult::success_no_output(Some(Value::Null))
             }
             "trigger_error" | "user_error" => {
                 self.call_trigger_error_builtin(compiled, name, values, output, stack, state)
@@ -26000,7 +25993,7 @@ impl Vm {
             }
         };
         if handled {
-            return VmResult::success(output.clone(), Some(Value::Bool(true)));
+            return VmResult::success_no_output(Some(Value::Bool(true)));
         }
 
         let reported = error_reporting_allows(state, level);
@@ -26027,7 +26020,7 @@ impl Vm {
         } else {
             Vec::new()
         };
-        VmResult::success_with_diagnostics(output.clone(), Some(Value::Bool(true)), diagnostics)
+        VmResult::success_with_diagnostics_no_output(Some(Value::Bool(true)), diagnostics)
     }
 
     fn dispatch_error_handler(
@@ -26220,7 +26213,7 @@ impl Vm {
                     );
                 }
                 output.start_buffer();
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "ob_get_contents" => {
                 if !values.is_empty() {
@@ -26235,7 +26228,7 @@ impl Vm {
                     .current_buffer_bytes()
                     .map(|bytes| Value::string(bytes.to_vec()))
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "ob_get_length" => {
                 if !values.is_empty() {
@@ -26250,7 +26243,7 @@ impl Vm {
                     .current_buffer_len()
                     .map(|length| Value::Int(length as i64))
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "ob_get_level" => {
                 if !values.is_empty() {
@@ -26261,10 +26254,7 @@ impl Vm {
                         "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_get_level expects no arguments",
                     );
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Int(output.buffer_level() as i64)),
-                )
+                VmResult::success_no_output(Some(Value::Int(output.buffer_level() as i64)))
             }
             "ob_get_clean" => {
                 if !values.is_empty() {
@@ -26279,7 +26269,7 @@ impl Vm {
                     .pop_buffer_clean()
                     .map(Value::string)
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "ob_get_flush" => {
                 if !values.is_empty() {
@@ -26297,7 +26287,7 @@ impl Vm {
                 if !matches!(value, Value::Bool(false)) {
                     output.pop_buffer_flush();
                 }
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "ob_end_clean" => {
                 if !values.is_empty() {
@@ -26308,10 +26298,7 @@ impl Vm {
                         "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_end_clean expects no arguments",
                     );
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Bool(output.pop_buffer_clean().is_some())),
-                )
+                VmResult::success_no_output(Some(Value::Bool(output.pop_buffer_clean().is_some())))
             }
             "ob_end_flush" => {
                 if !values.is_empty() {
@@ -26322,10 +26309,7 @@ impl Vm {
                         "E_PHP_VM_OUTPUT_BUFFER_ARITY: ob_end_flush expects no arguments",
                     );
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Bool(output.pop_buffer_flush().is_some())),
-                )
+                VmResult::success_no_output(Some(Value::Bool(output.pop_buffer_flush().is_some())))
             }
             "flush" => {
                 if !values.is_empty() {
@@ -26337,7 +26321,7 @@ impl Vm {
                     );
                 }
                 output.flush_active_buffers_to_root();
-                VmResult::success(output.clone(), Some(Value::Null))
+                VmResult::success_no_output(Some(Value::Null))
             }
             _ => self.runtime_error(
                 output,
@@ -26375,10 +26359,9 @@ impl Vm {
                     .first()
                     .is_none_or(|value| matches!(value, Value::Null))
                 {
-                    return VmResult::success(
-                        output.clone(),
-                        Some(Value::Array(env_entries_array(&state.env))),
-                    );
+                    return VmResult::success_no_output(Some(Value::Array(env_entries_array(
+                        &state.env,
+                    ))));
                 }
                 let key = match to_string(&values[0]) {
                     Ok(value) => value.to_string_lossy(),
@@ -26390,7 +26373,7 @@ impl Vm {
                     .find(|(entry_key, _)| entry_key == &key)
                     .map(|(_, value)| Value::string(value.clone()))
                     .unwrap_or(Value::Bool(false));
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "putenv" => {
                 if values.len() != 1 {
@@ -26407,16 +26390,16 @@ impl Vm {
                 };
                 if let Some((key, value)) = assignment.split_once('=') {
                     if key.is_empty() {
-                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                        return VmResult::success_no_output(Some(Value::Bool(false)));
                     }
                     set_env_entry(&mut state.env, key.to_string(), Some(value.to_string()));
                 } else {
                     if assignment.is_empty() {
-                        return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                        return VmResult::success_no_output(Some(Value::Bool(false)));
                     }
                     set_env_entry(&mut state.env, assignment, None);
                 }
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "php_sapi_name" => {
                 if !values.is_empty() {
@@ -26427,7 +26410,7 @@ impl Vm {
                         "E_PHP_VM_ENV_ARITY: php_sapi_name expects no arguments",
                     );
                 }
-                VmResult::success(output.clone(), Some(Value::string("cli")))
+                VmResult::success_no_output(Some(Value::string("cli")))
             }
             "php_uname" => {
                 if values.len() > 1 {
@@ -26447,7 +26430,7 @@ impl Vm {
                     },
                     None => "a".to_string(),
                 };
-                VmResult::success(output.clone(), Some(Value::string(php_uname_value(&mode))))
+                VmResult::success_no_output(Some(Value::string(php_uname_value(&mode))))
             }
             "get_current_user" => {
                 if !values.is_empty() {
@@ -26458,7 +26441,7 @@ impl Vm {
                         "E_PHP_VM_ENV_ARITY: get_current_user expects no arguments",
                     );
                 }
-                VmResult::success(output.clone(), Some(Value::string("phrust")))
+                VmResult::success_no_output(Some(Value::string("phrust")))
             }
             _ => self.runtime_error(
                 output,
@@ -26522,7 +26505,7 @@ impl Vm {
         stack: &mut CallStack,
     ) -> VmResult {
         match name {
-            "shell_exec" => VmResult::success(output.clone(), Some(Value::string(mock_output))),
+            "shell_exec" => VmResult::success_no_output(Some(Value::string(mock_output))),
             "exec" => {
                 if let Some(arg) = args.get(1)
                     && let Err(message) =
@@ -26536,17 +26519,15 @@ impl Vm {
                 {
                     return self.runtime_error(output, compiled, stack, message);
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::string(process_last_output_line(mock_output))),
-                )
+                VmResult::success_no_output(Some(Value::string(process_last_output_line(
+                    mock_output,
+                ))))
             }
             "system" => {
                 output.write_bytes(mock_output.as_bytes());
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::string(process_last_output_line(mock_output))),
-                )
+                VmResult::success_no_output(Some(Value::string(process_last_output_line(
+                    mock_output,
+                ))))
             }
             "passthru" => {
                 output.write_bytes(mock_output.as_bytes());
@@ -26556,7 +26537,7 @@ impl Vm {
                 {
                     return self.runtime_error(output, compiled, stack, message);
                 }
-                VmResult::success(output.clone(), Some(Value::Null))
+                VmResult::success_no_output(Some(Value::Null))
             }
             "proc_open" | "proc_close" | "proc_get_status" | "popen" | "pclose" => {
                 process_unsupported_mock_result(output, name, stack_trace(compiled, stack))
@@ -26597,7 +26578,7 @@ impl Vm {
             ))),
         };
         match result {
-            Ok(value) => VmResult::success(output.clone(), Some(value)),
+            Ok(value) => VmResult::success_no_output(Some(value)),
             Err(ArrayCallbackError::Runtime(result)) => *result,
             Err(ArrayCallbackError::BuiltinType { function, actual }) => {
                 array_callback_type_error(output, compiled, stack, function, &actual)
@@ -26797,7 +26778,7 @@ impl Vm {
             }
         };
         match result {
-            Ok(value) => VmResult::success(output.clone(), Some(value)),
+            Ok(value) => VmResult::success_no_output(Some(value)),
             Err(ArrayCallbackError::Runtime(result)) => *result,
             Err(ArrayCallbackError::BuiltinType { function, actual }) => {
                 array_callback_type_error(output, compiled, stack, function, &actual)
@@ -27151,7 +27132,7 @@ impl Vm {
             self.call_array_sort_builtin_inner(compiled, name, args, output, stack, state)
         };
         match result {
-            Ok(value) => VmResult::success(output.clone(), Some(value)),
+            Ok(value) => VmResult::success_no_output(Some(value)),
             Err(ArrayCallbackError::Runtime(result)) => *result,
             Err(ArrayCallbackError::BuiltinType { function, actual }) => {
                 array_callback_type_error(output, compiled, stack, function, &actual)
@@ -28543,22 +28524,25 @@ impl Vm {
         state: &mut ExecutionState,
         allow_by_ref_value_warnings: bool,
     ) -> VmResult {
-        let elements = array
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
-        let [target, method]: [Value; 2] = match elements.try_into() {
-            Ok(elements) => elements,
-            Err(_) => {
-                return self.runtime_error(
-                    output,
-                    compiled,
-                    stack,
-                    "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable arrays must contain exactly target and method",
-                );
-            }
+        if array.len() != 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable arrays must contain exactly target and method",
+            );
+        }
+        let (Some(target), Some(method)) =
+            (array.get(&ArrayKey::Int(0)), array.get(&ArrayKey::Int(1)))
+        else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable arrays must contain exactly target and method",
+            );
         };
-        let Some(method) = callable_string_value(method) else {
+        let Some(method) = callable_string_ref(method) else {
             return self.runtime_error(
                 output,
                 compiled,
@@ -28566,7 +28550,7 @@ impl Vm {
                 "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable array method must be string",
             );
         };
-        match callable_resolve_reference(target) {
+        match callable_resolve_reference(target.clone()) {
             Value::Object(object) => {
                 self.call_object_method_callable(
                     compiled, object, &method, args, call_span, output, stack, state,
@@ -28695,7 +28679,7 @@ impl Vm {
                     ) {
                         return result;
                     }
-                    return VmResult::success(output.clone(), Some(Value::Null));
+                    return VmResult::success_no_output(Some(Value::Null));
                 }
                 self.call_bound_object_method_callable(
                     compiled,
@@ -28721,7 +28705,7 @@ impl Vm {
                     ) {
                         return result;
                     }
-                    return VmResult::success(output.clone(), Some(Value::Null));
+                    return VmResult::success_no_output(Some(Value::Null));
                 }
                 self.call_callable_inner(
                     compiled,
@@ -28807,7 +28791,7 @@ impl Vm {
                     {
                         return result;
                     }
-                    return VmResult::success(output.clone(), Some(Value::Null));
+                    return VmResult::success_no_output(Some(Value::Null));
                 }
                 None
             }
@@ -28825,7 +28809,7 @@ impl Vm {
             }
         };
         let value = bind_closure_callable_value(callable, bound_this);
-        VmResult::success(output.clone(), Some(value))
+        VmResult::success_no_output(Some(value))
     }
 
     fn emit_closure_internal_scope_bind_warning(
@@ -29002,7 +28986,7 @@ impl Vm {
                         method,
                         args.into_iter().map(|arg| arg.value).collect(),
                     ) {
-                        Ok(value) => VmResult::success(output.clone(), Some(value)),
+                        Ok(value) => VmResult::success_no_output(Some(value)),
                         Err(message) => self.runtime_error(output, compiled, stack, message),
                     };
                 }
@@ -29248,7 +29232,7 @@ impl Vm {
                 args,
                 &self.options.runtime_context,
             ) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
@@ -29256,7 +29240,7 @@ impl Vm {
             is_spl_container_runtime_class(&class) && spl_container_method_is_supported(method)
         }) {
             return match call_spl_container_method(object, method, args) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
@@ -29264,7 +29248,7 @@ impl Vm {
             is_spl_heap_runtime_class(&class) && spl_heap_method_is_supported(method)
         }) {
             return match call_spl_heap_method(object, method, args) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
@@ -29273,7 +29257,7 @@ impl Vm {
         }) {
             return match call_spl_file_method(&object, method, args, &self.options.runtime_context)
             {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
@@ -29283,20 +29267,20 @@ impl Vm {
                 method,
                 args.into_iter().map(|arg| arg.value).collect(),
             ) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
         if is_zip_runtime_class(&object.class_name()) {
             return match call_zip_method(&object, method, args, &self.options.runtime_context) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
         if is_xml_runtime_class(&object.class_name()) {
             let values = args.into_iter().map(|arg| arg.value).collect();
             return match call_xml_runtime_method(&object, method, values) {
-                Ok(value) => VmResult::success(output.clone(), Some(value)),
+                Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
@@ -29338,7 +29322,7 @@ impl Vm {
                         method,
                         args.into_iter().map(|arg| arg.value).collect(),
                     ) {
-                        Ok(value) => VmResult::success(output.clone(), Some(value)),
+                        Ok(value) => VmResult::success_no_output(Some(value)),
                         Err(message) => self.runtime_error(output, compiled, stack, message),
                     };
                 }
@@ -30191,7 +30175,7 @@ impl Vm {
                 "E_PHP_VM_FIBER_FRAME_MISSING: fiber frame missing at suspend",
             ));
         };
-        let mut result = VmResult::success(output.clone(), None);
+        let mut result = VmResult::success_no_output(None);
         result.fiber_suspension = Some(FiberSuspension {
             value,
             continuations: vec![FiberContinuation {
@@ -31858,14 +31842,14 @@ impl Vm {
                 Ok(value) => value,
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             };
-            return VmResult::success(output.clone(), Some(value));
+            return VmResult::success_no_output(Some(value));
         }
         if is_php_token_runtime_class(class_name) {
             let value = match php_token_static_method_value(class_name, method, args) {
                 Ok(value) => value,
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             };
-            return VmResult::success(output.clone(), Some(value));
+            return VmResult::success_no_output(Some(value));
         }
         if internal_extension_static_class(class_name) {
             let values = args.into_iter().map(|arg| arg.value).collect();
@@ -31873,7 +31857,7 @@ impl Vm {
                 Ok(value) => value,
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             };
-            return VmResult::success(output.clone(), Some(value));
+            return VmResult::success_no_output(Some(value));
         }
         if let Err(result) = self.autoload_static_class_if_missing(
             compiled,
@@ -31904,7 +31888,7 @@ impl Vm {
                 Ok(value) => value,
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             };
-            return VmResult::success(output.clone(), Some(value));
+            return VmResult::success_no_output(Some(value));
         }
         let scope = method_lookup_scope_for_static_call(compiled, stack, class_name);
         let resolved = match lookup_resolved_method_in_state(
@@ -32140,7 +32124,7 @@ impl Vm {
                             resolved.canonical_path.display(),
                             state.include_stack.len(),
                         ));
-                        return VmResult::success(output.clone(), Some(Value::Bool(true)));
+                        return VmResult::success_no_output(Some(Value::Bool(true)));
                     }
                     state.included_once.push(resolved.canonical_path.clone());
                     include_path_recorded = true;
@@ -32382,7 +32366,7 @@ impl Vm {
                         loaded.canonical_path.display(),
                         state.include_stack.len(),
                     ));
-                    return VmResult::success(output.clone(), Some(Value::Bool(true)));
+                    return VmResult::success_no_output(Some(Value::Bool(true)));
                 }
                 state.included_once.push(loaded.canonical_path.clone());
                 self.record_include_trace_event(format!(
@@ -32616,7 +32600,7 @@ impl Vm {
             None => state.spl_autoload_extensions.clone(),
         };
         if extensions.is_empty() {
-            return VmResult::success(output.clone(), Some(Value::Null));
+            return VmResult::success_no_output(Some(Value::Null));
         }
 
         let base = class_name.to_ascii_lowercase();
@@ -32654,7 +32638,7 @@ impl Vm {
                 break;
             }
         }
-        VmResult::success(output.clone(), Some(Value::Null))
+        VmResult::success_no_output(Some(Value::Null))
     }
 
     fn call_autoload_builtin(
@@ -32722,7 +32706,7 @@ impl Vm {
                     .autoload_registry
                     .register_with_prepend(callback, prepend);
                 state.bump_autoload_stack_epoch();
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "spl_autoload_unregister" => {
                 let Some(callback) = values.first() else {
@@ -32756,20 +32740,20 @@ impl Vm {
                     }
                     state.autoload_registry.clear();
                     state.bump_autoload_stack_epoch();
-                    return VmResult::success(output.clone(), Some(Value::Bool(true)));
+                    return VmResult::success_no_output(Some(Value::Bool(true)));
                 }
                 let removed = state.autoload_registry.unregister(&callback);
                 if removed {
                     state.bump_autoload_stack_epoch();
                 }
-                VmResult::success(output.clone(), Some(Value::Bool(removed)))
+                VmResult::success_no_output(Some(Value::Bool(removed)))
             }
             "spl_autoload_functions" => {
                 let mut array = PhpArray::new();
                 for callback in state.autoload_registry.callbacks() {
                     array.append(autoload_callback_public_value(compiled, state, callback));
                 }
-                VmResult::success(output.clone(), Some(Value::Array(array)))
+                VmResult::success_no_output(Some(Value::Array(array)))
             }
             "spl_autoload_call" => {
                 let Some(class_name) = values.first() else {
@@ -32785,7 +32769,7 @@ impl Vm {
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 match self.autoload_class(compiled, &class_name, output, stack, state, None) {
-                    Ok(()) => VmResult::success(output.clone(), Some(Value::Null)),
+                    Ok(()) => VmResult::success_no_output(Some(Value::Null)),
                     Err(result) => result,
                 }
             }
@@ -32807,10 +32791,9 @@ impl Vm {
                     };
                     state.spl_autoload_extensions = extensions;
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::string(state.spl_autoload_extensions.clone())),
-                )
+                VmResult::success_no_output(Some(Value::string(
+                    state.spl_autoload_extensions.clone(),
+                )))
             }
             "spl_autoload" => self
                 .execute_spl_autoload(compiled, values, call_site, call_span, output, stack, state),
@@ -32827,13 +32810,10 @@ impl Vm {
                     Ok(name) => name.to_string_lossy(),
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Bool(matches!(
-                        global_constant_value(compiled, state, stack, &constant_name),
-                        Ok(Some(_))
-                    ))),
-                )
+                VmResult::success_no_output(Some(Value::Bool(matches!(
+                    global_constant_value(compiled, state, stack, &constant_name),
+                    Ok(Some(_))
+                ))))
             }
             "define" => {
                 if values.len() < 2 {
@@ -32849,7 +32829,7 @@ impl Vm {
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 if constant_name.is_empty() {
-                    return VmResult::success(output.clone(), Some(Value::Bool(false)));
+                    return VmResult::success_no_output(Some(Value::Bool(false)));
                 }
                 if matches!(
                     global_constant_value(compiled, state, stack, &constant_name),
@@ -32867,8 +32847,7 @@ impl Vm {
                     ) {
                         return result;
                     }
-                    return VmResult::success_with_diagnostics(
-                        output.clone(),
+                    return VmResult::success_with_diagnostics_no_output(
                         Some(Value::Bool(false)),
                         diagnostics,
                     );
@@ -32877,7 +32856,7 @@ impl Vm {
                     .user_constants
                     .insert(constant_name, effective_value(&values[1]));
                 state.bump_lookup_epoch();
-                VmResult::success(output.clone(), Some(Value::Bool(true)))
+                VmResult::success_no_output(Some(Value::Bool(true)))
             }
             "constant" => {
                 let Some(constant_name) = values.first() else {
@@ -32906,7 +32885,7 @@ impl Vm {
                     }
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             "extension_loaded" => {
                 let Some(extension_name) = values.first() else {
@@ -32922,13 +32901,9 @@ impl Vm {
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 let registry = php_std::ExtensionRegistry::standard_library();
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Bool(php_std::introspection::extension_loaded(
-                        &registry,
-                        &extension_name,
-                    ))),
-                )
+                VmResult::success_no_output(Some(Value::Bool(
+                    php_std::introspection::extension_loaded(&registry, &extension_name),
+                )))
             }
             "function_exists" => {
                 let Some(function_name) = values.first() else {
@@ -32944,15 +32919,12 @@ impl Vm {
                     Err(message) => return self.runtime_error(output, compiled, stack, message),
                 };
                 let registry = php_std::ExtensionRegistry::standard_library();
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Bool(
-                        compiled.lookup_function(&function_name).is_some()
-                            || dynamic_function_in_state(state, &function_name).is_some()
-                            || BuiltinRegistry::new().contains(&function_name)
-                            || php_std::introspection::function_exists(&registry, &function_name),
-                    )),
-                )
+                VmResult::success_no_output(Some(Value::Bool(
+                    compiled.lookup_function(&function_name).is_some()
+                        || dynamic_function_in_state(state, &function_name).is_some()
+                        || BuiltinRegistry::new().contains(&function_name)
+                        || php_std::introspection::function_exists(&registry, &function_name),
+                )))
             }
             "get_defined_functions" => {
                 if values.len() > 1 {
@@ -33015,7 +32987,7 @@ impl Vm {
                     Ok(exists) => exists,
                     Err(result) => return result,
                 };
-                VmResult::success(output.clone(), Some(Value::Bool(exists)))
+                VmResult::success_no_output(Some(Value::Bool(exists)))
             }
             "class_alias" => self.call_class_alias_builtin(
                 compiled, values, call_site, call_span, output, stack, state,
@@ -33073,12 +33045,9 @@ impl Vm {
             }
             "get_loaded_extensions" => {
                 let registry = php_std::ExtensionRegistry::standard_library();
-                VmResult::success(
-                    output.clone(),
-                    Some(php_std::introspection::get_loaded_extensions_value(
-                        &registry,
-                    )),
-                )
+                VmResult::success_no_output(Some(
+                    php_std::introspection::get_loaded_extensions_value(&registry),
+                ))
             }
             "phpversion" => {
                 if values.len() > 1 {
@@ -33106,7 +33075,7 @@ impl Vm {
                         }
                     }
                 };
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             _ => self.runtime_error(
                 output,
@@ -33211,7 +33180,7 @@ impl Vm {
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             }
         }
-        VmResult::success(output.clone(), Some(Value::Bool(callable)))
+        VmResult::success_no_output(Some(Value::Bool(callable)))
     }
 
     fn autoload_callable_class(
@@ -33307,7 +33276,7 @@ impl Vm {
             );
         }
 
-        VmResult::success(output.clone(), Some(Value::Array(result)))
+        VmResult::success_no_output(Some(Value::Array(result)))
     }
 
     fn call_method_exists_builtin(
@@ -33343,7 +33312,7 @@ impl Vm {
         let exists = lookup_method_in_state(compiled, state, &class_name, &method)
             .map(|value| value.is_some())
             .unwrap_or(false);
-        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+        VmResult::success_no_output(Some(Value::Bool(exists)))
     }
 
     fn call_property_exists_builtin(
@@ -33380,7 +33349,7 @@ impl Vm {
                 .into_iter()
                 .any(|(name, _)| name == property)
         {
-            return VmResult::success(output.clone(), Some(Value::Bool(true)));
+            return VmResult::success_no_output(Some(Value::Bool(true)));
         }
         if lookup_class_in_state(compiled, state, &class_name).is_none()
             && let Err(result) =
@@ -33391,7 +33360,7 @@ impl Vm {
         let exists = lookup_property_in_state(compiled, state, &class_name, &property)
             .map(|value| value.is_some())
             .unwrap_or(false);
-        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+        VmResult::success_no_output(Some(Value::Bool(exists)))
     }
 
     fn call_get_object_vars_builtin(
@@ -33417,12 +33386,9 @@ impl Vm {
                 "E_PHP_VM_SYMBOL_TYPE: get_object_vars expects object",
             );
         };
-        VmResult::success(
-            output.clone(),
-            Some(Value::Array(object_vars_array(
-                compiled, stack, &object, false,
-            ))),
-        )
+        VmResult::success_no_output(Some(Value::Array(object_vars_array(
+            compiled, stack, &object, false,
+        ))))
     }
 
     fn call_get_mangled_object_vars_builtin(
@@ -33448,12 +33414,9 @@ impl Vm {
                 "E_PHP_VM_SYMBOL_TYPE: get_mangled_object_vars expects object",
             );
         };
-        VmResult::success(
-            output.clone(),
-            Some(Value::Array(object_vars_array(
-                compiled, stack, &object, true,
-            ))),
-        )
+        VmResult::success_no_output(Some(Value::Array(object_vars_array(
+            compiled, stack, &object, true,
+        ))))
     }
 
     fn call_get_class_methods_builtin(
@@ -33483,13 +33446,13 @@ impl Vm {
             return result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         };
         let mut array = PhpArray::new();
         for name in visible_class_methods(compiled, stack, state, &class) {
             array.append(Value::string(name));
         }
-        VmResult::success(output.clone(), Some(Value::Array(array)))
+        VmResult::success_no_output(Some(Value::Array(array)))
     }
 
     fn call_get_class_vars_builtin(
@@ -33519,14 +33482,11 @@ impl Vm {
             return result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         };
-        VmResult::success(
-            output.clone(),
-            Some(Value::Array(visible_class_vars(
-                compiled, stack, state, &class,
-            ))),
-        )
+        VmResult::success_no_output(Some(Value::Array(visible_class_vars(
+            compiled, stack, state, &class,
+        ))))
     }
 
     fn call_user_func_builtin(
@@ -33888,10 +33848,9 @@ impl Vm {
                         "E_PHP_VM_CALL_CONTEXT_ARITY: func_get_args expects no arguments",
                     );
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Array(PhpArray::from_packed(frame.arguments.clone()))),
-                )
+                VmResult::success_no_output(Some(Value::Array(PhpArray::from_packed(
+                    frame.arguments.clone(),
+                ))))
             }
             "func_num_args" => {
                 if !values.is_empty() {
@@ -33902,10 +33861,7 @@ impl Vm {
                         "E_PHP_VM_CALL_CONTEXT_ARITY: func_num_args expects no arguments",
                     );
                 }
-                VmResult::success(
-                    output.clone(),
-                    Some(Value::Int(frame.arguments.len() as i64)),
-                )
+                VmResult::success_no_output(Some(Value::Int(frame.arguments.len() as i64)))
             }
             "func_get_arg" => {
                 if values.len() != 1 {
@@ -33936,7 +33892,7 @@ impl Vm {
                         format!("E_PHP_VM_CALL_CONTEXT_INDEX: func_get_arg index {index} is out of range"),
                     );
                 };
-                VmResult::success(output.clone(), Some(value))
+                VmResult::success_no_output(Some(value))
             }
             _ => self.runtime_error(
                 output,
@@ -33997,14 +33953,11 @@ impl Vm {
                 output.write_test_str(&text);
                 output.write_bytes(b"\n");
             }
-            return VmResult::success(output.clone(), Some(Value::Null));
+            return VmResult::success_no_output(Some(Value::Null));
         }
-        VmResult::success(
-            output.clone(),
-            Some(Value::Array(debug_backtrace_array(
-                compiled, stack, options, limit,
-            ))),
-        )
+        VmResult::success_no_output(Some(Value::Array(debug_backtrace_array(
+            compiled, stack, options, limit,
+        ))))
     }
 
     fn call_get_called_class_builtin(
@@ -34034,7 +33987,7 @@ impl Vm {
         let display_name = lookup_class_in_state(compiled, state, &called_class)
             .map(|class| class.display_name)
             .unwrap_or(called_class);
-        VmResult::success(output.clone(), Some(Value::string(display_name)))
+        VmResult::success_no_output(Some(Value::string(display_name)))
     }
 
     fn call_is_subclass_of_builtin(
@@ -34062,7 +34015,7 @@ impl Vm {
                 Ok(name) => name.to_string_lossy(),
                 Err(message) => return self.runtime_error(output, compiled, stack, message),
             },
-            None => return VmResult::success(output.clone(), Some(Value::Bool(false))),
+            None => return VmResult::success_no_output(Some(Value::Bool(false))),
         };
         let target_name = match to_string(&values[1]) {
             Ok(name) => name.to_string_lossy(),
@@ -34078,7 +34031,7 @@ impl Vm {
         }
         let exists = class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
             .unwrap_or(false);
-        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+        VmResult::success_no_output(Some(Value::Bool(exists)))
     }
 
     fn call_is_a_builtin(
@@ -34102,7 +34055,7 @@ impl Vm {
             .is_some_and(|value| to_bool(value).unwrap_or(false));
         let class_name = match class_name_for_is_a_subject(&values[0], allow_string) {
             Ok(Some(name)) => name,
-            Ok(None) => return VmResult::success(output.clone(), Some(Value::Bool(false))),
+            Ok(None) => return VmResult::success_no_output(Some(Value::Bool(false))),
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
         let target_name = match to_string(&values[1]) {
@@ -34122,7 +34075,7 @@ impl Vm {
         }
         let exists =
             class_is_a_in_state(compiled, state, &class_name, &target_name).unwrap_or(false);
-        VmResult::success(output.clone(), Some(Value::Bool(exists)))
+        VmResult::success_no_output(Some(Value::Bool(exists)))
     }
 
     fn call_get_class_builtin(
@@ -34153,7 +34106,7 @@ impl Vm {
         let display_name = lookup_class_in_state(compiled, state, &class_name)
             .map(|class| class.display_name)
             .unwrap_or_else(|| object.display_name());
-        VmResult::success(output.clone(), Some(Value::string(display_name)))
+        VmResult::success_no_output(Some(Value::string(display_name)))
     }
 
     fn call_get_parent_class_builtin(
@@ -34191,7 +34144,7 @@ impl Vm {
             })
             .map(Value::string)
             .unwrap_or(Value::Bool(false));
-        VmResult::success(output.clone(), Some(parent))
+        VmResult::success_no_output(Some(parent))
     }
 
     fn call_class_parents_builtin(
@@ -34239,7 +34192,7 @@ impl Vm {
             ) {
                 return result;
             }
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         };
         let mut array = PhpArray::new();
         let mut parent = class.parent;
@@ -34257,7 +34210,7 @@ impl Vm {
             parent =
                 lookup_class_in_state(compiled, state, &normalized).and_then(|class| class.parent);
         }
-        VmResult::success(output.clone(), Some(Value::Array(array)))
+        VmResult::success_no_output(Some(Value::Array(array)))
     }
 
     fn call_class_implements_builtin(
@@ -34305,7 +34258,7 @@ impl Vm {
             ) {
                 return result;
             }
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         };
         let mut array = PhpArray::new();
         let mut interfaces = Vec::new();
@@ -34313,7 +34266,7 @@ impl Vm {
         for (_, display) in interfaces {
             array.insert(string_key(&display), Value::string(display));
         }
-        VmResult::success(output.clone(), Some(Value::Array(array)))
+        VmResult::success_no_output(Some(Value::Array(array)))
     }
 
     fn emit_class_introspection_missing_warning(
@@ -34599,7 +34552,7 @@ impl Vm {
         &self,
         compiled: &CompiledUnit,
         name: &str,
-        output: &mut OutputBuffer,
+        _output: &mut OutputBuffer,
         state: &ExecutionState,
     ) -> VmResult {
         let classes = declared_classes_in_state(compiled, state);
@@ -34612,16 +34565,13 @@ impl Vm {
             })
             .map(|class| Value::string(class.display_name))
             .collect();
-        VmResult::success(
-            output.clone(),
-            Some(Value::Array(PhpArray::from_packed(values))),
-        )
+        VmResult::success_no_output(Some(Value::Array(PhpArray::from_packed(values))))
     }
 
     fn call_get_defined_functions_builtin(
         &self,
         compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
+        _output: &mut OutputBuffer,
         state: &ExecutionState,
     ) -> VmResult {
         let mut user_functions = BTreeSet::new();
@@ -34650,13 +34600,13 @@ impl Vm {
             string_key("user"),
             Value::Array(defined_symbol_names_array(&user_functions)),
         );
-        VmResult::success(output.clone(), Some(Value::Array(array)))
+        VmResult::success_no_output(Some(Value::Array(array)))
     }
 
     fn call_get_defined_constants_builtin(
         &self,
         compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
+        _output: &mut OutputBuffer,
         state: &ExecutionState,
         categorize: bool,
     ) -> VmResult {
@@ -34695,7 +34645,7 @@ impl Vm {
             }
             Value::Array(standard)
         };
-        VmResult::success(output.clone(), Some(value))
+        VmResult::success_no_output(Some(value))
     }
 
     fn call_class_alias_builtin(
@@ -34751,7 +34701,7 @@ impl Vm {
             ) {
                 return result;
             }
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         }
         if lookup_class_in_state(compiled, state, &alias_name).is_some()
             || php_std::ExtensionRegistry::standard_library()
@@ -34768,7 +34718,7 @@ impl Vm {
             ) {
                 return result;
             }
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         }
 
         let Some(class) = lookup_class_in_state(compiled, state, &source_name) else {
@@ -34782,7 +34732,7 @@ impl Vm {
             ) {
                 return result;
             }
-            return VmResult::success(output.clone(), Some(Value::Bool(false)));
+            return VmResult::success_no_output(Some(Value::Bool(false)));
         };
         let unit_index = dynamic_class_owner_index_in_state(state, &class.name)
             .unwrap_or_else(|| dynamic_or_retain_unit_index(state, compiled));
@@ -34799,7 +34749,7 @@ impl Vm {
             ),
         });
         state.bump_class_table_epoch();
-        VmResult::success(output.clone(), Some(Value::Bool(true)))
+        VmResult::success_no_output(Some(Value::Bool(true)))
     }
 
     fn class_like_exists_with_autoload_cache(
@@ -35320,8 +35270,7 @@ impl Vm {
                 return result;
             }
             self.register_destructor_if_needed(compiled, &class, object.clone(), state);
-            return VmResult::success_with_diagnostics(
-                output.clone(),
+            return VmResult::success_with_diagnostics_no_output(
                 Some(Value::Object(object)),
                 result.diagnostics,
             );
@@ -35337,7 +35286,7 @@ impl Vm {
             );
         }
         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
-        VmResult::success(output.clone(), Some(Value::Object(object)))
+        VmResult::success_no_output(Some(Value::Object(object)))
     }
 
     fn reflection_class_new_instance(
@@ -35465,8 +35414,7 @@ impl Vm {
                 return result;
             }
             self.register_destructor_if_needed(compiled, &class, object.clone(), state);
-            return VmResult::success_with_diagnostics(
-                output.clone(),
+            return VmResult::success_with_diagnostics_no_output(
                 Some(Value::Object(object)),
                 result.diagnostics,
             );
@@ -35482,7 +35430,7 @@ impl Vm {
             );
         }
         self.register_destructor_if_needed(compiled, &class, object.clone(), state);
-        VmResult::success(output.clone(), Some(Value::Object(object)))
+        VmResult::success_no_output(Some(Value::Object(object)))
     }
 
     fn preflight_reflection_class_method(
@@ -36096,7 +36044,7 @@ impl Vm {
                 state,
             );
             if result.status.is_success() {
-                return VmResult::success(output.clone(), None);
+                return VmResult::success_no_output(None);
             }
             match state.pending_throw.take() {
                 Some(next) => value = next,
@@ -54623,15 +54571,14 @@ fn process_unsupported_mock_result(
 }
 
 fn process_warning_result(
-    output: &OutputBuffer,
+    _output: &OutputBuffer,
     _name: &str,
     id: &'static str,
     message: String,
     return_value: Value,
     stack_trace: Vec<RuntimeStackFrame>,
 ) -> VmResult {
-    VmResult::success_with_diagnostics(
-        output.clone(),
+    VmResult::success_with_diagnostics_no_output(
         Some(return_value),
         vec![RuntimeDiagnostic::new(
             id,

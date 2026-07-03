@@ -125,6 +125,10 @@ impl VmResult {
         }
     }
 
+    pub(crate) fn success_no_output(return_value: Option<Value>) -> Self {
+        Self::success(OutputBuffer::new(), return_value)
+    }
+
     pub(crate) fn success_with_diagnostics(
         output: OutputBuffer,
         return_value: Option<Value>,
@@ -147,6 +151,13 @@ impl VmResult {
             counters: None,
             tiering_stats: None,
         }
+    }
+
+    pub(crate) fn success_with_diagnostics_no_output(
+        return_value: Option<Value>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+    ) -> Self {
+        Self::success_with_diagnostics(OutputBuffer::new(), return_value, diagnostics)
     }
 
     pub(super) fn script_exit(output: OutputBuffer, code: i32) -> Self {
