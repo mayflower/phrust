@@ -20,17 +20,32 @@ pub fn call_php_std_builtin(
     request: &RequestContext,
 ) -> VmResult {
     let mut context = CallContext::new(builtin.name(), args, source_span, output, request);
+    let output_len_before = context.output().len();
 
     match call_builtin(builtin, &mut context) {
         Ok(ReturnValue::Value(value)) => {
-            let output = context.output().clone();
             let diagnostics = context.take_diagnostics();
-            VmResult::success_with_diagnostics(output, Some(value), diagnostics)
+            if context.output().len() == output_len_before {
+                VmResult::success_with_diagnostics_no_output(Some(value), diagnostics)
+            } else {
+                VmResult::success_with_diagnostics(
+                    context.output().clone(),
+                    Some(value),
+                    diagnostics,
+                )
+            }
         }
         Ok(ReturnValue::Void) => {
-            let output = context.output().clone();
             let diagnostics = context.take_diagnostics();
-            VmResult::success_with_diagnostics(output, Some(Value::Null), diagnostics)
+            if context.output().len() == output_len_before {
+                VmResult::success_with_diagnostics_no_output(Some(Value::Null), diagnostics)
+            } else {
+                VmResult::success_with_diagnostics(
+                    context.output().clone(),
+                    Some(Value::Null),
+                    diagnostics,
+                )
+            }
         }
         Err(error) => {
             let output = context.output().clone();

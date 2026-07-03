@@ -35531,9 +35531,10 @@ impl Vm {
         }
         state.autoload_stack.push(normalized.clone());
         for callback in callbacks {
+            let callback_for_trace = trace_origin.map(|_| callback.clone());
             let result = self.call_callable(
                 compiled,
-                Value::Callable(callback.clone()),
+                Value::Callable(callback),
                 vec![CallArgument::positional(Value::string(
                     class_name.as_bytes().to_vec(),
                 ))],
@@ -35542,9 +35543,10 @@ impl Vm {
                 state,
             );
             if !result.status.is_success() {
-                if let Some(origin) = trace_origin {
+                if let (Some(origin), Some(callback)) = (trace_origin, callback_for_trace.as_ref())
+                {
                     state.pending_trace = Some(capture_autoload_trace(
-                        compiled, stack, &callback, class_name, origin,
+                        compiled, stack, callback, class_name, origin,
                     ));
                 }
                 let _ = state.autoload_stack.pop();
@@ -56045,14 +56047,21 @@ fn execute_builtin_entry(
     context.set_session_loader(state.session_loader.as_ref());
     context.sync_session_state_from_global();
     let time_limit_arg = (entry.name() == "set_time_limit").then(|| args.first().cloned());
+    let output_len_before = context.output().len();
     let result = (entry.function())(&mut context, args, source_span.clone());
-    let output = context.output().clone();
+    let output_len_after = context.output().len();
     context.sync_session_state_from_global();
     state.cwd = context.cwd().to_path_buf();
     state.json_last_error = context.json_last_error().0;
     state.default_timezone = context.default_timezone().to_owned();
     state.mb_internal_encoding = context.mb_internal_encoding().to_owned();
     let mut diagnostics = context.take_diagnostics();
+    let output_for_result = match &result {
+        Ok(_) if output_len_after != output_len_before => Some(context.output().clone()),
+        Err(_) => Some(context.output().clone()),
+        _ => None,
+    };
+    drop(context);
     match result {
         Ok(value) => {
             if let Some(Some(seconds_value)) = time_limit_arg
@@ -56061,9 +56070,18 @@ fn execute_builtin_entry(
             {
                 state.reset_execution_deadline_seconds(seconds as u64);
             }
-            VmResult::success_with_diagnostics(output, Some(value), diagnostics)
+            if output_len_after == output_len_before {
+                VmResult::success_with_diagnostics_no_output(Some(value), diagnostics)
+            } else {
+                VmResult::success_with_diagnostics(
+                    output_for_result.expect("changed output is cloned before context drop"),
+                    Some(value),
+                    diagnostics,
+                )
+            }
         }
         Err(error) => {
+            let output = output_for_result.expect("error output is cloned before context drop");
             let error_diagnostic = RuntimeDiagnostic::new(
                 error.diagnostic_id(),
                 RuntimeSeverity::FatalError,
