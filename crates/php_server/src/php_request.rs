@@ -764,7 +764,7 @@ pub(crate) fn log_php_execution_failure(script_path: &Path, output: &PhpExecutio
 
 pub(crate) fn append_vm_counters_to_trace(
     trace: &mut PerfTraceEvent,
-    counters: Option<&php_vm::VmCounters>,
+    counters: Option<&php_vm::api::VmCounters>,
 ) {
     let Some(counters) = counters else {
         return;
