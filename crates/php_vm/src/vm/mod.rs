@@ -7816,6 +7816,7 @@ impl Vm {
                                     stack.pop_recycle();
                                     return result;
                                 }
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             stack.pop_recycle();
@@ -8460,6 +8461,7 @@ impl Vm {
                                     stack.pop_recycle();
                                     return result;
                                 }
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             Ok(None) => {}
@@ -8582,6 +8584,7 @@ impl Vm {
                                     stack.pop_recycle();
                                     return result;
                                 }
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             Ok(None) => {}
@@ -8709,6 +8712,7 @@ impl Vm {
                         ) {
                             Ok(true) => {
                                 self.record_lvalue_trace_event("array-unset-dim", local, &dims);
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             Ok(false) => {}
@@ -8738,6 +8742,7 @@ impl Vm {
                             ) {
                                 Ok(_) => {
                                     self.record_lvalue_trace_event("array-unset-dim", local, &dims);
+                                    instruction_offset = next_instruction_offset;
                                     continue;
                                 }
                                 Err(result) => {
@@ -8826,6 +8831,7 @@ impl Vm {
                                     stack.pop_recycle();
                                     return result;
                                 }
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             Ok(false) => {}
@@ -8864,6 +8870,7 @@ impl Vm {
                                         stack.pop_recycle();
                                         return result;
                                     }
+                                    instruction_offset = next_instruction_offset;
                                     continue;
                                 }
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -8924,6 +8931,7 @@ impl Vm {
                                     stack.pop_recycle();
                                     return result;
                                 }
+                                instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             let result = self.runtime_error(output, compiled, stack, message);
