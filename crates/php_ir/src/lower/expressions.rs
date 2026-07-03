@@ -3547,8 +3547,18 @@ impl LoweringContext<'_> {
                 );
                 return None;
             }
-            let object =
-                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let receiver_range = self.span_for(SourceMappedId::from(target.receiver));
+            let object = self.lower_coalesce_left_to_register(
+                builder,
+                LowerSite {
+                    function: site.function,
+                    block: site.block,
+                    expr: target.receiver,
+                    span: span_from_range(self.file, receiver_range),
+                    range: receiver_range,
+                },
+                target.receiver,
+            )?;
             let mut current = object.block;
             let mut dims = Vec::with_capacity(target.dims.len());
             for dim in target.dims {
@@ -3596,8 +3606,18 @@ impl LoweringContext<'_> {
                 );
                 return None;
             }
-            let object =
-                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let receiver_range = self.span_for(SourceMappedId::from(target.receiver));
+            let object = self.lower_coalesce_left_to_register(
+                builder,
+                LowerSite {
+                    function: site.function,
+                    block: site.block,
+                    expr: target.receiver,
+                    span: span_from_range(self.file, receiver_range),
+                    range: receiver_range,
+                },
+                target.receiver,
+            )?;
             let property = self.lower_dynamic_member_name_to_register(
                 builder,
                 site,
@@ -3641,8 +3661,18 @@ impl LoweringContext<'_> {
                 block: current,
             });
         } else if let Some(target) = self.property_assignment_target(arg) {
-            let object =
-                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let receiver_range = self.span_for(SourceMappedId::from(target.receiver));
+            let object = self.lower_coalesce_left_to_register(
+                builder,
+                LowerSite {
+                    function: site.function,
+                    block: site.block,
+                    expr: target.receiver,
+                    span: span_from_range(self.file, receiver_range),
+                    range: receiver_range,
+                },
+                target.receiver,
+            )?;
             let instruction = if name == "isset" {
                 InstructionKind::IssetProperty {
                     dst,
@@ -3670,8 +3700,18 @@ impl LoweringContext<'_> {
                 block: object.block,
             });
         } else if let Some(target) = self.dynamic_property_target(arg) {
-            let object =
-                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let receiver_range = self.span_for(SourceMappedId::from(target.receiver));
+            let object = self.lower_coalesce_left_to_register(
+                builder,
+                LowerSite {
+                    function: site.function,
+                    block: site.block,
+                    expr: target.receiver,
+                    span: span_from_range(self.file, receiver_range),
+                    range: receiver_range,
+                },
+                target.receiver,
+            )?;
             let property = self.lower_dynamic_member_name_to_register(
                 builder,
                 site,

@@ -94,7 +94,7 @@ use php_runtime::{
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -123,6 +123,12 @@ const SPL_FILESYSTEM_FOLLOW_SYMLINKS: i64 = 16384;
 const SPL_FILESYSTEM_OTHER_MODE_MASK: i64 = 28672;
 const SPL_FILESYSTEM_SKIP_DOTS: i64 = 4096;
 const SPL_FILESYSTEM_UNIX_PATHS: i64 = 8192;
+const ZIP_CREATE: i64 = 1;
+const ZIP_EXCL: i64 = 2;
+const ZIP_CHECKCONS: i64 = 4;
+const ZIP_OVERWRITE: i64 = 8;
+const ZIP_FL_OVERWRITE: i64 = 8192;
+const ZIP_LENGTH_TO_END: i64 = 0;
 const SPL_REGEX_MATCH: i64 = 0;
 const SPL_REGEX_GET_MATCH: i64 = 1;
 const SPL_REGEX_ALL_MATCHES: i64 = 2;
@@ -17259,6 +17265,9 @@ impl Vm {
                         let value = if constant.eq_ignore_ascii_case("class") {
                             Value::String(PhpString::from_test_str(&class.display_name))
                         } else if let Some(value) = pdo_class_constant_value(&class.name, constant)
+                        {
+                            value
+                        } else if let Some(value) = zip_class_constant_value(&class.name, constant)
                         {
                             value
                         } else if let Some(value) = xml_class_constant_value(&class.name, constant)
@@ -44364,6 +44373,23 @@ fn zip_runtime_class() -> RuntimeClassEntry {
     }
 }
 
+fn zip_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
+    if !is_zip_runtime_class(class_name) {
+        return None;
+    }
+    let value = match constant.to_ascii_uppercase().as_str() {
+        "CREATE" => ZIP_CREATE,
+        "EXCL" => ZIP_EXCL,
+        "CHECKCONS" => ZIP_CHECKCONS,
+        "OVERWRITE" => ZIP_OVERWRITE,
+        "FL_OVERWRITE" => ZIP_FL_OVERWRITE,
+        "LENGTH_TO_END" => ZIP_LENGTH_TO_END,
+        "ER_OK" => 0,
+        _ => return None,
+    };
+    Some(Value::Int(value))
+}
+
 fn new_mysqli_object(
     class_name: &str,
     args: Vec<CallArgument>,
@@ -45005,7 +45031,35 @@ fn call_zip_method(
         "open" => {
             validate_zip_arg_count("ZipArchive::open", values.len(), 1, 2)?;
             let filename = to_string(&values[0])?.to_string_lossy();
+            let flags = values.get(1).map(to_int).transpose()?.unwrap_or(0);
             let path = zip_resolve_path(&filename, runtime_context)?;
+            if flags & (ZIP_CREATE | ZIP_OVERWRITE) != 0 {
+                if flags & ZIP_EXCL != 0 && path.exists() {
+                    zip_reset_object(object);
+                    return Ok(Value::Bool(false));
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "E_PHP_VM_ZIP_WRITE: failed to create archive directory `{}`: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                object.set_property(
+                    "__zip_path",
+                    Value::string(path.to_string_lossy().as_bytes().to_vec()),
+                );
+                object.set_property(
+                    "filename",
+                    Value::string(path.to_string_lossy().as_bytes().to_vec()),
+                );
+                object.set_property("__zip_write_mode", Value::Bool(true));
+                object.set_property("__zip_write_entries", Value::Array(PhpArray::new()));
+                object.set_property("numFiles", Value::Int(0));
+                object.set_property("status", Value::Int(0));
+                return Ok(Value::Bool(true));
+            }
             let entry_count = match zip_entry_count(&path) {
                 Ok(count) => count,
                 Err(_) => {
@@ -45027,6 +45081,13 @@ fn call_zip_method(
         }
         "close" => {
             validate_zip_arg_count("ZipArchive::close", values.len(), 0, 0)?;
+            if zip_object_write_mode(object) {
+                let Some(path) = zip_object_path(object) else {
+                    zip_reset_object(object);
+                    return Ok(Value::Bool(false));
+                };
+                zip_write_archive(object, &path)?;
+            }
             zip_reset_object(object);
             Ok(Value::Bool(true))
         }
@@ -45111,6 +45172,68 @@ fn call_zip_method(
             };
             zip_extract_to(&path, &destination, entries, runtime_context).map(Value::Bool)
         }
+        "addemptydir" => {
+            validate_zip_arg_count("ZipArchive::addEmptyDir", values.len(), 1, 2)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            let name = zip_normalize_entry_name(&to_string(&values[0])?.to_string_lossy(), true)?;
+            zip_append_write_entry(object, "dir", name, Vec::new())?;
+            Ok(Value::Bool(true))
+        }
+        "addfromstring" => {
+            validate_zip_arg_count("ZipArchive::addFromString", values.len(), 2, 3)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            let name = zip_normalize_entry_name(&to_string(&values[0])?.to_string_lossy(), false)?;
+            let contents = to_string(&values[1])?.as_bytes().to_vec();
+            zip_append_write_entry(object, "file", name, contents)?;
+            Ok(Value::Bool(true))
+        }
+        "addfile" => {
+            validate_zip_arg_count("ZipArchive::addFile", values.len(), 1, 5)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            let file_name = to_string(&values[0])?.to_string_lossy();
+            let file_path = zip_resolve_path(&file_name, runtime_context)?;
+            let mut contents = fs::read(&file_path).map_err(|error| {
+                format!(
+                    "E_PHP_VM_ZIP_WRITE: failed to read file `{}` for archive entry: {error}",
+                    file_path.display()
+                )
+            })?;
+            let entry_name = values
+                .get(1)
+                .map(to_string)
+                .transpose()?
+                .map(|name| name.to_string_lossy())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| {
+                    file_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file_name.clone())
+                });
+            let start = values.get(2).map(to_int).transpose()?.unwrap_or(0).max(0) as usize;
+            let length = values
+                .get(3)
+                .map(to_int)
+                .transpose()?
+                .unwrap_or(ZIP_LENGTH_TO_END);
+            if start >= contents.len() {
+                contents.clear();
+            } else {
+                contents = contents[start..].to_vec();
+                if length > 0 {
+                    contents.truncate(length as usize);
+                }
+            }
+            let name = zip_normalize_entry_name(&entry_name, false)?;
+            zip_append_write_entry(object, "file", name, contents)?;
+            Ok(Value::Bool(true))
+        }
         _ => Err(format!(
             "E_PHP_VM_ZIP_METHOD_GAP: ZipArchive::{method} is not implemented"
         )),
@@ -45119,9 +45242,18 @@ fn call_zip_method(
 
 fn zip_reset_object(object: &ObjectRef) {
     object.set_property("__zip_path", Value::Null);
+    object.set_property("__zip_write_mode", Value::Bool(false));
+    object.set_property("__zip_write_entries", Value::Null);
     object.set_property("filename", Value::string(Vec::new()));
     object.set_property("numFiles", Value::Int(0));
     object.set_property("status", Value::Int(0));
+}
+
+fn zip_object_write_mode(object: &ObjectRef) -> bool {
+    matches!(
+        object.get_property("__zip_write_mode"),
+        Some(Value::Bool(true))
+    )
 }
 
 fn zip_object_path(object: &ObjectRef) -> Option<PathBuf> {
@@ -45305,6 +45437,116 @@ fn zip_read_file(
         bytes.truncate(max_len);
     }
     Ok(bytes)
+}
+
+fn zip_normalize_entry_name(name: &str, directory: bool) -> Result<String, String> {
+    let mut name = name.replace('\\', "/");
+    while let Some(stripped) = name.strip_prefix('/') {
+        name = stripped.to_owned();
+    }
+    if name.is_empty() || name.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "E_PHP_VM_ZIP_ENTRY_PATH: zip entry name `{name}` is not safe"
+        ));
+    }
+    if directory && !name.ends_with('/') {
+        name.push('/');
+    }
+    Ok(name)
+}
+
+fn zip_append_write_entry(
+    object: &ObjectRef,
+    kind: &str,
+    name: String,
+    contents: Vec<u8>,
+) -> Result<(), String> {
+    let mut entries = match object.get_property("__zip_write_entries") {
+        Some(Value::Array(entries)) => entries,
+        _ => PhpArray::new(),
+    };
+    let key = ArrayKey::String(PhpString::from_bytes(name.as_bytes().to_vec()));
+    let mut entry = PhpArray::new();
+    zip_array_insert(&mut entry, "kind", Value::string(kind));
+    zip_array_insert(&mut entry, "name", Value::string(name.into_bytes()));
+    zip_array_insert(&mut entry, "contents", Value::string(contents));
+    entries.insert(key, Value::Array(entry));
+    object.set_property("numFiles", Value::Int(entries.iter().len() as i64));
+    object.set_property("__zip_write_entries", Value::Array(entries));
+    Ok(())
+}
+
+fn zip_write_archive(object: &ObjectRef, path: &Path) -> Result<(), String> {
+    let entries = match object.get_property("__zip_write_entries") {
+        Some(Value::Array(entries)) => entries,
+        _ => PhpArray::new(),
+    };
+    let file = fs::File::create(path).map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_WRITE: failed to create zip archive `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let mut writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (_, value) in entries.iter() {
+        let Value::Array(entry) = value else {
+            continue;
+        };
+        let kind = zip_entry_string(entry, "kind")?;
+        let name = zip_entry_string(entry, "name")?;
+        let contents = zip_entry_bytes(entry, "contents")?;
+        if kind == "dir" {
+            writer.add_directory(&name, options).map_err(|error| {
+                format!("E_PHP_VM_ZIP_WRITE: failed to add zip directory `{name}`: {error}")
+            })?;
+        } else {
+            writer.start_file(&name, options).map_err(|error| {
+                format!("E_PHP_VM_ZIP_WRITE: failed to add zip file `{name}`: {error}")
+            })?;
+            writer.write_all(&contents).map_err(|error| {
+                format!("E_PHP_VM_ZIP_WRITE: failed to write zip file `{name}`: {error}")
+            })?;
+        }
+    }
+    writer.finish().map_err(|error| {
+        format!(
+            "E_PHP_VM_ZIP_WRITE: failed to finish zip archive `{}`: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn zip_entry_string(entry: &PhpArray, key: &str) -> Result<String, String> {
+    match entry.get(&ArrayKey::String(PhpString::from_bytes(
+        key.as_bytes().to_vec(),
+    ))) {
+        Some(Value::String(value)) => Ok(value.to_string_lossy()),
+        Some(value) => Err(format!(
+            "E_PHP_VM_ZIP_WRITE_STATE: zip write entry field `{key}` must be string, {} found",
+            value_type_name(value)
+        )),
+        None => Err(format!(
+            "E_PHP_VM_ZIP_WRITE_STATE: zip write entry field `{key}` is missing"
+        )),
+    }
+}
+
+fn zip_entry_bytes(entry: &PhpArray, key: &str) -> Result<Vec<u8>, String> {
+    match entry.get(&ArrayKey::String(PhpString::from_bytes(
+        key.as_bytes().to_vec(),
+    ))) {
+        Some(Value::String(value)) => Ok(value.as_bytes().to_vec()),
+        Some(value) => Err(format!(
+            "E_PHP_VM_ZIP_WRITE_STATE: zip write entry field `{key}` must be string, {} found",
+            value_type_name(value)
+        )),
+        None => Err(format!(
+            "E_PHP_VM_ZIP_WRITE_STATE: zip write entry field `{key}` is missing"
+        )),
+    }
 }
 
 fn zip_file_stat(index: usize, file: &zip::read::ZipFile<'_>) -> PhpArray {
@@ -53111,6 +53353,9 @@ fn class_constant_value_by_name(
         ))));
     }
     if let Some(value) = pdo_class_constant_value(class_name, constant_name) {
+        return Ok(Some(value));
+    }
+    if let Some(value) = zip_class_constant_value(class_name, constant_name) {
         return Ok(Some(value));
     }
     if let Some(value) = xml_class_constant_value(class_name, constant_name) {
@@ -73926,6 +74171,24 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
     }
 
     #[test]
+    fn arrays_execute_property_isset_chains_quiet_missing_offsets() {
+        let result = execute_source(
+            r#"<?php
+            $a = [];
+            $property = "response";
+            echo isset($a[0]->response) ? "yes" : "no";
+            echo "|", empty($a[0]->response["x"]) ? "empty" : "filled";
+            echo "|", isset($a[0]->$property) ? "dyn" : "dyn-no";
+            echo "|", empty($a[0]->$property["x"]) ? "dyn-empty" : "dyn-filled";
+            "#,
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"no|empty|dyn-no|dyn-empty");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
     fn userland_arrayaccess_routes_offset_operations() {
         let result = execute_source(
             r#"<?php
@@ -75200,6 +75463,55 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         let _ = std::fs::remove_file(nested_file);
         let _ = std::fs::remove_file(top_file);
         let _ = std::fs::remove_dir(nested);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[test]
+    fn zip_archive_create_overwrite_writes_local_entries() {
+        let root = std::env::temp_dir().join(format!("phrust-zip-write-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let source_file = root.join("source.txt");
+        let archive_file = root.join("export.zip");
+        std::fs::write(&source_file, "payload").expect("fixture should be written");
+        let source_path = source_file.to_string_lossy().replace('\\', "\\\\");
+        let archive_path = archive_file.to_string_lossy().replace('\\', "\\\\");
+        let source = format!(
+            r#"<?php
+            echo ZipArchive::CREATE, ":", ZipArchive::OVERWRITE, ":", ZipArchive::FL_OVERWRITE, ":", ZipArchive::LENGTH_TO_END, "|";
+            $zip = new ZipArchive();
+            echo ($zip->open("{archive_path}", ZipArchive::CREATE | ZipArchive::OVERWRITE) === true) ? "open|" : "bad-open|";
+            echo $zip->addEmptyDir("templates") ? "dir|" : "bad-dir|";
+            echo $zip->addFile("{source_path}", "theme/source.txt") ? "file|" : "bad-file|";
+            echo $zip->addFromString("templates/index.html", "alpha") ? "string|" : "bad-string|";
+            echo $zip->addFromString("templates/index.html", "beta") ? "replace|" : "bad-replace|";
+            echo $zip->close() ? "close|" : "bad-close|";
+            $read = new ZipArchive();
+            echo $read->open("{archive_path}") ? "read|" : "bad-read|";
+            echo $read->count(), "|", $read->getFromName("templates/index.html"), "|", $read->getFromName("theme/source.txt");
+            "#
+        );
+        let result = execute_source_with_options(
+            &source,
+            VmOptions {
+                runtime_context: RuntimeContext::controlled_cli(
+                    source_file.to_string_lossy().into_owned(),
+                    Vec::new(),
+                )
+                .with_filesystem_capabilities(
+                    php_runtime::FilesystemCapabilities::none()
+                        .with_allowed_roots(vec![root.clone()]),
+                ),
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.to_string_lossy(),
+            "1:8:8192:0|open|dir|file|string|replace|close|read|3|beta|payload"
+        );
+        let _ = std::fs::remove_file(archive_file);
+        let _ = std::fs::remove_file(source_file);
         let _ = std::fs::remove_dir(root);
     }
 
