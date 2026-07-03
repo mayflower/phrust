@@ -7789,6 +7789,17 @@ impl Vm {
                                 return result;
                             }
                         };
+                        // The include-path inline cache only installs into an
+                        // observed slot; the rich interpreter observes every
+                        // IC-capable instruction generically, so mirror that
+                        // here before executing the include.
+                        self.observe_dense_call_inline_cache(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            InlineCacheKind::IncludePath,
+                        );
                         let result = self.execute_include(
                             compiled,
                             compiled_unit_cache_key(compiled),
