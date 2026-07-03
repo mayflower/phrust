@@ -5245,13 +5245,16 @@ pub(in crate::builtins::modules) fn replace_subject(
     subject: &Value,
     search: &[crate::PhpString],
     replace: &[crate::PhpString],
+    repeat_single_replacement: bool,
     count: &mut i64,
 ) -> BuiltinResult {
     match deref_value(subject) {
         Value::Array(array) => Ok(Value::Array(crate::PhpArray::from_packed(
             array
                 .iter()
-                .map(|(_, value)| replace_subject(value, search, replace, count))
+                .map(|(_, value)| {
+                    replace_subject(value, search, replace, repeat_single_replacement, count)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
         value => {
@@ -5260,9 +5263,12 @@ pub(in crate::builtins::modules) fn replace_subject(
                 if needle.is_empty() {
                     continue;
                 }
-                let replacement = replace
-                    .get(index)
-                    .map_or(b"".as_slice(), crate::PhpString::as_bytes);
+                let replacement = if repeat_single_replacement {
+                    replace.first()
+                } else {
+                    replace.get(index)
+                }
+                .map_or(b"".as_slice(), crate::PhpString::as_bytes);
                 bytes = replace_all(&bytes, needle.as_bytes(), replacement, count);
             }
             Ok(Value::string(bytes))
@@ -9773,6 +9779,30 @@ mod tests {
                 &mut output,
             ),
             Value::string("xycx")
+        );
+        assert_eq!(
+            call(
+                "str_replace",
+                vec![
+                    Value::packed_array(vec![Value::string("-.txt"), Value::string(".txt")]),
+                    Value::string("-1.txt"),
+                    Value::string("phrust-admin-core-upload.txt"),
+                ],
+                &mut output,
+            ),
+            Value::string("phrust-admin-core-upload-1.txt")
+        );
+        assert_eq!(
+            call(
+                "str_replace",
+                vec![
+                    Value::packed_array(vec![Value::string("a"), Value::string("b")]),
+                    Value::packed_array(vec![Value::string("x")]),
+                    Value::string("abca"),
+                ],
+                &mut output,
+            ),
+            Value::string("xcx")
         );
         assert_eq!(
             call(

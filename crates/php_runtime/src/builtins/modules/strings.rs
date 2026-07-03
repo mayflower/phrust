@@ -503,8 +503,15 @@ pub(in crate::builtins::modules) fn builtin_str_replace(
     }
     let search = string_list_arg("str_replace", &args[0])?;
     let replace = string_list_arg("str_replace", &args[1])?;
+    let repeat_single_replacement = !matches!(deref_value(&args[1]), Value::Array(_));
     let mut count = 0_i64;
-    let result = replace_subject(&args[2], &search, &replace, &mut count)?;
+    let result = replace_subject(
+        &args[2],
+        &search,
+        &replace,
+        repeat_single_replacement,
+        &mut count,
+    )?;
     if let Some(Value::Reference(cell)) = args.get(3) {
         cell.set(Value::Int(count));
     }
