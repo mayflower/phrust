@@ -388,8 +388,8 @@ mod tests {
         ));
 
         assert!(matches!(
-            user,
-            Value::Callable(CallableValue::UserFunction { ref name }) if name == "foo"
+            user.as_callable(),
+            Some(CallableValue::UserFunction { name }) if name == "foo"
         ));
         assert!(format!("{builtin:?}").contains("internal_builtin"));
         assert!(format!("{method:?}").contains("method_placeholder"));

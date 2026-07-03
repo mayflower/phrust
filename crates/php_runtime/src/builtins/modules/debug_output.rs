@@ -154,14 +154,8 @@ impl DebugFormatter {
                     indent,
                 );
                 self.write_var_dump_property(output, "line", Value::Int(debug.line), indent);
-                if has_parameters {
-                    self.write_var_dump_property(
-                        output,
-                        "parameter",
-                        closure_parameter_debug_array(&debug.parameters),
-                        indent,
-                    );
-                }
+                // Reference PHP emits closure debug fields in the order
+                // static, this, parameter after name/file/line.
                 if has_static {
                     self.write_closure_static_var_dump(
                         output,
@@ -175,6 +169,14 @@ impl DebugFormatter {
                         output,
                         "this",
                         Value::Object(bound_this.clone()),
+                        indent,
+                    );
+                }
+                if has_parameters {
+                    self.write_var_dump_property(
+                        output,
+                        "parameter",
+                        closure_parameter_debug_array(&debug.parameters),
                         indent,
                     );
                 }
@@ -271,8 +273,8 @@ impl DebugFormatter {
             .cloned()
             .or_else(|| capture.reference().map(|reference| reference.get()));
         matches!(
-            value,
-            Some(Value::Callable(CallableValue::Closure(payload))) if payload.function == function
+            value.as_ref().and_then(Value::as_closure),
+            Some(payload) if payload.function == function
         )
     }
 

@@ -612,8 +612,12 @@ fn match_exact(atom: ArgType, value: &Value) -> Option<Value> {
         (ArgType::Array, Value::Array(_)) => Some(value.clone()),
         (ArgType::Object, Value::Object(_))
         | (ArgType::Object, Value::Fiber(_))
-        | (ArgType::Object, Value::Generator(_))
-        | (ArgType::Object, Value::Callable(CallableValue::Closure(_))) => Some(value.clone()),
+        | (ArgType::Object, Value::Generator(_)) => Some(value.clone()),
+        (ArgType::Object, Value::Callable(callable))
+            if matches!(callable.as_ref(), CallableValue::Closure(_)) =>
+        {
+            Some(value.clone())
+        }
         (ArgType::Callable, Value::Callable(_)) => Some(value.clone()),
         _ => None,
     }
@@ -673,8 +677,10 @@ fn value_type(value: &Value) -> String {
         Value::Resource(_) => "resource".to_owned(),
         Value::Fiber(_) => "Fiber".to_owned(),
         Value::Generator(_) => "Generator".to_owned(),
-        Value::Callable(CallableValue::Closure(_)) => "Closure".to_owned(),
-        Value::Callable(_) => "callable".to_owned(),
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::Closure(_) => "Closure".to_owned(),
+            _ => "callable".to_owned(),
+        },
         Value::Reference(_) => "reference".to_owned(),
     }
 }
@@ -844,7 +850,7 @@ mod tests {
             )],
             TypeSpec::one(ArgType::Mixed),
         );
-        let closure = Value::Callable(CallableValue::Closure(ClosurePayload::new(7, Vec::new())));
+        let closure = Value::closure(ClosurePayload::new(7, Vec::new()));
 
         let validated = ArgumentValidator::new(CoercionMode::Strict)
             .validate(&info, std::slice::from_ref(&closure), span())

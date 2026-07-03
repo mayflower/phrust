@@ -5853,10 +5853,10 @@ mod tests {
         JSON_THROW_ON_ERROR,
     };
     use crate::{
-        ArrayKey, BuiltinRegistry, CallableValue, ClassEntry, ClassFlags, ClosurePayload,
-        FilesystemCapabilities, ObjectRef, OutputBuffer, PhpArray, PhpString, ReferenceCell,
-        ResourceTable, RuntimeHttpResponseState, StreamFlags, StreamMetadata, StrtokState, Value,
-        datetime, normalize_class_name, pcre,
+        ArrayKey, BuiltinRegistry, ClassEntry, ClassFlags, ClosurePayload, FilesystemCapabilities,
+        ObjectRef, OutputBuffer, PhpArray, PhpString, ReferenceCell, ResourceTable,
+        RuntimeHttpResponseState, StreamFlags, StreamMetadata, StrtokState, Value, datetime,
+        normalize_class_name, pcre,
     };
     use std::path::PathBuf;
 
@@ -8318,7 +8318,7 @@ mod tests {
             Value::string(format!("{id:032x}"))
         );
 
-        let closure = Value::Callable(CallableValue::Closure(ClosurePayload::new(1, Vec::new())));
+        let closure = Value::closure(ClosurePayload::new(1, Vec::new()));
         let Value::Int(closure_id) = call("spl_object_id", vec![closure.clone()], &mut output)
         else {
             panic!("expected closure object id int");

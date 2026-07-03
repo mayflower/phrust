@@ -248,8 +248,8 @@ pub(in crate::builtins::modules) fn builtin_preg_replace_callback(
         .map(|value| int_arg("preg_replace_callback", value))
         .transpose()?
         .unwrap_or(-1);
-    let callback_name = match deref_value(&args[1]) {
-        Value::Callable(CallableValue::InternalBuiltin { name }) => name.clone(),
+    let callback_name = match deref_value(&args[1]).as_callable() {
+        Some(CallableValue::InternalBuiltin { name }) => name.clone(),
         _ => {
             return Err(BuiltinError::new(
                 "E_PHP_RUNTIME_CALLABLE_CONTEXT_REQUIRED",

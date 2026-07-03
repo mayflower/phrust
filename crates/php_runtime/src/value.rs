@@ -31,11 +31,46 @@ pub enum Value {
     Fiber(FiberRef),
     /// Internal generator object.
     Generator(GeneratorRef),
-    /// Callable placeholder.
-    Callable(CallableValue),
+    /// Callable placeholder. Boxed: `CallableValue` is ~160 bytes and would
+    /// otherwise dominate `size_of::<Value>()`, which every register/local
+    /// slot write and clone pays for.
+    Callable(Box<CallableValue>),
     /// Reference cell exposed as a value only for explicit future reference
     /// operations. Ordinary local aliasing should use `ValueSlot`.
     Reference(ReferenceCell),
+}
+
+/// Register files and packed arrays memcpy `Value` on every clone; keep it
+/// small. If this assertion fails you added a fat variant - box its payload
+/// instead.
+const _: () = assert!(std::mem::size_of::<Value>() <= 24);
+const _: () = assert!(std::mem::size_of::<Option<Value>>() <= 24);
+
+impl Value {
+    /// Creates a callable value, boxing the payload.
+    #[must_use]
+    pub fn callable(callable: CallableValue) -> Self {
+        Self::Callable(Box::new(callable))
+    }
+
+    /// Returns the callable payload when this value is a callable.
+    #[must_use]
+    pub fn as_callable(&self) -> Option<&CallableValue> {
+        match self {
+            Self::Callable(callable) => Some(callable),
+            _ => None,
+        }
+    }
+
+    /// Consumes this value, returning the boxed callable payload when it is
+    /// a callable.
+    #[must_use]
+    pub fn into_callable(self) -> Option<Box<CallableValue>> {
+        match self {
+            Self::Callable(callable) => Some(callable),
+            _ => None,
+        }
+    }
 }
 
 impl Clone for Value {
@@ -139,19 +174,21 @@ impl Value {
     /// Creates a runtime closure callable value.
     #[must_use]
     pub fn closure(payload: ClosurePayload) -> Self {
-        Self::Callable(CallableValue::Closure(payload))
+        Self::Callable(Box::new(CallableValue::Closure(payload)))
     }
 
     /// Creates a resolved user-function callable value.
     #[must_use]
     pub fn user_function_callable(name: impl Into<String>) -> Self {
-        Self::Callable(CallableValue::UserFunction { name: name.into() })
+        Self::Callable(Box::new(CallableValue::UserFunction { name: name.into() }))
     }
 
     /// Creates a resolved internal-builtin callable value.
     #[must_use]
     pub fn internal_builtin_callable(name: impl Into<String>) -> Self {
-        Self::Callable(CallableValue::InternalBuiltin { name: name.into() })
+        Self::Callable(Box::new(CallableValue::InternalBuiltin {
+            name: name.into(),
+        }))
     }
 
     /// Creates a bound method callable value.
@@ -161,34 +198,34 @@ impl Value {
         method: impl Into<String>,
         scope: Option<String>,
     ) -> Self {
-        Self::Callable(CallableValue::BoundMethod {
+        Self::Callable(Box::new(CallableValue::BoundMethod {
             target,
             method: method.into(),
             scope,
-        })
+        }))
     }
 
     /// Creates a method-callable placeholder value.
     #[must_use]
     pub fn method_callable_placeholder(target: impl Into<String>) -> Self {
-        Self::Callable(CallableValue::MethodPlaceholder {
+        Self::Callable(Box::new(CallableValue::MethodPlaceholder {
             target: target.into(),
-        })
+        }))
     }
 
     /// Creates an unresolved dynamic callable gap value.
     #[must_use]
     pub fn unresolved_callable(target: impl Into<String>) -> Self {
-        Self::Callable(CallableValue::UnresolvedDynamic {
+        Self::Callable(Box::new(CallableValue::UnresolvedDynamic {
             target: target.into(),
-        })
+        }))
     }
 
     /// Returns closure payload when this value is a runtime closure.
     #[must_use]
     pub fn as_closure(&self) -> Option<&ClosurePayload> {
-        match self {
-            Self::Callable(CallableValue::Closure(payload)) => Some(payload),
+        match self.as_callable()? {
+            CallableValue::Closure(payload) => Some(payload),
             _ => None,
         }
     }
@@ -237,49 +274,51 @@ impl fmt::Debug for Value {
                 .field("id", &generator.id())
                 .field("state", &generator.state())
                 .finish(),
-            Self::Callable(CallableValue::UserFunction { name }) => f
-                .debug_struct("Callable")
-                .field("kind", &"user_function")
-                .field("name", name)
-                .finish(),
-            Self::Callable(CallableValue::Closure(payload)) => f
-                .debug_struct("Closure")
-                .field("function", &payload.function)
-                .field(
-                    "captures",
-                    &payload
-                        .captures
-                        .iter()
-                        .map(|capture| capture.name.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .finish(),
-            Self::Callable(CallableValue::InternalBuiltin { name }) => f
-                .debug_struct("Callable")
-                .field("kind", &"internal_builtin")
-                .field("name", name)
-                .finish(),
-            Self::Callable(CallableValue::BoundMethod {
-                target,
-                method,
-                scope,
-            }) => f
-                .debug_struct("Callable")
-                .field("kind", &"bound_method")
-                .field("target", target)
-                .field("method", method)
-                .field("scope", scope)
-                .finish(),
-            Self::Callable(CallableValue::MethodPlaceholder { target }) => f
-                .debug_struct("Callable")
-                .field("kind", &"method_placeholder")
-                .field("target", target)
-                .finish(),
-            Self::Callable(CallableValue::UnresolvedDynamic { target }) => f
-                .debug_struct("Callable")
-                .field("kind", &"unresolved_dynamic")
-                .field("target", target)
-                .finish(),
+            Self::Callable(callable) => match callable.as_ref() {
+                CallableValue::UserFunction { name } => f
+                    .debug_struct("Callable")
+                    .field("kind", &"user_function")
+                    .field("name", name)
+                    .finish(),
+                CallableValue::Closure(payload) => f
+                    .debug_struct("Closure")
+                    .field("function", &payload.function)
+                    .field(
+                        "captures",
+                        &payload
+                            .captures
+                            .iter()
+                            .map(|capture| capture.name.as_str())
+                            .collect::<Vec<_>>(),
+                    )
+                    .finish(),
+                CallableValue::InternalBuiltin { name } => f
+                    .debug_struct("Callable")
+                    .field("kind", &"internal_builtin")
+                    .field("name", name)
+                    .finish(),
+                CallableValue::BoundMethod {
+                    target,
+                    method,
+                    scope,
+                } => f
+                    .debug_struct("Callable")
+                    .field("kind", &"bound_method")
+                    .field("target", target)
+                    .field("method", method)
+                    .field("scope", scope)
+                    .finish(),
+                CallableValue::MethodPlaceholder { target } => f
+                    .debug_struct("Callable")
+                    .field("kind", &"method_placeholder")
+                    .field("target", target)
+                    .finish(),
+                CallableValue::UnresolvedDynamic { target } => f
+                    .debug_struct("Callable")
+                    .field("kind", &"unresolved_dynamic")
+                    .field("target", target)
+                    .finish(),
+            },
             Self::Reference(_) => f.write_str("Reference(<placeholder>)"),
         }
     }

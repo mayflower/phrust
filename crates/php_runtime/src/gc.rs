@@ -326,31 +326,24 @@ impl GcTrackedHeap {
                 let value = cell.get();
                 self.track_value_inner(&value, seen);
             }
-            Value::Callable(CallableValue::Closure(payload)) => {
-                if let Some(bound_this) = &payload.bound_this {
-                    self.track_value_inner(&Value::Object(bound_this.clone()), seen);
-                }
-                for capture in &payload.captures {
-                    if let Some(value) = capture.value() {
-                        self.track_value_inner(value, seen);
+            Value::Callable(callable) => match callable.as_ref() {
+                CallableValue::Closure(payload) => {
+                    if let Some(bound_this) = &payload.bound_this {
+                        self.track_value_inner(&Value::Object(bound_this.clone()), seen);
                     }
-                    if let Some(cell) = capture.reference() {
-                        self.track_value_inner(&Value::Reference(cell), seen);
+                    for capture in &payload.captures {
+                        if let Some(value) = capture.value() {
+                            self.track_value_inner(value, seen);
+                        }
+                        if let Some(cell) = capture.reference() {
+                            self.track_value_inner(&Value::Reference(cell), seen);
+                        }
                     }
                 }
-            }
-            Value::Callable(CallableValue::BoundMethod {
-                target: CallableMethodTarget::Object(object),
-                ..
-            }) => self.track_value_inner(&Value::Object(object.clone()), seen),
-            Value::Null
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Resource(_)
-            | Value::Uninitialized
-            | Value::Callable(
+                CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Object(object),
+                    ..
+                } => self.track_value_inner(&Value::Object(object.clone()), seen),
                 CallableValue::UserFunction { .. }
                 | CallableValue::InternalBuiltin { .. }
                 | CallableValue::BoundMethod {
@@ -358,8 +351,15 @@ impl GcTrackedHeap {
                     ..
                 }
                 | CallableValue::MethodPlaceholder { .. }
-                | CallableValue::UnresolvedDynamic { .. },
-            ) => {}
+                | CallableValue::UnresolvedDynamic { .. } => {}
+            },
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Resource(_)
+            | Value::Uninitialized => {}
         }
     }
 
@@ -433,44 +433,37 @@ impl GcScanner {
                 }
                 vec![id]
             }
-            Value::Callable(CallableValue::Closure(payload)) => {
-                self.next_closure_id = self.next_closure_id.saturating_add(1);
-                let id = GcEntityId::new(GcEntityKind::Closure, self.next_closure_id);
-                self.ensure_node(id, None);
-                let edges = payload
-                    .bound_this
-                    .as_ref()
-                    .map(|object| self.scan_value(&Value::Object(object.clone())))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(payload.captures.iter().flat_map(|capture| {
-                        capture
-                            .value()
-                            .map_or_else(Vec::new, |value| self.scan_value(value))
-                            .into_iter()
-                            .chain(
-                                capture
-                                    .reference()
-                                    .map(|cell| self.scan_value(&Value::Reference(cell)))
-                                    .unwrap_or_default(),
-                            )
-                    }))
-                    .collect::<Vec<_>>();
-                self.extend_edges(id, edges);
-                vec![id]
-            }
-            Value::Callable(CallableValue::BoundMethod {
-                target: CallableMethodTarget::Object(object),
-                ..
-            }) => self.scan_value(&Value::Object(object.clone())),
-            Value::Null
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Resource(_)
-            | Value::Uninitialized
-            | Value::Callable(
+            Value::Callable(callable) => match callable.as_ref() {
+                CallableValue::Closure(payload) => {
+                    self.next_closure_id = self.next_closure_id.saturating_add(1);
+                    let id = GcEntityId::new(GcEntityKind::Closure, self.next_closure_id);
+                    self.ensure_node(id, None);
+                    let edges = payload
+                        .bound_this
+                        .as_ref()
+                        .map(|object| self.scan_value(&Value::Object(object.clone())))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(payload.captures.iter().flat_map(|capture| {
+                            capture
+                                .value()
+                                .map_or_else(Vec::new, |value| self.scan_value(value))
+                                .into_iter()
+                                .chain(
+                                    capture
+                                        .reference()
+                                        .map(|cell| self.scan_value(&Value::Reference(cell)))
+                                        .unwrap_or_default(),
+                                )
+                        }))
+                        .collect::<Vec<_>>();
+                    self.extend_edges(id, edges);
+                    vec![id]
+                }
+                CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Object(object),
+                    ..
+                } => self.scan_value(&Value::Object(object.clone())),
                 CallableValue::UserFunction { .. }
                 | CallableValue::InternalBuiltin { .. }
                 | CallableValue::BoundMethod {
@@ -478,8 +471,15 @@ impl GcScanner {
                     ..
                 }
                 | CallableValue::MethodPlaceholder { .. }
-                | CallableValue::UnresolvedDynamic { .. },
-            ) => Vec::new(),
+                | CallableValue::UnresolvedDynamic { .. } => Vec::new(),
+            },
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Resource(_)
+            | Value::Uninitialized => Vec::new(),
         }
     }
 

@@ -1335,25 +1335,35 @@ fn collect_reachable_object_ids(
                 }
                 pending.push(cell.get());
             }
-            Value::Callable(CallableValue::Closure(payload)) => {
-                for capture in payload.captures {
-                    if let Some(value) = capture.value {
-                        pending.push(value);
+            Value::Callable(callable) => match *callable {
+                CallableValue::Closure(payload) => {
+                    for capture in payload.captures {
+                        if let Some(value) = capture.value {
+                            pending.push(value);
+                        }
+                        if let Some(cell) = capture.reference {
+                            pending.push(Value::Reference(cell));
+                        }
                     }
-                    if let Some(cell) = capture.reference {
-                        pending.push(Value::Reference(cell));
+                    if let Some(bound_this) = payload.bound_this {
+                        pending.push(Value::Object(bound_this));
                     }
                 }
-                if let Some(bound_this) = payload.bound_this {
-                    pending.push(Value::Object(bound_this));
+                CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Object(object),
+                    ..
+                } => {
+                    pending.push(Value::Object(object));
                 }
-            }
-            Value::Callable(CallableValue::BoundMethod {
-                target: CallableMethodTarget::Object(object),
-                ..
-            }) => {
-                pending.push(Value::Object(object));
-            }
+                CallableValue::UserFunction { .. }
+                | CallableValue::InternalBuiltin { .. }
+                | CallableValue::BoundMethod {
+                    target: CallableMethodTarget::Class(_),
+                    ..
+                }
+                | CallableValue::MethodPlaceholder { .. }
+                | CallableValue::UnresolvedDynamic { .. } => {}
+            },
             Value::Null
             | Value::Bool(_)
             | Value::Int(_)
@@ -1362,17 +1372,7 @@ fn collect_reachable_object_ids(
             | Value::Resource(_)
             | Value::Generator(_)
             | Value::Fiber(_)
-            | Value::Uninitialized
-            | Value::Callable(
-                CallableValue::UserFunction { .. }
-                | CallableValue::InternalBuiltin { .. }
-                | CallableValue::BoundMethod {
-                    target: CallableMethodTarget::Class(_),
-                    ..
-                }
-                | CallableValue::MethodPlaceholder { .. }
-                | CallableValue::UnresolvedDynamic { .. },
-            ) => {}
+            | Value::Uninitialized => {}
         }
     }
 }
@@ -1410,29 +1410,47 @@ fn collect_destructor_candidate_objects(
             let value = cell.get();
             collect_destructor_candidate_objects(&value, seen, candidates);
         }
-        Value::Callable(CallableValue::Closure(payload)) => {
-            for capture in &payload.captures {
-                if let Some(value) = capture.value() {
-                    collect_destructor_candidate_objects(value, seen, candidates);
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::Closure(payload) => {
+                for capture in &payload.captures {
+                    if let Some(value) = capture.value() {
+                        collect_destructor_candidate_objects(value, seen, candidates);
+                    }
+                    if let Some(cell) = capture.reference() {
+                        collect_destructor_candidate_objects(
+                            &Value::Reference(cell),
+                            seen,
+                            candidates,
+                        );
+                    }
                 }
-                if let Some(cell) = capture.reference() {
-                    collect_destructor_candidate_objects(&Value::Reference(cell), seen, candidates);
+                if let Some(bound_this) = &payload.bound_this {
+                    collect_destructor_candidate_objects(
+                        &Value::Object(bound_this.clone()),
+                        seen,
+                        candidates,
+                    );
                 }
             }
-            if let Some(bound_this) = &payload.bound_this {
+            CallableValue::BoundMethod {
+                target: CallableMethodTarget::Object(object),
+                ..
+            } => {
                 collect_destructor_candidate_objects(
-                    &Value::Object(bound_this.clone()),
+                    &Value::Object(object.clone()),
                     seen,
                     candidates,
                 );
             }
-        }
-        Value::Callable(CallableValue::BoundMethod {
-            target: CallableMethodTarget::Object(object),
-            ..
-        }) => {
-            collect_destructor_candidate_objects(&Value::Object(object.clone()), seen, candidates);
-        }
+            CallableValue::UserFunction { .. }
+            | CallableValue::InternalBuiltin { .. }
+            | CallableValue::BoundMethod {
+                target: CallableMethodTarget::Class(_),
+                ..
+            }
+            | CallableValue::MethodPlaceholder { .. }
+            | CallableValue::UnresolvedDynamic { .. } => {}
+        },
         Value::Null
         | Value::Bool(_)
         | Value::Int(_)
@@ -1441,17 +1459,7 @@ fn collect_destructor_candidate_objects(
         | Value::Resource(_)
         | Value::Generator(_)
         | Value::Fiber(_)
-        | Value::Uninitialized
-        | Value::Callable(
-            CallableValue::UserFunction { .. }
-            | CallableValue::InternalBuiltin { .. }
-            | CallableValue::BoundMethod {
-                target: CallableMethodTarget::Class(_),
-                ..
-            }
-            | CallableValue::MethodPlaceholder { .. }
-            | CallableValue::UnresolvedDynamic { .. },
-        ) => {}
+        | Value::Uninitialized => {}
     }
 }
 
@@ -22447,7 +22455,7 @@ impl Vm {
                             Value::Callable(callable) if method.eq_ignore_ascii_case("call") => {
                                 let result = self.call_closure_call_method(
                                     compiled,
-                                    callable,
+                                    *callable,
                                     values,
                                     output,
                                     stack,
@@ -22491,7 +22499,7 @@ impl Vm {
                             Value::Callable(callable) if method.eq_ignore_ascii_case("bindto") => {
                                 let result = self.call_closure_bind_to_method(
                                     compiled,
-                                    callable,
+                                    *callable,
                                     values,
                                     output,
                                     stack,
@@ -25354,7 +25362,8 @@ impl Vm {
         by_ref_warning_callable_name: Option<String>,
     ) -> VmResult {
         match callee {
-            Value::Callable(CallableValue::UserFunction { name }) => {
+            Value::Callable(callable) => match *callable {
+            CallableValue::UserFunction { name } => {
                 let make_call = |args, captures| {
                     let call = FunctionCall::new(args, captures)
                         .with_call_site_strict_types(compiled.unit().strict_types)
@@ -25395,7 +25404,7 @@ impl Vm {
                     )
                 }
             }
-            Value::Callable(CallableValue::Closure(payload)) => {
+            CallableValue::Closure(payload) => {
                 let mut call = FunctionCall::new(args, payload.captures)
                     .with_call_site_strict_types(compiled.unit().strict_types)
                     .with_optional_call_span(call_span)
@@ -25446,7 +25455,7 @@ impl Vm {
                     state,
                 )
             }
-            Value::Callable(CallableValue::InternalBuiltin { name }) => {
+            CallableValue::InternalBuiltin { name } => {
                 if is_array_callback_builtin_name(&name) {
                     return self.call_array_callback_builtin(
                         compiled, &name, args, call_span, output, stack, state,
@@ -25510,14 +25519,14 @@ impl Vm {
                     compiled,
                 )
             }
-            Value::Callable(CallableValue::BoundMethod {
+            CallableValue::BoundMethod {
                 target,
                 method,
                 scope,
-            }) => self.call_bound_method_callable(
+            } => self.call_bound_method_callable(
                 compiled, target, &method, scope, args, call_span, output, stack, state,
             ),
-            Value::Callable(CallableValue::MethodPlaceholder { target }) => self.runtime_error(
+            CallableValue::MethodPlaceholder { target } => self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -25525,12 +25534,13 @@ impl Vm {
                     "E_PHP_VM_UNSUPPORTED_METHOD_CALLABLE: method callable {target} is not implemented"
                 ),
             ),
-            Value::Callable(CallableValue::UnresolvedDynamic { target }) => self.runtime_error(
+            CallableValue::UnresolvedDynamic { target } => self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_UNRESOLVED_CALLABLE: callable {target} could not be resolved"),
             ),
+            },
             Value::String(name) => self.call_named_callable(
                 compiled,
                 &name.to_string_lossy(),
@@ -25834,7 +25844,7 @@ impl Vm {
                 let previous = state
                     .error_handlers
                     .last()
-                    .map(|entry| Value::Callable(entry.callback.clone()))
+                    .map(|entry| Value::Callable(Box::new(entry.callback.clone())))
                     .unwrap_or(Value::Null);
                 state
                     .error_handlers
@@ -25881,7 +25891,7 @@ impl Vm {
                 let previous = state
                     .exception_handlers
                     .last()
-                    .map(|callback| Value::Callable(callback.clone()))
+                    .map(|callback| Value::Callable(Box::new(callback.clone())))
                     .unwrap_or(Value::Null);
                 state.exception_handlers.push(callback);
                 VmResult::success_no_output(Some(previous))
@@ -26059,7 +26069,7 @@ impl Vm {
         .collect();
         let result = self.call_callable(
             compiled,
-            Value::Callable(callback),
+            Value::Callable(Box::new(callback)),
             args,
             output,
             stack,
@@ -27691,84 +27701,95 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> VmResult {
         match callee {
-            Value::Callable(CallableValue::UserFunction { name }) => {
-                if let Some(function) = compiled.lookup_function(&name) {
-                    self.execute_function(
+            Value::Callable(callable) => match *callable {
+                CallableValue::UserFunction { name } => {
+                    if let Some(function) = compiled.lookup_function(&name) {
+                        self.execute_function(
+                            compiled,
+                            function,
+                            FunctionCall::new(args, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .running_fiber(fiber),
+                            output,
+                            stack,
+                            state,
+                        )
+                    } else if let Some((owner, function)) = dynamic_function_in_state(state, &name)
+                    {
+                        self.execute_function(
+                            &owner,
+                            function,
+                            FunctionCall::new(args, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .running_fiber(fiber),
+                            output,
+                            stack,
+                            state,
+                        )
+                    } else {
+                        self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
+                        )
+                    }
+                }
+                CallableValue::Closure(payload) => {
+                    let mut call = FunctionCall::new(args, payload.captures)
+                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .running_fiber(fiber)
+                        .with_error_context(compiled.clone());
+                    let closure_owner = closure_owner_for_function(
                         compiled,
-                        function,
-                        FunctionCall::new(args, Vec::new())
-                            .with_call_site_strict_types(compiled.unit().strict_types)
-                            .running_fiber(fiber),
+                        state,
+                        payload.function,
+                        payload.debug.as_deref(),
+                        payload.context.owner_unit,
+                    );
+                    if let Some(bound_this) = payload.bound_this
+                        && closure_function_has_this_local(&closure_owner, payload.function)
+                    {
+                        call = call.with_this(bound_this);
+                    }
+                    if let Some(scope_class) = payload.context.scope_class {
+                        call = call.with_class_context(
+                            scope_class.clone(),
+                            payload
+                                .context
+                                .called_class
+                                .unwrap_or_else(|| scope_class.clone()),
+                            payload
+                                .context
+                                .declaring_class
+                                .unwrap_or_else(|| scope_class.clone()),
+                        );
+                    } else if let Some(this_value) = call.this_value.as_ref() {
+                        let scope_class = this_value.display_name();
+                        call = call.with_class_context(
+                            scope_class.clone(),
+                            scope_class.clone(),
+                            scope_class,
+                        );
+                    }
+                    self.execute_function(
+                        &closure_owner,
+                        FunctionId::new(payload.function),
+                        call,
                         output,
                         stack,
                         state,
-                    )
-                } else if let Some((owner, function)) = dynamic_function_in_state(state, &name) {
-                    self.execute_function(
-                        &owner,
-                        function,
-                        FunctionCall::new(args, Vec::new())
-                            .with_call_site_strict_types(compiled.unit().strict_types)
-                            .running_fiber(fiber),
-                        output,
-                        stack,
-                        state,
-                    )
-                } else {
-                    self.runtime_error(
-                        output,
-                        compiled,
-                        stack,
-                        format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
                     )
                 }
-            }
-            Value::Callable(CallableValue::Closure(payload)) => {
-                let mut call = FunctionCall::new(args, payload.captures)
-                    .with_call_site_strict_types(compiled.unit().strict_types)
-                    .running_fiber(fiber)
-                    .with_error_context(compiled.clone());
-                let closure_owner = closure_owner_for_function(
+                other_callable => self.call_callable(
                     compiled,
-                    state,
-                    payload.function,
-                    payload.debug.as_deref(),
-                    payload.context.owner_unit,
-                );
-                if let Some(bound_this) = payload.bound_this
-                    && closure_function_has_this_local(&closure_owner, payload.function)
-                {
-                    call = call.with_this(bound_this);
-                }
-                if let Some(scope_class) = payload.context.scope_class {
-                    call = call.with_class_context(
-                        scope_class.clone(),
-                        payload
-                            .context
-                            .called_class
-                            .unwrap_or_else(|| scope_class.clone()),
-                        payload
-                            .context
-                            .declaring_class
-                            .unwrap_or_else(|| scope_class.clone()),
-                    );
-                } else if let Some(this_value) = call.this_value.as_ref() {
-                    let scope_class = this_value.display_name();
-                    call = call.with_class_context(
-                        scope_class.clone(),
-                        scope_class.clone(),
-                        scope_class,
-                    );
-                }
-                self.execute_function(
-                    &closure_owner,
-                    FunctionId::new(payload.function),
-                    call,
+                    Value::Callable(Box::new(other_callable)),
+                    args,
                     output,
                     stack,
                     state,
-                )
-            }
+                ),
+            },
             other => self.call_callable(compiled, other, args, output, stack, state),
         }
     }
@@ -28722,7 +28743,7 @@ impl Vm {
             }
             other => self.call_callable_inner(
                 compiled,
-                Value::Callable(other),
+                Value::Callable(Box::new(other)),
                 args,
                 Some(span),
                 output,
@@ -35535,7 +35556,7 @@ impl Vm {
             let callback_for_trace = trace_origin.map(|_| callback.clone());
             let result = self.call_callable(
                 compiled,
-                Value::Callable(callback),
+                Value::Callable(Box::new(callback)),
                 vec![CallArgument::positional(Value::string(
                     class_name.as_bytes().to_vec(),
                 ))],
@@ -36040,7 +36061,7 @@ impl Vm {
             };
             let result = self.call_callable(
                 compiled,
-                Value::Callable(callback),
+                Value::Callable(Box::new(callback)),
                 vec![CallArgument::positional(value)],
                 output,
                 stack,
@@ -36128,32 +36149,34 @@ fn trace_value(value: &Value) -> String {
         ),
         Value::Fiber(fiber) => format!("Fiber(state={:?})", fiber.state()),
         Value::Generator(generator) => format!("Generator(state={:?})", generator.state()),
-        Value::Callable(CallableValue::UserFunction { name }) => {
-            format!("Callable(user_function={name})")
-        }
-        Value::Callable(CallableValue::Closure(payload)) => {
-            format!(
-                "Closure(function={}, captures={})",
-                payload.function,
-                payload.captures.len()
-            )
-        }
-        Value::Callable(CallableValue::InternalBuiltin { name }) => {
-            format!("Callable(internal_builtin={name})")
-        }
-        Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
-            let target = match target {
-                CallableMethodTarget::Object(object) => object.class_name(),
-                CallableMethodTarget::Class(class_name) => class_name.clone(),
-            };
-            format!("Callable(bound_method={target}::{method})")
-        }
-        Value::Callable(CallableValue::MethodPlaceholder { target }) => {
-            format!("Callable(method_placeholder={target})")
-        }
-        Value::Callable(CallableValue::UnresolvedDynamic { target }) => {
-            format!("Callable(unresolved_dynamic={target})")
-        }
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::UserFunction { name } => {
+                format!("Callable(user_function={name})")
+            }
+            CallableValue::Closure(payload) => {
+                format!(
+                    "Closure(function={}, captures={})",
+                    payload.function,
+                    payload.captures.len()
+                )
+            }
+            CallableValue::InternalBuiltin { name } => {
+                format!("Callable(internal_builtin={name})")
+            }
+            CallableValue::BoundMethod { target, method, .. } => {
+                let target = match target {
+                    CallableMethodTarget::Object(object) => object.class_name(),
+                    CallableMethodTarget::Class(class_name) => class_name.clone(),
+                };
+                format!("Callable(bound_method={target}::{method})")
+            }
+            CallableValue::MethodPlaceholder { target } => {
+                format!("Callable(method_placeholder={target})")
+            }
+            CallableValue::UnresolvedDynamic { target } => {
+                format!("Callable(unresolved_dynamic={target})")
+            }
+        },
         Value::Reference(cell) => format!("Reference(value={})", trace_value(&cell.get())),
     }
 }
@@ -37837,7 +37860,8 @@ impl Vm {
                 );
             };
             match target {
-                Value::Callable(CallableValue::UserFunction { name }) => {
+                Value::Callable(callable) => match callable.as_ref() {
+                CallableValue::UserFunction { name } => {
                     if let Some(function_id) = compiled.lookup_function(&normalize_function_name(name))
                     {
                         let function_entry = &compiled.unit().functions[function_id.index()];
@@ -37848,7 +37872,7 @@ impl Vm {
                         reflection_internal_function_object(name)
                     }
                 }
-                Value::Callable(CallableValue::Closure(payload)) => {
+                CallableValue::Closure(payload) => {
                     let function = FunctionId::new(payload.function);
                     let function_entry = compiled.unit().functions.get(function.index()).ok_or_else(|| {
                         format!(
@@ -37863,17 +37887,18 @@ impl Vm {
                         payload.bound_this.as_ref(),
                     )?)
                 }
-                Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
+                CallableValue::BoundMethod { target, method, .. } => {
                     let class_name = match target {
                         CallableMethodTarget::Object(object) => object.class_name(),
                         CallableMethodTarget::Class(class_name) => class_name.clone(),
                     };
                     reflection_method_object(compiled, &class_name, method)
                 }
-                Value::Callable(_) => Err(
+                _ => Err(
                     "E_PHP_VM_REFLECTION_UNSUPPORTED_CALLABLE: callable reflection supports user functions and closures in the reflection-clone MVP"
                         .to_owned(),
                 ),
+                },
                 _ => {
                     let function = reflection_string_arg(&args, 0, "ReflectionFunction::__construct")?;
                     if let Some(function_id) =
@@ -43506,7 +43531,7 @@ fn closure_static_method_value(
                     ));
                 }
             };
-            Ok(bind_closure_callable_value(callable, bound_this))
+            Ok(bind_closure_callable_value(*callable, bound_this))
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method Closure::{method} is not defined"
@@ -43542,7 +43567,7 @@ fn bind_closure_callable_value(callable: CallableValue, bound_this: Option<Objec
             };
             Value::bound_method_callable(rebound_target, method, scope)
         }
-        other => Value::Callable(other),
+        other => Value::Callable(Box::new(other)),
     }
 }
 
@@ -51725,28 +51750,34 @@ fn error_handler_callback_from_value(
     value: Value,
 ) -> Result<CallableValue, String> {
     match value {
-        Value::Callable(CallableValue::UserFunction { name }) => {
-            let normalized = normalize_function_name(&name);
-            if compiled.lookup_function(&normalized).is_some() {
-                Ok(CallableValue::UserFunction { name: normalized })
-            } else if BuiltinRegistry::new().contains(&normalized) {
-                Ok(CallableValue::InternalBuiltin { name: normalized })
-            } else {
-                Err(format!(
-                    "E_PHP_VM_ERROR_INVALID_CALLBACK: function {name} is not callable"
-                ))
+        Value::Callable(callable) => match *callable {
+            CallableValue::UserFunction { name } => {
+                let normalized = normalize_function_name(&name);
+                if compiled.lookup_function(&normalized).is_some() {
+                    Ok(CallableValue::UserFunction { name: normalized })
+                } else if BuiltinRegistry::new().contains(&normalized) {
+                    Ok(CallableValue::InternalBuiltin { name: normalized })
+                } else {
+                    Err(format!(
+                        "E_PHP_VM_ERROR_INVALID_CALLBACK: function {name} is not callable"
+                    ))
+                }
             }
-        }
-        Value::Callable(CallableValue::Closure(payload)) => Ok(CallableValue::Closure(payload)),
-        Value::Callable(CallableValue::InternalBuiltin { name }) => {
-            if BuiltinRegistry::new().contains(&name) {
-                Ok(CallableValue::InternalBuiltin { name })
-            } else {
-                Err(format!(
-                    "E_PHP_VM_ERROR_INVALID_CALLBACK: builtin {name} is not callable"
-                ))
+            CallableValue::Closure(payload) => Ok(CallableValue::Closure(payload)),
+            CallableValue::InternalBuiltin { name } => {
+                if BuiltinRegistry::new().contains(&name) {
+                    Ok(CallableValue::InternalBuiltin { name })
+                } else {
+                    Err(format!(
+                        "E_PHP_VM_ERROR_INVALID_CALLBACK: builtin {name} is not callable"
+                    ))
+                }
             }
-        }
+            other_callable => Err(format!(
+                "E_PHP_VM_ERROR_INVALID_CALLBACK: value of type {} is not callable",
+                value_type_name(&Value::Callable(Box::new(other_callable)))
+            )),
+        },
         Value::String(name) => {
             let name = normalize_function_name(&name.to_string_lossy());
             if compiled.lookup_function(&name).is_some() {
@@ -51772,27 +51803,33 @@ fn autoload_callback_from_value(
     value: Value,
 ) -> Result<CallableValue, String> {
     match value {
-        Value::Callable(CallableValue::UserFunction { name }) => {
-            let normalized = normalize_function_name(&name);
-            if compiled.lookup_function(&normalized).is_some()
-                || dynamic_function_in_state(state, &normalized).is_some()
-                || BuiltinRegistry::new().contains(&normalized)
-            {
-                Ok(CallableValue::UserFunction { name: normalized })
-            } else {
-                Err(format!(
-                    "function \"{name}\" not found or invalid function name"
-                ))
+        Value::Callable(callable) => match *callable {
+            CallableValue::UserFunction { name } => {
+                let normalized = normalize_function_name(&name);
+                if compiled.lookup_function(&normalized).is_some()
+                    || dynamic_function_in_state(state, &normalized).is_some()
+                    || BuiltinRegistry::new().contains(&normalized)
+                {
+                    Ok(CallableValue::UserFunction { name: normalized })
+                } else {
+                    Err(format!(
+                        "function \"{name}\" not found or invalid function name"
+                    ))
+                }
             }
-        }
-        Value::Callable(CallableValue::Closure(payload)) => Ok(CallableValue::Closure(payload)),
-        Value::Callable(CallableValue::InternalBuiltin { name }) => {
-            if BuiltinRegistry::new().contains(&name) {
-                Ok(CallableValue::InternalBuiltin { name })
-            } else {
-                Err(format!("builtin {name} is not callable"))
+            CallableValue::Closure(payload) => Ok(CallableValue::Closure(payload)),
+            CallableValue::InternalBuiltin { name } => {
+                if BuiltinRegistry::new().contains(&name) {
+                    Ok(CallableValue::InternalBuiltin { name })
+                } else {
+                    Err(format!("builtin {name} is not callable"))
+                }
             }
-        }
+            other_callable => Err(format!(
+                "value of type {} is not callable",
+                value_type_name(&Value::Callable(Box::new(other_callable)))
+            )),
+        },
         Value::String(name) => {
             let name = name.to_string_lossy();
             if let Some((class_name, method)) = name.split_once("::") {
@@ -55146,28 +55183,30 @@ fn callable_name_for_is_callable(
     value: &Value,
 ) -> Option<String> {
     match effective_value(value) {
-        Value::Callable(CallableValue::UserFunction { name }) => Some(name),
-        Value::Callable(CallableValue::InternalBuiltin { name }) => Some(name),
-        Value::Callable(CallableValue::Closure(payload)) => {
-            let function = compiled.unit().functions.get(payload.function as usize)?;
-            payload
-                .debug
-                .map(|debug| debug.name)
-                .or_else(|| Some(function.name.clone()))
-        }
-        Value::Callable(CallableValue::MethodPlaceholder { target })
-        | Value::Callable(CallableValue::UnresolvedDynamic { target }) => Some(target),
-        Value::Callable(CallableValue::BoundMethod { target, method, .. }) => {
-            let class_name = match target {
-                CallableMethodTarget::Object(object) => {
-                    callable_class_display_name(compiled, state, &object.class_name())
-                }
-                CallableMethodTarget::Class(class_name) => {
-                    callable_class_display_name(compiled, state, &class_name)
-                }
-            };
-            Some(format!("{class_name}::{method}"))
-        }
+        Value::Callable(callable) => match *callable {
+            CallableValue::UserFunction { name } => Some(name),
+            CallableValue::InternalBuiltin { name } => Some(name),
+            CallableValue::Closure(payload) => {
+                let function = compiled.unit().functions.get(payload.function as usize)?;
+                payload
+                    .debug
+                    .map(|debug| debug.name)
+                    .or_else(|| Some(function.name.clone()))
+            }
+            CallableValue::MethodPlaceholder { target }
+            | CallableValue::UnresolvedDynamic { target } => Some(target),
+            CallableValue::BoundMethod { target, method, .. } => {
+                let class_name = match target {
+                    CallableMethodTarget::Object(object) => {
+                        callable_class_display_name(compiled, state, &object.class_name())
+                    }
+                    CallableMethodTarget::Class(class_name) => {
+                        callable_class_display_name(compiled, state, &class_name)
+                    }
+                };
+                Some(format!("{class_name}::{method}"))
+            }
+        },
         Value::Object(object) => Some(format!(
             "{}::__invoke",
             callable_class_display_name(compiled, state, &object.class_name())
@@ -55212,7 +55251,7 @@ fn autoload_callback_public_value(
             Value::string(user_function_display_name(compiled, state, name))
         }
         CallableValue::InternalBuiltin { name } => Value::string(name.clone()),
-        CallableValue::Closure(_) => Value::Callable(callback.clone()),
+        CallableValue::Closure(_) => Value::Callable(Box::new(callback.clone())),
         CallableValue::BoundMethod { target, method, .. } => {
             if method.eq_ignore_ascii_case("__invoke")
                 && let CallableMethodTarget::Object(object) = target
@@ -57033,11 +57072,8 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
         RuntimeType::Object => {
             matches!(
                 value,
-                Value::Object(_)
-                    | Value::Fiber(_)
-                    | Value::Generator(_)
-                    | Value::Callable(CallableValue::Closure(_))
-            )
+                Value::Object(_) | Value::Fiber(_) | Value::Generator(_)
+            ) || matches!(value.as_callable(), Some(CallableValue::Closure(_)))
         }
         RuntimeType::Class { name, .. } => {
             matches!(
@@ -57049,10 +57085,8 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
             ) || matches!(
                 value,
                 Value::Generator(_) if name.eq_ignore_ascii_case("Generator")
-            ) || matches!(
-                value,
-                Value::Callable(CallableValue::Closure(_)) if name.eq_ignore_ascii_case("Closure")
-            )
+            ) || (matches!(value.as_callable(), Some(CallableValue::Closure(_)))
+                && name.eq_ignore_ascii_case("Closure"))
         }
         RuntimeType::Nullable { inner } => {
             matches!(value, Value::Null) || typecheck_fast_path_match(value, inner)
@@ -57354,8 +57388,8 @@ fn cast_value_to_array(compiled: &CompiledUnit, stack: &CallStack, value: &Value
         Value::Array(array) => Value::Array(array),
         Value::Null | Value::Uninitialized => Value::Array(PhpArray::new()),
         Value::Object(object) => Value::Array(object_vars_array(compiled, stack, &object, true)),
-        Value::Callable(CallableValue::Closure(payload)) => {
-            Value::packed_array(vec![Value::Callable(CallableValue::Closure(payload))])
+        Value::Callable(callable) if matches!(callable.as_ref(), CallableValue::Closure(_)) => {
+            Value::packed_array(vec![Value::Callable(callable)])
         }
         scalar => Value::packed_array(vec![scalar]),
     }

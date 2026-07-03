@@ -557,17 +557,15 @@ mod attribute_reflection_metadata {
                 Value::String(crate::PhpString::from_test_str("cap")),
             )],
         ));
-        match closure {
-            Value::Callable(crate::CallableValue::Closure(payload)) => {
-                assert_eq!(payload.function, 29);
-                assert_eq!(payload.captures[0].name, "captured");
-                assert_eq!(
-                    payload.captures[0].value(),
-                    Some(&Value::String(crate::PhpString::from_test_str("cap")))
-                );
-            }
-            other => panic!("expected closure callable, got {other:?}"),
-        }
+        let payload = closure
+            .as_closure()
+            .unwrap_or_else(|| panic!("expected closure callable, got {closure:?}"));
+        assert_eq!(payload.function, 29);
+        assert_eq!(payload.captures[0].name, "captured");
+        assert_eq!(
+            payload.captures[0].value(),
+            Some(&Value::String(crate::PhpString::from_test_str("cap")))
+        );
     }
 }
 

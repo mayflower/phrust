@@ -25,11 +25,8 @@ pub fn value_matches_runtime_type(value: &Value, runtime_type: &RuntimeType) -> 
         RuntimeType::Object => {
             matches!(
                 value,
-                Value::Object(_)
-                    | Value::Fiber(_)
-                    | Value::Generator(_)
-                    | Value::Callable(CallableValue::Closure(_))
-            )
+                Value::Object(_) | Value::Fiber(_) | Value::Generator(_)
+            ) || matches!(value.as_callable(), Some(CallableValue::Closure(_)))
         }
         RuntimeType::Never => false,
         RuntimeType::False => matches!(value, Value::Bool(false)),
@@ -118,12 +115,12 @@ pub fn value_type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Uninitialized => "uninitialized",
         Value::Array(_) => "array",
-        Value::Object(_)
-        | Value::Fiber(_)
-        | Value::Generator(_)
-        | Value::Callable(CallableValue::Closure(_)) => "object",
+        Value::Object(_) | Value::Fiber(_) | Value::Generator(_) => "object",
         Value::Resource(_) => "resource",
-        Value::Callable(_) => "callable",
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::Closure(_) => "object",
+            _ => "callable",
+        },
         Value::Reference(_) => unreachable!("references are handled before matching"),
     }
 }
@@ -203,10 +200,8 @@ mod tests {
 
     #[test]
     fn type_matcher_treats_closure_callables_as_objects() {
-        let closure = Value::Callable(CallableValue::Closure(ClosurePayload::new(11, Vec::new())));
-        let plain_callable = Value::Callable(CallableValue::UserFunction {
-            name: "strlen".into(),
-        });
+        let closure = Value::closure(ClosurePayload::new(11, Vec::new()));
+        let plain_callable = Value::user_function_callable("strlen");
 
         assert!(value_matches_runtime_type(&closure, &RuntimeType::Object));
         assert_eq!(value_type_name(&closure), "object");
