@@ -422,21 +422,41 @@ fn qualified_function_name(
     short_name.to_owned()
 }
 
+fn is_top_level_function_signature(module: &HirModule, signature: &FunctionSignature) -> bool {
+    module.namespaces().values().any(|namespace| {
+        namespace.items().iter().any(|item| {
+            item.kind() == TopLevelItemKind::Function && item.span() == signature.span()
+        })
+    })
+}
+
 fn function_declaration_metadata(
     module: &HirModule,
     signature: &FunctionSignature,
 ) -> Option<(String, DeclarationKind)> {
-    module
-        .declaration_table()
-        .entries()
-        .iter()
-        .find(|entry| {
-            matches!(
+    let short_name = signature.name()?;
+    let expected_basename = normalize_function_name(short_name);
+    let mut matching_entries = module.declaration_table().entries().iter().filter(|entry| {
+        normalized_function_basename(&entry.fqn().canonical(NameKind::Function))
+            == expected_basename
+            && matches!(
                 entry.kind(),
                 DeclarationKind::Function | DeclarationKind::ConditionalFunction
-            ) && range_contains(signature.span(), entry.span())
+            )
+            && range_contains(signature.span(), entry.span())
+    });
+    let is_top_level = is_top_level_function_signature(module, signature);
+    matching_entries
+        .find(|entry| entry.kind() == DeclarationKind::ConditionalFunction)
+        .or_else(|| matching_entries.next())
+        .map(|entry| {
+            let kind = if is_top_level {
+                entry.kind()
+            } else {
+                DeclarationKind::ConditionalFunction
+            };
+            (entry.fqn().canonical(NameKind::Function), kind)
         })
-        .map(|entry| (entry.fqn().canonical(NameKind::Function), entry.kind()))
 }
 
 fn class_declaration_kind(
@@ -4873,6 +4893,29 @@ mod tests {
             snapshot
                 .matches("function_name \"lowercase_octets\"")
                 .count(),
+            0,
+            "{snapshot}"
+        );
+    }
+
+    #[test]
+    fn direct_nested_function_inside_function_emits_runtime_declare() {
+        let frontend = analyze_source(
+            "<?php function outer() { function nested_helper() { return 'ok'; } return nested_helper(); }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        assert_eq!(result.unit.function_table.len(), 1);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("function_name \"outer\""), "{snapshot}");
+        assert!(
+            snapshot.contains("declare_function \"nested_helper\""),
+            "{snapshot}"
+        );
+        assert_eq!(
+            snapshot.matches("function_name \"nested_helper\"").count(),
             0,
             "{snapshot}"
         );

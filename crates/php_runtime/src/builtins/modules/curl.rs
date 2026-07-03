@@ -590,7 +590,6 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
         "__curl_last_response_body",
         Value::String(PhpString::from(response_body.clone())),
     );
-    curl_apply_response_callbacks(&handle, &response_headers, &response_body);
 
     let body = if curl_bool_property(&handle, "__curl_header") {
         let mut bytes = response_headers;
@@ -1182,53 +1181,6 @@ fn curl_post_body(handle: &ObjectRef) -> Result<CurlPostBody, CurlTransportError
             .map_err(|error| (43, error.message().to_owned())),
         None => Ok((Vec::new(), None)),
     }
-}
-
-fn curl_apply_response_callbacks(handle: &ObjectRef, headers: &[u8], body: &[u8]) {
-    if let Some(target) = curl_callback_target(handle, "__curl_headerfunction", "stream_headers") {
-        target.set_property("headers", Value::String(PhpString::from(headers.to_vec())));
-        target.set_property("done_headers", Value::Bool(true));
-    }
-
-    if let Some(target) = curl_callback_target(handle, "__curl_writefunction", "stream_body") {
-        let previous = match target.get_property("response_data") {
-            Some(Value::String(value)) => value.as_bytes().to_vec(),
-            _ => Vec::new(),
-        };
-        let existing_bytes = match target.get_property("response_bytes") {
-            Some(Value::Int(value)) if value > 0 => value as usize,
-            _ => 0,
-        };
-        let limit = match target.get_property("response_byte_limit") {
-            Some(Value::Int(value)) if value >= 0 => Some(value as usize),
-            _ => None,
-        };
-        let allowed = limit.map_or(body.len(), |limit| limit.saturating_sub(existing_bytes));
-        let kept = body.len().min(allowed);
-        let mut response = previous;
-        response.extend_from_slice(&body[..kept]);
-        target.set_property("response_data", Value::String(PhpString::from(response)));
-        target.set_property(
-            "response_bytes",
-            Value::Int(existing_bytes.saturating_add(kept) as i64),
-        );
-    }
-}
-
-fn curl_callback_target(handle: &ObjectRef, property: &str, method: &str) -> Option<ObjectRef> {
-    let Value::Array(callback) = handle.get_property(property)? else {
-        return None;
-    };
-    let Some(Value::Object(target)) = callback.get(&ArrayKey::Int(0)) else {
-        return None;
-    };
-    let Some(Value::String(callback_method)) = callback.get(&ArrayKey::Int(1)) else {
-        return None;
-    };
-    callback_method
-        .to_string_lossy()
-        .eq_ignore_ascii_case(method)
-        .then_some(target.clone())
 }
 
 fn form_encode_array(array: &PhpArray) -> String {
@@ -2251,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn curl_exec_populates_requests_transport_callback_fields() {
+    fn curl_exec_stores_callback_response_payloads_without_mutating_targets() {
         let _guard = NET_TEST_ENV_LOCK.lock().expect("env lock");
         let _override = NetTestsOverride::set(true);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local server");
@@ -2274,6 +2226,9 @@ mod tests {
             RuntimeSourceSpan::default(),
         )
         .expect("init");
+        let Value::Object(handle_object) = &handle else {
+            panic!("curl_init should return an object handle");
+        };
         let transport = ObjectRef::new_with_display_name(
             &curl_runtime_class("WpOrg\\Requests\\Transport\\Curl"),
             "WpOrg\\Requests\\Transport\\Curl",
@@ -2319,16 +2274,23 @@ mod tests {
         );
         assert_eq!(
             transport.get_property("response_data"),
-            Some(Value::string("OK"))
+            Some(Value::string(""))
         );
         assert_eq!(
             transport.get_property("response_bytes"),
-            Some(Value::Int(2))
+            Some(Value::Int(0))
         );
-        let Some(Value::String(headers)) = transport.get_property("headers") else {
-            panic!("headers should be populated");
+        assert_eq!(transport.get_property("headers"), Some(Value::string("")));
+        let Some(Value::String(headers)) =
+            handle_object.get_property("__curl_last_response_headers")
+        else {
+            panic!("response headers should be stored on the cURL handle");
         };
         assert!(headers.to_string_lossy().starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            handle_object.get_property("__curl_last_response_body"),
+            Some(Value::string("OK"))
+        );
         server.join().expect("server");
     }
 

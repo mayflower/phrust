@@ -553,6 +553,7 @@ fn direct_body_statement_spans(body: BlockStmt<'_>) -> Vec<TextRange> {
 
 fn is_direct_body_statement(node: &SyntaxNode) -> bool {
     Stmt::cast(node).is_some()
+        || FunctionDecl::cast(node).is_some()
         || ClassDecl::cast(node).is_some()
         || InterfaceDecl::cast(node).is_some()
         || TraitDecl::cast(node).is_some()

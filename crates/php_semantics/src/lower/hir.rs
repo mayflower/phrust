@@ -110,7 +110,7 @@ impl HirLowerer<'_> {
     }
 
     fn collect_statement_descendants(&mut self, node: &SyntaxNode) {
-        if Stmt::cast(node).is_some() {
+        if is_statement_list_item(node) {
             self.collect_node(node);
             return;
         }

@@ -61115,7 +61115,7 @@ mod tests {
             assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /callback"));
             std::io::Write::write_all(
                 &mut stream,
-                b"HTTP/1.1 200 OK\r\nX-Test: yes\r\nContent-Length: 4\r\n\r\nBODY",
+                b"HTTP/1.1 200 OK\r\nX-Test: yes\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nBODY\r\n0\r\n\r\n",
             )
             .expect("write response");
             stream
@@ -61146,6 +61146,7 @@ mod tests {
             $result = curl_exec($handle);
             echo str_starts_with($collector->headers, \"HTTP/1.1 200 OK\\r\\n\") ? 'H' : 'h';
             echo '|', str_contains($collector->headers, \"X-Test: yes\\r\\n\") ? 'X' : 'x';
+            echo '|', substr_count($collector->headers, \"HTTP/1.1 200 OK\");
             echo '|', $collector->body;
             echo '|', $result;
             "
@@ -61159,7 +61160,7 @@ mod tests {
         server.join().expect("server thread");
 
         assert!(result.status.is_success(), "{:?}", result.status);
-        assert_eq!(result.output.to_string_lossy(), "H|X|BODY|BODY");
+        assert_eq!(result.output.to_string_lossy(), "H|X|1|BODY|BODY");
     }
 
     #[test]
@@ -76936,6 +76937,48 @@ echo dense_supported(4), "\n", rich_fallback(), "\n";
                 .copied()
                 .unwrap_or_default()
                 >= 2,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_bytecode_auto_falls_back_for_direct_nested_function_declare() {
+        let result = execute_source_with_options(
+            r#"<?php
+function outer_direct_nested() {
+    function inner_direct_nested() {
+        return 'declared';
+    }
+    return inner_direct_nested();
+}
+echo function_exists('inner_direct_nested') ? 'early' : 'missing';
+echo '|', outer_direct_nested();
+echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "missing|declared|late");
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.bytecode_lower_attempts, 1, "{counters:?}");
+        assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
+        assert!(
+            counters.rich_fallback_functions_executed >= 1,
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .dense_call_fallback_by_reason
+                .iter()
+                .any(|(reason, count)| reason
+                    .contains("DeclareFunction { name: \"inner_direct_nested\"")
+                    && *count == 1),
             "{counters:?}"
         );
     }
