@@ -10,7 +10,7 @@ use crate::{
     RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity, Value,
     WordPressDiagnosticContext, normalize_class_name,
 };
-use native_tls::TlsConnector;
+use openssl::ssl::{SslConnector, SslMethod};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(test)]
@@ -791,8 +791,9 @@ fn execute_single_http_request(request: &CurlRequest) -> Result<CurlResponse, (i
         .set_write_timeout(Some(request.timeout))
         .map_err(|error| (28, format!("failed to set cURL write timeout: {error}")))?;
     let mut stream: Box<dyn CurlStream> = if request.https {
-        let connector = TlsConnector::new()
-            .map_err(|error| (35, format!("failed to initialize cURL TLS: {error}")))?;
+        let connector = SslConnector::builder(SslMethod::tls())
+            .map_err(|error| (35, format!("failed to initialize cURL TLS: {error}")))?
+            .build();
         Box::new(
             connector
                 .connect(&request.host, tcp_stream)
