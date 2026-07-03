@@ -9745,6 +9745,46 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn emit_array_offset_on_scalar_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
+        base: &Value,
+        span: IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = array_offset_on_scalar_warning(
+            base,
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+        );
+        match self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        ) {
+            Ok(false) if error_reporting_allows(state, php_runtime::PHP_E_WARNING) => {
+                emit_vm_diagnostic(
+                    output,
+                    state,
+                    &diagnostic,
+                    php_runtime::PhpDiagnosticChannel::Warning,
+                    php_runtime::PHP_E_WARNING,
+                );
+                diagnostics.push(diagnostic);
+            }
+            Ok(_) => {}
+            Err(result) => return Err(result),
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fetch_dim_value(
         &self,
         compiled: &CompiledUnit,
@@ -9878,6 +9918,18 @@ impl Vm {
             };
         }
         if quiet && quiet_dim_fetch_scalar_returns_null(&base) {
+            return Ok(Value::Null);
+        }
+        if quiet_dim_fetch_scalar_returns_null(&base) {
+            self.emit_array_offset_on_scalar_warning(
+                compiled,
+                output,
+                stack,
+                state,
+                diagnostics,
+                &base,
+                span,
+            )?;
             return Ok(Value::Null);
         }
 
@@ -19907,6 +19959,19 @@ impl Vm {
                                             && quiet_dim_fetch_scalar_returns_null(&base)
                                         {
                                             Value::Null
+                                        } else if quiet_dim_fetch_scalar_returns_null(&base) {
+                                            match self.emit_array_offset_on_scalar_warning(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut diagnostics,
+                                                &base,
+                                                instruction.span,
+                                            ) {
+                                                Ok(()) => Value::Null,
+                                                Err(result) => return result,
+                                            }
                                         } else {
                                             match fetch_dim_value(&array, &key) {
                                                 Ok(Some(value)) => value,
@@ -58999,6 +59064,37 @@ fn undefined_array_key_warning(
     )
 }
 
+fn array_offset_on_scalar_warning(
+    value: &Value,
+    span: RuntimeSourceSpan,
+    stack_trace: Vec<RuntimeStackFrame>,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::new(
+        "E_PHP_RUNTIME_ARRAY_OFFSET_ON_SCALAR_WARNING",
+        RuntimeSeverity::Warning,
+        format!(
+            "Trying to access array offset on {}",
+            array_offset_scalar_type_name(value)
+        ),
+        span,
+        stack_trace,
+        Some(php_runtime::PhpReferenceClassification::Warning),
+    )
+}
+
+fn array_offset_scalar_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Reference(cell) => array_offset_scalar_type_name(&cell.get()),
+        Value::Null | Value::Uninitialized => "null",
+        Value::Bool(false) => "false",
+        Value::Bool(true) => "true",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Resource(_) => "resource",
+        other => value_type_name(other),
+    }
+}
+
 fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
     let Value::Array(array) = array else {
         return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
@@ -69779,6 +69875,47 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
         assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
         assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
         assert!(counters.bytecode_instructions_executed > 0, "{counters:?}");
+    }
+
+    #[test]
+    fn scalar_fetch_dim_warns_and_returns_null_in_ir() {
+        assert_scalar_fetch_dim_warns_and_returns_null(ExecutionFormat::Ir);
+    }
+
+    #[test]
+    fn scalar_fetch_dim_warns_and_returns_null_in_auto_bytecode() {
+        assert_scalar_fetch_dim_warns_and_returns_null(ExecutionFormat::Auto);
+    }
+
+    fn assert_scalar_fetch_dim_warns_and_returns_null(execution_format: ExecutionFormat) {
+        let source = r#"<?php
+            foreach ([null, false, true, 1, 1.2] as $value) {
+                echo $value['name'] === null ? '|n|' : '|x|';
+            }
+        "#;
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                execution_format,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy().matches("|n|").count(), 5);
+        assert!(!result.output.to_string_lossy().contains("|x|"));
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.id() == "E_PHP_RUNTIME_ARRAY_OFFSET_ON_SCALAR_WARNING"
+                })
+                .count(),
+            5,
+            "{:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
