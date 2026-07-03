@@ -130,7 +130,7 @@ fn resolve_existing_path(
         return ResolvedRoute::Forbidden;
     }
     if is_php_path(&canonical) {
-        if method != "GET" && method != "HEAD" && method != "POST" {
+        if method != "GET" && method != "HEAD" && method != "POST" && method != "OPTIONS" {
             return ResolvedRoute::MethodNotAllowed;
         }
         return ResolvedRoute::PhpScript {
@@ -321,6 +321,23 @@ mod tests {
 
         assert!(matches!(
             resolve_route("GET", "/hello.php", &fixture.config("index.html")),
+            ResolvedRoute::PhpScript { .. }
+        ));
+    }
+
+    #[test]
+    fn maps_options_to_php_script() {
+        let fixture = Fixture::new();
+        fixture.write("index.php", "<?php echo \"front\";");
+        let mut config = fixture.config("index.php");
+        config.front_controller = Some(PathBuf::from("index.php"));
+
+        assert!(matches!(
+            resolve_route("OPTIONS", "/index.php", &config),
+            ResolvedRoute::PhpScript { .. }
+        ));
+        assert!(matches!(
+            resolve_route("OPTIONS", "/wp-json/wp/v2/settings", &config),
             ResolvedRoute::PhpScript { .. }
         ));
     }
