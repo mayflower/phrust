@@ -28133,13 +28133,14 @@ impl Vm {
             self.record_counter_property_ic_fallback("receiver_class_mismatch");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
+        let object_class_name = object.class_name();
         let Some(receiver_class_entry) =
-            lookup_class_in_state(compiled, state, &object.class_name())
+            lookup_class_in_state_ref(compiled, state, &object_class_name)
         else {
             self.record_counter_property_ic_fallback("receiver_class_missing");
             return Ok(PropertyFetchCacheRead::Fallback);
         };
-        if receiver_class_entry.id.raw() != layout.class_id {
+        if receiver_class_entry.as_ref().id.raw() != layout.class_id {
             self.record_counter_property_ic_fallback("class_id_mismatch");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
@@ -28237,13 +28238,14 @@ impl Vm {
             self.record_counter_property_assign_ic_fallback("receiver_class_mismatch");
             return Ok(PropertyAssignCacheWrite::Fallback);
         }
+        let object_class_name = object.class_name();
         let Some(receiver_class_entry) =
-            lookup_class_in_state(compiled, state, &object.class_name())
+            lookup_class_in_state_ref(compiled, state, &object_class_name)
         else {
             self.record_counter_property_assign_ic_fallback("receiver_class_missing");
             return Ok(PropertyAssignCacheWrite::Fallback);
         };
-        if receiver_class_entry.id.raw() != layout.class_id {
+        if receiver_class_entry.as_ref().id.raw() != layout.class_id {
             self.record_counter_property_assign_ic_fallback("class_id_mismatch");
             return Ok(PropertyAssignCacheWrite::Fallback);
         }
@@ -28470,15 +28472,9 @@ impl Vm {
                 owner
             }
         };
-        let Some(declaring_class) =
-            owner
-                .lookup_class(&declaring_class_name)
-                .cloned()
-                .or_else(|| {
-                    dynamic_class_entry_in_state(state, &declaring_class_name)
-                        .map(|entry| entry.class.clone())
-                })
-        else {
+        let Some(declaring_class) = owner.lookup_class(&declaring_class_name).or_else(|| {
+            dynamic_class_entry_in_state(state, &declaring_class_name).map(|entry| &entry.class)
+        }) else {
             return self.runtime_error(
                 output,
                 compiled,
@@ -28492,7 +28488,6 @@ impl Vm {
             .methods
             .iter()
             .find(|method| method.function == function)
-            .cloned()
         else {
             return self.runtime_error(
                 output,
@@ -28511,22 +28506,24 @@ impl Vm {
             compiled,
             state,
             current_scope_class(compiled, stack).as_deref(),
-            &declaring_class,
-            &method_entry,
+            declaring_class,
+            method_entry,
         ) {
             return self.runtime_error(output, compiled, stack, message);
         }
+        let method_function = method_entry.function;
+        let declaring_class_name = declaring_class.name.clone();
         self.execute_function(
             &owner,
-            method_entry.function,
+            method_function,
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
-                    declaring_class.name.clone(),
+                    declaring_class_name.clone(),
                     object.display_name(),
-                    declaring_class.name,
+                    declaring_class_name,
                 )
                 .inherit_fiber_context(running_fiber),
             output,
