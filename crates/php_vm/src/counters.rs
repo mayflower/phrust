@@ -6,8 +6,33 @@ use php_ir::instruction::{BinaryOp, InstructionKind};
 use php_runtime::{OutputStats, PhpArrayShapeKind, PhpArrayShapeLookupFallback, Slot, TempValue};
 
 use crate::aliasing::{AliasState, alias_transition_key};
+use crate::bytecode::DenseOpcode;
 use crate::inline_cache::POLYMORPHIC_INLINE_CACHE_LIMIT;
 use crate::{InlineCacheKind, InlineCacheObservation};
+
+/// O(1) per-opcode execution counts for the rich-IR interpreter, indexed by
+/// `ir_opcode_index`. Boxed so `VmCounters` stays cheap to move.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IrOpcodeCounts(pub(crate) Box<[u64; IR_OPCODE_COUNT]>);
+
+impl Default for IrOpcodeCounts {
+    fn default() -> Self {
+        Self(Box::new([0; IR_OPCODE_COUNT]))
+    }
+}
+
+/// O(1) per-opcode execution counts for dense bytecode, indexed by the
+/// `DenseOpcode` discriminant (max 66 today; 128 leaves headroom).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenseOpcodeCounts(pub(crate) Box<[u64; DENSE_OPCODE_SLOTS]>);
+
+pub(crate) const DENSE_OPCODE_SLOTS: usize = 128;
+
+impl Default for DenseOpcodeCounts {
+    fn default() -> Self {
+        Self(Box::new([0; DENSE_OPCODE_SLOTS]))
+    }
+}
 
 /// One runtime observation for a property-fetch callsite profile.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -139,6 +164,17 @@ pub struct VmCounters {
     pub superinstructions_emitted: u64,
     pub superinstructions_emitted_by_kind: BTreeMap<String, u64>,
     pub superinstructions_executed: BTreeMap<String, u64>,
+    /// Scratch accumulators for hot per-instruction recording: opcode counts
+    /// are O(1) enum-indexed arrays, block/branch keys are integer tuples, so
+    /// recording never allocates or compares strings. Everything is folded
+    /// into the public string-keyed maps by `fold_scratch_counters` before
+    /// any snapshot is taken.
+    pub(crate) ir_opcode_counts: IrOpcodeCounts,
+    pub(crate) dense_opcode_counts: DenseOpcodeCounts,
+    pub(crate) dense_opcode_seen: Vec<DenseOpcode>,
+    pub(crate) dense_block_entry_scratch: BTreeMap<(u32, u32), u64>,
+    pub(crate) dense_branch_edge_scratch: BTreeMap<(u32, u32, u32), u64>,
+    pub(crate) superinstruction_scratch: BTreeMap<&'static str, u64>,
     pub superinstruction_deopt_or_fallbacks: u64,
     pub superinstruction_deopt_or_fallback_by_reason: BTreeMap<String, u64>,
     pub superinstruction_skipped_by_reason: BTreeMap<String, u64>,
@@ -425,10 +461,8 @@ impl VmCounters {
 
     pub(crate) fn record_instruction(&mut self, kind: &InstructionKind) {
         self.instructions_executed += 1;
-        *self
-            .opcodes
-            .entry(opcode_name(kind).to_owned())
-            .or_default() += 1;
+        // O(1) enum-indexed count: no allocation or map walk per instruction.
+        self.ir_opcode_counts.0[ir_opcode_index(kind)] += 1;
         match kind {
             InstructionKind::BindReferenceFromCall { .. }
             | InstructionKind::CallFunction { .. }
@@ -813,31 +847,27 @@ impl VmCounters {
             .or_default() += 1;
     }
 
-    pub(crate) fn record_bytecode_instruction(&mut self, opcode: &str) {
+    pub(crate) fn record_bytecode_instruction(&mut self, opcode: DenseOpcode) {
         self.bytecode_instructions_executed += 1;
-        if opcode == "include" {
+        if matches!(opcode, DenseOpcode::Include) {
             self.includes += 1;
         }
-        let family = bytecode_opcode_family(opcode).to_owned();
-        *self
-            .opcodes
-            .entry(format!("bytecode_{opcode}"))
-            .or_default() += 1;
-        *self
-            .bytecode_executed_by_family
-            .entry(family.clone())
-            .or_default() += 1;
-        *self
-            .dense_instruction_families_executed
-            .entry(family)
-            .or_default() += 1;
+        // O(1) discriminant-indexed count; the `bytecode_` prefix and family
+        // projections are applied once per distinct opcode at fold time.
+        let index = opcode as usize;
+        debug_assert!(index < DENSE_OPCODE_SLOTS);
+        let count = &mut self.dense_opcode_counts.0[index];
+        if *count == 0 {
+            self.dense_opcode_seen.push(opcode);
+        }
+        *count += 1;
     }
 
     pub(crate) fn record_dense_block_entry(&mut self, function: u32, block: u32) {
         self.dense_block_entries += 1;
         *self
-            .dense_block_entry_counts
-            .entry(format!("f{function}:b{block}"))
+            .dense_block_entry_scratch
+            .entry((function, block))
             .or_default() += 1;
     }
 
@@ -859,8 +889,8 @@ impl VmCounters {
             self.dense_branch_fallthrough_chosen += 1;
         }
         *self
-            .dense_branch_edge_counts
-            .entry(format!("f{function}:b{from_block}->b{to_block}"))
+            .dense_branch_edge_scratch
+            .entry((function, from_block, to_block))
             .or_default() += 1;
     }
 
@@ -897,11 +927,57 @@ impl VmCounters {
         }
     }
 
-    pub(crate) fn record_superinstruction_executed(&mut self, kind: &str) {
-        *self
-            .superinstructions_executed
-            .entry(kind.to_string())
-            .or_default() += 1;
+    pub(crate) fn record_superinstruction_executed(&mut self, kind: &'static str) {
+        *self.superinstruction_scratch.entry(kind).or_default() += 1;
+    }
+
+    /// Folds the allocation-free scratch accumulators into the public
+    /// string-keyed maps. Must run before a counters snapshot is cloned or
+    /// serialized; the fold is idempotent because scratch is drained.
+    pub(crate) fn fold_scratch_counters(&mut self) {
+        for (index, name) in IR_OPCODE_NAMES.iter().enumerate() {
+            let count = std::mem::take(&mut self.ir_opcode_counts.0[index]);
+            if count > 0 {
+                *self.opcodes.entry((*name).to_owned()).or_default() += count;
+            }
+        }
+        for opcode in std::mem::take(&mut self.dense_opcode_seen) {
+            let count = std::mem::take(&mut self.dense_opcode_counts.0[opcode as usize]);
+            if count == 0 {
+                continue;
+            }
+            let name = opcode.as_str();
+            *self.opcodes.entry(format!("bytecode_{name}")).or_default() += count;
+            let family = bytecode_opcode_family(name).to_owned();
+            *self
+                .bytecode_executed_by_family
+                .entry(family.clone())
+                .or_default() += count;
+            *self
+                .dense_instruction_families_executed
+                .entry(family)
+                .or_default() += count;
+        }
+        for ((function, block), count) in std::mem::take(&mut self.dense_block_entry_scratch) {
+            *self
+                .dense_block_entry_counts
+                .entry(format!("f{function}:b{block}"))
+                .or_default() += count;
+        }
+        for ((function, from_block, to_block), count) in
+            std::mem::take(&mut self.dense_branch_edge_scratch)
+        {
+            *self
+                .dense_branch_edge_counts
+                .entry(format!("f{function}:b{from_block}->b{to_block}"))
+                .or_default() += count;
+        }
+        for (kind, count) in std::mem::take(&mut self.superinstruction_scratch) {
+            *self
+                .superinstructions_executed
+                .entry(kind.to_owned())
+                .or_default() += count;
+        }
     }
 
     pub(crate) fn record_optimized_exit_snapshot(&mut self, tier: &str, reason: &str) {
@@ -3984,116 +4060,225 @@ fn push_nested_usize_array(
     json.push('\n');
 }
 
-fn opcode_name(kind: &InstructionKind) -> &'static str {
+// Names and indexes are defined in one fixed order: `ir_opcode_index` is
+// the single match over `InstructionKind` (exhaustive, so new variants
+// fail to compile until both are extended) and `IR_OPCODE_NAMES` mirrors
+// its arm order.
+pub(crate) const IR_OPCODE_COUNT: usize = 103;
+
+#[rustfmt::skip]
+const IR_OPCODE_NAMES: [&str; IR_OPCODE_COUNT] = [
+    "nop", // 0
+    "load_const", // 1
+    "fetch_const", // 2
+    "register_constant", // 3
+    "declare_function", // 4
+    "declare_class", // 5
+    "move", // 6
+    "load_local", // 7
+    "load_local_quiet", // 8
+    "store_local", // 9
+    "bind_reference", // 10
+    "bind_global", // 11
+    "bind_reference_dim", // 12
+    "bind_reference_property", // 13
+    "bind_reference_property_dim", // 14
+    "bind_reference_dim_from_property", // 15
+    "bind_reference_from_property", // 16
+    "bind_reference_from_property_dim", // 17
+    "bind_reference_from_dim", // 18
+    "bind_reference_from_static_property_dim", // 19
+    "bind_reference_from_call", // 20
+    "bind_reference_from_method_call", // 21
+    "init_static_local", // 22
+    "binary_concat", // 23
+    "binary", // 24
+    "compare", // 25
+    "instanceof", // 26
+    "dynamic_instanceof", // 27
+    "unary", // 28
+    "cast", // 29
+    "discard", // 30
+    "echo", // 31
+    "emit_diagnostic", // 32
+    "yield", // 33
+    "yield_from", // 34
+    "call_function", // 35
+    "call_method", // 36
+    "call_static_method", // 37
+    "clone_object", // 38
+    "clone_with", // 39
+    "enter_try", // 40
+    "leave_try", // 41
+    "end_finally", // 42
+    "throw", // 43
+    "make_exception", // 44
+    "make_closure", // 45
+    "call_closure", // 46
+    "resolve_callable", // 47
+    "acquire_callable", // 48
+    "call_callable", // 49
+    "pipe", // 50
+    "include", // 51
+    "eval", // 52
+    "new_object", // 53
+    "dynamic_new_object", // 54
+    "fetch_property", // 55
+    "fetch_dynamic_property", // 56
+    "isset_property", // 57
+    "isset_dynamic_property", // 58
+    "empty_property", // 59
+    "empty_dynamic_property", // 60
+    "isset_dynamic_property_dim", // 61
+    "empty_dynamic_property_dim", // 62
+    "isset_property_dim", // 63
+    "empty_property_dim", // 64
+    "unset_property", // 65
+    "unset_property_dim", // 66
+    "unset_dynamic_property", // 67
+    "fetch_static_property", // 68
+    "fetch_dynamic_static_property", // 69
+    "isset_static_property", // 70
+    "empty_static_property", // 71
+    "isset_static_property_dim", // 72
+    "empty_static_property_dim", // 73
+    "unset_static_property_dim", // 74
+    "fetch_class_constant", // 75
+    "fetch_object_class_name", // 76
+    "assign_property", // 77
+    "assign_property_dim", // 78
+    "assign_dynamic_property", // 79
+    "bind_reference_static_property", // 80
+    "assign_static_property", // 81
+    "assign_dynamic_static_property", // 82
+    "new_array", // 83
+    "array_insert", // 84
+    "array_spread", // 85
+    "fetch_dim", // 86
+    "assign_dim", // 87
+    "append_dim", // 88
+    "isset_local", // 89
+    "empty_local", // 90
+    "unset_local", // 91
+    "isset_dim", // 92
+    "empty_dim", // 93
+    "unset_dim", // 94
+    "foreach_init", // 95
+    "foreach_next", // 96
+    "foreach_cleanup", // 97
+    "foreach_init_ref", // 98
+    "foreach_next_ref", // 99
+    "array_get", // 100
+    "unsupported", // 101
+    "runtime_error", // 102
+];
+
+#[rustfmt::skip]
+fn ir_opcode_index(kind: &InstructionKind) -> usize {
     match kind {
-        InstructionKind::Nop => "nop",
-        InstructionKind::LoadConst { .. } => "load_const",
-        InstructionKind::FetchConst { .. } => "fetch_const",
-        InstructionKind::RegisterConstant { .. } => "register_constant",
-        InstructionKind::DeclareFunction { .. } => "declare_function",
-        InstructionKind::DeclareClass { .. } => "declare_class",
-        InstructionKind::Move { .. } => "move",
-        InstructionKind::LoadLocal { .. } => "load_local",
-        InstructionKind::LoadLocalQuiet { .. } => "load_local_quiet",
-        InstructionKind::StoreLocal { .. } => "store_local",
-        InstructionKind::BindReference { .. } => "bind_reference",
-        InstructionKind::BindGlobal { .. } => "bind_global",
-        InstructionKind::BindReferenceDim { .. } => "bind_reference_dim",
-        InstructionKind::BindReferenceProperty { .. } => "bind_reference_property",
-        InstructionKind::BindReferencePropertyDim { .. } => "bind_reference_property_dim",
-        InstructionKind::BindReferenceDimFromProperty { .. } => "bind_reference_dim_from_property",
-        InstructionKind::BindReferenceFromProperty { .. } => "bind_reference_from_property",
-        InstructionKind::BindReferenceFromPropertyDim { .. } => "bind_reference_from_property_dim",
-        InstructionKind::BindReferenceFromDim { .. } => "bind_reference_from_dim",
-        InstructionKind::BindReferenceFromStaticPropertyDim { .. } => {
-            "bind_reference_from_static_property_dim"
-        }
-        InstructionKind::BindReferenceFromCall { .. } => "bind_reference_from_call",
-        InstructionKind::BindReferenceFromMethodCall { .. } => "bind_reference_from_method_call",
-        InstructionKind::InitStaticLocal { .. } => "init_static_local",
-        InstructionKind::Binary {
-            op: BinaryOp::Concat,
-            ..
-        } => "binary_concat",
-        InstructionKind::Binary { .. } => "binary",
-        InstructionKind::Compare { .. } => "compare",
-        InstructionKind::InstanceOf { .. } => "instanceof",
-        InstructionKind::DynamicInstanceOf { .. } => "dynamic_instanceof",
-        InstructionKind::Unary { .. } => "unary",
-        InstructionKind::Cast { .. } => "cast",
-        InstructionKind::Discard { .. } => "discard",
-        InstructionKind::Echo { .. } => "echo",
-        InstructionKind::EmitDiagnostic { .. } => "emit_diagnostic",
-        InstructionKind::Yield { .. } => "yield",
-        InstructionKind::YieldFrom { .. } => "yield_from",
-        InstructionKind::CallFunction { .. } => "call_function",
-        InstructionKind::CallMethod { .. } => "call_method",
-        InstructionKind::CallStaticMethod { .. } => "call_static_method",
-        InstructionKind::CloneObject { .. } => "clone_object",
-        InstructionKind::CloneWith { .. } => "clone_with",
-        InstructionKind::EnterTry { .. } => "enter_try",
-        InstructionKind::LeaveTry => "leave_try",
-        InstructionKind::EndFinally { .. } => "end_finally",
-        InstructionKind::Throw { .. } => "throw",
-        InstructionKind::MakeException { .. } => "make_exception",
-        InstructionKind::MakeClosure { .. } => "make_closure",
-        InstructionKind::CallClosure { .. } => "call_closure",
-        InstructionKind::ResolveCallable { .. } => "resolve_callable",
-        InstructionKind::AcquireCallable { .. } => "acquire_callable",
-        InstructionKind::CallCallable { .. } => "call_callable",
-        InstructionKind::Pipe { .. } => "pipe",
-        InstructionKind::Include { .. } => "include",
-        InstructionKind::Eval { .. } => "eval",
-        InstructionKind::NewObject { .. } => "new_object",
-        InstructionKind::DynamicNewObject { .. } => "dynamic_new_object",
-        InstructionKind::FetchProperty { .. } => "fetch_property",
-        InstructionKind::FetchDynamicProperty { .. } => "fetch_dynamic_property",
-        InstructionKind::IssetProperty { .. } => "isset_property",
-        InstructionKind::IssetDynamicProperty { .. } => "isset_dynamic_property",
-        InstructionKind::EmptyProperty { .. } => "empty_property",
-        InstructionKind::EmptyDynamicProperty { .. } => "empty_dynamic_property",
-        InstructionKind::IssetDynamicPropertyDim { .. } => "isset_dynamic_property_dim",
-        InstructionKind::EmptyDynamicPropertyDim { .. } => "empty_dynamic_property_dim",
-        InstructionKind::IssetPropertyDim { .. } => "isset_property_dim",
-        InstructionKind::EmptyPropertyDim { .. } => "empty_property_dim",
-        InstructionKind::UnsetProperty { .. } => "unset_property",
-        InstructionKind::UnsetPropertyDim { .. } => "unset_property_dim",
-        InstructionKind::UnsetDynamicProperty { .. } => "unset_dynamic_property",
-        InstructionKind::FetchStaticProperty { .. } => "fetch_static_property",
-        InstructionKind::FetchDynamicStaticProperty { .. } => "fetch_dynamic_static_property",
-        InstructionKind::IssetStaticProperty { .. } => "isset_static_property",
-        InstructionKind::EmptyStaticProperty { .. } => "empty_static_property",
-        InstructionKind::IssetStaticPropertyDim { .. } => "isset_static_property_dim",
-        InstructionKind::EmptyStaticPropertyDim { .. } => "empty_static_property_dim",
-        InstructionKind::UnsetStaticPropertyDim { .. } => "unset_static_property_dim",
-        InstructionKind::FetchClassConstant { .. } => "fetch_class_constant",
-        InstructionKind::FetchObjectClassName { .. } => "fetch_object_class_name",
-        InstructionKind::AssignProperty { .. } => "assign_property",
-        InstructionKind::AssignPropertyDim { .. } => "assign_property_dim",
-        InstructionKind::AssignDynamicProperty { .. } => "assign_dynamic_property",
-        InstructionKind::BindReferenceStaticProperty { .. } => "bind_reference_static_property",
-        InstructionKind::AssignStaticProperty { .. } => "assign_static_property",
-        InstructionKind::AssignDynamicStaticProperty { .. } => "assign_dynamic_static_property",
-        InstructionKind::NewArray { .. } => "new_array",
-        InstructionKind::ArrayInsert { .. } => "array_insert",
-        InstructionKind::ArraySpread { .. } => "array_spread",
-        InstructionKind::FetchDim { .. } => "fetch_dim",
-        InstructionKind::AssignDim { .. } => "assign_dim",
-        InstructionKind::AppendDim { .. } => "append_dim",
-        InstructionKind::IssetLocal { .. } => "isset_local",
-        InstructionKind::EmptyLocal { .. } => "empty_local",
-        InstructionKind::UnsetLocal { .. } => "unset_local",
-        InstructionKind::IssetDim { .. } => "isset_dim",
-        InstructionKind::EmptyDim { .. } => "empty_dim",
-        InstructionKind::UnsetDim { .. } => "unset_dim",
-        InstructionKind::ForeachInit { .. } => "foreach_init",
-        InstructionKind::ForeachNext { .. } => "foreach_next",
-        InstructionKind::ForeachCleanup { .. } => "foreach_cleanup",
-        InstructionKind::ForeachInitRef { .. } => "foreach_init_ref",
-        InstructionKind::ForeachNextRef { .. } => "foreach_next_ref",
-        InstructionKind::ArrayGet { .. } => "array_get",
-        InstructionKind::Unsupported { .. } => "unsupported",
-        InstructionKind::RuntimeError { .. } => "runtime_error",
+        InstructionKind::Nop => 0,
+        InstructionKind::LoadConst { .. } => 1,
+        InstructionKind::FetchConst { .. } => 2,
+        InstructionKind::RegisterConstant { .. } => 3,
+        InstructionKind::DeclareFunction { .. } => 4,
+        InstructionKind::DeclareClass { .. } => 5,
+        InstructionKind::Move { .. } => 6,
+        InstructionKind::LoadLocal { .. } => 7,
+        InstructionKind::LoadLocalQuiet { .. } => 8,
+        InstructionKind::StoreLocal { .. } => 9,
+        InstructionKind::BindReference { .. } => 10,
+        InstructionKind::BindGlobal { .. } => 11,
+        InstructionKind::BindReferenceDim { .. } => 12,
+        InstructionKind::BindReferenceProperty { .. } => 13,
+        InstructionKind::BindReferencePropertyDim { .. } => 14,
+        InstructionKind::BindReferenceDimFromProperty { .. } => 15,
+        InstructionKind::BindReferenceFromProperty { .. } => 16,
+        InstructionKind::BindReferenceFromPropertyDim { .. } => 17,
+        InstructionKind::BindReferenceFromDim { .. } => 18,
+        InstructionKind::BindReferenceFromStaticPropertyDim { .. } => 19,
+        InstructionKind::BindReferenceFromCall { .. } => 20,
+        InstructionKind::BindReferenceFromMethodCall { .. } => 21,
+        InstructionKind::InitStaticLocal { .. } => 22,
+        InstructionKind::Binary { op: BinaryOp::Concat, .. } => 23,
+        InstructionKind::Binary { .. } => 24,
+        InstructionKind::Compare { .. } => 25,
+        InstructionKind::InstanceOf { .. } => 26,
+        InstructionKind::DynamicInstanceOf { .. } => 27,
+        InstructionKind::Unary { .. } => 28,
+        InstructionKind::Cast { .. } => 29,
+        InstructionKind::Discard { .. } => 30,
+        InstructionKind::Echo { .. } => 31,
+        InstructionKind::EmitDiagnostic { .. } => 32,
+        InstructionKind::Yield { .. } => 33,
+        InstructionKind::YieldFrom { .. } => 34,
+        InstructionKind::CallFunction { .. } => 35,
+        InstructionKind::CallMethod { .. } => 36,
+        InstructionKind::CallStaticMethod { .. } => 37,
+        InstructionKind::CloneObject { .. } => 38,
+        InstructionKind::CloneWith { .. } => 39,
+        InstructionKind::EnterTry { .. } => 40,
+        InstructionKind::LeaveTry => 41,
+        InstructionKind::EndFinally { .. } => 42,
+        InstructionKind::Throw { .. } => 43,
+        InstructionKind::MakeException { .. } => 44,
+        InstructionKind::MakeClosure { .. } => 45,
+        InstructionKind::CallClosure { .. } => 46,
+        InstructionKind::ResolveCallable { .. } => 47,
+        InstructionKind::AcquireCallable { .. } => 48,
+        InstructionKind::CallCallable { .. } => 49,
+        InstructionKind::Pipe { .. } => 50,
+        InstructionKind::Include { .. } => 51,
+        InstructionKind::Eval { .. } => 52,
+        InstructionKind::NewObject { .. } => 53,
+        InstructionKind::DynamicNewObject { .. } => 54,
+        InstructionKind::FetchProperty { .. } => 55,
+        InstructionKind::FetchDynamicProperty { .. } => 56,
+        InstructionKind::IssetProperty { .. } => 57,
+        InstructionKind::IssetDynamicProperty { .. } => 58,
+        InstructionKind::EmptyProperty { .. } => 59,
+        InstructionKind::EmptyDynamicProperty { .. } => 60,
+        InstructionKind::IssetDynamicPropertyDim { .. } => 61,
+        InstructionKind::EmptyDynamicPropertyDim { .. } => 62,
+        InstructionKind::IssetPropertyDim { .. } => 63,
+        InstructionKind::EmptyPropertyDim { .. } => 64,
+        InstructionKind::UnsetProperty { .. } => 65,
+        InstructionKind::UnsetPropertyDim { .. } => 66,
+        InstructionKind::UnsetDynamicProperty { .. } => 67,
+        InstructionKind::FetchStaticProperty { .. } => 68,
+        InstructionKind::FetchDynamicStaticProperty { .. } => 69,
+        InstructionKind::IssetStaticProperty { .. } => 70,
+        InstructionKind::EmptyStaticProperty { .. } => 71,
+        InstructionKind::IssetStaticPropertyDim { .. } => 72,
+        InstructionKind::EmptyStaticPropertyDim { .. } => 73,
+        InstructionKind::UnsetStaticPropertyDim { .. } => 74,
+        InstructionKind::FetchClassConstant { .. } => 75,
+        InstructionKind::FetchObjectClassName { .. } => 76,
+        InstructionKind::AssignProperty { .. } => 77,
+        InstructionKind::AssignPropertyDim { .. } => 78,
+        InstructionKind::AssignDynamicProperty { .. } => 79,
+        InstructionKind::BindReferenceStaticProperty { .. } => 80,
+        InstructionKind::AssignStaticProperty { .. } => 81,
+        InstructionKind::AssignDynamicStaticProperty { .. } => 82,
+        InstructionKind::NewArray { .. } => 83,
+        InstructionKind::ArrayInsert { .. } => 84,
+        InstructionKind::ArraySpread { .. } => 85,
+        InstructionKind::FetchDim { .. } => 86,
+        InstructionKind::AssignDim { .. } => 87,
+        InstructionKind::AppendDim { .. } => 88,
+        InstructionKind::IssetLocal { .. } => 89,
+        InstructionKind::EmptyLocal { .. } => 90,
+        InstructionKind::UnsetLocal { .. } => 91,
+        InstructionKind::IssetDim { .. } => 92,
+        InstructionKind::EmptyDim { .. } => 93,
+        InstructionKind::UnsetDim { .. } => 94,
+        InstructionKind::ForeachInit { .. } => 95,
+        InstructionKind::ForeachNext { .. } => 96,
+        InstructionKind::ForeachCleanup { .. } => 97,
+        InstructionKind::ForeachInitRef { .. } => 98,
+        InstructionKind::ForeachNextRef { .. } => 99,
+        InstructionKind::ArrayGet { .. } => 100,
+        InstructionKind::Unsupported { .. } => 101,
+        InstructionKind::RuntimeError { .. } => 102,
     }
 }
 
@@ -4191,6 +4376,7 @@ mod tests {
             name: "f".to_owned(),
             args: Vec::new(),
         });
+        counters.fold_scratch_counters();
         counters.record_frame_activation(false, 4, 3);
         counters.record_frame_activation(true, 4, 3);
         counters.record_frame_reuse_blocked("by_ref_param");
@@ -4914,6 +5100,7 @@ mod tests {
         counters.record_optimized_exit_materialized();
         counters.record_snapshot_rejection_by_missing_state_family("foreach_iterators");
         counters.record_fallback_resume_success();
+        counters.fold_scratch_counters();
 
         let json = counters.to_json();
 

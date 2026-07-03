@@ -2188,6 +2188,7 @@ impl Vm {
                 counters.record_numeric_string_cache_stats(stats);
                 counters.record_runtime_layout_stats(layout_stats);
                 counters.record_output_stats(output_len, output_stats);
+                counters.fold_scratch_counters();
             }
             result.counters = self.counters.borrow().clone();
         }
@@ -2394,7 +2395,7 @@ impl Vm {
             return;
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_bytecode_instruction(opcode.as_str());
+            counters.record_bytecode_instruction(opcode);
         }
     }
 
@@ -32902,7 +32903,7 @@ impl Vm {
                 };
                 let registry = php_std::ExtensionRegistry::standard_library();
                 VmResult::success_no_output(Some(Value::Bool(
-                    php_std::introspection::extension_loaded(&registry, &extension_name),
+                    php_std::introspection::extension_loaded(registry, &extension_name),
                 )))
             }
             "function_exists" => {
@@ -32923,7 +32924,7 @@ impl Vm {
                     compiled.lookup_function(&function_name).is_some()
                         || dynamic_function_in_state(state, &function_name).is_some()
                         || BuiltinRegistry::new().contains(&function_name)
-                        || php_std::introspection::function_exists(&registry, &function_name),
+                        || php_std::introspection::function_exists(registry, &function_name),
                 )))
             }
             "get_defined_functions" => {
@@ -33046,7 +33047,7 @@ impl Vm {
             "get_loaded_extensions" => {
                 let registry = php_std::ExtensionRegistry::standard_library();
                 VmResult::success_no_output(Some(
-                    php_std::introspection::get_loaded_extensions_value(&registry),
+                    php_std::introspection::get_loaded_extensions_value(registry),
                 ))
             }
             "phpversion" => {
@@ -33068,7 +33069,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        if php_std::introspection::extension_loaded(&registry, &extension_name) {
+                        if php_std::introspection::extension_loaded(registry, &extension_name) {
                             Value::string(php_std::constants::PHP_VERSION)
                         } else {
                             Value::Bool(false)
@@ -46502,10 +46503,10 @@ fn call_phar_static_method(method: &str, args: Vec<Value>) -> Result<Value, Stri
             validate_phar_arg_count("Phar::getSupportedCompression", args.len(), 0, 0)?;
             let registry = php_std::ExtensionRegistry::standard_library();
             let mut compression = Vec::new();
-            if php_std::introspection::extension_loaded(&registry, "zlib") {
+            if php_std::introspection::extension_loaded(registry, "zlib") {
                 compression.push(Value::string("GZ"));
             }
-            if php_std::introspection::extension_loaded(&registry, "bz2") {
+            if php_std::introspection::extension_loaded(registry, "bz2") {
                 compression.push(Value::string("BZIP2"));
             }
             Ok(Value::Array(PhpArray::from_packed(compression)))
@@ -65494,7 +65495,10 @@ good"
     fn autoload_lookup_cache_invalidates_after_spl_autoload_register() {
         std::thread::Builder::new()
             .name("autoload_lookup_cache_invalidates_after_spl_autoload_register".to_owned())
-            .stack_size(8 * 1024 * 1024)
+            // Match the harness default (RUST_MIN_STACK=32MiB): the debug
+            // build's execute_function frame is ~2MiB, so an 8MiB cap sat one
+            // nested include away from overflow.
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .parent()
