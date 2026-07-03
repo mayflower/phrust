@@ -180,6 +180,18 @@ def main() -> int:
                     if row_status in {
                         RUST_ACCEPTS_REFERENCE_REJECTS,
                         RUST_REJECTS_REFERENCE_ACCEPTS,
+                    }:
+                        # Keep the raw reference evidence on mismatch rows so
+                        # transient reference-side failures are attributable.
+                        notes.append(
+                            "reference exit_code="
+                            f"{reference.get('exit_code')} "
+                            f"stdout={str(reference.get('stdout', ''))[:200]!r} "
+                            f"stderr={str(reference.get('stderr', ''))[:200]!r}"
+                        )
+                    if row_status in {
+                        RUST_ACCEPTS_REFERENCE_REJECTS,
+                        RUST_REJECTS_REFERENCE_ACCEPTS,
                     } and rel in known_gaps:
                         row_status = KNOWN_GAP
                         notes.append(str(known_gaps[rel].get("reason", "")))
