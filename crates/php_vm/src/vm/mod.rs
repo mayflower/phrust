@@ -55958,11 +55958,30 @@ fn builtin_intrinsic_spec(name: &str) -> Option<&'static BuiltinIntrinsicSpec> {
     BUILTIN_INTRINSICS.iter().find(|spec| spec.name == name)
 }
 
+/// Memoized per-spec result of `builtin_intrinsic_metadata_matches`.
+///
+/// The check compares the static intrinsic spec against the static generated
+/// arginfo table (a linear scan over ~2.3k entries), so recomputing it on
+/// every intrinsic builtin call dominated the fast-stub dispatch cost.
+fn builtin_intrinsic_metadata_matches_cached(spec: &'static BuiltinIntrinsicSpec) -> bool {
+    static RESULTS: std::sync::LazyLock<Vec<bool>> = std::sync::LazyLock::new(|| {
+        BUILTIN_INTRINSICS
+            .iter()
+            .map(builtin_intrinsic_metadata_matches)
+            .collect()
+    });
+    let base = BUILTIN_INTRINSICS.as_ptr() as usize;
+    let offset = spec as *const BuiltinIntrinsicSpec as usize - base;
+    let index = offset / std::mem::size_of::<BuiltinIntrinsicSpec>();
+    debug_assert!(index < BUILTIN_INTRINSICS.len());
+    RESULTS[index]
+}
+
 fn fast_builtin_stub_fallback_reason_for_spec(
-    spec: &BuiltinIntrinsicSpec,
+    spec: &'static BuiltinIntrinsicSpec,
     values: &[Value],
 ) -> Option<&'static str> {
-    if !builtin_intrinsic_metadata_matches(spec) {
+    if !builtin_intrinsic_metadata_matches_cached(spec) {
         return Some("metadata");
     }
     if values.len() != spec.exact_arity {

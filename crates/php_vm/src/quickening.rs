@@ -94,10 +94,119 @@ impl Default for QuickeningEntry {
     }
 }
 
+impl QuickeningEntry {
+    /// Returns true once this site has recorded any adaptive activity.
+    ///
+    /// Dense sites live in pre-grown vectors, so untouched slots must read
+    /// as absent to preserve the previous map-lookup semantics.
+    fn is_touched(&self) -> bool {
+        self.executions > 0
+            || self.state != QuickeningState::Uninitialized
+            || self.specialization.is_some()
+    }
+
+    fn observe(&mut self) -> QuickeningObservation {
+        self.executions = self.executions.saturating_add(1);
+        match self.state {
+            QuickeningState::Uninitialized => {
+                self.state = QuickeningState::Observing;
+                QuickeningObservation {
+                    attempt: true,
+                    ..QuickeningObservation::default()
+                }
+            }
+            QuickeningState::Observing => {
+                if self.executions >= SPECIALIZE_AFTER_EXECUTIONS {
+                    self.state = QuickeningState::Specialized;
+                    QuickeningObservation {
+                        attempt: true,
+                        specialized: true,
+                        ..QuickeningObservation::default()
+                    }
+                } else {
+                    QuickeningObservation {
+                        attempt: true,
+                        ..QuickeningObservation::default()
+                    }
+                }
+            }
+            QuickeningState::Specialized | QuickeningState::Dequickened => QuickeningObservation {
+                attempt: true,
+                ..QuickeningObservation::default()
+            },
+            QuickeningState::Blacklisted => QuickeningObservation::default(),
+        }
+    }
+
+    fn record_specialized_guard(&mut self, hit: bool) -> QuickeningObservation {
+        let specialization = self.specialization;
+        if hit {
+            let event = self.stats.record_guard_hit();
+            return QuickeningObservation {
+                specialization,
+                guard_hit: event.guard_hit,
+                ..QuickeningObservation::default()
+            };
+        }
+
+        let fallback = self.stats.record_guard_fallback();
+        let mut dequickened = false;
+        let mut megamorphic = false;
+        if self.state == QuickeningState::Specialized
+            && self.stats.guard_failures >= DEQUICKEN_AFTER_GUARD_MISSES
+        {
+            let event = self.stats.record_dequicken();
+            self.state = QuickeningState::Dequickened;
+            self.specialization = None;
+            dequickened = event.dequickened;
+            megamorphic = event.megamorphic;
+        }
+
+        QuickeningObservation {
+            specialization,
+            guard_miss: fallback.guard_miss,
+            guard_failure: fallback.guard_failure,
+            fallback_call: fallback.fallback_call,
+            dequickened,
+            megamorphic,
+            ..QuickeningObservation::default()
+        }
+    }
+
+    fn observe_candidate(
+        &mut self,
+        specialization: QuickeningSpecialization,
+    ) -> QuickeningObservation {
+        if self.state == QuickeningState::Specialized && self.specialization.is_none() {
+            self.specialization = Some(specialization);
+            return QuickeningObservation {
+                specialization: Some(specialization),
+                specialized: true,
+                ..QuickeningObservation::default()
+            };
+        }
+        QuickeningObservation::default()
+    }
+}
+
+/// Flat quickening entries for one dense-lowered function.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DenseFunctionQuickening {
+    unit: u32,
+    function: u32,
+    entries: Vec<QuickeningEntry>,
+}
+
 /// Per-request quickening metadata table.
+///
+/// Rich-IR sites keep the ordered map; dense sites are O(1) flat vectors
+/// indexed by instruction index, with a last-function cache so consecutive
+/// instructions in the same function skip the function lookup entirely.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QuickeningTable {
     entries: BTreeMap<QuickeningKey, QuickeningEntry>,
+    dense_functions: Vec<DenseFunctionQuickening>,
+    dense_last: std::cell::Cell<usize>,
 }
 
 impl QuickeningTable {
@@ -122,37 +231,97 @@ impl QuickeningTable {
     }
 
     fn observe_key(&mut self, key: QuickeningKey) -> QuickeningObservation {
-        let entry = self.entries.entry(key).or_default();
-        entry.executions = entry.executions.saturating_add(1);
-        match entry.state {
-            QuickeningState::Uninitialized => {
-                entry.state = QuickeningState::Observing;
-                QuickeningObservation {
-                    attempt: true,
-                    ..QuickeningObservation::default()
-                }
-            }
-            QuickeningState::Observing => {
-                if entry.executions >= SPECIALIZE_AFTER_EXECUTIONS {
-                    entry.state = QuickeningState::Specialized;
-                    QuickeningObservation {
-                        attempt: true,
-                        specialized: true,
-                        ..QuickeningObservation::default()
-                    }
-                } else {
-                    QuickeningObservation {
-                        attempt: true,
-                        ..QuickeningObservation::default()
-                    }
-                }
-            }
-            QuickeningState::Specialized | QuickeningState::Dequickened => QuickeningObservation {
-                attempt: true,
-                ..QuickeningObservation::default()
-            },
-            QuickeningState::Blacklisted => QuickeningObservation::default(),
+        self.entry_mut(key).observe()
+    }
+
+    fn entry_mut(&mut self, key: QuickeningKey) -> &mut QuickeningEntry {
+        match key {
+            QuickeningKey::Ir { .. } => self.entries.entry(key).or_default(),
+            QuickeningKey::Dense {
+                unit,
+                function,
+                instruction,
+            } => self.dense_entry_mut(unit, function, instruction),
         }
+    }
+
+    fn entry_if_touched(&self, key: QuickeningKey) -> Option<&QuickeningEntry> {
+        match key {
+            QuickeningKey::Ir { .. } => self.entries.get(&key),
+            QuickeningKey::Dense {
+                unit,
+                function,
+                instruction,
+            } => self.dense_entry(unit, function, instruction),
+        }
+    }
+
+    fn entry_if_touched_mut(&mut self, key: QuickeningKey) -> Option<&mut QuickeningEntry> {
+        match key {
+            QuickeningKey::Ir { .. } => self.entries.get_mut(&key),
+            QuickeningKey::Dense {
+                unit,
+                function,
+                instruction,
+            } => {
+                let index = self.dense_function_index(unit, function)?;
+                let entry = self.dense_functions[index]
+                    .entries
+                    .get_mut(instruction as usize)?;
+                entry.is_touched().then_some(entry)
+            }
+        }
+    }
+
+    fn dense_function_index(&self, unit: u32, function: u32) -> Option<usize> {
+        let last = self.dense_last.get();
+        if let Some(slot) = self.dense_functions.get(last)
+            && slot.unit == unit
+            && slot.function == function
+        {
+            return Some(last);
+        }
+        let index = self
+            .dense_functions
+            .iter()
+            .position(|slot| slot.unit == unit && slot.function == function)?;
+        self.dense_last.set(index);
+        Some(index)
+    }
+
+    fn dense_entry(&self, unit: u32, function: u32, instruction: u32) -> Option<&QuickeningEntry> {
+        let index = self.dense_function_index(unit, function)?;
+        let entry = self.dense_functions[index]
+            .entries
+            .get(instruction as usize)?;
+        entry.is_touched().then_some(entry)
+    }
+
+    fn dense_entry_mut(
+        &mut self,
+        unit: u32,
+        function: u32,
+        instruction: u32,
+    ) -> &mut QuickeningEntry {
+        let index = match self.dense_function_index(unit, function) {
+            Some(index) => index,
+            None => {
+                self.dense_functions.push(DenseFunctionQuickening {
+                    unit,
+                    function,
+                    entries: Vec::new(),
+                });
+                let index = self.dense_functions.len() - 1;
+                self.dense_last.set(index);
+                index
+            }
+        };
+        let entries = &mut self.dense_functions[index].entries;
+        let slot = instruction as usize;
+        if entries.len() <= slot {
+            entries.resize_with(slot + 1, QuickeningEntry::default);
+        }
+        &mut entries[slot]
     }
 
     /// Returns the specialization currently installed for one instruction.
@@ -178,8 +347,7 @@ impl QuickeningTable {
     }
 
     fn specialization_key(&self, key: QuickeningKey) -> Option<QuickeningSpecialization> {
-        self.entries
-            .get(&key)
+        self.entry_if_touched(key)
             .and_then(|entry| entry.specialization)
     }
 
@@ -206,7 +374,7 @@ impl QuickeningTable {
     }
 
     fn state_key(&self, key: QuickeningKey) -> Option<QuickeningState> {
-        self.entries.get(&key).map(|entry| entry.state)
+        self.entry_if_touched(key).map(|entry| entry.state)
     }
 
     /// Applies the shared guard/fallback protocol for an installed
@@ -237,40 +405,9 @@ impl QuickeningTable {
         key: QuickeningKey,
         hit: bool,
     ) -> QuickeningObservation {
-        let Some(entry) = self.entries.get_mut(&key) else {
-            return QuickeningObservation::default();
-        };
-        let specialization = entry.specialization;
-        if hit {
-            let event = entry.stats.record_guard_hit();
-            return QuickeningObservation {
-                specialization,
-                guard_hit: event.guard_hit,
-                ..QuickeningObservation::default()
-            };
-        }
-
-        let fallback = entry.stats.record_guard_fallback();
-        let mut dequickened = false;
-        let mut megamorphic = false;
-        if entry.state == QuickeningState::Specialized
-            && entry.stats.guard_failures >= DEQUICKEN_AFTER_GUARD_MISSES
-        {
-            let event = entry.stats.record_dequicken();
-            entry.state = QuickeningState::Dequickened;
-            entry.specialization = None;
-            dequickened = event.dequickened;
-            megamorphic = event.megamorphic;
-        }
-
-        QuickeningObservation {
-            specialization,
-            guard_miss: fallback.guard_miss,
-            guard_failure: fallback.guard_failure,
-            fallback_call: fallback.fallback_call,
-            dequickened,
-            megamorphic,
-            ..QuickeningObservation::default()
+        match self.entry_if_touched_mut(key) {
+            Some(entry) => entry.record_specialized_guard(hit),
+            None => QuickeningObservation::default(),
         }
     }
 
@@ -384,26 +521,27 @@ impl QuickeningTable {
         key: QuickeningKey,
         specialization: QuickeningSpecialization,
     ) -> QuickeningObservation {
-        let entry = self.entries.entry(key).or_default();
-        if entry.state == QuickeningState::Specialized && entry.specialization.is_none() {
-            entry.specialization = Some(specialization);
-            return QuickeningObservation {
-                specialization: Some(specialization),
-                specialized: true,
-                ..QuickeningObservation::default()
-            };
-        }
-        QuickeningObservation::default()
+        self.entry_mut(key).observe_candidate(specialization)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+            + self
+                .dense_functions
+                .iter()
+                .map(|slot| {
+                    slot.entries
+                        .iter()
+                        .filter(|entry| entry.is_touched())
+                        .count()
+                })
+                .sum::<usize>()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 }
 
