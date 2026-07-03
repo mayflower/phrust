@@ -71,9 +71,16 @@ impl BuiltinRegistry {
     }
 
     /// Looks up a builtin by normalized name.
+    ///
+    /// Entries are sorted (and asserted unique) by name at first access, so
+    /// lookup is a binary search instead of a linear scan over ~650 entries.
     #[must_use]
     pub fn get(self, name: &str) -> Option<BuiltinEntry> {
-        entries().iter().copied().find(|entry| entry.name == name)
+        let entries = entries();
+        entries
+            .binary_search_by(|entry| entry.name.cmp(name))
+            .ok()
+            .map(|index| entries[index])
     }
 
     /// Returns true when a normalized name is registered.
@@ -132,6 +139,10 @@ fn entries() -> &'static [BuiltinEntry] {
                 .flat_map(|entries| entries.iter().copied())
                 .collect::<Vec<_>>();
             entries.sort_unstable_by_key(|entry| entry.name);
+            debug_assert!(
+                entries.windows(2).all(|pair| pair[0].name != pair[1].name),
+                "builtin registry names must be unique for binary-search lookup"
+            );
             entries
         })
         .as_slice()

@@ -40,7 +40,8 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("fdiv", builtin_fdiv, BuiltinCompatibility::Php),
     BuiltinEntry::new("fmod", builtin_fmod, BuiltinCompatibility::Php),
     BuiltinEntry::new("fpow", builtin_fpow, BuiltinCompatibility::Php),
-    BuiltinEntry::new("getrandmax", builtin_getrandmax, BuiltinCompatibility::Php),
+    // getrandmax is registered by the core module alongside the other
+    // rand-family builtins; a duplicate here made registry lookup ambiguous.
     BuiltinEntry::new("hexdec", builtin_hexdec, BuiltinCompatibility::Php),
     BuiltinEntry::new("hypot", builtin_hypot, BuiltinCompatibility::Php),
     BuiltinEntry::new("intdiv", builtin_intdiv, BuiltinCompatibility::Php),
@@ -994,15 +995,6 @@ pub(in crate::builtins::modules) fn builtin_fpow(
     Ok(Value::float(
         numeric_f64_arg("fpow", &args[0])?.powf(numeric_f64_arg("fpow", &args[1])?),
     ))
-}
-
-pub(in crate::builtins::modules) fn builtin_getrandmax(
-    _context: &mut BuiltinContext<'_>,
-    args: Vec<Value>,
-    _span: RuntimeSourceSpan,
-) -> BuiltinResult {
-    expect_arity("getrandmax", &args, 0)?;
-    Ok(Value::Int(i32::MAX.into()))
 }
 
 pub(in crate::builtins::modules) fn builtin_hexdec(

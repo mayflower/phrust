@@ -1336,7 +1336,7 @@ impl LoweringContext<'_> {
         let Some(module) = module else {
             return Vec::new();
         };
-        let named_constants = predefined_constant_initializer_map();
+        let named_constants = predefined_constant_initializers();
         let class_likes = module
             .class_likes()
             .iter()
@@ -1356,7 +1356,7 @@ impl LoweringContext<'_> {
                 let value = constant_from_expr_with_class_constants(
                     module,
                     const_expr.expr_id(),
-                    &named_constants,
+                    named_constants,
                     None,
                     &class_constant_initializers,
                     &class_parents,
@@ -1385,7 +1385,9 @@ impl LoweringContext<'_> {
         else {
             return HashMap::new();
         };
-        let mut map = predefined_constant_initializer_map();
+        // One bulk clone of the shared predefined map; user-declared constants
+        // and define() initializers are layered on top below.
+        let mut map = predefined_constant_initializers().clone();
         let mut values = self.global_const_initializers().into_iter();
         for (name, value) in module
             .declaration_table()

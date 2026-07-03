@@ -1603,18 +1603,27 @@ fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &HirC
         && (index == 2 || arg.name.as_deref() == Some("callable_name"))
 }
 
-fn predefined_constant_initializer_map() -> HashMap<String, IrConstant> {
-    let registry = php_std::ExtensionRegistry::standard_library();
-    registry
-        .enabled_constants()
-        .into_iter()
-        .filter_map(|constant| {
-            Some((
-                constant.name().to_owned(),
-                ir_constant_from_std_value(constant.value()?)?,
-            ))
-        })
-        .collect()
+/// Predefined stdlib constant initializers, built once per process.
+///
+/// The registry exposes ~4.8k constants; rebuilding this owned-key map on
+/// every compile was a measurable fixed cost per CLI invocation.
+static PREDEFINED_CONSTANT_INITIALIZERS: std::sync::LazyLock<HashMap<String, IrConstant>> =
+    std::sync::LazyLock::new(|| {
+        let registry = php_std::ExtensionRegistry::standard_library();
+        registry
+            .enabled_constants()
+            .into_iter()
+            .filter_map(|constant| {
+                Some((
+                    constant.name().to_owned(),
+                    ir_constant_from_std_value(constant.value()?)?,
+                ))
+            })
+            .collect()
+    });
+
+fn predefined_constant_initializers() -> &'static HashMap<String, IrConstant> {
+    &PREDEFINED_CONSTANT_INITIALIZERS
 }
 
 fn ir_constant_from_std_value(value: php_std::ConstantValue) -> Option<IrConstant> {

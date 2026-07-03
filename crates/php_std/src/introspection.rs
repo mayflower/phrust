@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn extension_loaded_is_case_insensitive_and_configurable() {
-        let mut registry = ExtensionRegistry::standard_library();
+        let mut registry = ExtensionRegistry::standard_library().clone();
 
         assert!(extension_loaded(&registry, "CORE"));
         assert!(extension_loaded(&registry, "curl"));
@@ -80,7 +80,7 @@ mod tests {
         let registry = ExtensionRegistry::standard_library();
 
         assert_eq!(
-            get_loaded_extensions(&registry),
+            get_loaded_extensions(registry),
             [
                 "apcu",
                 "bcmath",
@@ -125,7 +125,7 @@ mod tests {
                 "zlib"
             ]
         );
-        let Value::Array(array) = get_loaded_extensions_value(&registry) else {
+        let Value::Array(array) = get_loaded_extensions_value(registry) else {
             panic!("expected array");
         };
         assert_eq!(array.len(), 41);
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn function_names_are_case_insensitive_and_test_helpers_hidden() {
-        let mut registry = ExtensionRegistry::standard_library();
+        let mut registry = ExtensionRegistry::standard_library().clone();
         registry.enable_extension("test").expect("enable test");
 
         assert!(function_exists(&registry, "STRLEN"));

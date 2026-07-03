@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn json_constants_are_enabled_with_json_extension() {
-        let mut registry = ExtensionRegistry::standard_library();
+        let mut registry = ExtensionRegistry::standard_library().clone();
         assert_eq!(
             registry
                 .enabled_constant("JSON_ERROR_NONE")

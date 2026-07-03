@@ -367,12 +367,13 @@ impl ExtensionRegistry {
     }
 
     /// Returns the default standard-library infrastructure registry.
+    ///
+    /// Returns a shared static: the registry is immutable after construction
+    /// and cloning it per call was a measurable per-compile cost.
     #[must_use]
-    pub fn standard_library() -> Self {
+    pub fn standard_library() -> &'static Self {
         static STANDARD_LIBRARY: OnceLock<ExtensionRegistry> = OnceLock::new();
-        STANDARD_LIBRARY
-            .get_or_init(Self::build_standard_library)
-            .clone()
+        STANDARD_LIBRARY.get_or_init(Self::build_standard_library)
     }
 
     fn build_standard_library() -> Self {
@@ -657,7 +658,7 @@ mod tests {
 
     #[test]
     fn infrastructure_registry_exposes_no_php_visible_functions() {
-        let mut registry = ExtensionRegistry::standard_library();
+        let mut registry = ExtensionRegistry::standard_library().clone();
         registry.enable_extension("test").expect("enable test");
 
         assert!(
@@ -1828,7 +1829,7 @@ mod tests {
 
     #[test]
     fn unknown_extension_mutation_is_rejected() {
-        let mut registry = ExtensionRegistry::standard_library();
+        let mut registry = ExtensionRegistry::standard_library().clone();
         assert_eq!(
             registry.enable_extension("missing"),
             Err(RegistryError::UnknownExtension("missing"))
