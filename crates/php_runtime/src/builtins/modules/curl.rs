@@ -128,6 +128,7 @@ const CURLINFO_HEADER_SIZE: i64 = 2097163;
 const CURLINFO_TOTAL_TIME: i64 = 3145731;
 const CURLM_OK: i64 = 0;
 const CURLM_BAD_HANDLE: i64 = 1;
+const CURL_VERSION_SSL: i64 = 4;
 
 type CurlTransportError = (i64, String);
 type CurlPostBody = (Vec<u8>, Option<&'static str>);
@@ -144,7 +145,10 @@ pub(in crate::builtins::modules) fn builtin_curl_version(
         Value::Int(0x080507),
     );
     out.insert(ArrayKey::String(PhpString::from("age")), Value::Int(0));
-    out.insert(ArrayKey::String(PhpString::from("features")), Value::Int(0));
+    out.insert(
+        ArrayKey::String(PhpString::from("features")),
+        Value::Int(CURL_VERSION_SSL),
+    );
     out.insert(
         ArrayKey::String(PhpString::from("ssl_version_number")),
         Value::Int(0),
@@ -159,7 +163,7 @@ pub(in crate::builtins::modules) fn builtin_curl_version(
     );
     out.insert(
         ArrayKey::String(PhpString::from("ssl_version")),
-        Value::String(PhpString::from("none")),
+        Value::String(PhpString::from("OpenSSL/phrust")),
     );
     out.insert(
         ArrayKey::String(PhpString::from("libz_version")),
@@ -167,7 +171,10 @@ pub(in crate::builtins::modules) fn builtin_curl_version(
     );
     out.insert(
         ArrayKey::String(PhpString::from("protocols")),
-        Value::packed_array(vec![Value::String(PhpString::from("http"))]),
+        Value::packed_array(vec![
+            Value::String(PhpString::from("http")),
+            Value::String(PhpString::from("https")),
+        ]),
     );
     Ok(Value::Array(out))
 }
@@ -952,14 +959,15 @@ fn find_crlf(bytes: &[u8]) -> Option<usize> {
 }
 
 fn parse_http_url(url: &str) -> Result<ParsedUrl, (i64, String)> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        if url.starts_with("https://") {
-            return Err((
-                1,
-                "cURL MVP does not implement HTTPS transport yet".to_owned(),
-            ));
-        }
-        return Err((3, "cURL MVP only supports http:// URLs".to_owned()));
+    let (rest, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (rest, 443)
+    } else {
+        return Err((
+            3,
+            "cURL MVP only supports http:// and https:// URLs".to_owned(),
+        ));
     };
     let (authority, path) = rest.split_once('/').map_or((rest, "/"), |(host, path)| {
         (host, if path.is_empty() { "/" } else { "" })
@@ -972,7 +980,7 @@ fn parse_http_url(url: &str) -> Result<ParsedUrl, (i64, String)> {
     let (host, port) = authority
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
-        .map_or((authority, 80), |(host, port)| (host, port));
+        .map_or((authority, default_port), |(host, port)| (host, port));
     if host.is_empty() {
         return Err((3, "cURL URL host is empty".to_owned()));
     }
@@ -1495,6 +1503,33 @@ mod tests {
     static NET_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn curl_version_advertises_ssl_transport_capability() {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        let Value::Array(version) =
+            builtin_curl_version(&mut context, vec![], RuntimeSourceSpan::default())
+                .expect("curl_version")
+        else {
+            panic!("curl_version should return an array");
+        };
+
+        assert_eq!(
+            version.get(&ArrayKey::String(PhpString::from("features"))),
+            Some(&Value::Int(CURL_VERSION_SSL))
+        );
+        let Some(Value::Array(protocols)) =
+            version.get(&ArrayKey::String(PhpString::from("protocols")))
+        else {
+            panic!("protocols should be an array");
+        };
+        assert!(
+            protocols
+                .iter()
+                .any(|(_, value)| value == &Value::String(PhpString::from("https")))
+        );
+    }
+
+    #[test]
     fn curl_exec_is_network_disabled_by_default() {
         let _guard = NET_TEST_ENV_LOCK.lock().expect("env lock");
         let _override = NetTestsOverride::set(false);
@@ -1569,6 +1604,63 @@ mod tests {
             &mut context,
             vec![Value::string(format!(
                 "http://127.0.0.1:{port}/site-health"
+            ))],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("init");
+        builtin_curl_setopt(
+            &mut context,
+            vec![
+                handle.clone(),
+                Value::Int(CURLOPT_RETURNTRANSFER),
+                Value::Bool(true),
+            ],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("set return transfer");
+
+        assert_eq!(
+            builtin_curl_exec(
+                &mut context,
+                vec![handle.clone()],
+                RuntimeSourceSpan::default()
+            )
+            .expect("exec"),
+            Value::string("OK")
+        );
+        assert_eq!(
+            builtin_curl_errno(&mut context, vec![handle], RuntimeSourceSpan::default())
+                .expect("errno"),
+            Value::Int(0)
+        );
+        assert!(context.take_diagnostics().is_empty());
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn curl_exec_accepts_https_loopback_urls() {
+        let _guard = NET_TEST_ENV_LOCK.lock().expect("env lock");
+        let _override = NetTestsOverride::set(false);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local server");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /site-health"));
+            assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .expect("write response");
+        });
+
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        let handle = builtin_curl_init(
+            &mut context,
+            vec![Value::string(format!(
+                "https://127.0.0.1:{port}/site-health"
             ))],
             RuntimeSourceSpan::default(),
         )
