@@ -27,6 +27,9 @@ fixtures=(
   "fixtures/bytecode/literals/valid/echo-multiple.php"
   "tests/fixtures/performance/superinstructions/binary-concat-echo.php"
   "tests/fixtures/performance/superinstructions/store-discard.php"
+  "tests/fixtures/performance/superinstructions/const-key-dim-fetch.php"
+  "tests/fixtures/performance/superinstructions/load-chain-const.php"
+  "tests/fixtures/performance/superinstructions/call-discard.php"
 )
 
 json_escape() {

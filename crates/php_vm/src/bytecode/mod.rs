@@ -166,6 +166,12 @@ pub enum DenseOpcode {
     AcquireCallable = 69,
     /// Create a closure value from a synthesized function and captures.
     MakeClosure = 70,
+    /// Fused constant key load and array dimension fetch.
+    LoadConstFetchDim = 71,
+    /// Fused local load and constant load into two registers.
+    LoadLocalLoadConst = 72,
+    /// Fused known function call whose result is immediately discarded.
+    CallFunctionDiscard = 73,
 }
 
 impl DenseOpcode {
@@ -257,6 +263,9 @@ impl DenseOpcode {
             Self::CallCallable => "call_callable",
             Self::AcquireCallable => "acquire_callable",
             Self::MakeClosure => "make_closure",
+            Self::LoadConstFetchDim => "load_const_fetch_dim",
+            Self::LoadLocalLoadConst => "load_local_load_const",
+            Self::CallFunctionDiscard => "call_function_discard",
         }
     }
 
@@ -269,6 +278,9 @@ impl DenseOpcode {
                 | Self::LoadLocalEcho
                 | Self::BinaryConcatEcho
                 | Self::StoreLocalDiscard
+                | Self::LoadConstFetchDim
+                | Self::LoadLocalLoadConst
+                | Self::CallFunctionDiscard
         )
     }
 }
@@ -435,6 +447,21 @@ pub enum DenseOperands {
         array: DenseOperand,
         key: DenseOperand,
         quiet: bool,
+    },
+    /// Fused constant-key load + array dimension fetch operands.
+    LoadConstFetchDim {
+        key_dst: u32,
+        key_constant: u32,
+        dst: u32,
+        array: DenseOperand,
+        quiet: bool,
+    },
+    /// Fused local load + constant load operands.
+    LoadLocalLoadConst {
+        first_dst: u32,
+        local: DenseOperand,
+        second_dst: u32,
+        constant: u32,
     },
     /// Local array dimension assignment/append operands.
     AssignDim {
@@ -1252,7 +1279,8 @@ fn select_function_superinstructions(
             let operands = function.instructions[index].operands.clone();
             let next_opcode = function.instructions[index + 1].opcode;
             let next_operands = function.instructions[index + 1].operands.clone();
-            let Some(fused) = select_pair_fusion(opcode, &operands, next_opcode, &next_operands)
+            let Some((fused, merged_operands)) =
+                select_pair_fusion(opcode, &operands, next_opcode, &next_operands)
             else {
                 if next_opcode == DenseOpcode::Echo {
                     report.record_skipped("unsupported_producer_echo_pair");
@@ -1262,6 +1290,9 @@ fn select_function_superinstructions(
             };
             report.record_candidate(fused);
             function.instructions[index].opcode = fused;
+            if let Some(merged) = merged_operands {
+                function.instructions[index].operands = merged;
+            }
             function.instructions[index + 1].opcode = DenseOpcode::Nop;
             function.instructions[index + 1].operands = DenseOperands::None;
             report.record_emitted(fused);
@@ -1275,17 +1306,99 @@ fn select_pair_fusion(
     operands: &DenseOperands,
     next_opcode: DenseOpcode,
     next_operands: &DenseOperands,
-) -> Option<DenseOpcode> {
+) -> Option<(DenseOpcode, Option<DenseOperands>)> {
     match next_opcode {
         DenseOpcode::Echo => {
             let DenseOperands::Operand { src: echo_src } = next_operands else {
                 return None;
             };
-            select_echo_fusion(opcode, operands, *echo_src)
+            select_echo_fusion(opcode, operands, *echo_src).map(|fused| (fused, None))
         }
         DenseOpcode::Discard => select_discard_fusion(opcode, operands, next_operands),
+        DenseOpcode::FetchDim => select_fetch_dim_fusion(opcode, operands, next_operands),
+        DenseOpcode::LoadConst => select_load_chain_fusion(opcode, operands, next_operands),
         _ => None,
     }
+}
+
+/// `LoadConst key; FetchDim dst, array, key` fuses when the fetch consumes
+/// exactly the constant-loaded key register. The fused arm still writes the
+/// key register before running the unchanged dimension-fetch sequence.
+fn select_fetch_dim_fusion(
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    next_operands: &DenseOperands,
+) -> Option<(DenseOpcode, Option<DenseOperands>)> {
+    let (
+        DenseOpcode::LoadConst,
+        DenseOperands::RegConst {
+            dst: key_dst,
+            constant,
+        },
+    ) = (opcode, operands)
+    else {
+        return None;
+    };
+    let DenseOperands::FetchDim {
+        dst,
+        array,
+        key,
+        quiet,
+    } = next_operands
+    else {
+        return None;
+    };
+    (key.kind == DenseOperandKind::Register && key.index == *key_dst).then_some((
+        DenseOpcode::LoadConstFetchDim,
+        Some(DenseOperands::LoadConstFetchDim {
+            key_dst: *key_dst,
+            key_constant: *constant,
+            dst: *dst,
+            array: *array,
+            quiet: *quiet,
+        }),
+    ))
+}
+
+/// `LoadLocal r1; LoadConst r2` fuses into one dispatch writing both
+/// registers; the local-load half keeps its undefined-variable semantics.
+fn select_load_chain_fusion(
+    opcode: DenseOpcode,
+    operands: &DenseOperands,
+    next_operands: &DenseOperands,
+) -> Option<(DenseOpcode, Option<DenseOperands>)> {
+    let (
+        DenseOpcode::LoadLocal,
+        DenseOperands::RegOperand {
+            dst: first_dst,
+            src,
+        },
+    ) = (opcode, operands)
+    else {
+        return None;
+    };
+    if src.kind != DenseOperandKind::Local {
+        return None;
+    }
+    let DenseOperands::RegConst {
+        dst: second_dst,
+        constant,
+    } = next_operands
+    else {
+        return None;
+    };
+    if *first_dst == *second_dst {
+        return None;
+    }
+    Some((
+        DenseOpcode::LoadLocalLoadConst,
+        Some(DenseOperands::LoadLocalLoadConst {
+            first_dst: *first_dst,
+            local: *src,
+            second_dst: *second_dst,
+            constant: *constant,
+        }),
+    ))
 }
 
 fn select_echo_fusion(
@@ -1321,15 +1434,20 @@ fn select_discard_fusion(
     opcode: DenseOpcode,
     operands: &DenseOperands,
     next_operands: &DenseOperands,
-) -> Option<DenseOpcode> {
-    let (DenseOpcode::StoreLocal, DenseOperands::LocalOperand { src, .. }) = (opcode, operands)
-    else {
-        return None;
-    };
+) -> Option<(DenseOpcode, Option<DenseOperands>)> {
     let DenseOperands::Operand { src: discard_src } = next_operands else {
         return None;
     };
-    (src == discard_src).then_some(DenseOpcode::StoreLocalDiscard)
+    match (opcode, operands) {
+        (DenseOpcode::StoreLocal, DenseOperands::LocalOperand { src, .. }) => {
+            (src == discard_src).then_some((DenseOpcode::StoreLocalDiscard, None))
+        }
+        (DenseOpcode::CallFunction, DenseOperands::Call { dst, .. }) => {
+            (discard_src.kind == DenseOperandKind::Register && discard_src.index == *dst)
+                .then_some((DenseOpcode::CallFunctionDiscard, None))
+        }
+        _ => None,
+    }
 }
 
 fn select_dense_function_rules(function: &DenseFunction, report: &mut RuleSelectionReport) {
@@ -1473,6 +1591,7 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::Echo
         | DenseOpcode::Discard => Some(RuleKind::NoRule),
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
         | DenseOpcode::CallCallable
         | DenseOpcode::AcquireCallable
@@ -1480,6 +1599,8 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::InitStaticLocal
+        | DenseOpcode::LoadConstFetchDim
+        | DenseOpcode::LoadLocalLoadConst
         | DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::FetchProperty
@@ -1531,6 +1652,9 @@ fn dense_skip_reason(opcode: DenseOpcode) -> &'static str {
         DenseOpcode::CallCallable => "effectful_callable_call",
         DenseOpcode::AcquireCallable => "effectful_callable_acquisition",
         DenseOpcode::MakeClosure => "effectful_closure_construction",
+        DenseOpcode::LoadConstFetchDim
+        | DenseOpcode::LoadLocalLoadConst
+        | DenseOpcode::CallFunctionDiscard => "fused_superinstruction",
         DenseOpcode::CallMethod => "effectful_method_call",
         DenseOpcode::CallStaticMethod => "effectful_static_method_call",
         DenseOpcode::NewArray
@@ -2553,6 +2677,42 @@ fn verify_instruction(
                 verify_call_arg(arg, unit, function, errors);
             }
         }
+        (
+            DenseOpcode::LoadConstFetchDim,
+            DenseOperands::LoadConstFetchDim {
+                key_dst,
+                key_constant,
+                dst,
+                array,
+                ..
+            },
+        ) => {
+            verify_register(*key_dst, function, errors);
+            verify_constant(*key_constant, unit, errors);
+            verify_register(*dst, function, errors);
+            verify_operand(*array, unit, function, errors);
+        }
+        (
+            DenseOpcode::LoadLocalLoadConst,
+            DenseOperands::LoadLocalLoadConst {
+                first_dst,
+                local,
+                second_dst,
+                constant,
+            },
+        ) => {
+            verify_register(*first_dst, function, errors);
+            verify_operand(*local, unit, function, errors);
+            verify_register(*second_dst, function, errors);
+            verify_constant(*constant, unit, errors);
+        }
+        (DenseOpcode::CallFunctionDiscard, DenseOperands::Call { dst, name, args }) => {
+            verify_register(*dst, function, errors);
+            verify_name(*name, unit, errors);
+            for arg in args {
+                verify_call_arg(arg, unit, function, errors);
+            }
+        }
         (DenseOpcode::CallCallable, DenseOperands::CallableCall { dst, callee, args }) => {
             verify_register(*dst, function, errors);
             verify_operand(*callee, unit, function, errors);
@@ -3059,6 +3219,30 @@ fn render_operands(operands: &DenseOperands) -> String {
             format!(
                 "r{dst} new n{class_name} (display n{display_class_name}) ({})",
                 rendered_args.join(", ")
+            )
+        }
+        DenseOperands::LoadConstFetchDim {
+            key_dst,
+            key_constant,
+            dst,
+            array,
+            quiet,
+        } => {
+            format!(
+                "r{key_dst} c{key_constant}; r{dst} {}[r{key_dst}]{}",
+                render_operand(*array),
+                if *quiet { " quiet" } else { "" }
+            )
+        }
+        DenseOperands::LoadLocalLoadConst {
+            first_dst,
+            local,
+            second_dst,
+            constant,
+        } => {
+            format!(
+                "r{first_dst} {}; r{second_dst} c{constant}",
+                render_operand(*local)
             )
         }
         DenseOperands::CallableCall { dst, callee, args } => {

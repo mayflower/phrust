@@ -33,6 +33,9 @@ CHOSEN_FUSIONS = {
     "load_const echo": "load_const_echo",
     "load_local echo": "load_local_echo",
     "binary_concat echo": "binary_concat_echo",
+    "load_const fetch_dim": "load_const_fetch_dim",
+    "load_local load_const": "load_local_load_const",
+    "call_function discard": "call_function_discard",
 }
 
 
@@ -161,7 +164,7 @@ def aggregate(reports: list[FixtureReport], top: int) -> dict[str, Any]:
             "pattern": pattern,
             "superinstruction": opcode,
             "observed_count": pair_counts.get(pattern, 0),
-            "reason": "single-block producer immediately consumed by echo with generic unfused equivalent",
+            "reason": "single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence",
         }
         for pattern, opcode in CHOSEN_FUSIONS.items()
     ]
@@ -171,12 +174,12 @@ def aggregate(reports: list[FixtureReport], top: int) -> dict[str, Any]:
             "reason": "current dense blocks keep conditional jumps as terminators; terminator fusion needs separate source-map and branch accounting",
         },
         {
-            "family": "load_or_binary_plus_scalar_op_or_store",
-            "reason": "safe execution helper boundaries are not yet factored for arithmetic/store chains beyond existing generic handlers",
+            "family": "binary_plus_store_chain",
+            "reason": "store_local is almost always followed by discard, which already fuses; a binary/store pair fusion would only trade one fusion for another on the dominant triple",
         },
         {
             "family": "call_or_builtin_plus_branch_or_echo",
-            "reason": "call helpers preserve named-argument, by-reference, diagnostic, and fallback behavior and need dedicated fused helper proof",
+            "reason": "call-plus-branch/echo helpers preserve named-argument, by-reference, diagnostic, and fallback behavior and need dedicated fused helper proof; call-plus-discard is fused via the shared call arm",
         },
         {
             "family": "array_or_foreach_loop_skeleton",
@@ -184,7 +187,7 @@ def aggregate(reports: list[FixtureReport], top: int) -> dict[str, Any]:
         },
         {
             "family": "property_fetch_plus_echo",
-            "reason": "property fetch dense execution remains fenced by FPE-04 unsupported/fallback accounting",
+            "reason": "property fetch dense arms carry inline-cache observation and guard state whose fused re-entry accounting is not yet factored",
         },
     ]
     return {

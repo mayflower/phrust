@@ -3084,13 +3084,16 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
             unsupported_reason: None,
         },
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
         | DenseOpcode::CallCallable
         | DenseOpcode::AcquireCallable
         | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
-        | DenseOpcode::Include => BaselineStencilClass {
+        | DenseOpcode::Include
+        | DenseOpcode::LoadConstFetchDim
+        | DenseOpcode::LoadLocalLoadConst => BaselineStencilClass {
             helper_calls: 1,
             deopt_slots: 1,
             compile_cost_units: 5,
@@ -3414,12 +3417,15 @@ fn classify_copy_patch_stencil_instruction(
             unsupported_reason: None,
         },
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
         | DenseOpcode::CallCallable
         | DenseOpcode::AcquireCallable
         | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
-        | DenseOpcode::CallStaticMethod => {
+        | DenseOpcode::CallStaticMethod
+        | DenseOpcode::LoadConstFetchDim
+        | DenseOpcode::LoadLocalLoadConst => {
             unsupported_copy_patch_class("dynamic_or_userland_call_requires_frame_and_symbol_state")
         }
         DenseOpcode::Include => unsupported_copy_patch_class("include_requires_request_state"),
@@ -3642,13 +3648,16 @@ fn classify_mid_tier_instruction(
             plan.deopt_points += 1;
         }
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
         | DenseOpcode::CallCallable
         | DenseOpcode::AcquireCallable
         | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
-        | DenseOpcode::Include => {
+        | DenseOpcode::Include
+        | DenseOpcode::LoadConstFetchDim
+        | DenseOpcode::LoadLocalLoadConst => {
             push_unique(&mut plan.rejection_reasons, "magic_hooks_or_dynamic_calls");
             plan.deopt_points += 1;
         }

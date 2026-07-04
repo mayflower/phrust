@@ -1120,7 +1120,10 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         | DenseOpcode::Return
         | DenseOpcode::Exit
         | DenseOpcode::Discard => Vec::new(),
-        DenseOpcode::LoadLocal | DenseOpcode::LoadLocalEcho | DenseOpcode::LoadLocalQuiet => {
+        DenseOpcode::LoadLocal
+        | DenseOpcode::LoadLocalEcho
+        | DenseOpcode::LoadLocalQuiet
+        | DenseOpcode::LoadLocalLoadConst => {
             vec![VmDeoptReason::UnsupportedValue]
         }
         DenseOpcode::BinaryAdd
@@ -1155,6 +1158,7 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
             VmDeoptReason::HelperStatus,
         ],
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
         | DenseOpcode::CallCallable
         | DenseOpcode::AcquireCallable
@@ -1169,6 +1173,7 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::FetchDim
+        | DenseOpcode::LoadConstFetchDim
         | DenseOpcode::AssignDim
         | DenseOpcode::AppendDim
         | DenseOpcode::EmptyDim

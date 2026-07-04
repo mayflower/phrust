@@ -7423,16 +7423,27 @@ impl Vm {
                             return result;
                         }
                     }
-                    DenseOpcode::LoadLocal => {
-                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
-                            let result = self.invalid_bytecode_operand_shape(
-                                output,
-                                compiled,
-                                stack,
-                                instruction,
-                            );
-                            stack.pop_recycle();
-                            return result;
+                    DenseOpcode::LoadLocal | DenseOpcode::LoadLocalLoadConst => {
+                        // The fused form appends a constant load into a second
+                        // register after the unchanged local-load sequence.
+                        let (dst, src, fused_const) = match instruction.operands {
+                            DenseOperands::RegOperand { dst, src } => (dst, src, None),
+                            DenseOperands::LoadLocalLoadConst {
+                                first_dst,
+                                local,
+                                second_dst,
+                                constant,
+                            } => (first_dst, local, Some((second_dst, constant))),
+                            _ => {
+                                let result = self.invalid_bytecode_operand_shape(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    instruction,
+                                );
+                                stack.pop_recycle();
+                                return result;
+                            }
                         };
                         if src.kind != DenseOperandKind::Local {
                             let result = self.invalid_bytecode_operand_shape(
@@ -7485,6 +7496,29 @@ impl Vm {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
                             return result;
+                        }
+                        if let Some((second_dst, constant)) = fused_const {
+                            let value = match self
+                                .constant_value(compiled.unit(), ConstId::new(constant))
+                            {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            };
+                            if let Err(message) = stack
+                                .current_mut()
+                                .expect("bytecode frame was pushed")
+                                .registers
+                                .set(RegId::new(second_dst), value)
+                            {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
                         }
                     }
                     DenseOpcode::LoadLocalEcho => {
@@ -8287,7 +8321,7 @@ impl Vm {
                             return result;
                         }
                     }
-                    DenseOpcode::CallFunction => {
+                    DenseOpcode::CallFunction | DenseOpcode::CallFunctionDiscard => {
                         let DenseOperands::Call {
                             dst,
                             name,
@@ -8519,6 +8553,58 @@ impl Vm {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
                             return result;
+                        }
+                        if instruction.opcode == DenseOpcode::CallFunctionDiscard {
+                            // Same sequence as the standalone Discard arm:
+                            // take the value out of the register and run
+                            // destructors for the unreferenced result.
+                            let discard_src = DenseOperand {
+                                kind: DenseOperandKind::Register,
+                                index: dst,
+                            };
+                            let value = match self.read_dense_operand(compiled, stack, discard_src)
+                            {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                            };
+                            if let Err(message) = unset_dense_register_operand(stack, discard_src) {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            let mut exception_handlers = Vec::new();
+                            let mut pending_control = None;
+                            if let Some(outcome) = self.run_destructors_for_unreferenced_value(
+                                compiled,
+                                output,
+                                stack,
+                                state,
+                                &mut exception_handlers,
+                                &mut pending_control,
+                                &value,
+                            ) {
+                                match outcome {
+                                    RaiseOutcome::Done(result) => {
+                                        stack.pop_recycle();
+                                        return *result;
+                                    }
+                                    RaiseOutcome::Caught(_) => {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode discard cannot route a caught destructor exception",
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                }
+                            }
                         }
                     }
                     DenseOpcode::NewObject => {
@@ -9066,22 +9152,67 @@ impl Vm {
                             self.record_counter_array_packed_to_mixed_transition();
                         }
                     }
-                    DenseOpcode::FetchDim => {
-                        let DenseOperands::FetchDim {
-                            dst,
-                            array,
-                            key,
-                            quiet,
-                        } = instruction.operands
-                        else {
-                            let result = self.invalid_bytecode_operand_shape(
-                                output,
-                                compiled,
-                                stack,
-                                instruction,
-                            );
-                            stack.pop_recycle();
-                            return result;
+                    DenseOpcode::FetchDim | DenseOpcode::LoadConstFetchDim => {
+                        // The fused form performs the constant key load (same
+                        // effect as the LoadConst arm) and then runs this
+                        // unchanged dimension-fetch sequence on the key
+                        // register, so fused and unfused semantics match.
+                        let (dst, array, key, quiet) = match instruction.operands {
+                            DenseOperands::FetchDim {
+                                dst,
+                                array,
+                                key,
+                                quiet,
+                            } => (dst, array, key, quiet),
+                            DenseOperands::LoadConstFetchDim {
+                                key_dst,
+                                key_constant,
+                                dst,
+                                array,
+                                quiet,
+                            } => {
+                                let value = match self
+                                    .constant_value(compiled.unit(), ConstId::new(key_constant))
+                                {
+                                    Ok(value) => value,
+                                    Err(message) => {
+                                        let result =
+                                            self.runtime_error(output, compiled, stack, message);
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                };
+                                if let Err(message) = stack
+                                    .current_mut()
+                                    .expect("bytecode frame was pushed")
+                                    .registers
+                                    .set(RegId::new(key_dst), value)
+                                {
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    stack.pop_recycle();
+                                    return result;
+                                }
+                                (
+                                    dst,
+                                    array,
+                                    DenseOperand {
+                                        kind: DenseOperandKind::Register,
+                                        index: key_dst,
+                                    },
+                                    quiet,
+                                )
+                            }
+                            _ => {
+                                let result = self.invalid_bytecode_operand_shape(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    instruction,
+                                );
+                                stack.pop_recycle();
+                                return result;
+                            }
                         };
                         let span = dense
                             .spans
@@ -59888,7 +60019,21 @@ fn dense_load_local_is_pre_call_by_ref_out_param(
                 }
                 continue;
             }
-            DenseOpcode::CallFunction => {
+            DenseOpcode::LoadLocalLoadConst => {
+                let DenseOperands::LoadLocalLoadConst {
+                    first_dst,
+                    second_dst,
+                    ..
+                } = instruction.operands
+                else {
+                    return false;
+                };
+                if first_dst == dst || second_dst == dst {
+                    return false;
+                }
+                continue;
+            }
+            DenseOpcode::CallFunction | DenseOpcode::CallFunctionDiscard => {
                 let DenseOperands::Call { name, ref args, .. } = instruction.operands else {
                     return false;
                 };
@@ -62135,12 +62280,15 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
             "objects"
         }
         DenseOpcode::CallFunction
+        | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::CallCallable => "function_calls",
+        DenseOpcode::LoadLocalLoadConst => "locals",
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::FetchDim
+        | DenseOpcode::LoadConstFetchDim
         | DenseOpcode::AssignDim
         | DenseOpcode::AppendDim
         | DenseOpcode::IssetDim

@@ -491,6 +491,26 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
                 collect_operand_slot(capture.src, slots);
             }
         }
+        DenseOperands::LoadConstFetchDim {
+            key_dst,
+            dst,
+            array,
+            ..
+        } => {
+            slots.insert(OsrVmSlot::Register(*key_dst));
+            slots.insert(OsrVmSlot::Register(*dst));
+            collect_operand_slot(*array, slots);
+        }
+        DenseOperands::LoadLocalLoadConst {
+            first_dst,
+            local,
+            second_dst,
+            ..
+        } => {
+            slots.insert(OsrVmSlot::Register(*first_dst));
+            slots.insert(OsrVmSlot::Register(*second_dst));
+            collect_operand_slot(*local, slots);
+        }
         DenseOperands::Include { dst, path, .. } => {
             slots.insert(OsrVmSlot::Register(*dst));
             collect_operand_slot(*path, slots);

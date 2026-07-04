@@ -54,19 +54,22 @@ block, so patterns never cross branch or return boundaries.
 
 | Pattern | Superinstruction | Observed count | Reason |
 | --- | --- | ---: | --- |
-| `load_const echo` | `load_const_echo` | 22 | single-block producer immediately consumed by echo with generic unfused equivalent |
-| `load_local echo` | `load_local_echo` | 5 | single-block producer immediately consumed by echo with generic unfused equivalent |
-| `binary_concat echo` | `binary_concat_echo` | 1 | single-block producer immediately consumed by echo with generic unfused equivalent |
+| `load_const echo` | `load_const_echo` | 22 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
+| `load_local echo` | `load_local_echo` | 5 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
+| `binary_concat echo` | `binary_concat_echo` | 1 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
+| `load_const fetch_dim` | `load_const_fetch_dim` | 1 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
+| `load_local load_const` | `load_local_load_const` | 6 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
+| `call_function discard` | `call_function_discard` | 0 | single-block producer immediately consumed by the fused successor, executed through the unfused arm's helper sequence |
 
 ## Deferred Families
 
 | Family | Reason |
 | --- | --- |
 | `compare_plus_conditional_jump` | current dense blocks keep conditional jumps as terminators; terminator fusion needs separate source-map and branch accounting |
-| `load_or_binary_plus_scalar_op_or_store` | safe execution helper boundaries are not yet factored for arithmetic/store chains beyond existing generic handlers |
-| `call_or_builtin_plus_branch_or_echo` | call helpers preserve named-argument, by-reference, diagnostic, and fallback behavior and need dedicated fused helper proof |
+| `binary_plus_store_chain` | store_local is almost always followed by discard, which already fuses; a binary/store pair fusion would only trade one fusion for another on the dominant triple |
+| `call_or_builtin_plus_branch_or_echo` | call-plus-branch/echo helpers preserve named-argument, by-reference, diagnostic, and fallback behavior and need dedicated fused helper proof; call-plus-discard is fused via the shared call arm |
 | `array_or_foreach_loop_skeleton` | array/foreach state carries COW, reference, mutation, and loop-control semantics that should remain unfused until guarded fixtures exist |
-| `property_fetch_plus_echo` | property fetch dense execution remains fenced by FPE-04 unsupported/fallback accounting |
+| `property_fetch_plus_echo` | property fetch dense arms carry inline-cache observation and guard state whose fused re-entry accounting is not yet factored |
 
 ## Correctness Policy
 
