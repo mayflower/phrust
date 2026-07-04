@@ -4883,6 +4883,9 @@ mod tests {
     fn run_writes_timings_sidecar_without_changing_stdout() {
         let path =
             PathBuf::from("target/performance/timings/tests/run-writes-timings-sidecar.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create timing report test directory");
+        }
         let _ = fs::remove_file(&path);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
