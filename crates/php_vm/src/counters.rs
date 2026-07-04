@@ -230,6 +230,11 @@ pub struct VmCounters {
     pub string_hash_cache_misses: u64,
     pub symbol_eq_fast_hits: u64,
     pub symbol_eq_byte_fallbacks: u64,
+    pub symbolized_call_name_hits: u64,
+    pub symbolized_method_name_hits: u64,
+    pub symbolized_property_name_hits: u64,
+    pub symbolized_array_key_hits: u64,
+    pub symbolized_name_fallbacks_by_reason: BTreeMap<String, u64>,
     pub array_dim_fetches: u64,
     pub packed_dim_fast_path_hits: u64,
     pub packed_dim_fast_path_misses: u64,
@@ -618,6 +623,29 @@ impl VmCounters {
     pub(crate) fn record_value_clone_by_reason(&mut self, reason: &str) {
         *self
             .value_clone_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_symbolized_call_name_hit(&mut self) {
+        self.symbolized_call_name_hits += 1;
+    }
+
+    pub(crate) fn record_symbolized_method_name_hit(&mut self) {
+        self.symbolized_method_name_hits += 1;
+    }
+
+    pub(crate) fn record_symbolized_property_name_hit(&mut self) {
+        self.symbolized_property_name_hits += 1;
+    }
+
+    pub(crate) fn record_symbolized_array_key_hit(&mut self) {
+        self.symbolized_array_key_hits += 1;
+    }
+
+    pub(crate) fn record_symbolized_name_fallback(&mut self, reason: &str) {
+        *self
+            .symbolized_name_fallbacks_by_reason
             .entry(reason.to_owned())
             .or_default() += 1;
     }
@@ -2494,6 +2522,36 @@ impl VmCounters {
             &mut json,
             "symbol_eq_byte_fallbacks",
             self.symbol_eq_byte_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbolized_call_name_hits",
+            self.symbolized_call_name_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbolized_method_name_hits",
+            self.symbolized_method_name_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbolized_property_name_hits",
+            self.symbolized_property_name_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "symbolized_array_key_hits",
+            self.symbolized_array_key_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "symbolized_name_fallbacks_by_reason",
+            &self.symbolized_name_fallbacks_by_reason,
             true,
         );
         push_field(&mut json, "array_dim_fetches", self.array_dim_fetches, true);

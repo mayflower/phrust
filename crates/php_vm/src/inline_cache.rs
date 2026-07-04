@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use php_runtime::PhpString;
+
 use crate::include::IncludePathFileFingerprint;
 use crate::{DEQUICKEN_AFTER_GUARD_MISSES, DISABLE_AFTER_GUARD_MISSES, FallbackProtocolStats};
 
@@ -168,7 +170,7 @@ pub struct FunctionCallBuiltinMetadata {
 /// One guarded function-call target in a polymorphic IC slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionCallPolymorphicEntry {
-    pub lowered_name: String,
+    pub lowered_name: PhpString,
     pub epoch: InvalidationEpoch,
     pub shape: FunctionCallShape,
     pub builtin_metadata: Option<FunctionCallBuiltinMetadata>,
@@ -590,7 +592,7 @@ pub struct InlineCacheSlot {
     pub instruction: InstrId,
     pub epoch: InvalidationEpoch,
     pub stats: InlineCacheStats,
-    pub function_call_name: Option<String>,
+    pub function_call_name: Option<PhpString>,
     pub function_call_shape: Option<FunctionCallShape>,
     pub function_call_builtin_metadata: Option<FunctionCallBuiltinMetadata>,
     pub function_call_target: Option<FunctionCallCacheTarget>,
@@ -995,7 +997,7 @@ impl InlineCacheTable {
         function: FunctionId,
         block: BlockId,
         instruction: InstrId,
-        lowered_name: &str,
+        lowered_name: &PhpString,
         shape: &FunctionCallShape,
     ) -> Option<FunctionCallBuiltinMetadata> {
         let key = inline_cache_key(
@@ -1008,10 +1010,10 @@ impl InlineCacheTable {
         let slot = self.slots.get(&key)?;
         slot.function_call_polymorphic_entries
             .iter()
-            .find(|entry| entry.lowered_name == lowered_name && entry.shape == *shape)
+            .find(|entry| entry.lowered_name == *lowered_name && entry.shape == *shape)
             .and_then(|entry| entry.builtin_metadata.clone())
             .or_else(|| {
-                (slot.function_call_name.as_deref() == Some(lowered_name)
+                (slot.function_call_name.as_ref() == Some(lowered_name)
                     && slot.function_call_shape.as_ref() == Some(shape))
                 .then(|| slot.function_call_builtin_metadata.clone())
                 .flatten()
@@ -1028,7 +1030,7 @@ impl InlineCacheTable {
         function: FunctionId,
         block: BlockId,
         instruction: InstrId,
-        lowered_name: &str,
+        lowered_name: &PhpString,
         epoch: InvalidationEpoch,
         shape: &FunctionCallShape,
         builtin_metadata: Option<&FunctionCallBuiltinMetadata>,
@@ -1069,7 +1071,7 @@ impl InlineCacheTable {
                 .function_call_polymorphic_entries
                 .iter()
                 .position(|entry| {
-                    entry.lowered_name == lowered_name
+                    entry.lowered_name == *lowered_name
                         && entry.shape == *shape
                         && entry.builtin_metadata.as_ref() == builtin_metadata
                 })
@@ -1089,11 +1091,11 @@ impl InlineCacheTable {
             let same_name = slot
                 .function_call_polymorphic_entries
                 .iter()
-                .any(|entry| entry.lowered_name == lowered_name);
+                .any(|entry| entry.lowered_name == *lowered_name);
             let same_name_and_shape = slot
                 .function_call_polymorphic_entries
                 .iter()
-                .any(|entry| entry.lowered_name == lowered_name && entry.shape == *shape);
+                .any(|entry| entry.lowered_name == *lowered_name && entry.shape == *shape);
             let observation = if same_name {
                 record_slot_guard_failure(slot)
             } else if slot.function_call_polymorphic_entries.len() < POLYMORPHIC_INLINE_CACHE_LIMIT
@@ -1111,7 +1113,7 @@ impl InlineCacheTable {
             }
             return (None, with_kind(InlineCacheKind::FunctionCall, observation));
         }
-        let Some(cached_name) = slot.function_call_name.as_deref() else {
+        let Some(cached_name) = slot.function_call_name.as_ref() else {
             let observation = record_slot_miss(slot);
             return (None, with_kind(InlineCacheKind::FunctionCall, observation));
         };
@@ -1152,7 +1154,7 @@ impl InlineCacheTable {
         function: FunctionId,
         block: BlockId,
         instruction: InstrId,
-        lowered_name: &str,
+        lowered_name: &PhpString,
         epoch: InvalidationEpoch,
         shape: FunctionCallShape,
         builtin_metadata: Option<FunctionCallBuiltinMetadata>,
@@ -1173,7 +1175,7 @@ impl InlineCacheTable {
                 return;
             }
             let new_entry = FunctionCallPolymorphicEntry {
-                lowered_name: lowered_name.to_owned(),
+                lowered_name: lowered_name.clone(),
                 epoch,
                 shape,
                 builtin_metadata,
@@ -2335,6 +2337,7 @@ mod tests {
     };
     use crate::include::IncludePathFileFingerprint;
     use php_ir::ids::{BlockId, FunctionId, InstrId};
+    use php_runtime::PhpString;
     use std::path::PathBuf;
 
     fn positional_shape(arity: u32) -> FunctionCallShape {
@@ -2485,7 +2488,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(3),
             positional_shape(1),
             Some(builtin_metadata("strlen")),
@@ -2499,7 +2502,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(3),
             &positional_shape(1),
             Some(&builtin_metadata("strlen")),
@@ -2529,7 +2532,7 @@ mod tests {
             function,
             block,
             instruction,
-            "perf_fn",
+            &PhpString::intern(b"perf_fn"),
             InvalidationEpoch::new(1),
             positional_shape(0),
             None,
@@ -2540,7 +2543,7 @@ mod tests {
             function,
             block,
             instruction,
-            "perf_fn",
+            &PhpString::intern(b"perf_fn"),
             InvalidationEpoch::new(2),
             &positional_shape(0),
             None,
@@ -2575,7 +2578,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(1),
             shape.clone(),
             Some(builtin_metadata("strlen")),
@@ -2591,7 +2594,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(1),
             &wrong_shape,
             Some(&builtin_metadata("strlen")),
@@ -2604,7 +2607,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(1),
             shape.clone(),
             Some(builtin_metadata("strlen")),
@@ -2622,7 +2625,7 @@ mod tests {
             function,
             block,
             instruction,
-            "strlen",
+            &PhpString::intern(b"strlen"),
             InvalidationEpoch::new(1),
             &shape,
             Some(&wrong_metadata),
@@ -2650,7 +2653,7 @@ mod tests {
             function,
             block,
             instruction,
-            "perf_fn_a",
+            &PhpString::intern(b"perf_fn_a"),
             InvalidationEpoch::new(1),
             positional_shape(0),
             None,
@@ -2664,7 +2667,7 @@ mod tests {
                 function,
                 block,
                 instruction,
-                name,
+                &PhpString::intern(name.as_bytes()),
                 InvalidationEpoch::new(1),
                 &positional_shape(0),
                 None,
@@ -2678,7 +2681,7 @@ mod tests {
                 function,
                 block,
                 instruction,
-                name,
+                &PhpString::intern(name.as_bytes()),
                 InvalidationEpoch::new(1),
                 positional_shape(0),
                 None,
@@ -2716,7 +2719,7 @@ mod tests {
                 function,
                 block,
                 instruction,
-                name,
+                &PhpString::intern(name.as_bytes()),
                 InvalidationEpoch::new(1),
                 positional_shape(0),
                 None,
@@ -2731,7 +2734,7 @@ mod tests {
             function,
             block,
             instruction,
-            "perf_fn_b",
+            &PhpString::intern(b"perf_fn_b"),
             InvalidationEpoch::new(1),
             &positional_shape(0),
             None,

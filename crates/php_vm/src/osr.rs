@@ -836,6 +836,8 @@ mod tests {
             }],
             spans: vec![IrSpan::new(php_ir::FileId::new(0), 0, 1)],
             names: vec!["fn".to_string()],
+            interned_names: Vec::new(),
+            normalized_interned_names: Vec::new(),
             cache_slots: Vec::new(),
             source_map: Vec::new(),
         }

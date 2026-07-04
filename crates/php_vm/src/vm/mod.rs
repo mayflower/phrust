@@ -3452,7 +3452,7 @@ impl Vm {
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: php_ir::ids::InstrId,
-        lowered_name: &str,
+        lowered_name: &PhpString,
         epoch: InvalidationEpoch,
         shape: &FunctionCallShape,
     ) -> Option<FunctionCallCacheTarget> {
@@ -3501,7 +3501,7 @@ impl Vm {
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: php_ir::ids::InstrId,
-        lowered_name: &str,
+        lowered_name: &PhpString,
         epoch: InvalidationEpoch,
         shape: FunctionCallShape,
         target: FunctionCallCacheTarget,
@@ -4060,6 +4060,51 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_value_clone_by_reason(reason);
+        }
+    }
+
+    fn record_counter_symbolized_call_name_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_symbolized_call_name_hit();
+        }
+    }
+
+    fn record_counter_symbolized_method_name_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_symbolized_method_name_hit();
+        }
+    }
+
+    fn record_counter_symbolized_property_name_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_symbolized_property_name_hit();
+        }
+    }
+
+    fn record_counter_symbolized_array_key_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_symbolized_array_key_hit();
+        }
+    }
+
+    fn record_counter_symbolized_name_fallback(&self, reason: &'static str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_symbolized_name_fallback(reason);
         }
     }
 
@@ -7918,6 +7963,7 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
+                        let name_index = name;
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
                                 output,
@@ -7936,7 +7982,21 @@ impl Vm {
                                 return result;
                             }
                         };
-                        let lowered_name = normalize_function_name(name);
+                        // Prefer the per-unit interned normalized name: no
+                        // per-call lowering allocation, and the IC guard
+                        // compares by symbol identity.
+                        let lowered_name = match dense.normalized_interned_name(name_index) {
+                            Some(interned) => {
+                                self.record_counter_symbolized_call_name_hit();
+                                interned.clone()
+                            }
+                            None => {
+                                self.record_counter_symbolized_name_fallback(
+                                    "uninterned_call_name",
+                                );
+                                PhpString::intern(normalize_function_name(name).as_bytes())
+                            }
+                        };
                         let epoch = state.lookup_epoch();
                         let call_shape = function_call_shape(&values);
                         self.observe_dense_call_inline_cache(
@@ -7960,8 +8020,10 @@ impl Vm {
                             target
                         } else {
                             self.record_counter_dense_call_ic_miss();
+                            let lowered_str =
+                                std::str::from_utf8(lowered_name.as_bytes()).unwrap_or_default();
                             let Some(resolved) =
-                                self.resolve_function_call_target(compiled, state, &lowered_name)
+                                self.resolve_function_call_target(compiled, state, lowered_str)
                             else {
                                 self.record_counter_dense_call_fallback("unknown_function");
                                 let diagnostic = undefined_function(
@@ -8144,6 +8206,11 @@ impl Vm {
                                 return result;
                             }
                         };
+                        if dense.interned_name(method).is_some() {
+                            self.record_counter_symbolized_method_name_hit();
+                        } else {
+                            self.record_counter_symbolized_name_fallback("uninterned_method_name");
+                        }
                         let Some(method) = dense.names.get(method as usize) else {
                             let result = self.runtime_error(
                                 output,
@@ -8228,6 +8295,11 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
+                        if dense.interned_name(method).is_some() {
+                            self.record_counter_symbolized_method_name_hit();
+                        } else {
+                            self.record_counter_symbolized_name_fallback("uninterned_method_name");
+                        }
                         let Some(method) = dense.names.get(method as usize) else {
                             let result = self.runtime_error(
                                 output,
@@ -8431,6 +8503,11 @@ impl Vm {
                                 return result;
                             }
                         };
+                        if let Value::String(key_string) = key_ref.as_value()
+                            && key_string.symbol_id().is_some()
+                        {
+                            self.record_counter_symbolized_array_key_hit();
+                        }
                         let value = self.try_quickened_packed_array_int_key(
                             function_id,
                             BlockId::new(block_index),
@@ -9202,6 +9279,13 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
+                        if dense.interned_name(property).is_some() {
+                            self.record_counter_symbolized_property_name_hit();
+                        } else {
+                            self.record_counter_symbolized_name_fallback(
+                                "uninterned_property_name",
+                            );
+                        }
                         let Some(property) = dense.names.get(property as usize) else {
                             let result = self.runtime_error(
                                 output,
@@ -9272,6 +9356,13 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
+                        if dense.interned_name(property).is_some() {
+                            self.record_counter_symbolized_property_name_hit();
+                        } else {
+                            self.record_counter_symbolized_name_fallback(
+                                "uninterned_property_name",
+                            );
+                        }
                         let Some(property) = dense.names.get(property as usize) else {
                             let result = self.runtime_error(
                                 output,
@@ -22351,6 +22442,7 @@ impl Vm {
                             }
                         };
                         let lowered_name = normalize_function_name(name);
+                        let interned_name = PhpString::intern(lowered_name.as_bytes());
                         let epoch = state.lookup_epoch();
                         let call_shape = function_call_shape(&values);
                         let target = self
@@ -22359,7 +22451,7 @@ impl Vm {
                                 function_id,
                                 block_id,
                                 instruction.id,
-                                &lowered_name,
+                                &interned_name,
                                 epoch,
                                 &call_shape,
                             )
@@ -22379,7 +22471,7 @@ impl Vm {
                                     function_id,
                                     block_id,
                                     instruction.id,
-                                    &lowered_name,
+                                    &interned_name,
                                     epoch,
                                     call_shape.clone(),
                                     resolved.clone(),
@@ -24624,6 +24716,7 @@ impl Vm {
                                     )
                                 } else {
                                     let lowered_name = normalize_function_name(&display_name);
+                                    let interned_name = PhpString::intern(lowered_name.as_bytes());
                                     let epoch = state.lookup_epoch();
                                     let call_shape = function_call_shape(&values);
                                     let target = self
@@ -24632,7 +24725,7 @@ impl Vm {
                                             function_id,
                                             block_id,
                                             instruction.id,
-                                            &lowered_name,
+                                            &interned_name,
                                             epoch,
                                             &call_shape,
                                         )
@@ -24652,7 +24745,7 @@ impl Vm {
                                                 function_id,
                                                 block_id,
                                                 instruction.id,
-                                                &lowered_name,
+                                                &interned_name,
                                                 epoch,
                                                 call_shape.clone(),
                                                 resolved.clone(),
@@ -37571,7 +37664,7 @@ fn is_reflection_runtime_class(name: &str) -> bool {
     .contains(&name.as_str())
 }
 
-fn normalize_function_name(name: &str) -> String {
+pub(crate) fn normalize_function_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
 
@@ -68365,6 +68458,37 @@ var_dump(unserialize('O:1:"C":0:{}'));
         let counters = result.counters.expect("counters should be collected");
         assert!(counters.literal_intern_misses >= 1, "{counters:?}");
         assert!(counters.literal_intern_hits >= 2, "{counters:?}");
+    }
+
+    #[test]
+    fn dense_dispatch_symbolizes_call_and_array_key_names() {
+        let source = "<?php function sym_target($v) { return $v + 1; } \
+                      $map = [\"alpha\" => 5]; $total = 0; \
+                      for ($i = 0; $i < 6; $i++) { $total = sym_target($total) + $map[\"alpha\"]; } \
+                      echo $total;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Bytecode,
+                inline_caches: InlineCacheMode::On,
+                quickening: QuickeningMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"36");
+        let counters = result.counters.expect("counters");
+        assert!(counters.symbolized_call_name_hits >= 6, "{counters:?}");
+        assert!(counters.symbolized_array_key_hits >= 6, "{counters:?}");
+        assert_eq!(
+            counters
+                .symbolized_name_fallbacks_by_reason
+                .get("uninterned_call_name"),
+            None,
+            "{counters:?}"
+        );
+        assert!(counters.function_call_ic_hits >= 1, "{counters:?}");
     }
 
     #[test]

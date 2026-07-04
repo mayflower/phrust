@@ -15,6 +15,7 @@ use php_ir::instruction::{IrCallArg, IrCallArgValueKind, Terminator, TerminatorK
 use php_ir::rule_selection::{RuleKind, RuleSelection, RuleSelectionReport};
 use php_ir::source_map::{IrSourceMapTarget, IrSpan};
 use php_ir::{BinaryOp, CompareOp, Instruction, InstructionKind, IrFunction, IrUnit, Operand};
+use php_runtime::PhpString;
 
 /// Dense bytecode format version.
 pub const DENSE_BYTECODE_VERSION: u32 = 1;
@@ -608,6 +609,14 @@ pub struct DenseBytecodeUnit {
     pub spans: Vec<IrSpan>,
     /// String/name side table reserved for future supported opcodes.
     pub names: Vec<String>,
+    /// Interned mirror of `names`, index-aligned; built once after lowering
+    /// so hot dispatch reuses shared, symbol-carrying strings instead of
+    /// re-materializing names per execution.
+    pub interned_names: Vec<PhpString>,
+    /// Interned, `normalize_function_name`-lowered mirror of `names`,
+    /// index-aligned; used by call dispatch so per-call normalization
+    /// allocations disappear.
+    pub normalized_interned_names: Vec<PhpString>,
     /// Cache slot side table reserved for future IC/quickening sites.
     pub cache_slots: Vec<String>,
     /// Dense source map.
@@ -853,6 +862,33 @@ impl DenseBytecodeUnit {
     pub fn to_snapshot_text(&self) -> String {
         render_snapshot(self)
     }
+
+    /// Builds the interned name mirrors (raw and call-normalized) for the
+    /// current `names` table. Called once per lowering; idempotent.
+    pub fn intern_names(&mut self) {
+        self.interned_names = self
+            .names
+            .iter()
+            .map(|name| PhpString::intern(name.as_bytes()))
+            .collect();
+        self.normalized_interned_names = self
+            .names
+            .iter()
+            .map(|name| PhpString::intern(crate::vm::normalize_function_name(name).as_bytes()))
+            .collect();
+    }
+
+    /// Interned name for a dense name id, when the mirror was built.
+    #[must_use]
+    pub fn interned_name(&self, index: u32) -> Option<&PhpString> {
+        self.interned_names.get(index as usize)
+    }
+
+    /// Interned call-normalized name for a dense name id, when built.
+    #[must_use]
+    pub fn normalized_interned_name(&self, index: u32) -> Option<&PhpString> {
+        self.normalized_interned_names.get(index as usize)
+    }
 }
 
 fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
@@ -863,6 +899,8 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
         functions: Vec::with_capacity(unit.functions.len()),
         spans: Vec::new(),
         names: Vec::new(),
+        interned_names: Vec::new(),
+        normalized_interned_names: Vec::new(),
         cache_slots: Vec::new(),
         source_map: Vec::new(),
     };
@@ -892,6 +930,7 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
             span,
         });
     }
+    dense.intern_names();
     DenseExecutionPlan {
         unit: dense,
         functions,
@@ -1520,6 +1559,8 @@ fn lower_unit(unit: &IrUnit) -> Result<DenseBytecodeUnit, DenseLowerError> {
         functions: Vec::with_capacity(unit.functions.len()),
         spans: Vec::new(),
         names: Vec::new(),
+        interned_names: Vec::new(),
+        normalized_interned_names: Vec::new(),
         cache_slots: Vec::new(),
         source_map: Vec::new(),
     };
@@ -1542,6 +1583,7 @@ fn lower_unit(unit: &IrUnit) -> Result<DenseBytecodeUnit, DenseLowerError> {
         code: DenseLowerErrorCode::UnsupportedInstruction,
         message: format!("lowered dense bytecode failed verification: {errors:?}"),
     })?;
+    dense.intern_names();
     Ok(dense)
 }
 
@@ -3458,6 +3500,8 @@ echo $other;
             }],
             spans: vec![IrSpan::new(file, 0, 1)],
             names: Vec::new(),
+            interned_names: Vec::new(),
+            normalized_interned_names: Vec::new(),
             cache_slots: Vec::new(),
             source_map: vec![DenseSourceMapEntry {
                 target: DenseSourceMapTarget::Block {
@@ -3578,6 +3622,8 @@ echo $other;
             }],
             spans: vec![IrSpan::new(php_ir::FileId::new(0), 0, 1)],
             names: vec!["fn".to_string()],
+            interned_names: Vec::new(),
+            normalized_interned_names: Vec::new(),
             cache_slots: Vec::new(),
             source_map: Vec::new(),
         }
