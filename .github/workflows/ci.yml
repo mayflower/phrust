@@ -85,8 +85,19 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
+      - name: Build pinned reference PHP
+        if: matrix.gate == 'verify-runtime'
+        run: |
+          nix develop -c just bootstrap-ref
+          nix develop -c just build-ref-php
+
       - name: Run gate
-        run: nix develop -c just ${{ matrix.gate }}
+        run: |
+          if [[ "${{ matrix.gate }}" == "verify-runtime" ]]; then
+            REFERENCE_PHP="$PWD/third_party/php-src/sapi/cli/php" nix develop -c just verify-runtime
+          else
+            nix develop -c just ${{ matrix.gate }}
+          fi
 
       - name: Upload gate reports
         if: always()

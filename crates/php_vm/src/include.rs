@@ -1289,7 +1289,7 @@ mod tests {
         let first = cache
             .get_or_compile_include(&loader, &first_resolved, OptimizationLevel::O0)
             .expect("first compile");
-        fixture.write("lib.php", "<?php echo 'two';\n");
+        fixture.write("lib.php", "<?php echo 'two'; echo '!';\n");
         let second_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("second resolve");

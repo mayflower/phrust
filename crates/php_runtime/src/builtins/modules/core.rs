@@ -2206,12 +2206,12 @@ fn php_deref_value_to_json_inner(
                         if matches!(classified.kind, NumericStringKind::FloatString)
                             && matches!(classified.value, Some(NumericStringValue::Float(_))) =>
                     {
-                        if let Some(NumericStringValue::Float(value)) = classified.value {
-                            if value.is_finite() {
-                                return JsonNumber::from_f64(value)
-                                    .map(JsonValue::Number)
-                                    .ok_or(JSON_ERROR_SYNTAX);
-                            }
+                        if let Some(NumericStringValue::Float(value)) = classified.value
+                            && value.is_finite()
+                        {
+                            return JsonNumber::from_f64(value)
+                                .map(JsonValue::Number)
+                                .ok_or(JSON_ERROR_SYNTAX);
                         }
                     }
                     _ => {}
@@ -2332,7 +2332,10 @@ pub(in crate::builtins::modules) fn utf8_ignore_invalid(bytes: &[u8]) -> String 
             Err(error) => {
                 let valid_up_to = error.valid_up_to();
                 if valid_up_to > 0 {
-                    out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) });
+                    out.push_str(
+                        std::str::from_utf8(&rest[..valid_up_to])
+                            .expect("valid UTF-8 prefix reported by from_utf8"),
+                    );
                 }
                 let skip = error.error_len().unwrap_or(1);
                 rest = &rest[valid_up_to.saturating_add(skip)..];
@@ -2354,7 +2357,10 @@ fn utf8_substitute_invalid(bytes: &[u8]) -> String {
             Err(error) => {
                 let valid_up_to = error.valid_up_to();
                 if valid_up_to > 0 {
-                    out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) });
+                    out.push_str(
+                        std::str::from_utf8(&rest[..valid_up_to])
+                            .expect("valid UTF-8 prefix reported by from_utf8"),
+                    );
                 }
                 out.push('\u{fffd}');
                 let invalid = &rest[valid_up_to..];
