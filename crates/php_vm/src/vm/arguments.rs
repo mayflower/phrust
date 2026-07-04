@@ -329,7 +329,17 @@ fn bind_arguments(
             };
             trace_args.push(FrameTraceArgument {
                 name: None,
-                value: trace_value_for_param(&value, param_is_sensitive(param)),
+                value: if param_is_sensitive(param) {
+                    trace_value_for_param(&value, true)
+                } else if let Some(cell) = &reference {
+                    // Traces observe later writes through by-ref parameters
+                    // (matching the reference engine), and holding the cell
+                    // instead of a value snapshot keeps the argument's
+                    // copy-on-write handle unshared for the frame's lifetime.
+                    Value::Reference(cell.clone())
+                } else {
+                    value.clone()
+                },
             });
             if !elide_frame_args
                 && highest_frame_param_index.is_some_and(|highest| index <= highest)

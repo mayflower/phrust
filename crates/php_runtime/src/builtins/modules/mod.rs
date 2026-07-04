@@ -1,4 +1,5 @@
 pub(in crate::builtins) mod apcu;
+pub mod array_intrinsics;
 pub(in crate::builtins) mod arrays;
 pub(in crate::builtins) mod bcmath;
 pub(in crate::builtins) mod core;

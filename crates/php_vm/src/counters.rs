@@ -313,6 +313,10 @@ pub struct VmCounters {
     pub json_encode_fast_path_hits: u64,
     pub json_encode_fast_path_bytes: u64,
     pub json_encode_generic_fallback_by_reason: BTreeMap<String, u64>,
+    pub array_slice_packed_fast_hits: u64,
+    pub count_array_shape_fast_hits: u64,
+    pub map_update_slot_fast_hits: u64,
+    pub array_builtin_fast_fallback_by_reason: BTreeMap<String, u64>,
     pub specialized_builtin_opcode_hits: BTreeMap<String, u64>,
     pub slow_path_calls_by_reason: BTreeMap<String, u64>,
     pub value_clone_by_reason: BTreeMap<String, u64>,
@@ -1472,6 +1476,25 @@ impl VmCounters {
             .entry(reason.to_owned())
             .or_default() += 1;
         self.record_slow_path_call(&format!("json_encode_generic.{reason}"));
+    }
+
+    pub(crate) fn record_array_slice_packed_fast_hit(&mut self) {
+        self.array_slice_packed_fast_hits += 1;
+    }
+
+    pub(crate) fn record_count_array_shape_fast_hit(&mut self) {
+        self.count_array_shape_fast_hits += 1;
+    }
+
+    pub(crate) fn record_map_update_slot_fast_hit(&mut self) {
+        self.map_update_slot_fast_hits += 1;
+    }
+
+    pub(crate) fn record_array_builtin_fast_fallback(&mut self, builtin: &str, reason: &str) {
+        *self
+            .array_builtin_fast_fallback_by_reason
+            .entry(format!("{builtin}.{reason}"))
+            .or_default() += 1;
     }
 
     pub(crate) fn record_call_ic_megamorphic_fallback(&mut self) {
@@ -3097,6 +3120,30 @@ impl VmCounters {
             &mut json,
             "json_encode_generic_fallback_by_reason",
             &self.json_encode_generic_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "array_slice_packed_fast_hits",
+            self.array_slice_packed_fast_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "count_array_shape_fast_hits",
+            self.count_array_shape_fast_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "map_update_slot_fast_hits",
+            self.map_update_slot_fast_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "array_builtin_fast_fallback_by_reason",
+            &self.array_builtin_fast_fallback_by_reason,
             true,
         );
         push_string_u64_map_field(

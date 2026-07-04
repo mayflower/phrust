@@ -5283,22 +5283,25 @@ pub(in crate::builtins::modules) fn normalize_slice_start(len: usize, offset: i6
     }
 }
 
+/// Shared `array_slice`-family offset/length math: the resolved
+/// `start..end` element range (empty when length consumes the range).
+pub(crate) fn slice_bounds(len: usize, offset: i64, length: Option<i64>) -> (usize, usize) {
+    let start = normalize_slice_start(len, offset);
+    let end = match length {
+        None => len,
+        Some(length) if length >= 0 => start.saturating_add(length as usize).min(len),
+        Some(length) => len.saturating_sub(length.unsigned_abs() as usize),
+    };
+    (start, end.max(start))
+}
+
 pub(in crate::builtins::modules) fn slice_entries(
     entries: Vec<(ArrayKey, Value)>,
     offset: i64,
     length: Option<i64>,
 ) -> Vec<(ArrayKey, Value)> {
-    let start = normalize_slice_start(entries.len(), offset);
-    let end = match length {
-        None => entries.len(),
-        Some(length) if length >= 0 => start.saturating_add(length as usize).min(entries.len()),
-        Some(length) => entries.len().saturating_sub(length.unsigned_abs() as usize),
-    };
-    if end < start {
-        Vec::new()
-    } else {
-        entries[start..end].to_vec()
-    }
+    let (start, end) = slice_bounds(entries.len(), offset, length);
+    entries[start..end].to_vec()
 }
 
 pub(in crate::builtins::modules) fn splice_length(

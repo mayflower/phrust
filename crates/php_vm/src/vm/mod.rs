@@ -4480,6 +4480,56 @@ impl Vm {
         }
     }
 
+    /// Counts single-key non-append dim writes (the grouped map-update
+    /// shape) as slot-fast when the container was mutated in place, and as
+    /// a borrow-conflict fallback otherwise. Appends and nested writes stay
+    /// outside the map-update counters.
+    fn record_counter_map_update_slot_path(
+        &self,
+        path: AssignDimLocalPath,
+        dims: &[ArrayKey],
+        append: bool,
+    ) {
+        if append || dims.len() != 1 || !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            match path {
+                AssignDimLocalPath::InPlace => counters.record_map_update_slot_fast_hit(),
+                AssignDimLocalPath::ClonedReferenceFallback => {
+                    counters.record_array_builtin_fast_fallback("map_update", "borrow_conflict");
+                }
+            }
+        }
+    }
+
+    fn record_counter_array_slice_packed_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_slice_packed_fast_hit();
+        }
+    }
+
+    fn record_counter_count_array_shape_fast_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_count_array_shape_fast_hit();
+        }
+    }
+
+    fn record_counter_array_builtin_fast_fallback(&self, builtin: &str, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_array_builtin_fast_fallback(builtin, reason);
+        }
+    }
+
     fn record_counter_json_encode_fast_path(&self, bytes: usize) {
         if !self.options.collect_counters {
             return;
@@ -4546,6 +4596,9 @@ impl Vm {
                 return result;
             }
             if let Some(result) = self.try_execute_json_encode_fast(name, &values, state) {
+                return result;
+            }
+            if let Some(result) = self.try_execute_array_slice_fast(name, &values) {
                 return result;
             }
         }
@@ -4855,6 +4908,7 @@ impl Vm {
         if name == "count" {
             self.record_counter_array_count_fast_path_hit();
             self.record_counter_internal_count_array_direct_fast_path_hit();
+            self.record_counter_count_array_shape_fast_hit();
         }
         Some(VmResult::success_no_output(Some(result)))
     }
@@ -4896,20 +4950,70 @@ impl Vm {
         }
     }
 
+    /// `array_slice` over values-only packed storage with defaulted or
+    /// `false` key preservation; every other shape (and every diagnostic)
+    /// stays on the generic path with the reason recorded.
+    fn try_execute_array_slice_fast(&self, name: &str, values: &[Value]) -> Option<VmResult> {
+        if name != "array_slice" {
+            return None;
+        }
+        if !(2..=4).contains(&values.len()) {
+            self.record_counter_array_builtin_fast_fallback("array_slice", "arity");
+            return None;
+        }
+        let (Value::Array(array), Value::Int(offset)) = (&values[0], &values[1]) else {
+            self.record_counter_array_builtin_fast_fallback("array_slice", "type");
+            return None;
+        };
+        let length = match values.get(2) {
+            None | Some(Value::Null) => None,
+            Some(Value::Int(length)) => Some(*length),
+            Some(_) => {
+                self.record_counter_array_builtin_fast_fallback("array_slice", "type");
+                return None;
+            }
+        };
+        match values.get(3) {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                self.record_counter_array_builtin_fast_fallback("array_slice", "preserve_keys");
+                return None;
+            }
+            Some(_) => {
+                self.record_counter_array_builtin_fast_fallback("array_slice", "type");
+                return None;
+            }
+        }
+        let Some(result) =
+            php_runtime::builtins::array_intrinsics::array_slice_packed(array, *offset, length)
+        else {
+            self.record_counter_array_builtin_fast_fallback("array_slice", "array_shape");
+            return None;
+        };
+        self.record_counter_array_slice_packed_fast_hit();
+        Some(VmResult::success_no_output(Some(Value::Array(result))))
+    }
+
     fn try_execute_direct_count_array(
         &self,
         name: &str,
         values: &[Value],
         _output: &OutputBuffer,
     ) -> Option<VmResult> {
-        if name != "count" || values.len() != 1 {
+        if name != "count" {
+            return None;
+        }
+        if values.len() != 1 {
+            self.record_counter_array_builtin_fast_fallback("count", "mode");
             return None;
         }
         let Value::Array(array) = effective_value(&values[0]) else {
+            self.record_counter_array_builtin_fast_fallback("count", "type");
             return None;
         };
         self.record_counter_array_count_fast_path_hit();
         self.record_counter_internal_count_array_direct_fast_path_hit();
+        self.record_counter_count_array_shape_fast_hit();
         Some(VmResult::success_no_output(Some(Value::Int(
             array.len() as i64
         ))))
@@ -9232,6 +9336,10 @@ impl Vm {
                                 local_array_has_cow_or_reference_fallback(stack, local);
                             let result =
                                 assign_dim_local(stack, local, &dims, value.clone(), append);
+                            if let Ok(path) = &result {
+                                self.record_counter_map_update_slot_path(*path, &dims, append);
+                            }
+                            let result = result.map(|_| ());
                             if result.is_ok() && cow_or_reference {
                                 self.record_counter_cow_or_reference_fallback();
                             }
@@ -21398,6 +21506,10 @@ impl Vm {
                                 local_array_has_cow_or_reference_fallback(stack, *local);
                             let result =
                                 assign_dim_local(stack, *local, &dims, value.clone(), false);
+                            if let Ok(path) = &result {
+                                self.record_counter_map_update_slot_path(*path, &dims, false);
+                            }
+                            let result = result.map(|_| ());
                             if result.is_ok() && cow_or_reference {
                                 self.record_counter_cow_or_reference_fallback();
                             }
@@ -21549,6 +21661,10 @@ impl Vm {
                                 local_array_has_cow_or_reference_fallback(stack, *local);
                             let result =
                                 assign_dim_local(stack, *local, &dims, value.clone(), true);
+                            if let Ok(path) = &result {
+                                self.record_counter_map_update_slot_path(*path, &dims, true);
+                            }
+                            let result = result.map(|_| ());
                             if result.is_ok() && cow_or_reference {
                                 self.record_counter_cow_or_reference_fallback();
                             }
@@ -55992,13 +56108,16 @@ fn frame_trace_args_array(frame: &Frame) -> PhpArray {
     }
     let mut array = PhpArray::new();
     for arg in &frame.trace_arguments {
+        // By-ref parameters store the live cell; PHP-visible trace args
+        // carry the current value, not the reference wrapper.
+        let value = match &arg.value {
+            Value::Reference(cell) => cell.get(),
+            value => value.clone(),
+        };
         if let Some(name) = &arg.name {
-            array.insert(
-                ArrayKey::String(PhpString::from(name.as_str())),
-                arg.value.clone(),
-            );
+            array.insert(ArrayKey::String(PhpString::from(name.as_str())), value);
         } else {
-            array.append(arg.value.clone());
+            array.append(value);
         }
     }
     array
@@ -61033,24 +61152,55 @@ fn internal_builtin_by_ref_temporary_fatal_result(
     )
 }
 
+/// How `assign_dim_local` reached the container, for slot-fast counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssignDimLocalPath {
+    /// Mutated the slot (or its reference cell) in place — no transient
+    /// handle clone, so copy-on-write only separates for real sharing.
+    InPlace,
+    /// The reference cell was already borrowed; used the clone-based
+    /// read/mutate/write-back path.
+    ClonedReferenceFallback,
+}
+
 fn assign_dim_local(
     stack: &mut CallStack,
     local: LocalId,
     dims: &[ArrayKey],
     value: Value,
     append: bool,
-) -> Result<(), String> {
+) -> Result<AssignDimLocalPath, String> {
     let frame = stack.current_mut().ok_or("no active frame")?;
     let Some(slot) = frame.locals.get_slot_mut(local) else {
         return Err(format!("invalid local local:{}", local.raw()));
     };
+    let mut pending = Some(value);
+    let in_place = slot.try_with_effective_value_mut(|current| {
+        if matches!(current, Value::Uninitialized | Value::Null) {
+            *current = Value::Array(PhpArray::new());
+        }
+        assign_dim_value(
+            current,
+            dims,
+            pending.take().expect("assign value consumed once"),
+            append,
+        )
+    });
+    if let Some(result) = in_place {
+        return result.map(|()| AssignDimLocalPath::InPlace);
+    }
     let mut current = slot.read();
     if matches!(current, Value::Uninitialized | Value::Null) {
         current = Value::Array(PhpArray::new());
     }
-    assign_dim_value(&mut current, dims, value, append)?;
+    assign_dim_value(
+        &mut current,
+        dims,
+        pending.take().expect("assign value still pending"),
+        append,
+    )?;
     slot.write(current);
-    Ok(())
+    Ok(AssignDimLocalPath::ClonedReferenceFallback)
 }
 
 fn assign_globals_dim(
@@ -61164,8 +61314,24 @@ fn assign_dim_value(
     append: bool,
 ) -> Result<(), String> {
     if let Value::Reference(cell) = container {
+        let mut pending = Some(value);
+        if let Ok(result) = cell.try_with_value_mut(|current| {
+            assign_dim_value(
+                current,
+                dims,
+                pending.take().expect("assign value consumed once"),
+                append,
+            )
+        }) {
+            return result;
+        }
         let mut current = cell.get();
-        assign_dim_value(&mut current, dims, value, append)?;
+        assign_dim_value(
+            &mut current,
+            dims,
+            pending.take().expect("assign value still pending"),
+            append,
+        )?;
         cell.set(current);
         return Ok(());
     }

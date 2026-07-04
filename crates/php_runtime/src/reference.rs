@@ -82,6 +82,18 @@ impl ReferenceCell {
         self.inner.try_borrow().map(|value| f(&value))
     }
 
+    /// Runs `f` with a checked mutable borrow of the contained value.
+    ///
+    /// In-place mutation preserves the cell's copy-on-write handle instead of
+    /// forcing a clone/separate/write-back cycle; callers fall back to the
+    /// clone-based path when the cell is already borrowed.
+    pub fn try_with_value_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Value) -> T,
+    ) -> Result<T, BorrowMutError> {
+        self.inner.try_borrow_mut().map(|mut value| f(&mut value))
+    }
+
     /// Replaces the contained value.
     pub fn set(&self, value: Value) {
         *self.inner.borrow_mut() = value;
@@ -198,6 +210,20 @@ impl Slot {
         match self {
             Self::Value(slot) => *slot = value,
             Self::Reference(cell) => cell.set(value),
+        }
+    }
+
+    /// Runs `f` with in-place mutable access to the effective value, so
+    /// copy-on-write containers are not forced to separate by a transient
+    /// read clone. Returns `None` when a reference cell is already borrowed;
+    /// callers then take the clone-based read/write path.
+    pub fn try_with_effective_value_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Value) -> T,
+    ) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(f(value)),
+            Self::Reference(cell) => cell.try_with_value_mut(f).ok(),
         }
     }
 
