@@ -1,9 +1,11 @@
 //! Json builtin registry slice.
 
 use super::super::context::{
-    JSON_BIGINT_AS_STRING, JSON_ERROR_CTRL_CHAR, JSON_ERROR_DEPTH, JSON_ERROR_NONE,
-    JSON_ERROR_STATE_MISMATCH, JSON_ERROR_SYNTAX, JSON_ERROR_UTF8, JSON_OBJECT_AS_ARRAY,
-    JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR, json_error_message,
+    JSON_BIGINT_AS_STRING, JSON_ERROR_CTRL_CHAR, JSON_ERROR_DEPTH,
+    JSON_ERROR_INVALID_PROPERTY_NAME, JSON_ERROR_NONE, JSON_ERROR_STATE_MISMATCH,
+    JSON_ERROR_SYNTAX, JSON_ERROR_UTF8, JSON_ERROR_UTF16, JSON_INVALID_UTF8_IGNORE,
+    JSON_INVALID_UTF8_SUBSTITUTE, JSON_OBJECT_AS_ARRAY, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
+    json_error_message,
 };
 use super::core::*;
 use crate::builtins::{
@@ -54,7 +56,26 @@ pub(in crate::builtins::modules) fn builtin_json_encode(
         .map(|value| int_arg("json_encode", value))
         .transpose()?
         .unwrap_or(0);
-    match php_value_to_json_checked(&args[0], flags) {
+    let depth = args
+        .get(2)
+        .map(|value| int_arg("json_encode", value))
+        .transpose()?
+        .unwrap_or(512);
+    if depth < 0 {
+        return Err(argument_value_error(
+            "json_encode",
+            "#3 ($depth)",
+            "must be greater than or equal to 0",
+        ));
+    }
+    if depth > i32::MAX as i64 {
+        return Err(argument_value_error(
+            "json_encode",
+            "#3 ($depth)",
+            &format!("must be less than {}", i32::MAX),
+        ));
+    }
+    match php_value_to_json_checked(&args[0], flags, depth as usize) {
         Ok((json, encode_error)) => {
             let encoded = if flags & JSON_PRETTY_PRINT != 0 {
                 serde_json::to_string_pretty(&json)
@@ -104,37 +125,55 @@ pub(in crate::builtins::modules) fn builtin_json_decode(
         .transpose()?
         .unwrap_or(0);
     if depth <= 0 {
-        return json_decode_failure(context, flags, JSON_ERROR_DEPTH);
+        return Err(argument_value_error(
+            "json_decode",
+            "#3 ($depth)",
+            "must be greater than 0",
+        ));
     }
-    let Ok(input) = std::str::from_utf8(input.as_bytes()) else {
-        return json_decode_failure(context, flags, JSON_ERROR_UTF8);
+    if depth > i32::MAX as i64 {
+        return Err(argument_value_error(
+            "json_decode",
+            "#3 ($depth)",
+            &format!("must be less than {}", i32::MAX),
+        ));
+    }
+    let input = match json_decode_input(input.as_bytes(), flags) {
+        Ok(input) => input,
+        Err(code) => return json_decode_failure(context, flags, code),
     };
-    match serde_json::from_str::<JsonValue>(input) {
+    match serde_json::from_str::<JsonValue>(&input) {
         Ok(json) => {
             if json_depth(&json) > depth as usize {
                 return json_decode_failure(context, flags, JSON_ERROR_DEPTH);
             }
+            if !associative
+                && flags & JSON_OBJECT_AS_ARRAY == 0
+                && json_has_invalid_property_name(&json)
+            {
+                return json_decode_failure(context, flags, JSON_ERROR_INVALID_PROPERTY_NAME);
+            }
             context.set_json_last_error(JSON_ERROR_NONE);
             Ok(json_to_php_value_with_flags(
-                json,
+                normalize_decoded_json_strings(json, flags),
                 associative || flags & JSON_OBJECT_AS_ARRAY != 0,
                 flags,
             ))
         }
         Err(error) => {
-            json_decode_failure(context, flags, classify_json_decode_error(input, &error))
+            json_decode_failure(context, flags, classify_json_decode_error(&input, &error))
         }
     }
 }
 
 fn json_decode_failure(context: &mut BuiltinContext<'_>, flags: i64, code: i64) -> BuiltinResult {
-    context.set_json_last_error(code);
     if flags & JSON_THROW_ON_ERROR != 0 {
-        Err(BuiltinError::new(
-            "E_PHP_RUNTIME_JSON_EXCEPTION",
-            json_error_message(code),
-        ))
+        Err(
+            BuiltinError::new("E_PHP_RUNTIME_JSON_EXCEPTION", json_error_message(code))
+                .with_json_error_code(code),
+        )
     } else {
+        context.set_json_last_error(code);
         Ok(Value::Null)
     }
 }
@@ -192,6 +231,9 @@ fn json_depth(value: &JsonValue) -> usize {
 }
 
 fn classify_json_decode_error(input: &str, error: &serde_json::Error) -> i64 {
+    if has_unpaired_utf16_escape(input) {
+        return JSON_ERROR_UTF16;
+    }
     if input
         .bytes()
         .any(|byte| byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r' | b' '))
@@ -204,6 +246,48 @@ fn classify_json_decode_error(input: &str, error: &serde_json::Error) -> i64 {
         return JSON_ERROR_STATE_MISMATCH;
     }
     JSON_ERROR_SYNTAX
+}
+
+fn json_decode_input(bytes: &[u8], flags: i64) -> Result<String, i64> {
+    match std::str::from_utf8(bytes) {
+        Ok(input) => Ok(input.to_string()),
+        Err(_) if flags & JSON_INVALID_UTF8_IGNORE != 0 => Ok(utf8_ignore_invalid(bytes)),
+        Err(_) if flags & JSON_INVALID_UTF8_SUBSTITUTE != 0 => {
+            Ok(String::from_utf8_lossy(bytes).into_owned())
+        }
+        Err(_) => Err(JSON_ERROR_UTF8),
+    }
+}
+
+fn normalize_decoded_json_strings(value: JsonValue, flags: i64) -> JsonValue {
+    match value {
+        JsonValue::String(value) if flags & JSON_INVALID_UTF8_IGNORE != 0 => {
+            JsonValue::String(value)
+        }
+        JsonValue::Array(values) => JsonValue::Array(
+            values
+                .into_iter()
+                .map(|value| normalize_decoded_json_strings(value, flags))
+                .collect(),
+        ),
+        JsonValue::Object(values) => JsonValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, normalize_decoded_json_strings(value, flags)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn json_has_invalid_property_name(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains('\0') || json_has_invalid_property_name(value)),
+        JsonValue::Array(values) => values.iter().any(json_has_invalid_property_name),
+        _ => false,
+    }
 }
 
 fn has_mismatched_json_closer(input: &str) -> bool {
@@ -232,6 +316,53 @@ fn has_mismatched_json_closer(input: &str) -> bool {
     false
 }
 
+fn has_unpaired_utf16_escape(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index + 6 <= bytes.len() {
+        if bytes[index] == b'\\' && bytes[index + 1] == b'u' {
+            if let Some(code) = parse_json_hex4(&bytes[index + 2..index + 6]) {
+                if (0xD800..=0xDBFF).contains(&code) {
+                    let paired = index + 12 <= bytes.len()
+                        && bytes[index + 6] == b'\\'
+                        && bytes[index + 7] == b'u'
+                        && parse_json_hex4(&bytes[index + 8..index + 12])
+                            .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low));
+                    if !paired {
+                        return true;
+                    }
+                    index += 12;
+                    continue;
+                }
+                if (0xDC00..=0xDFFF).contains(&code) {
+                    return true;
+                }
+            }
+            index += 6;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn parse_json_hex4(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut value = 0u16;
+    for byte in bytes {
+        value = value.checked_mul(16)?;
+        value = value.checked_add(match byte {
+            b'0'..=b'9' => (byte - b'0') as u16,
+            b'a'..=b'f' => (byte - b'a' + 10) as u16,
+            b'A'..=b'F' => (byte - b'A' + 10) as u16,
+            _ => return None,
+        })?;
+    }
+    Some(value)
+}
+
 pub(in crate::builtins::modules) fn builtin_json_validate(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -251,18 +382,47 @@ pub(in crate::builtins::modules) fn builtin_json_validate(
         .map(|value| int_arg("json_validate", value))
         .transpose()?
         .unwrap_or(0);
-    if depth <= 0 {
-        context.set_json_last_error(JSON_ERROR_DEPTH);
+    if input.as_bytes().is_empty() {
+        context.set_json_last_error(JSON_ERROR_SYNTAX);
         return Ok(Value::Bool(false));
     }
-    let Ok(input) = std::str::from_utf8(input.as_bytes()) else {
-        context.set_json_last_error(JSON_ERROR_UTF8);
-        return Ok(Value::Bool(false));
+    if depth <= 0 {
+        return Err(argument_value_error(
+            "json_validate",
+            "#2 ($depth)",
+            "must be greater than 0",
+        ));
+    }
+    if depth > i32::MAX as i64 {
+        return Err(argument_value_error(
+            "json_validate",
+            "#2 ($depth)",
+            &format!("must be less than {}", i32::MAX),
+        ));
+    }
+    if flags & !JSON_INVALID_UTF8_IGNORE != 0 {
+        return Err(argument_value_error(
+            "json_validate",
+            "#3 ($flags)",
+            "must be a valid flag (allowed flags: JSON_INVALID_UTF8_IGNORE)",
+        ));
+    }
+    let input = match std::str::from_utf8(input.as_bytes()) {
+        Ok(input) => input.to_string(),
+        Err(_) if flags & JSON_INVALID_UTF8_IGNORE != 0 => utf8_ignore_invalid(input.as_bytes()),
+        Err(_) => {
+            context.set_json_last_error(JSON_ERROR_UTF8);
+            return Ok(Value::Bool(false));
+        }
     };
-    match serde_json::from_str::<JsonValue>(input) {
-        Ok(_) => {
+    match serde_json::from_str::<JsonValue>(&input) {
+        Ok(json) if json_depth(&json) <= depth as usize => {
             context.set_json_last_error(JSON_ERROR_NONE);
             Ok(Value::Bool(true))
+        }
+        Ok(_) => {
+            context.set_json_last_error(JSON_ERROR_DEPTH);
+            Ok(Value::Bool(false))
         }
         Err(_) if flags & JSON_THROW_ON_ERROR != 0 => Err(BuiltinError::new(
             "E_PHP_RUNTIME_JSON_EXCEPTION",

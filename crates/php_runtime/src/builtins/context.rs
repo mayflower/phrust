@@ -17,6 +17,10 @@ pub(in crate::builtins) const JSON_ERROR_CTRL_CHAR: i64 = 3;
 pub(in crate::builtins) const JSON_ERROR_SYNTAX: i64 = 4;
 pub(in crate::builtins) const JSON_ERROR_UTF8: i64 = 5;
 pub(in crate::builtins) const JSON_ERROR_RECURSION: i64 = 6;
+pub(in crate::builtins) const JSON_ERROR_INF_OR_NAN: i64 = 7;
+pub(in crate::builtins) const JSON_ERROR_UNSUPPORTED_TYPE: i64 = 8;
+pub(in crate::builtins) const JSON_ERROR_INVALID_PROPERTY_NAME: i64 = 9;
+pub(in crate::builtins) const JSON_ERROR_UTF16: i64 = 10;
 pub(in crate::builtins) const JSON_OBJECT_AS_ARRAY: i64 = 1;
 pub(in crate::builtins) const JSON_BIGINT_AS_STRING: i64 = 2;
 pub(in crate::builtins) const JSON_HEX_TAG: i64 = 1;
@@ -30,6 +34,9 @@ pub(in crate::builtins) const JSON_PARTIAL_OUTPUT_ON_ERROR: i64 = 512;
 pub(in crate::builtins) const JSON_UNESCAPED_SLASHES: i64 = 64;
 pub(in crate::builtins) const JSON_UNESCAPED_UNICODE: i64 = 256;
 pub(in crate::builtins) const JSON_PRESERVE_ZERO_FRACTION: i64 = 1024;
+pub(in crate::builtins) const JSON_UNESCAPED_LINE_TERMINATORS: i64 = 2048;
+pub(in crate::builtins) const JSON_INVALID_UTF8_IGNORE: i64 = 1_048_576;
+pub(in crate::builtins) const JSON_INVALID_UTF8_SUBSTITUTE: i64 = 2_097_152;
 pub(in crate::builtins) const JSON_THROW_ON_ERROR: i64 = 4_194_304;
 
 /// Request-local state for `strtok`.
@@ -855,6 +862,10 @@ pub(in crate::builtins) const fn json_error_message(code: i64) -> &'static str {
         JSON_ERROR_SYNTAX => "Syntax error",
         JSON_ERROR_UTF8 => "Malformed UTF-8 characters, possibly incorrectly encoded",
         JSON_ERROR_RECURSION => "Recursion detected",
+        JSON_ERROR_INF_OR_NAN => "Inf and NaN cannot be JSON encoded",
+        JSON_ERROR_UNSUPPORTED_TYPE => "Type is not supported",
+        JSON_ERROR_INVALID_PROPERTY_NAME => "The decoded property name is invalid",
+        JSON_ERROR_UTF16 => "Single unpaired UTF-16 surrogate in unicode escape",
         _ => "Unknown error",
     }
 }

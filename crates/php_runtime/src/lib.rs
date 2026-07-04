@@ -86,11 +86,12 @@ pub mod api {
         MysqlConnection, MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
     };
     pub use crate::diagnostic::{
-        PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError,
-        RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
-        WordPressDiagnosticContext, argument_count_error_mvp, array_to_string_warning,
-        division_by_zero_mvp, leading_numeric_string_warning, non_numeric_string_type_error,
-        type_error_mvp, undefined_function, undefined_variable_warning, unhandled_match_error_mvp,
+        JsonDiagnosticContext, PhpReferenceClassification, RuntimeDiagnostic,
+        RuntimeDiagnosticPayload, RuntimeError, RuntimeEventKind, RuntimeSeverity,
+        RuntimeStackFrame, VmCompileDiagnostic, WordPressDiagnosticContext,
+        argument_count_error_mvp, array_to_string_warning, division_by_zero_mvp,
+        leading_numeric_string_warning, non_numeric_string_type_error, type_error_mvp,
+        undefined_function, undefined_variable_warning, unhandled_match_error_mvp,
         unsupported_feature, value_error_mvp,
     };
     pub use crate::error_output::{
@@ -220,8 +221,8 @@ pub use db::mysql::{
     MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
 };
 pub use diagnostic::{
-    PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError,
-    RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
+    JsonDiagnosticContext, PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload,
+    RuntimeError, RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
     WordPressDiagnosticContext, argument_count_error_mvp, array_to_string_warning,
     division_by_zero_mvp, leading_numeric_string_warning, non_numeric_string_type_error,
     type_error_mvp, undefined_function, undefined_variable_warning, unhandled_match_error_mvp,

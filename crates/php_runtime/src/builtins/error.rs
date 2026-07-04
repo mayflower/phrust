@@ -30,6 +30,8 @@ pub struct BuiltinErrorContext {
     pub actual_type: Option<String>,
     /// Human-facing remediation.
     pub suggestion: Option<String>,
+    /// JSON error code used when a JSON builtin throws JsonException.
+    pub json_error_code: Option<i64>,
 }
 
 impl BuiltinError {
@@ -79,6 +81,13 @@ impl BuiltinError {
         self
     }
 
+    /// Adds the JSON error code for JsonException construction.
+    #[must_use]
+    pub fn with_json_error_code(mut self, code: i64) -> Self {
+        self.context_mut().json_error_code = Some(code);
+        self
+    }
+
     /// Stable diagnostic ID.
     #[must_use]
     pub const fn diagnostic_id(&self) -> &'static str {
@@ -122,6 +131,9 @@ impl BuiltinError {
             }
             if let Some(actual_type) = &error_context.actual_type {
                 context.insert("actual_type".to_string(), actual_type.clone());
+            }
+            if let Some(json_error_code) = error_context.json_error_code {
+                context.insert("json_error_code".to_string(), json_error_code.to_string());
             }
         }
 

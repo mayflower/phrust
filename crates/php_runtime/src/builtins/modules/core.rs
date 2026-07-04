@@ -1,10 +1,12 @@
 //! Core builtin implementations and cross-module helpers.
 
 use super::super::context::{
-    JSON_ERROR_RECURSION, JSON_ERROR_SYNTAX, JSON_ERROR_UTF8, JSON_FORCE_OBJECT, JSON_HEX_AMP,
-    JSON_HEX_APOS, JSON_HEX_QUOT, JSON_HEX_TAG, JSON_NUMERIC_CHECK, JSON_PARTIAL_OUTPUT_ON_ERROR,
-    JSON_PRESERVE_ZERO_FRACTION, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR, JSON_UNESCAPED_SLASHES,
-    JSON_UNESCAPED_UNICODE, json_error_message,
+    JSON_ERROR_DEPTH, JSON_ERROR_INF_OR_NAN, JSON_ERROR_RECURSION, JSON_ERROR_SYNTAX,
+    JSON_ERROR_UNSUPPORTED_TYPE, JSON_ERROR_UTF8, JSON_FORCE_OBJECT, JSON_HEX_AMP, JSON_HEX_APOS,
+    JSON_HEX_QUOT, JSON_HEX_TAG, JSON_INVALID_UTF8_IGNORE, JSON_INVALID_UTF8_SUBSTITUTE,
+    JSON_NUMERIC_CHECK, JSON_PARTIAL_OUTPUT_ON_ERROR, JSON_PRESERVE_ZERO_FRACTION,
+    JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR, JSON_UNESCAPED_LINE_TERMINATORS,
+    JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, json_error_message,
 };
 use super::super::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
@@ -2079,8 +2081,9 @@ pub(in crate::builtins::modules) fn is_remote_stream_uri(uri: &str) -> bool {
 pub(in crate::builtins::modules) fn php_value_to_json_checked(
     value: &Value,
     flags: i64,
+    max_depth: usize,
 ) -> Result<(JsonValue, Option<i64>), i64> {
-    let mut state = JsonEncodeState::new(flags);
+    let mut state = JsonEncodeState::new(flags, max_depth);
     let json = php_value_to_json_inner(value, flags, &mut state)?;
     Ok((json, state.first_error))
 }
@@ -2091,26 +2094,52 @@ struct JsonEncodeState {
     active_arrays: Vec<usize>,
     active_objects: Vec<u64>,
     active_references: Vec<usize>,
+    depth: usize,
+    max_depth: usize,
 }
 
 impl JsonEncodeState {
-    const fn new(flags: i64) -> Self {
+    const fn new(flags: i64, max_depth: usize) -> Self {
         Self {
             partial: flags & JSON_PARTIAL_OUTPUT_ON_ERROR != 0,
             first_error: None,
             active_arrays: Vec::new(),
             active_objects: Vec::new(),
             active_references: Vec::new(),
+            depth: 0,
+            max_depth,
         }
     }
 
     fn error_json(&mut self, code: i64) -> Result<JsonValue, i64> {
         if self.partial {
             self.first_error.get_or_insert(code);
-            Ok(JsonValue::Null)
+            Ok(match code {
+                JSON_ERROR_INF_OR_NAN => JsonValue::Number(JsonNumber::from(0)),
+                _ => JsonValue::Null,
+            })
         } else {
             Err(code)
         }
+    }
+
+    fn enter_nested(&mut self) -> Result<bool, i64> {
+        self.depth = self.depth.saturating_add(1);
+        if self.depth > self.max_depth {
+            self.depth = self.depth.saturating_sub(1);
+            if self.partial {
+                self.first_error.get_or_insert(JSON_ERROR_DEPTH);
+                Ok(false)
+            } else {
+                Err(JSON_ERROR_DEPTH)
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn leave_nested(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 }
 
@@ -2146,6 +2175,9 @@ fn php_deref_value_to_json_inner(
         Value::Int(value) => Ok(JsonValue::Number(JsonNumber::from(value))),
         Value::Float(value) => {
             let value = value.to_f64();
+            if !value.is_finite() {
+                return state.error_json(JSON_ERROR_INF_OR_NAN);
+            }
             if value.is_finite()
                 && value.fract() == 0.0
                 && flags & JSON_PRESERVE_ZERO_FRACTION == 0
@@ -2156,7 +2188,7 @@ fn php_deref_value_to_json_inner(
             } else {
                 JsonNumber::from_f64(value)
                     .map(JsonValue::Number)
-                    .ok_or(JSON_ERROR_SYNTAX)
+                    .ok_or(JSON_ERROR_INF_OR_NAN)
             }
         }
         Value::String(value) => {
@@ -2175,21 +2207,28 @@ fn php_deref_value_to_json_inner(
                             && matches!(classified.value, Some(NumericStringValue::Float(_))) =>
                     {
                         if let Some(NumericStringValue::Float(value)) = classified.value {
-                            return JsonNumber::from_f64(value)
-                                .map(JsonValue::Number)
-                                .ok_or(JSON_ERROR_SYNTAX);
+                            if value.is_finite() {
+                                return JsonNumber::from_f64(value)
+                                    .map(JsonValue::Number)
+                                    .ok_or(JSON_ERROR_SYNTAX);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
-            std::str::from_utf8(value.as_bytes())
-                .map(|text| JsonValue::String(text.to_string()))
-                .map_err(|_| JSON_ERROR_UTF8)
+            match json_string_from_php_bytes(value.as_bytes(), flags) {
+                Ok(text) => Ok(JsonValue::String(text)),
+                Err(code) => state.error_json(code),
+            }
         }
         Value::Array(array) => {
+            if !state.enter_nested()? {
+                return Ok(JsonValue::Null);
+            }
             let id = array.gc_debug_id();
             if state.active_arrays.contains(&id) {
+                state.leave_nested();
                 return state.error_json(JSON_ERROR_RECURSION);
             }
             state.active_arrays.push(id);
@@ -2202,43 +2241,135 @@ fn php_deref_value_to_json_inner(
                     .collect::<Result<Vec<_>, _>>()
                     .map(JsonValue::Array);
                 state.active_arrays.pop();
+                state.leave_nested();
                 json
             } else {
                 let mut object = JsonMap::new();
                 for (key, value) in array.iter() {
                     let key = match key {
                         ArrayKey::Int(value) => value.to_string(),
-                        ArrayKey::String(value) => value.to_string_lossy(),
+                        ArrayKey::String(value) => {
+                            json_key_from_php_bytes(value.as_bytes(), flags, state)?
+                        }
                     };
                     object.insert(key, php_value_to_json_inner(value, flags, state)?);
                 }
                 state.active_arrays.pop();
+                state.leave_nested();
                 Ok(JsonValue::Object(object))
             }
         }
         Value::Object(object) => {
+            if !state.enter_nested()? {
+                return Ok(JsonValue::Null);
+            }
             let id = object.id();
             if state.active_objects.contains(&id) {
+                state.leave_nested();
                 return state.error_json(JSON_ERROR_RECURSION);
             }
             state.active_objects.push(id);
             if let Some(json) = spl_fixed_array_to_json(&object, flags, state) {
                 state.active_objects.pop();
+                state.leave_nested();
                 return json;
             }
             let mut json = JsonMap::new();
             for (name, value) in object.properties_snapshot() {
+                let label = object.property_debug_label(&name);
+                if label.contains(":private") || label.contains(":protected") {
+                    continue;
+                }
                 json.insert(name, php_value_to_json_inner(&value, flags, state)?);
             }
             state.active_objects.pop();
+            state.leave_nested();
             Ok(JsonValue::Object(json))
         }
         Value::Resource(_)
         | Value::Fiber(_)
         | Value::Generator(_)
         | Value::Callable(_)
-        | Value::Reference(_) => Err(JSON_ERROR_SYNTAX),
+        | Value::Reference(_) => state.error_json(JSON_ERROR_UNSUPPORTED_TYPE),
     }
+}
+
+fn json_string_from_php_bytes(bytes: &[u8], flags: i64) -> Result<String, i64> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(_) if flags & JSON_INVALID_UTF8_IGNORE != 0 => Ok(utf8_ignore_invalid(bytes)),
+        Err(_) if flags & JSON_INVALID_UTF8_SUBSTITUTE != 0 => Ok(utf8_substitute_invalid(bytes)),
+        Err(_) => Err(JSON_ERROR_UTF8),
+    }
+}
+
+fn json_key_from_php_bytes(
+    bytes: &[u8],
+    flags: i64,
+    state: &mut JsonEncodeState,
+) -> Result<String, i64> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(_) if flags & JSON_INVALID_UTF8_IGNORE != 0 => Ok(utf8_ignore_invalid(bytes)),
+        Err(_) if flags & JSON_INVALID_UTF8_SUBSTITUTE != 0 => Ok(utf8_substitute_invalid(bytes)),
+        Err(_) if state.partial => {
+            state.first_error.get_or_insert(JSON_ERROR_UTF8);
+            Ok(String::new())
+        }
+        Err(_) => Err(JSON_ERROR_UTF8),
+    }
+}
+
+pub(in crate::builtins::modules) fn utf8_ignore_invalid(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) });
+                }
+                let skip = error.error_len().unwrap_or(1);
+                rest = &rest[valid_up_to.saturating_add(skip)..];
+            }
+        }
+    }
+    out
+}
+
+fn utf8_substitute_invalid(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) });
+                }
+                out.push('\u{fffd}');
+                let invalid = &rest[valid_up_to..];
+                let first = invalid.first().copied().unwrap_or_default();
+                let mut skip = error.error_len().unwrap_or(1);
+                if first >= 0xc0 {
+                    while skip < invalid.len() && (invalid[skip] & 0xc0) == 0x80 {
+                        skip += 1;
+                    }
+                }
+                rest = &invalid[skip..];
+            }
+        }
+    }
+    out
 }
 
 fn spl_fixed_array_to_json(
@@ -2292,6 +2423,7 @@ pub(in crate::builtins::modules) fn json_to_php_value(
             .as_i64()
             .map(Value::Int)
             .or_else(|| value.as_f64().map(Value::float))
+            .or_else(|| value.to_string().parse::<f64>().ok().map(Value::float))
             .unwrap_or(Value::Null),
         JsonValue::String(value) => Value::string(value),
         JsonValue::Array(values) => Value::packed_array(
@@ -2334,6 +2466,8 @@ pub(in crate::builtins::modules) fn normalize_json_encoded(
 
     if flags & JSON_UNESCAPED_UNICODE == 0 {
         encoded = escape_json_non_ascii(&encoded);
+    } else if flags & JSON_UNESCAPED_LINE_TERMINATORS == 0 {
+        encoded = escape_json_line_terminators(&encoded);
     }
 
     if flags & JSON_HEX_TAG != 0 {
@@ -2362,6 +2496,14 @@ fn escape_json_non_ascii(encoded: &str) -> String {
             normalized.push(ch);
             continue;
         }
+        if matches!(ch, '\u{2028}' | '\u{2029}') {
+            normalized.push_str(match ch {
+                '\u{2028}' => "\\u2028",
+                '\u{2029}' => "\\u2029",
+                _ => unreachable!(),
+            });
+            continue;
+        }
         let code = ch as u32;
         if code <= 0xFFFF {
             normalized.push_str(&format!("\\u{code:04x}"));
@@ -2373,6 +2515,12 @@ fn escape_json_non_ascii(encoded: &str) -> String {
         }
     }
     normalized
+}
+
+fn escape_json_line_terminators(encoded: &str) -> String {
+    encoded
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn json_pretty_indent_for_php(encoded: &str) -> String {
@@ -2649,13 +2797,13 @@ pub(in crate::builtins::modules) fn json_failure(
     flags: i64,
     code: i64,
 ) -> BuiltinResult {
-    context.set_json_last_error(code);
     if flags & JSON_THROW_ON_ERROR != 0 {
-        Err(BuiltinError::new(
-            "E_PHP_RUNTIME_JSON_EXCEPTION",
-            json_error_message(code),
-        ))
+        Err(
+            BuiltinError::new("E_PHP_RUNTIME_JSON_EXCEPTION", json_error_message(code))
+                .with_json_error_code(code),
+        )
     } else {
+        context.set_json_last_error(code);
         Ok(Value::Bool(false))
     }
 }

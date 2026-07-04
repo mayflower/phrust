@@ -644,6 +644,8 @@ impl VmCompileDiagnostic {
 pub enum RuntimeDiagnosticPayload {
     /// VM compile diagnostic payload.
     VmCompile(VmCompileDiagnostic),
+    /// JSON builtin diagnostic payload.
+    JsonBuiltin(JsonDiagnosticContext),
     /// WordPress bring-up diagnostic classification payload.
     WordPressBringup(WordPressDiagnosticContext),
 }
@@ -654,8 +656,38 @@ impl RuntimeDiagnosticPayload {
     pub fn envelope_context(&self) -> BTreeMap<String, String> {
         match self {
             Self::VmCompile(payload) => payload.envelope_context(),
+            Self::JsonBuiltin(payload) => payload.envelope_context(),
             Self::WordPressBringup(payload) => payload.envelope_context(),
         }
+    }
+}
+
+/// Additive diagnostic metadata for JSON builtin failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonDiagnosticContext {
+    error_code: i64,
+}
+
+impl JsonDiagnosticContext {
+    /// Creates a JSON diagnostic context with the PHP-visible error code.
+    #[must_use]
+    pub const fn new(error_code: i64) -> Self {
+        Self { error_code }
+    }
+
+    /// JSON error code used for JsonException::getCode().
+    #[must_use]
+    pub const fn error_code(&self) -> i64 {
+        self.error_code
+    }
+
+    /// Structured payload fields for shared diagnostic envelopes.
+    #[must_use]
+    pub fn envelope_context(&self) -> BTreeMap<String, String> {
+        let mut context = BTreeMap::new();
+        context.insert("payload".to_string(), "json_builtin".to_string());
+        context.insert("json_error_code".to_string(), self.error_code.to_string());
+        context
     }
 }
 

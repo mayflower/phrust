@@ -44,6 +44,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("explode", builtin_explode, BuiltinCompatibility::Php),
     BuiltinEntry::new("hex2bin", builtin_hex2bin, BuiltinCompatibility::Php),
     BuiltinEntry::new(
+        "quoted_printable_decode",
+        builtin_quoted_printable_decode,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "highlight_string",
         builtin_highlight_string,
         BuiltinCompatibility::Php,
@@ -862,6 +867,41 @@ pub(in crate::builtins::modules) fn builtin_hex2bin(
         return Ok(Value::Bool(false));
     }
     hex_decode(input.as_bytes()).map_or(Ok(Value::Bool(false)), |bytes| Ok(Value::string(bytes)))
+}
+
+pub(in crate::builtins::modules) fn builtin_quoted_printable_decode(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    expect_arity("quoted_printable_decode", &args, 1)?;
+    let input = string_arg("quoted_printable_decode", &args[0])?;
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'=' {
+            if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                index += 2;
+                continue;
+            }
+            if index + 2 < bytes.len() && bytes[index + 1] == b'\r' && bytes[index + 2] == b'\n' {
+                index += 3;
+                continue;
+            }
+            if index + 2 < bytes.len()
+                && let (Some(high), Some(low)) =
+                    (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    Ok(Value::string(out))
 }
 
 pub(in crate::builtins::modules) fn builtin_ord(

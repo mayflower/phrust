@@ -78,18 +78,18 @@ use php_runtime::{
     ClassPropertyFlags as RuntimeClassPropertyFlags,
     ClassPropertyHooks as RuntimeClassPropertyHooks, ClosureCaptureValue, ClosureContext,
     ClosureDebugInfo, ClosureDebugParameter, ClosurePayload, ExecutionStatus, FiberRef, FiberState,
-    GeneratorCallContext, GeneratorRef, GeneratorState, GlobalSymbolTable, Lvalue, LvalueKind,
-    NumericValue, ObjectRef, OutputBuffer, PhpArray, PhpArrayKind, PhpArrayShapeKind,
-    PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpString, ProcessCapability, ReferenceCell,
-    RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeHttpResponseState,
-    RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions,
-    UploadRegistry, Value, VmCompileDiagnostic, WordPressDiagnosticContext,
-    array_to_string_warning, compare, division_by_zero_mvp, emit_php_diagnostic, equal,
-    error_reporting_allows_level, identical, reset_float_string_precision, runtime_type_name,
-    serialize as serialize_value, set_float_string_precision, to_arithmetic_number, to_bool,
-    to_float, to_int, to_number, to_string, undefined_function, undefined_variable_warning,
-    unserialize as unserialize_value, unsupported_feature, value_matches_runtime_type,
-    value_type_name,
+    GeneratorCallContext, GeneratorRef, GeneratorState, GlobalSymbolTable, JsonDiagnosticContext,
+    Lvalue, LvalueKind, NumericValue, ObjectRef, OutputBuffer, PhpArray, PhpArrayKind,
+    PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpString,
+    ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload,
+    RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType,
+    Slot, UnserializeOptions, UploadRegistry, Value, VmCompileDiagnostic,
+    WordPressDiagnosticContext, array_to_string_warning, compare, division_by_zero_mvp,
+    emit_php_diagnostic, equal, error_reporting_allows_level, identical,
+    reset_float_string_precision, runtime_type_name, serialize as serialize_value,
+    set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
+    to_string, undefined_function, undefined_variable_warning, unserialize as unserialize_value,
+    unsupported_feature, value_matches_runtime_type, value_type_name,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -56406,7 +56406,7 @@ fn execute_builtin_entry(
         }
         Err(error) => {
             let output = output_for_result.expect("error output is cloned before context drop");
-            let error_diagnostic = RuntimeDiagnostic::new(
+            let mut error_diagnostic = RuntimeDiagnostic::new(
                 error.diagnostic_id(),
                 RuntimeSeverity::FatalError,
                 error.message().to_owned(),
@@ -56414,6 +56414,15 @@ fn execute_builtin_entry(
                 Vec::new(),
                 None,
             );
+            if let Some(json_error_code) =
+                error.context().and_then(|context| context.json_error_code)
+            {
+                error_diagnostic = error_diagnostic.with_diagnostic_payload(
+                    RuntimeDiagnosticPayload::JsonBuiltin(JsonDiagnosticContext::new(
+                        json_error_code,
+                    )),
+                );
+            }
             diagnostics.push(error_diagnostic.clone());
             let mut result = VmResult::runtime_error_with_diagnostic(
                 output,
@@ -56621,6 +56630,11 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         .map_or_else(|| diagnostic.message(), |(_, message)| message);
     let object =
         make_exception_object(class_name, &Value::string(message.as_bytes().to_vec())).ok()?;
+    if diagnostic.id() == "E_PHP_RUNTIME_JSON_EXCEPTION"
+        && let Some(RuntimeDiagnosticPayload::JsonBuiltin(payload)) = diagnostic.payload()
+    {
+        object.set_property("code", Value::Int(payload.error_code()));
+    }
     tag_throwable_location_from_diagnostic(&object, diagnostic);
     Some(Value::Object(object))
 }
@@ -77724,6 +77738,7 @@ dense_property_write_typed_failure($typed, 'bad');
             .iter()
             .find_map(|diagnostic| match diagnostic.payload()? {
                 RuntimeDiagnosticPayload::VmCompile(payload) => Some(payload),
+                RuntimeDiagnosticPayload::JsonBuiltin(_) => None,
                 RuntimeDiagnosticPayload::WordPressBringup(_) => None,
             })
             .expect("compile error should carry VM compile payload")
@@ -77737,6 +77752,7 @@ dense_property_write_typed_failure($typed, 'bad');
             .iter()
             .find_map(|diagnostic| match diagnostic.payload()? {
                 RuntimeDiagnosticPayload::WordPressBringup(payload) => Some(payload),
+                RuntimeDiagnosticPayload::JsonBuiltin(_) => None,
                 RuntimeDiagnosticPayload::VmCompile(_) => None,
             })
             .unwrap_or_else(|| {

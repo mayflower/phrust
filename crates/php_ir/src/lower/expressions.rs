@@ -1696,6 +1696,28 @@ impl LoweringContext<'_> {
         block: BlockId,
         member: ExprId,
     ) -> Option<LoweredExpr> {
+        if let Some(inner) = self.simple_braced_dynamic_member_source(member) {
+            if inner.starts_with('$') {
+                let local = builder.intern_local(site.function, local_name(&inner));
+                let dst = builder.alloc_register(site.function);
+                let range = self.span_for(SourceMappedId::from(member));
+                let span = span_from_range(self.file, range);
+                let instruction = builder.emit(
+                    site.function,
+                    block,
+                    InstructionKind::LoadLocal { dst, local },
+                    span,
+                );
+                self.add_expr_source_map(builder, site.function, block, instruction, member, span);
+                return Some(LoweredExpr {
+                    register: dst,
+                    block,
+                });
+            }
+            if literal_constant(&inner).is_some() {
+                return self.lower_literal_to_register(builder, site, &inner);
+            }
+        }
         let module = self
             .frontend
             .database()
@@ -1731,6 +1753,17 @@ impl LoweringContext<'_> {
             });
         }
         self.lower_expr_to_register(builder, site.function, block, member)
+    }
+
+    fn simple_braced_dynamic_member_source(&self, expr: ExprId) -> Option<String> {
+        let range = self.span_for(SourceMappedId::from(expr));
+        let source = self.source_text.slice(range)?.trim();
+        let inner = source.strip_prefix('{')?.strip_suffix('}')?.trim();
+        if inner.starts_with('$') || literal_constant(inner).is_some() {
+            Some(inner.to_owned())
+        } else {
+            None
+        }
     }
 
     pub(super) fn dynamic_member_variable_name_from_source(&self, expr: ExprId) -> Option<String> {
@@ -9512,7 +9545,9 @@ impl LoweringContext<'_> {
             .module(self.frontend.module().module_id())?;
         let expression = module.expressions().get(expr)?;
         match expression.kind() {
-            HirExprKind::Literal { text } => Some(local_name(text).to_owned()),
+            HirExprKind::Literal { text } => quoted_literal_body(text)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .or_else(|| Some(local_name(text).to_owned())),
             HirExprKind::Name { resolution } => Some(local_name(resolution.source()).to_owned()),
             _ => None,
         }
