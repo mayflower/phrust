@@ -8920,6 +8920,15 @@ impl Vm {
                                 return result;
                             }
                         };
+                        // Register the dense call site so IC installs and
+                        // megamorphic transitions stick (mirrors CallFunction).
+                        self.observe_dense_call_inline_cache(
+                            compiled,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            InlineCacheKind::FunctionCall,
+                        );
                         let result = self.execute_callable_value_call(
                             compiled,
                             callee,
