@@ -13,5 +13,6 @@ pub use context::{
 pub use error::{BuiltinError, BuiltinErrorContext};
 #[doc(hidden)]
 pub use modules::curl::{CurlNetworkTestOverride, set_curl_network_tests_override_for_tests};
+pub use modules::string_intrinsics;
 pub use registry::{BuiltinCompatibility, BuiltinEntry, BuiltinRegistry};
 pub use signatures::{BuiltinResult, InternalFunction};

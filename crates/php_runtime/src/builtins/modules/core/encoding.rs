@@ -152,12 +152,16 @@ pub(in crate::builtins::modules) fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Engine default for `htmlspecialchars`-family flags: escape both quote
+/// kinds (`ENT_QUOTES`); substitution/doctype bits are not modeled byte-wise.
+pub(in crate::builtins::modules) const HTML_ESCAPE_DEFAULT_FLAGS: i64 = 3;
+
 pub(in crate::builtins::modules) fn html_escape_with_options(
     bytes: &[u8],
     flags: i64,
     double_encode: bool,
 ) -> Vec<u8> {
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(html_escaped_capacity(bytes, flags));
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -180,6 +184,22 @@ pub(in crate::builtins::modules) fn html_escape_with_options(
         index += 1;
     }
     output
+}
+
+/// Exact escaped length for `double_encode` output; an upper bound when
+/// existing entities are passed through (a literal `&` never expands past
+/// `&amp;`).
+fn html_escaped_capacity(bytes: &[u8], flags: i64) -> usize {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b'&' => 5,
+            b'<' | b'>' => 4,
+            b'"' if flags & 2 != 0 => 6,
+            b'\'' if flags & 1 != 0 => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 fn valid_html_entity_len(bytes: &[u8]) -> Option<usize> {

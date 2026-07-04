@@ -32,6 +32,7 @@ pub(in crate::builtins) mod sockets;
 pub(in crate::builtins) mod sodium;
 pub(in crate::builtins) mod spl;
 pub(in crate::builtins) mod streams;
+pub mod string_intrinsics;
 pub(in crate::builtins) mod strings;
 pub(in crate::builtins) mod xml;
 pub(in crate::builtins) mod zlib;

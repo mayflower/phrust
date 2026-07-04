@@ -4817,20 +4817,20 @@ impl Vm {
         values: &[Value],
         _output: &OutputBuffer,
     ) -> Option<VmResult> {
-        if !fast_builtin_stub_supported(name) {
-            return None;
-        }
+        let (spec_index, spec) = builtin_intrinsic_spec(name)?;
         self.record_counter_builtin_intrinsic_candidate();
-        let Some(result) = fast_builtin_stub_result(name, values) else {
-            let fallback_reason = fast_builtin_stub_fallback_reason(name, values);
+        let Some(result) = fast_builtin_stub_result_for_spec(spec_index, spec, values) else {
+            let fallback_reason =
+                fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values)
+                    .unwrap_or("type");
             self.record_counter_builtin_fast_stub(name, false);
             self.record_counter_builtin_fast_stub_fallback(name, fallback_reason);
-            self.record_counter_intrinsic(name, false);
-            self.record_counter_intrinsic_fallback(name, fallback_reason);
+            self.record_counter_intrinsic(spec.counter_name, false);
+            self.record_counter_intrinsic_fallback(spec.counter_name, fallback_reason);
             return None;
         };
         self.record_counter_builtin_fast_stub(name, true);
-        self.record_counter_intrinsic(name, true);
+        self.record_counter_intrinsic(spec.counter_name, true);
         if name == "count" {
             self.record_counter_array_count_fast_path_hit();
             self.record_counter_internal_count_array_direct_fast_path_hit();
@@ -56781,14 +56781,18 @@ fn internal_function_dispatch_cacheable(name: &str) -> bool {
 enum BuiltinIntrinsicKind {
     ArrayKeyExists,
     CountArray,
+    ExplodeSingleByte,
+    HtmlSpecialCharsDefault,
     IsArray,
     IsInt,
     IsString,
     StrContains,
     StrEndsWith,
     StrLen,
+    StrReplaceScalar,
     StrStartsWith,
     StrToLower,
+    StrToUpper,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56796,11 +56800,15 @@ struct BuiltinIntrinsicParam {
     name: &'static str,
     type_decl: &'static str,
     optional: bool,
+    by_ref: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BuiltinIntrinsicSpec {
     name: &'static str,
+    /// Counter label under `intrinsic_hits`/`intrinsic_misses`; carries the
+    /// specialized-case suffix where the fast path covers only one shape.
+    counter_name: &'static str,
     return_type: &'static str,
     params: &'static [BuiltinIntrinsicParam],
     exact_arity: usize,
@@ -56811,22 +56819,26 @@ const INTRINSIC_VALUE_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam 
     name: "value",
     type_decl: "mixed",
     optional: false,
+    by_ref: false,
 }];
 const INTRINSIC_STRING_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
     name: "string",
     type_decl: "string",
     optional: false,
+    by_ref: false,
 }];
 const INTRINSIC_COUNT_PARAMS: &[BuiltinIntrinsicParam] = &[
     BuiltinIntrinsicParam {
         name: "value",
         type_decl: "Countable|array",
         optional: false,
+        by_ref: false,
     },
     BuiltinIntrinsicParam {
         name: "mode",
         type_decl: "int",
         optional: true,
+        by_ref: false,
     },
 ];
 const INTRINSIC_STRING_PAIR_PARAMS: &[BuiltinIntrinsicParam] = &[
@@ -56834,11 +56846,13 @@ const INTRINSIC_STRING_PAIR_PARAMS: &[BuiltinIntrinsicParam] = &[
         name: "haystack",
         type_decl: "string",
         optional: false,
+        by_ref: false,
     },
     BuiltinIntrinsicParam {
         name: "needle",
         type_decl: "string",
         optional: false,
+        by_ref: false,
     },
 ];
 const INTRINSIC_ARRAY_KEY_EXISTS_PARAMS: &[BuiltinIntrinsicParam] = &[
@@ -56846,16 +56860,91 @@ const INTRINSIC_ARRAY_KEY_EXISTS_PARAMS: &[BuiltinIntrinsicParam] = &[
         name: "key",
         type_decl: "mixed",
         optional: false,
+        by_ref: false,
     },
     BuiltinIntrinsicParam {
         name: "array",
         type_decl: "array",
         optional: false,
+        by_ref: false,
+    },
+];
+const INTRINSIC_EXPLODE_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "separator",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "limit",
+        type_decl: "int",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_HTMLSPECIALCHARS_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "flags",
+        type_decl: "int",
+        optional: true,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "encoding",
+        type_decl: "?string",
+        optional: true,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "double_encode",
+        type_decl: "bool",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_STR_REPLACE_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "search",
+        type_decl: "array|string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "replace",
+        type_decl: "array|string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "subject",
+        type_decl: "string|array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "count",
+        type_decl: "mixed",
+        optional: true,
+        by_ref: true,
     },
 ];
 const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     BuiltinIntrinsicSpec {
         name: "array_key_exists",
+        counter_name: "array_key_exists",
         return_type: "bool",
         params: INTRINSIC_ARRAY_KEY_EXISTS_PARAMS,
         exact_arity: 2,
@@ -56863,13 +56952,31 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "count",
+        counter_name: "count",
         return_type: "int",
         params: INTRINSIC_COUNT_PARAMS,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::CountArray,
     },
     BuiltinIntrinsicSpec {
+        name: "explode",
+        counter_name: "explode_single_byte",
+        return_type: "array",
+        params: INTRINSIC_EXPLODE_PARAMS,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::ExplodeSingleByte,
+    },
+    BuiltinIntrinsicSpec {
+        name: "htmlspecialchars",
+        counter_name: "htmlspecialchars_default",
+        return_type: "string",
+        params: INTRINSIC_HTMLSPECIALCHARS_PARAMS,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::HtmlSpecialCharsDefault,
+    },
+    BuiltinIntrinsicSpec {
         name: "is_array",
+        counter_name: "is_array",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
         exact_arity: 1,
@@ -56877,6 +56984,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "is_int",
+        counter_name: "is_int",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
         exact_arity: 1,
@@ -56884,6 +56992,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "is_string",
+        counter_name: "is_string",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
         exact_arity: 1,
@@ -56891,6 +57000,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "strlen",
+        counter_name: "strlen",
         return_type: "int",
         params: INTRINSIC_STRING_PARAM,
         exact_arity: 1,
@@ -56898,6 +57008,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "str_contains",
+        counter_name: "str_contains",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
         exact_arity: 2,
@@ -56905,13 +57016,23 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "str_ends_with",
+        counter_name: "str_ends_with",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::StrEndsWith,
     },
     BuiltinIntrinsicSpec {
+        name: "str_replace",
+        counter_name: "str_replace_scalar",
+        return_type: "string|array",
+        params: INTRINSIC_STR_REPLACE_PARAMS,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::StrReplaceScalar,
+    },
+    BuiltinIntrinsicSpec {
         name: "str_starts_with",
+        counter_name: "str_starts_with",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
         exact_arity: 2,
@@ -56919,19 +57040,27 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
     },
     BuiltinIntrinsicSpec {
         name: "strtolower",
+        counter_name: "strtolower",
         return_type: "string",
         params: INTRINSIC_STRING_PARAM,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::StrToLower,
     },
+    BuiltinIntrinsicSpec {
+        name: "strtoupper",
+        counter_name: "strtoupper_ascii",
+        return_type: "string",
+        params: INTRINSIC_STRING_PARAM,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrToUpper,
+    },
 ];
 
-fn fast_builtin_stub_supported(name: &str) -> bool {
-    builtin_intrinsic_spec(name).is_some()
-}
-
-fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
-    let (spec_index, spec) = builtin_intrinsic_spec(name)?;
+fn fast_builtin_stub_result_for_spec(
+    spec_index: usize,
+    spec: &'static BuiltinIntrinsicSpec,
+    values: &[Value],
+) -> Option<Value> {
     if fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).is_some() {
         return None;
     }
@@ -56972,16 +57101,35 @@ fn fast_builtin_stub_result(name: &str, values: &[Value]) -> Option<Value> {
         (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::string(
             php_source::byte_kernel::ascii_lowercase_copy(string.as_bytes()),
         )),
+        (BuiltinIntrinsicKind::StrToUpper, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::strtoupper_ascii(string),
+        )),
+        (
+            BuiltinIntrinsicKind::StrReplaceScalar,
+            [
+                Value::String(search),
+                Value::String(replace),
+                Value::String(subject),
+            ],
+        ) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::str_replace_scalar(search, replace, subject),
+        )),
+        (BuiltinIntrinsicKind::HtmlSpecialCharsDefault, [Value::String(string)]) => {
+            Some(Value::String(
+                php_runtime::builtins::string_intrinsics::htmlspecialchars_default(string),
+            ))
+        }
+        (
+            BuiltinIntrinsicKind::ExplodeSingleByte,
+            [Value::String(separator), Value::String(subject)],
+        ) if separator.len() == 1 => Some(Value::Array(
+            php_runtime::builtins::string_intrinsics::explode_single_byte(
+                separator.as_bytes()[0],
+                subject,
+            ),
+        )),
         _ => None,
     }
-}
-
-#[cold]
-fn fast_builtin_stub_fallback_reason(name: &str, values: &[Value]) -> &'static str {
-    let Some((spec_index, spec)) = builtin_intrinsic_spec(name) else {
-        return "unsupported";
-    };
-    fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).unwrap_or("type")
 }
 
 fn builtin_intrinsic_spec(name: &str) -> Option<(usize, &'static BuiltinIntrinsicSpec)> {
@@ -57023,10 +57171,7 @@ fn fast_builtin_stub_fallback_reason_for_spec(
     {
         return Some("by_ref");
     }
-    if builtin_intrinsic_type_match(spec.kind, values) {
-        return None;
-    }
-    Some("type")
+    builtin_intrinsic_type_fallback(spec.kind, values)
 }
 
 fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
@@ -57044,32 +57189,67 @@ fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
             actual.name == expected.name
                 && actual.type_decl == expected.type_decl
                 && actual.optional == expected.optional
-                && !actual.by_ref
+                && actual.by_ref == expected.by_ref
                 && !actual.variadic
         })
 }
 
-fn builtin_intrinsic_type_match(kind: BuiltinIntrinsicKind, values: &[Value]) -> bool {
+/// `None` when the argument shape fits the intrinsic fast path; otherwise the
+/// per-builtin fallback reason recorded in the counters.
+fn builtin_intrinsic_type_fallback(
+    kind: BuiltinIntrinsicKind,
+    values: &[Value],
+) -> Option<&'static str> {
     match (kind, values) {
         (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(_)]) => {
-            ArrayKey::from_value(key).is_some()
+            if ArrayKey::from_value(key).is_some() {
+                None
+            } else {
+                Some("type")
+            }
         }
         (BuiltinIntrinsicKind::CountArray, [Value::Array(_)])
-        | (BuiltinIntrinsicKind::StrLen, [Value::String(_)])
-        | (BuiltinIntrinsicKind::StrToLower, [Value::String(_)]) => true,
-        (
+        | (
+            BuiltinIntrinsicKind::StrLen
+            | BuiltinIntrinsicKind::StrToLower
+            | BuiltinIntrinsicKind::StrToUpper
+            | BuiltinIntrinsicKind::HtmlSpecialCharsDefault,
+            [Value::String(_)],
+        )
+        | (
             BuiltinIntrinsicKind::StrContains
             | BuiltinIntrinsicKind::StrStartsWith
             | BuiltinIntrinsicKind::StrEndsWith,
             [Value::String(_), Value::String(_)],
-        ) => true,
-        (
+        )
+        | (
             BuiltinIntrinsicKind::IsArray
             | BuiltinIntrinsicKind::IsInt
             | BuiltinIntrinsicKind::IsString,
             [_],
-        ) => true,
-        _ => false,
+        ) => None,
+        (BuiltinIntrinsicKind::ExplodeSingleByte, [Value::String(separator), Value::String(_)]) => {
+            match separator.len() {
+                0 => Some("empty_separator"),
+                1 => None,
+                _ => Some("multi_byte_separator"),
+            }
+        }
+        (
+            BuiltinIntrinsicKind::StrReplaceScalar,
+            [Value::String(_), Value::String(_), Value::String(_)],
+        ) => None,
+        (BuiltinIntrinsicKind::StrReplaceScalar, [search, replace, subject]) => {
+            if [search, replace, subject]
+                .iter()
+                .any(|value| matches!(value, Value::Array(_)))
+            {
+                Some("array_args")
+            } else {
+                Some("type")
+            }
+        }
+        _ => Some("type"),
     }
 }
 
@@ -60567,16 +60747,20 @@ fn internal_builtin_generated_named_args_supported(function: &str) -> bool {
         function,
         "array_key_exists"
             | "count"
+            | "explode"
+            | "htmlspecialchars"
             | "is_array"
             | "is_int"
             | "is_string"
             | "round"
             | "strlen"
             | "str_contains"
+            | "str_replace"
             | "str_split"
             | "str_starts_with"
             | "str_ends_with"
             | "strtolower"
+            | "strtoupper"
     )
 }
 
@@ -60584,23 +60768,15 @@ fn call_internal_builtin_named_args_to_positional(
     function: &str,
     args: Vec<CallArgument>,
 ) -> Result<Vec<CallArgument>, InternalBuiltinArgError> {
-    let first_named = || {
-        args.iter()
-            .find_map(|arg| arg.name.as_deref())
-            .unwrap_or("arg")
-    };
+    let first_named = args
+        .iter()
+        .find_map(|arg| arg.name.clone())
+        .unwrap_or_else(|| "arg".to_owned());
     let Some(metadata) = php_std::generated::arginfo::function_metadata(function) else {
         return Err(InternalBuiltinArgError::Message(format!(
-            "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${}",
-            first_named()
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${first_named}"
         )));
     };
-    if metadata.params.iter().any(|param| param.by_ref) {
-        return Err(InternalBuiltinArgError::Message(format!(
-            "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${}",
-            first_named()
-        )));
-    }
 
     let mut reordered = vec![None; metadata.params.len()];
     let mut next_positional = 0_usize;
@@ -60647,9 +60823,21 @@ fn call_internal_builtin_named_args_to_positional(
         let Some(param) = metadata.params.get(index) else {
             break;
         };
-        if let Some(default) = generated_default_value_for_call(param.default_value) {
-            positional.push(CallArgument::positional(default));
+        // A default filled into a by-ref slot would be bound as a dead
+        // reference; supplied by-ref args (reordered above) stay intact.
+        if param.by_ref {
+            return Err(InternalBuiltinArgError::Message(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${first_named}"
+            )));
         }
+        // A silently skipped hole would shift every later argument left;
+        // reject unsupported defaults instead of guessing.
+        let Some(default) = generated_default_value_for_call(param.default_value) else {
+            return Err(InternalBuiltinArgError::Message(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${first_named}"
+            )));
+        };
+        positional.push(CallArgument::positional(default));
     }
     Ok(positional)
 }
@@ -60670,6 +60858,12 @@ fn generated_default_value_for_call(default: Option<&str>) -> Option<Value> {
         "RoundingMode::HalfAwayFromZero" | "\\RoundingMode::HalfAwayFromZero"
     ) {
         return Some(Value::Int(1));
+    }
+    if default == "ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401" {
+        return Some(Value::Int(11));
+    }
+    if default == "PHP_INT_MAX" {
+        return Some(Value::Int(i64::MAX));
     }
     default.parse::<i64>().ok().map(Value::Int)
 }

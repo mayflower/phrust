@@ -28,8 +28,9 @@ use crate::{
     to_string, unserialize as unserialize_value,
 };
 pub(in crate::builtins::modules) use encoding::{
-    build_query_pairs, format_array_values, hash_digest_bytes, hex_decode, hex_encode, hex_nibble,
-    hmac_digest_bytes, html_decode, html_escape_with_options, url_decode, url_encode,
+    HTML_ESCAPE_DEFAULT_FLAGS, build_query_pairs, format_array_values, hash_digest_bytes,
+    hex_decode, hex_encode, hex_nibble, hmac_digest_bytes, html_decode, html_escape_with_options,
+    url_decode, url_encode,
 };
 use http::{
     builtin_header, builtin_header_remove, builtin_headers_list, builtin_headers_sent,
@@ -5434,7 +5435,18 @@ pub(in crate::builtins::modules) fn replace_all(
     replacement: &[u8],
     count: &mut i64,
 ) -> Vec<u8> {
-    let mut output = Vec::new();
+    let mut occurrences = 0_usize;
+    let mut start = 0;
+    while let Some(index) = find_bytes_from(bytes, needle, start, false) {
+        occurrences += 1;
+        start = index + needle.len();
+    }
+    if occurrences == 0 {
+        return bytes.to_vec();
+    }
+    let mut output = Vec::with_capacity(
+        bytes.len() - occurrences * needle.len() + occurrences * replacement.len(),
+    );
     let mut start = 0;
     while let Some(index) = find_bytes_from(bytes, needle, start, false) {
         output.extend_from_slice(&bytes[start..index]);

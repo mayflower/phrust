@@ -378,13 +378,9 @@ pub(in crate::builtins::modules) fn builtin_strtoupper(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("strtoupper", &args, 1)?;
-    Ok(Value::string(
-        string_arg("strtoupper", &args[0])?
-            .as_bytes()
-            .iter()
-            .map(u8::to_ascii_uppercase)
-            .collect::<Vec<_>>(),
-    ))
+    Ok(Value::String(super::string_intrinsics::strtoupper_ascii(
+        &string_arg("strtoupper", &args[0])?,
+    )))
 }
 
 pub(in crate::builtins::modules) fn builtin_trim(
@@ -431,6 +427,12 @@ pub(in crate::builtins::modules) fn builtin_explode(
         ));
     }
     let string = string_arg("explode", &args[1])?;
+    if args.len() == 2 && separator.len() == 1 {
+        return Ok(Value::Array(super::string_intrinsics::explode_single_byte(
+            separator.as_bytes()[0],
+            &string,
+        )));
+    }
     let limit = args
         .get(2)
         .map(|value| int_arg("explode", value))
@@ -1196,17 +1198,23 @@ pub(in crate::builtins::modules) fn builtin_htmlspecialchars(
             "builtin htmlspecialchars expects one to four argument(s)",
         ));
     }
-    let flags = args
-        .get(1)
-        .map_or(Ok(3), |value| int_arg("htmlspecialchars", value))?;
+    let flags = args.get(1).map_or(Ok(HTML_ESCAPE_DEFAULT_FLAGS), |value| {
+        int_arg("htmlspecialchars", value)
+    })?;
     let double_encode = args.get(3).map_or(Ok(true), to_bool).map_err(|message| {
         BuiltinError::new(
             "E_PHP_RUNTIME_BUILTIN_TYPE",
             format!("builtin htmlspecialchars expects bool-compatible double_encode: {message}"),
         )
     })?;
+    let input = string_arg("htmlspecialchars", &args[0])?;
+    if flags == HTML_ESCAPE_DEFAULT_FLAGS && double_encode {
+        return Ok(Value::String(
+            super::string_intrinsics::htmlspecialchars_default(&input),
+        ));
+    }
     Ok(Value::string(html_escape_with_options(
-        string_arg("htmlspecialchars", &args[0])?.as_bytes(),
+        input.as_bytes(),
         flags,
         double_encode,
     )))
