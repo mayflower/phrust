@@ -2331,11 +2331,10 @@ pub(in crate::builtins::modules) fn utf8_ignore_invalid(bytes: &[u8]) -> String 
             }
             Err(error) => {
                 let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    out.push_str(
-                        std::str::from_utf8(&rest[..valid_up_to])
-                            .expect("valid UTF-8 prefix reported by from_utf8"),
-                    );
+                if valid_up_to > 0
+                    && let Ok(valid_prefix) = std::str::from_utf8(&rest[..valid_up_to])
+                {
+                    out.push_str(valid_prefix);
                 }
                 let skip = error.error_len().unwrap_or(1);
                 rest = &rest[valid_up_to.saturating_add(skip)..];
@@ -2356,11 +2355,10 @@ fn utf8_substitute_invalid(bytes: &[u8]) -> String {
             }
             Err(error) => {
                 let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    out.push_str(
-                        std::str::from_utf8(&rest[..valid_up_to])
-                            .expect("valid UTF-8 prefix reported by from_utf8"),
-                    );
+                if valid_up_to > 0
+                    && let Ok(valid_prefix) = std::str::from_utf8(&rest[..valid_up_to])
+                {
+                    out.push_str(valid_prefix);
                 }
                 out.push('\u{fffd}');
                 let invalid = &rest[valid_up_to..];
