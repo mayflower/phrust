@@ -354,7 +354,7 @@ pub(in crate::builtins::modules) fn builtin_array_change_key_case(
     let mut output = PhpArray::new();
     for (key, value) in array.iter() {
         let key = match key {
-            ArrayKey::Int(value) => ArrayKey::Int(*value),
+            ArrayKey::Int(value) => ArrayKey::Int(value),
             ArrayKey::String(value) if case == 1 => ArrayKey::String(crate::PhpString::from_bytes(
                 value.to_string_lossy().to_uppercase().into_bytes(),
             )),
@@ -391,7 +391,7 @@ pub(in crate::builtins::modules) fn builtin_array_keys(
         {
             continue;
         }
-        keys.push(array_key_to_value(key));
+        keys.push(array_key_to_value(&key));
     }
     Ok(Value::packed_array(keys))
 }
@@ -505,7 +505,7 @@ pub(in crate::builtins::modules) fn builtin_array_key_first(
     Ok(array
         .iter()
         .next()
-        .map_or(Value::Null, |(key, _)| array_key_to_value(key)))
+        .map_or(Value::Null, |(key, _)| array_key_to_value(&key)))
 }
 
 pub(in crate::builtins::modules) fn builtin_array_key_last(
@@ -520,7 +520,7 @@ pub(in crate::builtins::modules) fn builtin_array_key_last(
     Ok(array
         .iter()
         .last()
-        .map_or(Value::Null, |(key, _)| array_key_to_value(key)))
+        .map_or(Value::Null, |(key, _)| array_key_to_value(&key)))
 }
 
 pub(in crate::builtins::modules) fn builtin_in_array(
@@ -567,7 +567,7 @@ pub(in crate::builtins::modules) fn builtin_array_search(
         .unwrap_or(false);
     for (key, value) in array.iter() {
         if array_value_matches("array_search", &args[0], value, strict)? {
-            return Ok(array_key_to_value(key));
+            return Ok(array_key_to_value(&key));
         }
     }
     Ok(Value::Bool(false))
@@ -682,7 +682,7 @@ pub(in crate::builtins::modules) fn builtin_array_diff_key(
     let others = array_list_arg("array_diff_key", &args[1..])?;
     let mut output = PhpArray::new();
     for (key, value) in first.iter() {
-        if others.iter().all(|array| array.get(key).is_none()) {
+        if others.iter().all(|array| array.get(&key).is_none()) {
             output.insert(key.clone(), value.clone());
         }
     }
@@ -799,7 +799,7 @@ pub(in crate::builtins::modules) fn builtin_array_intersect_key(
     let others = array_list_arg("array_intersect_key", &args[1..])?;
     let mut output = PhpArray::new();
     for (key, value) in first.iter() {
-        if others.iter().all(|array| array.get(key).is_some()) {
+        if others.iter().all(|array| array.get(&key).is_some()) {
             output.insert(key.clone(), value.clone());
         }
     }
@@ -1326,7 +1326,7 @@ pub(in crate::builtins::modules) fn builtin_array_flip(
             );
             continue;
         };
-        output.insert(output_key, array_key_to_value(key));
+        output.insert(output_key, array_key_to_value(&key));
     }
     Ok(Value::Array(output))
 }

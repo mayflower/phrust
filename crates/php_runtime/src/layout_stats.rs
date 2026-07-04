@@ -60,6 +60,31 @@ pub struct RuntimeLayoutStats {
     pub object_dynamic_property_map_reads: u64,
     /// Object property writes into the dynamic side map.
     pub object_dynamic_property_map_writes: u64,
+    /// Packed arrays constructed with values-only storage.
+    pub packed_values_storage_arrays: u64,
+    /// Reads served directly from values-only packed storage.
+    pub packed_values_storage_reads: u64,
+    /// Appends into values-only packed storage.
+    pub packed_values_storage_appends: u64,
+    /// Packed iterations that synthesized their integer keys.
+    pub packed_virtual_key_iterations: u64,
+    /// Packed arrays converted to mixed by a string-key insert.
+    pub packed_to_mixed_string_key: u64,
+    /// Packed arrays converted to mixed by a non-sequential integer key.
+    pub packed_to_mixed_non_sequential_int_key: u64,
+    /// Packed arrays converted to mixed by an append after an unset tail.
+    pub packed_to_mixed_append_key_gap: u64,
+    /// Packed arrays converted to mixed by an unset creating a hole.
+    pub packed_to_mixed_unset_hole: u64,
+}
+
+/// Why a packed array had to leave values-only storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackedToMixedReason {
+    StringKey,
+    NonSequentialIntKey,
+    AppendKeyGap,
+    UnsetHole,
 }
 
 static LAYOUT_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -200,6 +225,50 @@ layout_recorder!(
     record_object_dynamic_property_map_write_slow,
     object_dynamic_property_map_writes
 );
+layout_recorder!(
+    pub(crate) record_packed_values_storage_array,
+    record_packed_values_storage_array_slow,
+    packed_values_storage_arrays
+);
+layout_recorder!(
+    pub(crate) record_packed_values_storage_read,
+    record_packed_values_storage_read_slow,
+    packed_values_storage_reads
+);
+layout_recorder!(
+    pub(crate) record_packed_values_storage_append,
+    record_packed_values_storage_append_slow,
+    packed_values_storage_appends
+);
+layout_recorder!(
+    pub(crate) record_packed_virtual_key_iteration,
+    record_packed_virtual_key_iteration_slow,
+    packed_virtual_key_iterations
+);
+
+/// Reason-tagged packed-to-mixed conversion recorder.
+#[inline(always)]
+pub(crate) fn record_packed_to_mixed(reason: PackedToMixedReason) {
+    if stats_enabled() {
+        record_packed_to_mixed_slow(reason);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn record_packed_to_mixed_slow(reason: PackedToMixedReason) {
+    LAYOUT_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        match reason {
+            PackedToMixedReason::StringKey => stats.packed_to_mixed_string_key += 1,
+            PackedToMixedReason::NonSequentialIntKey => {
+                stats.packed_to_mixed_non_sequential_int_key += 1;
+            }
+            PackedToMixedReason::AppendKeyGap => stats.packed_to_mixed_append_key_gap += 1,
+            PackedToMixedReason::UnsetHole => stats.packed_to_mixed_unset_hole += 1,
+        }
+    });
+}
 
 /// Clears layout counters for deterministic VM executions and enables
 /// recording (sticky; see module docs).

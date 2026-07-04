@@ -15910,7 +15910,7 @@ impl Vm {
                         };
                         self.register_destructor_if_needed(compiled, &class, copy.clone(), state);
                         for (key, value) in replacements.iter() {
-                            let property = match clone_with_property_name(key) {
+                            let property = match clone_with_property_name(&key) {
                                 Ok(property) => property,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -44035,7 +44035,7 @@ fn resolve_closure_from_callable_relative_value(
         Value::Array(array) => {
             let mut resolved = PhpArray::new();
             for (key, value) in array.iter() {
-                let value = if key == &ArrayKey::Int(0) {
+                let value = if key == ArrayKey::Int(0) {
                     match effective_value(value) {
                         Value::String(class_name) => resolve_relative_callable_class_name(
                             compiled,
@@ -46567,7 +46567,7 @@ fn pdo_split_execute_params(params: &PhpArray) -> (Vec<Value>, HashMap<String, V
         match key {
             ArrayKey::Int(_) => positional.push(value.clone()),
             ArrayKey::String(name) => {
-                named.insert(pdo_normalize_named_param(name), value.clone());
+                named.insert(pdo_normalize_named_param(&name), value.clone());
             }
         }
     }
@@ -46579,12 +46579,12 @@ fn pdo_split_bound_params(params: &PhpArray) -> (Vec<Value>, HashMap<String, Val
     let mut named = HashMap::new();
     for (key, value) in params.iter() {
         match key {
-            ArrayKey::Int(index) if *index >= 1 => {
-                positional_pairs.push((*index, value.clone()));
+            ArrayKey::Int(index) if index >= 1 => {
+                positional_pairs.push((index, value.clone()));
             }
             ArrayKey::Int(_) => {}
             ArrayKey::String(name) => {
-                named.insert(pdo_normalize_named_param(name), value.clone());
+                named.insert(pdo_normalize_named_param(&name), value.clone());
             }
         }
     }
@@ -58052,7 +58052,7 @@ fn cast_value_to_object(value: &Value) -> Value {
         Value::Array(array) => {
             let object = ObjectRef::new_with_display_name(&std_class_entry(), "stdClass");
             for (key, element) in array.iter() {
-                object.set_property(object_cast_property_name(key), effective_value(element));
+                object.set_property(object_cast_property_name(&key), effective_value(element));
             }
             Value::Object(object)
         }
@@ -61158,7 +61158,7 @@ fn try_array_union(lhs: &Value, rhs: &Value) -> Option<Value> {
     };
     let mut result = lhs.clone();
     for (key, value) in rhs.iter() {
-        if result.get(key).is_none() {
+        if result.get(&key).is_none() {
             result.insert(key.clone(), effective_value(value));
         }
     }

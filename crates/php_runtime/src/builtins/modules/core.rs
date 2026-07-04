@@ -2584,7 +2584,7 @@ pub(in crate::builtins::modules) fn pattern_order_matches(
             let ArrayKey::Int(index) = key else {
                 continue;
             };
-            let index = *index as usize;
+            let index = index as usize;
             while grouped.len() <= index {
                 grouped.push(PhpArray::new());
             }
@@ -4493,7 +4493,7 @@ pub(in crate::builtins::modules) fn array_diff_by_key_and_value(
     for (key, value) in first.iter() {
         let needle = array_compare_value_key("array_diff_assoc", value)?;
         if others.iter().all(|other| {
-            !other.get(key).is_some_and(|candidate| {
+            !other.get(&key).is_some_and(|candidate| {
                 array_compare_value_key("array_diff_assoc", candidate)
                     .is_ok_and(|candidate| candidate == needle)
             })
@@ -4531,7 +4531,7 @@ pub(in crate::builtins::modules) fn array_intersect_by_key_and_value(
     for (key, value) in first.iter() {
         let needle = array_compare_value_key("array_intersect_assoc", value)?;
         if others.iter().all(|other| {
-            other.get(key).is_some_and(|candidate| {
+            other.get(&key).is_some_and(|candidate| {
                 array_compare_value_key("array_intersect_assoc", candidate)
                     .is_ok_and(|candidate| candidate == needle)
             })
@@ -5361,7 +5361,7 @@ pub(in crate::builtins::modules) fn replace_recursive_into(
     input: &crate::PhpArray,
 ) {
     for (key, value) in input.iter() {
-        let replacement = if let Some(existing) = output.get(key).cloned() {
+        let replacement = if let Some(existing) = output.get(&key).cloned() {
             replace_recursive_values(existing, value.clone())
         } else {
             value.clone()

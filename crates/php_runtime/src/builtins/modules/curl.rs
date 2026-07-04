@@ -477,7 +477,7 @@ pub(in crate::builtins::modules) fn builtin_curl_setopt_array(
     };
     for (key, value) in options.iter() {
         let option = match key {
-            ArrayKey::Int(option) => *option,
+            ArrayKey::Int(option) => option,
             ArrayKey::String(option) => option.to_string_lossy().parse().unwrap_or(-1),
         };
         let ok = set_curl_option(&handle, option, value.clone())?;

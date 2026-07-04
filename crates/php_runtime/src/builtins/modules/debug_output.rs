@@ -62,7 +62,7 @@ impl DebugFormatter {
                 output.write_test_str(&format!("array({}) {{\n", array.len()));
                 for (key, element) in array.iter() {
                     write_indent(output, indent + 2);
-                    write_array_key_dump(output, key);
+                    write_array_key_dump(output, &key);
                     write_indent(output, indent + 2);
                     self.write_var_dump_value(output, element, indent + 2);
                 }
@@ -316,7 +316,7 @@ impl DebugFormatter {
                 output.write_test_str("(\n");
                 for (key, element) in array.iter() {
                     write_indent(output, indent + 4);
-                    write_print_r_key(output, key);
+                    write_print_r_key(output, &key);
                     output.write_test_str(" => ");
                     let element_indent = if print_r_value_starts_multiline(element) {
                         indent + 8
@@ -388,7 +388,7 @@ impl DebugFormatter {
                 output.write_test_str("array (\n");
                 for (key, element) in array.iter() {
                     write_indent(output, indent + 2);
-                    write_export_key(output, key);
+                    write_export_key(output, &key);
                     output.write_test_str(" => ");
                     if var_export_value_starts_multiline(element) {
                         output.write_test_str("\n");

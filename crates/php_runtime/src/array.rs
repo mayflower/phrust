@@ -1,5 +1,6 @@
 //! Opaque ordered PHP array storage for runtime-semantics.
 
+use crate::layout_stats::PackedToMixedReason;
 use crate::{
     PhpString, Value,
     numeric_string::{
@@ -282,22 +283,53 @@ impl ArrayEntry {
 
 /// Non-allocating borrowed iterator over proven packed-array values.
 pub struct PackedArrayValues<'a> {
-    entries: std::slice::Iter<'a, ArrayEntry>,
+    values: std::slice::Iter<'a, Value>,
 }
 
 impl<'a> Iterator for PackedArrayValues<'a> {
     type Item = &'a Value;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.entries.next().map(ArrayEntry::value)
+        self.values.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.entries.size_hint()
+        self.values.size_hint()
     }
 }
 
 impl ExactSizeIterator for PackedArrayValues<'_> {}
+
+/// Insertion-order iterator over array pairs. Packed arrays synthesize
+/// their sequential integer keys instead of storing them.
+pub enum PhpArrayIter<'a> {
+    Packed(std::iter::Enumerate<std::slice::Iter<'a, Value>>),
+    Mixed(std::slice::Iter<'a, ArrayEntry>),
+}
+
+impl<'a> Iterator for PhpArrayIter<'a> {
+    type Item = (ArrayKey, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Packed(values) => values
+                .next()
+                .map(|(index, value)| (ArrayKey::Int(index as i64), value)),
+            Self::Mixed(entries) => entries
+                .next()
+                .map(|entry| (entry.key.clone(), &entry.value)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Packed(values) => values.size_hint(),
+            Self::Mixed(entries) => entries.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for PhpArrayIter<'_> {}
 
 /// Mutable array slot guard that refreshes value-dependent metadata when the
 /// caller finishes mutating the value.
@@ -312,19 +344,19 @@ impl Deref for PhpArrayValueMut<'_> {
     type Target = Value;
 
     fn deref(&self) -> &Self::Target {
-        &self.storage.entries()[self.index].value
+        self.storage.value_at(self.index)
     }
 }
 
 impl DerefMut for PhpArrayValueMut<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.storage.entries_mut()[self.index].value
+        self.storage.value_at_mut(self.index)
     }
 }
 
 impl Drop for PhpArrayValueMut<'_> {
     fn drop(&mut self) {
-        let value = &self.storage.entries()[self.index].value;
+        let value = self.storage.value_at(self.index);
         let new_is_reference = matches!(value, Value::Reference(_));
         let new_is_int = matches!(value, Value::Int(_));
         self.storage.metadata_mut().replace_value_flags(
@@ -349,11 +381,6 @@ struct ArrayCachedMetadata {
 }
 
 impl ArrayCachedMetadata {
-    fn from_entries(entries: &[ArrayEntry]) -> Self {
-        crate::layout_stats::record_array_metadata_recompute();
-        Self::from_entries_without_counter(entries)
-    }
-
     fn from_entries_for_debug(entries: &[ArrayEntry]) -> Self {
         Self::from_entries_without_counter(entries)
     }
@@ -364,6 +391,42 @@ impl ArrayCachedMetadata {
             metadata.add_entry(entry);
         }
         metadata
+    }
+
+    fn from_packed_values(values: &[Value]) -> Self {
+        crate::layout_stats::record_array_metadata_recompute();
+        Self::from_packed_values_without_counter(values)
+    }
+
+    fn from_packed_values_without_counter(values: &[Value]) -> Self {
+        let mut metadata = Self::default();
+        for value in values {
+            metadata.add_packed_value(value);
+        }
+        metadata
+    }
+
+    /// Packed slots always carry the next sequential integer key.
+    fn add_packed_value(&mut self, value: &Value) {
+        self.len += 1;
+        if matches!(value, Value::Reference(_)) {
+            self.reference_values += 1;
+        }
+        if matches!(value, Value::Int(_)) {
+            self.int_values += 1;
+        }
+        self.int_keys += 1;
+    }
+
+    fn remove_packed_value(&mut self, value: &Value) {
+        self.len -= 1;
+        if matches!(value, Value::Reference(_)) {
+            self.reference_values -= 1;
+        }
+        if matches!(value, Value::Int(_)) {
+            self.int_values -= 1;
+        }
+        self.int_keys -= 1;
     }
 
     fn add_entry(&mut self, entry: &ArrayEntry) {
@@ -468,16 +531,13 @@ impl ArrayCachedMetadata {
     }
 }
 
-/// Packed array storage.
+/// Packed array storage: values only, keys are virtually `0..len`.
 ///
-/// The packed variant keeps full `ArrayEntry` slots for now so the public
-/// insertion-order iterator can continue yielding borrowed keys. The variant
-/// boundary is still useful: packed metadata is structural instead of inferred
-/// from a mixed hash side table, and future values-only storage can stay behind
-/// `PhpArray`.
+/// Iteration synthesizes the sequential integer keys, so a packed slot is
+/// one `Value` instead of a full key/value entry.
 #[derive(Clone, Debug)]
 struct PackedArrayStorage {
-    entries: Vec<ArrayEntry>,
+    values: Vec<Value>,
     next_append_key: Option<i64>,
     internal_pointer: Option<usize>,
     mutation_epoch: u64,
@@ -508,7 +568,7 @@ enum ArrayStorage {
 impl Default for ArrayStorage {
     fn default() -> Self {
         Self::Packed(PackedArrayStorage {
-            entries: Vec::new(),
+            values: Vec::new(),
             next_append_key: None,
             internal_pointer: None,
             mutation_epoch: 0,
@@ -519,26 +579,67 @@ impl Default for ArrayStorage {
 
 impl PartialEq for ArrayStorage {
     fn eq(&self, other: &Self) -> bool {
-        self.entries() == other.entries()
-            && self.next_append_key() == other.next_append_key()
-            && self.internal_pointer() == other.internal_pointer()
+        if self.next_append_key() != other.next_append_key()
+            || self.internal_pointer() != other.internal_pointer()
+            || self.len() != other.len()
+        {
+            return false;
+        }
+        match (self, other) {
+            (Self::Packed(lhs), Self::Packed(rhs)) => lhs.values == rhs.values,
+            (Self::Mixed(lhs), Self::Mixed(rhs)) => lhs.entries == rhs.entries,
+            (Self::Packed(packed), Self::Mixed(mixed))
+            | (Self::Mixed(mixed), Self::Packed(packed)) => {
+                mixed.entries.iter().enumerate().all(|(index, entry)| {
+                    matches!(&entry.key, ArrayKey::Int(key) if *key == index as i64)
+                        && entry.value == packed.values[index]
+                })
+            }
+        }
     }
 }
 
 impl Eq for ArrayStorage {}
 
 impl ArrayStorage {
-    fn entries(&self) -> &[ArrayEntry] {
+    fn value_at(&self, index: usize) -> &Value {
         match self {
-            Self::Packed(storage) => &storage.entries,
-            Self::Mixed(storage) => &storage.entries,
+            Self::Packed(storage) => &storage.values[index],
+            Self::Mixed(storage) => &storage.entries[index].value,
         }
     }
 
-    fn entries_mut(&mut self) -> &mut Vec<ArrayEntry> {
+    fn value_at_mut(&mut self, index: usize) -> &mut Value {
         match self {
-            Self::Packed(storage) => &mut storage.entries,
-            Self::Mixed(storage) => &mut storage.entries,
+            Self::Packed(storage) => &mut storage.values[index],
+            Self::Mixed(storage) => &mut storage.entries[index].value,
+        }
+    }
+
+    fn get_value(&self, index: usize) -> Option<&Value> {
+        match self {
+            Self::Packed(storage) => storage.values.get(index),
+            Self::Mixed(storage) => storage.entries.get(index).map(ArrayEntry::value),
+        }
+    }
+
+    /// Key at an index; packed keys are synthesized.
+    fn key_at(&self, index: usize) -> Option<ArrayKey> {
+        match self {
+            Self::Packed(storage) => {
+                (index < storage.values.len()).then_some(ArrayKey::Int(index as i64))
+            }
+            Self::Mixed(storage) => storage.entries.get(index).map(|entry| entry.key.clone()),
+        }
+    }
+
+    fn iter_pairs(&self) -> PhpArrayIter<'_> {
+        match self {
+            Self::Packed(storage) => {
+                crate::layout_stats::record_packed_virtual_key_iteration();
+                PhpArrayIter::Packed(storage.values.iter().enumerate())
+            }
+            Self::Mixed(storage) => PhpArrayIter::Mixed(storage.entries.iter()),
         }
     }
 
@@ -599,22 +700,30 @@ impl ArrayStorage {
     }
 
     fn len(&self) -> usize {
-        self.entries().len()
+        match self {
+            Self::Packed(storage) => storage.values.len(),
+            Self::Mixed(storage) => storage.entries.len(),
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.entries().is_empty()
+        self.len() == 0
     }
 
     fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
     }
 
-    fn make_mixed(&mut self) {
+    fn make_mixed(&mut self, reason: PackedToMixedReason) {
         let Self::Packed(storage) = self else {
             return;
         };
-        let entries = std::mem::take(&mut storage.entries);
+        crate::layout_stats::record_packed_to_mixed(reason);
+        let entries = std::mem::take(&mut storage.values)
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| ArrayEntry::new(ArrayKey::Int(index as i64), value))
+            .collect::<Vec<_>>();
         // `ArrayKey` hashing/equality depend only on the key bytes; the
         // interior cells on `PhpString` memoize the hash and symbol id
         // without ever changing either relation (see `build_index`).
@@ -633,7 +742,7 @@ impl ArrayStorage {
 
     fn find_index(&self, key: &ArrayKey) -> Option<usize> {
         match self {
-            Self::Packed(storage) => packed_key_index(&storage.entries, key),
+            Self::Packed(storage) => packed_key_index(storage.values.len(), key),
             Self::Mixed(storage) => storage.index.get(key).copied(),
         }
     }
@@ -641,8 +750,13 @@ impl ArrayStorage {
     fn push_entry(&mut self, entry: ArrayEntry) {
         match self {
             Self::Packed(storage) => {
-                storage.cached_metadata.add_entry(&entry);
-                storage.entries.push(entry);
+                debug_assert!(
+                    matches!(&entry.key, ArrayKey::Int(key) if *key as usize == storage.values.len()),
+                    "packed pushes carry the next sequential integer key"
+                );
+                crate::layout_stats::record_packed_values_storage_append();
+                storage.cached_metadata.add_packed_value(&entry.value);
+                storage.values.push(entry.value);
             }
             Self::Mixed(storage) => {
                 let index = storage.entries.len();
@@ -656,11 +770,8 @@ impl ArrayStorage {
     }
 
     fn replace_value(&mut self, index: usize, value: Value) -> Value {
-        let old = {
-            let entries = self.entries_mut();
-            std::mem::replace(&mut entries[index].value, value)
-        };
-        let new = &self.entries()[index].value;
+        let old = std::mem::replace(self.value_at_mut(index), value);
+        let new = self.value_at(index);
         let old_is_reference = matches!(old, Value::Reference(_));
         let new_is_reference = matches!(new, Value::Reference(_));
         let old_is_int = matches!(old, Value::Int(_));
@@ -674,42 +785,58 @@ impl ArrayStorage {
         old
     }
 
-    fn remove_index(&mut self, index: usize) -> ArrayEntry {
-        let entry = self.entries_mut().remove(index);
-        self.metadata_mut().remove_entry(&entry);
-        if let Self::Mixed(storage) = self {
-            storage.index.remove(&entry.key);
-            for value in storage.index.values_mut() {
-                if *value > index {
-                    *value -= 1;
+    fn remove_index(&mut self, index: usize) -> (ArrayKey, Value) {
+        match self {
+            Self::Packed(storage) => {
+                let value = storage.values.remove(index);
+                storage.cached_metadata.remove_packed_value(&value);
+                self.debug_assert_consistent();
+                (ArrayKey::Int(index as i64), value)
+            }
+            Self::Mixed(storage) => {
+                let entry = storage.entries.remove(index);
+                storage.cached_metadata.remove_entry(&entry);
+                storage.index.remove(&entry.key);
+                for value in storage.index.values_mut() {
+                    if *value > index {
+                        *value -= 1;
+                    }
                 }
+                self.debug_assert_consistent();
+                (entry.key, entry.value)
             }
         }
-        self.debug_assert_consistent();
-        entry
     }
 
     fn debug_assert_consistent(&self) {
-        debug_assert_eq!(self.metadata().len, self.entries().len());
-        debug_assert_eq!(
-            self.metadata(),
-            ArrayCachedMetadata::from_entries_for_debug(self.entries())
-        );
-        if let Self::Mixed(storage) = self {
-            debug_assert_eq!(storage.index.len(), storage.entries.len());
-            for (index, entry) in storage.entries.iter().enumerate() {
-                debug_assert_eq!(storage.index.get(&entry.key), Some(&index));
+        debug_assert_eq!(self.metadata().len, self.len());
+        match self {
+            Self::Packed(storage) => {
+                debug_assert_eq!(
+                    self.metadata(),
+                    ArrayCachedMetadata::from_packed_values_without_counter(&storage.values)
+                );
+            }
+            Self::Mixed(storage) => {
+                debug_assert_eq!(
+                    self.metadata(),
+                    ArrayCachedMetadata::from_entries_for_debug(&storage.entries)
+                );
+                debug_assert_eq!(storage.index.len(), storage.entries.len());
+                for (index, entry) in storage.entries.iter().enumerate() {
+                    debug_assert_eq!(storage.index.get(&entry.key), Some(&index));
+                }
             }
         }
     }
 }
 
-fn packed_key_index(entries: &[ArrayEntry], key: &ArrayKey) -> Option<usize> {
+fn packed_key_index(len: usize, key: &ArrayKey) -> Option<usize> {
     let ArrayKey::Int(index) = key else {
         return None;
     };
     let index = usize::try_from(*index).ok()?;
-    (index < entries.len()).then_some(index)
+    (index < len).then_some(index)
 }
 
 /// `ArrayKey` is a stable map key despite clippy's `mutable_key_type` view:
@@ -780,7 +907,7 @@ impl PhpArray {
     pub fn new() -> Self {
         Self {
             storage: Rc::new(ArrayStorage::Packed(PackedArrayStorage {
-                entries: Vec::new(),
+                values: Vec::new(),
                 next_append_key: None,
                 internal_pointer: None,
                 mutation_epoch: 0,
@@ -793,15 +920,11 @@ impl PhpArray {
     #[must_use]
     pub fn from_packed(elements: Vec<Value>) -> Self {
         let len = elements.len();
-        let entries = elements
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| ArrayEntry::new(ArrayKey::Int(index as i64), value))
-            .collect::<Vec<_>>();
-        let cached_metadata = ArrayCachedMetadata::from_entries(&entries);
+        crate::layout_stats::record_packed_values_storage_array();
+        let cached_metadata = ArrayCachedMetadata::from_packed_values(&elements);
         Self {
             storage: Rc::new(ArrayStorage::Packed(PackedArrayStorage {
-                entries,
+                values: elements,
                 next_append_key: (len > 0).then(|| i64::try_from(len).ok()).flatten(),
                 internal_pointer: (len > 0).then_some(0),
                 mutation_epoch: len as u64,
@@ -1069,7 +1192,10 @@ impl PhpArray {
         let remains_packed =
             storage.is_packed() && matches!(key, ArrayKey::Int(value) if value == old_len as i64);
         if !remains_packed {
-            storage.make_mixed();
+            storage.make_mixed(match key {
+                ArrayKey::String(_) => PackedToMixedReason::StringKey,
+                ArrayKey::Int(_) => PackedToMixedReason::NonSequentialIntKey,
+            });
         }
         storage.push_entry(ArrayEntry::new(key, value));
         if storage.internal_pointer().is_none() {
@@ -1093,7 +1219,7 @@ impl PhpArray {
             storage.is_packed() && matches!(key, ArrayKey::Int(value) if value == old_len as i64);
         bump_append_key(storage, &key);
         if !remains_packed {
-            storage.make_mixed();
+            storage.make_mixed(PackedToMixedReason::AppendKeyGap);
         }
         storage.push_entry(ArrayEntry::new(key.clone(), value));
         if storage.internal_pointer().is_none() {
@@ -1123,9 +1249,10 @@ impl PhpArray {
     pub fn get(&self, key: &ArrayKey) -> Option<&Value> {
         match self.storage.as_ref() {
             ArrayStorage::Packed(storage) => {
-                let index = packed_key_index(&storage.entries, key)?;
+                let index = packed_key_index(storage.values.len(), key)?;
                 crate::layout_stats::record_array_packed_direct_get();
-                storage.entries.get(index).map(ArrayEntry::value)
+                crate::layout_stats::record_packed_values_storage_read();
+                storage.values.get(index)
             }
             ArrayStorage::Mixed(storage) => {
                 let index = storage.index.get(key).copied()?;
@@ -1139,7 +1266,7 @@ impl PhpArray {
     pub fn get_mut(&mut self, key: &ArrayKey) -> Option<PhpArrayValueMut<'_>> {
         let storage = self.storage_mut_for(PhpArrayWriteIntent::NestedDimensionWrite);
         let index = storage.find_index(key)?;
-        let value = &storage.entries()[index].value;
+        let value = storage.value_at(index);
         let old_is_reference = matches!(value, Value::Reference(_));
         let old_is_int = matches!(value, Value::Int(_));
         bump_mutation_epoch(storage);
@@ -1155,12 +1282,13 @@ impl PhpArray {
     pub fn remove(&mut self, key: &ArrayKey) -> Option<Value> {
         let storage = self.storage_mut_for(PhpArrayWriteIntent::Remove);
         let index = storage.find_index(key)?;
-        let was_packed = storage.is_packed();
-        let old_len = storage.len();
-        let value = storage.remove_index(index).value;
-        if was_packed && index + 1 != old_len {
-            storage.make_mixed();
+        // Removing a non-tail packed element must preserve the remaining
+        // keys, so the array leaves values-only storage before the removal
+        // renumbers positions.
+        if storage.is_packed() && index + 1 != storage.len() {
+            storage.make_mixed(PackedToMixedReason::UnsetHole);
         }
+        let (_removed_key, value) = storage.remove_index(index);
         adjust_pointer_after_remove(storage, index);
         bump_mutation_epoch(storage);
         Some(value)
@@ -1172,7 +1300,8 @@ impl PhpArray {
     /// so a following `[]=` reuses it (e.g. popping `-2` from `[-2 => x]` makes
     /// the next append `-2` again).
     pub fn pop(&mut self) -> Option<Value> {
-        let last_key = self.storage.entries().last()?.key.clone();
+        let len = self.storage.len();
+        let last_key = self.storage.key_at(len.checked_sub(1)?)?;
         let previous_next = self.storage.next_append_key();
         let value = self.remove(&last_key);
         if let ArrayKey::Int(key) = last_key
@@ -1189,8 +1318,7 @@ impl PhpArray {
     pub fn pointer_value(&self) -> Option<Value> {
         self.storage
             .internal_pointer()
-            .and_then(|index| self.storage.entries().get(index))
-            .map(ArrayEntry::value)
+            .and_then(|index| self.storage.get_value(index))
             .cloned()
     }
 
@@ -1199,9 +1327,7 @@ impl PhpArray {
     pub fn pointer_key(&self) -> Option<ArrayKey> {
         self.storage
             .internal_pointer()
-            .and_then(|index| self.storage.entries().get(index))
-            .map(ArrayEntry::key)
-            .cloned()
+            .and_then(|index| self.storage.key_at(index))
     }
 
     /// Moves the internal pointer to the first element.
@@ -1212,7 +1338,7 @@ impl PhpArray {
             return None;
         }
         storage.set_internal_pointer(Some(0));
-        storage.entries().first().map(ArrayEntry::value).cloned()
+        storage.get_value(0).cloned()
     }
 
     /// Moves the internal pointer to the last element.
@@ -1220,7 +1346,7 @@ impl PhpArray {
         let storage = self.storage_mut_for(PhpArrayWriteIntent::PointerMutation);
         let last = storage.len().checked_sub(1)?;
         storage.set_internal_pointer(Some(last));
-        storage.entries().get(last).map(ArrayEntry::value).cloned()
+        storage.get_value(last).cloned()
     }
 
     /// Advances the internal pointer by one element.
@@ -1233,7 +1359,7 @@ impl PhpArray {
             return None;
         }
         storage.set_internal_pointer(Some(next));
-        storage.entries().get(next).map(ArrayEntry::value).cloned()
+        storage.get_value(next).cloned()
     }
 
     /// Moves the internal pointer one element backwards.
@@ -1242,26 +1368,20 @@ impl PhpArray {
         let Some(current) = storage.internal_pointer() else {
             let last = storage.len().checked_sub(1)?;
             storage.set_internal_pointer(Some(last));
-            return storage.entries().get(last).map(ArrayEntry::value).cloned();
+            return storage.get_value(last).cloned();
         };
         let Some(previous) = current.checked_sub(1) else {
             storage.set_internal_pointer(None);
             return None;
         };
         storage.set_internal_pointer(Some(previous));
-        storage
-            .entries()
-            .get(previous)
-            .map(ArrayEntry::value)
-            .cloned()
+        storage.get_value(previous).cloned()
     }
 
-    /// Iterates in insertion order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&ArrayKey, &Value)> {
-        self.storage
-            .entries()
-            .iter()
-            .map(|entry| (entry.key(), entry.value()))
+    /// Iterates in insertion order. Packed arrays synthesize their
+    /// sequential integer keys, so keys are yielded by value.
+    pub fn iter(&self) -> PhpArrayIter<'_> {
+        self.storage.iter_pairs()
     }
 
     /// Returns packed elements only when the keys are exactly `0..len`.
@@ -1271,8 +1391,14 @@ impl PhpArray {
             return Some(self.packed_values_fast()?.collect());
         }
         crate::layout_stats::record_array_linear_scan_fallback();
-        let mut elements = Vec::with_capacity(self.storage.len());
-        for (index, entry) in self.storage.entries().iter().enumerate() {
+        let ArrayStorage::Mixed(storage) = self.storage.as_ref() else {
+            return Some(match self.storage.as_ref() {
+                ArrayStorage::Packed(storage) => storage.values.iter().collect(),
+                ArrayStorage::Mixed(_) => unreachable!(),
+            });
+        };
+        let mut elements = Vec::with_capacity(storage.entries.len());
+        for (index, entry) in storage.entries.iter().enumerate() {
             if entry.key != ArrayKey::Int(index as i64) {
                 return None;
             }
@@ -1288,8 +1414,9 @@ impl PhpArray {
         let ArrayStorage::Packed(storage) = self.storage.as_ref() else {
             return None;
         };
+        crate::layout_stats::record_packed_values_storage_read();
         Some(PackedArrayValues {
-            entries: storage.entries.iter(),
+            values: storage.values.iter(),
         })
     }
 
@@ -1297,20 +1424,27 @@ impl PhpArray {
     #[must_use]
     pub fn packed_element(&self, index: usize) -> Option<&Value> {
         crate::layout_stats::record_array_linear_scan_fallback();
-        for (entry_index, entry) in self.storage.entries().iter().enumerate() {
-            if entry.key != ArrayKey::Int(entry_index as i64) {
-                return None;
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(storage) => storage.values.get(index),
+            ArrayStorage::Mixed(storage) => {
+                for (entry_index, entry) in storage.entries.iter().enumerate() {
+                    if entry.key != ArrayKey::Int(entry_index as i64) {
+                        return None;
+                    }
+                }
+                storage.entries.get(index).map(ArrayEntry::value)
             }
         }
-        self.storage.entries().get(index).map(ArrayEntry::value)
     }
 
     /// Returns one packed element using only tracked metadata.
     #[must_use]
     pub fn packed_element_fast(&self, index: usize) -> Option<&Value> {
-        self.is_packed_fast()
-            .then(|| self.storage.entries().get(index).map(ArrayEntry::value))
-            .flatten()
+        if !self.is_packed_fast() {
+            return None;
+        }
+        crate::layout_stats::record_packed_values_storage_read();
+        self.storage.get_value(index)
     }
 
     fn storage_mut_for(&mut self, _intent: PhpArrayWriteIntent) -> &mut ArrayStorage {

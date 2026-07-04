@@ -529,7 +529,7 @@ fn arrays_equal(left: &crate::PhpArray, right: &crate::PhpArray) -> Result<bool,
         return Ok(false);
     }
     for (left_key, left_value) in left.iter() {
-        let Some(right_value) = right.get(left_key) else {
+        let Some(right_value) = right.get(&left_key) else {
             return Ok(false);
         };
         if !equal(left_value, right_value)? {
@@ -545,13 +545,13 @@ fn arrays_compare(left: &crate::PhpArray, right: &crate::PhpArray) -> Result<Ord
         ordering => return Ok(ordering),
     }
     for (left_key, left_value) in left.iter() {
-        let Some(right_value) = right.get(left_key) else {
+        let Some(right_value) = right.get(&left_key) else {
             let right_key = right
                 .iter()
                 .map(|(key, _)| key)
                 .next()
                 .expect("equal length arrays are not empty when a key is missing");
-            return Ok(compare_array_keys(left_key, right_key));
+            return Ok(compare_array_keys(&left_key, &right_key));
         };
         let ordering = compare(left_value, right_value)?;
         if ordering != Ordering::Equal {

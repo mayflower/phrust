@@ -128,7 +128,7 @@ impl Serializer {
                 self.output
                     .extend_from_slice(format!("a:{}:{{", array.len()).as_bytes());
                 for (key, element) in array.iter() {
-                    self.write_key(key);
+                    self.write_key(&key);
                     self.write_value(element, depth + 1)?;
                 }
                 self.output.extend_from_slice(b"}");

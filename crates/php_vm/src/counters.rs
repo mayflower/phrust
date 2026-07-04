@@ -234,6 +234,11 @@ pub struct VmCounters {
     pub object_declared_slot_writes: u64,
     pub object_dynamic_property_map_reads: u64,
     pub object_dynamic_property_map_writes: u64,
+    pub packed_values_storage_arrays: u64,
+    pub packed_values_storage_reads: u64,
+    pub packed_values_storage_appends: u64,
+    pub packed_virtual_key_iterations: u64,
+    pub packed_to_mixed_by_reason: BTreeMap<String, u64>,
     pub symbolized_call_name_hits: u64,
     pub symbolized_method_name_hits: u64,
     pub symbolized_property_name_hits: u64,
@@ -806,6 +811,26 @@ impl VmCounters {
         self.object_declared_slot_writes += stats.object_declared_slot_writes;
         self.object_dynamic_property_map_reads += stats.object_dynamic_property_map_reads;
         self.object_dynamic_property_map_writes += stats.object_dynamic_property_map_writes;
+        self.packed_values_storage_arrays += stats.packed_values_storage_arrays;
+        self.packed_values_storage_reads += stats.packed_values_storage_reads;
+        self.packed_values_storage_appends += stats.packed_values_storage_appends;
+        self.packed_virtual_key_iterations += stats.packed_virtual_key_iterations;
+        for (reason, count) in [
+            ("string_key", stats.packed_to_mixed_string_key),
+            (
+                "non_sequential_int_key",
+                stats.packed_to_mixed_non_sequential_int_key,
+            ),
+            ("append_key_gap", stats.packed_to_mixed_append_key_gap),
+            ("unset_hole", stats.packed_to_mixed_unset_hole),
+        ] {
+            if count > 0 {
+                *self
+                    .packed_to_mixed_by_reason
+                    .entry(reason.to_owned())
+                    .or_default() += count;
+            }
+        }
     }
 
     pub(crate) fn record_bytecode_lower_attempt(&mut self) {
@@ -2554,6 +2579,36 @@ impl VmCounters {
             &mut json,
             "object_dynamic_property_map_writes",
             self.object_dynamic_property_map_writes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_values_storage_arrays",
+            self.packed_values_storage_arrays,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_values_storage_reads",
+            self.packed_values_storage_reads,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_values_storage_appends",
+            self.packed_values_storage_appends,
+            true,
+        );
+        push_field(
+            &mut json,
+            "packed_virtual_key_iterations",
+            self.packed_virtual_key_iterations,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "packed_to_mixed_by_reason",
+            &self.packed_to_mixed_by_reason,
             true,
         );
         push_field(
@@ -4586,6 +4641,14 @@ mod tests {
             object_declared_slot_writes: 67,
             object_dynamic_property_map_reads: 71,
             object_dynamic_property_map_writes: 73,
+            packed_values_storage_arrays: 79,
+            packed_values_storage_reads: 83,
+            packed_values_storage_appends: 89,
+            packed_virtual_key_iterations: 97,
+            packed_to_mixed_string_key: 101,
+            packed_to_mixed_non_sequential_int_key: 103,
+            packed_to_mixed_append_key_gap: 107,
+            packed_to_mixed_unset_hole: 109,
         });
         counters.record_autoload();
         counters.record_literal_intern(false);
@@ -4856,6 +4919,38 @@ mod tests {
         assert_eq!(counters.object_declared_slot_writes, 67);
         assert_eq!(counters.object_dynamic_property_map_reads, 71);
         assert_eq!(counters.object_dynamic_property_map_writes, 73);
+        assert_eq!(counters.packed_values_storage_arrays, 79);
+        assert_eq!(counters.packed_values_storage_reads, 83);
+        assert_eq!(counters.packed_values_storage_appends, 89);
+        assert_eq!(counters.packed_virtual_key_iterations, 97);
+        assert_eq!(
+            counters
+                .packed_to_mixed_by_reason
+                .get("string_key")
+                .copied(),
+            Some(101)
+        );
+        assert_eq!(
+            counters
+                .packed_to_mixed_by_reason
+                .get("non_sequential_int_key")
+                .copied(),
+            Some(103)
+        );
+        assert_eq!(
+            counters
+                .packed_to_mixed_by_reason
+                .get("append_key_gap")
+                .copied(),
+            Some(107)
+        );
+        assert_eq!(
+            counters
+                .packed_to_mixed_by_reason
+                .get("unset_hole")
+                .copied(),
+            Some(109)
+        );
         assert_eq!(counters.string_concats, 1);
         assert_eq!(counters.packed_dim_fast_path_hits, 1);
         assert_eq!(counters.packed_dim_fast_path_misses, 1);
