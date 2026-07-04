@@ -310,6 +310,9 @@ pub struct VmCounters {
     pub intrinsic_hits: BTreeMap<String, u64>,
     pub intrinsic_misses: BTreeMap<String, u64>,
     pub intrinsic_fallback_by_reason: BTreeMap<String, u64>,
+    pub json_encode_fast_path_hits: u64,
+    pub json_encode_fast_path_bytes: u64,
+    pub json_encode_generic_fallback_by_reason: BTreeMap<String, u64>,
     pub specialized_builtin_opcode_hits: BTreeMap<String, u64>,
     pub slow_path_calls_by_reason: BTreeMap<String, u64>,
     pub value_clone_by_reason: BTreeMap<String, u64>,
@@ -1456,6 +1459,19 @@ impl VmCounters {
             .entry(format!("{name}.{reason}"))
             .or_default() += 1;
         self.record_slow_path_call(&format!("builtin_intrinsic.{name}.{reason}"));
+    }
+
+    pub(crate) fn record_json_encode_fast_path(&mut self, bytes: usize) {
+        self.json_encode_fast_path_hits += 1;
+        self.json_encode_fast_path_bytes += bytes as u64;
+    }
+
+    pub(crate) fn record_json_encode_generic_fallback(&mut self, reason: &str) {
+        *self
+            .json_encode_generic_fallback_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+        self.record_slow_path_call(&format!("json_encode_generic.{reason}"));
     }
 
     pub(crate) fn record_call_ic_megamorphic_fallback(&mut self) {
@@ -3063,6 +3079,24 @@ impl VmCounters {
             &mut json,
             "intrinsic_fallback_by_reason",
             &self.intrinsic_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "json_encode_fast_path_hits",
+            self.json_encode_fast_path_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "json_encode_fast_path_bytes",
+            self.json_encode_fast_path_bytes,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "json_encode_generic_fallback_by_reason",
+            &self.json_encode_generic_fallback_by_reason,
             true,
         );
         push_string_u64_map_field(

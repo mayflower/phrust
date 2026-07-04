@@ -4480,6 +4480,24 @@ impl Vm {
         }
     }
 
+    fn record_counter_json_encode_fast_path(&self, bytes: usize) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_json_encode_fast_path(bytes);
+        }
+    }
+
+    fn record_counter_json_encode_generic_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_json_encode_generic_fallback(reason);
+        }
+    }
+
     fn record_counter_call_ic_megamorphic_fallback(&self) {
         if !self.options.collect_counters {
             return;
@@ -4523,10 +4541,13 @@ impl Vm {
         let Some(entry) = self.lookup_internal_function_dispatch(name) else {
             return unknown_builtin_result(name, output);
         };
-        if self.options.inline_caches.enabled()
-            && let Some(result) = self.try_execute_fast_builtin_stub(name, &values, output)
-        {
-            return result;
+        if self.options.inline_caches.enabled() {
+            if let Some(result) = self.try_execute_fast_builtin_stub(name, &values, output) {
+                return result;
+            }
+            if let Some(result) = self.try_execute_json_encode_fast(name, &values, state) {
+                return result;
+            }
         }
         if let Some(result) = self.try_execute_direct_count_array(name, &values, output) {
             return result;
@@ -4836,6 +4857,43 @@ impl Vm {
             self.record_counter_internal_count_array_direct_fast_path_hit();
         }
         Some(VmResult::success_no_output(Some(result)))
+    }
+
+    /// Default-flags `json_encode` over scalar/array shapes, bypassing the
+    /// serde tree and the full builtin-context construction. Fallback keeps
+    /// the generic path authoritative for floats, objects, references,
+    /// non-default flags, and every error case.
+    fn try_execute_json_encode_fast(
+        &self,
+        name: &str,
+        values: &[Value],
+        state: &mut ExecutionState,
+    ) -> Option<VmResult> {
+        if name != "json_encode" {
+            return None;
+        }
+        match values {
+            [_] | [_, Value::Int(0)] => {}
+            [_, _] => {
+                self.record_counter_json_encode_generic_fallback("flags");
+                return None;
+            }
+            _ => {
+                self.record_counter_json_encode_generic_fallback("arity");
+                return None;
+            }
+        }
+        match php_runtime::builtins::json_fast::json_encode_default_flags(&values[0]) {
+            Ok(encoded) => {
+                self.record_counter_json_encode_fast_path(encoded.len());
+                state.json_last_error = php_runtime::builtins::json_fast::JSON_ENCODE_NO_ERROR;
+                Some(VmResult::success_no_output(Some(Value::string(encoded))))
+            }
+            Err(reason) => {
+                self.record_counter_json_encode_generic_fallback(reason);
+                None
+            }
+        }
     }
 
     fn try_execute_direct_count_array(

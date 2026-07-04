@@ -17,6 +17,7 @@ pub(in crate::builtins) mod hash;
 pub(in crate::builtins) mod iconv;
 pub(in crate::builtins) mod intl;
 pub(in crate::builtins) mod json;
+pub mod json_fast;
 pub(in crate::builtins) mod math;
 pub(in crate::builtins) mod mbstring;
 pub(in crate::builtins) mod memcached;
