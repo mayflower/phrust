@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import overhead_attribution
 from normalize_perf_output import normalize
 from ratchet_schema import (
     counter_highlights as ratchet_counter_highlights,
@@ -623,7 +624,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         "Timed iterations run uninstrumented. Startup/Compile/Execute columns and",
         "counter highlights come from one dedicated instrumented run per row and",
-        "are not part of the timed medians.",
+        "are not part of the timed medians. Per-scenario overhead-family",
+        "attribution lands in `target/performance/app-flows/overhead.{json,md}`;",
+        "family definitions live in `docs/performance-counter-families.md`.",
         "",
         "## Summary",
         "",
@@ -980,6 +983,11 @@ def run_matrix(args: argparse.Namespace) -> int:
                     "counter_highlights": counter_focus(
                         instrumented.counters if instrumented is not None else {}
                     ),
+                    "overhead_families": (
+                        overhead_attribution.attribute(instrumented.counters)
+                        if instrumented is not None and instrumented.counters
+                        else {}
+                    ),
                 }
             )
 
@@ -1012,6 +1020,24 @@ def run_matrix(args: argparse.Namespace) -> int:
     rendered = render_markdown(summary)
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     markdown_path.write_text(rendered, encoding="utf-8")
+    overhead_report = overhead_attribution.build_report(
+        [
+            {
+                "scenario": row["scenario"],
+                "row": row["row"],
+                "counters": row["counters"],
+            }
+            for row in rows
+            if isinstance(row.get("counters"), dict) and row["counters"]
+        ]
+    )
+    overhead_json_path = out_dir / "overhead.json"
+    overhead_json_path.write_text(
+        json.dumps(overhead_report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (out_dir / "overhead.md").write_text(
+        overhead_attribution.render_markdown(overhead_report), encoding="utf-8"
+    )
     if should_write_summary_doc(mode):
         SUMMARY_DOC.write_text(rendered, encoding="utf-8")
     if args.ratchet_out is not None:
@@ -1037,8 +1063,8 @@ def run_matrix(args: argparse.Namespace) -> int:
         return 1
     print(
         "[pass] app-flow matrix compared "
-        f"{len(scenarios)} scenario(s), wrote {rel(json_path)}, "
-        f"reference_status={reference_status}"
+        f"{len(scenarios)} scenario(s), wrote {rel(json_path)} and "
+        f"{rel(overhead_json_path)}, reference_status={reference_status}"
     )
     if not reference_available:
         print(f"[skip] reference PHP unavailable: {rel(reference)}")
@@ -1115,6 +1141,24 @@ def self_test() -> int:
         raise SystemExit("self-test: instrumented command must carry instrumentation flags")
     if should_write_summary_doc("smoke") or not should_write_summary_doc("full"):
         raise SystemExit("self-test: summary doc gating incorrect")
+    overhead_attribution.self_test()
+    overhead_report = overhead_attribution.build_report(
+        [
+            {
+                "scenario": scenarios[0].id,
+                "row": "phrust-fast-preset",
+                "counters": {"value_clones": 5, "array_handle_clones": 2},
+            }
+        ]
+    )
+    if overhead_report["schema"] != overhead_attribution.OVERHEAD_SCHEMA:
+        raise SystemExit("self-test: overhead report schema mismatch")
+    top = overhead_report["rows"][0]["top_families"]
+    if [entry["family"] for entry in top] != ["value_clones", "array_handle_clones"]:
+        raise SystemExit(f"self-test: overhead top families incorrect: {top}")
+    overhead_markdown = overhead_attribution.render_markdown(overhead_report)
+    if "value_clones=5" not in overhead_markdown:
+        raise SystemExit("self-test: overhead markdown render failed")
     print(f"[pass] app-flow matrix self-test validated {len(scenarios)} scenarios")
     return 0
 
