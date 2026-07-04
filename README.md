@@ -1,5 +1,9 @@
 # phrust
 
+<p align="center">
+  <img src="assets/elephrant-black.png" alt="phrust elephrant logo" width="180">
+</p>
+
 `phrust` is an experiment in recreating an existing program, PHP, by extracting
 specifications from the original documentation and tests and then implementing those
 specifications with enough initial structure, validation gates, and feedback
