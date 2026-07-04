@@ -1,18 +1,175 @@
 use super::{ClassEntry, ObjectIdGuard, debug::property_debug_label, next_object_id};
 use crate::Value;
-use std::cell::{BorrowError, BorrowMutError, RefCell};
+use std::cell::{BorrowError, BorrowMutError, Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
+
+/// Class-owned declared-property layout, shared across instances of the
+/// same class through a thread-local cache. The layout maps storage names
+/// (private names arrive pre-mangled as `private:Owner:prop`) to slot
+/// indices and carries the per-class debug labels; per-object state is a
+/// plain slot vector plus a side map for dynamic properties.
+struct PropertyLayout {
+    /// Process-thread-unique identity used as the slot-access guard.
+    layout_id: u64,
+    /// Declared storage names in declaration order, slot-index aligned.
+    slot_names: Vec<String>,
+    /// storage name -> slot index.
+    slot_by_name: HashMap<String, u32>,
+    /// var_dump labels for every class property name (including statics and
+    /// virtual hook properties, matching the previous per-object map).
+    debug_labels: HashMap<String, String>,
+}
+
+thread_local! {
+    static LAYOUT_CACHE: RefCell<HashMap<String, Vec<Rc<PropertyLayout>>>> =
+        RefCell::new(HashMap::new());
+    static NEXT_LAYOUT_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+fn next_layout_id() -> u64 {
+    NEXT_LAYOUT_ID.with(|next| {
+        let id = next.get();
+        next.set(id.wrapping_add(1));
+        id
+    })
+}
+
+/// Returns true when a property entry occupies backed instance storage.
+fn is_backed_instance_property(property: &super::ClassPropertyEntry) -> bool {
+    !property.flags.is_static
+        && !((property.hooks.get_function_id.is_some() || property.hooks.set_function_id.is_some())
+            && !property.hooks.backed)
+}
+
+/// Builds or reuses the shared layout for a class. Conditional classes can
+/// redefine a name with a different shape, so a cached layout is only
+/// shared when the declared names and debug labels match exactly; slot
+/// defaults always come from the caller's class entry.
+fn class_layout(class: &ClassEntry, display_name: &str) -> Rc<PropertyLayout> {
+    let mut slot_names = Vec::new();
+    for property in &class.properties {
+        if is_backed_instance_property(property) && !slot_names.contains(&property.name) {
+            slot_names.push(property.name.clone());
+        }
+    }
+    let debug_labels: HashMap<String, String> = class
+        .properties
+        .iter()
+        .map(|property| {
+            (
+                property.name.clone(),
+                property_debug_label(property, display_name),
+            )
+        })
+        .collect();
+    LAYOUT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let candidates = cache.entry(class.name.clone()).or_default();
+        if let Some(existing) = candidates
+            .iter()
+            .find(|layout| layout.slot_names == slot_names && layout.debug_labels == debug_labels)
+        {
+            return Rc::clone(existing);
+        }
+        let slot_by_name = slot_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index as u32))
+            .collect();
+        let layout = Rc::new(PropertyLayout {
+            layout_id: next_layout_id(),
+            slot_names,
+            slot_by_name,
+            debug_labels,
+        });
+        candidates.push(Rc::clone(&layout));
+        layout
+    })
+}
 
 #[derive(Debug)]
 struct ObjectStorage {
     class_name: String,
     display_name: String,
     id_guard: Option<ObjectIdGuard>,
-    properties: HashMap<String, Value>,
-    property_order: Vec<String>,
-    property_debug_labels: HashMap<String, String>,
+    layout: Rc<PropertyLayout>,
+    /// Declared property slots; `None` means unset (absent), which is
+    /// distinct from a present `Value::Uninitialized` typed slot.
+    declared_slots: Vec<Option<Value>>,
+    /// Dynamic (undeclared) properties; declared names never live here.
+    dynamic_properties: HashMap<String, Value>,
+    /// Insertion order of dynamic properties. Declared properties iterate
+    /// in declaration (slot) order — even after unset and re-assignment,
+    /// matching reference slot semantics — followed by dynamic entries.
+    dynamic_order: Vec<String>,
+    /// Labels for debug-view entries that are not part of the class layout.
+    dynamic_debug_labels: HashMap<String, String>,
+}
+
+impl fmt::Debug for PropertyLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PropertyLayout")
+            .field("layout_id", &self.layout_id)
+            .field("slot_names", &self.slot_names)
+            .finish()
+    }
+}
+
+impl ObjectStorage {
+    fn get(&self, name: &str) -> Option<&Value> {
+        if let Some(slot) = self.layout.slot_by_name.get(name) {
+            crate::layout_stats::record_object_declared_slot_read();
+            return self.declared_slots[*slot as usize].as_ref();
+        }
+        crate::layout_stats::record_object_dynamic_property_map_read();
+        self.dynamic_properties.get(name)
+    }
+
+    fn set(&mut self, name: String, value: Value) {
+        if let Some(slot) = self.layout.slot_by_name.get(&name).copied() {
+            crate::layout_stats::record_object_declared_slot_write();
+            self.declared_slots[slot as usize] = Some(value);
+            return;
+        }
+        crate::layout_stats::record_object_dynamic_property_map_write();
+        if !self.dynamic_properties.contains_key(&name) {
+            self.dynamic_order.push(name.clone());
+        }
+        self.dynamic_properties.insert(name, value);
+    }
+
+    fn unset(&mut self, name: &str) -> bool {
+        if let Some(slot) = self.layout.slot_by_name.get(name).copied() {
+            let slot_value = &mut self.declared_slots[slot as usize];
+            if slot_value.is_none() {
+                return false;
+            }
+            *slot_value = None;
+            return true;
+        }
+        let removed = self.dynamic_properties.remove(name).is_some();
+        if removed {
+            self.dynamic_order.retain(|entry| entry != name);
+        }
+        removed
+    }
+
+    fn snapshot(&self) -> Vec<(String, Value)> {
+        let declared = self
+            .layout
+            .slot_names
+            .iter()
+            .zip(&self.declared_slots)
+            .filter_map(|(name, slot)| slot.as_ref().map(|value| (name.clone(), value.clone())));
+        let dynamic = self.dynamic_order.iter().filter_map(|name| {
+            self.dynamic_properties
+                .get(name)
+                .map(|value| (name.clone(), value.clone()))
+        });
+        declared.chain(dynamic).collect()
+    }
 }
 
 /// Reference to runtime object storage.
@@ -64,34 +221,18 @@ impl ObjectRef {
     pub fn new_with_display_name(class: &ClassEntry, display_name: impl Into<String>) -> Self {
         crate::layout_stats::record_object_allocation();
         let display_name = display_name.into();
-        let property_entries = class
-            .properties
-            .iter()
-            .filter(|property| {
-                !property.flags.is_static
-                    && !((property.hooks.get_function_id.is_some()
-                        || property.hooks.set_function_id.is_some())
-                        && !property.hooks.backed)
-            })
-            .map(|property| (property.name.clone(), property.default.clone()))
-            .collect::<Vec<_>>();
-        let property_debug_labels = class
-            .properties
-            .iter()
-            .map(|property| {
-                (
-                    property.name.clone(),
-                    property_debug_label(property, &display_name),
-                )
-            })
-            .collect();
-        let mut property_order = Vec::new();
-        for (name, _) in &property_entries {
-            if !property_order.iter().any(|entry| entry == name) {
-                property_order.push(name.clone());
+        let layout = class_layout(class, &display_name);
+        // Slot defaults always come from the caller's class entry (a cached
+        // layout may have been built from an earlier, identical shape).
+        let mut declared_slots: Vec<Option<Value>> = vec![None; layout.slot_names.len()];
+        for property in &class.properties {
+            if !is_backed_instance_property(property) {
+                continue;
+            }
+            if let Some(slot) = layout.slot_by_name.get(&property.name) {
+                declared_slots[*slot as usize] = Some(property.default.clone());
             }
         }
-        let properties = property_entries.into_iter().collect();
         let id = next_object_id();
         Self {
             id,
@@ -99,9 +240,11 @@ impl ObjectRef {
                 class_name: class.name.clone(),
                 display_name,
                 id_guard: Some(ObjectIdGuard::new(id)),
-                properties,
-                property_order,
-                property_debug_labels,
+                layout,
+                declared_slots,
+                dynamic_properties: HashMap::new(),
+                dynamic_order: Vec::new(),
+                dynamic_debug_labels: HashMap::new(),
             })),
         }
     }
@@ -117,15 +260,21 @@ impl ObjectRef {
         source: &Self,
         properties: Vec<(String, String, Value)>,
     ) -> Self {
-        let mut property_order = Vec::with_capacity(properties.len());
-        let mut property_values = HashMap::with_capacity(properties.len());
-        let mut property_debug_labels = HashMap::with_capacity(properties.len());
+        let empty_layout = Rc::new(PropertyLayout {
+            layout_id: 0,
+            slot_names: Vec::new(),
+            slot_by_name: HashMap::new(),
+            debug_labels: HashMap::new(),
+        });
+        let mut dynamic_order = Vec::with_capacity(properties.len());
+        let mut dynamic_properties = HashMap::with_capacity(properties.len());
+        let mut dynamic_debug_labels = HashMap::with_capacity(properties.len());
         for (name, debug_label, value) in properties {
-            if !property_values.contains_key(&name) {
-                property_order.push(name.clone());
+            if !dynamic_properties.contains_key(&name) {
+                dynamic_order.push(name.clone());
             }
-            property_debug_labels.insert(name.clone(), debug_label);
-            property_values.insert(name, value);
+            dynamic_debug_labels.insert(name.clone(), debug_label);
+            dynamic_properties.insert(name, value);
         }
         Self {
             id: source.id,
@@ -133,9 +282,11 @@ impl ObjectRef {
                 class_name: source.class_name(),
                 display_name: source.display_name(),
                 id_guard: None,
-                properties: property_values,
-                property_order,
-                property_debug_labels,
+                layout: empty_layout,
+                declared_slots: Vec::new(),
+                dynamic_properties,
+                dynamic_order,
+                dynamic_debug_labels,
             })),
         }
     }
@@ -185,9 +336,11 @@ impl ObjectRef {
                 class_name: storage.class_name.clone(),
                 display_name: storage.display_name.clone(),
                 id_guard: Some(ObjectIdGuard::new(id)),
-                properties: storage.properties.clone(),
-                property_order: storage.property_order.clone(),
-                property_debug_labels: storage.property_debug_labels.clone(),
+                layout: Rc::clone(&storage.layout),
+                declared_slots: storage.declared_slots.clone(),
+                dynamic_properties: storage.dynamic_properties.clone(),
+                dynamic_order: storage.dynamic_order.clone(),
+                dynamic_debug_labels: storage.dynamic_debug_labels.clone(),
             })),
         }
     }
@@ -195,24 +348,19 @@ impl ObjectRef {
     /// Reads a property value.
     #[must_use]
     pub fn get_property(&self, name: &str) -> Option<Value> {
-        self.storage.borrow().properties.get(name).cloned()
+        self.storage.borrow().get(name).cloned()
     }
 
     /// Attempts to read a property value without panicking on nested borrows.
     pub fn try_get_property(&self, name: &str) -> Result<Option<Value>, BorrowError> {
         self.storage
             .try_borrow()
-            .map(|storage| storage.properties.get(name).cloned())
+            .map(|storage| storage.get(name).cloned())
     }
 
     /// Writes a property value.
     pub fn set_property(&self, name: impl Into<String>, value: Value) {
-        let name = name.into();
-        let mut storage = self.storage.borrow_mut();
-        if !storage.properties.contains_key(&name) {
-            storage.property_order.push(name.clone());
-        }
-        storage.properties.insert(name, value);
+        self.storage.borrow_mut().set(name.into(), value);
     }
 
     /// Attempts to write a property value without panicking on nested borrows.
@@ -222,33 +370,27 @@ impl ObjectRef {
         value: Value,
     ) -> Result<(), BorrowMutError> {
         let name = name.into();
-        self.storage.try_borrow_mut().map(|mut storage| {
-            if !storage.properties.contains_key(&name) {
-                storage.property_order.push(name.clone());
-            }
-            storage.properties.insert(name, value);
-        })
+        self.storage
+            .try_borrow_mut()
+            .map(|mut storage| storage.set(name, value))
     }
 
     /// Returns the `var_dump` property label for a stored property name.
     #[must_use]
     pub fn property_debug_label(&self, name: &str) -> String {
-        self.storage
-            .borrow()
-            .property_debug_labels
+        let storage = self.storage.borrow();
+        storage
+            .layout
+            .debug_labels
             .get(name)
+            .or_else(|| storage.dynamic_debug_labels.get(name))
             .cloned()
             .unwrap_or_else(|| format!("\"{name}\""))
     }
 
     /// Removes a property value, returning whether it existed.
     pub fn unset_property(&self, name: &str) -> bool {
-        let mut storage = self.storage.borrow_mut();
-        let removed = storage.properties.remove(name).is_some();
-        if removed {
-            storage.property_order.retain(|entry| entry != name);
-        }
-        removed
+        self.storage.borrow_mut().unset(name)
     }
 
     /// Clears all stored properties as an internal GC action.
@@ -258,8 +400,11 @@ impl ObjectRef {
     /// rooted.
     pub fn gc_clear_properties(&self) {
         let mut storage = self.storage.borrow_mut();
-        storage.properties.clear();
-        storage.property_order.clear();
+        for slot in &mut storage.declared_slots {
+            *slot = None;
+        }
+        storage.dynamic_properties.clear();
+        storage.dynamic_order.clear();
     }
 
     /// Releases the PHP-visible object handle after the VM proves the object has
@@ -273,33 +418,73 @@ impl ObjectRef {
     /// Returns a snapshot of runtime properties in PHP insertion/declaration order.
     #[must_use]
     pub fn properties_snapshot(&self) -> Vec<(String, Value)> {
-        let storage = self.storage.borrow();
-        storage
-            .property_order
-            .iter()
-            .filter_map(|name| {
-                storage
-                    .properties
-                    .get(name)
-                    .map(|value| (name.clone(), value.clone()))
-            })
-            .collect()
+        self.storage.borrow().snapshot()
     }
 
     /// Attempts to snapshot runtime properties without panicking on nested borrows.
     pub fn try_properties_snapshot(&self) -> Result<Vec<(String, Value)>, BorrowError> {
-        self.storage.try_borrow().map(|storage| {
-            storage
-                .property_order
-                .iter()
-                .filter_map(|name| {
-                    storage
-                        .properties
-                        .get(name)
-                        .map(|value| (name.clone(), value.clone()))
-                })
-                .collect()
-        })
+        self.storage.try_borrow().map(|storage| storage.snapshot())
+    }
+
+    /// Identity of this object's class layout, used as the declared-slot
+    /// access guard by inline caches.
+    #[must_use]
+    pub fn class_layout_epoch(&self) -> u64 {
+        self.storage.borrow().layout.layout_id
+    }
+
+    /// Slot index for a declared storage name under the current layout.
+    #[must_use]
+    pub fn declared_slot_index(&self, storage_name: &str) -> Option<u32> {
+        self.storage
+            .borrow()
+            .layout
+            .slot_by_name
+            .get(storage_name)
+            .copied()
+    }
+
+    /// Declared storage name for a slot under the current layout.
+    #[must_use]
+    pub fn slot_metadata(&self, slot: u32) -> Option<String> {
+        self.storage
+            .borrow()
+            .layout
+            .slot_names
+            .get(slot as usize)
+            .cloned()
+    }
+
+    /// Reads a declared slot directly when the layout guard matches.
+    /// Returns `None` on guard mismatch or an unset slot; callers fall back
+    /// to the generic name-keyed path.
+    #[must_use]
+    pub fn get_declared_slot(&self, slot: u32, layout_epoch: u64) -> Option<Value> {
+        let storage = self.storage.borrow();
+        if storage.layout.layout_id != layout_epoch {
+            return None;
+        }
+        let value = storage.declared_slots.get(slot as usize)?.clone();
+        if value.is_some() {
+            crate::layout_stats::record_object_declared_slot_read();
+        }
+        value
+    }
+
+    /// Writes a declared slot directly when the layout guard matches.
+    /// Returns false on guard mismatch so callers fall back to the generic
+    /// name-keyed path.
+    pub fn set_declared_slot(&self, slot: u32, layout_epoch: u64, value: Value) -> bool {
+        let mut storage = self.storage.borrow_mut();
+        if storage.layout.layout_id != layout_epoch {
+            return false;
+        }
+        let Some(slot_value) = storage.declared_slots.get_mut(slot as usize) else {
+            return false;
+        };
+        *slot_value = Some(value);
+        crate::layout_stats::record_object_declared_slot_write();
+        true
     }
 }
 

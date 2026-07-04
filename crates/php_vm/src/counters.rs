@@ -230,6 +230,10 @@ pub struct VmCounters {
     pub string_hash_cache_misses: u64,
     pub symbol_eq_fast_hits: u64,
     pub symbol_eq_byte_fallbacks: u64,
+    pub object_declared_slot_reads: u64,
+    pub object_declared_slot_writes: u64,
+    pub object_dynamic_property_map_reads: u64,
+    pub object_dynamic_property_map_writes: u64,
     pub symbolized_call_name_hits: u64,
     pub symbolized_method_name_hits: u64,
     pub symbolized_property_name_hits: u64,
@@ -798,6 +802,10 @@ impl VmCounters {
         self.string_hash_cache_misses += stats.string_hash_cache_misses;
         self.symbol_eq_fast_hits += stats.symbol_eq_fast_hits;
         self.symbol_eq_byte_fallbacks += stats.symbol_eq_byte_fallbacks;
+        self.object_declared_slot_reads += stats.object_declared_slot_reads;
+        self.object_declared_slot_writes += stats.object_declared_slot_writes;
+        self.object_dynamic_property_map_reads += stats.object_dynamic_property_map_reads;
+        self.object_dynamic_property_map_writes += stats.object_dynamic_property_map_writes;
     }
 
     pub(crate) fn record_bytecode_lower_attempt(&mut self) {
@@ -2522,6 +2530,30 @@ impl VmCounters {
             &mut json,
             "symbol_eq_byte_fallbacks",
             self.symbol_eq_byte_fallbacks,
+            true,
+        );
+        push_field(
+            &mut json,
+            "object_declared_slot_reads",
+            self.object_declared_slot_reads,
+            true,
+        );
+        push_field(
+            &mut json,
+            "object_declared_slot_writes",
+            self.object_declared_slot_writes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "object_dynamic_property_map_reads",
+            self.object_dynamic_property_map_reads,
+            true,
+        );
+        push_field(
+            &mut json,
+            "object_dynamic_property_map_writes",
+            self.object_dynamic_property_map_writes,
             true,
         );
         push_field(
@@ -4550,6 +4582,10 @@ mod tests {
             string_hash_cache_misses: 47,
             symbol_eq_fast_hits: 53,
             symbol_eq_byte_fallbacks: 59,
+            object_declared_slot_reads: 61,
+            object_declared_slot_writes: 67,
+            object_dynamic_property_map_reads: 71,
+            object_dynamic_property_map_writes: 73,
         });
         counters.record_autoload();
         counters.record_literal_intern(false);
@@ -4816,6 +4852,10 @@ mod tests {
         assert_eq!(counters.string_hash_cache_misses, 47);
         assert_eq!(counters.symbol_eq_fast_hits, 53);
         assert_eq!(counters.symbol_eq_byte_fallbacks, 59);
+        assert_eq!(counters.object_declared_slot_reads, 61);
+        assert_eq!(counters.object_declared_slot_writes, 67);
+        assert_eq!(counters.object_dynamic_property_map_reads, 71);
+        assert_eq!(counters.object_dynamic_property_map_writes, 73);
         assert_eq!(counters.string_concats, 1);
         assert_eq!(counters.packed_dim_fast_path_hits, 1);
         assert_eq!(counters.packed_dim_fast_path_misses, 1);

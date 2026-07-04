@@ -52,6 +52,14 @@ pub struct RuntimeLayoutStats {
     pub symbol_eq_fast_hits: u64,
     /// String equality that fell back to byte comparison.
     pub symbol_eq_byte_fallbacks: u64,
+    /// Declared object property reads served from the slot vector.
+    pub object_declared_slot_reads: u64,
+    /// Declared object property writes into the slot vector.
+    pub object_declared_slot_writes: u64,
+    /// Object property reads that consulted the dynamic side map.
+    pub object_dynamic_property_map_reads: u64,
+    /// Object property writes into the dynamic side map.
+    pub object_dynamic_property_map_writes: u64,
 }
 
 static LAYOUT_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -171,6 +179,26 @@ layout_recorder!(
     pub(crate) record_symbol_eq_byte_fallback,
     record_symbol_eq_byte_fallback_slow,
     symbol_eq_byte_fallbacks
+);
+layout_recorder!(
+    pub(crate) record_object_declared_slot_read,
+    record_object_declared_slot_read_slow,
+    object_declared_slot_reads
+);
+layout_recorder!(
+    pub(crate) record_object_declared_slot_write,
+    record_object_declared_slot_write_slow,
+    object_declared_slot_writes
+);
+layout_recorder!(
+    pub(crate) record_object_dynamic_property_map_read,
+    record_object_dynamic_property_map_read_slow,
+    object_dynamic_property_map_reads
+);
+layout_recorder!(
+    pub(crate) record_object_dynamic_property_map_write,
+    record_object_dynamic_property_map_write_slow,
+    object_dynamic_property_map_writes
 );
 
 /// Clears layout counters for deterministic VM executions and enables
