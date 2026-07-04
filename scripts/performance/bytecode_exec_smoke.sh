@@ -40,6 +40,8 @@ strict_unsupported_fixtures=(
   "fixtures/runtime/valid/generators/yield.php:instruction_subset"
 )
 
+# Statically named instantiation joined the dense subset, so these probes
+# instantiate through a dynamic class name to stay rich-planned.
 auto_fallback_fixtures=(
   "fixtures/bytecode/fallback/object-property-read-auto.php:object_instantiation"
   "fixtures/bytecode/fallback/object-property-write-auto.php:object_instantiation"

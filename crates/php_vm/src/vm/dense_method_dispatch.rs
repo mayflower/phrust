@@ -237,6 +237,7 @@ impl Vm {
             &class_owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context(
@@ -497,6 +498,7 @@ impl Vm {
             &class_owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_class_context(
                     declaring_class.name.clone(),
                     called_class,
@@ -592,6 +594,7 @@ impl Vm {
             &owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(compiled.unit().strict_types)
                 .with_optional_call_span(call_span)
                 .with_class_context(
                     declaring_class.name.clone(),
@@ -626,9 +629,12 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        // Autoloaders receive the source-case class name (the reference
+        // engine passes the spelling at the new-expression site); the
+        // normalized name would fail case-sensitive loader comparisons.
         if let Err(result) = self.autoload_static_class_if_missing(
             compiled,
-            class_name,
+            display_class_name,
             call_span.unwrap_or_default(),
             Some((
                 compiled_unit_cache_key(compiled),

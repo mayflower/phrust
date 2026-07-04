@@ -149,6 +149,7 @@ pub struct VmCounters {
     pub dense_direct_call_hits: u64,
     pub dense_method_call_hits: u64,
     pub dense_static_call_hits: u64,
+    pub dense_callable_call_hits: u64,
     pub dense_call_ic_hits: u64,
     pub dense_call_ic_misses: u64,
     pub dense_call_fallback_by_reason: BTreeMap<String, u64>,
@@ -989,6 +990,10 @@ impl VmCounters {
 
     pub(crate) fn record_dense_static_call_hit(&mut self) {
         self.dense_static_call_hits += 1;
+    }
+
+    pub(crate) fn record_dense_callable_call_hit(&mut self) {
+        self.dense_callable_call_hits += 1;
     }
 
     pub(crate) fn record_dense_call_ic_hit(&mut self) {
@@ -2279,6 +2284,12 @@ impl VmCounters {
             &mut json,
             "dense_static_call_hits",
             self.dense_static_call_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_callable_call_hits",
+            self.dense_callable_call_hits,
             true,
         );
         push_field(

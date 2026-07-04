@@ -1156,6 +1156,9 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         ],
         DenseOpcode::CallFunction
         | DenseOpcode::NewObject
+        | DenseOpcode::CallCallable
+        | DenseOpcode::AcquireCallable
+        | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::Include => vec![VmDeoptReason::CallFrameBoundary],

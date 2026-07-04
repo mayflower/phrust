@@ -18,9 +18,9 @@ pub use result::{VmControlFlow, VmResult};
 
 use crate::aliasing::{AliasState, slot_alias_state};
 use crate::bytecode::{
-    DenseBytecodeUnit, DenseCallArg, DenseExecutionPlan, DenseFunction, DenseFunctionPlan,
-    DenseInstruction, DenseOpcode, DenseOperand, DenseOperandKind, DenseOperands,
-    SuperinstructionSelectionReport,
+    DenseBytecodeUnit, DenseCallArg, DenseClosureCapture, DenseExecutionPlan, DenseFunction,
+    DenseFunctionPlan, DenseInstruction, DenseOpcode, DenseOperand, DenseOperandKind,
+    DenseOperands, SuperinstructionSelectionReport,
 };
 use crate::compiled_unit::CompiledUnit;
 #[cfg(feature = "jit-cranelift")]
@@ -2350,6 +2350,15 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_dense_method_call_hit();
+        }
+    }
+
+    fn record_counter_dense_callable_call_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_callable_call_hit();
         }
     }
 
@@ -4911,6 +4920,106 @@ impl Vm {
             self.record_counter_count_array_shape_fast_hit();
         }
         Some(VmResult::success_no_output(Some(result)))
+    }
+
+    /// Dispatches a runtime callable value (callable string, closure,
+    /// invokable, callable array) through the shared function-call target
+    /// helpers. Both the rich `CallCallable` arm and the dense
+    /// `CallCallable` opcode call this, so their semantics cannot diverge:
+    /// plain function-name strings take the function-call inline cache,
+    /// everything else routes through the generic callable dispatcher.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_callable_value_call(
+        &self,
+        compiled: &CompiledUnit,
+        callee: Value,
+        values: Vec<CallArgument>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        call_span: Option<IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        running_fiber: &Option<FiberRef>,
+    ) -> VmResult {
+        match &callee {
+            Value::String(name) => {
+                let display_name = name.to_string_lossy();
+                if display_name.contains("::") {
+                    self.call_callable_with_call_span(
+                        compiled, callee, values, call_span, output, stack, state,
+                    )
+                } else {
+                    let lowered_name = normalize_function_name(&display_name);
+                    let interned_name = PhpString::intern(lowered_name.as_bytes());
+                    let epoch = state.lookup_epoch();
+                    let call_shape = function_call_shape(&values);
+                    let target = self
+                        .lookup_function_call_inline_cache(
+                            compiled,
+                            function_id,
+                            block_id,
+                            instruction_id,
+                            &interned_name,
+                            epoch,
+                            &call_shape,
+                        )
+                        .or_else(|| {
+                            let resolved =
+                                self.resolve_function_call_target(compiled, state, &lowered_name)?;
+                            if self.options.inline_caches.enabled()
+                                && function_call_target_is_builtin(&resolved)
+                            {
+                                self.record_counter_builtin_call_ic(false);
+                            }
+                            self.install_function_call_inline_cache(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction_id,
+                                &interned_name,
+                                epoch,
+                                call_shape.clone(),
+                                resolved.clone(),
+                            );
+                            Some(resolved)
+                        });
+                    if let Some(target) = target {
+                        self.execute_function_call_target(
+                            compiled,
+                            target,
+                            values,
+                            Some((
+                                compiled_unit_cache_key(compiled),
+                                function_id,
+                                block_id,
+                                instruction_id,
+                            )),
+                            call_span,
+                            output,
+                            stack,
+                            state,
+                            running_fiber,
+                        )
+                    } else {
+                        let diagnostic = undefined_function(
+                            &display_name,
+                            RuntimeSourceSpan::default(),
+                            stack_trace(compiled, stack),
+                        );
+                        VmResult::runtime_error_with_diagnostic(
+                            output.clone(),
+                            diagnostic.message().to_owned(),
+                            diagnostic,
+                        )
+                    }
+                }
+            }
+            _ => self.call_callable_with_call_span(
+                compiled, callee, values, call_span, output, stack, state,
+            ),
+        }
     }
 
     /// Default-flags `json_encode` over scalar/array shapes, bypassing the
@@ -8487,6 +8596,192 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::MakeClosure => {
+                        let DenseOperands::MakeClosure {
+                            dst,
+                            function,
+                            ref captures,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let captured = match self
+                            .evaluate_dense_closure_captures(dense, compiled, stack, captures)
+                        {
+                            Ok(captures) => captures,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = make_closure_value(
+                            compiled,
+                            state,
+                            stack,
+                            FunctionId::new(function),
+                            captured,
+                        );
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::AcquireCallable => {
+                        let DenseOperands::RegOperand { dst, src } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let value = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = match acquire_callable_value(compiled, state, stack, value) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                // Dense functions carry no local exception
+                                // handlers (try/catch keeps a function on the
+                                // rich plan), so the raise propagates to
+                                // outer frames.
+                                let mut exception_handlers = Vec::new();
+                                let mut pending_control = None;
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    dense
+                                        .spans
+                                        .get(instruction.span.index())
+                                        .copied()
+                                        .unwrap_or_default(),
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(_) => {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            "E_PHP_VM_DENSE_ACQUIRE_CALLABLE_HANDLER: dense functions have no local exception handlers",
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                    RaiseOutcome::Done(result) => {
+                                        stack.pop_recycle();
+                                        return *result;
+                                    }
+                                }
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::CallCallable => {
+                        let DenseOperands::CallableCall {
+                            dst,
+                            callee,
+                            ref args,
+                        } = instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let callee = match self.read_dense_operand(compiled, stack, callee) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
+                            Ok(values) => values,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let result = self.execute_callable_value_call(
+                            compiled,
+                            callee,
+                            values,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            dense.spans.get(instruction.span.index()).copied(),
+                            output,
+                            stack,
+                            state,
+                            &None,
+                        );
+                        if !result.status.is_success() {
+                            self.record_counter_dense_call_fallback("dispatch_error");
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        if result.fiber_suspension.is_some() {
+                            self.record_counter_dense_call_fallback("fiber_suspension");
+                            let result = VmResult::unsupported(
+                                output.clone(),
+                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode callable calls do not support fiber suspension yet",
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        }
+                        self.record_counter_dense_callable_call_hit();
+                        let value = result.return_value.unwrap_or(Value::Null);
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode caller frame is active")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::CallMethod => {
                         let DenseOperands::MethodCall {
                             dst,
@@ -10946,6 +11241,43 @@ impl Vm {
         dims.iter()
             .map(|operand| self.read_dense_operand(compiled, stack, *operand))
             .collect()
+    }
+
+    /// Dense mirror of `evaluate_closure_captures`: by-ref captures bind the
+    /// enclosing local's reference cell, by-value captures read the operand.
+    fn evaluate_dense_closure_captures(
+        &self,
+        dense: &DenseBytecodeUnit,
+        compiled: &CompiledUnit,
+        stack: &mut CallStack,
+        captures: &[DenseClosureCapture],
+    ) -> Result<Vec<ClosureCaptureValue>, String> {
+        let mut values = Vec::with_capacity(captures.len());
+        for capture in captures {
+            let name = dense
+                .names
+                .get(capture.name as usize)
+                .ok_or_else(|| format!("invalid dense bytecode capture name n{}", capture.name))?;
+            if capture.by_ref {
+                if capture.src.kind != DenseOperandKind::Local {
+                    return Err(format!(
+                        "E_PHP_VM_BY_REF_CAPTURE_NOT_REFERENCEABLE: closure capture ${name} is not a local variable"
+                    ));
+                }
+                let cell = stack
+                    .current_mut()
+                    .ok_or("no active frame")?
+                    .locals
+                    .ensure_reference_cell(LocalId::new(capture.src.index))?;
+                values.push(ClosureCaptureValue::by_reference(name.clone(), cell));
+                continue;
+            }
+            values.push(ClosureCaptureValue::by_value(
+                name.clone(),
+                self.read_dense_operand(compiled, stack, capture.src)?,
+            ));
+        }
+        Ok(values)
     }
 
     fn read_dense_call_args(
@@ -24919,23 +25251,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let bound_this = compiled
-                            .unit()
-                            .functions
-                            .get(function.index())
-                            .filter(|closure| closure.flags.is_closure && !closure.flags.is_static)
-                            .and_then(|_| current_this_object(compiled, stack));
-                        let value = Value::closure(
-                            ClosurePayload::new(function.raw(), captured)
-                                .with_debug(closure_debug_info(compiled, *function))
-                                .with_bound_this(bound_this)
-                                .with_context(ClosureContext {
-                                    owner_unit: dynamic_unit_index_for_compiled(state, compiled),
-                                    scope_class: current_scope_class(compiled, stack),
-                                    called_class: current_called_class(compiled, stack),
-                                    declaring_class: current_scope_class(compiled, stack),
-                                }),
-                        );
+                        let value = make_closure_value(compiled, state, stack, *function, captured);
                         if let Err(message) = stack
                             .current_mut()
                             .expect("frame was pushed")
@@ -25134,98 +25450,19 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result = match &callee {
-                            Value::String(name) => {
-                                let display_name = name.to_string_lossy();
-                                if display_name.contains("::") {
-                                    self.call_callable_with_call_span(
-                                        compiled,
-                                        callee,
-                                        values,
-                                        Some(instruction.span),
-                                        output,
-                                        stack,
-                                        state,
-                                    )
-                                } else {
-                                    let lowered_name = normalize_function_name(&display_name);
-                                    let interned_name = PhpString::intern(lowered_name.as_bytes());
-                                    let epoch = state.lookup_epoch();
-                                    let call_shape = function_call_shape(&values);
-                                    let target = self
-                                        .lookup_function_call_inline_cache(
-                                            compiled,
-                                            function_id,
-                                            block_id,
-                                            instruction.id,
-                                            &interned_name,
-                                            epoch,
-                                            &call_shape,
-                                        )
-                                        .or_else(|| {
-                                            let resolved = self.resolve_function_call_target(
-                                                compiled,
-                                                state,
-                                                &lowered_name,
-                                            )?;
-                                            if self.options.inline_caches.enabled()
-                                                && function_call_target_is_builtin(&resolved)
-                                            {
-                                                self.record_counter_builtin_call_ic(false);
-                                            }
-                                            self.install_function_call_inline_cache(
-                                                compiled,
-                                                function_id,
-                                                block_id,
-                                                instruction.id,
-                                                &interned_name,
-                                                epoch,
-                                                call_shape.clone(),
-                                                resolved.clone(),
-                                            );
-                                            Some(resolved)
-                                        });
-                                    if let Some(target) = target {
-                                        self.execute_function_call_target(
-                                            compiled,
-                                            target,
-                                            values,
-                                            Some((
-                                                compiled_unit_cache_key(compiled),
-                                                function_id,
-                                                block_id,
-                                                instruction.id,
-                                            )),
-                                            Some(instruction.span),
-                                            output,
-                                            stack,
-                                            state,
-                                            &running_fiber,
-                                        )
-                                    } else {
-                                        let diagnostic = undefined_function(
-                                            &display_name,
-                                            RuntimeSourceSpan::default(),
-                                            stack_trace(compiled, stack),
-                                        );
-                                        VmResult::runtime_error_with_diagnostic(
-                                            output.clone(),
-                                            diagnostic.message().to_owned(),
-                                            diagnostic,
-                                        )
-                                    }
-                                }
-                            }
-                            _ => self.call_callable_with_call_span(
-                                compiled,
-                                callee,
-                                values,
-                                Some(instruction.span),
-                                output,
-                                stack,
-                                state,
-                            ),
-                        };
+                        let result = self.execute_callable_value_call(
+                            compiled,
+                            callee,
+                            values,
+                            function_id,
+                            block_id,
+                            instruction.id,
+                            Some(instruction.span),
+                            output,
+                            stack,
+                            state,
+                            &running_fiber,
+                        );
                         if !result.status.is_success()
                             && let Some(throwable) = state
                                 .pending_throw
@@ -58195,6 +58432,34 @@ fn coerce_or_check_variadic_param_type(
     Ok(())
 }
 
+/// Builds the closure value for `MakeClosure`; both the rich arm and the
+/// dense opcode call this so binding context and debug info stay identical.
+fn make_closure_value(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    function: FunctionId,
+    captured: Vec<ClosureCaptureValue>,
+) -> Value {
+    let bound_this = compiled
+        .unit()
+        .functions
+        .get(function.index())
+        .filter(|closure| closure.flags.is_closure && !closure.flags.is_static)
+        .and_then(|_| current_this_object(compiled, stack));
+    Value::closure(
+        ClosurePayload::new(function.raw(), captured)
+            .with_debug(closure_debug_info(compiled, function))
+            .with_bound_this(bound_this)
+            .with_context(ClosureContext {
+                owner_unit: dynamic_unit_index_for_compiled(state, compiled),
+                scope_class: current_scope_class(compiled, stack),
+                called_class: current_called_class(compiled, stack),
+                declaring_class: current_scope_class(compiled, stack),
+            }),
+    )
+}
+
 fn evaluate_closure_captures(
     unit: &IrUnit,
     stack: &mut CallStack,
@@ -61866,10 +62131,13 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         | DenseOpcode::UnaryMinus
         | DenseOpcode::UnaryNot
         | DenseOpcode::UnaryBitNot => "unary_ops",
-        DenseOpcode::NewObject => "objects",
-        DenseOpcode::CallFunction | DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
-            "function_calls"
+        DenseOpcode::NewObject | DenseOpcode::AcquireCallable | DenseOpcode::MakeClosure => {
+            "objects"
         }
+        DenseOpcode::CallFunction
+        | DenseOpcode::CallMethod
+        | DenseOpcode::CallStaticMethod
+        | DenseOpcode::CallCallable => "function_calls",
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
         | DenseOpcode::FetchDim
@@ -69639,6 +69907,41 @@ var_dump(unserialize('O:1:"C":0:{}'));
         let counters = result.counters.expect("counters should be collected");
         assert!(counters.literal_intern_misses >= 1, "{counters:?}");
         assert!(counters.literal_intern_hits >= 2, "{counters:?}");
+    }
+
+    #[test]
+    fn dense_bytecode_executes_closures_and_callable_calls() {
+        // Closure creation and callable-value calls execute on the dense
+        // plan; a try/catch helper stays on the rich plan as a local
+        // fallback without pushing the whole program off dense execution.
+        let source = "<?php \
+            function apply_twice($fn, $x) { return $fn($fn($x)); } \
+            function catcher($fn) { try { return $fn(0); } catch (RuntimeException $e) { return $e->getMessage(); } } \
+            $double = function ($n) { return $n * 2; }; \
+            $sum = 0; \
+            for ($i = 1; $i <= 4; $i++) { $sum += apply_twice($double, $i); } \
+            $boom = function ($n) { throw new RuntimeException('caught'); }; \
+            echo $sum, '|', apply_twice('strrev', 'ab'), '|', catcher($boom);";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Auto,
+                ..VmOptions::default()
+            },
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"40|ab|caught");
+        let counters = result.counters.expect("counters");
+        assert!(counters.dense_callable_call_hits >= 8, "{counters:?}");
+        assert!(
+            counters.opcodes.get("bytecode_make_closure").copied() >= Some(2),
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.rich_fallback_functions_executed, 1,
+            "only the try/catch helper stays rich: {counters:?}"
+        );
     }
 
     #[test]

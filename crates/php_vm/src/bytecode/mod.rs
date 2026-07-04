@@ -160,6 +160,12 @@ pub enum DenseOpcode {
     LoadLocalQuiet = 66,
     /// Instantiate a statically named class and run its constructor.
     NewObject = 67,
+    /// Call a runtime callable value (closure, callable string, invokable).
+    CallCallable = 68,
+    /// Materialize a callable value (closure literal, callable coercion).
+    AcquireCallable = 69,
+    /// Create a closure value from a synthesized function and captures.
+    MakeClosure = 70,
 }
 
 impl DenseOpcode {
@@ -248,6 +254,9 @@ impl DenseOpcode {
             Self::BindGlobal => "bind_global",
             Self::LoadLocalQuiet => "load_local_quiet",
             Self::NewObject => "new_object",
+            Self::CallCallable => "call_callable",
+            Self::AcquireCallable => "acquire_callable",
+            Self::MakeClosure => "make_closure",
         }
     }
 
@@ -385,6 +394,18 @@ pub enum DenseOperands {
         display_class_name: u32,
         args: Vec<DenseCallArg>,
     },
+    /// Runtime callable value call.
+    CallableCall {
+        dst: u32,
+        callee: DenseOperand,
+        args: Vec<DenseCallArg>,
+    },
+    /// Closure construction from a synthesized function and captures.
+    MakeClosure {
+        dst: u32,
+        function: u32,
+        captures: Vec<DenseClosureCapture>,
+    },
     /// Instance method call.
     MethodCall {
         dst: u32,
@@ -485,6 +506,15 @@ pub enum DenseOperands {
         kind: IncludeKind,
         path: DenseOperand,
     },
+}
+
+/// One dense closure capture: name side-table index, source operand, and
+/// whether the closure captures the source local's reference cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseClosureCapture {
+    pub name: u32,
+    pub src: DenseOperand,
+    pub by_ref: bool,
 }
 
 /// One dense function-call argument with call-shape metadata preserved.
@@ -1444,6 +1474,9 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::Discard => Some(RuleKind::NoRule),
         DenseOpcode::CallFunction
         | DenseOpcode::NewObject
+        | DenseOpcode::CallCallable
+        | DenseOpcode::AcquireCallable
+        | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::InitStaticLocal
@@ -1495,6 +1528,9 @@ fn dense_skip_reason(opcode: DenseOpcode) -> &'static str {
     match opcode {
         DenseOpcode::CallFunction => "effectful_call",
         DenseOpcode::NewObject => "effectful_object_instantiation",
+        DenseOpcode::CallCallable => "effectful_callable_call",
+        DenseOpcode::AcquireCallable => "effectful_callable_acquisition",
+        DenseOpcode::MakeClosure => "effectful_closure_construction",
         DenseOpcode::CallMethod => "effectful_method_call",
         DenseOpcode::CallStaticMethod => "effectful_static_method_call",
         DenseOpcode::NewArray
@@ -1838,6 +1874,40 @@ fn lower_instruction(
                 },
             )
         }
+        InstructionKind::CallCallable { dst, callee, args } => (
+            DenseOpcode::CallCallable,
+            DenseOperands::CallableCall {
+                dst: dst.raw(),
+                callee: lower_operand(*callee),
+                args: lower_call_args(instruction, names, args)?,
+            },
+        ),
+        InstructionKind::AcquireCallable { dst, value } => (
+            DenseOpcode::AcquireCallable,
+            DenseOperands::RegOperand {
+                dst: dst.raw(),
+                src: lower_operand(*value),
+            },
+        ),
+        InstructionKind::MakeClosure {
+            dst,
+            function,
+            captures,
+        } => (
+            DenseOpcode::MakeClosure,
+            DenseOperands::MakeClosure {
+                dst: dst.raw(),
+                function: function.raw(),
+                captures: captures
+                    .iter()
+                    .map(|capture| DenseClosureCapture {
+                        name: push_name(names, &capture.name).index() as u32,
+                        src: lower_operand(capture.src),
+                        by_ref: capture.by_ref,
+                    })
+                    .collect(),
+            },
+        ),
         InstructionKind::CallMethod {
             dst,
             object,
@@ -2374,7 +2444,10 @@ fn verify_instruction(
             verify_register(*dst, function, errors);
             verify_constant(*constant, unit, errors);
         }
-        (DenseOpcode::Move, DenseOperands::RegOperand { dst, src })
+        (
+            DenseOpcode::Move | DenseOpcode::AcquireCallable,
+            DenseOperands::RegOperand { dst, src },
+        )
         | (
             DenseOpcode::LoadLocal
             | DenseOpcode::LoadLocalEcho
@@ -2478,6 +2551,20 @@ fn verify_instruction(
             verify_name(*name, unit, errors);
             for arg in args {
                 verify_call_arg(arg, unit, function, errors);
+            }
+        }
+        (DenseOpcode::CallCallable, DenseOperands::CallableCall { dst, callee, args }) => {
+            verify_register(*dst, function, errors);
+            verify_operand(*callee, unit, function, errors);
+            for arg in args {
+                verify_call_arg(arg, unit, function, errors);
+            }
+        }
+        (DenseOpcode::MakeClosure, DenseOperands::MakeClosure { dst, captures, .. }) => {
+            verify_register(*dst, function, errors);
+            for capture in captures {
+                verify_name(capture.name, unit, errors);
+                verify_operand(capture.src, unit, function, errors);
             }
         }
         (
@@ -2972,6 +3059,35 @@ fn render_operands(operands: &DenseOperands) -> String {
             format!(
                 "r{dst} new n{class_name} (display n{display_class_name}) ({})",
                 rendered_args.join(", ")
+            )
+        }
+        DenseOperands::CallableCall { dst, callee, args } => {
+            let rendered_args: Vec<_> = args.iter().map(render_call_arg).collect();
+            format!(
+                "r{dst} callable {} ({})",
+                render_operand(*callee),
+                rendered_args.join(", ")
+            )
+        }
+        DenseOperands::MakeClosure {
+            dst,
+            function,
+            captures,
+        } => {
+            let rendered: Vec<_> = captures
+                .iter()
+                .map(|capture| {
+                    format!(
+                        "n{}{}={}",
+                        capture.name,
+                        if capture.by_ref { " by_ref" } else { "" },
+                        render_operand(capture.src)
+                    )
+                })
+                .collect();
+            format!(
+                "r{dst} closure function:{function} [{}]",
+                rendered.join(", ")
             )
         }
         DenseOperands::MethodCall {

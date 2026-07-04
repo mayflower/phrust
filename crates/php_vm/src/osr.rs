@@ -475,6 +475,22 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
                 }
             }
         }
+        DenseOperands::CallableCall { dst, callee, args } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            collect_operand_slot(*callee, slots);
+            for arg in args {
+                collect_operand_slot(arg.value, slots);
+                if let Some(local) = arg.by_ref_local {
+                    slots.insert(OsrVmSlot::Local(local));
+                }
+            }
+        }
+        DenseOperands::MakeClosure { dst, captures, .. } => {
+            slots.insert(OsrVmSlot::Register(*dst));
+            for capture in captures {
+                collect_operand_slot(capture.src, slots);
+            }
+        }
         DenseOperands::Include { dst, path, .. } => {
             slots.insert(OsrVmSlot::Register(*dst));
             collect_operand_slot(*path, slots);

@@ -7,4 +7,6 @@ class BytecodePropertyHookTarget {
     }
 }
 
-echo (new BytecodePropertyHookTarget())->value, "\n";
+// Dynamic instantiation keeps this a rich-planned auto-fallback probe.
+$class = 'BytecodePropertyHookTarget';
+echo (new $class())->value, "\n";

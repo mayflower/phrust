@@ -3,4 +3,6 @@ class BytecodeTypedPropertyTarget {
     public int $value = 7;
 }
 
-echo (new BytecodeTypedPropertyTarget())->value, "\n";
+// Dynamic instantiation keeps this a rich-planned auto-fallback probe.
+$class = 'BytecodeTypedPropertyTarget';
+echo (new $class())->value, "\n";

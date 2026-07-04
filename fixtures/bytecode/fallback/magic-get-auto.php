@@ -5,4 +5,6 @@ class BytecodeMagicGetTarget {
     }
 }
 
-echo (new BytecodeMagicGetTarget())->missing, "\n";
+// Dynamic instantiation keeps this a rich-planned auto-fallback probe.
+$class = 'BytecodeMagicGetTarget';
+echo (new $class())->missing, "\n";

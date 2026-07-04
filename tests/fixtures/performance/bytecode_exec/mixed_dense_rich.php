@@ -9,7 +9,9 @@ function dense_supported_value() {
 }
 
 function rich_fallback_value() {
-    $box = new BytecodeMixedFallbackBox();
+    // Dynamic instantiation keeps this function rich-planned.
+    $class = 'BytecodeMixedFallbackBox';
+    $box = new $class();
     return $box->value;
 }
 

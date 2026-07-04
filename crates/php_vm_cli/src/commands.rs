@@ -3085,6 +3085,9 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
         },
         DenseOpcode::CallFunction
         | DenseOpcode::NewObject
+        | DenseOpcode::CallCallable
+        | DenseOpcode::AcquireCallable
+        | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::Include => BaselineStencilClass {
@@ -3412,6 +3415,9 @@ fn classify_copy_patch_stencil_instruction(
         },
         DenseOpcode::CallFunction
         | DenseOpcode::NewObject
+        | DenseOpcode::CallCallable
+        | DenseOpcode::AcquireCallable
+        | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod => {
             unsupported_copy_patch_class("dynamic_or_userland_call_requires_frame_and_symbol_state")
@@ -3637,6 +3643,9 @@ fn classify_mid_tier_instruction(
         }
         DenseOpcode::CallFunction
         | DenseOpcode::NewObject
+        | DenseOpcode::CallCallable
+        | DenseOpcode::AcquireCallable
+        | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
         | DenseOpcode::Include => {
