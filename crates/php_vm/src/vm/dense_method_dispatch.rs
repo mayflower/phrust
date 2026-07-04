@@ -52,6 +52,23 @@ impl Vm {
         };
 
         let receiver_class = object.class_name();
+        if is_mysqli_runtime_class(&receiver_class) {
+            // Same inline dispatch as the rich CallMethod arm; the generic
+            // object-method callable helper does not cover mysqli.
+            self.record_counter_dense_call_fallback("runtime_method_receiver");
+            let value = match call_mysqli_method(
+                &object,
+                method,
+                args,
+                &mut state.mysql,
+                compiled,
+                stack,
+            ) {
+                Ok(value) => value,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            };
+            return VmResult::success_no_output(Some(value));
+        }
         if is_spl_iterator_runtime_class(&receiver_class)
             || is_spl_container_runtime_class(&receiver_class)
             || is_spl_file_runtime_class(&receiver_class)

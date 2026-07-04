@@ -8935,6 +8935,19 @@ impl Vm {
                         );
                         if !result.status.is_success() {
                             self.record_counter_dense_call_fallback("dispatch_error");
+                            // Mirror the rich CallCallable arm: dispatch
+                            // errors carrying a throwable present as an
+                            // uncaught exception, not a raw diagnostic.
+                            if let Some(throwable) = state
+                                .pending_throw
+                                .take()
+                                .or_else(|| runtime_error_throwable(&result))
+                            {
+                                let result =
+                                    self.propagate_exception(output, stack, state, throwable);
+                                stack.pop_recycle();
+                                return result;
+                            }
                             stack.pop_recycle();
                             return result;
                         }
@@ -10662,7 +10675,20 @@ impl Vm {
         span: IrSpan,
         message: String,
     ) -> VmResult {
-        let result = self.runtime_error(output, compiled, stack, message);
+        // Match the rich raise path: the emitted diagnostic carries the
+        // source span, not just the throwable location tag.
+        let result = self.runtime_error_with_bringup_context(
+            output,
+            compiled,
+            stack,
+            state,
+            runtime_source_span(compiled, span),
+            message,
+            BringupDiagnosticInput {
+                autoload_enabled: Some(true),
+                ..BringupDiagnosticInput::default()
+            },
+        );
         if let Some(throwable) = runtime_error_throwable(&result) {
             tag_throwable_location(&throwable, compiled, span);
             state.pending_trace = Some(capture_backtrace_string(compiled, stack));
