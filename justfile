@@ -118,6 +118,7 @@ help:
       '  just framework-smoke      Run offline framework-like performance smoke' \
       '  just wordpress-like-hotpath-smoke Run deterministic server hotpath smoke' \
       '  just app-flow-smoke      Run CI-safe app-flow engine comparison smoke' \
+      '  just runtime-layout-performance-smoke Run runtime-layout tranche counter gate' \
       '  just app-flow-matrix     Run full application-flow Phrust/reference matrix' \
       '  just release-benchmark-smoke Run production release performance smoke' \
       '  just pgo-benchmark-smoke  Run optional PGO performance smoke' \
@@ -1188,6 +1189,19 @@ app-flow-matrix:
     cargo build -p php_vm_cli --bin php-vm
     cargo build --release -p php_vm_cli --bin php-vm
     scripts/performance/app_flow_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --release-engine "${CARGO_TARGET_DIR:-target}/release/php-vm" --iterations "${PHRUST_APP_FLOW_ITERATIONS:-5}" --warmups "${PHRUST_APP_FLOW_WARMUPS:-1}" --scale "${PHRUST_APP_FLOW_SCALE:-2}" --timeout "${PHRUST_APP_FLOW_TIMEOUT:-30.0}"
+
+# Runtime-layout tranche gate: focused fast-path tests, app-flow smoke, and
+# the counter-existence/ratchet checker. Counter regressions are reported by
+# default; PHRUST_RATCHET_ENFORCE=1 makes them hard failures.
+runtime-layout-performance-smoke:
+    cargo build -p php_vm_cli --bin php-vm
+    cargo test -p php_runtime string_intrinsics
+    cargo test -p php_runtime json_fast
+    cargo test -p php_runtime array_intrinsics
+    cargo test -p php_vm dense_bytecode
+    cargo test -p php_vm superinstruction
+    @just app-flow-smoke
+    scripts/performance/runtime_layout_smoke.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
 
 perf-ratchet-prereq:
     cargo build -p php_vm_cli --bin php-vm
