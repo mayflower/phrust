@@ -883,8 +883,20 @@ pub(crate) fn append_vm_counters_to_trace(
             "vm_bytecode_instructions_executed",
             counters.bytecode_instructions_executed,
         ),
-        ("vm_function_calls", counters.function_calls),
-        ("vm_method_calls", counters.method_calls),
+        // Calls are counted per interpreter tier; the trace reports the
+        // tier-agnostic totals so dense growth does not zero the metric.
+        (
+            "vm_function_calls",
+            counters.function_calls
+                + counters.dense_direct_call_hits
+                + counters.dense_callable_call_hits,
+        ),
+        (
+            "vm_method_calls",
+            counters.method_calls
+                + counters.dense_method_call_hits
+                + counters.dense_static_call_hits,
+        ),
         ("vm_frame_allocations", counters.frame_allocations),
         ("vm_frame_reuses", counters.frame_reuses),
         ("vm_value_clones", counters.value_clones),
