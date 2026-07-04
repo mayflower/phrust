@@ -1977,6 +1977,8 @@ pub struct Vm {
     /// Memoized per-(unit, function): whether the body can observe its
     /// argument vector (func_get_args-style builtins or dynamic dispatch).
     argument_vector_observers: RefCell<HashMap<(u64, u32), bool>>,
+    /// Memoized per-(unit, function) trivial-method inline plans.
+    trivial_method_plans: RefCell<HashMap<(u64, u32), Option<TrivialMethodPlan>>>,
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
 }
 
@@ -1997,6 +1999,7 @@ impl Vm {
             counters: RefCell::new(None),
             literal_pool: RefCell::new(LiteralPool::default()),
             argument_vector_observers: RefCell::new(HashMap::new()),
+            trivial_method_plans: RefCell::new(HashMap::new()),
             quickening: RefCell::new(QuickeningTable::default()),
             inline_caches: RefCell::new(InlineCacheTable::default()),
             jit: RefCell::new(JitRuntimeState::default()),
@@ -2017,6 +2020,7 @@ impl Vm {
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
         self.argument_vector_observers.borrow_mut().clear();
+        self.trivial_method_plans.borrow_mut().clear();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         *self.inline_caches.borrow_mut() = InlineCacheTable::default();
         *self.jit.borrow_mut() = JitRuntimeState::default();
@@ -28922,6 +28926,160 @@ impl Vm {
         }
     }
 
+    /// Attempts to run a trivial getter/setter body as a direct declared
+    /// slot access, skipping frame push and argument binding. Returns None
+    /// to fall back to generic dispatch; every guard failure is
+    /// reason-tagged. Visibility was already validated by the caller, and
+    /// private properties never match the plain-name slot lookup, so
+    /// mangled storage falls back naturally.
+    fn try_inline_trivial_method(
+        &self,
+        owner: &CompiledUnit,
+        method_function: FunctionId,
+        declaring_class: &php_ir::module::ClassEntry,
+        object: &ObjectRef,
+        args: &[CallArgument],
+    ) -> Option<VmResult> {
+        let key = (compiled_unit_cache_key(owner), method_function.raw());
+        let plan = {
+            let plans = self.trivial_method_plans.borrow();
+            plans.get(&key).cloned()
+        };
+        let plan = match plan {
+            Some(plan) => plan,
+            None => {
+                let plan = owner
+                    .unit()
+                    .functions
+                    .get(method_function.index())
+                    .and_then(classify_trivial_method);
+                if plan.is_some() {
+                    self.record_counter_method_inline("candidate", None);
+                }
+                self.trivial_method_plans
+                    .borrow_mut()
+                    .insert(key, plan.clone());
+                plan
+            }
+        }?;
+        // The classifier guarantees by-value parameters, so the by-ref
+        // capability metadata carried by local-sourced arguments is inert;
+        // named arguments keep generic binding.
+        if args.iter().any(|arg| arg.name.is_some()) {
+            self.record_counter_method_inline("fallback", Some("argument_shape"));
+            return None;
+        }
+        match plan {
+            TrivialMethodPlan::Getter { property } => {
+                if !args.is_empty() {
+                    self.record_counter_method_inline("fallback", Some("argument_shape"));
+                    return None;
+                }
+                let slot = match object.declared_slot_index(&property) {
+                    Some(slot) => slot,
+                    None => {
+                        self.record_counter_method_inline("fallback", Some("slot_missing"));
+                        return None;
+                    }
+                };
+                match object.get_declared_slot(slot, object.class_layout_epoch()) {
+                    Some(Value::Uninitialized) | None => {
+                        self.record_counter_method_inline(
+                            "fallback",
+                            Some("uninitialized_or_unset"),
+                        );
+                        None
+                    }
+                    Some(value) => {
+                        self.record_counter_method_inline("hit", None);
+                        Some(VmResult::success_no_output(Some(value)))
+                    }
+                }
+            }
+            TrivialMethodPlan::Setter {
+                property,
+                returns_this,
+            } => {
+                if args.len() != 1 {
+                    self.record_counter_method_inline("fallback", Some("argument_shape"));
+                    return None;
+                }
+                let Some(entry) = declaring_class
+                    .properties
+                    .iter()
+                    .find(|entry| entry.name == property)
+                else {
+                    self.record_counter_method_inline("fallback", Some("slot_missing"));
+                    return None;
+                };
+                if entry.type_.is_some()
+                    || entry.flags.is_readonly
+                    || entry.flags.is_static
+                    || entry.flags.set_is_private
+                    || entry.flags.set_is_protected
+                    || entry.hooks.get.is_some()
+                    || entry.hooks.set.is_some()
+                    || declaring_class.flags.is_readonly
+                {
+                    self.record_counter_method_inline("fallback", Some("guarded_property"));
+                    return None;
+                }
+                let slot = match object.declared_slot_index(&property) {
+                    Some(slot) => slot,
+                    None => {
+                        self.record_counter_method_inline("fallback", Some("slot_missing"));
+                        return None;
+                    }
+                };
+                let epoch = object.class_layout_epoch();
+                if matches!(
+                    object.get_declared_slot(slot, epoch),
+                    Some(Value::Reference(_)) | None
+                ) {
+                    self.record_counter_method_inline("fallback", Some("reference_or_unset"));
+                    return None;
+                }
+                // Mirror argument binding: a reference argument passes its
+                // current value to a by-value parameter.
+                let value = match &args[0].value {
+                    Value::Reference(cell) => cell.get(),
+                    other => other.clone(),
+                };
+                if !object.set_declared_slot(slot, epoch, value) {
+                    self.record_counter_method_inline("fallback", Some("slot_missing"));
+                    return None;
+                }
+                self.record_counter_method_inline("hit", None);
+                let value = if returns_this {
+                    Value::Object(object.clone())
+                } else {
+                    Value::Null
+                };
+                Some(VmResult::success_no_output(Some(value)))
+            }
+        }
+    }
+
+    fn record_counter_method_inline(&self, kind: &str, reason: Option<&'static str>) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            match kind {
+                "candidate" => counters.method_inline_candidates += 1,
+                "hit" => counters.method_inline_hits += 1,
+                _ => {
+                    if let Some(reason) = reason {
+                        *counters
+                            .method_inline_fallback_by_reason
+                            .entry(reason.to_owned())
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn execute_method_call_target(
         &self,
         compiled: &CompiledUnit,
@@ -28994,6 +29152,11 @@ impl Vm {
             return self.runtime_error(output, compiled, stack, message);
         }
         let method_function = method_entry.function;
+        if let Some(result) =
+            self.try_inline_trivial_method(&owner, method_function, declaring_class, &object, &args)
+        {
+            return result;
+        }
         let declaring_class_name = declaring_class.name.clone();
         self.execute_function(
             &owner,
@@ -58134,6 +58297,159 @@ fn function_body_observes_argument_vector(function: &IrFunction) -> bool {
     })
 }
 
+/// Inline plan for a trivial method body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TrivialMethodPlan {
+    /// `return $this->prop;`
+    Getter { property: String },
+    /// `$this->prop = $x;` optionally returning `$this`.
+    Setter {
+        property: String,
+        returns_this: bool,
+    },
+}
+
+/// Classifies bodies that are exactly a declared-property read or write on
+/// `$this`, with plain positional untyped parameters and no control flow.
+/// Everything else stays on generic dispatch.
+fn classify_trivial_method(function: &IrFunction) -> Option<TrivialMethodPlan> {
+    if !function.flags.is_method
+        || function.flags.is_static
+        || function.flags.is_generator
+        || function.flags.is_closure
+        || function.returns_by_ref
+        || function.return_type.is_some()
+        || !function.captures.is_empty()
+        || function.blocks.len() != 1
+        || function
+            .params
+            .iter()
+            .any(|param| param.by_ref || param.variadic || param.type_.is_some())
+    {
+        return None;
+    }
+    let block = function.blocks.first()?;
+    let terminator = block.terminator.as_ref()?;
+    let instructions = &block.instructions;
+    let this_local = LocalId::new(0);
+    match (function.params.len(), instructions.as_slice()) {
+        // LoadLocal $this; FetchProperty; return value
+        (0, [load_this, fetch]) => {
+            let InstructionKind::LoadLocal {
+                dst: this_reg,
+                local,
+            } = &load_this.kind
+            else {
+                return None;
+            };
+            if *local != this_local {
+                return None;
+            }
+            let InstructionKind::FetchProperty {
+                dst: value_reg,
+                object: Operand::Register(object_reg),
+                property,
+            } = &fetch.kind
+            else {
+                return None;
+            };
+            if object_reg != this_reg {
+                return None;
+            }
+            let TerminatorKind::Return {
+                value: Some(Operand::Register(returned)),
+                by_ref_local: None,
+            } = &terminator.kind
+            else {
+                return None;
+            };
+            (returned == value_reg).then(|| TrivialMethodPlan::Getter {
+                property: property.clone(),
+            })
+        }
+        // LoadLocal $this; LoadLocal $x; AssignProperty; Discard
+        // [; LoadLocal $this] ; return [$this]
+        (1, [load_this, load_param, assign, discard, rest @ ..]) => {
+            let InstructionKind::LoadLocal {
+                dst: this_reg,
+                local,
+            } = &load_this.kind
+            else {
+                return None;
+            };
+            if *local != this_local {
+                return None;
+            }
+            let InstructionKind::LoadLocal {
+                dst: param_reg,
+                local: param_local,
+            } = &load_param.kind
+            else {
+                return None;
+            };
+            if *param_local != LocalId::new(1) {
+                return None;
+            }
+            let InstructionKind::AssignProperty {
+                dst: assign_reg,
+                object: Operand::Register(object_reg),
+                property,
+                value: Operand::Register(value_reg),
+            } = &assign.kind
+            else {
+                return None;
+            };
+            if object_reg != this_reg || value_reg != param_reg {
+                return None;
+            }
+            let InstructionKind::Discard {
+                src: Operand::Register(discarded),
+            } = &discard.kind
+            else {
+                return None;
+            };
+            if discarded != assign_reg {
+                return None;
+            }
+            match (rest, &terminator.kind) {
+                (
+                    [],
+                    TerminatorKind::Return {
+                        value: None,
+                        by_ref_local: None,
+                    },
+                ) => Some(TrivialMethodPlan::Setter {
+                    property: property.clone(),
+                    returns_this: false,
+                }),
+                (
+                    [load_this_again],
+                    TerminatorKind::Return {
+                        value: Some(Operand::Register(returned)),
+                        by_ref_local: None,
+                    },
+                ) => {
+                    let InstructionKind::LoadLocal {
+                        dst: this_again_reg,
+                        local: this_again_local,
+                    } = &load_this_again.kind
+                    else {
+                        return None;
+                    };
+                    (*this_again_local == this_local && returned == this_again_reg).then(|| {
+                        TrivialMethodPlan::Setter {
+                            property: property.clone(),
+                            returns_this: true,
+                        }
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn fetch_dim_value(array: &Value, key: &ArrayKey) -> Result<Option<Value>, String> {
     if let Value::Reference(cell) = array {
         return fetch_dim_value(&cell.get(), key);
@@ -68833,6 +69149,40 @@ var_dump(unserialize('O:1:"C":0:{}'));
             counters
                 .direct_frame_fallback_by_reason
                 .get("argument_vector_observed")
+                .copied()
+                .unwrap_or_default()
+                >= 1,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn trivial_getters_and_setters_inline_through_slots() {
+        let source = "<?php class Row { public $v = 1; private $s = 2; \
+            public function getV() { return $this->v; } \
+            public function setV($x) { $this->v = $x; return $this; } \
+            public function getS() { return $this->s; } } \
+            $r = new Row(); $t = 0; $s = 0; \
+            for ($i = 0; $i < 6; $i++) { $t += $r->setV($i)->getV(); $s = $r->getS(); } \
+            echo $t, \"|\", $s;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"15|2");
+        let counters = result.counters.expect("counters");
+        assert!(counters.method_inline_candidates >= 2, "{counters:?}");
+        assert!(counters.method_inline_hits >= 8, "{counters:?}");
+        // The private-property getter must fall back to generic dispatch.
+        assert!(
+            counters
+                .method_inline_fallback_by_reason
+                .get("slot_missing")
                 .copied()
                 .unwrap_or_default()
                 >= 1,
