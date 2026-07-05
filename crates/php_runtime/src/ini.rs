@@ -3,6 +3,8 @@
 /// One supported INI entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IniEntrySnapshot {
+    /// Extension that owns this INI option.
+    pub extension: &'static str,
     /// Canonical INI option name.
     pub name: &'static str,
     /// Engine default value.
@@ -15,6 +17,7 @@ pub struct IniEntrySnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IniEntry {
+    extension: &'static str,
     name: &'static str,
     global_value: &'static str,
     local_value: String,
@@ -32,11 +35,12 @@ impl Default for IniRegistry {
         Self {
             entries: default_entries()
                 .into_iter()
-                .map(|(name, value)| IniEntry {
+                .map(|(extension, name, value, access)| IniEntry {
+                    extension,
                     name,
                     global_value: value,
                     local_value: value.to_owned(),
-                    access: 7,
+                    access,
                 })
                 .collect(),
         }
@@ -50,11 +54,21 @@ impl IniRegistry {
         self.entries
             .iter()
             .map(|entry| IniEntrySnapshot {
+                extension: entry.extension,
                 name: entry.name,
                 global_value: entry.global_value.to_owned(),
                 local_value: entry.local_value.clone(),
                 access: entry.access,
             })
+            .collect()
+    }
+
+    /// Returns a stable snapshot for options owned by an extension.
+    #[must_use]
+    pub fn entries_for_extension(&self, extension: &str) -> Vec<IniEntrySnapshot> {
+        self.entries()
+            .into_iter()
+            .filter(|entry| entry.extension.eq_ignore_ascii_case(extension))
             .collect()
     }
 
@@ -73,6 +87,9 @@ impl IniRegistry {
     /// Overrides a supported option and returns its previous local value.
     pub fn set(&mut self, name: &str, value: impl Into<String>) -> Option<String> {
         let entry = self.lookup_mut(name)?;
+        if entry.access & 1 == 0 {
+            return None;
+        }
         let previous = std::mem::replace(&mut entry.local_value, value.into());
         Some(previous)
     }
@@ -90,24 +107,26 @@ impl IniRegistry {
     }
 }
 
-fn default_entries() -> [(&'static str, &'static str); 16] {
+fn default_entries() -> [(&'static str, &'static str, &'static str, i64); 18] {
     [
-        ("date.timezone", "UTC"),
-        ("default_charset", "UTF-8"),
-        ("display_errors", "1"),
-        ("error_reporting", "-1"),
-        ("file_uploads", "1"),
-        ("ignore_user_abort", "0"),
-        ("include_path", "."),
-        ("max_file_uploads", "20"),
-        ("max_input_nesting_level", "64"),
-        ("max_input_vars", "1000"),
-        ("memory_limit", "128M"),
-        ("post_max_size", "8M"),
-        ("precision", "14"),
-        ("serialize_precision", "-1"),
-        ("upload_max_filesize", "2M"),
-        ("upload_tmp_dir", ""),
+        ("date", "date.timezone", "UTC", 7),
+        ("standard", "default_charset", "UTF-8", 7),
+        ("core", "display_errors", "1", 7),
+        ("core", "error_reporting", "-1", 7),
+        ("ffi", "ffi.enable", "preload", 4),
+        ("ffi", "ffi.preload", "", 4),
+        ("standard", "file_uploads", "1", 7),
+        ("standard", "ignore_user_abort", "0", 7),
+        ("standard", "include_path", ".", 7),
+        ("standard", "max_file_uploads", "20", 7),
+        ("standard", "max_input_nesting_level", "64", 7),
+        ("standard", "max_input_vars", "1000", 7),
+        ("core", "memory_limit", "128M", 7),
+        ("standard", "post_max_size", "8M", 7),
+        ("core", "precision", "14", 7),
+        ("core", "serialize_precision", "-1", 7),
+        ("standard", "upload_max_filesize", "2M", 7),
+        ("standard", "upload_tmp_dir", "", 7),
     ]
 }
 
@@ -129,6 +148,10 @@ mod tests {
         assert_eq!(registry.get("upload_max_filesize"), Some("2M"));
         assert_eq!(registry.get("post_max_size"), Some("8M"));
         assert_eq!(registry.get("max_file_uploads"), Some("20"));
+        assert_eq!(registry.get("ffi.enable"), Some("preload"));
+        assert_eq!(registry.cfg_var("ffi.preload"), Some(""));
+        assert_eq!(registry.set("ffi.enable", "1"), None);
+        assert_eq!(registry.get("ffi.enable"), Some("preload"));
         assert_eq!(registry.set("missing", "value"), None);
     }
 
@@ -148,6 +171,8 @@ mod tests {
                 "default_charset",
                 "display_errors",
                 "error_reporting",
+                "ffi.enable",
+                "ffi.preload",
                 "file_uploads",
                 "ignore_user_abort",
                 "include_path",
@@ -162,5 +187,12 @@ mod tests {
                 "upload_tmp_dir"
             ]
         );
+
+        let ffi_names = registry
+            .entries_for_extension("FFI")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(ffi_names, vec!["ffi.enable", "ffi.preload"]);
     }
 }

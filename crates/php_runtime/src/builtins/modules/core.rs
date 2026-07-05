@@ -7161,7 +7161,7 @@ mod tests {
         let actual = array.iter().collect::<Vec<_>>();
         assert_eq!(actual.len(), expected.len());
         for ((key, value), (expected_key, expected_resource)) in actual.iter().zip(expected) {
-            assert_eq!(**key, ArrayKey::Int(*expected_key));
+            assert_eq!(*key, ArrayKey::Int(*expected_key));
             assert_eq!(**value, Value::Resource(expected_resource.clone()));
         }
     }

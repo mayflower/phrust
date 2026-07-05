@@ -13,15 +13,19 @@
   `dlopen` behavior.
 - Covers `FFI::cdef()` in the generated PHPT suite as a disabled-by-default
   fatal runtime diagnostic.
+- Exposes `ffi.enable=preload` and `ffi.preload=` through the request-local INI
+  registry, `ini_get`, `get_cfg_var`, and `ini_get_all('ffi', ...)`, while
+  keeping runtime `ini_set('ffi.enable', ...)` read-only.
 
 ## Known gaps
 
 - Unsafe FFI execution is not implemented. `FFI::cdef`, `FFI::load`,
   allocation, casts, type parsing, scope loading, CData/CType object behavior,
   and memory helpers all require an explicit future capability gate.
-- INI policy such as `ffi.enable`, `ffi.preload`, and server-mode restrictions
-  is represented by the fail-closed runtime behavior, not by a complete PHP INI
-  subsystem.
+- FFI preload execution and scope loading are not implemented; the INI entries
+  are visibility and policy metadata only.
+- Server-mode restrictions beyond read-only default-off INI metadata and
+  fail-closed runtime dispatch are not implemented.
 - Platform ABI constants and exact `FFI\Exception` / `FFI\ParserException`
   throw-site parity are out of this slice.
 - The local php-src oracle CLI currently does not load `ext/ffi`; reference

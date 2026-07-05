@@ -27423,7 +27423,7 @@ impl Vm {
                         "E_PHP_VM_CONFIG_ARITY: ini_get_all expects zero to two arguments",
                     );
                 }
-                if let Some(extension) = values.first()
+                let extension_filter = if let Some(extension) = values.first()
                     && !matches!(extension, Value::Null)
                 {
                     let extension = match ini_option_name(extension) {
@@ -27434,15 +27434,25 @@ impl Vm {
                     };
                     if !extension.eq_ignore_ascii_case("standard")
                         && !extension.eq_ignore_ascii_case("core")
+                        && !extension.eq_ignore_ascii_case("ffi")
                     {
                         return VmResult::success_no_output(Some(Value::Bool(false)));
                     }
-                }
+                    if extension.eq_ignore_ascii_case("ffi") {
+                        Some(extension)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let details = values
                     .get(1)
                     .is_none_or(|value| to_bool(value).unwrap_or(true));
                 VmResult::success_no_output(Some(Value::Array(ini_get_all_array(
-                    &state.ini, details,
+                    &state.ini,
+                    details,
+                    extension_filter.as_deref(),
                 ))))
             }
             "get_cfg_var" => {
@@ -64309,9 +64319,13 @@ fn apply_float_string_precision(registry: &IniRegistry) {
     }
 }
 
-fn ini_get_all_array(registry: &IniRegistry, details: bool) -> PhpArray {
+fn ini_get_all_array(registry: &IniRegistry, details: bool, extension: Option<&str>) -> PhpArray {
     let mut output = PhpArray::new();
-    for entry in registry.entries() {
+    let entries = match extension {
+        Some(extension) => registry.entries_for_extension(extension),
+        None => registry.entries(),
+    };
+    for entry in entries {
         let value = if details {
             let mut detail = PhpArray::new();
             detail.insert(

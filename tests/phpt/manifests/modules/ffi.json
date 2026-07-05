@@ -4,8 +4,8 @@
   "priority": "disabled-by-default unsafe capability surface",
   "selected_manifest": "tests/phpt/manifests/modules/ffi.selected.jsonl",
   "corpus_count": 106,
-  "selected_count": 2,
-  "pass_count": 2,
+  "selected_count": 3,
+  "pass_count": 3,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
@@ -16,16 +16,19 @@
     "ReflectionClass extension/internal metadata",
     "generated static method metadata",
     "fail-closed VM hook for unsafe static methods",
-    "disabled-by-default runtime diagnostic for FFI::cdef"
+    "disabled-by-default runtime diagnostic for FFI::cdef",
+    "ffi.enable and ffi.preload INI policy visibility",
+    "extension-scoped ini_get_all('ffi') metadata",
+    "read-only runtime mutation policy for unsafe FFI enablement"
   ],
   "non_scope": [
     "libffi or dlopen execution",
     "C parser and CType/CData object semantics",
     "FFI memory operations",
-    "FFI preload and scope loading",
+    "FFI preload execution and scope loading",
     "class constants with platform ABI values",
     "PHP FFI exception object parity",
-    "server-mode policy enforcement beyond fail-closed runtime dispatch"
+    "server-mode policy enforcement beyond read-only default-off INI and fail-closed runtime dispatch"
   ],
   "target_gates": [
     "nix develop -c cargo test -p php_std ffi --no-fail-fast",
