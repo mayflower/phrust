@@ -1468,6 +1468,10 @@ pub(super) fn standard_library_pcre_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("preg_quote", "pcre"))
         .with_function(FunctionDescriptor::php("preg_replace", "pcre"))
         .with_function(FunctionDescriptor::php("preg_replace_callback", "pcre"))
+        .with_function(FunctionDescriptor::php(
+            "preg_replace_callback_array",
+            "pcre",
+        ))
         .with_function(FunctionDescriptor::php("preg_split", "pcre"))
         .with_constant(ConstantDescriptor::with_value(
             "PREG_BAD_UTF8_ERROR",

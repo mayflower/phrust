@@ -28914,6 +28914,8 @@ impl Vm {
             "preg_replace_callback" => {
                 self.call_preg_replace_callback_builtin(compiled, values, output, stack, state)
             }
+            "preg_replace_callback_array" => self
+                .call_preg_replace_callback_array_builtin(compiled, values, output, stack, state),
             _ => Err(ArrayCallbackError::Message(format!(
                 "E_PHP_VM_UNKNOWN_PCRE_CALLBACK_BUILTIN: {name}"
             ))),
@@ -29021,6 +29023,143 @@ impl Vm {
             cell.set(Value::Int(count));
         }
         Ok(value)
+    }
+
+    fn call_preg_replace_callback_array_builtin(
+        &self,
+        compiled: &CompiledUnit,
+        args: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ArrayCallbackError> {
+        if !(2..=5).contains(&args.len()) {
+            return Err(ArrayCallbackError::Message(
+                "E_PHP_VM_BUILTIN_ARITY: preg_replace_callback_array expects two to five argument(s)"
+                    .to_owned(),
+            ));
+        }
+        let Value::Array(patterns) = callable_resolve_reference(args[0].clone()) else {
+            return Err(ArrayCallbackError::Message(format!(
+                "E_PHP_VM_BUILTIN_TYPE: preg_replace_callback_array expects array, {} given",
+                value_type_name(&args[0])
+            )));
+        };
+        let limit = args
+            .get(2)
+            .map(to_int)
+            .transpose()
+            .map_err(|message| {
+                ArrayCallbackError::Message(format!("preg_replace_callback_array: {message}"))
+            })?
+            .unwrap_or(-1);
+        let mut compiled_patterns = Vec::new();
+        let mut cache = php_runtime::pcre::PcreCache::default();
+        for (key, callback) in patterns.iter() {
+            let ArrayKey::String(pattern) = key else {
+                return Err(ArrayCallbackError::Message(
+                    "E_PHP_RUNTIME_BUILTIN_TYPE: preg_replace_callback_array(): Argument #1 ($pattern) must contain only string patterns as keys"
+                        .to_owned(),
+                ));
+            };
+            validate_array_callback_arg(
+                compiled,
+                state,
+                "preg_replace_callback_array",
+                1,
+                "pattern",
+                false,
+                callback,
+            )
+            .map_err(|_| {
+                ArrayCallbackError::Message(
+                    "E_PHP_RUNTIME_BUILTIN_TYPE: preg_replace_callback_array(): Argument #1 ($pattern) must contain only valid callbacks"
+                        .to_owned(),
+                )
+            })?;
+            let compiled_pattern = match cache.compile(&pattern) {
+                Ok(compiled_pattern) => compiled_pattern,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            compiled_patterns.push((compiled_pattern, callback.clone()));
+        }
+
+        let mut count = 0i64;
+        let value = match effective_value(&args[1]) {
+            Value::Array(subjects) => {
+                let mut replaced = PhpArray::new();
+                for (key, subject) in subjects.iter() {
+                    let text = to_string(subject).map_err(|message| {
+                        ArrayCallbackError::Message(format!(
+                            "preg_replace_callback_array: subject must be string-compatible: {message}"
+                        ))
+                    })?;
+                    let bytes = self.preg_replace_callback_array_bytes(
+                        compiled,
+                        &compiled_patterns,
+                        text.as_bytes(),
+                        limit,
+                        &mut count,
+                        output,
+                        stack,
+                        state,
+                    )?;
+                    replaced.insert(key.clone(), Value::string(bytes));
+                }
+                Value::Array(replaced)
+            }
+            subject => {
+                let text = to_string(&subject).map_err(|message| {
+                    ArrayCallbackError::Message(format!(
+                        "preg_replace_callback_array: subject must be string-compatible: {message}"
+                    ))
+                })?;
+                let bytes = self.preg_replace_callback_array_bytes(
+                    compiled,
+                    &compiled_patterns,
+                    text.as_bytes(),
+                    limit,
+                    &mut count,
+                    output,
+                    stack,
+                    state,
+                )?;
+                Value::string(bytes)
+            }
+        };
+        if let Some(Value::Reference(cell)) = args.get(3) {
+            cell.set(Value::Int(count));
+        }
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preg_replace_callback_array_bytes(
+        &self,
+        compiled: &CompiledUnit,
+        patterns: &[(std::sync::Arc<php_runtime::pcre::CompiledPattern>, Value)],
+        subject: &[u8],
+        limit: i64,
+        count: &mut i64,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Vec<u8>, ArrayCallbackError> {
+        let mut current = subject.to_vec();
+        for (pattern, callback) in patterns {
+            current = self.preg_replace_callback_bytes(
+                compiled,
+                pattern,
+                callback.clone(),
+                &current,
+                limit,
+                count,
+                output,
+                stack,
+                state,
+            )?;
+        }
+        Ok(current)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -70780,6 +70919,7 @@ fn internal_builtin_param_requires_reference(function: &str, index: usize) -> bo
         || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
         || (function == "preg_replace" && index == 4)
         || (function == "preg_replace_callback" && index == 4)
+        || (function == "preg_replace_callback_array" && index == 3)
         || (function == "apcu_fetch" && index == 1)
         || (matches!(function, "apcu_dec" | "apcu_inc") && index == 2)
         || (matches!(
@@ -71195,7 +71335,10 @@ fn is_array_callback_builtin_name(name: &str) -> bool {
 }
 
 fn is_pcre_callback_builtin_name(name: &str) -> bool {
-    matches!(name, "preg_replace_callback")
+    matches!(
+        name,
+        "preg_replace_callback" | "preg_replace_callback_array"
+    )
 }
 
 fn is_array_sort_builtin_name(name: &str) -> bool {

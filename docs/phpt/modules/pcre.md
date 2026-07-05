@@ -2,7 +2,7 @@
 
 - Priority: 18.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- the selected close gate: 76 PASS, 10 SKIP, 0 FAIL, 0 BORK from 86 selected fixtures
+- the selected close gate: 77 PASS, 10 SKIP, 0 FAIL, 0 BORK from 87 selected fixtures
 - Previous upstream corpus snapshot before this promotion: 69 PASS, 10 SKIP, 86 FAIL, 0 BORK
   from 165 corpus candidates
 
@@ -21,6 +21,8 @@
 - `preg_grep` positive matching
 - `preg_quote` delimiter escaping
 - `preg_replace_callback` named function, closure, and invalid-callable dispatch
+- `preg_replace_callback_array` sequential function and closure dispatch, count
+  by reference, empty pattern maps, and array subject key preservation
 - `preg_filter` replacement filtering with scalar `null` no-match behavior and
   array key preservation
 
@@ -28,7 +30,7 @@
 
 - Remaining 85 upstream `ext/pcre` failures
 - PCRE JIT, callouts, `(*MARK)`, and every PHP modifier edge
-- `preg_replace_callback_array`, array/method callback edge cases
+- `preg_replace_callback_array` array/method callback edge cases
 - Byte-perfect warning text, stack formatting, UTF-8 edge diagnostics, and
   locale-sensitive ctype behavior
 
@@ -40,6 +42,7 @@
 - `tests/phpt/generated/pcre/preg-replace-callback.phpt`
 - `tests/phpt/generated/pcre/preg-replace-callback-invalid.phpt`
 - `tests/phpt/generated/pcre/paired-delimiters.phpt`
+- `tests/phpt/generated/pcre/preg-replace-callback-array.phpt`
 - 80 target-green upstream rows from `ext/pcre/tests`
 - `ext/pcre/tests/preg_match_basic.phpt`
 - `ext/pcre/tests/preg_quote_basic.phpt`
@@ -78,6 +81,8 @@
   bridge.
 - `preg_replace_callback` uses real VM callable dispatch for named functions and
   closures.
+- `preg_replace_callback_array` is registered in the PCRE runtime/std surface
+  and uses the VM callback dispatch path for user functions and closures.
 - `preg_filter` now shares the replacement engine while filtering out subjects
   that did not match.
 - The PCRE pattern parser now handles PHP paired delimiters `()`, `[]`, `{}`,
@@ -88,19 +93,19 @@
 - The previous full target-only upstream sweep on the PHP 8.5.7 oracle corpus
   measured 69 PASS, 10 SKIP, and 86 FAIL from 165 `ext/pcre/tests` rows. This
   branch promotes `preg_filter.phpt` from that failure set into the selected
-  gate. The selected gate now also includes generated paired-delimiter
-  coverage.
+  gate. The selected gate now also includes generated paired-delimiter and
+  `preg_replace_callback_array` coverage.
 
 ## Known Gaps
 
 - Full upstream `ext/pcre` still has unsupported feature, warning parity,
-  callback-array, UTF-8, malformed-pattern diagnostics, and locale-sensitive
-  cases.
+  callback-array edge cases, UTF-8, malformed-pattern diagnostics, and
+  locale-sensitive cases.
 - The remaining failure set includes `preg_match_all` capture shape variants,
-  `preg_replace_callback_array`, `preg_filter` edge cases, replacement
-  backreference edge cases, split edge cases, invalid UTF-8 offsets,
-  recursion/backtrack limits, JIT/callout/mark cases, and byte-perfect warning
-  text.
+  `preg_replace_callback_array` array/method callback edge cases, `preg_filter`
+  edge cases, replacement backreference edge cases, split edge cases, invalid
+  UTF-8 offsets, recursion/backtrack limits, JIT/callout/mark cases, and
+  byte-perfect warning text.
 - Direct runtime-registry callback use remains limited to internal callables;
   userland callback dispatch is covered through the VM path.
 - Fatal stack formatting for invalid callbacks is intentionally matched by
@@ -110,5 +115,6 @@
 ## Next Step
 
 Close the remaining `preg_match_all` shape, warning parity, UTF-8,
-`preg_replace_callback_array`, advanced replacement/split, and `preg_filter`
-edge-case failures before the next upstream promotion.
+`preg_replace_callback_array` array/method callback edge cases, advanced
+replacement/split, and `preg_filter` edge-case failures before the next
+upstream promotion.

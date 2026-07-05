@@ -1814,6 +1814,7 @@ mod tests {
             "preg_quote",
             "preg_replace",
             "preg_replace_callback",
+            "preg_replace_callback_array",
             "preg_split",
         ] {
             assert!(

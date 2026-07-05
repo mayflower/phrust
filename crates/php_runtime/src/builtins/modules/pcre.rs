@@ -44,6 +44,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_preg_replace_callback,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "preg_replace_callback_array",
+        builtin_preg_replace_callback_array,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("preg_split", builtin_preg_split, BuiltinCompatibility::Php),
 ];
 
@@ -306,6 +311,24 @@ pub(in crate::builtins::modules) fn builtin_preg_replace_callback(
     context.clear_preg_last_error();
     Ok(result)
 }
+
+pub(in crate::builtins::modules) fn builtin_preg_replace_callback_array(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 5 {
+        return Err(arity_error(
+            "preg_replace_callback_array",
+            "two to five argument(s)",
+        ));
+    }
+    Err(BuiltinError::new(
+        "E_PHP_RUNTIME_CALLABLE_CONTEXT_REQUIRED",
+        "preg_replace_callback_array requires VM callable dispatch for user callbacks",
+    ))
+}
+
 pub(in crate::builtins::modules) fn builtin_preg_split(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
