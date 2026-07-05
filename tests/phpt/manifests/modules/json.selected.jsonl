@@ -59,9 +59,11 @@
 {"path":"ext/json/tests/inf_nan_error.phpt"}
 {"path":"ext/json/tests/json_decode_basic.phpt"}
 {"path":"ext/json/tests/json_decode_error.phpt"}
+{"path":"ext/json/tests/json_decode_exceptions.phpt"}
 {"path":"ext/json/tests/json_decode_invalid_utf8.phpt"}
 {"path":"ext/json/tests/json_encode_basic.phpt"}
 {"path":"ext/json/tests/json_encode_basic_utf8.phpt"}
+{"path":"ext/json/tests/json_encode_exceptions.phpt"}
 {"path":"ext/json/tests/json_encode_invalid_utf8.phpt"}
 {"path":"ext/json/tests/json_encode_numeric.phpt"}
 {"path":"ext/json/tests/json_encode_pretty_print.phpt"}

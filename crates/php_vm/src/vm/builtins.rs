@@ -63,23 +63,47 @@ impl Vm {
             values
         };
         if name == "json_encode" {
-            return self.execute_json_encode_with_serializable(
+            let trace_values = values.clone();
+            let result = self.execute_json_encode_with_serializable(
                 entry, values, output, stack, state, compiled, call_span,
             );
+            attach_json_builtin_throwable(
+                name,
+                &result,
+                &trace_values,
+                call_span,
+                output,
+                stack,
+                state,
+                compiled,
+            );
+            return result;
         }
         if name == "curl_exec" {
             return self.execute_curl_exec_with_callbacks(
                 entry, values, output, stack, state, compiled, call_span,
             );
         }
-        execute_builtin_entry(
+        let trace_values = values.clone();
+        let result = execute_builtin_entry(
             entry,
             values,
             output,
             &self.options.runtime_context,
             state,
             builtin_source_span(compiled, call_span),
-        )
+        );
+        attach_json_builtin_throwable(
+            name,
+            &result,
+            &trace_values,
+            call_span,
+            output,
+            stack,
+            state,
+            compiled,
+        );
+        result
     }
 
     fn coerce_internal_builtin_string_args(
@@ -115,4 +139,37 @@ impl Vm {
         }
         Ok(values)
     }
+}
+
+fn attach_json_builtin_throwable(
+    name: &str,
+    result: &VmResult,
+    values: &[Value],
+    call_span: Option<php_ir::IrSpan>,
+    _output: &OutputBuffer,
+    stack: &CallStack,
+    state: &mut ExecutionState,
+    compiled: &CompiledUnit,
+) {
+    if result.status.is_success() || !matches!(name, "json_decode" | "json_encode") {
+        return;
+    }
+    let Some(call_span) = call_span else {
+        return;
+    };
+    if !result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.id() == "E_PHP_RUNTIME_JSON_EXCEPTION")
+    {
+        return;
+    }
+    let Some(throwable) = runtime_error_throwable(result) else {
+        return;
+    };
+    tag_throwable_location(&throwable, compiled, call_span);
+    state.pending_trace = Some(attach_builtin_failed_call_trace(
+        &throwable, compiled, stack, name, values, call_span,
+    ));
+    state.pending_throw = Some(throwable);
 }

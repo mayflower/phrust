@@ -2,7 +2,7 @@
 
 - Priority: 17.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/json.selected.jsonl`
-- the selected close gate: 86 PASS, 3 SKIP, 0 FAIL, 0 BORK from 89 selected fixtures
+- the selected close gate: 88 PASS, 3 SKIP, 0 FAIL, 0 BORK from 91 selected fixtures
 
 ## Scope
 
@@ -10,6 +10,7 @@
 - `json_decode` associative-array and `stdClass` basics
 - `json_last_error` and `json_last_error_msg`
 - `JSON_THROW_ON_ERROR` failure routing
+- `JsonException` protected/private debug shape for selected throw rows
 - `JSON_FORCE_OBJECT`, default Unicode escaping, decode depth/state/control
   diagnostics, `JSON_BIGINT_AS_STRING`, and recursive encode diagnostics
 - `json_validate` general usage, argument errors, depth errors, invalid UTF-8,
@@ -28,7 +29,6 @@
 
 ## Non-Scope
 
-- Exact `JsonException` debug/var_dump shape parity.
 - `pass001` literal object-id expectation rows.
 - Complete JSON flag parity beyond the promoted upstream rows
 
@@ -49,7 +49,9 @@
 - `ext/json/tests/008.phpt`
 - `ext/json/tests/009.phpt`
 - `ext/json/tests/json_encode_basic.phpt`
+- `ext/json/tests/json_encode_exceptions.phpt`
 - `ext/json/tests/json_decode_basic.phpt`
+- `ext/json/tests/json_decode_exceptions.phpt`
 - `ext/json/tests/json_last_error_error.phpt`
 - `ext/json/tests/json_last_error_msg_error.phpt`
 - `ext/json/tests/json_encode_unescaped_slashes.phpt`
@@ -73,7 +75,7 @@
 - `ext/json/tests/bug73113.phpt`
 - `ext/json/tests/serialize.phpt`
 - all additional target-green upstream rows from the latest full `ext/json`
-  target sweep, for 84 selected upstream rows total.
+  target sweep, for 86 selected upstream rows total.
 
 ## Relevant Source Areas
 
@@ -119,6 +121,11 @@
 - Focused probes with target/reuse disabled reached PASS for
   `json_encode_recursion_03.phpt`, `json_encode_recursion_04.phpt`, and
   `json_encode_recursion_05.phpt`.
+- Added php-src-compatible protected/private storage for internal throwable
+  debug output and attached failed `json_decode`/`json_encode` builtin frames
+  before raising `JsonException`.
+- Focused probes with target/reuse disabled reached PASS for
+  `json_decode_exceptions.phpt` and `json_encode_exceptions.phpt`.
 
 ## Known Gaps
 
@@ -137,20 +144,18 @@
 - `JSON_THROW_ON_ERROR` decode failures now route to catchable `JsonException`
   through the existing VM throwable path and preserve selected last-error
   clearing semantics.
+- Selected `JsonException` rows now dump the php-src-compatible
+  protected/private `Exception` property layout, including builtin call traces.
 - `JsonSerializable` dispatch is now bridged through the VM for selected rows,
   including userland return values, self-return public-property fallback,
   callback exceptions, nested self-encode recursion, and partial recursion
   substitution.
-- Remaining upstream failures are now narrowed to 4 rows:
-  `json_decode_exceptions.phpt`, `json_encode_exceptions.phpt`,
-  `pass001.1.phpt`, and `pass001.1_64bit.phpt`.
-- The exception rows still fail on `JsonException` debug shape: phrust exposes
-  simplified public `message`/`code`/`file`/`line` properties where php-src
-  dumps the protected/private `Exception` layout.
+- Remaining upstream failures are now narrowed to 2 rows:
+  `pass001.1.phpt` and `pass001.1_64bit.phpt`.
 - The `pass001.1` rows still fail because their literal expectations contain
   `%d` object-id markers while phrust emits concrete `stdClass` object handles.
 
 ## Next Step
 
-Close the remaining `JsonException` debug-shape and `pass001` literal
-object-id expectation rows, then rerun the full upstream sweep.
+Close the remaining `pass001` literal object-id expectation rows, then rerun
+the full upstream sweep.

@@ -14861,18 +14861,24 @@ impl Vm {
                         };
                         let span = runtime_source_span(compiled, instruction.span);
                         if let Some(file) = span.file {
-                            object.set_property("file", Value::string(file.into_bytes()));
+                            set_throwable_property(
+                                &object,
+                                "file",
+                                Value::string(file.into_bytes()),
+                            );
                         }
                         if let Some(line) =
                             source_span_display_line(compiled, instruction.span, false)
                         {
-                            object.set_property("line", Value::Int(line));
+                            set_throwable_property(&object, "line", Value::Int(line));
                         }
-                        object.set_property(
+                        set_throwable_property(
+                            &object,
                             "trace",
                             Value::Array(debug_backtrace_array(compiled, stack, 1, 0)),
                         );
-                        object.set_property(
+                        set_throwable_property(
+                            &object,
                             "trace_string",
                             Value::string(capture_backtrace_string(compiled, stack).into_bytes()),
                         );
@@ -42572,16 +42578,32 @@ fn throwable_class_name(value: &Value) -> String {
     }
 }
 
+const THROWABLE_STRING_PROPERTY: &str = "private:Exception:string";
+const THROWABLE_TRACE_PROPERTY: &str = "private:Exception:trace";
+const THROWABLE_PREVIOUS_PROPERTY: &str = "private:Exception:previous";
+const THROWABLE_TRACE_STRING_PROPERTY: &str = "__phrust_trace_string";
+
 fn make_exception_object(class_name: &str, message: &Value) -> Result<ObjectRef, String> {
     let message = to_string(message)?.to_string_lossy();
     let class_name = internal_throwable_display_name(class_name);
     let parent = internal_throwable_parent(&class_name).map(str::to_owned);
+    let protected_flags = RuntimeClassPropertyFlags {
+        is_protected: true,
+        ..RuntimeClassPropertyFlags::default()
+    };
+    let private_flags = RuntimeClassPropertyFlags {
+        is_private: true,
+        ..RuntimeClassPropertyFlags::default()
+    };
     let throwable_property =
-        |name: &str, default: Value, type_: RuntimeType| RuntimeClassPropertyEntry {
+        |name: &str,
+         default: Value,
+         type_: Option<RuntimeType>,
+         flags: RuntimeClassPropertyFlags| RuntimeClassPropertyEntry {
             name: name.to_owned(),
             default,
-            type_: Some(type_),
-            flags: RuntimeClassPropertyFlags::default(),
+            type_,
+            flags,
             hooks: RuntimeClassPropertyHooks::default(),
             attributes: Vec::new(),
         };
@@ -42594,19 +42616,45 @@ fn make_exception_object(class_name: &str, message: &Value) -> Result<ObjectRef,
             throwable_property(
                 "message",
                 Value::String(PhpString::from_test_str(&message)),
-                RuntimeType::String,
+                Some(RuntimeType::String),
+                protected_flags,
             ),
-            throwable_property("code", Value::Int(0), RuntimeType::Int),
-            throwable_property("file", Value::string(Vec::new()), RuntimeType::String),
-            throwable_property("line", Value::Int(0), RuntimeType::Int),
-            RuntimeClassPropertyEntry {
-                name: "trace".to_owned(),
-                default: Value::Array(PhpArray::new()),
-                type_: None,
-                flags: RuntimeClassPropertyFlags::default(),
-                hooks: RuntimeClassPropertyHooks::default(),
-                attributes: Vec::new(),
-            },
+            throwable_property(
+                THROWABLE_STRING_PROPERTY,
+                Value::string(Vec::new()),
+                Some(RuntimeType::String),
+                private_flags,
+            ),
+            throwable_property(
+                "code",
+                Value::Int(0),
+                Some(RuntimeType::Int),
+                protected_flags,
+            ),
+            throwable_property(
+                "file",
+                Value::string(Vec::new()),
+                Some(RuntimeType::String),
+                protected_flags,
+            ),
+            throwable_property(
+                "line",
+                Value::Int(0),
+                Some(RuntimeType::Int),
+                protected_flags,
+            ),
+            throwable_property(
+                THROWABLE_TRACE_PROPERTY,
+                Value::Array(PhpArray::new()),
+                None,
+                private_flags,
+            ),
+            throwable_property(
+                THROWABLE_PREVIOUS_PROPERTY,
+                Value::Null,
+                None,
+                private_flags,
+            ),
         ],
         constants: Vec::new(),
         enum_cases: Vec::new(),
@@ -42616,6 +42664,29 @@ fn make_exception_object(class_name: &str, message: &Value) -> Result<ObjectRef,
         flags: RuntimeClassFlags::default(),
     };
     Ok(ObjectRef::new_with_display_name(&class, class_name))
+}
+
+fn throwable_property_storage_name(name: &str) -> &str {
+    match name {
+        "string" => THROWABLE_STRING_PROPERTY,
+        "trace" => THROWABLE_TRACE_PROPERTY,
+        "previous" => THROWABLE_PREVIOUS_PROPERTY,
+        "trace_string" => THROWABLE_TRACE_STRING_PROPERTY,
+        _ => name,
+    }
+}
+
+fn get_throwable_property(object: &ObjectRef, name: &str) -> Option<Value> {
+    let storage_name = throwable_property_storage_name(name);
+    object.get_property(storage_name).or_else(|| {
+        (storage_name != name)
+            .then(|| object.get_property(name))
+            .flatten()
+    })
+}
+
+fn set_throwable_property(object: &ObjectRef, name: &str, value: Value) {
+    object.set_property(throwable_property_storage_name(name), value);
 }
 
 fn new_internal_throwable_object(
@@ -42660,26 +42731,28 @@ fn initialize_internal_throwable_object(
         .first()
         .map(|arg| arg.value.clone())
         .unwrap_or_else(|| Value::string(Vec::new()));
-    object.set_property("message", message);
-    object.set_property("code", Value::Int(0));
+    set_throwable_property(object, "message", message);
+    set_throwable_property(object, "code", Value::Int(0));
     if let Some(code) = args.get(1) {
-        object.set_property("code", code.value.clone());
+        set_throwable_property(object, "code", code.value.clone());
     }
     if let Some(previous) = args.get(2) {
-        object.set_property("previous", previous.value.clone());
+        set_throwable_property(object, "previous", previous.value.clone());
     }
     let display_span = runtime_source_span(compiled, span);
     if let Some(file) = display_span.file {
-        object.set_property("file", Value::string(file.into_bytes()));
+        set_throwable_property(object, "file", Value::string(file.into_bytes()));
     }
     if let Some(line) = source_span_display_line(compiled, span, false) {
-        object.set_property("line", Value::Int(line));
+        set_throwable_property(object, "line", Value::Int(line));
     }
-    object.set_property(
+    set_throwable_property(
+        object,
         "trace",
         Value::Array(debug_backtrace_array(compiled, stack, 1, 0)),
     );
-    object.set_property(
+    set_throwable_property(
+        object,
         "trace_string",
         Value::string(capture_backtrace_string(compiled, stack).into_bytes()),
     );
@@ -42999,15 +43072,15 @@ fn internal_throwable_method_value(
         "getmessage" => Ok(object
             .get_property("message")
             .unwrap_or_else(|| Value::string(Vec::new()))),
-        "getcode" => Ok(object.get_property("code").unwrap_or(Value::Int(0))),
-        "getline" => Ok(object.get_property("line").unwrap_or(Value::Int(0))),
+        "getcode" => Ok(get_throwable_property(object, "code").unwrap_or(Value::Int(0))),
+        "getline" => Ok(get_throwable_property(object, "line").unwrap_or(Value::Int(0))),
         "getfile" => Ok(object
             .get_property("file")
             .unwrap_or_else(|| Value::string(Vec::new()))),
-        "getprevious" => Ok(object.get_property("previous").unwrap_or(Value::Null)),
+        "getprevious" => Ok(get_throwable_property(object, "previous").unwrap_or(Value::Null)),
         "gettraceasstring" => Ok(Value::string(throwable_trace_string(object).into_bytes())),
         "gettrace" => Ok(object
-            .get_property("trace")
+            .get_property(throwable_property_storage_name("trace"))
             .unwrap_or_else(|| Value::Array(PhpArray::new()))),
         "__tostring" => Ok(Value::string(throwable_string(object).into_bytes())),
         _ => Err(format!(
@@ -43018,8 +43091,7 @@ fn internal_throwable_method_value(
 }
 
 fn throwable_trace_string(object: &ObjectRef) -> String {
-    object
-        .get_property("trace_string")
+    get_throwable_property(object, "trace_string")
         .and_then(|value| to_string(&value).ok())
         .map(|value| value.to_string_lossy())
         .filter(|value| !value.is_empty())
@@ -43038,7 +43110,7 @@ fn throwable_string(object: &ObjectRef) -> String {
         .and_then(|value| to_string(&value).ok())
         .map(|value| value.to_string_lossy())
         .unwrap_or_default();
-    let line = match object.get_property("line") {
+    let line = match get_throwable_property(object, "line") {
         Some(Value::Int(line)) => line,
         _ => 0,
     };
@@ -43107,11 +43179,15 @@ fn catch_matches(
 fn tag_throwable_location(throwable: &Value, compiled: &CompiledUnit, span: php_ir::IrSpan) {
     if let Value::Object(object) = throwable {
         if let Some(file) = compiled.unit().files.get(span.file.index()) {
-            object.set_property("file", Value::string(file.path.clone().into_bytes()));
+            set_throwable_property(
+                object,
+                "file",
+                Value::string(file.path.clone().into_bytes()),
+            );
         }
         let line = source_span_display_line(compiled, span, false)
             .unwrap_or_else(|| i64::from(span.start));
-        object.set_property("line", Value::Int(line));
+        set_throwable_property(object, "line", Value::Int(line));
     }
 }
 
@@ -43120,7 +43196,7 @@ fn tag_throwable_location_from_diagnostic(object: &ObjectRef, diagnostic: &Runti
     let Some(file) = span.file.as_deref().filter(|file| !file.is_empty()) else {
         return;
     };
-    object.set_property("file", Value::string(file.as_bytes().to_vec()));
+    set_throwable_property(object, "file", Value::string(file.as_bytes().to_vec()));
     let line = std::fs::read(file)
         .ok()
         .map(|bytes| {
@@ -43131,7 +43207,7 @@ fn tag_throwable_location_from_diagnostic(object: &ObjectRef, diagnostic: &Runti
                 .count() as i64
         })
         .unwrap_or_else(|| i64::from(span.start));
-    object.set_property("line", Value::Int(line));
+    set_throwable_property(object, "line", Value::Int(line));
 }
 
 fn uncaught_exception(
@@ -43154,7 +43230,7 @@ fn uncaught_exception(
                 .and_then(|value| to_string(&value).ok())
                 .map(|value| value.to_string_lossy())
                 .unwrap_or_default();
-            let line = match object.get_property("line") {
+            let line = match get_throwable_property(object, "line") {
                 Some(Value::Int(line)) => line,
                 _ => 0,
             };
@@ -67137,6 +67213,55 @@ fn capture_backtrace_string_with_builtin_failed_call(
     lines.join("\n")
 }
 
+fn builtin_failed_call_trace_array(
+    compiled: &CompiledUnit,
+    function: &str,
+    values: &[Value],
+    call_span: php_ir::IrSpan,
+) -> PhpArray {
+    let mut trace = PhpArray::new();
+    let mut frame = PhpArray::new();
+    if let Some(file) = compiled.unit().files.get(call_span.file.index()) {
+        frame.insert(
+            string_key("file"),
+            Value::string(file.path.clone().into_bytes()),
+        );
+    }
+    let line = source_span_display_line(compiled, call_span, false)
+        .unwrap_or_else(|| i64::from(call_span.start));
+    frame.insert(string_key("line"), Value::Int(line));
+    frame.insert(
+        string_key("function"),
+        Value::string(function.as_bytes().to_vec()),
+    );
+    frame.insert(
+        string_key("args"),
+        Value::Array(PhpArray::from_packed(values.to_vec())),
+    );
+    trace.append(Value::Array(frame));
+    trace
+}
+
+fn attach_builtin_failed_call_trace(
+    throwable: &Value,
+    compiled: &CompiledUnit,
+    stack: &CallStack,
+    function: &str,
+    values: &[Value],
+    call_span: php_ir::IrSpan,
+) -> String {
+    if let Value::Object(object) = throwable {
+        set_throwable_property(
+            object,
+            "trace",
+            Value::Array(builtin_failed_call_trace_array(
+                compiled, function, values, call_span,
+            )),
+        );
+    }
+    capture_backtrace_string_with_builtin_failed_call(compiled, stack, function, values, call_span)
+}
+
 fn capture_backtrace_string_with_internal_iterator_builtin_call(
     compiled: &CompiledUnit,
     stack: &CallStack,
@@ -67181,7 +67306,7 @@ fn append_throwable_internal_iterator_trace_arg_frame(
     let Value::Object(object) = throwable else {
         return;
     };
-    let mut trace = match object.get_property("trace") {
+    let mut trace = match get_throwable_property(object, "trace") {
         Some(Value::Array(array)) => array,
         _ => PhpArray::new(),
     };
@@ -67204,7 +67329,7 @@ fn append_throwable_internal_iterator_trace_arg_frame(
         Value::Array(PhpArray::from_packed(values.to_vec())),
     );
     trace.append(Value::Array(frame));
-    object.set_property("trace", Value::Array(trace));
+    set_throwable_property(object, "trace", Value::Array(trace));
 }
 
 fn format_internal_iterator_trace_call(compiled: &CompiledUnit, value: Option<&Value>) -> String {
@@ -68940,7 +69065,7 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
     if diagnostic.id() == "E_PHP_RUNTIME_JSON_EXCEPTION"
         && let Some(RuntimeDiagnosticPayload::JsonBuiltin(payload)) = diagnostic.payload()
     {
-        object.set_property("code", Value::Int(payload.error_code()));
+        set_throwable_property(&object, "code", Value::Int(payload.error_code()));
     }
     tag_throwable_location_from_diagnostic(&object, diagnostic);
     Some(Value::Object(object))
@@ -76727,6 +76852,47 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
         assert_eq!(
             result.output.to_string_lossy(),
             "arity|arity-type|type|value|json:Syntax error"
+        );
+    }
+
+    #[test]
+    fn json_throw_on_error_exception_debug_shape_matches_php() {
+        let result = execute_source(
+            "<?php
+            try {
+                json_decode('{', false, 512, JSON_THROW_ON_ERROR);
+            } catch (JsonException $e) {
+                var_dump($e);
+            }
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        let output = result.output.to_string_lossy();
+        assert!(output.contains("object(JsonException)#1 (7) {"), "{output}");
+        assert!(
+            output.contains("[\"message\":protected]=>\n  string(12) \"Syntax error\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"string\":\"Exception\":private]=>"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"trace\":\"Exception\":private]=>"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"previous\":\"Exception\":private]=>"),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"function\"]=>\n      string(11) \"json_decode\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("[\"args\"]=>\n      array(4) {"),
+            "{output}"
         );
     }
 
