@@ -253,6 +253,14 @@ pub struct ArrayEntry {
     string_key_shared_for_shape: bool,
 }
 
+impl ArrayEntry {
+    /// Consumes the entry into its key and value.
+    #[must_use]
+    pub fn into_key_value(self) -> (ArrayKey, Value) {
+        (self.key, self.value)
+    }
+}
+
 impl PartialEq for ArrayEntry {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key && self.value == other.value
@@ -1292,6 +1300,41 @@ impl PhpArray {
     #[must_use]
     pub fn is_shared(&self) -> bool {
         Rc::strong_count(&self.storage) > 1
+    }
+
+    /// Consumes the array into owned `(key, value)` pairs. A handle that
+    /// solely owns its storage moves the values out without cloning;
+    /// shared storage falls back to cloning each pair.
+    #[must_use]
+    pub fn into_pairs(self) -> Vec<(ArrayKey, Value)> {
+        match Rc::try_unwrap(self.storage) {
+            Ok(storage) => match storage {
+                ArrayStorage::Packed(storage) => storage
+                    .values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| (ArrayKey::Int(index as i64), value))
+                    .collect(),
+                ArrayStorage::Record(storage) => {
+                    let keys = storage.shape.keys.clone();
+                    storage
+                        .values
+                        .into_iter()
+                        .zip(keys)
+                        .map(|(value, key)| (ArrayKey::String(key), value))
+                        .collect()
+                }
+                ArrayStorage::Mixed(storage) => storage
+                    .entries
+                    .into_iter()
+                    .map(ArrayEntry::into_key_value)
+                    .collect(),
+            },
+            Err(storage) => Self { storage }
+                .iter()
+                .map(|(key, value)| (key, value.clone()))
+                .collect(),
+        }
     }
 
     /// Returns true when tracked metadata proves the array is exactly

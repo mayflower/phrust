@@ -4804,6 +4804,15 @@ impl Vm {
         }
     }
 
+    fn record_counter_cufa_argument_path(&self, owned: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_cufa_argument_path(owned);
+        }
+    }
+
     fn record_counter_array_slice_packed_fast_hit(&self) {
         if !self.options.collect_counters {
             return;
@@ -10625,25 +10634,26 @@ impl Vm {
                             return result;
                         };
                         let value = match value {
-                            Some(value) => match self.read_dense_operand_with_source(
-                                compiled,
-                                stack,
-                                value,
-                                layout_source::RETURN_VALUE,
-                            ) {
-                                Ok(value) => {
-                                    self.record_counter_value_clone_reason(
-                                        layout_source::RETURN_VALUE.name(),
-                                    );
-                                    Some(value)
+                            // The frame dies with this return; register
+                            // operands move out instead of cloning. Dense
+                            // functions never carry local finally handlers,
+                            // so nothing can observe the register afterwards.
+                            Some(value) => {
+                                match self.take_consumed_dense_operand(compiled, stack, value) {
+                                    Ok(value) => {
+                                        self.record_counter_value_clone_reason(
+                                            layout_source::RETURN_VALUE.name(),
+                                        );
+                                        Some(value)
+                                    }
+                                    Err(message) => {
+                                        let result =
+                                            self.runtime_error(output, compiled, stack, message);
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
                                 }
-                                Err(message) => {
-                                    let result =
-                                        self.runtime_error(output, compiled, stack, message);
-                                    stack.pop_recycle();
-                                    return result;
-                                }
-                            },
+                            }
                             None => None,
                         };
                         let value = match coerce_return_value(
@@ -15104,6 +15114,18 @@ impl Vm {
                     }
                     InstructionKind::EndFinally { after } => match pending_control.take() {
                         Some(PendingControl::Return(value)) => {
+                            let mut resume_finally = None;
+                            while let Some(handler) = exception_handlers.pop() {
+                                if let Some(finally) = handler.finally {
+                                    resume_finally = Some(finally);
+                                    break;
+                                }
+                            }
+                            if let Some(finally) = resume_finally {
+                                pending_control = Some(PendingControl::Return(value));
+                                block_id = finally;
+                                continue 'dispatch;
+                            }
                             let value = match coerce_return_value(
                                 compiled,
                                 state,
@@ -28183,7 +28205,33 @@ impl Vm {
                     value,
                     by_ref_local,
                 } => {
+                    // A pending finally re-enters this frame's blocks and may
+                    // still read registers; only then keep the cloning read.
+                    let finally_pending = exception_handlers
+                        .iter()
+                        .any(|handler| handler.finally.is_some());
                     let value = match value {
+                        Some(Operand::Register(id)) if !finally_pending => {
+                            let taken = stack
+                                .frame_mut(frame_index)
+                                .expect("frame was pushed")
+                                .registers
+                                .take(*id);
+                            match taken {
+                                Ok(value) if value.is_uninitialized() => {
+                                    return self.runtime_error(
+                                        output,
+                                        compiled,
+                                        stack,
+                                        format!("read uninitialized register r{}", id.raw()),
+                                    );
+                                }
+                                Ok(value) => Some(value),
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            }
+                        }
                         Some(value) => {
                             let _source = layout_source::enter(layout_source::RETURN_VALUE);
                             match read_operand_at_frame(unit, stack, frame_index, *value) {
@@ -28195,9 +28243,18 @@ impl Vm {
                         }
                         None => None,
                     };
-                    if let Some(handler) = exception_handlers.pop()
-                        && let Some(finally) = handler.finally
-                    {
+                    // A return unwinds through every enclosing try scope:
+                    // catch-only handlers are discarded, the innermost
+                    // pending finally runs first, and EndFinally resumes the
+                    // unwind for outer finallys.
+                    let mut resume_finally = None;
+                    while let Some(handler) = exception_handlers.pop() {
+                        if let Some(finally) = handler.finally {
+                            resume_finally = Some(finally);
+                            break;
+                        }
+                    }
+                    if let Some(finally) = resume_finally {
                         pending_control = Some(PendingControl::Return(value));
                         block_id = finally;
                         continue 'dispatch;
@@ -40290,7 +40347,8 @@ impl Vm {
                 "E_PHP_VM_CALLABLE_TYPE: call_user_func_array expects array arguments",
             );
         };
-        let args = call_args_from_php_array(&array);
+        self.record_counter_cufa_argument_path(!array.is_shared());
+        let args = call_args_from_owned_php_array(array);
         if let Err(result) = self.preflight_user_callback(
             compiled,
             &callback,
@@ -66949,6 +67007,24 @@ fn class_member_visible(
         });
     }
     true
+}
+
+/// Consuming variant of [`call_args_from_php_array`]: argument arrays that
+/// reach `call_user_func_array` as sole-owner temporaries (hook dispatch
+/// building `array_slice(...)` results) move their values into the call
+/// instead of cloning every element.
+fn call_args_from_owned_php_array(array: PhpArray) -> Vec<CallArgument> {
+    array
+        .into_pairs()
+        .into_iter()
+        .map(|(key, value)| {
+            let mut arg = CallArgument::positional(value);
+            if let ArrayKey::String(name) = key {
+                arg.name = Some(name.to_string_lossy());
+            }
+            arg
+        })
+        .collect()
 }
 
 fn call_args_from_php_array(array: &PhpArray) -> Vec<CallArgument> {

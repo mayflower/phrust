@@ -359,6 +359,8 @@ pub struct VmCounters {
     pub property_dim_assign_in_place_hits: u64,
     pub property_dim_assign_generic_by_reason: BTreeMap<String, u64>,
     pub property_dim_probe_borrowed_hits: u64,
+    pub cufa_owned_argument_moves: u64,
+    pub cufa_shared_argument_clones: u64,
     pub array_builtin_fast_fallback_by_reason: BTreeMap<String, u64>,
     pub specialized_builtin_opcode_hits: BTreeMap<String, u64>,
     pub slow_path_calls_by_reason: BTreeMap<String, u64>,
@@ -1741,6 +1743,14 @@ impl VmCounters {
 
     pub(crate) fn record_property_dim_probe_borrowed_hit(&mut self) {
         self.property_dim_probe_borrowed_hits += 1;
+    }
+
+    pub(crate) fn record_cufa_argument_path(&mut self, owned: bool) {
+        if owned {
+            self.cufa_owned_argument_moves += 1;
+        } else {
+            self.cufa_shared_argument_clones += 1;
+        }
     }
 
     pub(crate) fn record_array_builtin_fast_fallback(&mut self, builtin: &str, reason: &str) {
@@ -3525,6 +3535,18 @@ impl VmCounters {
             &mut json,
             "property_dim_probe_borrowed_hits",
             self.property_dim_probe_borrowed_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "cufa_owned_argument_moves",
+            self.cufa_owned_argument_moves,
+            true,
+        );
+        push_field(
+            &mut json,
+            "cufa_shared_argument_clones",
+            self.cufa_shared_argument_clones,
             true,
         );
         push_string_u64_map_field(
