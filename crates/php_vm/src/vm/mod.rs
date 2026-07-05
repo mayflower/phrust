@@ -9384,7 +9384,7 @@ impl Vm {
                                 })
                                 .unwrap_or(Value::Uninitialized)
                         };
-                        let result = match php_empty(&value) {
+                        let result = match php_empty_access_value(&value) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -12009,7 +12009,7 @@ impl Vm {
                 state,
             )?;
             if rest.is_empty() {
-                return php_empty(&child)
+                return php_empty_access_value(&child)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message));
             }
             return self
@@ -12019,7 +12019,8 @@ impl Vm {
             .ok()
             .flatten()
             .unwrap_or(Value::Uninitialized);
-        php_empty(&value).map_err(|message| self.runtime_error(output, compiled, stack, message))
+        php_empty_access_value(&value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
     }
 
     fn try_userland_arrayaccess_offset_unset_local(
@@ -19364,7 +19365,7 @@ impl Vm {
                         };
                         let result =
                             match property_state_value(compiled, state, stack, &object, property) {
-                                Some(value) => match php_empty(&value) {
+                                Some(value) => match php_empty_access_value(&value) {
                                     Ok(value) => value,
                                     Err(message) => {
                                         return self
@@ -19410,7 +19411,8 @@ impl Vm {
                                             stack,
                                             state,
                                         ) {
-                                            Ok(Some(value)) => match php_empty(&value) {
+                                            Ok(Some(value)) => match php_empty_access_value(&value)
+                                            {
                                                 Ok(value) => value,
                                                 Err(message) => {
                                                     return self.runtime_error(
@@ -19472,7 +19474,7 @@ impl Vm {
                         let result = match property_state_value(
                             compiled, state, stack, &object, &property,
                         ) {
-                            Some(value) => match php_empty(&value) {
+                            Some(value) => match php_empty_access_value(&value) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -19516,7 +19518,7 @@ impl Vm {
                                         stack,
                                         state,
                                     ) {
-                                        Ok(Some(value)) => match php_empty(&value) {
+                                        Ok(Some(value)) => match php_empty_access_value(&value) {
                                             Ok(value) => value,
                                             Err(message) => {
                                                 return self.runtime_error(
@@ -19620,7 +19622,7 @@ impl Vm {
                                     })
                             })
                             .unwrap_or(Value::Uninitialized);
-                        let result = match php_empty(&value) {
+                        let result = match php_empty_access_value(&value) {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -19716,7 +19718,7 @@ impl Vm {
                         let value = property_state_value(compiled, state, stack, &object, property)
                             .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
                             .unwrap_or(Value::Uninitialized);
-                        let result = match php_empty(&value) {
+                        let result = match php_empty_access_value(&value) {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -23210,7 +23212,7 @@ impl Vm {
                                 })
                                 .unwrap_or(Value::Uninitialized)
                         };
-                        let result = match php_empty(&value) {
+                        let result = match php_empty_access_value(&value) {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -48473,7 +48475,7 @@ fn static_property_dim_isset_empty_result(
         .flatten()
         .unwrap_or(Value::Uninitialized);
     if is_empty {
-        Ok(php_empty(&value)?)
+        Ok(php_empty_access_value(&value)?)
     } else {
         Ok(!matches!(value, Value::Uninitialized | Value::Null))
     }
@@ -70045,6 +70047,13 @@ fn fetch_dim_path_value(value: &Value, dims: &[ArrayKey]) -> Result<Option<Value
                 };
                 current = next;
             }
+            Value::Object(object) if is_simplexml_object(object) => {
+                let next = php_runtime::xml::simplexml_dimension(object, key);
+                if matches!(next, Value::Null) {
+                    return Ok(None);
+                }
+                current = effective_value(&next);
+            }
             _ => return Ok(None),
         }
     }
@@ -72909,6 +72918,19 @@ fn php_empty(value: &Value) -> Result<bool, String> {
         | Value::Generator(_)
         | Value::Callable(_) => Ok(false),
     }
+}
+
+fn php_empty_access_value(value: &Value) -> Result<bool, String> {
+    match effective_value(value) {
+        Value::Object(object) if is_simplexml_object(&object) => {
+            Ok(php_runtime::xml::simplexml_empty_access(&object))
+        }
+        value => php_empty(&value),
+    }
+}
+
+fn is_simplexml_object(object: &ObjectRef) -> bool {
+    normalize_class_name(&object.class_name()) == "simplexmlelement"
 }
 
 fn illegal_string_offset_warning(

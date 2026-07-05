@@ -609,6 +609,22 @@ pub fn simplexml_dimension(object: &ObjectRef, key: &ArrayKey) -> Value {
     }
 }
 
+pub fn simplexml_empty_access(object: &ObjectRef) -> bool {
+    if let Some(entry) = first_simplexml_entry(object) {
+        return simplexml_empty_access(&entry);
+    }
+    if let Some(document) = document_from_object(object) {
+        let text = simplexml_element_text(&document.root);
+        return element_element_children(&document.root).is_empty()
+            && (text.is_empty() || text.as_bytes() == b"0");
+    }
+    match object.get_property("__text") {
+        Some(Value::String(text)) => text.is_empty() || text.as_bytes() == b"0",
+        Some(Value::Uninitialized | Value::Null) | None => true,
+        Some(value) => matches!(value, Value::Bool(false) | Value::Int(0)),
+    }
+}
+
 fn simplexml_numeric_dimension(object: &ObjectRef, index: i64) -> Value {
     if index < 0 {
         return Value::Null;

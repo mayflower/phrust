@@ -16,8 +16,9 @@
   tree.
 - `SimpleXMLElement` supports text conversion, child property access,
   `children()`, `attributes()`, `count()`, `getName()`, array-style attribute
-  offsets, numeric child selection offsets, iteration over child elements,
-  duplicate child-list iteration keys, and `asXML()`.
+  offsets, numeric child selection offsets, direct `isset()`/`empty()` over
+  properties and offsets, iteration over child elements, duplicate child-list
+  iteration keys, and `asXML()`.
 - The selected WordPress-style slice covers RSS title/item reads, plugin
   metadata attributes, and simple config option iteration.
 
@@ -35,7 +36,7 @@
 
 | Stable ID | Reference behavior summary | Current phrust behavior | Fixture path | Next owner layer |
 | --- | --- | --- | --- | --- |
-| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, `children()`, `count()`, `getName()`, attribute offsets, numeric child selection offsets, attributes, text, iteration, duplicate child-list keys, and serialization are implemented. | `tests/phpt/generated/simplexml/array-offsets-getname.phpt` | future SimpleXML/DOM integration |
+| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, `children()`, `count()`, `getName()`, attribute offsets, numeric child selection offsets, direct `isset()`/`empty()`, attributes, text, iteration, duplicate child-list keys, and serialization are implemented. | `tests/phpt/generated/simplexml/array-offsets-getname.phpt` | future SimpleXML/DOM integration |
 | `XML-DOM-INTL-SIMPLEXML-LIBXML-ERRORS` | SimpleXML participates in libxml error handling and parse option behavior. | The shared strict parser rejects unsupported constructs without libxml error state. | `tests/phpt/generated/simplexml/simplexml-basic.phpt` | future libxml compatibility layer |
 
 ## Target Gates
