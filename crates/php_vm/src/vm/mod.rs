@@ -55018,6 +55018,10 @@ fn call_xml_runtime_method(
             validate_xml_value_count("SimpleXMLElement::attributes", &args, 0, 0)?;
             Ok(php_runtime::xml::simplexml_attributes(object))
         }
+        ("simplexmlelement", "children") => {
+            validate_xml_value_count("SimpleXMLElement::children", &args, 0, 0)?;
+            Ok(php_runtime::xml::simplexml_children(object))
+        }
         ("simplexmlelement", "__tostring") => {
             validate_xml_value_count("SimpleXMLElement::__toString", &args, 0, 0)?;
             Ok(php_runtime::xml::simplexml_text(object))
@@ -70224,6 +70228,35 @@ fn object_property_iteration_entries(
 ) -> Result<Vec<ObjectPropertyIterationEntry>, String> {
     let class_name = object.class_name();
     if normalize_class_name(&class_name) == "simplexmlelement" {
+        if let Some(Value::Array(entries)) = object.get_property("__entries") {
+            let names = object.get_property("__entry_names");
+            return Ok(entries
+                .iter()
+                .map(|(key, _)| match key {
+                    ArrayKey::Int(index) => {
+                        let key = names
+                            .as_ref()
+                            .and_then(|value| match value {
+                                Value::Array(names) => names.get(&ArrayKey::Int(index)),
+                                _ => None,
+                            })
+                            .and_then(|value| match value {
+                                Value::String(name) => Some(name.to_string_lossy()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| index.to_string());
+                        ObjectPropertyIterationEntry {
+                            key,
+                            storage_name: index.to_string(),
+                        }
+                    }
+                    ArrayKey::String(key) => ObjectPropertyIterationEntry {
+                        key: key.to_string_lossy(),
+                        storage_name: key.to_string_lossy(),
+                    },
+                })
+                .collect());
+        }
         return Ok(object
             .properties_snapshot()
             .into_iter()

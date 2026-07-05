@@ -5,7 +5,7 @@
   `simplexml_load_file`, and
   `SimpleXMLElement`
 - Selected manifest: `tests/phpt/manifests/modules/simplexml.selected.jsonl`
-- Selected gate: 4 generated PHPTs covering platform visibility, object
+- Selected gate: 5 generated PHPTs covering platform visibility, object
   access, local file loading, and WordPress-style RSS/plugin/config snippets
 
 ## Runtime Contract
@@ -15,7 +15,8 @@
 - `simplexml_load_file()` loads allowed local files through the same strict XML
   tree.
 - `SimpleXMLElement` supports text conversion, child property access,
-  `attributes()`, iteration over child elements, and `asXML()`.
+  `children()`, `attributes()`, iteration over child elements, duplicate
+  child-list iteration keys, and `asXML()`.
 - The selected WordPress-style slice covers RSS title/item reads, plugin
   metadata attributes, and simple config option iteration.
 
@@ -23,6 +24,7 @@
 
 - `tests/phpt/generated/simplexml/platform-checks.phpt`
 - `tests/phpt/generated/simplexml/simplexml-basic.phpt`
+- `tests/phpt/generated/simplexml/children-method.phpt`
 - `tests/phpt/generated/simplexml/load-file.phpt`
 - `tests/phpt/generated/simplexml/wordpress-snippets.phpt`
 
@@ -30,7 +32,7 @@
 
 | Stable ID | Reference behavior summary | Current phrust behavior | Fixture path | Next owner layer |
 | --- | --- | --- | --- | --- |
-| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, attributes, text, iteration, and serialization are implemented. | `tests/phpt/generated/simplexml/simplexml-basic.phpt` | future SimpleXML/DOM integration |
+| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, `children()`, attributes, text, iteration, duplicate child-list keys, and serialization are implemented. | `tests/phpt/generated/simplexml/children-method.phpt` | future SimpleXML/DOM integration |
 | `XML-DOM-INTL-SIMPLEXML-LIBXML-ERRORS` | SimpleXML participates in libxml error handling and parse option behavior. | The shared strict parser rejects unsupported constructs without libxml error state. | `tests/phpt/generated/simplexml/simplexml-basic.phpt` | future libxml compatibility layer |
 
 ## Target Gates

@@ -18,6 +18,8 @@ const XML_READER_ATTRIBUTE_INDEX: &str = "__phrust_xml_reader_attribute_index";
 const XML_WRITER_BUFFER: &str = "__phrust_xml_writer_buffer";
 const XML_WRITER_STACK: &str = "__phrust_xml_writer_stack";
 const XML_WRITER_OPEN_TAG: &str = "__phrust_xml_writer_open_tag";
+const SIMPLEXML_ENTRIES: &str = "__entries";
+const SIMPLEXML_ENTRY_NAMES: &str = "__entry_names";
 
 pub const XML_READER_NONE: i64 = 0;
 pub const XML_READER_ELEMENT: i64 = 1;
@@ -221,26 +223,74 @@ pub fn new_simplexml_element(element: &XmlElement) -> ObjectRef {
     for (name, children) in children_by_name {
         let value = match children.as_slice() {
             [child] => Value::Object(child.clone()),
-            _ => Value::Object(new_simplexml_element_list(&children)),
+            _ => Value::Object(new_simplexml_element_list(&name, &children)),
         };
         object.set_property(name, value);
     }
     object
 }
 
-fn new_simplexml_element_list(elements: &[ObjectRef]) -> ObjectRef {
+fn new_simplexml_element_list(name: &str, elements: &[ObjectRef]) -> ObjectRef {
     let object = ObjectRef::new_with_display_name(
         &empty_internal_class("SimpleXMLElement"),
         "SimpleXMLElement",
     );
     object.set_property("__text", Value::string(Vec::<u8>::new()));
     let mut entries = PhpArray::new();
+    let mut entry_names = PhpArray::new();
     for (index, element) in elements.iter().enumerate() {
         let value = Value::Object(element.clone());
         object.set_property(index.to_string(), value.clone());
         entries.insert(ArrayKey::Int(index as i64), value);
+        entry_names.insert(
+            ArrayKey::Int(index as i64),
+            Value::string(name.as_bytes().to_vec()),
+        );
     }
-    object.set_property("__entries", Value::Array(entries));
+    object.set_property(SIMPLEXML_ENTRIES, Value::Array(entries));
+    object.set_property(SIMPLEXML_ENTRY_NAMES, Value::Array(entry_names));
+    object
+}
+
+fn new_simplexml_children_list(children: &[XmlNode]) -> ObjectRef {
+    let object = ObjectRef::new_with_display_name(
+        &empty_internal_class("SimpleXMLElement"),
+        "SimpleXMLElement",
+    );
+    object.set_property("__text", Value::string(Vec::<u8>::new()));
+    let mut entries = PhpArray::new();
+    let mut entry_names = PhpArray::new();
+    let mut children_by_name: BTreeMap<String, Vec<ObjectRef>> = BTreeMap::new();
+    for (index, child) in children
+        .iter()
+        .filter_map(|child| match child {
+            XmlNode::Element(element) => Some(element),
+            XmlNode::Text(_) => None,
+        })
+        .enumerate()
+    {
+        let child_object = new_simplexml_element(child);
+        let value = Value::Object(child_object.clone());
+        object.set_property(index.to_string(), value.clone());
+        entries.insert(ArrayKey::Int(index as i64), value);
+        entry_names.insert(
+            ArrayKey::Int(index as i64),
+            Value::string(child.name.as_bytes().to_vec()),
+        );
+        children_by_name
+            .entry(child.name.clone())
+            .or_default()
+            .push(child_object);
+    }
+    for (name, children) in children_by_name {
+        let value = match children.as_slice() {
+            [child] => Value::Object(child.clone()),
+            _ => Value::Object(new_simplexml_element_list(&name, &children)),
+        };
+        object.set_property(name, value);
+    }
+    object.set_property(SIMPLEXML_ENTRIES, Value::Array(entries));
+    object.set_property(SIMPLEXML_ENTRY_NAMES, Value::Array(entry_names));
     object
 }
 
@@ -414,12 +464,24 @@ pub fn simplexml_load_string(xml: &str) -> Result<Value, String> {
 pub fn simplexml_as_xml(object: &ObjectRef) -> Value {
     document_from_object(object)
         .map(|document| Value::string(serialize_document(&document).into_bytes()))
+        .or_else(|| {
+            first_simplexml_entry(object).and_then(|entry| match simplexml_as_xml(&entry) {
+                Value::String(value) => Some(Value::String(value)),
+                _ => None,
+            })
+        })
         .unwrap_or_else(|| Value::string(Vec::<u8>::new()))
 }
 
 pub fn simplexml_text(object: &ObjectRef) -> Value {
     document_from_object(object)
         .map(|document| Value::string(element_text(&document.root).into_bytes()))
+        .or_else(|| {
+            first_simplexml_entry(object).and_then(|entry| match simplexml_text(&entry) {
+                Value::String(value) => Some(Value::String(value)),
+                _ => None,
+            })
+        })
         .unwrap_or_else(|| {
             object
                 .get_property("__text")
@@ -430,7 +492,14 @@ pub fn simplexml_text(object: &ObjectRef) -> Value {
 pub fn simplexml_attributes(object: &ObjectRef) -> Value {
     document_from_object(object)
         .map(|document| Value::Object(simplexml_attributes_object(&document.root)))
+        .or_else(|| first_simplexml_entry(object).map(|entry| simplexml_attributes(&entry)))
         .unwrap_or(Value::Null)
+}
+
+pub fn simplexml_children(object: &ObjectRef) -> Value {
+    document_from_object(object)
+        .map(|document| Value::Object(new_simplexml_children_list(&document.root.children)))
+        .unwrap_or_else(|| Value::Object(object.clone()))
 }
 
 pub fn xml_reader_xml(object: &ObjectRef, xml: &str) -> Result<Value, String> {
@@ -838,6 +907,16 @@ fn document_from_object(object: &ObjectRef) -> Option<XmlDocument> {
             }
             _ => None,
         })
+}
+
+fn first_simplexml_entry(object: &ObjectRef) -> Option<ObjectRef> {
+    let Some(Value::Array(entries)) = object.get_property(SIMPLEXML_ENTRIES) else {
+        return None;
+    };
+    entries.iter().find_map(|(_, value)| match value {
+        Value::Object(object) => Some(object.clone()),
+        _ => None,
+    })
 }
 
 fn element_from_object(object: &ObjectRef) -> Option<XmlElement> {
