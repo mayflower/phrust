@@ -65,6 +65,7 @@ const HASH_ALGOS: &[&str] = &[
     "sha512/224",
     "sha512/256",
     "sha512",
+    "adler32",
     "crc32",
     "crc32b",
 ];
@@ -621,6 +622,7 @@ mod tests {
             .map(|(_, value)| value.to_string())
             .collect::<Vec<_>>();
         assert!(values.iter().any(|value| value.contains("sha256")));
+        assert!(values.iter().any(|value| value.contains("adler32")));
         assert!(values.iter().any(|value| value.contains("crc32")));
 
         let Value::Array(hmac_algos) = call("hash_hmac_algos", vec![]) else {
@@ -699,6 +701,28 @@ mod tests {
             Value::string("5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0")
         );
         std::fs::remove_dir_all(&root).expect("remove tempdir");
+    }
+
+    #[test]
+    fn hash_supports_adler32_vectors() {
+        assert_eq!(
+            call("hash", vec![Value::string("adler32"), Value::string("")]),
+            Value::string("00000001")
+        );
+        assert_eq!(
+            call("hash", vec![Value::string("adler32"), Value::string("abc")]),
+            Value::string("024d0127")
+        );
+        assert_eq!(
+            call(
+                "hash",
+                vec![
+                    Value::string("adler32"),
+                    Value::string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+                ]
+            ),
+            Value::string("8adb150c")
+        );
     }
 
     #[test]

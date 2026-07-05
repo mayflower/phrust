@@ -38,9 +38,21 @@ pub(in crate::builtins::modules) fn hash_digest_bytes(
         Some("sha512224") => Ok(Sha512_224::digest(input).to_vec()),
         Some("sha512256") => Ok(Sha512_256::digest(input).to_vec()),
         Some("sha512") => Ok(Sha512::digest(input).to_vec()),
+        Some("adler32") => Ok(adler32(input).to_be_bytes().to_vec()),
         Some("crc32") | Some("crc32b") => Ok(crc32fast::hash(input).to_be_bytes().to_vec()),
         _ => Err(value_error(name, "unsupported hash algorithm")),
     }
+}
+
+fn adler32(input: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65_521;
+    let mut a = 1_u32;
+    let mut b = 0_u32;
+    for byte in input {
+        a = (a + u32::from(*byte)) % MOD_ADLER;
+        b = (b + a) % MOD_ADLER;
+    }
+    (b << 16) | a
 }
 
 pub(in crate::builtins::modules) fn hmac_digest_bytes(
@@ -159,7 +171,7 @@ pub(in crate::builtins::modules) fn hmac_with_block(
 pub(in crate::builtins::modules) fn normalized_hash_algorithm(algorithm: &str) -> Option<String> {
     let normalized = algorithm.to_ascii_lowercase().replace('-', "");
     match normalized.as_str() {
-        "md5" | "sha1" | "crc32" | "crc32b" => Some(normalized),
+        "md5" | "sha1" | "adler32" | "crc32" | "crc32b" => Some(normalized),
         "sha224" | "sha256" | "sha384" | "sha512" => Some(normalized),
         "sha512/224" => Some("sha512224".to_owned()),
         "sha512/256" => Some("sha512256".to_owned()),

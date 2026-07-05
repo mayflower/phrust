@@ -4,12 +4,12 @@
   "priority": "Digest, HMAC, and streaming context parity",
   "selected_manifest": "tests/phpt/manifests/modules/hash.selected.jsonl",
   "corpus_count": 82,
-  "selected_count": 19,
-  "pass_count": 19,
+  "selected_count": 20,
+  "pass_count": 20,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 63,
+  "known_failure_count": 62,
   "scope": [
     "Selected upstream ext/hash rows for md5, sha1, SHA-2 digests, HMAC-md5, file hashing, HKDF, PBKDF2, and stream updates",
     "hash_file and hash_hmac_file over local files",
@@ -18,7 +18,8 @@
     "finalized HashContext rejection",
     "hash_update_file and hash_update_stream digest accumulation",
     "hash_pbkdf2 and hash_hkdf SHA-256 derivation",
-    "sha224, sha512/224, and sha512/256 digest/HMAC backends"
+    "sha224, sha512/224, and sha512/256 digest/HMAC backends",
+    "Adler-32 digest backend"
   ],
   "non_scope": ["Full php-src hash algorithm inventory", "HashContext magic serialization/debug-info parity"],
   "target_gates": ["just phpt-dev-module MODULE=hash"],

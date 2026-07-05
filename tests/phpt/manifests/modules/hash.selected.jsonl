@@ -1,5 +1,6 @@
 {"path":"tests/phpt/generated/hash/file.phpt"}
 {"path":"tests/phpt/generated/hash/context.phpt"}
+{"path":"ext/hash/tests/adler32.phpt"}
 {"path":"ext/hash/tests/bug52240.phpt"}
 {"path":"ext/hash/tests/bug64745.phpt"}
 {"path":"ext/hash/tests/hash_file_basic.phpt"}
