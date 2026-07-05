@@ -73,6 +73,21 @@ now.
    argument encoding used for `is_callable` is the starting point, gated on
    callee-signature knowledge. (`SUBSET_ALLOWED`: by-ref argument location
    encoding for proven shapes, generic materialization as fallback.)
+
+   Where the pin happens today: `lower_call_args_with_value_policy`
+   (`php_ir/src/lower/expressions.rs`) lowers every non-placeholder argument
+   through `lower_expr_to_register`, so a plain `$arr` argument becomes a
+   `LoadLocal` into a register that stays live for the whole call while the
+   `by_ref_local` metadata rides alongside. The binder
+   (`php_vm/src/vm/arguments.rs`) then rebinds the parameter through
+   `call_argument_reference_cell`, which never needed the materialized value
+   for direct locals. The `by_ref_arg_*` counters attribute this per run:
+   on `session_auth_policy`, 225/225 by-ref bindings are location-eligible,
+   all currently materialized (`local_value_materialized`), all pinning an
+   array handle, and all guaranteed one copy-on-write separation
+   (`by_ref_arg_cow_separations`). Safe to replace: direct-local arguments
+   to callees whose by-ref positions are provable at lowering time; the
+   placeholder path already exists for quiet by-ref builtin arguments.
 2. **Dense plans do not thread through method dispatch**: method bodies
    invoked from dense callers execute on the rich interpreter (container
    resolution: 41 rich method calls/run). Threading the dense plan through

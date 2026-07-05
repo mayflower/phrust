@@ -69131,6 +69131,67 @@ var_dump(unserialize('O:1:"C":0:{}'));
     }
 
     #[test]
+    fn by_ref_arg_bindings_attribute_materialization_and_cow_state() {
+        let source = "<?php\n\
+            function add_row(array &$rows, int $row): void { $rows[] = $row; }\n\
+            function bump(int &$n): void { $n++; }\n\
+            $rows = [];\n\
+            for ($i = 0; $i < 4; $i++) { add_row($rows, $i); }\n\
+            $n = 0;\n\
+            bump($n);\n\
+            echo count($rows), ':', $n;";
+        for format in [ExecutionFormat::Ir, ExecutionFormat::Bytecode] {
+            let result = execute_source_with_options(
+                source,
+                VmOptions {
+                    collect_counters: true,
+                    execution_format: format,
+                    ..VmOptions::default()
+                },
+            );
+            assert!(
+                result.status.is_success(),
+                "{format:?}: {:?}",
+                result.status
+            );
+            assert_eq!(result.output.as_bytes(), b"4:1", "{format:?}");
+            let counters = result.counters.expect("counters");
+            assert_eq!(
+                counters.by_ref_arg_location_binding_attempts, 5,
+                "{format:?}: {counters:?}"
+            );
+            assert_eq!(
+                counters.by_ref_arg_location_bindings, 5,
+                "{format:?}: {counters:?}"
+            );
+            // Today every by-ref local argument is still materialized as a
+            // caller value register; location encoding will reduce these.
+            assert_eq!(
+                counters.by_ref_arg_value_materializations, 5,
+                "{format:?}: {counters:?}"
+            );
+            assert_eq!(
+                counters.by_ref_arg_register_pins, 4,
+                "{format:?}: {counters:?}"
+            );
+            assert_eq!(
+                counters.by_ref_arg_cow_separations + counters.by_ref_arg_cow_separations_avoided,
+                5,
+                "{format:?}: {counters:?}"
+            );
+            assert_eq!(
+                counters
+                    .by_ref_arg_fallback_by_reason
+                    .get("local_value_materialized")
+                    .copied(),
+                Some(5),
+                "{format:?}: {:?}",
+                counters.by_ref_arg_fallback_by_reason
+            );
+        }
+    }
+
+    #[test]
     fn quickening_is_default_off_and_on_is_output_identical() {
         let source =
             "<?php $sum = 0; for ($i = 0; $i < 12; $i++) { $sum = $sum + $i; } echo $sum, \"\\n\";";

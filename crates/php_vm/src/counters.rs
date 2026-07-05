@@ -321,6 +321,13 @@ pub struct VmCounters {
     pub specialized_builtin_opcode_hits: BTreeMap<String, u64>,
     pub slow_path_calls_by_reason: BTreeMap<String, u64>,
     pub value_clone_by_reason: BTreeMap<String, u64>,
+    pub by_ref_arg_location_binding_attempts: u64,
+    pub by_ref_arg_location_bindings: u64,
+    pub by_ref_arg_value_materializations: u64,
+    pub by_ref_arg_register_pins: u64,
+    pub by_ref_arg_cow_separations: u64,
+    pub by_ref_arg_cow_separations_avoided: u64,
+    pub by_ref_arg_fallback_by_reason: BTreeMap<String, u64>,
     pub call_ic_megamorphic_fallbacks: u64,
     pub local_slot_fast_path_hits: u64,
     pub local_slot_fast_path_misses: u64,
@@ -666,6 +673,15 @@ impl VmCounters {
     pub(crate) fn record_value_clone_by_reason(&mut self, reason: &str) {
         *self
             .value_clone_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    /// Attributes one by-reference argument binding fallback (why a location
+    /// binding was not used or still materialized a caller value).
+    pub(crate) fn record_by_ref_arg_fallback(&mut self, reason: &str) {
+        *self
+            .by_ref_arg_fallback_by_reason
             .entry(reason.to_owned())
             .or_default() += 1;
     }
@@ -3190,6 +3206,48 @@ impl VmCounters {
             &mut json,
             "value_clone_by_reason",
             &self.value_clone_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_location_binding_attempts",
+            self.by_ref_arg_location_binding_attempts,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_location_bindings",
+            self.by_ref_arg_location_bindings,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_value_materializations",
+            self.by_ref_arg_value_materializations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_register_pins",
+            self.by_ref_arg_register_pins,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_cow_separations",
+            self.by_ref_arg_cow_separations,
+            true,
+        );
+        push_field(
+            &mut json,
+            "by_ref_arg_cow_separations_avoided",
+            self.by_ref_arg_cow_separations_avoided,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "by_ref_arg_fallback_by_reason",
+            &self.by_ref_arg_fallback_by_reason,
             true,
         );
         push_field(

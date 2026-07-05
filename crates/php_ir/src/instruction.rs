@@ -144,6 +144,10 @@ pub enum IrCallArgValueKind {
     Direct,
     /// A temporary produced by an expression PHP allows with a notice.
     IndirectTemporary,
+    /// The value operand is an inert placeholder: the argument is bound
+    /// entirely through its by-ref location metadata and the caller never
+    /// materialized it as a value register.
+    ByRefLocationPlaceholder,
 }
 
 /// Array-dimension lvalue metadata for a call argument.

@@ -299,7 +299,13 @@ fn bind_arguments(
                 .map(ReferenceCell::get)
                 .unwrap_or_else(|| arg.value.clone());
             let reference = if param.by_ref {
+                record_by_ref_arg_counters(typecheck, |counters| {
+                    counters.by_ref_arg_location_binding_attempts += 1;
+                });
                 if let Some(reference) = value_reference {
+                    record_by_ref_arg_counters(typecheck, |counters| {
+                        counters.record_by_ref_arg_fallback("value_reference_argument");
+                    });
                     Some(reference)
                 } else if let Some(reference) = call_argument_reference_cell(
                     compiled, None, &arg, stack,
@@ -309,8 +315,12 @@ fn bind_arguments(
                         .with_context("function", &function.name)
                         .with_context("parameter", &param.name)
                 })? {
+                    record_by_ref_arg_location_binding(typecheck, &arg, &reference);
                     Some(reference)
                 } else if allow_by_ref_value_warnings {
+                    record_by_ref_arg_counters(typecheck, |counters| {
+                        counters.record_by_ref_arg_fallback("value_given_warning");
+                    });
                     diagnostics.push(by_ref_value_given_warning(
                         compiled,
                         function,
@@ -322,6 +332,9 @@ fn bind_arguments(
                     ));
                     None
                 } else {
+                    record_by_ref_arg_counters(typecheck, |counters| {
+                        counters.record_by_ref_arg_fallback("not_referenceable");
+                    });
                     return Err(by_ref_not_referenceable_error(function, param, index));
                 }
             } else {
@@ -418,6 +431,56 @@ fn bind_arguments(
 struct VariadicTailArg {
     key: Option<String>,
     value: Value,
+}
+
+fn record_by_ref_arg_counters(
+    typecheck: TypecheckFastPathContext<'_>,
+    record: impl FnOnce(&mut VmCounters),
+) {
+    if let Some(counters) = typecheck.counters
+        && let Some(counters) = counters.borrow_mut().as_mut()
+    {
+        record(counters);
+    }
+}
+
+/// Attributes one by-ref binding that went through location metadata: whether
+/// the caller still materialized the argument as a value register (pinning
+/// array handles) and whether the bound cell's array is already shared, which
+/// guarantees a copy-on-write separation on the callee's first write.
+fn record_by_ref_arg_location_binding(
+    typecheck: TypecheckFastPathContext<'_>,
+    arg: &CallArgument,
+    reference: &ReferenceCell,
+) {
+    record_by_ref_arg_counters(typecheck, |counters| {
+        counters.by_ref_arg_location_bindings += 1;
+        let materialized = !matches!(arg.value_kind, IrCallArgValueKind::ByRefLocationPlaceholder);
+        if materialized {
+            counters.by_ref_arg_value_materializations += 1;
+            let kind = if arg.by_ref_local.is_some() {
+                "local_value_materialized"
+            } else if arg.by_ref_dim.is_some() {
+                "dim_value_materialized"
+            } else if arg.by_ref_property.is_some() {
+                "property_value_materialized"
+            } else {
+                "property_dim_value_materialized"
+            };
+            counters.record_by_ref_arg_fallback(kind);
+            if matches!(arg.value, Value::Array(_)) {
+                counters.by_ref_arg_register_pins += 1;
+            }
+        }
+        let shared_array = reference
+            .try_with_value_mut(|value| matches!(value, Value::Array(array) if array.is_shared()))
+            .unwrap_or(false);
+        if shared_array {
+            counters.by_ref_arg_cow_separations += 1;
+        } else {
+            counters.by_ref_arg_cow_separations_avoided += 1;
+        }
+    });
 }
 
 fn by_ref_not_referenceable_error(
