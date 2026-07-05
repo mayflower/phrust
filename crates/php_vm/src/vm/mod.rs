@@ -2443,6 +2443,33 @@ impl Vm {
         }
     }
 
+    fn record_counter_dense_method_dispatch_attempt(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.dense_method_dispatch_attempts += 1;
+        }
+    }
+
+    fn record_counter_dense_method_dispatch_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.dense_method_dispatch_hits += 1;
+        }
+    }
+
+    fn record_counter_dense_method_dispatch_fallback(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_method_dispatch_fallback(reason);
+        }
+    }
+
     fn record_counter_rich_fallback_function_executed(&self, reason: &str) {
         if !self.options.collect_counters {
             return;
@@ -7755,6 +7782,7 @@ impl Vm {
                         };
                         let result = self.execute_dense_new_object(
                             compiled,
+                            plan,
                             function_id,
                             BlockId::new(block_index),
                             InstrId::new(dense_instruction_index),
@@ -8040,6 +8068,7 @@ impl Vm {
                         };
                         let result = self.execute_dense_method_call(
                             compiled,
+                            plan,
                             function_id,
                             BlockId::new(block_index),
                             InstrId::new(dense_instruction_index),
@@ -8129,6 +8158,7 @@ impl Vm {
                         };
                         let result = self.execute_dense_static_method_call(
                             compiled,
+                            plan,
                             function_id,
                             BlockId::new(block_index),
                             InstrId::new(dense_instruction_index),
@@ -23341,6 +23371,7 @@ impl Vm {
                                     stack,
                                     state,
                                     &running_fiber,
+                                    None,
                                 );
                                 if !result.status.is_success()
                                     && let Some(throwable) = state
@@ -28594,6 +28625,69 @@ impl Vm {
         }
     }
 
+    /// Executes a resolved userland body through its dense plan when the
+    /// owning unit is the current unit and the plan marks the function
+    /// dense; anything unproven falls back to the rich interpreter with an
+    /// attributed reason. Dense callers thread method, static-method, and
+    /// constructor bodies through here so they stop silently dropping to
+    /// rich execution.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_function_with_dense_plan(
+        &self,
+        compiled: &CompiledUnit,
+        owner: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function: FunctionId,
+        call: FunctionCall<'_>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        if let Some(plan) = plan {
+            self.record_counter_dense_method_dispatch_attempt();
+            let fallback_reason = if !owner.ptr_eq(compiled) {
+                Some("not_current_unit")
+            } else if call.resume_continuation.is_some()
+                || call.resume_fiber_continuation.is_some()
+                || call.running_generator.is_some()
+                || call.running_fiber.is_some()
+            {
+                Some("generator_or_fiber_context")
+            } else {
+                match plan.function_plan(function.index()) {
+                    Some(DenseFunctionPlan::Dense) => {
+                        if let (Some(dense_function), Some(ir_function)) = (
+                            plan.unit.functions.get(function.index()),
+                            compiled.unit().functions.get(function.index()),
+                        ) {
+                            self.record_counter_dense_method_dispatch_hit();
+                            return self.execute_bytecode_function(
+                                compiled,
+                                &plan.unit,
+                                Some(plan),
+                                dense_function,
+                                ir_function,
+                                function,
+                                call,
+                                output,
+                                stack,
+                                state,
+                            );
+                        }
+                        Some("dense_body_missing")
+                    }
+                    Some(DenseFunctionPlan::RichFallback { reason }) => Some(reason.as_str()),
+                    None => Some("plan_missing"),
+                }
+            };
+            if let Some(reason) = fallback_reason {
+                self.record_counter_dense_method_dispatch_fallback(reason);
+            }
+        }
+        self.execute_function(owner, function, call, output, stack, state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn execute_method_call_target(
         &self,
         compiled: &CompiledUnit,
@@ -28605,6 +28699,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         running_fiber: &Option<FiberRef>,
+        dense_plan: Option<&DenseExecutionPlan>,
     ) -> VmResult {
         let declaring_class_name = target.resolved_target().declaring_class.clone();
         let function = target.resolved_target().function;
@@ -28672,8 +28767,10 @@ impl Vm {
             return result;
         }
         let declaring_class_name = declaring_class.name.clone();
-        self.execute_function(
+        self.execute_function_with_dense_plan(
+            compiled,
             &owner,
+            dense_plan,
             method_function,
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
@@ -57588,6 +57685,12 @@ fn coerce_return_value(
     value: Option<Value>,
     typecheck: TypecheckFastPathContext<'_>,
 ) -> Result<Option<Value>, String> {
+    // A generator's declared return type constrains the generator object the
+    // call produces, never the body's `return` value: the reference engine
+    // feeds that value to getReturn() without any type check.
+    if function.flags.is_generator {
+        return Ok(value);
+    }
     let Some(return_type) = ir_runtime_type(function.return_type.as_ref()) else {
         return Ok(value);
     };
@@ -69189,6 +69292,51 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 counters.by_ref_arg_fallback_by_reason
             );
         }
+    }
+
+    #[test]
+    fn dense_callers_thread_method_bodies_through_the_plan() {
+        let source = "<?php\n\
+            class Counter {\n\
+                private int $total = 0;\n\
+                public function add(int $n): int { $this->total += $n; return $this->total; }\n\
+                public function stream(): \\Generator { yield $this->total; }\n\
+            }\n\
+            $c = new Counter();\n\
+            $sum = 0;\n\
+            for ($i = 0; $i < 8; $i++) { $sum = $c->add($i); }\n\
+            foreach ($c->stream() as $v) { $sum += $v; }\n\
+            echo $sum;";
+        let result = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                execution_format: ExecutionFormat::Auto,
+                ..VmOptions::default()
+            },
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"56");
+        let counters = result.counters.expect("counters");
+        assert!(
+            counters.dense_method_dispatch_hits >= 8,
+            "method bodies should execute dense: {counters:?}"
+        );
+        // The generator method keeps its rich-fallback plan and the fallback
+        // is attributed instead of silently dropping to rich execution.
+        assert!(
+            counters.rich_method_calls_from_dense_callers >= 1,
+            "{counters:?}"
+        );
+        assert!(
+            counters
+                .dense_method_dispatch_fallback_by_reason
+                .keys()
+                .next()
+                .is_some(),
+            "{:?}",
+            counters.dense_method_dispatch_fallback_by_reason
+        );
     }
 
     #[test]

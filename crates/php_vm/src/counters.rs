@@ -328,6 +328,11 @@ pub struct VmCounters {
     pub by_ref_arg_cow_separations: u64,
     pub by_ref_arg_cow_separations_avoided: u64,
     pub by_ref_arg_fallback_by_reason: BTreeMap<String, u64>,
+    pub dense_method_dispatch_attempts: u64,
+    pub dense_method_dispatch_hits: u64,
+    pub dense_method_dispatch_fallbacks: u64,
+    pub dense_method_dispatch_fallback_by_reason: BTreeMap<String, u64>,
+    pub rich_method_calls_from_dense_callers: u64,
     pub call_ic_megamorphic_fallbacks: u64,
     pub local_slot_fast_path_hits: u64,
     pub local_slot_fast_path_misses: u64,
@@ -673,6 +678,15 @@ impl VmCounters {
     pub(crate) fn record_value_clone_by_reason(&mut self, reason: &str) {
         *self
             .value_clone_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_dense_method_dispatch_fallback(&mut self, reason: &str) {
+        self.dense_method_dispatch_fallbacks += 1;
+        self.rich_method_calls_from_dense_callers += 1;
+        *self
+            .dense_method_dispatch_fallback_by_reason
             .entry(reason.to_owned())
             .or_default() += 1;
     }
@@ -3248,6 +3262,36 @@ impl VmCounters {
             &mut json,
             "by_ref_arg_fallback_by_reason",
             &self.by_ref_arg_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_method_dispatch_attempts",
+            self.dense_method_dispatch_attempts,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_method_dispatch_hits",
+            self.dense_method_dispatch_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "dense_method_dispatch_fallbacks",
+            self.dense_method_dispatch_fallbacks,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "dense_method_dispatch_fallback_by_reason",
+            &self.dense_method_dispatch_fallback_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "rich_method_calls_from_dense_callers",
+            self.rich_method_calls_from_dense_callers,
             true,
         );
         push_field(

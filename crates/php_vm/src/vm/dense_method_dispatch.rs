@@ -1,9 +1,11 @@
 use super::prelude::*;
 
 impl Vm {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_dense_method_call(
         &self,
         compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: InstrId,
@@ -122,7 +124,7 @@ impl Vm {
             self.record_counter_dense_call_ic_hit();
             self.record_counter_dense_method_call_hit();
             return self.execute_method_call_target(
-                compiled, target, object, args, call_span, output, stack, state, &None,
+                compiled, target, object, args, call_span, output, stack, state, &None, plan,
             );
         }
         if observation.is_some() {
@@ -250,8 +252,10 @@ impl Vm {
         );
         self.record_counter_dense_method_call_hit();
         let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
-        self.execute_function(
+        self.execute_function_with_dense_plan(
+            compiled,
             &class_owner,
+            plan,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
@@ -272,6 +276,7 @@ impl Vm {
     pub(super) fn execute_dense_static_method_call(
         &self,
         compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: InstrId,
@@ -357,6 +362,7 @@ impl Vm {
             self.record_counter_dense_static_call_hit();
             return self.execute_static_method_call_target(
                 compiled,
+                plan,
                 target,
                 called_class,
                 args,
@@ -511,8 +517,10 @@ impl Vm {
         );
         self.record_counter_dense_static_call_hit();
         let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
-        self.execute_function(
+        self.execute_function_with_dense_plan(
+            compiled,
             &class_owner,
+            plan,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
@@ -532,6 +540,7 @@ impl Vm {
     pub(super) fn execute_static_method_call_target(
         &self,
         compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
         target: MethodCallCacheTarget,
         called_class: String,
         args: Vec<CallArgument>,
@@ -607,8 +616,10 @@ impl Vm {
                 compiled, output, stack, state, call_span, message,
             );
         }
-        self.execute_function(
+        self.execute_function_with_dense_plan(
+            compiled,
             &owner,
+            plan,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
                 .with_call_site_strict_types(compiled.unit().strict_types)
@@ -635,6 +646,7 @@ impl Vm {
     pub(super) fn execute_dense_new_object(
         &self,
         compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
         function_id: FunctionId,
         block_id: BlockId,
         instruction_id: InstrId,
@@ -742,8 +754,10 @@ impl Vm {
             }
             let class_owner = dynamic_class_owner_in_state(state, &constructor.class.name)
                 .unwrap_or_else(|| compiled.clone());
-            let result = self.execute_function(
+            let result = self.execute_function_with_dense_plan(
+                compiled,
                 &class_owner,
+                plan,
                 constructor.method.function,
                 FunctionCall::new(args, Vec::new())
                     .with_call_site_strict_types(compiled.unit().strict_types)

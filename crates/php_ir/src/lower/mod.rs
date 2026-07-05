@@ -2077,6 +2077,28 @@ mod tests {
     use php_semantics::analyze_source;
 
     #[test]
+    fn generator_methods_with_return_types_keep_the_generator_flag() {
+        let frontend = analyze_source(
+            "<?php class A { public function g(): Generator { yield 1; } } function h(): Generator { yield 2; }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+        let flags: Vec<(&str, bool)> = result
+            .unit
+            .functions
+            .iter()
+            .map(|function| (function.name.as_str(), function.flags.is_generator))
+            .collect();
+        assert!(
+            flags.contains(&("h", true)),
+            "function generator flag lost: {flags:?}"
+        );
+        assert!(
+            flags.contains(&("A::g", true)),
+            "method generator flag lost: {flags:?}"
+        );
+    }
+
+    #[test]
     fn lower_empty_file_to_top_level_return_null() {
         let frontend = analyze_source("");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
