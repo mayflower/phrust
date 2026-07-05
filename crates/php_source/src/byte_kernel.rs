@@ -656,6 +656,9 @@ mod scalar {
 
 #[cfg(target_arch = "x86_64")]
 mod arch {
+    // SIMD intrinsics require `unsafe`; the hardening gate's `-D unsafe-code`
+    // reaches workspace dependencies, so scope the allowance to this backend.
+    #![allow(unsafe_code)]
     #![allow(unsafe_op_in_unsafe_fn)]
 
     use super::scalar;
@@ -1201,6 +1204,9 @@ mod arch {
 
 #[cfg(target_arch = "aarch64")]
 mod arch {
+    // SIMD intrinsics require `unsafe`; the hardening gate's `-D unsafe-code`
+    // reaches workspace dependencies, so scope the allowance to this backend.
+    #![allow(unsafe_code)]
     #![allow(unsafe_op_in_unsafe_fn)]
 
     use super::scalar;
