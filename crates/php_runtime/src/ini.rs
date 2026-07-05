@@ -107,8 +107,9 @@ impl IniRegistry {
     }
 }
 
-fn default_entries() -> [(&'static str, &'static str, &'static str, i64); 18] {
+fn default_entries() -> [(&'static str, &'static str, &'static str, i64); 19] {
     [
+        ("standard", "arg_separator.input", "&", 7),
         ("date", "date.timezone", "UTC", 7),
         ("standard", "default_charset", "UTF-8", 7),
         ("core", "display_errors", "1", 7),
@@ -167,6 +168,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "arg_separator.input",
                 "date.timezone",
                 "default_charset",
                 "display_errors",

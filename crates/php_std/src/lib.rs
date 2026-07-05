@@ -2218,12 +2218,13 @@ mod tests {
     #[test]
     fn visible_stdlib_constants_have_generated_metadata_or_platform_note() {
         let registry = ExtensionRegistry::standard_library();
-        let missing = registry
+        let mut missing = registry
             .enabled_constants()
             .into_iter()
             .filter(|constant| constant.source_metadata().is_none())
             .map(ConstantDescriptor::name)
             .collect::<Vec<_>>();
+        missing.sort_unstable();
 
         assert_eq!(
             missing, CONSTANTS_WITH_EXTERNAL_ARGINFO,

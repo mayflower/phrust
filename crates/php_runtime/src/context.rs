@@ -11,6 +11,8 @@ use std::time::Duration;
 /// Minimal ini-like runtime options carried by the VM.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeIniOptions {
+    /// Characters accepted as query-string input separators.
+    pub arg_separator_input: String,
     /// Placeholder for PHP's `error_reporting` bitmask.
     pub error_reporting: ErrorReporting,
     /// Placeholder for display_errors-style behavior.
@@ -26,6 +28,7 @@ pub struct RuntimeIniOptions {
 impl Default for RuntimeIniOptions {
     fn default() -> Self {
         Self {
+            arg_separator_input: "&".to_string(),
             error_reporting: ErrorReporting::default(),
             display_errors: true,
             default_input_filter: RuntimeInputFilter::UnsafeRaw,
@@ -561,6 +564,7 @@ impl RuntimeContext {
             .collect::<Vec<_>>()
             .join(":");
         let _ = registry.set("include_path", include_path);
+        let _ = registry.set("arg_separator.input", self.ini.arg_separator_input.clone());
         let _ = registry.set("error_reporting", self.ini.error_reporting.mask.to_string());
         let _ = registry.set(
             "display_errors",
@@ -1262,17 +1266,34 @@ fn insert_uploaded_file_attribute(
 
 #[must_use]
 pub fn parse_query_string(query: &str) -> Vec<(String, String)> {
-    parse_form_urlencoded(query.as_bytes())
+    parse_query_string_with_separators(query, "&")
+}
+
+#[must_use]
+pub fn parse_query_string_with_separators(
+    query: &str,
+    arg_separator_input: &str,
+) -> Vec<(String, String)> {
+    parse_form_urlencoded(query.as_bytes(), input_separator_bytes(arg_separator_input))
 }
 
 #[must_use]
 pub fn parse_form_urlencoded_body(body: &[u8]) -> Vec<(String, String)> {
-    parse_form_urlencoded(body)
+    parse_form_urlencoded(body, b"&")
 }
 
-fn parse_form_urlencoded(input: &[u8]) -> Vec<(String, String)> {
+fn input_separator_bytes(arg_separator_input: &str) -> &[u8] {
+    let separators = arg_separator_input.as_bytes();
+    if separators.is_empty() {
+        b"&"
+    } else {
+        separators
+    }
+}
+
+fn parse_form_urlencoded(input: &[u8], separators: &[u8]) -> Vec<(String, String)> {
     input
-        .split(|byte| *byte == b'&')
+        .split(|byte| separators.contains(byte))
         .filter(|part| !part.is_empty())
         .filter_map(|part| {
             let (name, value) = split_bytes_once(part, b'=').unwrap_or((part, &[]));
@@ -1364,6 +1385,7 @@ mod tests {
         RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions,
         RuntimeInputFilter, RuntimeUploadedFile, StrictTypesInfo, UploadRegistry,
         input_pairs_array, parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
+        parse_query_string_with_separators,
     };
     use crate::{ArrayKey, PhpString, Value};
 
@@ -1905,6 +1927,33 @@ mod tests {
                 ("second".to_string(), "%a".to_string()),
                 ("third".to_string(), "%b".to_string()),
                 ("decoded".to_string(), "A".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn query_string_respects_php_arg_separator_input_characters() {
+        assert_eq!(
+            parse_query_string_with_separators("first=val1/second=val2/third=val3", "/"),
+            vec![
+                ("first".to_string(), "val1".to_string()),
+                ("second".to_string(), "val2".to_string()),
+                ("third".to_string(), "val3".to_string())
+            ]
+        );
+        assert_eq!(
+            parse_query_string_with_separators("a=1;b=2&c=3", "&;"),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string())
+            ]
+        );
+        assert_eq!(
+            parse_query_string_with_separators("a=1&b=2", ""),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
             ]
         );
     }

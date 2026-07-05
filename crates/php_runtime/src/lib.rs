@@ -77,7 +77,7 @@ pub mod api {
         RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter,
         RuntimeRequestMode, RuntimeUploadedFile, SessionLoadCallback, StrictTypesInfo,
         UploadRegistry, UploadRegistryEntry, parse_cookie_header, parse_form_urlencoded_body,
-        parse_query_string,
+        parse_query_string, parse_query_string_with_separators,
     };
     pub use crate::convert::{
         ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, identical,
@@ -227,6 +227,7 @@ pub use context::{
     RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter,
     RuntimeRequestMode, RuntimeUploadedFile, SessionLoadCallback, StrictTypesInfo, UploadRegistry,
     UploadRegistryEntry, parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
+    parse_query_string_with_separators,
 };
 pub use convert::{
     ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, identical,

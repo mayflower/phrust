@@ -1340,16 +1340,40 @@ pub(in crate::builtins::modules) fn builtin_parse_url(
 }
 
 pub(in crate::builtins::modules) fn builtin_parse_str(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("parse_str", &args, 2)?;
     let query = string_arg("parse_str", &args[0])?.to_string_lossy();
-    let pairs = crate::parse_query_string(&query);
-    let array = crate::context::input_pairs_array(&pairs, &RuntimeIniOptions::default());
+    let ini = input_ini_options(context);
+    let pairs = crate::parse_query_string_with_separators(&query, &ini.arg_separator_input);
+    let array = crate::context::input_pairs_array(&pairs, &ini);
     assign_reference_arg(args.get(1), Value::Array(array));
     Ok(Value::Null)
+}
+
+fn input_ini_options(context: &BuiltinContext<'_>) -> RuntimeIniOptions {
+    let mut ini = RuntimeIniOptions::default();
+    if let Some(value) = context.ini_get("arg_separator.input") {
+        ini.arg_separator_input = value.to_string();
+    }
+    if let Some(value) = context.ini_get("max_input_vars")
+        && let Ok(limit) = value.parse::<usize>()
+    {
+        ini.max_input_vars = limit;
+    }
+    if let Some(value) = context.ini_get("max_input_nesting_level")
+        && let Ok(limit) = value.parse::<usize>()
+    {
+        ini.max_input_nesting_level = limit;
+    }
+    if let Some(value) = context.ini_get("filter.default")
+        && let Some(filter) = crate::RuntimeInputFilter::from_ini_value(value)
+    {
+        ini.default_input_filter = filter;
+    }
+    ini
 }
 
 pub(in crate::builtins::modules) fn builtin_http_build_query(

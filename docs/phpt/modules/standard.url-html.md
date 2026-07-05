@@ -3,7 +3,7 @@
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
 - Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- focused gate: 23 PASS, 0 FAIL, 0 BORK
+- focused gate: 26 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -12,7 +12,8 @@
 - `http_build_query` null separator defaults, references, and RFC3986
   `encoding_type` coverage
 - Basic `parse_url` component extraction and `PHP_URL_*` constant ordering
-- Malformed `parse_str` key recovery and invalid percent preservation
+- `parse_str` basics, custom `arg_separator.input`, malformed key recovery, and
+  invalid percent preservation
 - Default `htmlspecialchars` / `htmlentities` coverage
 
 ## Non-Scope
@@ -44,7 +45,10 @@
 - `ext/standard/tests/url/parse_url_basic_010.phpt`
 - `ext/standard/tests/url/parse_url_basic_011.phpt`
 - `ext/standard/tests/url/parse_url_relative_scheme.phpt`
+- `ext/standard/tests/strings/parse_str_basic1.phpt`
+- `ext/standard/tests/strings/parse_str_basic2.phpt`
 - `ext/standard/tests/strings/parse_str_basic4.phpt`
+- `ext/standard/tests/strings/parse_str_memory_error.phpt`
 - `tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt`
@@ -72,13 +76,15 @@
 - `parse_url()` covers the basic upstream component extraction set, including
   partial numeric ports and `PHP_URL_*` iteration order through
   `get_defined_constants()`.
-- `parse_str()` now matches PHP malformed bracket-key recovery for the selected
-  upstream query fixture, including root dot/space normalization and invalid
-  percent escape preservation.
-- Latest focused target run: PASS, 23 selected PHPTs.
+- `parse_str()` now matches PHP basic result-array population, custom
+  `arg_separator.input` characters, malformed bracket-key recovery for the
+  selected upstream query fixture, root dot/space normalization, invalid
+  percent escape preservation, and the selected memory-safety regression.
+- Latest focused target run: PASS, 26 selected PHPTs.
 
 ## Known Gaps
 
 - Full entity-table, charset, flag, object-query, `parse_url` edge-case,
-  remaining `parse_str`, and URL edge-case behavior remains outside the
-  selected focused gate.
+  remaining `parse_str`, including the separate startup `filter.default`
+  deprecation-output mismatch in `parse_str_basic3.phpt`, and URL edge-case
+  behavior remains outside the selected focused gate.
