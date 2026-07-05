@@ -73,23 +73,24 @@ pub(in crate::builtins::modules) fn builtin_preg_match(
         .transpose()?
         .unwrap_or(0);
     let subject_bytes = subject.as_bytes();
-    if offset < 0 || offset as usize > subject_bytes.len() {
+    let Some(start_offset) = preg_match_offset(subject_bytes.len(), offset) else {
         context.set_preg_last_error(
-            pcre::PREG_BAD_UTF8_OFFSET_ERROR,
-            pcre::preg_error_message(pcre::PREG_BAD_UTF8_OFFSET_ERROR),
+            pcre::PREG_INTERNAL_ERROR,
+            pcre::preg_error_message(pcre::PREG_INTERNAL_ERROR),
         );
+        assign_reference_arg(args.get(2), Value::packed_array(Vec::new()));
         return Ok(Value::Bool(false));
-    }
+    };
     let Some(compiled) = compile_preg_pattern(context, pattern) else {
         return Ok(Value::Bool(false));
     };
-    match compiled.captures(&subject_bytes[offset as usize..]) {
+    match compiled.captures(&subject_bytes[start_offset..]) {
         Ok(Some(captures)) => {
             let matches = pcre::captures_to_array_with_names(
                 &captures,
                 compiled.capture_names(),
                 flags,
-                offset as usize,
+                start_offset,
             );
             assign_reference_arg(args.get(2), matches);
             context.clear_preg_last_error();
@@ -124,25 +125,26 @@ pub(in crate::builtins::modules) fn builtin_preg_match_all(
         .transpose()?
         .unwrap_or(0);
     let subject_bytes = subject.as_bytes();
-    if offset < 0 || offset as usize > subject_bytes.len() {
+    let Some(start_offset) = preg_match_offset(subject_bytes.len(), offset) else {
         context.set_preg_last_error(
-            pcre::PREG_BAD_UTF8_OFFSET_ERROR,
-            pcre::preg_error_message(pcre::PREG_BAD_UTF8_OFFSET_ERROR),
+            pcre::PREG_INTERNAL_ERROR,
+            pcre::preg_error_message(pcre::PREG_INTERNAL_ERROR),
         );
+        assign_reference_arg(args.get(2), Value::packed_array(Vec::new()));
         return Ok(Value::Bool(false));
-    }
+    };
     let Some(compiled) = compile_preg_pattern(context, pattern) else {
         return Ok(Value::Bool(false));
     };
 
     let mut all = Vec::new();
-    for captures in compiled.captures_iter(&subject_bytes[offset as usize..]) {
+    for captures in compiled.captures_iter(&subject_bytes[start_offset..]) {
         match captures {
             Ok(captures) => all.push(pcre::captures_to_array_with_names(
                 &captures,
                 compiled.capture_names(),
                 flags,
-                offset as usize,
+                start_offset,
             )),
             Err(error) => return preg_failure(context, error.into()),
         }
@@ -156,6 +158,14 @@ pub(in crate::builtins::modules) fn builtin_preg_match_all(
     assign_reference_arg(args.get(2), output);
     context.clear_preg_last_error();
     Ok(Value::Int(count))
+}
+
+fn preg_match_offset(subject_len: usize, offset: i64) -> Option<usize> {
+    if offset >= 0 {
+        let offset = offset as usize;
+        return (offset <= subject_len).then_some(offset);
+    }
+    Some(subject_len.saturating_sub(offset.unsigned_abs() as usize))
 }
 pub(in crate::builtins::modules) fn builtin_preg_replace(
     context: &mut BuiltinContext<'_>,

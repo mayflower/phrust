@@ -8569,6 +8569,61 @@ mod tests {
             ]))
         );
 
+        let negative_offset_matches = ReferenceCell::new(Value::Null);
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "preg_match_all",
+                vec![
+                    Value::string(r#"/[0-35-9]/"#),
+                    Value::string(
+                        r#"Hello, world! This is a test. This is another test. \[4]. 34534 string."#
+                    ),
+                    Value::Reference(negative_offset_matches.clone()),
+                    Value::Int(pcre::PREG_PATTERN_ORDER | pcre::PREG_OFFSET_CAPTURE),
+                    Value::Int(-10),
+                ],
+            ),
+            Value::Int(1)
+        );
+        let Value::Array(pattern_rows) = negative_offset_matches.get() else {
+            panic!("expected pattern-order rows");
+        };
+        let Some(Value::Array(full_matches)) = pattern_rows.get(&ArrayKey::Int(0)) else {
+            panic!("expected full-match row");
+        };
+        assert_eq!(
+            full_matches.get(&ArrayKey::Int(0)),
+            Some(&Value::packed_array(vec![
+                Value::string("3"),
+                Value::Int(61)
+            ]))
+        );
+
+        let invalid_offset_matches = ReferenceCell::new(Value::Null);
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "preg_match",
+                vec![
+                    Value::string(r#"/\d/"#),
+                    Value::string("abc123"),
+                    Value::Reference(invalid_offset_matches.clone()),
+                    Value::Int(pcre::PREG_OFFSET_CAPTURE),
+                    Value::Int(7),
+                ],
+            ),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            invalid_offset_matches.get(),
+            Value::packed_array(Vec::new())
+        );
+        assert_eq!(
+            call_in_context(&mut context, "preg_last_error", Vec::new()),
+            Value::Int(pcre::PREG_INTERNAL_ERROR)
+        );
+
         let all = ReferenceCell::new(Value::Null);
         assert_eq!(
             call_in_context(

@@ -2,7 +2,7 @@
 
 - Priority: 18.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- the selected close gate: 82 PASS, 10 SKIP, 0 FAIL, 0 BORK from 92 selected fixtures
+- the selected close gate: 83 PASS, 10 SKIP, 0 FAIL, 0 BORK from 93 selected fixtures
 - Previous upstream corpus snapshot before this promotion: 69 PASS, 10 SKIP, 86 FAIL, 0 BORK
   from 165 corpus candidates
 
@@ -10,6 +10,8 @@
 
 - `preg_match` captures, named captures, `PREG_OFFSET_CAPTURE`, and offset-base
   handling
+- `preg_match` and `preg_match_all` negative offset normalization with absolute
+  capture offsets and positive out-of-range empty-match initialization
 - `preg_match_all` set-order capture arrays with named groups and unmatched
   nulls
 - `preg_last_error` and `preg_last_error_msg` request-local state across VM
@@ -34,7 +36,7 @@
 
 ## Non-Scope
 
-- Remaining 83 upstream `ext/pcre` failures
+- Remaining 82 upstream `ext/pcre` failures
 - PCRE JIT, callouts, `(*MARK)`, and every PHP modifier edge
 - `preg_replace_callback_array` array/method callback edge cases
 - Byte-perfect warning text, stack formatting, UTF-8 edge diagnostics, and
@@ -52,6 +54,7 @@
 - `tests/phpt/generated/pcre/preg-replace-callback-flags.phpt`
 - 84 target-green upstream rows from `ext/pcre/tests`
 - `ext/pcre/tests/preg_match_basic.phpt`
+- `ext/pcre/tests/preg_match_all_basic.phpt`
 - `ext/pcre/tests/preg_quote_basic.phpt`
 - `ext/pcre/tests/preg_replace.phpt`
 - `ext/pcre/tests/preg_replace_basic.phpt`
@@ -88,6 +91,10 @@
   builtin context for the request.
 - Capture conversion now emits named keys and absolute offsets for selected
   `preg_match` and `preg_match_all` paths.
+- `preg_match` and `preg_match_all` now normalize negative offsets using PHP's
+  byte-offset rules, including clamping before-start offsets to zero and
+  initializing the matches argument to an empty array for positive out-of-range
+  offsets.
 - `preg_replace` count is bound by reference through the VM builtin argument
   bridge.
 - `preg_replace` replacement expansion now follows PHP's one/two-digit
@@ -112,7 +119,7 @@
   `preg_match_all`-free regex cases that fit the existing runtime surface.
 - The previous full target-only upstream sweep on the PHP 8.5.7 oracle corpus
   measured 69 PASS, 10 SKIP, and 86 FAIL from 165 `ext/pcre/tests` rows. This
-  branch promotes `preg_filter.phpt`, `preg_replace.phpt`,
+  branch promotes `preg_match_all_basic.phpt`, `preg_filter.phpt`, `preg_replace.phpt`,
   `preg_replace_basic.phpt`, `preg_replace_edit_basic.phpt`, and
   `preg_replace_callback_flags.phpt` from that failure set into the selected
   gate. The selected gate now also includes generated paired-delimiter,

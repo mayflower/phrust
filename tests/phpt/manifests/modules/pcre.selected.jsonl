@@ -73,6 +73,7 @@
 {"path":"ext/pcre/tests/pcre_extended.phpt"}
 {"path":"ext/pcre/tests/pcre_reentrancy.phpt"}
 {"path":"ext/pcre/tests/preg_grep_basic.phpt"}
+{"path":"ext/pcre/tests/preg_match_all_basic.phpt"}
 {"path":"ext/pcre/tests/preg_match_basic.phpt"}
 {"path":"ext/pcre/tests/preg_match_basic_002.phpt"}
 {"path":"ext/pcre/tests/preg_match_basic_edit.phpt"}
