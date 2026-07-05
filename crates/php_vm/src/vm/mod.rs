@@ -25492,6 +25492,7 @@ impl Vm {
                                 &object,
                                 method,
                                 values.into_iter().map(|arg| arg.value).collect(),
+                                &self.options.runtime_context,
                             ) {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -32183,7 +32184,12 @@ impl Vm {
         }
         if is_xml_runtime_class(&object.class_name()) {
             let values = args.into_iter().map(|arg| arg.value).collect();
-            return match call_xml_runtime_method(&object, method, values) {
+            return match call_xml_runtime_method(
+                &object,
+                method,
+                values,
+                &self.options.runtime_context,
+            ) {
                 Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
@@ -54919,6 +54925,7 @@ fn call_xml_runtime_method(
     object: &ObjectRef,
     method: &str,
     args: Vec<Value>,
+    runtime_context: &RuntimeContext,
 ) -> Result<Value, String> {
     let class_name = normalize_class_name(&object.class_name());
     let method = normalize_method_name(method);
@@ -55020,14 +55027,79 @@ fn call_xml_runtime_method(
             let xml = xml_string_arg("XMLReader::XML", args[0].clone())?;
             php_runtime::xml::xml_reader_xml(object, &xml)
         }
+        ("xmlreader", "open") => {
+            validate_xml_value_count("XMLReader::open", &args, 1, 3)?;
+            let path = xml_string_arg("XMLReader::open", args[0].clone())?;
+            let source = xml_reader_open_source(&path, runtime_context)?;
+            php_runtime::xml::xml_reader_xml(object, &source)
+        }
         ("xmlreader", "read") => {
             validate_xml_value_count("XMLReader::read", &args, 0, 0)?;
             Ok(php_runtime::xml::xml_reader_read(object))
+        }
+        ("xmlreader", "next") => {
+            validate_xml_value_count("XMLReader::next", &args, 0, 1)?;
+            let name = args
+                .first()
+                .cloned()
+                .map(|value| xml_string_arg("XMLReader::next", value))
+                .transpose()?;
+            Ok(php_runtime::xml::xml_reader_next(object, name.as_deref()))
         }
         ("xmlreader", "getattribute") => {
             validate_xml_value_count("XMLReader::getAttribute", &args, 1, 1)?;
             let name = xml_string_arg("XMLReader::getAttribute", args[0].clone())?;
             Ok(php_runtime::xml::xml_reader_get_attribute(object, &name))
+        }
+        ("xmlreader", "getattributeno") => {
+            validate_xml_value_count("XMLReader::getAttributeNo", &args, 1, 1)?;
+            let index = to_int(&args[0])?;
+            Ok(php_runtime::xml::xml_reader_get_attribute_no(object, index))
+        }
+        ("xmlreader", "lookupnamespace") => {
+            validate_xml_value_count("XMLReader::lookupNamespace", &args, 1, 1)?;
+            let prefix = xml_string_arg("XMLReader::lookupNamespace", args[0].clone())?;
+            Ok(php_runtime::xml::xml_reader_lookup_namespace(
+                object, &prefix,
+            ))
+        }
+        ("xmlreader", "movetoattribute") => {
+            validate_xml_value_count("XMLReader::moveToAttribute", &args, 1, 1)?;
+            let name = xml_string_arg("XMLReader::moveToAttribute", args[0].clone())?;
+            Ok(php_runtime::xml::xml_reader_move_to_attribute(
+                object, &name,
+            ))
+        }
+        ("xmlreader", "movetoattributeno") => {
+            validate_xml_value_count("XMLReader::moveToAttributeNo", &args, 1, 1)?;
+            let index = to_int(&args[0])?;
+            Ok(php_runtime::xml::xml_reader_move_to_attribute_no(
+                object, index,
+            ))
+        }
+        ("xmlreader", "movetofirstattribute") => {
+            validate_xml_value_count("XMLReader::moveToFirstAttribute", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_move_to_first_attribute(object))
+        }
+        ("xmlreader", "movetonextattribute") => {
+            validate_xml_value_count("XMLReader::moveToNextAttribute", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_move_to_next_attribute(object))
+        }
+        ("xmlreader", "movetoelement") => {
+            validate_xml_value_count("XMLReader::moveToElement", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_move_to_element(object))
+        }
+        ("xmlreader", "readstring") => {
+            validate_xml_value_count("XMLReader::readString", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_read_string(object))
+        }
+        ("xmlreader", "readinnerxml") => {
+            validate_xml_value_count("XMLReader::readInnerXml", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_read_inner_xml(object))
+        }
+        ("xmlreader", "readouterxml") => {
+            validate_xml_value_count("XMLReader::readOuterXml", &args, 0, 0)?;
+            Ok(php_runtime::xml::xml_reader_read_outer_xml(object))
         }
         ("xmlreader", "close") => {
             validate_xml_value_count("XMLReader::close", &args, 0, 0)?;
@@ -55274,11 +55346,22 @@ fn xml_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
     let value = match constant.to_ascii_uppercase().as_str() {
         "NONE" => php_runtime::xml::XML_READER_NONE,
         "ELEMENT" => php_runtime::xml::XML_READER_ELEMENT,
+        "ATTRIBUTE" => php_runtime::xml::XML_READER_ATTRIBUTE,
         "TEXT" => php_runtime::xml::XML_READER_TEXT,
         "END_ELEMENT" => php_runtime::xml::XML_READER_END_ELEMENT,
         _ => return None,
     };
     Some(Value::Int(value))
+}
+
+fn xml_reader_open_source(path: &str, runtime_context: &RuntimeContext) -> Result<String, String> {
+    let path = spl_file_resolve_path(path, runtime_context);
+    fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "E_PHP_VM_XML_READER_OPEN: failed to read `{}`: {error}",
+            path.to_string_lossy()
+        )
+    })
 }
 
 fn xml_string_arg(name: &str, value: Value) -> Result<String, String> {

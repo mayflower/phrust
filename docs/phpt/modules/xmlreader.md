@@ -1,22 +1,34 @@
 # xmlreader
 
-- Strategy: bounded XMLReader MVP over the shared XML tree
+- Strategy: bounded XMLReader attribute navigation MVP over the shared XML tree
 - Selected manifest: `tests/phpt/manifests/modules/xmlreader.selected.jsonl`
-- Selected gate: 1 generated PHPT covering `XML()`, `read()`, node fields,
-  `getAttribute()`, and `close()`
+- Selected gate: 4 generated PHPTs covering `open()`, `XML()`, `read()`,
+  `next()`, node fields, namespace lookup, attribute cursor movement, XML
+  string readers, and `close()`
 
 ## Runtime Contract
 
 - `extension_loaded("xmlreader")` returns `true`.
+- `XMLReader::open()` reads a local XML file path and initializes the reader.
 - `XMLReader::XML()` parses an in-memory strict XML string.
 - `XMLReader::read()` advances through element, text, and end-element events.
-- `nodeType`, `name`, `value`, `getAttribute()`, and `close()` are available.
+- `XMLReader::next()` advances to the next element sibling in the bounded event
+  stream, optionally matching the element name.
+- `XMLReader::lookupNamespace()` resolves namespace declarations visible to the
+  current node.
+- `XMLReader::moveToAttribute()`, `moveToAttributeNo()`,
+  `moveToFirstAttribute()`, `moveToNextAttribute()`, and `moveToElement()`
+  expose bounded attribute cursor movement.
+- `nodeType`, `name`, `localName`, `prefix`, `depth`, `value`,
+  `namespaceURI`, `attributeCount`, `hasAttributes`, `hasValue`,
+  `getAttribute()`, `getAttributeNo()`, `readString()`, `readInnerXml()`,
+  `readOuterXml()`, and `close()` are available.
 
 ## Unsupported Area
 
 | Stable ID | Reference behavior summary | Current phrust behavior | Fixture path | Next owner layer |
 | --- | --- | --- | --- | --- |
-| `XML-DOM-INTL-XMLREADER-FULL-STREAM` | PHP XMLReader supports files, streams, namespaces, validation, attributes, and libxml options/errors. | Only in-memory strict XML traversal is implemented. | `tests/phpt/generated/xmlreader/basic.phpt` | future XMLReader stream/libxml layer |
+| `XML-DOM-INTL-XMLREADER-FULL-STREAM` | PHP XMLReader supports URI/stream wrappers, validation flags, DOM expansion, full libxml options/errors, and true streaming behavior. | Local-file and in-memory strict XML traversal, bounded namespace lookup, bounded attribute cursor movement, and XML string readers are implemented. URI/stream wrappers remain unsupported. | `tests/phpt/generated/xmlreader/basic.phpt`, `tests/phpt/generated/xmlreader/navigation-readxml.phpt`, `tests/phpt/generated/xmlreader/open-local-file.phpt`, `tests/phpt/generated/xmlreader/attributes-namespaces.phpt` | future XMLReader stream/libxml/DOM layer |
 
 ## Target Gates
 

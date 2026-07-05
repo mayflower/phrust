@@ -17,7 +17,7 @@ var_dump($reader->close());
 bool(true)
 1|root||'7'
 1|child||NULL
-3||A|NULL
+3|#text|A|NULL
 15|child||NULL
-15|root||NULL
+15|root||'7'
 bool(true)

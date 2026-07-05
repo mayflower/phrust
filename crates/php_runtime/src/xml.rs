@@ -14,12 +14,14 @@ const XML_NODE_PATH: &str = "__phrust_xml_path";
 const XML_TEXT_STORAGE: &str = "__phrust_xml_text";
 const XML_READER_EVENTS: &str = "__phrust_xml_reader_events";
 const XML_READER_INDEX: &str = "__phrust_xml_reader_index";
+const XML_READER_ATTRIBUTE_INDEX: &str = "__phrust_xml_reader_attribute_index";
 const XML_WRITER_BUFFER: &str = "__phrust_xml_writer_buffer";
 const XML_WRITER_STACK: &str = "__phrust_xml_writer_stack";
 const XML_WRITER_OPEN_TAG: &str = "__phrust_xml_writer_open_tag";
 
 pub const XML_READER_NONE: i64 = 0;
 pub const XML_READER_ELEMENT: i64 = 1;
+pub const XML_READER_ATTRIBUTE: i64 = 2;
 pub const XML_READER_TEXT: i64 = 3;
 pub const XML_READER_END_ELEMENT: i64 = 15;
 
@@ -50,6 +52,12 @@ pub struct XmlReaderEvent {
     pub name: String,
     pub value: String,
     pub attributes: Vec<(String, String)>,
+    pub namespace_uri: String,
+    pub namespaces: Vec<(String, String)>,
+    pub depth: i64,
+    pub inner_xml: String,
+    pub outer_xml: String,
+    pub string_value: String,
 }
 
 /// Parses a strict XML document using no external resources.
@@ -86,6 +94,17 @@ pub fn serialize_element(element: &XmlElement) -> String {
     out.push_str("</");
     out.push_str(&element.name);
     out.push('>');
+    out
+}
+
+fn serialize_children(element: &XmlElement) -> String {
+    let mut out = String::new();
+    for child in &element.children {
+        match child {
+            XmlNode::Element(child) => out.push_str(&serialize_element(child)),
+            XmlNode::Text(text) => out.push_str(&escape_text(text, false)),
+        }
+    }
     out
 }
 
@@ -241,6 +260,7 @@ pub fn new_xml_reader() -> ObjectRef {
     set_xml_reader_current(&object, None);
     object.set_property(XML_READER_EVENTS, Value::Array(PhpArray::new()));
     object.set_property(XML_READER_INDEX, Value::Int(-1));
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
     object
 }
 
@@ -418,6 +438,7 @@ pub fn xml_reader_xml(object: &ObjectRef, xml: &str) -> Result<Value, String> {
     let events = reader_events(&document);
     object.set_property(XML_READER_EVENTS, reader_events_value(&events));
     object.set_property(XML_READER_INDEX, Value::Int(-1));
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
     set_xml_reader_current(object, None);
     Ok(Value::Bool(true))
 }
@@ -429,12 +450,46 @@ pub fn xml_reader_read(object: &ObjectRef) -> Value {
         _ => 0,
     };
     if next < 0 || next as usize >= events.len() {
+        object.set_property(XML_READER_INDEX, Value::Int(events.len() as i64));
         set_xml_reader_current(object, None);
         return Value::Bool(false);
     }
     object.set_property(XML_READER_INDEX, Value::Int(next));
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
     set_xml_reader_current(object, events.get(next as usize));
     Value::Bool(true)
+}
+
+pub fn xml_reader_next(object: &ObjectRef, name: Option<&str>) -> Value {
+    let events = reader_events_from_object(object);
+    let current_index = match object.get_property(XML_READER_INDEX) {
+        Some(Value::Int(index)) => index,
+        _ => -1,
+    };
+    let min_depth = events
+        .get(current_index.max(0) as usize)
+        .filter(|event| current_index >= 0 && event.node_type == XML_READER_ELEMENT)
+        .map(|event| event.depth)
+        .unwrap_or(i64::MAX);
+
+    let mut index = current_index + 1;
+    while index >= 0 && (index as usize) < events.len() {
+        let event = &events[index as usize];
+        if event.node_type == XML_READER_ELEMENT
+            && event.depth <= min_depth
+            && name.is_none_or(|name| event.name == name)
+        {
+            object.set_property(XML_READER_INDEX, Value::Int(index));
+            object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
+            set_xml_reader_current(object, Some(event));
+            return Value::Bool(true);
+        }
+        index += 1;
+    }
+
+    object.set_property(XML_READER_INDEX, Value::Int(events.len() as i64));
+    set_xml_reader_current(object, None);
+    Value::Bool(false)
 }
 
 pub fn xml_reader_get_attribute(object: &ObjectRef, name: &str) -> Value {
@@ -454,9 +509,112 @@ pub fn xml_reader_get_attribute(object: &ObjectRef, name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+pub fn xml_reader_get_attribute_no(object: &ObjectRef, index: i64) -> Value {
+    if index < 0 {
+        return Value::Null;
+    }
+    let Some(Value::Int(current)) = object.get_property(XML_READER_INDEX) else {
+        return Value::Null;
+    };
+    let events = reader_events_from_object(object);
+    events
+        .get(current as usize)
+        .and_then(|event| event.attributes.get(index as usize))
+        .map(|(_, value)| Value::string(value.as_bytes().to_vec()))
+        .unwrap_or(Value::Null)
+}
+
+pub fn xml_reader_lookup_namespace(object: &ObjectRef, prefix: &str) -> Value {
+    current_reader_event(object)
+        .and_then(|event| {
+            event
+                .namespaces
+                .iter()
+                .find(|(candidate, _)| candidate == prefix)
+                .map(|(_, uri)| Value::string(uri.as_bytes().to_vec()))
+        })
+        .unwrap_or(Value::Null)
+}
+
+pub fn xml_reader_move_to_attribute(object: &ObjectRef, name: &str) -> Value {
+    let Some(event) = current_reader_event(object) else {
+        return Value::Bool(false);
+    };
+    let Some(index) = event
+        .attributes
+        .iter()
+        .position(|(attr_name, _)| attr_name == name)
+    else {
+        return Value::Bool(false);
+    };
+    set_xml_reader_attribute_current(object, &event, index)
+}
+
+pub fn xml_reader_move_to_attribute_no(object: &ObjectRef, index: i64) -> Value {
+    if index < 0 {
+        return Value::Bool(false);
+    }
+    let Some(event) = current_reader_event(object) else {
+        return Value::Bool(false);
+    };
+    if index as usize >= event.attributes.len() {
+        return Value::Bool(false);
+    }
+    set_xml_reader_attribute_current(object, &event, index as usize)
+}
+
+pub fn xml_reader_move_to_first_attribute(object: &ObjectRef) -> Value {
+    xml_reader_move_to_attribute_no(object, 0)
+}
+
+pub fn xml_reader_move_to_next_attribute(object: &ObjectRef) -> Value {
+    let next = match object.get_property(XML_READER_ATTRIBUTE_INDEX) {
+        Some(Value::Int(index)) if index >= 0 => index + 1,
+        _ => 0,
+    };
+    xml_reader_move_to_attribute_no(object, next)
+}
+
+pub fn xml_reader_move_to_element(object: &ObjectRef) -> Value {
+    if !matches!(
+        object.get_property(XML_READER_ATTRIBUTE_INDEX),
+        Some(Value::Int(index)) if index >= 0
+    ) {
+        return Value::Bool(false);
+    }
+    let Some(event) = current_reader_event(object) else {
+        return Value::Bool(false);
+    };
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
+    set_xml_reader_current(object, Some(&event));
+    Value::Bool(true)
+}
+
+pub fn xml_reader_read_string(object: &ObjectRef) -> Value {
+    if let Some((_, value)) = current_reader_attribute(object) {
+        return Value::string(value.into_bytes());
+    }
+    current_reader_event(object)
+        .map(|event| Value::string(event.string_value.into_bytes()))
+        .unwrap_or_else(|| Value::string(Vec::<u8>::new()))
+}
+
+pub fn xml_reader_read_inner_xml(object: &ObjectRef) -> Value {
+    current_reader_event(object)
+        .map(|event| Value::string(event.inner_xml.into_bytes()))
+        .unwrap_or_else(|| Value::string(Vec::<u8>::new()))
+}
+
+pub fn xml_reader_read_outer_xml(object: &ObjectRef) -> Value {
+    current_reader_event(object)
+        .map(|event| Value::string(event.outer_xml.into_bytes()))
+        .unwrap_or_else(|| Value::string(Vec::<u8>::new()))
+}
+
 pub fn xml_reader_close(object: &ObjectRef) -> Value {
     object.set_property(XML_READER_EVENTS, Value::Array(PhpArray::new()));
     object.set_property(XML_READER_INDEX, Value::Int(-1));
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
     set_xml_reader_current(object, None);
     Value::Bool(true)
 }
@@ -606,20 +764,49 @@ fn collect_elements_by_tag_name(element: &XmlElement, name: &str, out: &mut Vec<
 }
 
 fn push_reader_events(element: &XmlElement, events: &mut Vec<XmlReaderEvent>) {
+    push_reader_events_with_depth(element, events, 0, &BTreeMap::new());
+}
+
+fn push_reader_events_with_depth(
+    element: &XmlElement,
+    events: &mut Vec<XmlReaderEvent>,
+    depth: i64,
+    inherited_namespaces: &BTreeMap<String, String>,
+) {
+    let namespaces = element_namespace_context(element, inherited_namespaces);
+    let namespace_uri = namespace_uri_for_name(&element.name, &namespaces, false);
+    let namespaces_vec = namespace_vec(&namespaces);
+    let inner_xml = serialize_children(element);
+    let outer_xml = serialize_element(element);
+    let string_value = element_text(element);
     events.push(XmlReaderEvent {
         node_type: XML_READER_ELEMENT,
         name: element.name.clone(),
         value: String::new(),
         attributes: element.attributes.clone(),
+        namespace_uri: namespace_uri.clone(),
+        namespaces: namespaces_vec.clone(),
+        depth,
+        inner_xml,
+        outer_xml,
+        string_value,
     });
     for child in &element.children {
         match child {
-            XmlNode::Element(child) => push_reader_events(child, events),
+            XmlNode::Element(child) => {
+                push_reader_events_with_depth(child, events, depth + 1, &namespaces)
+            }
             XmlNode::Text(text) if !text.is_empty() => events.push(XmlReaderEvent {
                 node_type: XML_READER_TEXT,
-                name: String::new(),
+                name: "#text".to_owned(),
                 value: text.clone(),
                 attributes: Vec::new(),
+                namespace_uri: String::new(),
+                namespaces: namespaces_vec.clone(),
+                depth: depth + 1,
+                inner_xml: String::new(),
+                outer_xml: escape_text(text, false),
+                string_value: text.clone(),
             }),
             XmlNode::Text(_) => {}
         }
@@ -628,7 +815,13 @@ fn push_reader_events(element: &XmlElement, events: &mut Vec<XmlReaderEvent>) {
         node_type: XML_READER_END_ELEMENT,
         name: element.name.clone(),
         value: String::new(),
-        attributes: Vec::new(),
+        attributes: element.attributes.clone(),
+        namespace_uri,
+        namespaces: namespaces_vec,
+        depth,
+        inner_xml: String::new(),
+        outer_xml: String::new(),
+        string_value: String::new(),
     });
 }
 
@@ -763,6 +956,26 @@ fn reader_events_value(events: &[XmlReaderEvent]) -> Value {
             ArrayKey::String(PhpString::from("value")),
             Value::string(event.value.as_bytes().to_vec()),
         );
+        entry.insert(
+            ArrayKey::String(PhpString::from("namespace_uri")),
+            Value::string(event.namespace_uri.as_bytes().to_vec()),
+        );
+        entry.insert(
+            ArrayKey::String(PhpString::from("depth")),
+            Value::Int(event.depth),
+        );
+        entry.insert(
+            ArrayKey::String(PhpString::from("inner_xml")),
+            Value::string(event.inner_xml.as_bytes().to_vec()),
+        );
+        entry.insert(
+            ArrayKey::String(PhpString::from("outer_xml")),
+            Value::string(event.outer_xml.as_bytes().to_vec()),
+        );
+        entry.insert(
+            ArrayKey::String(PhpString::from("string_value")),
+            Value::string(event.string_value.as_bytes().to_vec()),
+        );
         let mut attrs = PhpArray::new();
         for (name, value) in &event.attributes {
             attrs.insert(
@@ -773,6 +986,17 @@ fn reader_events_value(events: &[XmlReaderEvent]) -> Value {
         entry.insert(
             ArrayKey::String(PhpString::from("attrs")),
             Value::Array(attrs),
+        );
+        let mut namespaces = PhpArray::new();
+        for (prefix, uri) in &event.namespaces {
+            namespaces.insert(
+                ArrayKey::String(PhpString::from(prefix.as_str())),
+                Value::string(uri.as_bytes().to_vec()),
+            );
+        }
+        entry.insert(
+            ArrayKey::String(PhpString::from("namespaces")),
+            Value::Array(namespaces),
         );
         array.append(Value::Array(entry));
     }
@@ -801,6 +1025,27 @@ fn reader_events_from_object(object: &ObjectRef) -> Vec<XmlReaderEvent> {
                 Some(Value::String(value)) => value.to_string_lossy(),
                 _ => String::new(),
             };
+            let namespace_uri = match entry.get(&ArrayKey::String(PhpString::from("namespace_uri")))
+            {
+                Some(Value::String(value)) => value.to_string_lossy(),
+                _ => String::new(),
+            };
+            let depth = match entry.get(&ArrayKey::String(PhpString::from("depth"))) {
+                Some(Value::Int(value)) => *value,
+                _ => 0,
+            };
+            let inner_xml = match entry.get(&ArrayKey::String(PhpString::from("inner_xml"))) {
+                Some(Value::String(value)) => value.to_string_lossy(),
+                _ => String::new(),
+            };
+            let outer_xml = match entry.get(&ArrayKey::String(PhpString::from("outer_xml"))) {
+                Some(Value::String(value)) => value.to_string_lossy(),
+                _ => String::new(),
+            };
+            let string_value = match entry.get(&ArrayKey::String(PhpString::from("string_value"))) {
+                Some(Value::String(value)) => value.to_string_lossy(),
+                _ => value.clone(),
+            };
             let mut attributes = Vec::new();
             if let Some(Value::Array(attrs)) =
                 entry.get(&ArrayKey::String(PhpString::from("attrs")))
@@ -811,26 +1056,172 @@ fn reader_events_from_object(object: &ObjectRef) -> Vec<XmlReaderEvent> {
                     }
                 }
             }
+            let mut namespaces = Vec::new();
+            if let Some(Value::Array(namespace_array)) =
+                entry.get(&ArrayKey::String(PhpString::from("namespaces")))
+            {
+                for (key, value) in namespace_array.iter() {
+                    if let (ArrayKey::String(key), Value::String(value)) = (key, value) {
+                        namespaces.push((key.to_string_lossy(), value.to_string_lossy()));
+                    }
+                }
+            }
             Some(XmlReaderEvent {
                 node_type,
                 name,
                 value,
                 attributes,
+                namespace_uri,
+                namespaces,
+                depth,
+                inner_xml,
+                outer_xml,
+                string_value,
             })
         })
         .collect()
 }
 
+fn current_reader_event(object: &ObjectRef) -> Option<XmlReaderEvent> {
+    let Some(Value::Int(index)) = object.get_property(XML_READER_INDEX) else {
+        return None;
+    };
+    if index < 0 {
+        return None;
+    }
+    reader_events_from_object(object)
+        .get(index as usize)
+        .cloned()
+}
+
+fn current_reader_attribute(object: &ObjectRef) -> Option<(String, String)> {
+    let Some(Value::Int(index)) = object.get_property(XML_READER_ATTRIBUTE_INDEX) else {
+        return None;
+    };
+    if index < 0 {
+        return None;
+    }
+    current_reader_event(object).and_then(|event| event.attributes.get(index as usize).cloned())
+}
+
 fn set_xml_reader_current(object: &ObjectRef, event: Option<&XmlReaderEvent>) {
     if let Some(event) = event {
+        object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(-1));
         object.set_property("nodeType", Value::Int(event.node_type));
         object.set_property("name", Value::string(event.name.as_bytes().to_vec()));
         object.set_property("value", Value::string(event.value.as_bytes().to_vec()));
+        object.set_property(
+            "namespaceURI",
+            Value::string(event.namespace_uri.as_bytes().to_vec()),
+        );
+        object.set_property("depth", Value::Int(event.depth));
+        object.set_property("attributeCount", Value::Int(event.attributes.len() as i64));
+        object.set_property("hasAttributes", Value::Bool(!event.attributes.is_empty()));
+        object.set_property("hasValue", Value::Bool(!event.value.is_empty()));
+        let (prefix, local_name) = split_xml_name(&event.name);
+        object.set_property("localName", Value::string(local_name.as_bytes().to_vec()));
+        object.set_property("prefix", Value::string(prefix.as_bytes().to_vec()));
     } else {
         object.set_property("nodeType", Value::Int(XML_READER_NONE));
         object.set_property("name", Value::string(Vec::<u8>::new()));
         object.set_property("value", Value::string(Vec::<u8>::new()));
+        object.set_property("namespaceURI", Value::string(Vec::<u8>::new()));
+        object.set_property("depth", Value::Int(0));
+        object.set_property("attributeCount", Value::Int(0));
+        object.set_property("hasAttributes", Value::Bool(false));
+        object.set_property("hasValue", Value::Bool(false));
+        object.set_property("localName", Value::string(Vec::<u8>::new()));
+        object.set_property("prefix", Value::string(Vec::<u8>::new()));
     }
+}
+
+fn set_xml_reader_attribute_current(
+    object: &ObjectRef,
+    event: &XmlReaderEvent,
+    index: usize,
+) -> Value {
+    let Some((name, value)) = event.attributes.get(index) else {
+        return Value::Bool(false);
+    };
+    let (prefix, local_name) = split_xml_name(name);
+    let namespace_uri = namespace_uri_for_attribute(name, &event.namespaces);
+    object.set_property(XML_READER_ATTRIBUTE_INDEX, Value::Int(index as i64));
+    object.set_property("nodeType", Value::Int(XML_READER_ATTRIBUTE));
+    object.set_property("name", Value::string(name.as_bytes().to_vec()));
+    object.set_property("localName", Value::string(local_name.as_bytes().to_vec()));
+    object.set_property("prefix", Value::string(prefix.as_bytes().to_vec()));
+    object.set_property(
+        "namespaceURI",
+        Value::string(namespace_uri.as_bytes().to_vec()),
+    );
+    object.set_property("value", Value::string(value.as_bytes().to_vec()));
+    object.set_property("depth", Value::Int(event.depth + 1));
+    object.set_property("attributeCount", Value::Int(0));
+    object.set_property("hasAttributes", Value::Bool(false));
+    object.set_property("hasValue", Value::Bool(true));
+    Value::Bool(true)
+}
+
+fn split_xml_name(name: &str) -> (String, String) {
+    if let Some((prefix, local)) = name.split_once(':') {
+        (prefix.to_string(), local.to_string())
+    } else {
+        (String::new(), name.to_string())
+    }
+}
+
+fn element_namespace_context(
+    element: &XmlElement,
+    inherited: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut namespaces = inherited.clone();
+    for (name, value) in &element.attributes {
+        if name == "xmlns" {
+            namespaces.insert(String::new(), value.clone());
+        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+            namespaces.insert(prefix.to_owned(), value.clone());
+        }
+    }
+    namespaces
+}
+
+fn namespace_vec(namespaces: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    namespaces
+        .iter()
+        .map(|(prefix, uri)| (prefix.clone(), uri.clone()))
+        .collect()
+}
+
+fn namespace_uri_for_name(
+    name: &str,
+    namespaces: &BTreeMap<String, String>,
+    is_attribute: bool,
+) -> String {
+    let (prefix, _) = split_xml_name(name);
+    if prefix.is_empty() {
+        if is_attribute {
+            String::new()
+        } else {
+            namespaces.get("").cloned().unwrap_or_default()
+        }
+    } else {
+        namespaces.get(&prefix).cloned().unwrap_or_default()
+    }
+}
+
+fn namespace_uri_for_attribute(name: &str, namespaces: &[(String, String)]) -> String {
+    if name == "xmlns" || name.starts_with("xmlns:") {
+        return "http://www.w3.org/2000/xmlns/".to_owned();
+    }
+    let (prefix, _) = split_xml_name(name);
+    if prefix.is_empty() {
+        return String::new();
+    }
+    namespaces
+        .iter()
+        .find(|(candidate, _)| candidate == &prefix)
+        .map(|(_, uri)| uri.clone())
+        .unwrap_or_default()
 }
 
 fn writer_buffer(object: &ObjectRef) -> String {
