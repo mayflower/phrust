@@ -614,12 +614,14 @@ mod tests {
                 .load(Ordering::Relaxed),
             2
         );
+        // Each request rebuilds request-local engine state; the rejected
+        // persistence stays visible instead of being renamed away.
         assert_eq!(
             state
                 .metrics
                 .persistent_engine_request_local_rejections
                 .load(Ordering::Relaxed),
-            0
+            2
         );
         assert_eq!(
             state

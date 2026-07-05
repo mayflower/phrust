@@ -898,6 +898,13 @@ pub(crate) fn execute_compiled_php_with_state(
         .metrics
         .persistent_engine_request_local_resets
         .fetch_add(1, Ordering::Relaxed);
+    // Honest accounting: every request rebuilds its request-local engine
+    // state; nothing beyond compiled artifacts and feedback templates is
+    // persisted, and that rejection stays visible as a metric.
+    state
+        .metrics
+        .persistent_engine_request_local_rejections
+        .fetch_add(1, Ordering::Relaxed);
     state
         .metrics
         .persistent_engine_policy_reuses

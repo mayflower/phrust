@@ -370,7 +370,7 @@ fn server_reuses_compiled_script_cache_for_repeated_php_requests() {
     );
     assert!(
         metrics.contains(
-            "phrust_server_persistent_engine_rejected_persistence_total{reason=\"request_local_state\"} 0\n"
+            "phrust_server_persistent_engine_rejected_persistence_total{reason=\"request_local_state\"} 2\n"
         ),
         "{metrics}"
     );

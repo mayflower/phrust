@@ -1,6 +1,15 @@
 use php_vm::api::QuickeningSiteSnapshot;
 use std::{collections::BTreeMap, sync::Mutex};
 
+// NOTE: feedback templates, not an OPcache-style metadata layer.
+//
+// This store only carries quickening feedback templates between requests.
+// It does not persist immutable class/function/property metadata, include
+// graphs, or any PHP-visible state; describing it as OPcache-like would be
+// dishonest. Request-local state is rebuilt per request and that rejection
+// is reported through
+// `phrust_server_persistent_engine_rejected_persistence_total`.
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PersistentMetadataStats {
     pub(crate) feedback_templates: u64,
