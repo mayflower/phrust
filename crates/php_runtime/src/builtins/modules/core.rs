@@ -6305,14 +6305,14 @@ mod tests {
         assert_eq!(
             source_stats
                 .value_clone_by_family
-                .get(layout_stats::SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION),
+                .get(layout_stats::SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION.name()),
             Some(&1),
             "{source_stats:?}"
         );
         assert_eq!(
             source_stats
                 .array_handle_clone_by_family
-                .get(layout_stats::SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION),
+                .get(layout_stats::SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION.name()),
             Some(&1),
             "{source_stats:?}"
         );

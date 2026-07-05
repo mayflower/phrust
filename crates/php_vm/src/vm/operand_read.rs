@@ -65,7 +65,7 @@ impl Vm {
         compiled: &CompiledUnit,
         stack: &CallStack,
         operand: DenseOperand,
-        source_family: &'static str,
+        source_family: php_runtime::layout_stats::LayoutSourceFamily,
     ) -> Result<Value, String> {
         match operand.kind {
             DenseOperandKind::Register => {

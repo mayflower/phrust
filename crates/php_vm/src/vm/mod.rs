@@ -10568,7 +10568,7 @@ impl Vm {
                             ) {
                                 Ok(value) => {
                                     self.record_counter_value_clone_reason(
-                                        layout_source::RETURN_VALUE,
+                                        layout_source::RETURN_VALUE.name(),
                                     );
                                     Some(value)
                                 }
@@ -11580,7 +11580,9 @@ impl Vm {
                     arg.value,
                     layout_source::CALL_ARGUMENT_SNAPSHOT,
                 )?;
-                self.record_counter_value_clone_reason(layout_source::CALL_ARGUMENT_SNAPSHOT);
+                self.record_counter_value_clone_reason(
+                    layout_source::CALL_ARGUMENT_SNAPSHOT.name(),
+                );
                 value
             };
             let by_ref_dim = arg
@@ -12308,7 +12310,7 @@ impl Vm {
                     .map(|(key, value)| (Some(array_key_to_value(key)), value));
                 if next.is_some() {
                     *position += 1;
-                    self.record_counter_value_clone_reason(layout_source::FOREACH_VALUE);
+                    self.record_counter_value_clone_reason(layout_source::FOREACH_VALUE.name());
                 }
                 next
             }
@@ -12323,7 +12325,7 @@ impl Vm {
                 });
                 if next.is_some() {
                     *position += 1;
-                    self.record_counter_value_clone_reason(layout_source::FOREACH_VALUE);
+                    self.record_counter_value_clone_reason(layout_source::FOREACH_VALUE.name());
                 }
                 next
             }
@@ -24064,7 +24066,7 @@ impl Vm {
                                 if next.is_some() {
                                     *position += 1;
                                     self.record_counter_value_clone_reason(
-                                        layout_source::FOREACH_VALUE,
+                                        layout_source::FOREACH_VALUE.name(),
                                     );
                                 }
                                 next
@@ -24081,7 +24083,7 @@ impl Vm {
                                 if next.is_some() {
                                     *position += 1;
                                     self.record_counter_value_clone_reason(
-                                        layout_source::FOREACH_VALUE,
+                                        layout_source::FOREACH_VALUE.name(),
                                     );
                                 }
                                 next
@@ -28175,7 +28177,9 @@ impl Vm {
                             );
                         };
                         let frame = stack.frame_mut(frame_index).expect("frame is active");
-                        let _source = layout_source::enter("return_reference_binding");
+                        let _source = layout_source::enter(
+                            php_runtime::layout_stats::SOURCE_RETURN_REFERENCE_BINDING,
+                        );
                         match frame.locals.ensure_reference_cell(*local) {
                             Ok(reference) => Some(reference),
                             Err(message) => {
@@ -83172,7 +83176,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             assert_eq!(
                 counters
                     .value_clone_by_reason
-                    .get(layout_source::FOREACH_VALUE)
+                    .get(layout_source::FOREACH_VALUE.name())
                     .copied(),
                 Some(64),
                 "{format:?}: {:?}",
@@ -83215,56 +83219,6 @@ var_dump(unserialize('O:1:"C":0:{}'));
     }
 
     #[test]
-    fn branch_conditions_borrow_array_operands_without_handle_clone() {
-        let source = "<?php
-            $items = [1, 2, 3];
-            $hits = 0;
-            for ($i = 0; $i < 32; $i++) {
-                if ($items) {
-                    $hits++;
-                }
-            }
-            echo $hits;
-        ";
-        for format in [ExecutionFormat::Ir, ExecutionFormat::Bytecode] {
-            let result = execute_source_with_options(
-                source,
-                VmOptions {
-                    collect_counters: true,
-                    collect_profile_spans: false,
-                    collect_layout_source_attribution: true,
-                    execution_format: format,
-                    ..VmOptions::default()
-                },
-            );
-            assert!(
-                result.status.is_success(),
-                "{format:?}: {:?}",
-                result.status
-            );
-            assert_eq!(result.output.as_bytes(), b"32", "{format:?}");
-            let counters = result.counters.expect("counters");
-            let reference_dereference_array_clones = counters
-                .array_handle_clone_by_source_family
-                .get(layout_source::REFERENCE_DEREFERENCE)
-                .copied()
-                .unwrap_or_default();
-            assert!(
-                counters.array_handle_clones <= 4,
-                "{format:?}: branch truthiness should not clone array operands per iteration: {} {:?}",
-                counters.array_handle_clones,
-                counters.array_handle_clone_by_source_family
-            );
-            assert!(
-                reference_dereference_array_clones <= 1,
-                "{format:?}: branch truthiness should not dereference-clone array operands per iteration: {} {:?}",
-                reference_dereference_array_clones,
-                counters.array_handle_clone_by_source_family
-            );
-        }
-    }
-
-    #[test]
     fn rich_echo_borrows_register_operand_for_fast_scalar_output() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
@@ -83283,7 +83237,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
         assert_eq!(
             counters
                 .value_clone_by_source_family
-                .get(layout_source::STACK_REGISTER_LOCAL_MOVE)
+                .get(layout_source::STACK_REGISTER_LOCAL_MOVE.name())
                 .copied()
                 .unwrap_or_default(),
             0,

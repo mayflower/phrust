@@ -129,48 +129,165 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static LAYOUT_STATS: RefCell<RuntimeLayoutStats> =
         RefCell::new(RuntimeLayoutStats::default());
-    static LAYOUT_SOURCE_STATS: RefCell<RuntimeLayoutSourceStats> =
-        RefCell::new(RuntimeLayoutSourceStats::default());
-    static LAYOUT_SOURCE_STACK: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static LAYOUT_SOURCE_COUNTS: RefCell<RuntimeLayoutSourceCounts> =
+        const { RefCell::new(RuntimeLayoutSourceCounts::new()) };
+    static LAYOUT_SOURCE_STACK: RefCell<Vec<LayoutSourceFamily>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-const UNATTRIBUTED_SOURCE_FAMILY: &str = "unattributed";
+/// Fixed-array per-family counters. Hot recorders only ever index these
+/// arrays; the string-keyed export view is built once in
+/// [`take_layout_source_stats`].
+#[derive(Clone, Copy, Debug)]
+struct RuntimeLayoutSourceCounts {
+    value_clones: [u64; LAYOUT_SOURCE_FAMILY_COUNT],
+    array_handle_clones: [u64; LAYOUT_SOURCE_FAMILY_COUNT],
+    cow_separations: [u64; LAYOUT_SOURCE_FAMILY_COUNT],
+    reference_cell_creations: [u64; LAYOUT_SOURCE_FAMILY_COUNT],
+}
+
+impl RuntimeLayoutSourceCounts {
+    const fn new() -> Self {
+        Self {
+            value_clones: [0; LAYOUT_SOURCE_FAMILY_COUNT],
+            array_handle_clones: [0; LAYOUT_SOURCE_FAMILY_COUNT],
+            cow_separations: [0; LAYOUT_SOURCE_FAMILY_COUNT],
+            reference_cell_creations: [0; LAYOUT_SOURCE_FAMILY_COUNT],
+        }
+    }
+}
+
+fn family_map(counts: &[u64; LAYOUT_SOURCE_FAMILY_COUNT]) -> BTreeMap<String, u64> {
+    LayoutSourceFamily::ALL
+        .iter()
+        .filter(|family| counts[**family as usize] != 0)
+        .map(|family| (family.name().to_owned(), counts[*family as usize]))
+        .collect()
+}
+
+/// Fixed-ID clone/COW source families. Hot recorders index fixed arrays by
+/// this id: no string hashing, map updates, or allocation happens per event.
+/// Names are attached only at export time and keep the public JSON labels.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayoutSourceFamily {
+    Unattributed = 0,
+    ArgumentBinding,
+    ArrayBuiltinOutputMaterialization,
+    ArrayElementRead,
+    ArrayElementWrite,
+    BuiltinArgumentMaterialization,
+    BuiltinBody,
+    ByRefArgumentBinding,
+    CallArgumentSnapshot,
+    ClosureCaptureBinding,
+    CowSeparationContents,
+    ForeachValue,
+    ObjectPropertyRead,
+    OutputStringConversion,
+    ReferenceDereference,
+    ReturnReferenceBinding,
+    ReturnValue,
+    StackRegisterLocalMove,
+}
+
+/// Number of source families, sizing the fixed per-event counter arrays.
+pub const LAYOUT_SOURCE_FAMILY_COUNT: usize = 18;
+
+impl LayoutSourceFamily {
+    /// Stable JSON label for this family.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::ArgumentBinding => "argument_binding",
+            Self::ArrayBuiltinOutputMaterialization => "array_builtin_output_materialization",
+            Self::ArrayElementRead => "array_element_read",
+            Self::ArrayElementWrite => "array_element_write",
+            Self::BuiltinArgumentMaterialization => "builtin_argument_materialization",
+            Self::BuiltinBody => "builtin_body",
+            Self::ByRefArgumentBinding => "by_ref_argument_binding",
+            Self::CallArgumentSnapshot => "call_argument_snapshot",
+            Self::ClosureCaptureBinding => "closure_capture_binding",
+            Self::CowSeparationContents => "cow_separation_contents",
+            Self::ForeachValue => "foreach_value",
+            Self::ObjectPropertyRead => "object_property_read",
+            Self::OutputStringConversion => "output_string_conversion",
+            Self::ReferenceDereference => "reference_dereference",
+            Self::ReturnReferenceBinding => "return_reference_binding",
+            Self::ReturnValue => "return_value",
+            Self::StackRegisterLocalMove => "stack_register_local_move",
+        }
+    }
+
+    const ALL: [Self; LAYOUT_SOURCE_FAMILY_COUNT] = [
+        Self::Unattributed,
+        Self::ArgumentBinding,
+        Self::ArrayBuiltinOutputMaterialization,
+        Self::ArrayElementRead,
+        Self::ArrayElementWrite,
+        Self::BuiltinArgumentMaterialization,
+        Self::BuiltinBody,
+        Self::ByRefArgumentBinding,
+        Self::CallArgumentSnapshot,
+        Self::ClosureCaptureBinding,
+        Self::CowSeparationContents,
+        Self::ForeachValue,
+        Self::ObjectPropertyRead,
+        Self::OutputStringConversion,
+        Self::ReferenceDereference,
+        Self::ReturnReferenceBinding,
+        Self::ReturnValue,
+        Self::StackRegisterLocalMove,
+    ];
+}
 
 /// Value copied while reading an array element or equivalent array storage.
-pub const SOURCE_ARRAY_ELEMENT_READ: &str = "array_element_read";
+pub const SOURCE_ARRAY_ELEMENT_READ: LayoutSourceFamily = LayoutSourceFamily::ArrayElementRead;
 /// Value copied while writing an array element or equivalent array storage.
-pub const SOURCE_ARRAY_ELEMENT_WRITE: &str = "array_element_write";
+pub const SOURCE_ARRAY_ELEMENT_WRITE: LayoutSourceFamily = LayoutSourceFamily::ArrayElementWrite;
 /// Value copied while materializing output from generic array builtins.
-pub const SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION: &str =
-    "array_builtin_output_materialization";
+pub const SOURCE_ARRAY_BUILTIN_OUTPUT_MATERIALIZATION: LayoutSourceFamily =
+    LayoutSourceFamily::ArrayBuiltinOutputMaterialization;
 /// Value copied while binding by-reference storage.
-pub const SOURCE_BY_REF_ARGUMENT_BINDING: &str = "by_ref_argument_binding";
+pub const SOURCE_BY_REF_ARGUMENT_BINDING: LayoutSourceFamily =
+    LayoutSourceFamily::ByRefArgumentBinding;
 /// Value copied while taking a callable argument snapshot.
-pub const SOURCE_CALL_ARGUMENT_SNAPSHOT: &str = "call_argument_snapshot";
+pub const SOURCE_CALL_ARGUMENT_SNAPSHOT: LayoutSourceFamily =
+    LayoutSourceFamily::CallArgumentSnapshot;
 /// Value copied while binding a closure capture.
-pub const SOURCE_CLOSURE_CAPTURE_BINDING: &str = "closure_capture_binding";
+pub const SOURCE_CLOSURE_CAPTURE_BINDING: LayoutSourceFamily =
+    LayoutSourceFamily::ClosureCaptureBinding;
 /// Value copied while a shared array storage separates for a write (element
 /// deep-copy performed by `Rc::make_mut` inside `storage_mut_for`).
-pub const SOURCE_COW_SEPARATION_CONTENTS: &str = "cow_separation_contents";
+pub const SOURCE_COW_SEPARATION_CONTENTS: LayoutSourceFamily =
+    LayoutSourceFamily::CowSeparationContents;
 /// Value copied inside a runtime builtin body (registry-dispatched builtins
 /// whose internal copies have no more specific attribution).
-pub const SOURCE_BUILTIN_BODY: &str = "builtin_body";
+pub const SOURCE_BUILTIN_BODY: LayoutSourceFamily = LayoutSourceFamily::BuiltinBody;
 /// Value copied while binding call arguments into frame locals/parameters.
-pub const SOURCE_ARGUMENT_BINDING: &str = "argument_binding";
+pub const SOURCE_ARGUMENT_BINDING: LayoutSourceFamily = LayoutSourceFamily::ArgumentBinding;
 /// Value copied while materializing arguments for builtin parameter handling.
-pub const SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION: &str = "builtin_argument_materialization";
+pub const SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION: LayoutSourceFamily =
+    LayoutSourceFamily::BuiltinArgumentMaterialization;
 /// Value copied while materializing foreach-style iteration output.
-pub const SOURCE_FOREACH_VALUE: &str = "foreach_value";
+pub const SOURCE_FOREACH_VALUE: LayoutSourceFamily = LayoutSourceFamily::ForeachValue;
 /// Value copied while reading object property storage.
-pub const SOURCE_OBJECT_PROPERTY_READ: &str = "object_property_read";
+pub const SOURCE_OBJECT_PROPERTY_READ: LayoutSourceFamily = LayoutSourceFamily::ObjectPropertyRead;
 /// Value copied while converting output to string storage.
-pub const SOURCE_OUTPUT_STRING_CONVERSION: &str = "output_string_conversion";
+pub const SOURCE_OUTPUT_STRING_CONVERSION: LayoutSourceFamily =
+    LayoutSourceFamily::OutputStringConversion;
 /// Value copied while dereferencing a PHP reference cell.
-pub const SOURCE_REFERENCE_DEREFERENCE: &str = "reference_dereference";
+pub const SOURCE_REFERENCE_DEREFERENCE: LayoutSourceFamily =
+    LayoutSourceFamily::ReferenceDereference;
+/// Value copied while binding a returned reference.
+pub const SOURCE_RETURN_REFERENCE_BINDING: LayoutSourceFamily =
+    LayoutSourceFamily::ReturnReferenceBinding;
 /// Value copied while materializing a return value.
-pub const SOURCE_RETURN_VALUE: &str = "return_value";
+pub const SOURCE_RETURN_VALUE: LayoutSourceFamily = LayoutSourceFamily::ReturnValue;
 /// Value copied between stack/register/local storage.
-pub const SOURCE_STACK_REGISTER_LOCAL_MOVE: &str = "stack_register_local_move";
+pub const SOURCE_STACK_REGISTER_LOCAL_MOVE: LayoutSourceFamily =
+    LayoutSourceFamily::StackRegisterLocalMove;
 
 /// Returns true when layout/allocation stats recording is enabled.
 #[inline(always)]
@@ -228,7 +345,7 @@ macro_rules! layout_recorder {
 
 /// Enters a source family for subsequent layout events in this thread.
 #[must_use]
-pub fn enter_layout_source_family(family: &'static str) -> LayoutSourceGuard {
+pub fn enter_layout_source_family(family: LayoutSourceFamily) -> LayoutSourceGuard {
     if !source_attribution_enabled() {
         return LayoutSourceGuard { active: false };
     }
@@ -238,7 +355,7 @@ pub fn enter_layout_source_family(family: &'static str) -> LayoutSourceGuard {
 
 /// Enters a source family only when no more specific source is active.
 #[must_use]
-pub fn enter_default_layout_source_family(family: &'static str) -> LayoutSourceGuard {
+pub fn enter_default_layout_source_family(family: LayoutSourceFamily) -> LayoutSourceGuard {
     if !source_attribution_enabled() {
         return LayoutSourceGuard { active: false };
     }
@@ -263,13 +380,13 @@ impl Drop for LayoutSourceGuard {
     }
 }
 
-fn current_source_family() -> &'static str {
+fn current_source_family() -> LayoutSourceFamily {
     LAYOUT_SOURCE_STACK.with(|stack| {
         stack
             .borrow()
             .last()
             .copied()
-            .unwrap_or(UNATTRIBUTED_SOURCE_FAMILY)
+            .unwrap_or(LayoutSourceFamily::Unattributed)
     })
 }
 
@@ -278,12 +395,8 @@ fn record_value_clone_source() {
         return;
     }
     let family = current_source_family();
-    LAYOUT_SOURCE_STATS.with(|stats| {
-        *stats
-            .borrow_mut()
-            .value_clone_by_family
-            .entry(family)
-            .or_default() += 1;
+    LAYOUT_SOURCE_COUNTS.with(|counts| {
+        counts.borrow_mut().value_clones[family as usize] += 1;
     });
 }
 
@@ -292,12 +405,8 @@ fn record_array_handle_clone_source() {
         return;
     }
     let family = current_source_family();
-    LAYOUT_SOURCE_STATS.with(|stats| {
-        *stats
-            .borrow_mut()
-            .array_handle_clone_by_family
-            .entry(family)
-            .or_default() += 1;
+    LAYOUT_SOURCE_COUNTS.with(|counts| {
+        counts.borrow_mut().array_handle_clones[family as usize] += 1;
     });
 }
 
@@ -306,12 +415,8 @@ fn record_cow_separation_source() {
         return;
     }
     let family = current_source_family();
-    LAYOUT_SOURCE_STATS.with(|stats| {
-        *stats
-            .borrow_mut()
-            .cow_separation_by_family
-            .entry(family)
-            .or_default() += 1;
+    LAYOUT_SOURCE_COUNTS.with(|counts| {
+        counts.borrow_mut().cow_separations[family as usize] += 1;
     });
 }
 
@@ -320,12 +425,8 @@ fn record_reference_cell_creation_source() {
         return;
     }
     let family = current_source_family();
-    LAYOUT_SOURCE_STATS.with(|stats| {
-        *stats
-            .borrow_mut()
-            .reference_cell_creation_by_family
-            .entry(family)
-            .or_default() += 1;
+    LAYOUT_SOURCE_COUNTS.with(|counts| {
+        counts.borrow_mut().reference_cell_creations[family as usize] += 1;
     });
 }
 
@@ -571,7 +672,7 @@ fn record_packed_to_mixed_slow(reason: PackedToMixedReason) {
 pub fn reset_layout_stats() {
     enable_stats();
     LAYOUT_STATS.with(|stats| *stats.borrow_mut() = RuntimeLayoutStats::default());
-    LAYOUT_SOURCE_STATS.with(|stats| *stats.borrow_mut() = RuntimeLayoutSourceStats::default());
+    LAYOUT_SOURCE_COUNTS.with(|counts| *counts.borrow_mut() = RuntimeLayoutSourceCounts::new());
     LAYOUT_SOURCE_STACK.with(|stack| stack.borrow_mut().clear());
 }
 
@@ -592,7 +693,15 @@ pub fn take_layout_stats() -> RuntimeLayoutStats {
 pub fn take_layout_source_stats() -> RuntimeLayoutSourceStats {
     disable_stats();
     disable_layout_source_attribution();
-    LAYOUT_SOURCE_STATS.with(|stats| std::mem::take(&mut *stats.borrow_mut()))
+    LAYOUT_SOURCE_COUNTS.with(|counts| {
+        let taken = std::mem::replace(&mut *counts.borrow_mut(), RuntimeLayoutSourceCounts::new());
+        RuntimeLayoutSourceStats {
+            value_clone_by_family: family_map(&taken.value_clones),
+            array_handle_clone_by_family: family_map(&taken.array_handle_clones),
+            cow_separation_by_family: family_map(&taken.cow_separations),
+            reference_cell_creation_by_family: family_map(&taken.reference_cell_creations),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -608,16 +717,20 @@ mod tests {
         let _string_clone = string.clone();
         let array = PhpArray::from_packed(vec![Value::Int(1), Value::Int(2)]);
         {
-            let _source = layout_stats::enter_layout_source_family("test_array");
+            let _source =
+                layout_stats::enter_layout_source_family(layout_stats::SOURCE_ARRAY_ELEMENT_READ);
             let mut array_clone = array.clone();
             array_clone.append(Value::Int(3));
         }
         {
-            let _source = layout_stats::enter_layout_source_family("test_reference");
+            let _source = layout_stats::enter_layout_source_family(
+                layout_stats::SOURCE_BY_REF_ARGUMENT_BINDING,
+            );
             let _cell = ReferenceCell::new(Value::String(string));
         }
         {
-            let _source = layout_stats::enter_layout_source_family("test_value");
+            let _source =
+                layout_stats::enter_layout_source_family(layout_stats::SOURCE_RETURN_VALUE);
             let _value_clone = Value::Array(array).clone();
         }
 
@@ -632,7 +745,7 @@ mod tests {
         assert!(
             source_stats
                 .value_clone_by_family
-                .get("test_value")
+                .get("return_value")
                 .copied()
                 .unwrap_or_default()
                 >= 1,
@@ -641,7 +754,7 @@ mod tests {
         assert!(
             source_stats
                 .array_handle_clone_by_family
-                .get("test_array")
+                .get("array_element_read")
                 .copied()
                 .unwrap_or_default()
                 >= 1,
@@ -650,7 +763,7 @@ mod tests {
         assert_eq!(
             source_stats
                 .reference_cell_creation_by_family
-                .get("test_reference"),
+                .get("by_ref_argument_binding"),
             Some(&1)
         );
     }
@@ -692,12 +805,36 @@ mod tests {
     }
 
     #[test]
+    fn hot_source_recorders_do_no_string_or_map_work() {
+        // The per-event recorders must stay allocation-free: fixed-array
+        // indexing only. String labels and maps are export-time concerns.
+        let source = include_str!("layout_stats.rs");
+        for recorder in [
+            "fn record_value_clone_source()",
+            "fn record_array_handle_clone_source()",
+            "fn record_cow_separation_source()",
+            "fn record_reference_cell_creation_source()",
+        ] {
+            let start = source.find(recorder).expect("recorder exists");
+            let body_end = source[start..].find("\n}").expect("recorder body end");
+            let body = &source[start..start + body_end];
+            for forbidden in ["to_owned", "to_string", "format!", "BTreeMap", "HashMap"] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{recorder} performs `{forbidden}` on the hot recording path"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn source_attribution_stays_off_when_only_counters_are_enabled() {
         layout_stats::reset_layout_stats();
 
         {
             // Guard is inert without the explicit attribution opt-in.
-            let _source = layout_stats::enter_layout_source_family("test_value");
+            let _source =
+                layout_stats::enter_layout_source_family(layout_stats::SOURCE_RETURN_VALUE);
             let _value_clone = Value::Array(PhpArray::new()).clone();
         }
 
@@ -715,12 +852,13 @@ mod tests {
         layout_stats::reset_layout_stats();
         layout_stats::enable_layout_source_attribution();
         {
-            let _source = layout_stats::enter_layout_source_family("test_value");
+            let _source =
+                layout_stats::enter_layout_source_family(layout_stats::SOURCE_RETURN_VALUE);
             let _value_clone = Value::Int(1).clone();
         }
         let source_stats = layout_stats::take_layout_source_stats();
         assert_eq!(
-            source_stats.value_clone_by_family.get("test_value"),
+            source_stats.value_clone_by_family.get("return_value"),
             Some(&1)
         );
 
@@ -749,13 +887,13 @@ mod tests {
         assert_eq!(
             source_stats
                 .value_clone_by_family
-                .get(layout_stats::SOURCE_REFERENCE_DEREFERENCE),
+                .get(layout_stats::SOURCE_REFERENCE_DEREFERENCE.name()),
             Some(&1)
         );
         assert!(
             source_stats
                 .value_clone_by_family
-                .get(layout_stats::SOURCE_STACK_REGISTER_LOCAL_MOVE)
+                .get(layout_stats::SOURCE_STACK_REGISTER_LOCAL_MOVE.name())
                 .copied()
                 .unwrap_or_default()
                 >= 1,
@@ -764,7 +902,7 @@ mod tests {
         assert!(
             source_stats
                 .array_handle_clone_by_family
-                .get(layout_stats::SOURCE_STACK_REGISTER_LOCAL_MOVE)
+                .get(layout_stats::SOURCE_STACK_REGISTER_LOCAL_MOVE.name())
                 .copied()
                 .unwrap_or_default()
                 >= 1,
@@ -773,13 +911,13 @@ mod tests {
         assert_eq!(
             source_stats
                 .value_clone_by_family
-                .get(layout_stats::SOURCE_FOREACH_VALUE),
+                .get(layout_stats::SOURCE_FOREACH_VALUE.name()),
             Some(&1)
         );
         assert_eq!(
             source_stats
                 .array_handle_clone_by_family
-                .get(layout_stats::SOURCE_FOREACH_VALUE),
+                .get(layout_stats::SOURCE_FOREACH_VALUE.name()),
             Some(&1)
         );
         assert!(

@@ -919,6 +919,7 @@ mod tests {
         );
 
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
         let validated = ArgumentValidator::new(CoercionMode::Strict)
             .validate(
                 &info,
@@ -955,6 +956,7 @@ mod tests {
         let argument = Value::Array(items);
 
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
         let validated = ArgumentValidator::new(CoercionMode::Strict)
             .validate(&info, std::slice::from_ref(&argument), span())
             .expect("array argument validates");
@@ -967,14 +969,14 @@ mod tests {
         assert_eq!(
             source_stats
                 .value_clone_by_family
-                .get(layout_stats::SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION),
+                .get(layout_stats::SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION.name()),
             Some(&1),
             "{source_stats:?}"
         );
         assert_eq!(
             source_stats
                 .array_handle_clone_by_family
-                .get(layout_stats::SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION),
+                .get(layout_stats::SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION.name()),
             Some(&1),
             "{source_stats:?}"
         );
