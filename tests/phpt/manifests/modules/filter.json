@@ -4,12 +4,12 @@
   "priority": "Validation and sanitization MVP",
   "selected_manifest": "tests/phpt/manifests/modules/filter.selected.jsonl",
   "corpus_count": 114,
-  "selected_count": 59,
-  "pass_count": 59,
+  "selected_count": 60,
+  "pass_count": 60,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 58,
+  "known_failure_count": 57,
   "scope": [
     "WordPress-relevant scalar validation and sanitization",
     "Common filter metadata and array helper paths",
@@ -27,6 +27,7 @@
     "FILTER_UNSAFE_RAW ampersand, low-byte, and high-byte entity encoding",
     "FILTER_SANITIZE_ENCODED percent encoding with PHP safe byte preservation",
     "FILTER_SANITIZE_ADD_SLASHES quote, backslash, and NUL escaping",
+    "FILTER_FLAG_STRIP_BACKTICK handling for FILTER_UNSAFE_RAW",
     "FILTER_FLAG_STRIP_HIGH handling for ASCII DEL in raw, encoded, string, and special-char sanitizers",
     "FILTER_VALIDATE_FLOAT custom decimal option and invalid decimal ValueError",
     "filter_var_array encoded sanitizer and scalar/array shape interactions",
@@ -35,7 +36,7 @@
     "E_DEPRECATED-masked filter.default startup diagnostic suppression"
   ],
   "non_scope": [
-    "Remaining 58 ext/filter upstream rows",
+    "Remaining 57 ext/filter upstream rows",
     "Full PHP filter option matrix",
     "VM-dispatched user callback and closure filter execution",
     "Remaining exact filter flag behavior matrix and warning/deprecation text"

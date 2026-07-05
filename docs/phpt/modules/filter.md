@@ -2,14 +2,14 @@
 
 - Strategy: validation and sanitization MVP
 - Selected manifest: `tests/phpt/manifests/modules/filter.selected.jsonl`
-- Selected close gate: 59 PASS, 0 SKIP, 0 FAIL, 0 BORK from 59 selected fixtures
-- Upstream corpus snapshot before the selected gate: 56 PASS, 3 XFAIL, 55 FAIL,
+- Selected close gate: 60 PASS, 0 SKIP, 0 FAIL, 0 BORK from 60 selected fixtures
+- Upstream corpus snapshot before the selected gate: 57 PASS, 3 XFAIL, 54 FAIL,
   0 BORK from 114 corpus candidates
 - Selected fixtures:
   - `tests/phpt/generated/filter/basic.phpt`
   - `tests/phpt/generated/filter/arrays.phpt`
   - `tests/phpt/generated/filter/options-callback.phpt`
-  - 56 target-green upstream rows from `ext/filter/tests`
+  - 57 target-green upstream rows from `ext/filter/tests`
 
 ## Implemented Surface
 
@@ -51,6 +51,8 @@ the PHP-compatible `ValueError` for multi-character decimal separators.
 `FILTER_FLAG_ENCODE_HIGH` with PHP-style decimal entities. High-byte handling
 uses PHP's `0x7f` threshold, so `FILTER_FLAG_STRIP_HIGH` removes ASCII DEL in
 the promoted raw, encoded, string, and special-character sanitizer paths.
+`FILTER_FLAG_STRIP_BACKTICK` removes backticks from `FILTER_UNSAFE_RAW`
+independently of the low/high strip flags.
 `FILTER_SANITIZE_ENCODED` percent-encodes non-safe bytes using PHP's promoted
 safe byte set, preserving ASCII alphanumerics plus `-`, `_`, and `.`.
 `FILTER_SANITIZE_ADD_SLASHES` covers quote, backslash, and NUL escaping.
@@ -89,7 +91,7 @@ callbacks, throw-on-failure mode, remaining exact warning/deprecation text,
 remaining legacy string sanitizer deprecation output, and locale-specific
 numeric parsing remain out of scope.
 
-The full upstream target sweep measured 56 PASS, 3 XFAIL, and 55 FAIL from 114
+The full upstream target sweep measured 57 PASS, 3 XFAIL, and 54 FAIL from 114
 `ext/filter/tests` rows. The remaining unpromoted rows are dominated by
 stricter PHP URL/email/IP quirks, remaining filter flag behavior, callback
 dispatch, deeper request/superglobal edge cases, array-to-string conversion behavior,

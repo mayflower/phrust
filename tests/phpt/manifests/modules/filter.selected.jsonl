@@ -47,6 +47,7 @@
 {"path":"ext/filter/tests/bug55478.phpt"}
 {"path":"ext/filter/tests/bug64441.phpt"}
 {"path":"ext/filter/tests/bug67167.01.phpt"}
+{"path":"ext/filter/tests/bug69202.phpt"}
 {"path":"ext/filter/tests/bug76366.phpt"}
 {"path":"ext/filter/tests/bug7715.phpt"}
 {"path":"ext/filter/tests/bug7733.phpt"}

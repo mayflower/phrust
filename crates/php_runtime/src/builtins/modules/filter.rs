@@ -72,6 +72,7 @@ const FILTER_FLAG_ENCODE_LOW: i64 = 16;
 const FILTER_FLAG_ENCODE_HIGH: i64 = 32;
 const FILTER_FLAG_ENCODE_AMP: i64 = 64;
 const FILTER_FLAG_NO_ENCODE_QUOTES: i64 = 128;
+const FILTER_FLAG_STRIP_BACKTICK: i64 = 512;
 const FILTER_FLAG_ALLOW_FRACTION: i64 = 4_096;
 const FILTER_FLAG_ALLOW_THOUSAND: i64 = 8_192;
 const FILTER_FLAG_ALLOW_SCIENTIFIC: i64 = 16_384;
@@ -844,12 +845,14 @@ fn unsafe_raw(name: &str, value: &Value, flags: i64) -> BuiltinResult {
         | FILTER_FLAG_STRIP_HIGH
         | FILTER_FLAG_ENCODE_LOW
         | FILTER_FLAG_ENCODE_HIGH
-        | FILTER_FLAG_ENCODE_AMP;
+        | FILTER_FLAG_ENCODE_AMP
+        | FILTER_FLAG_STRIP_BACKTICK;
     if flags & relevant_flags == 0 {
         return Ok(Value::String(input));
     }
     let strip_low = flags & FILTER_FLAG_STRIP_LOW != 0;
     let strip_high = flags & FILTER_FLAG_STRIP_HIGH != 0;
+    let strip_backtick = flags & FILTER_FLAG_STRIP_BACKTICK != 0;
     let encoded = encode_filter_entities(input.as_bytes(), |byte| {
         (flags & FILTER_FLAG_ENCODE_AMP != 0 && byte == b'&')
             || (flags & FILTER_FLAG_ENCODE_LOW != 0 && is_filter_low(byte))
@@ -859,7 +862,9 @@ fn unsafe_raw(name: &str, value: &Value, flags: i64) -> BuiltinResult {
         encoded
             .into_iter()
             .filter(|byte| {
-                !(strip_low && is_filter_low(*byte)) && !(strip_high && is_filter_high(*byte))
+                !(strip_low && is_filter_low(*byte))
+                    && !(strip_high && is_filter_high(*byte))
+                    && !(strip_backtick && *byte == b'`')
             })
             .collect::<Vec<_>>(),
     ))
@@ -1594,6 +1599,43 @@ mod tests {
                 ],
             ),
             string("")
+        );
+    }
+
+    #[test]
+    fn unsafe_raw_strips_backticks_independently() {
+        assert_eq!(
+            call(
+                "filter_var",
+                vec![
+                    string("``a`b`c``"),
+                    Value::Int(FILTER_UNSAFE_RAW),
+                    Value::Int(FILTER_FLAG_STRIP_BACKTICK),
+                ],
+            ),
+            string("abc")
+        );
+        assert_eq!(
+            call(
+                "filter_var",
+                vec![
+                    string("``a`b`c``"),
+                    Value::Int(FILTER_UNSAFE_RAW),
+                    Value::Int(FILTER_FLAG_STRIP_LOW | FILTER_FLAG_STRIP_BACKTICK),
+                ],
+            ),
+            string("abc")
+        );
+        assert_eq!(
+            call(
+                "filter_var",
+                vec![
+                    string("``a`b`c``"),
+                    Value::Int(FILTER_UNSAFE_RAW),
+                    Value::Int(FILTER_FLAG_STRIP_LOW | FILTER_FLAG_STRIP_HIGH),
+                ],
+            ),
+            string("``a`b`c``")
         );
     }
 
