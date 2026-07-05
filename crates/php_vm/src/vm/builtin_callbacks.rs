@@ -24,6 +24,7 @@ impl Vm {
                 builtin_source_span(compiled, call_span),
             );
         };
+        let original_first = first.clone();
         let mut transform_state = JsonSerializableEncodeState::default();
         let transformed = match self.prepare_json_serializable_value(
             first,
@@ -54,6 +55,7 @@ impl Vm {
             result.return_value = Some(Value::Bool(false));
             state.json_last_error = php_runtime::JSON_ERROR_RECURSION;
         }
+        release_unrooted_object_handles(&original_first, stack, state);
         result
     }
 
@@ -289,22 +291,27 @@ impl Vm {
         Some(callback_result)
     }
 
-    pub(super) fn prepare_var_dump_values(
+    pub(super) fn prepare_debug_output_values(
         &self,
+        builtin: &str,
         values: Vec<Value>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
         compiled: &CompiledUnit,
     ) -> Result<Vec<Value>, VmResult> {
+        let kind = DebugOutputBuiltin::from_name(builtin);
         values
             .into_iter()
-            .map(|value| self.prepare_var_dump_value(value, output, stack, state, compiled))
+            .map(|value| {
+                self.prepare_debug_output_value(kind, value, output, stack, state, compiled)
+            })
             .collect()
     }
 
-    fn prepare_var_dump_value(
+    fn prepare_debug_output_value(
         &self,
+        kind: DebugOutputBuiltin,
         value: Value,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
@@ -313,13 +320,13 @@ impl Vm {
     ) -> Result<Value, VmResult> {
         match value {
             Value::Object(object) => self
-                .debug_info_object_value(&object, output, stack, state, compiled)
+                .debug_info_object_value(kind, &object, output, stack, state, compiled)
                 .map(|debug_value| debug_value.unwrap_or(Value::Object(object))),
             Value::Reference(cell) => {
                 let Value::Object(object) = cell.get() else {
                     return Ok(Value::Reference(cell));
                 };
-                self.debug_info_object_value(&object, output, stack, state, compiled)
+                self.debug_info_object_value(kind, &object, output, stack, state, compiled)
                     .map(|debug_value| {
                         debug_value
                             .map(|value| Value::Reference(ReferenceCell::new(value)))
@@ -332,6 +339,7 @@ impl Vm {
 
     fn debug_info_object_value(
         &self,
+        kind: DebugOutputBuiltin,
         object: &ObjectRef,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
@@ -339,7 +347,7 @@ impl Vm {
         compiled: &CompiledUnit,
     ) -> Result<Option<Value>, VmResult> {
         let Some(return_value) =
-            self.call_debug_info_method(compiled, object, output, stack, state)?
+            self.call_debug_info_method(kind, compiled, object, output, stack, state)?
         else {
             return Ok(spl_internal_debug_info_object(object).map(Value::Object));
         };
@@ -359,6 +367,7 @@ impl Vm {
 
     fn call_debug_info_method(
         &self,
+        kind: DebugOutputBuiltin,
         compiled: &CompiledUnit,
         object: &ObjectRef,
         output: &mut OutputBuffer,
@@ -388,22 +397,15 @@ impl Vm {
         let guard = MagicMethodCall {
             receiver: format!("object:{}", object.id()),
             magic_method: normalize_method_name("__debugInfo"),
-            called_method: normalize_method_name("var_dump"),
+            called_method: normalize_method_name(kind.name()),
         };
         if state
             .magic_method_stack
             .iter()
             .any(|active| active == &guard)
         {
-            return Err(self.runtime_error(
-                output,
-                compiled,
-                stack,
-                format!(
-                    "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive __debugInfo for {}::var_dump",
-                    object.class_name()
-                ),
-            ));
+            kind.write_recursion(output);
+            return Err(VmResult::success(output.clone(), Some(Value::Null)));
         }
         state.magic_method_stack.push(guard);
         let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
@@ -884,6 +886,35 @@ struct JsonSerializableEncodeState {
     active_arrays: Vec<usize>,
     active_objects: Vec<u64>,
     recursion_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebugOutputBuiltin {
+    VarDump,
+    PrintR,
+}
+
+impl DebugOutputBuiltin {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "print_r" => Self::PrintR,
+            _ => Self::VarDump,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::VarDump => "var_dump",
+            Self::PrintR => "print_r",
+        }
+    }
+
+    fn write_recursion(self, output: &mut OutputBuffer) {
+        match self {
+            Self::VarDump => output.write_test_str("*RECURSION*\n"),
+            Self::PrintR => output.write_test_str("*RECURSION*"),
+        }
+    }
 }
 
 fn json_encode_flags(values: &[Value]) -> i64 {

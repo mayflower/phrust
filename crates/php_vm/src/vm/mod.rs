@@ -76828,6 +76828,60 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
     }
 
     #[test]
+    fn json_encode_jsonserializable_debug_info_recursion_matches_php() {
+        let result = execute_source(
+            "<?php
+            class SerializingTest implements JsonSerializable {
+                public $a = 1;
+                public function __debugInfo() {
+                    return [ 'result' => json_encode($this) ];
+                }
+                public function jsonSerialize(): mixed {
+                    var_dump($this);
+                    return $this;
+                }
+            }
+            var_dump(json_encode(new SerializingTest()));
+            echo \"---------\n\";
+            var_dump(new SerializingTest());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"object(SerializingTest)#1 (1) {\n  [\"result\"]=>\n  bool(false)\n}\nstring(7) \"{\"a\":1}\"\n---------\n*RECURSION*\nobject(SerializingTest)#1 (1) {\n  [\"result\"]=>\n  string(7) \"{\"a\":1}\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn print_r_uses_debug_info_for_jsonserializable_callbacks() {
+        let result = execute_source(
+            "<?php
+            class SerializingTest implements JsonSerializable {
+                public $a = 1;
+                public function __debugInfo() {
+                    return [ 'result' => $this->a ];
+                }
+                public function jsonSerialize(): mixed {
+                    print_r($this);
+                    return $this;
+                }
+            }
+            var_dump(json_encode(new SerializingTest()));
+            echo \"---------\n\";
+            var_dump(new SerializingTest());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"SerializingTest Object\n(\n    [result] => 1\n)\nstring(7) \"{\"a\":1}\"\n---------\nobject(SerializingTest)#1 (1) {\n  [\"result\"]=>\n  int(1)\n}\n"
+        );
+    }
+
+    #[test]
     fn generated_arginfo_deprecations_respect_error_reporting() {
         let result = execute_source(
             "<?php

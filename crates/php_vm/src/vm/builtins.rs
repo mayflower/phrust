@@ -54,8 +54,8 @@ impl Vm {
             Ok(values) => values,
             Err(result) => return result,
         };
-        let values = if name == "var_dump" {
-            match self.prepare_var_dump_values(values, output, stack, state, compiled) {
+        let values = if matches!(name, "var_dump" | "print_r") {
+            match self.prepare_debug_output_values(name, values, output, stack, state, compiled) {
                 Ok(values) => values,
                 Err(result) => return result,
             }

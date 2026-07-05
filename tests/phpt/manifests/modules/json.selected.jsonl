@@ -68,6 +68,9 @@
 {"path":"ext/json/tests/json_encode_pretty_print2.phpt"}
 {"path":"ext/json/tests/json_encode_recursion_01.phpt"}
 {"path":"ext/json/tests/json_encode_recursion_02.phpt"}
+{"path":"ext/json/tests/json_encode_recursion_03.phpt"}
+{"path":"ext/json/tests/json_encode_recursion_04.phpt"}
+{"path":"ext/json/tests/json_encode_recursion_05.phpt"}
 {"path":"ext/json/tests/json_encode_recursion_06.phpt"}
 {"path":"ext/json/tests/json_encode_u2028_u2029.phpt"}
 {"path":"ext/json/tests/json_encode_unescaped_slashes.phpt"}
