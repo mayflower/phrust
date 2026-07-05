@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/imagick/backend-gate.phpt","module":"imagick","kind":"contract","generated_timestamp":"20260705T000000Z","generator_version":"manual-extension-pack","reason":"covers PECL Imagick extension/class metadata and deterministic fail-closed ImageMagick backend gate before image operations are wired"}

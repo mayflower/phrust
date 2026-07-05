@@ -15110,6 +15110,23 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_imagick_runtime_class(&class_name) {
+                            let object = match new_imagick_object(&class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if is_pdo_runtime_class(&class_name) {
                             let object = match new_pdo_object(
                                 &class_name,
@@ -16010,6 +16027,31 @@ impl Vm {
                                     }
                                 };
                             let object = match new_memcached_object(class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_imagick_runtime_class(class_name) {
+                            let values =
+                                match read_call_args_at_frame(unit, stack, frame_index, args) {
+                                    Ok(values) => values,
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
+                            let object = match new_imagick_object(class_name, values) {
                                 Ok(object) => object,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -25354,6 +25396,23 @@ impl Vm {
                         }
                         if is_memcached_runtime_class(&object.class_name()) {
                             let value = match call_memcached_method(&object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_imagick_runtime_class(&object.class_name()) {
+                            let value = match call_imagick_method(&object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -44548,6 +44607,16 @@ fn internal_class_methods(class_name: &str) -> Vec<InternalClassMethod> {
                 }),
         );
     }
+    if normalize_class_name(class_name) == "imagick" {
+        methods.extend(
+            IMAGICK_INSTANCE_METHODS
+                .iter()
+                .map(|name| InternalClassMethod {
+                    name,
+                    is_static: false,
+                }),
+        );
+    }
     methods
 }
 
@@ -44662,6 +44731,22 @@ const MEMCACHED_INSTANCE_METHODS: &[&str] = &[
     "cas",
     "getStats",
     "getVersion",
+];
+
+const IMAGICK_INSTANCE_METHODS: &[&str] = &[
+    "__construct",
+    "readImage",
+    "writeImage",
+    "resizeImage",
+    "cropImage",
+    "thumbnailImage",
+    "identifyImage",
+    "getImageWidth",
+    "getImageHeight",
+    "getImageFormat",
+    "setImageFormat",
+    "clear",
+    "destroy",
 ];
 
 fn internal_class_has_method(class_name: &str, method_name: &str) -> bool {
@@ -49714,6 +49799,7 @@ pub(crate) fn dense_new_object_lowering_supported(class_name: &str) -> bool {
         || is_spl_heap_runtime_class(class_name)
         || is_spl_file_runtime_class(class_name)
         || is_std_class_runtime_class(class_name)
+        || is_imagick_runtime_class(class_name)
         || is_date_time_runtime_class(class_name))
 }
 
@@ -51068,6 +51154,35 @@ fn redis_get_option(object: &ObjectRef, values: &[Value]) -> Result<Value, Strin
 
 fn is_memcached_runtime_class(class_name: &str) -> bool {
     normalize_class_name(class_name) == "memcached"
+}
+
+fn is_imagick_runtime_class(class_name: &str) -> bool {
+    matches!(
+        normalize_class_name(class_name).as_str(),
+        "imagick" | "imagickdraw" | "imagickpixel" | "imagickpixeliterator"
+    )
+}
+
+fn new_imagick_object(class_name: &str, _args: Vec<CallArgument>) -> Result<ObjectRef, String> {
+    if !is_imagick_runtime_class(class_name) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        ));
+    }
+    Err(format!(
+        "E_PHP_VM_UNSUPPORTED_IMAGICK: class {class_name} requires an ImageMagick backend capability gate"
+    ))
+}
+
+fn call_imagick_method(
+    object: &ObjectRef,
+    method: &str,
+    _args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    Err(format!(
+        "E_PHP_VM_UNSUPPORTED_IMAGICK: method {}::{method} requires an ImageMagick backend capability gate",
+        object.display_name()
+    ))
 }
 
 fn internal_memcached_instanceof(object_class: &str, target_class: &str) -> Option<bool> {
@@ -63970,6 +64085,17 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
         "messagepackunpacker" => Some(internal_empty_class_entry(
             "messagepackunpacker",
             "MessagePackUnpacker",
+        )),
+        "imagick" => Some(internal_empty_class_entry("imagick", "Imagick")),
+        "imagickdraw" => Some(internal_empty_class_entry("imagickdraw", "ImagickDraw")),
+        "imagickpixel" => Some(internal_empty_class_entry("imagickpixel", "ImagickPixel")),
+        "imagickpixeliterator" => Some(internal_empty_class_entry(
+            "imagickpixeliterator",
+            "ImagickPixelIterator",
+        )),
+        "imagickexception" => Some(internal_empty_class_entry(
+            "imagickexception",
+            "ImagickException",
         )),
         "phar" => Some(internal_empty_class_entry("phar", "Phar")),
         "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
@@ -89712,6 +89838,28 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             result.output.as_bytes(),
             b"class|instance|method|0:16|server|1:0|no-add:16|3|3:2:missing|10:7|3x|deleted|miss:16"
         );
+    }
+
+    #[test]
+    fn imagick_surface_fails_closed_without_imagemagick_backend() {
+        let result = execute_source(
+            r#"<?php
+            echo extension_loaded("imagick") ? "loaded|" : "missing|";
+            echo class_exists("Imagick", false) ? "class|" : "no-class|";
+            echo class_exists("ImagickDraw", false) ? "draw|" : "no-draw|";
+            echo method_exists("Imagick", "readImage") ? "method|" : "no-method|";
+            $reflection = new ReflectionClass("Imagick");
+            echo $reflection->getName(), ":", $reflection->getExtensionName(), "|";
+            new Imagick();
+            "#,
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"loaded|class|draw|method|Imagick:imagick|"
+        );
+        assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNSUPPORTED_IMAGICK");
     }
 
     #[test]

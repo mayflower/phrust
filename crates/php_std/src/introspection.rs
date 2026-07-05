@@ -111,6 +111,7 @@ mod tests {
                 "hash",
                 "iconv",
                 "igbinary",
+                "imagick",
                 "imap",
                 "intl",
                 "json",
@@ -159,7 +160,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 62);
+        assert_eq!(array.len(), 63);
     }
 
     #[test]

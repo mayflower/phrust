@@ -385,6 +385,7 @@ impl ExtensionRegistry {
             standard_library_apcu_extension(),
             standard_library_redis_extension(),
             standard_library_memcached_extension(),
+            standard_library_imagick_extension(),
             standard_library_igbinary_extension(),
             standard_library_msgpack_extension(),
             standard_library_opcache_extension(),
@@ -1355,6 +1356,32 @@ mod tests {
                 generated::arginfo::method_metadata("FFI", name).expect("ffi method metadata");
             assert_eq!(method.extension, "ffi");
             assert!(method.is_static);
+        }
+    }
+
+    #[test]
+    fn imagick_extension_tracks_backend_gated_surface_metadata() {
+        let registry = ExtensionRegistry::standard_library();
+
+        let extension = registry.extension("imagick").expect("imagick extension");
+        assert!(extension.enabled_by_default);
+        assert!(extension.functions().is_empty());
+        assert!(extension.constants().is_empty());
+
+        for name in [
+            "Imagick",
+            "ImagickDraw",
+            "ImagickPixel",
+            "ImagickPixelIterator",
+            "ImagickException",
+        ] {
+            let class = registry.enabled_class(name).expect("imagick class");
+            assert_eq!(class.extension, "imagick");
+            assert_eq!(class.kind, ClassKind::Class);
+            assert!(
+                class.source_metadata().is_none(),
+                "PECL Imagick classes must not pretend to have php-src arginfo"
+            );
         }
     }
 

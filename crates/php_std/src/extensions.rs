@@ -3419,6 +3419,31 @@ pub(super) fn standard_library_memcached_extension() -> ExtensionDescriptor {
         ))
 }
 
+pub(super) fn standard_library_imagick_extension() -> ExtensionDescriptor {
+    ExtensionDescriptor::new("imagick")
+        .with_class(ClassDescriptor::new("Imagick", "imagick", ClassKind::Class))
+        .with_class(ClassDescriptor::new(
+            "ImagickDraw",
+            "imagick",
+            ClassKind::Class,
+        ))
+        .with_class(ClassDescriptor::new(
+            "ImagickPixel",
+            "imagick",
+            ClassKind::Class,
+        ))
+        .with_class(ClassDescriptor::new(
+            "ImagickPixelIterator",
+            "imagick",
+            ClassKind::Class,
+        ))
+        .with_class(ClassDescriptor::new(
+            "ImagickException",
+            "imagick",
+            ClassKind::Class,
+        ))
+}
+
 pub(super) fn standard_library_igbinary_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("igbinary")
         .with_function(FunctionDescriptor::php("igbinary_serialize", "igbinary"))

@@ -1,0 +1,32 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "imagick",
+  "priority": "ImageMagick-backed media extension",
+  "selected_manifest": "tests/phpt/manifests/modules/imagick.selected.jsonl",
+  "corpus_count": 0,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "extension_loaded(\"imagick\")",
+    "Imagick class surface metadata",
+    "ReflectionClass extension/internal metadata",
+    "WordPress image-editor selection method probes",
+    "fail-closed constructor backend gate"
+  ],
+  "non_scope": [
+    "ImageMagick/MagickWand binding or FFI execution",
+    "read/write/resize/crop/thumbnail/identify operations",
+    "formats, profiles, EXIF/IPTC metadata, colorspaces, layers, animations, resource limits, and policy files",
+    "ImageMagick-version-dependent constants"
+  ],
+  "target_gates": [
+    "nix develop -c cargo test -p php_std imagick --no-fail-fast",
+    "nix develop -c cargo test -p php_vm imagick --no-fail-fast",
+    "REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=imagick"
+  ],
+  "next_step": "Wire a real ImageMagick backend capability gate, then promote PECL Imagick smoke PHPTs for constructor/read/identify/resize/crop/write behavior."
+}
