@@ -1370,16 +1370,21 @@ pub(in crate::builtins::modules) fn builtin_http_build_query(
         .get(1)
         .map(|value| string_arg("http_build_query", value))
         .transpose()?;
-    let arg_separator = args
-        .get(2)
-        .map(|value| string_arg("http_build_query", value))
+    let arg_separator = match args.get(2) {
+        Some(Value::Null) | None => "&".to_owned(),
+        Some(value) => string_arg("http_build_query", value)?.to_string_lossy(),
+    };
+    let raw_encoding = args
+        .get(3)
+        .map(|value| int_arg("http_build_query", value))
         .transpose()?
-        .map_or_else(|| "&".to_owned(), |value| value.to_string_lossy());
+        == Some(PHP_QUERY_RFC3986);
     let numeric_prefix_text = numeric_prefix.as_ref().map(|value| value.to_string_lossy());
     let mut pairs = Vec::new();
     build_query_pairs(
         None,
         numeric_prefix_text.as_deref(),
+        raw_encoding,
         &Value::Array(array),
         &mut pairs,
     )?;

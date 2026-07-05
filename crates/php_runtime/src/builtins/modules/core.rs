@@ -29,9 +29,9 @@ use crate::{
     to_string, unserialize as unserialize_value,
 };
 pub(in crate::builtins::modules) use encoding::{
-    HTML_ESCAPE_DEFAULT_FLAGS, build_query_pairs, format_array_values, hash_digest_bytes,
-    hex_decode, hex_encode, hex_nibble, hmac_digest_bytes, html_decode, html_escape_with_options,
-    url_decode, url_encode,
+    HTML_ESCAPE_DEFAULT_FLAGS, PHP_QUERY_RFC3986, build_query_pairs, format_array_values,
+    hash_digest_bytes, hex_decode, hex_encode, hex_nibble, hmac_digest_bytes, html_decode,
+    html_escape_with_options, url_decode, url_encode,
 };
 use http::{
     builtin_header, builtin_header_remove, builtin_headers_list, builtin_headers_sent,
@@ -6232,8 +6232,8 @@ mod tests {
     use super::super::debug_output::{php_float_debug_string, php_float_export_string};
     use super::{
         BuiltinCompatibility, BuiltinContext, JSON_ERROR_SYNTAX, JSON_PRESERVE_ZERO_FRACTION,
-        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, PHP_RAND_MAX, RuntimeSourceSpan,
-        SORT_FLAG_CASE, SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
+        JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, PHP_QUERY_RFC3986, PHP_RAND_MAX,
+        RuntimeSourceSpan, SORT_FLAG_CASE, SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
     };
     use crate::builtins::context::{
         JSON_BIGINT_AS_STRING, JSON_ERROR_CTRL_CHAR, JSON_ERROR_DEPTH, JSON_ERROR_NONE,
@@ -11022,6 +11022,24 @@ mod tests {
                 &mut output
             ),
             Value::string("foo=bar;num0=abc;true=1")
+        );
+        let mut raw_query = PhpArray::new();
+        raw_query.insert(
+            ArrayKey::String(PhpString::from_test_str("a b")),
+            Value::string("c d"),
+        );
+        assert_eq!(
+            call(
+                "http_build_query",
+                vec![
+                    Value::Array(raw_query),
+                    Value::string(""),
+                    Value::Null,
+                    Value::Int(PHP_QUERY_RFC3986)
+                ],
+                &mut output
+            ),
+            Value::string("a%20b=c%20d")
         );
     }
 

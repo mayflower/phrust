@@ -861,6 +861,8 @@ mod tests {
         let registry = ExtensionRegistry::standard_library();
 
         for (name, expected) in [
+            ("PHP_QUERY_RFC1738", constants::PHP_QUERY_RFC1738),
+            ("PHP_QUERY_RFC3986", constants::PHP_QUERY_RFC3986),
             ("PHP_URL_SCHEME", constants::PHP_URL_SCHEME),
             ("PHP_URL_HOST", constants::PHP_URL_HOST),
             ("PHP_URL_PORT", constants::PHP_URL_PORT),

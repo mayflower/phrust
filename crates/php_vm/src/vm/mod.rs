@@ -73422,6 +73422,7 @@ fn internal_builtin_generated_named_args_supported(function: &str) -> bool {
         "array_key_exists"
             | "count"
             | "explode"
+            | "http_build_query"
             | "in_array"
             | "substr"
             | "trim"
@@ -73541,6 +73542,15 @@ fn generated_default_value_for_call(default: Option<&str>) -> Option<Value> {
     }
     if default == "PHP_INT_MAX" {
         return Some(Value::Int(i64::MAX));
+    }
+    if default == "PHP_QUERY_RFC1738" {
+        return Some(Value::Int(php_std::constants::PHP_QUERY_RFC1738));
+    }
+    if default == "PHP_QUERY_RFC3986" {
+        return Some(Value::Int(php_std::constants::PHP_QUERY_RFC3986));
+    }
+    if default.len() >= 2 && default.starts_with('"') && default.ends_with('"') {
+        return Some(Value::string(default.trim_matches('"')));
     }
     default.parse::<i64>().ok().map(Value::Int)
 }
@@ -75525,6 +75535,16 @@ mod tests {
             result.output.as_bytes(),
             php_source::reference_php_version().as_bytes()
         );
+    }
+
+    #[test]
+    fn constants_execute_query_encoding_named_arg() {
+        let result = execute_source(
+            "<?php echo PHP_QUERY_RFC1738, '|', PHP_QUERY_RFC3986, '|', http_build_query(['a b' => 'c d'], encoding_type: PHP_QUERY_RFC3986);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"1|2|a%20b=c%20d");
     }
 
     #[test]

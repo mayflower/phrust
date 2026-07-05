@@ -203,6 +203,7 @@ pub(in crate::builtins::modules) fn hex_nibble(byte: u8) -> Option<u8> {
 /// Engine default for `htmlspecialchars`-family flags: escape both quote
 /// kinds (`ENT_QUOTES`); substitution/doctype bits are not modeled byte-wise.
 pub(in crate::builtins::modules) const HTML_ESCAPE_DEFAULT_FLAGS: i64 = 3;
+pub(in crate::builtins::modules) const PHP_QUERY_RFC3986: i64 = 2;
 
 pub(in crate::builtins::modules) fn html_escape_with_options(
     bytes: &[u8],
@@ -331,6 +332,7 @@ pub(in crate::builtins::modules) fn url_decode(bytes: &[u8], raw: bool) -> Vec<u
 pub(in crate::builtins::modules) fn build_query_pairs(
     prefix: Option<String>,
     numeric_prefix: Option<&str>,
+    raw_encoding: bool,
     value: &Value,
     pairs: &mut Vec<String>,
 ) -> Result<(), BuiltinError> {
@@ -347,7 +349,7 @@ pub(in crate::builtins::modules) fn build_query_pairs(
                 let name = prefix
                     .as_ref()
                     .map_or(key.clone(), |prefix| format!("{prefix}[{key}]"));
-                build_query_pairs(Some(name), numeric_prefix, value, pairs)?;
+                build_query_pairs(Some(name), numeric_prefix, raw_encoding, value, pairs)?;
             }
         }
         Value::Null => {}
@@ -362,8 +364,8 @@ pub(in crate::builtins::modules) fn build_query_pairs(
             };
             pairs.push(format!(
                 "{}={}",
-                String::from_utf8_lossy(&url_encode(name.as_bytes(), false)),
-                String::from_utf8_lossy(&url_encode(value.as_bytes(), false))
+                String::from_utf8_lossy(&url_encode(name.as_bytes(), raw_encoding)),
+                String::from_utf8_lossy(&url_encode(value.as_bytes(), raw_encoding))
             ));
         }
     }

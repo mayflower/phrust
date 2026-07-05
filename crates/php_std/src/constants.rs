@@ -293,6 +293,10 @@ pub const ENT_HTML5: i64 = 48;
 pub const CHAR_MAX: i64 = 127;
 /// `htmlspecialchars()` escaping mode.
 pub const HTML_SPECIALCHARS: i64 = 0;
+/// `http_build_query()` RFC 1738 encoding mode.
+pub const PHP_QUERY_RFC1738: i64 = 1;
+/// `http_build_query()` RFC 3986 encoding mode.
+pub const PHP_QUERY_RFC3986: i64 = 2;
 
 /// `parse_url()` component selector for the URL scheme.
 pub const PHP_URL_SCHEME: i64 = 0;

@@ -1082,6 +1082,16 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("vprintf", "standard"))
         .with_function(FunctionDescriptor::php("vsprintf", "standard"))
         .with_constant(ConstantDescriptor::with_value(
+            "PHP_QUERY_RFC1738",
+            "standard",
+            ConstantValue::Int(constants::PHP_QUERY_RFC1738),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "PHP_QUERY_RFC3986",
+            "standard",
+            ConstantValue::Int(constants::PHP_QUERY_RFC3986),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "PHP_URL_SCHEME",
             "standard",
             ConstantValue::Int(constants::PHP_URL_SCHEME),
