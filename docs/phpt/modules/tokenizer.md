@@ -16,6 +16,9 @@
 - Promotes upstream `PhpToken_constructor.phpt` for constructor public
   properties, `getTokenName()` nullability, `Stringable` instance checks, and
   ignorable open-tag classification.
+- Promotes upstream `PhpToken_methods.phpt` and `PhpToken_toString.phpt` for
+  PHP-compatible token-name display, `is()` matching/error behavior, typed
+  property access errors, and string casting through `__toString()`.
 
 ## Known gaps
 
@@ -24,9 +27,9 @@
 - Numeric token IDs are intentionally engine-owned and compared by names/text,
   not hardcoded Zend token values.
 - Parser-internal token names are not exposed.
-- Remaining upstream failures cluster around `PhpToken` class methods/magic
-  behavior beyond the promoted constructor/core helpers, legacy token aliases
-  such as `T_PAAMAYIM_NEKUDOTAYIM`,
+- Remaining upstream failures cluster around `PhpToken` subclass/finality and
+  extension behavior, `PhpToken::tokenize()` `EXPECTF` coverage, legacy token
+  aliases such as `T_PAAMAYIM_NEKUDOTAYIM`,
   bad-character token emission, heredoc recovery, and `TOKEN_PARSE`
   context-sensitive keyword reclassification.
 
@@ -36,4 +39,5 @@
 - `nix develop -c cargo test -p php_std tokenizer --no-fail-fast`
 - `REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=tokenizer`
 
-Last upstream target sweep before this promotion: 31 PASS, 22 FAIL.
+Last tokenizer module gate after this promotion: 38 selected PASS, 20 known
+failures remain.

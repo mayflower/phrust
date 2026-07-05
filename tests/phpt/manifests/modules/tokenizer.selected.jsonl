@@ -4,6 +4,8 @@
 {"path":"tests/phpt/generated/tokenizer/token-get-all-token-parse-supported.phpt"}
 {"path":"tests/phpt/generated/tokenizer/token-get-all-php85-syntax.phpt"}
 {"path":"ext/tokenizer/tests/PhpToken_constructor.phpt"}
+{"path":"ext/tokenizer/tests/PhpToken_methods.phpt"}
+{"path":"ext/tokenizer/tests/PhpToken_toString.phpt"}
 {"path":"ext/tokenizer/tests/002.phpt"}
 {"path":"ext/tokenizer/tests/003.phpt"}
 {"path":"ext/tokenizer/tests/attributes.phpt"}

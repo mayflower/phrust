@@ -25336,7 +25336,23 @@ impl Vm {
                             let value = match php_token_method_value(&object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
+                                    let result =
+                                        self.runtime_error(output, compiled, stack, message);
+                                    match self.route_throwable_result(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        result,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
                                 }
                             };
                             if let Err(message) = stack
@@ -37237,6 +37253,7 @@ impl Vm {
             || internal_throwable_instanceof(&object.class_name(), "throwable").is_some()
             || spl_runtime_marker(object).is_some_and(|class| is_spl_caching_iterator_class(&class))
             || is_spl_file_runtime_class(&object.class_name())
+            || is_php_token_runtime_class(&object.class_name())
             || normalize_class_name(&object.class_name()) == "simplexmlelement"
         {
             return Ok(true);
@@ -37279,6 +37296,18 @@ impl Vm {
             return Ok(PhpString::from_bytes(
                 throwable_string(&object).into_bytes(),
             ));
+        }
+        if is_php_token_runtime_class(&object.class_name()) {
+            return match object.get_property("text") {
+                Some(Value::String(text)) => Ok(text),
+                _ => Err(self.runtime_error_with_source_span(
+                    output,
+                    compiled,
+                    stack,
+                    source_span,
+                    "E_PHP_VM_TOSTRING_RETURN_TYPE: PhpToken::__toString(): Return value must be of type string",
+                )),
+            };
         }
         if spl_runtime_marker(&object).is_some_and(|class| is_spl_caching_iterator_class(&class)) {
             return self.spl_caching_iterator_to_string(compiled, &object, output, stack, state);
@@ -51286,9 +51315,6 @@ fn php_token_method_value(
                     args.len()
                 ));
             }
-            if let Some(value) = object.get_property("__ignorable") {
-                return Ok(value);
-            }
             Ok(Value::Bool(
                 object
                     .get_property("id")
@@ -51330,16 +51356,10 @@ fn php_token_method_value(
 fn php_token_matches_kind(object: &ObjectRef, kind: &Value) -> Result<bool, String> {
     match kind {
         Value::Reference(cell) => php_token_matches_kind(object, &cell.get()),
-        Value::Int(value) => Ok(object.get_property("id") == Some(Value::Int(*value))),
+        Value::Int(value) => Ok(php_token_required_id(object)? == *value),
         Value::String(value) => {
             let candidate = value.to_string_lossy();
-            let text = object
-                .get_property("text")
-                .and_then(|value| match value {
-                    Value::String(text) => Some(text.to_string_lossy()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let text = php_token_required_text(object)?.to_string_lossy();
             let name = php_token_name_value(object)
                 .and_then(|value| match value {
                     Value::String(name) => Some(name.to_string_lossy()),
@@ -51350,29 +51370,66 @@ fn php_token_matches_kind(object: &ObjectRef, kind: &Value) -> Result<bool, Stri
         }
         Value::Array(array) => {
             for (_, value) in array.iter() {
-                if php_token_matches_kind(object, value)? {
+                let matches = match value {
+                    Value::Reference(cell) => php_token_matches_kind(object, &cell.get())?,
+                    Value::Int(expected) => php_token_required_id(object)? == *expected,
+                    Value::String(expected) => {
+                        php_token_required_text(object)?.as_bytes() == expected.as_bytes()
+                    }
+                    other => {
+                        return Err(format!(
+                            "E_PHP_VM_TOKENIZER_KIND_ELEMENT_TYPE: PhpToken::is(): Argument #1 ($kind) must only have elements of type string|int, {} given",
+                            type_error_value_name(other)
+                        ));
+                    }
+                };
+                if matches {
                     return Ok(true);
                 }
             }
             Ok(false)
         }
         other => Err(format!(
-            "E_PHP_VM_TOKENIZER_KIND_TYPE: PhpToken::is expects int|string|array, {} given",
-            value_type_name(other)
+            "E_PHP_VM_TOKENIZER_KIND_TYPE: PhpToken::is(): Argument #1 ($kind) must be of type string|int|array, {} given",
+            type_error_value_name(other)
         )),
     }
 }
 
-fn php_token_name_value(object: &ObjectRef) -> Option<Value> {
-    if let Some(Value::String(name)) = object.get_property("name") {
-        return Some(Value::String(name));
+fn php_token_required_id(object: &ObjectRef) -> Result<i64, String> {
+    match object.get_property("id") {
+        Some(Value::Int(id)) => Ok(id),
+        _ => Err(
+            "E_PHP_VM_TOKENIZER_UNINITIALIZED_PROPERTY: Typed property PhpToken::$id must not be accessed before initialization"
+                .to_owned(),
+        ),
     }
+}
+
+fn php_token_required_text(object: &ObjectRef) -> Result<PhpString, String> {
+    match object.get_property("text") {
+        Some(Value::String(text)) => Ok(text),
+        _ => Err(
+            "E_PHP_VM_TOKENIZER_UNINITIALIZED_PROPERTY: Typed property PhpToken::$text must not be accessed before initialization"
+                .to_owned(),
+        ),
+    }
+}
+
+fn php_token_name_value(object: &ObjectRef) -> Option<Value> {
     let id = match object.get_property("id") {
         Some(Value::Int(id)) => id,
         _ => return None,
     };
-    php_runtime::tokenizer::token_name_for_id(id)
-        .map(|name| Value::String(PhpString::from_test_str(name)))
+    if let Some(name) = php_runtime::tokenizer::token_name_for_id(id) {
+        return Some(Value::String(PhpString::from_test_str(name)));
+    }
+    if (0..=u8::MAX as i64).contains(&id) {
+        if let Some(Value::String(text)) = object.get_property("text") {
+            return Some(Value::String(text));
+        }
+    }
+    None
 }
 
 fn php_token_object(token: php_runtime::tokenizer::TokenizerToken) -> ObjectRef {
@@ -51381,11 +51438,6 @@ fn php_token_object(token: php_runtime::tokenizer::TokenizerToken) -> ObjectRef 
     object.set_property("text", Value::string(token.text.into_bytes()));
     object.set_property("line", Value::Int(i64::from(token.line)));
     object.set_property("pos", Value::Int(i64::from(token.pos)));
-    object.set_property("name", Value::String(PhpString::from_test_str(&token.name)));
-    object.set_property(
-        "__ignorable",
-        Value::Bool(php_runtime::tokenizer::is_ignorable_name(token.token_name)),
-    );
     object
 }
 
@@ -69708,6 +69760,7 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         "E_PHP_VM_PARAM_TYPE_MISMATCH" => "TypeError",
         "E_PHP_VM_DYNAMIC_CLASS_NAME_TYPE" => "TypeError",
         "E_PHP_VM_AUTOLOAD_INVALID_CALLBACK" => "TypeError",
+        "E_PHP_VM_TOKENIZER_KIND_TYPE" | "E_PHP_VM_TOKENIZER_KIND_ELEMENT_TYPE" => "TypeError",
         "E_PHP_VM_ARRAY_KEY_CONVERSION" => "Error",
         "E_PHP_VM_PRIVATE_METHOD_ACCESS"
         | "E_PHP_VM_PROTECTED_METHOD_ACCESS"
@@ -69735,7 +69788,8 @@ fn runtime_error_throwable(result: &VmResult) -> Option<Value> {
         | "E_PHP_VM_PROTECTED_CLASS_CONSTANT_ACCESS"
         | "E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER"
         | "E_PHP_VM_ABSTRACT_CLASS_INSTANTIATION"
-        | "E_PHP_VM_METHOD_CALL_NON_OBJECT" => "Error",
+        | "E_PHP_VM_METHOD_CALL_NON_OBJECT"
+        | "E_PHP_VM_TOKENIZER_UNINITIALIZED_PROPERTY" => "Error",
         "E_PHP_VM_PROPERTY_TYPE_MISMATCH" => "TypeError",
         // The reference engine throws plain Error for first-class callable
         // acquisition failures, but Closure::fromCallable wraps the same
@@ -74806,6 +74860,9 @@ fn non_numeric_string_type_error(
 }
 
 fn object_has_public_to_string(compiled: &CompiledUnit, object: &ObjectRef) -> bool {
+    if is_php_token_runtime_class(&object.class_name()) {
+        return true;
+    }
     let Some(class) = compiled.lookup_class(&object.class_name()) else {
         return false;
     };
@@ -74822,6 +74879,9 @@ fn object_has_public_to_string_in_state(
     state: &ExecutionState,
     object: &ObjectRef,
 ) -> bool {
+    if is_php_token_runtime_class(&object.class_name()) {
+        return true;
+    }
     let Ok(Some(resolved)) =
         lookup_resolved_method_in_state(compiled, state, &object.class_name(), "__toString", None)
     else {
@@ -88886,6 +88946,19 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
         assert_eq!(
             result.output.as_bytes(),
             b"PhpToken|id|function|10|100|stringable|function|T_FUNCTION|null"
+        );
+    }
+
+    #[test]
+    fn tokenizer_php_token_casts_to_string_in_runtime_builtins() {
+        let result = execute_source(
+            "<?php $tokens = PhpToken::tokenize('<?php echo \"Hello \". $what;'); var_dump(implode($tokens)); var_dump((string) $tokens[0]);",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"string(27) \"<?php echo \"Hello \". $what;\"\nstring(6) \"<?php \"\n"
         );
     }
 

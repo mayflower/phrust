@@ -1531,6 +1531,12 @@ pub(in crate::builtins::modules) fn string_cast_value(
             );
             Ok(crate::PhpString::from_test_str("Array"))
         }
+        Value::Object(object) if normalize_class_name(&object.class_name()) == "phptoken" => {
+            match object.get_property("text") {
+                Some(Value::String(text)) => Ok(text),
+                _ => to_string(value),
+            }
+        }
         Value::Reference(cell) => string_cast_value(context, &cell.get(), span),
         other => to_string(other),
     }
