@@ -61,3 +61,23 @@ The Performance counter JSON includes:
 - `invalidations_by_reason.autoload_positive_target_missing`
 
 The `inline-cache-smoke` gate requires visible autoload lookup hits and misses.
+
+## Bootstrap Lookup Coverage (tranche evidence)
+
+The web-bootstrap lookup families the optimization gates mark
+`EVIDENCE_GATE` are implemented and epoch-guarded end to end:
+include-path resolution ICs (`include_path_ic_*`), include-once results
+(`include_once_skips` plus the include graph), autoload class-lookup ICs
+(`autoload_class_lookup_ic_*`), and class-constant/static-property
+metadata ICs (`class_static_ic_*`, slot family
+`inline_cache_class_constant_static_property_slots`). On a repeated
+bootstrap loop (`fixtures/runtime_semantics/includes/
+bootstrap-lookup-cache-paths.php`) the steady state resolves 29/30
+includes and 58/61 class-constant/static-property lookups from ICs while
+staying byte-exact against the reference engine on both presets.
+
+Negative autoload lookups are deliberately not cached: the reference
+engine re-invokes registered autoloaders for every unknown-class probe,
+so repeated `class_exists` misses must keep calling the loader. The
+`negative_lookup_hits` counter only fires for the side-effect-safe graph
+cases documented above.
