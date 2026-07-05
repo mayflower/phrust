@@ -68,7 +68,7 @@ pub(in crate::builtins::modules) fn builtin_unserialize(
 pub(in crate::builtins::modules) fn builtin_var_export(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(1..=2).contains(&args.len()) {
         return Err(BuiltinError::new(
@@ -89,6 +89,13 @@ pub(in crate::builtins::modules) fn builtin_var_export(
         .unwrap_or(-1);
     let mut formatter = DebugFormatter::with_serialize_precision(serialize_precision);
     formatter.write_var_export_value(&mut output, &args[0], 0);
+    if formatter.var_export_saw_recursion() {
+        context.php_warning(
+            "E_PHP_RUNTIME_VAR_EXPORT_RECURSION",
+            "var_export does not handle circular references",
+            span,
+        );
+    }
     if return_output {
         Ok(Value::string(output.into_bytes()))
     } else {

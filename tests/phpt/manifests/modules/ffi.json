@@ -1,0 +1,36 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "ffi",
+  "priority": "disabled-by-default unsafe capability surface",
+  "selected_manifest": "tests/phpt/manifests/modules/ffi.selected.jsonl",
+  "corpus_count": 106,
+  "selected_count": 2,
+  "pass_count": 2,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 104,
+  "scope": [
+    "extension visibility",
+    "generated FFI class surface",
+    "ReflectionClass extension/internal metadata",
+    "generated static method metadata",
+    "fail-closed VM hook for unsafe static methods",
+    "disabled-by-default runtime diagnostic for FFI::cdef"
+  ],
+  "non_scope": [
+    "libffi or dlopen execution",
+    "C parser and CType/CData object semantics",
+    "FFI memory operations",
+    "FFI preload and scope loading",
+    "class constants with platform ABI values",
+    "PHP FFI exception object parity",
+    "server-mode policy enforcement beyond fail-closed runtime dispatch"
+  ],
+  "target_gates": [
+    "nix develop -c cargo test -p php_std ffi --no-fail-fast",
+    "nix develop -c cargo test -p php_vm ffi --no-fail-fast",
+    "REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=ffi"
+  ],
+  "next_step": "Add an explicit unsafe capability gate, then promote opt-in PHPTs covering cdef/type/new/cast and memory helpers with real FFI objects."
+}

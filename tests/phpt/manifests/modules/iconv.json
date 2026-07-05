@@ -3,15 +3,27 @@
   "module": "iconv",
   "priority": "Encoding conversion MVP",
   "selected_manifest": "tests/phpt/manifests/modules/iconv.selected.jsonl",
-  "corpus_count": 2,
-  "selected_count": 2,
-  "pass_count": 2,
-  "skip_count": 0,
+  "corpus_count": 76,
+  "selected_count": 24,
+  "pass_count": 9,
+  "skip_count": 15,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 0,
-  "scope": ["UTF-8, ASCII, and ISO-8859-1 conversion plus encoding state"],
-  "non_scope": ["Full iconv charset catalog and transliteration"],
-  "target_gates": ["just phpt-dev-module MODULE=iconv"],
-  "next_step": "Add more charset aliases after a dedicated compatibility pass."
+  "known_failure_count": 55,
+  "scope": [
+    "UTF-8, ASCII, and ISO-8859-1 conversion plus encoding state",
+    "Common ASCII and ISO-8859-1 charset aliases",
+    "Target-green upstream iconv PHPT smoke rows plus generated bounds coverage"
+  ],
+  "non_scope": [
+    "Full iconv charset catalog and transliteration",
+    "Remaining 55 upstream iconv failures",
+    "iconv_strrpos and MIME header helpers",
+    "Stream filters and exact warning text parity"
+  ],
+  "target_gates": [
+    "nix develop -c cargo test -p php_runtime iconv --no-fail-fast",
+    "REFERENCE_PHP=/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 PHPT_DISABLE_REFERENCE_REUSE=1 nix develop -c just phpt-dev-module MODULE=iconv"
+  ],
+  "next_step": "Add iconv_strrpos, MIME header helpers, transliteration, and ignore-mode parity after a dedicated compatibility pass."
 }

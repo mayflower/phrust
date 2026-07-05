@@ -7,8 +7,11 @@ mod registry;
 mod signatures;
 
 pub use context::{
-    ApcuState, BuiltinContext, FilesystemRuntimeState, IconvEncodingState, RuntimeSourceSpan,
-    StreamContextState, StrtokState,
+    ApcuState, BuiltinContext, FilesystemRuntimeState, FtpOptionValue, FtpState, GettextState,
+    IconvEncodingState, ImapState, LdapState, OpcacheState, OpenSslErrorState, PcntlState,
+    ReadlineState, RuntimeSourceSpan, ShmopState, SoapState, SocketState, Ssh2State,
+    StreamContextState, StrtokState, SysvMessageQueueState, SysvSemaphoreState,
+    SysvSharedMemoryState,
 };
 pub use error::{BuiltinError, BuiltinErrorContext};
 #[doc(hidden)]

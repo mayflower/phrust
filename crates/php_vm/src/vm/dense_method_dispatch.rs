@@ -788,6 +788,7 @@ impl Vm {
                 &spl_class,
                 args,
                 &self.options.runtime_context,
+                Some(&mut state.resources),
             )
         {
             return self.runtime_error_at_optional_span(

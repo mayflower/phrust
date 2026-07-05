@@ -1,0 +1,43 @@
+# hash
+
+- Strategy: selected upstream digest, HMAC, and streaming context parity slice
+- Selected manifest: `tests/phpt/manifests/modules/hash.selected.jsonl`
+- Selected fixtures:
+  - `tests/phpt/generated/hash/file.phpt`
+  - `tests/phpt/generated/hash/context.phpt`
+  - selected `ext/hash/tests/*.phpt` rows for md5, sha1, SHA-2, HMAC-md5,
+    file hashing, HKDF, PBKDF2, and stream updates
+
+## Implemented Surface
+
+The runtime exposes the existing `hash`, `hash_hmac`, `hash_algos`,
+`hash_hmac_algos`, and `hash_equals` builtins plus `hash_file`,
+`hash_hmac_file`, `hash_init`, `hash_update`, `hash_copy`, and `hash_final`.
+The metadata registry exposes `HashContext` and `HASH_HMAC`.
+
+Supported digest/HMAC algorithms in this slice are `md5`, `sha1`, `sha224`,
+`sha256`, `sha384`, `sha512/224`, `sha512/256`, and `sha512`; digest-only
+coverage also includes `crc32` and `crc32b`.
+
+The selected rows cover SHA-256 file digests, SHA-256 file HMACs, raw binary
+file digest output, upstream md5/sha1/SHA-2 digest vectors, HMAC-md5, upstream
+file hashing, `hash_update_file`, `hash_update_stream`, `hash_pbkdf2`, and
+RFC5869 `hash_hkdf` vectors. The context row covers `HashContext` visibility,
+incremental SHA-256 hashing, copying a partially updated context, HMAC contexts,
+and finalized context rejection.
+
+## Gaps
+
+The full php-src hash algorithm inventory remains out of scope for this slice:
+`md2`, `md4`, `sha3-*`, `xxh*`, `ripemd*`, `haval*`, `tiger*`, `snefru*`,
+`gost*`, and `whirlpool` are still unsupported. HashContext magic
+serialization/debug-info parity is also not complete.
+
+## Target Gates
+
+- `nix develop -c cargo test -p php_runtime hash`
+- `nix develop -c cargo test -p php_std hash`
+- `nix develop -c just phpt-dev-module MODULE=hash`
+
+Last upstream target sweep before this promotion: 14 PASS, 6 SKIP, 60 FAIL.
+After adding SHA-2 variants, the selected manifest contains 19 green rows.

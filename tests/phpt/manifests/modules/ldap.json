@@ -1,0 +1,32 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "ldap",
+  "priority": "Deterministic LDAP facade and security-explicit backend gap",
+  "selected_manifest": "tests/phpt/manifests/modules/ldap.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "Registered LDAP functions, classes, and stable constants",
+    "Request-local LDAP\\Connection handles without implicit network access",
+    "Option set/get behavior for common LDAP and TLS policy options",
+    "Error state through ldap_errno, ldap_error, and ldap_err2str",
+    "ldap_escape, ldap_explode_dn, and ldap_dn2ufn helpers",
+    "Deterministic empty LDAP\\Result handles for read/list/search traversal",
+    "Explicit failure for bind, mutation, compare, extended operations, and TLS"
+  ],
+  "non_scope": [
+    "OpenLDAP/libldap backend integration",
+    "Live LDAP DSN integration tests",
+    "SASL, referrals, controls parsing, paged results, and TLS handshakes"
+  ],
+  "target_gates": [
+    "cargo test -p php_runtime ldap --no-fail-fast",
+    "just phpt-dev-module MODULE=ldap"
+  ],
+  "next_step": "Add an opt-in LDAP backend and live DSN-gated PHPTs before promoting php-src LDAP integration tests."
+}

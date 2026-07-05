@@ -25,6 +25,21 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "xml_get_current_byte_index",
+        builtin_xml_get_current_byte_index,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xml_get_current_line_number",
+        builtin_xml_get_current_line_number,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xml_get_current_column_number",
+        builtin_xml_get_current_column_number,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "xml_parser_create_ns",
         builtin_xml_parser_create_ns,
         BuiltinCompatibility::Php,
@@ -57,6 +72,9 @@ const XML_PARSER_CASE_FOLDING: &str = "__phrust_xml_case_folding";
 const XML_PARSER_TARGET_ENCODING: &str = "__phrust_xml_target_encoding";
 const XML_PARSER_SKIP_TAGSTART: &str = "__phrust_xml_skip_tagstart";
 const XML_PARSER_SKIP_WHITE: &str = "__phrust_xml_skip_white";
+const XML_PARSER_CURRENT_BYTE: &str = "__phrust_xml_current_byte";
+const XML_PARSER_CURRENT_LINE: &str = "__phrust_xml_current_line";
+const XML_PARSER_CURRENT_COLUMN: &str = "__phrust_xml_current_column";
 
 fn builtin_xml_parser_create(
     _context: &mut BuiltinContext<'_>,
@@ -90,6 +108,7 @@ fn new_xml_parser() -> Value {
     object.set_property(XML_PARSER_TARGET_ENCODING, Value::string("UTF-8"));
     object.set_property(XML_PARSER_SKIP_TAGSTART, Value::Int(0));
     object.set_property(XML_PARSER_SKIP_WHITE, Value::Bool(false));
+    set_current_position(&object, "");
     Value::Object(object)
 }
 
@@ -123,6 +142,7 @@ fn builtin_xml_parse(
         )
     })?;
     let ok = xml::parse_xml(input).is_ok();
+    set_current_position(&parser, input);
     parser.set_property(
         XML_PARSER_ERROR_CODE,
         Value::Int(if ok {
@@ -132,6 +152,17 @@ fn builtin_xml_parse(
         }),
     );
     Ok(Value::Int(i64::from(ok)))
+}
+
+fn set_current_position(parser: &crate::ObjectRef, input: &str) {
+    parser.set_property(XML_PARSER_CURRENT_BYTE, Value::Int(input.len() as i64));
+    let line = input.bytes().filter(|byte| *byte == b'\n').count() as i64 + 1;
+    let column = input
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail.len() as i64 + 1)
+        .unwrap_or(input.len() as i64 + 1);
+    parser.set_property(XML_PARSER_CURRENT_LINE, Value::Int(line));
+    parser.set_property(XML_PARSER_CURRENT_COLUMN, Value::Int(column));
 }
 
 fn builtin_xml_get_error_code(
@@ -176,6 +207,42 @@ fn builtin_xml_error_string(
         _ => "syntax error",
     };
     Ok(Value::string(message.as_bytes().to_vec()))
+}
+
+fn builtin_xml_get_current_byte_index(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    xml_current_position("xml_get_current_byte_index", args, XML_PARSER_CURRENT_BYTE)
+}
+
+fn builtin_xml_get_current_line_number(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    xml_current_position("xml_get_current_line_number", args, XML_PARSER_CURRENT_LINE)
+}
+
+fn builtin_xml_get_current_column_number(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    xml_current_position(
+        "xml_get_current_column_number",
+        args,
+        XML_PARSER_CURRENT_COLUMN,
+    )
+}
+
+fn xml_current_position(name: &str, args: Vec<Value>, property: &str) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error(name, "one argument"));
+    }
+    let parser = xml_parser_arg(name, &args[0])?;
+    Ok(parser.get_property(property).unwrap_or(Value::Int(0)))
 }
 
 fn builtin_xml_parser_get_option(

@@ -479,6 +479,12 @@ impl MysqlState {
         }
     }
 
+    /// Runs a SQL statement and returns the affected-row count.
+    pub fn exec_changes(&mut self, id: i64, sql: &str) -> Result<i64, MysqlError> {
+        self.execute(id, sql)?;
+        Ok(self.affected_rows(id))
+    }
+
     /// Returns the last connection error code.
     #[must_use]
     pub fn errno(&self, id: i64) -> i64 {

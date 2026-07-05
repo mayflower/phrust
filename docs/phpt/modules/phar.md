@@ -3,7 +3,7 @@
 - Strategy: read-only local PHAR MVP
 - Classification: real-implementation-required for Composer PHAR mode
 - Selected manifest: `tests/phpt/manifests/modules/phar.selected.jsonl`
-- Selected gate: 3 PASS and 4 SKIP. The skipped upstream rows are optional
+- Selected gate: 4 PASS and 4 SKIP. The skipped upstream rows are optional
   compression/signature capability probes.
 
 ## Implemented Scope
@@ -18,6 +18,9 @@
   `stream_get_contents`, and `include` for uncompressed file entries.
 - `include_once` / `require_once` tracking uses stable synthetic `phar://`
   paths.
+- `Phar::count()`, `Phar::offsetExists()`, `Phar::getPath()`,
+  `Phar::getAlias()`, and `Phar::getStub()` expose read-only manifest/archive
+  metadata already parsed during construction.
 - `Phar::getSupportedCompression()` derives zlib and bz2 names from the enabled
   extension registry. `Phar::getSupportedSignatures()` exposes selected static
   metadata for upstream capability probes.
@@ -28,14 +31,15 @@
   uncompressed archive with `hex2bin()`, reads `data.txt` through
   `file_get_contents` and `fopen`, includes `lib/hello.php`, constructs
   `Phar`, and removes the temporary archive.
+- `tests/phpt/generated/phar/read-only-methods.phpt` checks read-only `Phar`
+  object metadata methods against the same deterministic archive format.
 
 ## Remaining Gaps
 
 - PHAR archive writing and mutation APIs are not implemented.
 - Signature validation/enforcement, compressed archive reads/writes, bz2,
-  tar/zip
-  `PharData`, archive iteration, metadata APIs, and `PharFileInfo` object
-  creation remain known gaps.
+  tar/zip `PharData`, archive iteration, metadata unserialization/write APIs,
+  and `PharFileInfo` object creation remain known gaps.
 - `phar://` metadata/stat functions are intentionally narrower than full PHP
   stream-wrapper parity.
 

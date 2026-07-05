@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/shmop/basic.phpt","module":"shmop","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers extension visibility, Shmop object handles, binary-safe read/write, keyed reopen, read-only mode, private key isolation, and delete semantics"}

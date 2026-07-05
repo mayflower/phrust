@@ -211,6 +211,18 @@ impl PharArchive {
     pub fn entry(&self, name: &str) -> Option<&PharEntry> {
         self.entries.get(&normalize_entry_name(name))
     }
+
+    /// Returns the number of manifest entries in the archive.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether the archive contains no manifest entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Parsed local `phar://` URI.

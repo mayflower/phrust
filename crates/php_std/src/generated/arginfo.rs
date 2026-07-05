@@ -55,7 +55,7 @@ pub struct GeneratedConstantMetadata {
 pub const GENERATED_ARGINFO_FUNCTION_COUNT: usize = 2324;
 pub const GENERATED_ARGINFO_CLASS_COUNT: usize = 376;
 pub const GENERATED_ARGINFO_METHOD_COUNT: usize = 2252;
-pub const GENERATED_ARGINFO_CONSTANT_COUNT: usize = 4775;
+pub const GENERATED_ARGINFO_CONSTANT_COUNT: usize = 4776;
 pub const GENERATED_ARGINFO_OVERRIDE_COUNT: usize = 1;
 
 pub const GENERATED_ARGINFO_EXTRACTOR_GAPS: &[&str] = &[];
@@ -101929,6 +101929,14 @@ pub const GENERATED_CONSTANTS: &[GeneratedConstantMetadata] = &[
     GeneratedConstantMetadata {
         owner: None,
         name: "IMAGETYPE_PSD",
+        extension: "standard",
+        source: "ext/standard/basic_functions.stub.php",
+        type_decl: "mixed",
+        value: "UNKNOWN",
+    },
+    GeneratedConstantMetadata {
+        owner: None,
+        name: "IMAGETYPE_SVG",
         extension: "standard",
         source: "ext/standard/basic_functions.stub.php",
         type_decl: "mixed",

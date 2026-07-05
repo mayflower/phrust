@@ -1,5 +1,9 @@
 use crate::engine::{CliIniOptions, EngineInput, execute_php, lint_php, read_script};
 use php_diagnostics::DiagnosticOutputFormat;
+use php_runtime::{
+    PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,
+    PHP_E_USER_NOTICE, PHP_E_USER_WARNING, PHP_E_WARNING,
+};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -8,6 +12,14 @@ use std::path::{Path, PathBuf};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_PHP_ERROR: i32 = 255;
+const PHP_E_PARSE: i64 = 4;
+const PHP_E_CORE_ERROR: i64 = 16;
+const PHP_E_CORE_WARNING: i64 = 32;
+const PHP_E_COMPILE_ERROR: i64 = 64;
+const PHP_E_COMPILE_WARNING: i64 = 128;
+const PHP_E_STRICT: i64 = 2048;
+const PHP_E_RECOVERABLE_ERROR: i64 = 4096;
+const PHP_E_ALL: i64 = 30719;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedCli {
@@ -604,7 +616,17 @@ fn print_php_info<W: Write>(
 
 fn ini_options(defines: &[(String, String)]) -> CliIniOptions {
     let mut options = CliIniOptions {
-        overrides: defines.to_vec(),
+        overrides: defines
+            .iter()
+            .map(|(name, value)| {
+                if name == "error_reporting" {
+                    if let Some(mask) = parse_error_reporting_ini(value) {
+                        return (name.clone(), mask.to_string());
+                    }
+                }
+                (name.clone(), value.clone())
+            })
+            .collect(),
         ..CliIniOptions::default()
     };
     for (name, value) in defines {
@@ -616,7 +638,7 @@ fn ini_options(defines: &[(String, String)]) -> CliIniOptions {
                 options.display_errors = Some(parse_bool_ini(value));
             }
             "error_reporting" => {
-                if let Ok(mask) = value.parse::<i64>() {
+                if let Some(mask) = parse_error_reporting_ini(value) {
                     options.error_reporting = Some(mask);
                 }
             }
@@ -625,6 +647,63 @@ fn ini_options(defines: &[(String, String)]) -> CliIniOptions {
         }
     }
     options
+}
+
+fn parse_error_reporting_ini(value: &str) -> Option<i64> {
+    parse_error_reporting_or(value.trim())
+}
+
+fn parse_error_reporting_or(value: &str) -> Option<i64> {
+    let mut parts = value.split('|');
+    let mut mask = parse_error_reporting_and(parts.next()?.trim())?;
+    for part in parts {
+        mask |= parse_error_reporting_and(part.trim())?;
+    }
+    Some(mask)
+}
+
+fn parse_error_reporting_and(value: &str) -> Option<i64> {
+    let mut parts = value.split('&');
+    let mut mask = parse_error_reporting_factor(parts.next()?.trim())?;
+    for part in parts {
+        mask &= parse_error_reporting_factor(part.trim())?;
+    }
+    Some(mask)
+}
+
+fn parse_error_reporting_factor(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix('~') {
+        return parse_error_reporting_factor(rest).map(|mask| !mask);
+    }
+    if value.starts_with('(') && value.ends_with(')') {
+        return parse_error_reporting_ini(&value[1..value.len() - 1]);
+    }
+    if let Ok(mask) = value.parse::<i64>() {
+        return Some(mask);
+    }
+    match value {
+        "E_ALL" => Some(PHP_E_ALL),
+        "E_ERROR" => Some(PHP_E_ERROR),
+        "E_WARNING" => Some(PHP_E_WARNING),
+        "E_PARSE" => Some(PHP_E_PARSE),
+        "E_NOTICE" => Some(PHP_E_NOTICE),
+        "E_CORE_ERROR" => Some(PHP_E_CORE_ERROR),
+        "E_CORE_WARNING" => Some(PHP_E_CORE_WARNING),
+        "E_COMPILE_ERROR" => Some(PHP_E_COMPILE_ERROR),
+        "E_COMPILE_WARNING" => Some(PHP_E_COMPILE_WARNING),
+        "E_USER_ERROR" => Some(PHP_E_USER_ERROR),
+        "E_USER_WARNING" => Some(PHP_E_USER_WARNING),
+        "E_USER_NOTICE" => Some(PHP_E_USER_NOTICE),
+        "E_STRICT" => Some(PHP_E_STRICT),
+        "E_RECOVERABLE_ERROR" => Some(PHP_E_RECOVERABLE_ERROR),
+        "E_DEPRECATED" => Some(PHP_E_DEPRECATED),
+        "E_USER_DEPRECATED" => Some(PHP_E_USER_DEPRECATED),
+        _ => None,
+    }
 }
 
 fn split_include_path(value: &str) -> impl Iterator<Item = PathBuf> + '_ {
@@ -808,6 +887,34 @@ mod tests {
         assert!(error.contains("-c requires"));
         let error = ParsedCli::parse(&["--repeat".to_string()]).expect_err("error");
         assert!(error.contains("--repeat requires"));
+    }
+
+    #[test]
+    fn ini_options_parse_error_reporting_expressions() {
+        let options = ini_options(&[(
+            "error_reporting".to_string(),
+            "E_ALL&~E_DEPRECATED".to_string(),
+        )]);
+        assert_eq!(options.error_reporting, Some(PHP_E_ALL & !PHP_E_DEPRECATED));
+        assert_eq!(
+            options.overrides,
+            vec![(
+                "error_reporting".to_string(),
+                (PHP_E_ALL & !PHP_E_DEPRECATED).to_string()
+            )]
+        );
+
+        let options = ini_options(&[(
+            "error_reporting".to_string(),
+            "E_WARNING | E_USER_WARNING".to_string(),
+        )]);
+        assert_eq!(
+            options.error_reporting,
+            Some(PHP_E_WARNING | PHP_E_USER_WARNING)
+        );
+
+        let options = ini_options(&[("error_reporting".to_string(), "24575".to_string())]);
+        assert_eq!(options.error_reporting, Some(24575));
     }
 
     #[test]

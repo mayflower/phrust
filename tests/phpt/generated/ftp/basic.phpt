@@ -1,12 +1,116 @@
 --TEST--
-ftp default-disabled connection basics
+ftp surface and default-disabled connection basics
 --SKIPIF--
 <?php if (!extension_loaded("ftp")) die("skip ftp extension not loaded"); ?>
 --FILE--
 <?php
+$functions = [
+    "ftp_alloc",
+    "ftp_append",
+    "ftp_cdup",
+    "ftp_chdir",
+    "ftp_chmod",
+    "ftp_close",
+    "ftp_connect",
+    "ftp_delete",
+    "ftp_exec",
+    "ftp_fget",
+    "ftp_fput",
+    "ftp_get",
+    "ftp_get_option",
+    "ftp_login",
+    "ftp_mdtm",
+    "ftp_mkdir",
+    "ftp_mlsd",
+    "ftp_nb_continue",
+    "ftp_nb_fget",
+    "ftp_nb_fput",
+    "ftp_nb_get",
+    "ftp_nb_put",
+    "ftp_nlist",
+    "ftp_pasv",
+    "ftp_put",
+    "ftp_pwd",
+    "ftp_quit",
+    "ftp_raw",
+    "ftp_rawlist",
+    "ftp_rename",
+    "ftp_rmdir",
+    "ftp_set_option",
+    "ftp_site",
+    "ftp_size",
+    "ftp_ssl_connect",
+    "ftp_systype",
+];
+foreach ($functions as $function) {
+    echo $function, ":", (function_exists($function) ? "yes" : "no"), "\n";
+}
+var_dump(class_exists(FTP\Connection::class));
+var_dump([FTP_ASCII, FTP_TEXT, FTP_BINARY, FTP_IMAGE, FTP_AUTORESUME, FTP_TIMEOUT_SEC, FTP_AUTOSEEK, FTP_USEPASVADDRESS, FTP_FAILED, FTP_FINISHED, FTP_MOREDATA]);
 var_dump(@ftp_connect("127.0.0.1", 1, 1));
 var_dump(@ftp_ssl_connect("127.0.0.1", 1, 1));
 ?>
 --EXPECT--
+ftp_alloc:yes
+ftp_append:yes
+ftp_cdup:yes
+ftp_chdir:yes
+ftp_chmod:yes
+ftp_close:yes
+ftp_connect:yes
+ftp_delete:yes
+ftp_exec:yes
+ftp_fget:yes
+ftp_fput:yes
+ftp_get:yes
+ftp_get_option:yes
+ftp_login:yes
+ftp_mdtm:yes
+ftp_mkdir:yes
+ftp_mlsd:yes
+ftp_nb_continue:yes
+ftp_nb_fget:yes
+ftp_nb_fput:yes
+ftp_nb_get:yes
+ftp_nb_put:yes
+ftp_nlist:yes
+ftp_pasv:yes
+ftp_put:yes
+ftp_pwd:yes
+ftp_quit:yes
+ftp_raw:yes
+ftp_rawlist:yes
+ftp_rename:yes
+ftp_rmdir:yes
+ftp_set_option:yes
+ftp_site:yes
+ftp_size:yes
+ftp_ssl_connect:yes
+ftp_systype:yes
+bool(true)
+array(11) {
+  [0]=>
+  int(1)
+  [1]=>
+  int(1)
+  [2]=>
+  int(2)
+  [3]=>
+  int(2)
+  [4]=>
+  int(-1)
+  [5]=>
+  int(0)
+  [6]=>
+  int(1)
+  [7]=>
+  int(2)
+  [8]=>
+  int(0)
+  [9]=>
+  int(1)
+  [10]=>
+  int(2)
+}
 bool(false)
 bool(false)

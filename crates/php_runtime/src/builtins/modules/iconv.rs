@@ -143,19 +143,20 @@ fn builtin_iconv_substr(
         .transpose()?
         .unwrap_or("UTF-8");
     let chars = chars_for_encoding("iconv_substr", input.as_bytes(), encoding)?;
-    let start = normalize_offset(chars.len(), offset);
-    let end = length.map_or(chars.len(), |value| {
-        if value < 0 {
-            chars.len().saturating_sub(value.unsigned_abs() as usize)
-        } else {
-            start.saturating_add(value as usize).min(chars.len())
-        }
-    });
-    Ok(Value::string(
-        chars[start.min(chars.len())..end.min(chars.len())]
-            .iter()
-            .collect::<String>(),
-    ))
+    let start = normalize_offset(chars.len(), offset).min(chars.len());
+    let end = length
+        .map_or(chars.len(), |value| {
+            if value < 0 {
+                chars.len().saturating_sub(value.unsigned_abs() as usize)
+            } else {
+                start.saturating_add(value as usize).min(chars.len())
+            }
+        })
+        .min(chars.len());
+    if end < start {
+        return Ok(Value::string(Vec::new()));
+    }
+    Ok(Value::string(chars[start..end].iter().collect::<String>()))
 }
 
 fn builtin_iconv_strpos(
@@ -204,8 +205,10 @@ fn canonical_encoding(encoding: &str) -> Option<&'static str> {
     let base = encoding.split("//").next().unwrap_or(encoding);
     match base.trim().to_ascii_uppercase().replace('_', "-").as_str() {
         "UTF-8" | "UTF8" => Some("UTF-8"),
-        "ASCII" | "US-ASCII" => Some("ASCII"),
-        "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "LATIN-1" => Some("ISO-8859-1"),
+        "ASCII" | "US-ASCII" | "ANSI-X3.4-1968" | "ANSI-X3.4-1986" | "ISO-IR-6" | "ISO646-US"
+        | "US" | "IBM367" | "CP367" | "CSASCII" => Some("ASCII"),
+        "ISO-8859-1" | "ISO8859-1" | "ISO-8859-1:1987" | "ISO-IR-100" | "LATIN1" | "LATIN-1"
+        | "L1" | "IBM819" | "CP819" | "CSISOLATIN1" => Some("ISO-8859-1"),
         _ => None,
     }
 }
@@ -304,5 +307,64 @@ fn normalize_offset(len: usize, offset: i64) -> usize {
         len.saturating_sub(offset.unsigned_abs() as usize)
     } else {
         (offset as usize).min(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OutputBuffer, PhpString};
+
+    fn call(name: &str, args: Vec<Value>) -> Value {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        ENTRIES
+            .iter()
+            .find(|entry| entry.name() == name)
+            .expect("iconv entry")
+            .function()(&mut context, args, RuntimeSourceSpan::default())
+        .expect("iconv succeeds")
+    }
+
+    fn string(value: &str) -> Value {
+        Value::String(PhpString::from_test_str(value))
+    }
+
+    #[test]
+    fn common_ascii_and_latin1_aliases_are_canonicalized() {
+        assert_eq!(
+            call(
+                "iconv",
+                vec![string("CP819"), string("UTF-8"), Value::string(vec![0xE4]),],
+            ),
+            Value::string("ä".as_bytes().to_vec())
+        );
+        assert_eq!(
+            call(
+                "iconv",
+                vec![string("ANSI_X3.4-1968"), string("UTF-8"), string("abc"),],
+            ),
+            string("abc")
+        );
+        assert_eq!(
+            call("iconv_strlen", vec![string("abc"), string("CP367")]),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn substr_returns_empty_string_when_length_ends_before_start() {
+        assert_eq!(
+            call(
+                "iconv_substr",
+                vec![
+                    string("foo"),
+                    Value::Int(2),
+                    Value::Int(-2),
+                    string("UTF-8"),
+                ],
+            ),
+            Value::string(Vec::new())
+        );
     }
 }

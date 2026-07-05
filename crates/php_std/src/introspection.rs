@@ -57,17 +57,27 @@ mod tests {
         assert!(extension_loaded(&registry, "CORE"));
         assert!(extension_loaded(&registry, "curl"));
         assert!(extension_loaded(&registry, "DATE"));
+        assert!(extension_loaded(&registry, "ffi"));
         assert!(extension_loaded(&registry, "JSON"));
         assert!(extension_loaded(&registry, "PCRE"));
         assert!(extension_loaded(&registry, "mbstring"));
         assert!(extension_loaded(&registry, "mysqli"));
         assert!(extension_loaded(&registry, "openssl"));
+        assert!(extension_loaded(&registry, "pcntl"));
         assert!(extension_loaded(&registry, "phar"));
         assert!(extension_loaded(&registry, "pdo"));
+        assert!(extension_loaded(&registry, "pdo_mysql"));
+        assert!(extension_loaded(&registry, "pdo_pgsql"));
         assert!(extension_loaded(&registry, "pdo_sqlite"));
+        assert!(extension_loaded(&registry, "pgsql"));
+        assert!(extension_loaded(&registry, "readline"));
         assert!(extension_loaded(&registry, "reflection"));
         assert!(extension_loaded(&registry, "session"));
+        assert!(extension_loaded(&registry, "shmop"));
         assert!(extension_loaded(&registry, "sqlite3"));
+        assert!(extension_loaded(&registry, "sysvmsg"));
+        assert!(extension_loaded(&registry, "sysvsem"));
+        assert!(extension_loaded(&registry, "sysvshm"));
 
         registry.disable_extension("json").expect("disable json");
         assert!(!extension_loaded(&registry, "Json"));
@@ -84,43 +94,64 @@ mod tests {
             [
                 "apcu",
                 "bcmath",
+                "calendar",
                 "core",
                 "ctype",
                 "curl",
                 "date",
                 "dom",
                 "exif",
+                "ffi",
                 "fileinfo",
                 "filter",
                 "ftp",
                 "gd",
+                "gettext",
                 "gmp",
                 "hash",
                 "iconv",
+                "igbinary",
+                "imap",
                 "intl",
                 "json",
+                "ldap",
                 "mbstring",
                 "memcached",
+                "msgpack",
                 "mysqli",
+                "opcache",
                 "openssl",
+                "pcntl",
                 "pcre",
                 "pdo",
+                "pdo_mysql",
+                "pdo_pgsql",
                 "pdo_sqlite",
+                "pgsql",
                 "phar",
+                "posix",
                 "random",
+                "readline",
                 "redis",
                 "reflection",
                 "session",
+                "shmop",
                 "simplexml",
+                "soap",
                 "sockets",
                 "sodium",
                 "spl",
                 "sqlite3",
+                "ssh2",
                 "standard",
+                "sysvmsg",
+                "sysvsem",
+                "sysvshm",
                 "tokenizer",
                 "xml",
                 "xmlreader",
                 "xmlwriter",
+                "xsl",
                 "zip",
                 "zlib"
             ]
@@ -128,7 +159,7 @@ mod tests {
         let Value::Array(array) = get_loaded_extensions_value(registry) else {
             panic!("expected array");
         };
-        assert_eq!(array.len(), 41);
+        assert_eq!(array.len(), 62);
     }
 
     #[test]
@@ -143,7 +174,13 @@ mod tests {
         assert!(function_exists(&registry, "mysqli_query"));
         assert!(function_exists(&registry, "openssl_digest"));
         assert!(function_exists(&registry, "pdo_drivers"));
+        assert!(function_exists(&registry, "readline_info"));
+        assert!(function_exists(&registry, "shmop_open"));
+        assert!(function_exists(&registry, "msg_get_queue"));
+        assert!(function_exists(&registry, "sem_get"));
+        assert!(function_exists(&registry, "shm_attach"));
         assert!(function_exists(&registry, "imagecreatefromstring"));
+        assert!(function_exists(&registry, "gettext"));
         assert!(!function_exists(&registry, "__php_std_test_probe"));
         assert!(!function_exists(&registry, "composer_missing_function"));
     }

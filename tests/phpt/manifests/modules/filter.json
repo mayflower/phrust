@@ -3,15 +3,28 @@
   "module": "filter",
   "priority": "Validation and sanitization MVP",
   "selected_manifest": "tests/phpt/manifests/modules/filter.selected.jsonl",
-  "corpus_count": 1,
-  "selected_count": 1,
-  "pass_count": 1,
+  "corpus_count": 114,
+  "selected_count": 31,
+  "pass_count": 31,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 0,
-  "scope": ["WordPress-relevant scalar validation and sanitization"],
-  "non_scope": ["Full PHP filter option matrix"],
-  "target_gates": ["just phpt-dev-module MODULE=filter"],
-  "next_step": "Add option-array coverage with min/max ranges."
+  "known_failure_count": 86,
+  "scope": [
+    "WordPress-relevant scalar validation and sanitization",
+    "Common filter metadata and array helper paths",
+    "Int and float min/max range options",
+    "FILTER_CALLBACK metadata and builtin string callback execution"
+  ],
+  "non_scope": [
+    "Remaining 86 ext/filter upstream rows",
+    "Full PHP filter option matrix",
+    "VM-dispatched user callback and closure filter execution",
+    "Missing filter flag constants and exact warning/deprecation text"
+  ],
+  "target_gates": [
+    "cargo test -p php_server server_filter_input_array_reads_query_snapshot",
+    "just phpt-dev-module MODULE=filter"
+  ],
+  "next_step": "Close missing filter flag constants, PHP validator quirks, request input edge cases, and VM-dispatched callback filters before the next upstream promotion."
 }

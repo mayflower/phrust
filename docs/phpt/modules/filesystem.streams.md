@@ -2,7 +2,8 @@
 
 - Priority: 11
 - Selected manifest: `tests/phpt/manifests/modules/filesystem.streams.selected.jsonl`
-- Current counts: 25 PASS, 0 SKIP, 0 FAIL, 0 BORK from 25 selected module fixtures
+- Current target counts: 35 PASS, 10 SKIP, 0 FAIL, 0 BORK from 45 selected
+  module fixtures
 
 ## Scope
 
@@ -13,6 +14,7 @@
 - include/require
 - selected upstream local file, stat, temp, glob, readfile, and
   `stream_get_contents` behavior
+- selected upstream `basename`, `dirname`, and `pathinfo` behavior
 
 ## Non-Scope
 
@@ -33,6 +35,8 @@
 - `ext/standard/tests/file/readfile_variation9.phpt`
 - `ext/standard/tests/file/chmod_variation1.phpt`
 - `ext/standard/tests/file/glob_basic.phpt`
+- 20 target-green upstream `basename`, `dirname`, and `pathinfo` fixtures from
+  `ext/standard/tests/file`
 - `ext/standard/tests/file/lstat_stat_variation1.phpt`
 - `ext/standard/tests/file/lstat_stat_variation2.phpt`
 - `ext/standard/tests/file/tempnam_variation5.phpt`
@@ -227,3 +231,20 @@ helpers, `sys_get_temp_dir`, `tempnam`, `tmpfile`, request-local `umask`,
 directory iteration, stream context defaults/options, and local
 `stream_set_timeout` behavior without adding overlay-specific rows to
 `filesystem.streams`.
+
+## Path Helper Report
+
+The selected upstream path-helper slice now covers PHP-compatible
+`basename`, `dirname`, and `pathinfo` behavior, including suffix stripping,
+empty-path dirname handling, dotfile extension splitting, and combined
+`pathinfo` option priority.
+
+Validation:
+
+- `nix develop -c cargo test -p php_runtime path_helpers --no-fail-fast`: PASS, 1 test
+- `nix develop -c cargo test -p php_runtime filesystem --no-fail-fast`: PASS, 6 tests
+- `PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_MANIFEST=/tmp/phrust-filesystem-path-helpers.jsonl PHPT_REUSE_LAST=0 PHPT_TIMEOUT_SECONDS=10 nix develop -c just phpt-module-target MODULE=filesystem.streams`: PASS, 10 PASS, 10 SKIP
+
+Blocker report: no non-green outcomes remain in the focused
+`basename`/`dirname`/`pathinfo` upstream subset. The 10 SKIP rows are
+Windows-only upstream PHPTs.

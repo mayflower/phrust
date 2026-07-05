@@ -1,7 +1,7 @@
 {
   "schema_version": "phpt-module-plan-v1",
   "module": "ftp",
-  "priority": "Default-disabled FTP surface",
+  "priority": "Loopback-gated FTP control-channel subset",
   "selected_manifest": "tests/phpt/manifests/modules/ftp.selected.jsonl",
   "corpus_count": 1,
   "selected_count": 1,
@@ -10,8 +10,23 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["Deterministic false returns for connection attempts"],
-  "non_scope": ["FTP networking or command protocol support"],
-  "target_gates": ["just phpt-dev-module MODULE=ftp"],
-  "next_step": "Keep external FTP disabled unless a future prompt enables a capability gate."
+  "scope": [
+    "Default-disabled ftp_connect and ftp_ssl_connect behavior",
+    "Registered FTP\\Connection class and PHP-src FTP constants",
+    "Loopback-only ftp_connect, ftp_login, ftp_pwd, ftp_chdir, ftp_raw, ftp_close, and ftp_quit covered by Rust fake-server tests",
+    "Loopback passive ftp_nlist, ftp_rawlist, and ftp_mlsd data-channel reads",
+    "Loopback passive ftp_get, ftp_put, ftp_append, ftp_nb_get, and ftp_nb_put local filename transfers",
+    "Control-channel directory, metadata, SITE, ALLO, chmod, rename, delete, and option APIs",
+    "Stream-resource transfer functions registered with deterministic gap results"
+  ],
+  "non_scope": [
+    "External network FTP",
+    "TLS/SSL FTP",
+    "Active data channels, local stream resource transfers, and true async transfer progress"
+  ],
+  "target_gates": [
+    "cargo test -p php_runtime ftp --no-fail-fast",
+    "just phpt-dev-module MODULE=ftp"
+  ],
+  "next_step": "Bridge PHP stream resources into ftp_fget and ftp_fput before promoting stream-transfer PHPTs."
 }

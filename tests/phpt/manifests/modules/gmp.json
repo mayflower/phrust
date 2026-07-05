@@ -1,7 +1,7 @@
 {
   "schema_version": "phpt-module-plan-v1",
   "module": "gmp",
-  "priority": "BigInt facade MVP",
+  "priority": "Expanded BigInt-backed GMP facade",
   "selected_manifest": "tests/phpt/manifests/modules/gmp.selected.jsonl",
   "corpus_count": 1,
   "selected_count": 1,
@@ -10,8 +10,20 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["String-returning BigInt arithmetic accepted by gmp_strval"],
-  "non_scope": ["Native GMP object identity and full class behavior"],
+  "scope": [
+    "String-returning BigInt values accepted by gmp_strval",
+    "Base parsing and string conversion",
+    "Arithmetic, quotient/remainder, gcd/lcm/invert, roots, and powm",
+    "Bitwise operations, testbit, scans, popcount, and hamdist",
+    "Factorial, binomial, import/export, and deterministic primality helpers"
+  ],
+  "non_scope": [
+    "Native GMP object identity and mutable GMP object behavior",
+    "Full GMP class serialization",
+    "Limb-order import/export flags",
+    "Secure randomness",
+    "Jacobi, Legendre, and Kronecker symbols"
+  ],
   "target_gates": ["just phpt-dev-module MODULE=gmp"],
-  "next_step": "Introduce a real GMP value object when object semantics are needed."
+  "next_step": "Introduce a real GMP value object before enabling mutable object-only APIs."
 }

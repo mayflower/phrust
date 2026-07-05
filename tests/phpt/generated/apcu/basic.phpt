@@ -12,6 +12,18 @@ var_dump(apcu_add("k", "other"));
 var_dump(apcu_exists("k"));
 var_dump(apcu_delete("k"));
 var_dump(apcu_fetch("k"));
+var_dump(apcu_store("count", 4));
+var_dump(apcu_inc("count", 3, $inc_ok));
+var_dump($inc_ok);
+var_dump(apcu_dec("count", 2, $dec_ok));
+var_dump($dec_ok);
+$info = apcu_cache_info();
+var_dump(is_array($info));
+var_dump($info["num_entries"]);
+var_dump(array_key_exists("cache_list", $info));
+$sma = apcu_sma_info();
+var_dump(is_array($sma));
+var_dump($sma["num_seg"]);
 ?>
 --EXPECT--
 bool(true)
@@ -22,3 +34,13 @@ bool(false)
 bool(true)
 bool(true)
 bool(false)
+bool(true)
+int(7)
+bool(true)
+int(5)
+bool(true)
+bool(true)
+int(1)
+bool(true)
+bool(true)
+int(1)

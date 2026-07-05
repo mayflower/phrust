@@ -1,12 +1,13 @@
 //! Debug-output formatting for core inspection builtins.
 
-use crate::{ArrayKey, CallableValue, OutputBuffer, PhpArray, Value, value::FloatValue};
+use crate::{ArrayKey, CallableValue, ObjectRef, OutputBuffer, PhpArray, Value, value::FloatValue};
 use std::collections::BTreeSet;
 
 pub(in crate::builtins::modules) struct DebugFormatter {
     active_references: BTreeSet<usize>,
     active_arrays: BTreeSet<usize>,
     active_objects: BTreeSet<u64>,
+    var_export_saw_recursion: bool,
     /// `serialize_precision` ini value applied to var_dump floats (`-1` selects
     /// the shortest round-trippable representation).
     serialize_precision: i32,
@@ -18,6 +19,7 @@ impl Default for DebugFormatter {
             active_references: BTreeSet::new(),
             active_arrays: BTreeSet::new(),
             active_objects: BTreeSet::new(),
+            var_export_saw_recursion: false,
             serialize_precision: -1,
         }
     }
@@ -29,6 +31,10 @@ impl DebugFormatter {
             serialize_precision,
             ..Self::default()
         }
+    }
+
+    pub(in crate::builtins::modules) const fn var_export_saw_recursion(&self) -> bool {
+        self.var_export_saw_recursion
     }
 
     pub(in crate::builtins::modules) fn write_var_dump_value(
@@ -118,6 +124,50 @@ impl DebugFormatter {
                 self.write_var_dump_value(output, &cell.get(), indent);
                 self.active_references.remove(&id);
             }
+        }
+    }
+
+    pub(in crate::builtins::modules) fn write_debug_zval_dump_value(
+        &mut self,
+        output: &mut OutputBuffer,
+        value: &Value,
+        indent: usize,
+    ) {
+        match value {
+            Value::Object(object) => {
+                if !self.active_objects.insert(object.id()) {
+                    output.write_test_str("*RECURSION*\n");
+                    return;
+                }
+                let properties = object.properties_snapshot();
+                output.write_test_str(&format!(
+                    "object({})#{} ({}) refcount({}){{\n",
+                    object.display_name(),
+                    object.id(),
+                    properties.len(),
+                    object.gc_refcount_estimate().saturating_add(3)
+                ));
+                for (name, property) in properties {
+                    write_indent(output, indent + 2);
+                    let label = object.property_debug_label(&name);
+                    output.write_test_str(&format!("[{label}]=>\n"));
+                    write_indent(output, indent + 2);
+                    self.write_debug_zval_dump_value(output, &property, indent + 2);
+                }
+                write_indent(output, indent);
+                output.write_test_str("}\n");
+                self.active_objects.remove(&object.id());
+            }
+            Value::Reference(cell) => {
+                let id = cell.gc_debug_id();
+                if !self.active_references.insert(id) {
+                    output.write_test_str("*RECURSION*\n");
+                    return;
+                }
+                self.write_debug_zval_dump_value(output, &cell.get(), indent);
+                self.active_references.remove(&id);
+            }
+            value => self.write_var_dump_value(output, value, indent),
         }
     }
 
@@ -390,7 +440,7 @@ impl DebugFormatter {
                     write_indent(output, indent + 2);
                     write_export_key(output, &key);
                     output.write_test_str(" => ");
-                    if var_export_value_starts_multiline(element) {
+                    if self.var_export_child_starts_multiline(element) {
                         output.write_test_str("\n");
                         write_indent(output, indent + 2);
                     }
@@ -401,13 +451,18 @@ impl DebugFormatter {
                 output.write_test_str(")");
             }
             Value::Object(object) => {
+                if !self.active_objects.insert(object.id()) {
+                    self.var_export_saw_recursion = true;
+                    output.write_test_str("NULL");
+                    return;
+                }
                 if object.class_name().eq_ignore_ascii_case("stdClass") {
                     output.write_test_str("(object) array(\n");
                     for (name, property) in object.properties_snapshot() {
                         write_indent(output, indent + 3);
                         write_export_string(output, &name);
                         output.write_test_str(" => ");
-                        if var_export_value_starts_multiline(&property) {
+                        if self.var_export_child_starts_multiline(&property) {
                             output.write_test_str("\n");
                             write_indent(output, indent + 2);
                         }
@@ -416,6 +471,28 @@ impl DebugFormatter {
                     }
                     write_indent(output, indent);
                     output.write_test_str(")");
+                    self.active_objects.remove(&object.id());
+                    return;
+                }
+                if let Some(entries) = spl_fixed_array_export_entries(object) {
+                    output.write_test_str(&format!(
+                        "\\{}::__set_state(array(\n",
+                        object.display_name()
+                    ));
+                    for (key, property) in entries {
+                        write_indent(output, indent + 3);
+                        write_export_key(output, &key);
+                        output.write_test_str(" => ");
+                        if self.var_export_child_starts_multiline(&property) {
+                            output.write_test_str("\n");
+                            write_indent(output, indent + 2);
+                        }
+                        self.write_var_export_value(output, &property, indent + 2);
+                        output.write_test_str(",\n");
+                    }
+                    write_indent(output, indent);
+                    output.write_test_str("))");
+                    self.active_objects.remove(&object.id());
                     return;
                 }
                 output.write_test_str(&format!(
@@ -426,7 +503,7 @@ impl DebugFormatter {
                     write_indent(output, indent + 3);
                     write_export_string(output, &name);
                     output.write_test_str(" => ");
-                    if var_export_value_starts_multiline(&property) {
+                    if self.var_export_child_starts_multiline(&property) {
                         output.write_test_str("\n");
                         write_indent(output, indent + 2);
                     }
@@ -435,6 +512,7 @@ impl DebugFormatter {
                 }
                 write_indent(output, indent);
                 output.write_test_str("))");
+                self.active_objects.remove(&object.id());
             }
             Value::Resource(resource) => {
                 output.write_test_str(&format!("NULL /* resource #{} */", resource.id().get()));
@@ -445,13 +523,68 @@ impl DebugFormatter {
             Value::Reference(cell) => {
                 let id = cell.gc_debug_id();
                 if !self.active_references.insert(id) {
-                    output.write_test_str("NULL /* *RECURSION* */");
+                    self.var_export_saw_recursion = true;
+                    output.write_test_str("NULL");
                     return;
                 }
                 self.write_var_export_value(output, &cell.get(), indent);
                 self.active_references.remove(&id);
             }
         }
+    }
+
+    fn var_export_child_starts_multiline(&self, value: &Value) -> bool {
+        match value {
+            Value::Object(object) if self.active_objects.contains(&object.id()) => false,
+            Value::Reference(cell) => {
+                let value = cell.get();
+                self.var_export_child_starts_multiline(&value)
+            }
+            _ => var_export_value_starts_multiline(value),
+        }
+    }
+}
+
+fn spl_fixed_array_export_entries(object: &ObjectRef) -> Option<Vec<(ArrayKey, Value)>> {
+    if !object_is_spl_fixed_array(object) {
+        return None;
+    }
+    let Some(Value::Array(entries)) = object.get_property("__entries") else {
+        return Some(Vec::new());
+    };
+    Some(
+        entries
+            .iter()
+            .filter_map(|(_, entry)| {
+                let Value::Array(pair) = debug_deref_value(entry) else {
+                    return None;
+                };
+                let key = pair
+                    .get(&ArrayKey::Int(0))
+                    .map(debug_deref_value)
+                    .as_ref()
+                    .and_then(ArrayKey::from_value)?;
+                let value = pair.get(&ArrayKey::Int(1)).cloned().unwrap_or(Value::Null);
+                Some((key, value))
+            })
+            .collect(),
+    )
+}
+
+fn object_is_spl_fixed_array(object: &ObjectRef) -> bool {
+    if object.class_name().eq_ignore_ascii_case("splfixedarray") {
+        return true;
+    }
+    matches!(
+        object.get_property("__spl_runtime_class").as_ref().map(debug_deref_value),
+        Some(Value::String(class_name)) if class_name.to_string_lossy().eq_ignore_ascii_case("splfixedarray")
+    )
+}
+
+fn debug_deref_value(value: &Value) -> Value {
+    match value {
+        Value::Reference(cell) => cell.get(),
+        value => value.clone(),
     }
 }
 

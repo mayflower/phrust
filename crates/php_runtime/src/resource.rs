@@ -335,6 +335,7 @@ struct ResourceState {
     kind: ResourceKind,
     flags: StreamFlags,
     metadata: StreamMetadata,
+    user_closable: bool,
     data: StreamData,
 }
 
@@ -380,6 +381,7 @@ impl ResourceRef {
             kind: ResourceKind::Stream,
             flags,
             metadata,
+            user_closable: true,
             data,
         })))
     }
@@ -426,6 +428,12 @@ impl ResourceRef {
             ResourceKind::FileInfo => "file_info".to_string(),
             ResourceKind::Closed => "Unknown".to_string(),
         }
+    }
+
+    /// Returns whether userland close functions may close this resource.
+    #[must_use]
+    pub fn is_user_closable(&self) -> bool {
+        self.0.borrow().user_closable
     }
 
     /// Writes bytes into writable in-memory, temp, stdio, or file-backed buffers.
@@ -943,6 +951,7 @@ impl ResourceTable {
             kind: ResourceKind::Directory,
             flags: StreamFlags::new(true, false, true),
             metadata: StreamMetadata::new("plainfile", "stream", "r", uri),
+            user_closable: true,
             data: StreamData::Directory {
                 path,
                 entries,
@@ -962,6 +971,7 @@ impl ResourceTable {
             kind: ResourceKind::StreamContext,
             flags: StreamFlags::new(false, false, false),
             metadata: StreamMetadata::new("PHP", "stream-context", "", "stream-context"),
+            user_closable: true,
             data: StreamData::Context { options },
         })));
         self.resources.insert(id, resource.clone());
@@ -977,7 +987,27 @@ impl ResourceTable {
             kind: ResourceKind::FileInfo,
             flags: StreamFlags::new(false, false, false),
             metadata: StreamMetadata::new("fileinfo", "file_info", "", "fileinfo"),
+            user_closable: true,
             data: StreamData::FileInfo,
+        })));
+        self.resources.insert(id, resource.clone());
+        resource
+    }
+
+    /// Registers an internal glob resource that is closed by owner cleanup.
+    pub fn register_internal_glob(&mut self, pattern: impl Into<String>) -> ResourceRef {
+        let id = ResourceId::new(self.next_id);
+        self.next_id += 1;
+        let resource = ResourceRef(Rc::new(RefCell::new(ResourceState {
+            id,
+            kind: ResourceKind::Stream,
+            flags: StreamFlags::new(true, false, false),
+            metadata: StreamMetadata::new("glob", "stream", "r", pattern),
+            user_closable: false,
+            data: StreamData::Memory {
+                buffer: Vec::new(),
+                cursor: 0,
+            },
         })));
         self.resources.insert(id, resource.clone());
         resource
@@ -1007,6 +1037,12 @@ impl ResourceTable {
     #[must_use]
     pub fn get(&self, id: ResourceId) -> Option<ResourceRef> {
         self.resources.get(&id).cloned()
+    }
+
+    /// Returns all resources in stable resource-id order.
+    #[must_use]
+    pub fn resources(&self) -> Vec<ResourceRef> {
+        self.resources.values().cloned().collect()
     }
 
     /// Closes a resource by ID. Double-close is safe and returns `false`.

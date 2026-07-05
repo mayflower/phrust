@@ -1,0 +1,33 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "core",
+  "priority": "Core platform symbol, exception, and INI compatibility slice",
+  "selected_manifest": "tests/phpt/manifests/modules/core.selected.jsonl",
+  "corpus_count": 0,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "Pinned PHP 8.5.7 version constants",
+    "Core error constants used by framework bootstrap checks",
+    "extension_loaded, php_sapi_name, and INI function visibility",
+    "Selected ini_get, ini_set, and ini_get_all behavior",
+    "Core get_defined_constants and get_defined_functions visibility",
+    "Core throwable, exception, and error class/interface visibility"
+  ],
+  "non_scope": [
+    "Full php-src Zend and core PHPT corpus",
+    "Complete INI mode/access enforcement",
+    "get_cfg_var value parity for runtime defaults",
+    "Exact exception object behavior beyond symbol visibility"
+  ],
+  "target_gates": [
+    "nix develop -c cargo test -p php_runtime core --no-fail-fast",
+    "nix develop -c cargo test -p php_std core --no-fail-fast",
+    "nix develop -c just phpt-dev-module MODULE=core"
+  ],
+  "next_step": "Promote narrow upstream Zend/core PHPTs for INI access modes, get_cfg_var, and exception object methods as runtime parity improves."
+}

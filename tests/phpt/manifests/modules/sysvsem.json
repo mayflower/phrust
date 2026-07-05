@@ -1,0 +1,17 @@
+{
+  "schema_version":"phpt-module-plan-v1",
+  "module":"sysvsem",
+  "priority":"System V semaphore compatibility MVP",
+  "selected_manifest":"tests/phpt/manifests/modules/sysvsem.selected.jsonl",
+  "corpus_count":2,
+  "selected_count":1,
+  "pass_count":1,
+  "skip_count":0,
+  "fail_count":0,
+  "bork_count":0,
+  "known_failure_count":2,
+  "scope":["extension visibility","SysvSemaphore class visibility","request-local semaphore handles","acquire/release limit behavior","nonblocking failure","semaphore removal"],
+  "non_scope":["cross-process System V semaphores","host semaphore IDs","kernel auto-release behavior","blocking wait behavior"],
+  "target_gates":["nix develop -c cargo test -p php_runtime sysvsem","nix develop -c cargo test -p php_std sysv","nix develop -c just phpt-dev-module MODULE=sysvsem"],
+  "next_step":"Promote upstream sysvsem PHPTs after host-backed System V semaphores are available behind deadlock-safe cleanup."
+}

@@ -2,7 +2,7 @@
 
 - Priority: media/archive MIME MVP
 - Selected manifest: `tests/phpt/manifests/modules/fileinfo.selected.jsonl`
-- Current focused snapshot: 1 PASS, 0 SKIP, 0 FAIL, 0 BORK from 1 selected
+- Current focused snapshot: 2 PASS, 0 SKIP, 0 FAIL, 0 BORK from 2 selected
   generated fixture
 
 ## Scope
@@ -10,7 +10,7 @@
 - `finfo_open`, `finfo_file`, `finfo_buffer`, and `finfo_close`
 - `mime_content_type`
 - Deterministic MIME sniffing for selected upload/archive payloads:
-  PNG, JPEG, GIF, PDF, ZIP, JSON, XML/SVG, and plain text
+  PNG, JPEG, GIF, PDF, ZIP, JSON, XML, SVG, and plain text
 
 ## Non-Scope
 
@@ -22,6 +22,7 @@
 ## Selected PHPT Fixtures
 
 - `tests/phpt/generated/fileinfo/mime-basic.phpt`
+- `tests/phpt/generated/fileinfo/svg.phpt`
 
 ## Relevant Source Areas
 

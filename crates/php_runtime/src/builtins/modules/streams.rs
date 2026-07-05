@@ -171,12 +171,23 @@ pub(in crate::builtins::modules) fn builtin_fopen(
     }
 }
 pub(in crate::builtins::modules) fn builtin_fclose(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("fclose", &args, 1)?;
-    Ok(resource_arg(&args[0]).map_or(Value::Bool(false), |resource| Value::Bool(resource.close())))
+    let Some(resource) = resource_arg(&args[0]) else {
+        return Ok(Value::Bool(false));
+    };
+    if !resource.is_user_closable() {
+        context.php_warning(
+            "E_PHP_RUNTIME_RESOURCE_NOT_USER_CLOSABLE",
+            "fclose(): cannot close the provided stream, as it must not be manually closed",
+            span,
+        );
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(resource.close()))
 }
 pub(in crate::builtins::modules) fn builtin_fread(
     _context: &mut BuiltinContext<'_>,

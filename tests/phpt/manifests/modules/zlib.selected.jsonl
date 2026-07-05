@@ -1,4 +1,5 @@
 {"path":"tests/phpt/generated/zlib/compression-basic.phpt"}
+{"path":"tests/phpt/generated/zlib/gzip-stream-helpers.phpt"}
 {"path":"ext/zlib/tests/gzcompress_basic1.phpt"}
 {"path":"ext/zlib/tests/gzdeflate_basic1.phpt"}
 {"path":"ext/zlib/tests/gzdeflate_variation1.phpt"}

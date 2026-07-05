@@ -2,12 +2,15 @@
 
 - Strategy: bounded UTF-8 MVP
 - Selected manifest: `tests/phpt/manifests/modules/mbstring.selected.jsonl`
-- Selected gate: 3 generated PHPTs covering platform visibility, UTF-8 common
+- Selected gate: 77 PHPTs covering platform visibility, UTF-8 common
   functions, UTF-8/ASCII detection, request-local internal encoding, and narrow
-  UTF-8 conversion
-- Corpus snapshot: 420 `mbstring`-owned candidates in
-  `tests/phpt/manifests/phpt-corpus.jsonl`; committed baseline counts are
-  3 PASS, 36 SKIP, 360 FAIL, 21 BORK, and 414 known non-green outcomes.
+  UTF-8 conversion, bounded UTF-8 position helpers, and 73 target-green
+  upstream rows
+- Selected target-only gate: 22 PASS, 55 SKIP, 0 FAIL, 0 BORK from 77 selected
+  fixtures.
+- Upstream target-only snapshot: 417 `ext/mbstring/tests` candidates measured
+  as 18 PASS, 55 SKIP, 344 FAIL, 0 BORK. The selected target gate is expected
+  to be 22 PASS and 55 SKIP after adding the four generated fixtures.
 
 ## Decision
 
@@ -17,11 +20,12 @@ Enable a deliberately narrow mbstring surface for Composer and framework probes:
 - `mb_substr`
 - `mb_strtolower`
 - `mb_strtoupper`
+- `mb_strpos`
+- `mb_stripos`
 - `mb_detect_encoding`
 - `mb_check_encoding`
 - `mb_internal_encoding`
 - `mb_convert_encoding` for UTF-8 to UTF-8 only
-- `mb_strpos`
 
 The implementation uses the existing runtime and Rust standard-library Unicode
 primitives. It does not introduce a full encoding database, mbregex, Oniguruma,
@@ -29,9 +33,11 @@ locale data, or broad upstream `ext/mbstring` parity.
 
 The default project oracle at
 `/Volumes/CrucialMusic/src/phrust/third_party/php-src/sapi/cli/php` was built
-without mbstring. The selected selected outputs were captured from a temporary
-read-only PHP 8.5.7 clone at `/tmp/php-src-mbstring-oracle/sapi/cli/php` built
-from the same php-src checkout with `--enable-mbstring --disable-mbregex`.
+without mbstring. A previous temporary read-only PHP 8.5.7 clone at
+`/tmp/php-src-mbstring-oracle/sapi/cli/php` is currently absent in this
+checkout, so the upstream promotion evidence here is target-only. The normal
+`phpt-dev-module` reference phase fails on the four generated mbstring fixtures
+until that oracle is rebuilt.
 
 ## Runtime Contract
 
@@ -52,8 +58,10 @@ Required for this strategy:
 - `tests/phpt/generated/mbstring/platform-checks.phpt`
 - `tests/phpt/generated/mbstring/utf8-common-functions.phpt`
 - `tests/phpt/generated/mbstring/utf8-encoding-state.phpt`
+- `tests/phpt/generated/mbstring/utf8-position-functions.phpt`
+- 73 target-green upstream rows from `ext/mbstring/tests`
 - `tests/phpt/generated/wp.stdlib/text-encoding-basic.phpt` covers the
-  `mb_strpos` addition selected by the WordPress stdlib harness.
+  WordPress stdlib text-encoding integration path.
 
 These PHPTs keep the enabled surface explicit and reference-backed without
 promoting the full upstream mbstring corpus.
@@ -109,6 +117,5 @@ Out of scope for this MVP:
 ## Target Gates
 
 - `nix develop -c cargo test -p php_runtime`
-- `REFERENCE_PHP=/tmp/php-src-mbstring-oracle/sapi/cli/php PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_DISABLE_REFERENCE_REUSE=1 PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=mbstring`
-- `nix develop -c just verify-stdlib`
-- `nix develop -c just verify-phpt`
+- `PHP_SRC_DIR=/Volumes/CrucialMusic/src/phrust/third_party/php-src PHPT_DISABLE_REFERENCE_REUSE=1 PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-module-target MODULE=mbstring`
+- `nix develop -c cargo test -p php_std mbstring`

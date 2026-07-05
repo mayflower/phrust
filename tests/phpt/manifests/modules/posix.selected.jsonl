@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/posix/basic.phpt","module":"posix","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers bounded host-backed POSIX helpers, constants, uname shape, and last-error behavior"}

@@ -2,19 +2,20 @@
 
 - Strategy: bounded XML-backed DOM MVP
 - Classification: optional, enabled for `DOMDocument`, `DOMElement`,
-  `DOMNode`, and `DOMNodeList`
+  `DOMText`, `DOMNode`, and `DOMNodeList`
 - Selected manifest: `tests/phpt/manifests/modules/dom.selected.jsonl`
-- Selected gate: 3 generated PHPTs covering platform visibility,
+- Selected gate: 4 generated PHPTs covering platform visibility,
   `DOMDocument::loadXML`/`saveXML`, node-list lookup, attributes, and bounded
   mutation
 
 ## Runtime Contract
 
 - `extension_loaded("dom")` returns `true`.
-- `DOMDocument`, `DOMElement`, `DOMNode`, and `DOMNodeList` exist.
+- `DOMDocument`, `DOMElement`, `DOMText`, `DOMNode`, and `DOMNodeList` exist.
 - `DOMDocument::loadXML()` parses the shared strict XML tree.
 - `DOMDocument::saveXML()` serializes that tree.
 - `DOMDocument::createElement()` creates XML-backed element objects.
+- `DOMDocument::createTextNode()` creates bounded `DOMText` objects.
 - `DOMDocument::appendChild()` sets the document root for constructed
   documents.
 - `DOMDocument::getElementsByTagName()` returns a countable, iterable
@@ -24,12 +25,15 @@
 - `DOMElement` exposes `nodeName`, `nodeValue`, `tagName`, and `textContent`.
 - `DOMElement::getAttribute()`, `setAttribute()`, and bounded `appendChild()`
   operate on that element object.
+- `DOMText` exposes `nodeName`, `nodeValue`, `textContent`, and `data`; appending
+  it to a `DOMElement` serializes escaped text content.
 
 ## Required PHPTs
 
 - `tests/phpt/generated/dom/platform-checks.phpt`
 - `tests/phpt/generated/dom/domdocument-basic.phpt`
 - `tests/phpt/generated/dom/domdocument-node-apis.phpt`
+- `tests/phpt/generated/dom/domtext-node-apis.phpt`
 
 ## Unsupported Area
 

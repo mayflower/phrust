@@ -4,14 +4,14 @@
   "priority":"data-platform classification",
   "selected_manifest":"tests/phpt/manifests/modules/phar.selected.jsonl",
   "corpus_count":553,
-  "selected_count":1,
-  "pass_count":1,
+  "selected_count":2,
+  "pass_count":2,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
-  "known_failure_count":552,
-  "scope":["extension_loaded(\"phar\")","Phar class platform probes","read-only local phar:// reads and includes","Composer PHAR policy"],
-  "non_scope":["signing","compression","stub execution","archive mutation APIs"],
+  "known_failure_count":551,
+  "scope":["extension_loaded(\"phar\")","Phar class platform probes","read-only local phar:// reads and includes","read-only Phar metadata methods","Composer PHAR policy"],
+  "non_scope":["signing","compression","metadata unserialization","stub execution","archive mutation APIs"],
   "target_gates":["nix develop -c just phpt-dev-module MODULE=phar","nix develop -c just composer-smoke","nix develop -c just verify-phpt"],
-  "next_step":"Keep the read-only PHAR MVP green while deferring signing, compression, stub execution, and mutation APIs."
+  "next_step":"Keep the read-only PHAR MVP green while deferring signing, compression, metadata unserialization, stub execution, and mutation APIs."
 }

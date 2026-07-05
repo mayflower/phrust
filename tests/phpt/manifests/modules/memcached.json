@@ -1,7 +1,7 @@
 {
   "schema_version": "phpt-module-plan-v1",
   "module": "memcached",
-  "priority": "Disabled external Memcached surface",
+  "priority": "Deterministic in-process Memcached fake backend",
   "selected_manifest": "tests/phpt/manifests/modules/memcached.selected.jsonl",
   "corpus_count": 1,
   "selected_count": 1,
@@ -10,8 +10,21 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["Extension and class introspection only"],
-  "non_scope": ["External Memcached network connections and command emulation"],
+  "scope": [
+    "Extension and class introspection",
+    "Memcached construction and method_exists probes",
+    "addServer/addServers and getServerList",
+    "get/set/add/replace/delete and multi-key cache operations",
+    "increment/decrement, touch, flush, options, result codes/messages",
+    "append/prepend, CAS-shaped writes, empty stats/version placeholders"
+  ],
+  "non_scope": [
+    "External Memcached daemon protocol",
+    "Persistent sockets and persistent ID pooling",
+    "Binary protocol, TLS, SASL, and session handlers",
+    "Real TTL expiry, serializer wire-format compatibility, and compression",
+    "Live daemon result-code transition parity"
+  ],
   "target_gates": ["just phpt-dev-module MODULE=memcached"],
-  "next_step": "Add explicit local adapter only after the contract is approved."
+  "next_step": "Add opt-in live-daemon tests once a network adapter contract is approved."
 }

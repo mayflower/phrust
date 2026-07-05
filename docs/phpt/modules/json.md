@@ -1,8 +1,8 @@
 # json
 
-- Priority: 17.6 closed
+- Priority: 17.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/json.selected.jsonl`
-- the selected close gate: 24 PASS, 0 SKIP, 0 FAIL, 0 BORK from 24 selected fixtures
+- the selected close gate: 72 PASS, 3 SKIP, 0 FAIL, 0 BORK from 75 selected fixtures
 
 ## Scope
 
@@ -12,14 +12,22 @@
 - `JSON_THROW_ON_ERROR` failure routing
 - `JSON_FORCE_OBJECT`, default Unicode escaping, decode depth/state/control
   diagnostics, `JSON_BIGINT_AS_STRING`, and recursive encode diagnostics
+- `json_validate` general usage, argument errors, depth errors, invalid UTF-8,
+  and parity against selected `json_decode` inputs
+- `json_encode` invalid UTF-8 ignore/substitute modes and selected
+  `JSON_THROW_ON_ERROR` error-clearing behavior
+- All upstream `ext/json` rows that are currently target-green in the full
+  target sweep, including decode error rows, invalid UTF-8 rows, U+2028/U+2029
+  encoding, unsupported-type errors, and selected historical bug rows.
 
 ## Non-Scope
 
-- Full upstream `ext/json` corpus
-- `JsonSerializable` userland dispatch until JSON encoding has a clean VM
-  method-call bridge
-- Invalid UTF-8 recovery modes and complete JSON flag parity
-- `json_validate`
+- Remaining upstream rows that require `JsonSerializable` userland method
+  dispatch from the runtime builtin layer.
+- Exact `JsonException` debug/var_dump shape parity.
+- Recursion fixtures whose expected behavior depends on `JsonSerializable`
+  dispatch.
+- Complete JSON flag parity beyond the promoted upstream rows
 
 ## Selected PHPT Fixtures
 
@@ -47,6 +55,15 @@
 - `ext/json/tests/pass002.phpt`
 - `ext/json/tests/pass003.phpt`
 - `ext/json/tests/json_encode_pretty_print2.phpt`
+- `ext/json/tests/json_validate_001.phpt`
+- `ext/json/tests/json_validate_002.phpt`
+- `ext/json/tests/json_validate_003.phpt`
+- `ext/json/tests/json_validate_004.phpt`
+- `ext/json/tests/json_validate_005.phpt`
+- `ext/json/tests/json_encode_invalid_utf8.phpt`
+- `ext/json/tests/json_exceptions_error_clearing.phpt`
+- all additional target-green upstream rows from the latest full `ext/json`
+  target sweep, for 70 selected upstream rows total.
 
 ## Relevant Source Areas
 
@@ -62,13 +79,18 @@
 
 ## Evidence
 
-- Replaced the broad 88-test selected manifest with a focused selected harness.
+- Expanded the selected harness from 31 rows to 75 rows: 5 generated fixtures,
+  67 upstream PASS rows, and 3 upstream SKIP rows.
 - Added generated oracle fixtures for encode basics, encode common flags, decode
   basics, last-error state transitions, and `JSON_THROW_ON_ERROR`.
 - Promoted upstream `ext/json/tests/001.phpt` through `009.phpt` after the
   target and reference probes both reached 9 PASS.
-- Latest focused target run: 24 PASS, 0 FAIL.
-- Latest focused reference run: 24 PASS.
+- Promoted upstream `json_validate_001.phpt` through `json_validate_005.phpt`,
+  `json_encode_invalid_utf8.phpt`, and `json_exceptions_error_clearing.phpt`
+  after focused target probes reached PASS.
+- Latest full upstream target sweep before promotion: 67 PASS, 3 SKIP, 18 FAIL.
+- Latest selected module gate after promotion, with reference reuse disabled:
+  target 72 PASS / 3 SKIP; reference 75 PASS; 0 non-green outcomes.
 
 ## Known Gaps
 
@@ -80,14 +102,24 @@
 - `json_decode` now enforces selected depth failures, preserves selected big
   integers with `JSON_BIGINT_AS_STRING`, and distinguishes selected state
   mismatch and control-character diagnostics.
+- `json_validate` now matches selected upstream general, error, depth, invalid
+  UTF-8, and decode-comparison rows.
+- `json_encode` now matches selected upstream invalid UTF-8 ignore and
+  substitute rows.
 - `JSON_THROW_ON_ERROR` decode failures now route to catchable `JsonException`
-  through the existing VM throwable path.
-- `JsonSerializable` is deliberately left as `STDLIB-GAP-JSONSERIALIZABLE-DISPATCH`:
+  through the existing VM throwable path and preserve selected last-error
+  clearing semantics.
+- `JsonSerializable` remains `STDLIB-GAP-JSONSERIALIZABLE-DISPATCH`:
   `json_encode` is a runtime builtin and there is not yet a clean VM method-call
   bridge for invoking userland `jsonSerialize()`.
+- Remaining upstream failures are now narrowed to 18 rows:
+  `bug61978.phpt`, `bug66025.phpt`, `bug68992.phpt`, `bug71835.phpt`,
+  `bug72069.phpt`, `bug73113.phpt`, `bug77843.phpt`,
+  `json_decode_exceptions.phpt`, `json_encode_exceptions.phpt`,
+  `json_encode_recursion_01.phpt` through `json_encode_recursion_06.phpt`,
+  `pass001.1.phpt`, `pass001.1_64bit.phpt`, and `serialize.phpt`.
 
 ## Next Step
 
-The selected gate is closed for the selected JSON module. Keep
-`STDLIB-GAP-JSONSERIALIZABLE-DISPATCH` as the next semantic expansion point once
-runtime builtins have a clean bridge into VM userland method dispatch.
+Implement a VM-backed `JsonSerializable` dispatch bridge for runtime builtins,
+then promote the remaining upstream rows.

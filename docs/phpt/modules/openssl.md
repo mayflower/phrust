@@ -2,7 +2,7 @@
 
 - Strategy: deterministic crypto helper MVP
 - Selected manifest: `tests/phpt/manifests/modules/openssl.selected.jsonl`
-- Selected gate: 4 PASS
+- Selected gate: 5 PASS
 
 ## Implemented Surface
 
@@ -11,24 +11,36 @@ application update, hashing, and security probes:
 
 - `openssl_random_pseudo_bytes`
 - `openssl_digest`
+- `openssl_encrypt`
+- `openssl_decrypt`
 - `openssl_get_md_methods`
 - `openssl_get_cipher_methods`
 - `openssl_cipher_iv_length`
 - `openssl_verify`
 - `OPENSSL_ALGO_SHA256`
+- `OPENSSL_RAW_DATA`
+- `OPENSSL_ZERO_PADDING`
+- `OPENSSL_DONT_ZERO_PAD_KEY`
 
 Digest support is implemented for the selected hash families backed by Rust
 digest crates. `openssl_random_pseudo_bytes()` uses OS randomness.
-Cipher metadata is limited to the selected AES-CBC probes.
+Cipher metadata and encrypt/decrypt behavior are limited to selected
+AES-128-CBC and AES-256-CBC probes backed by OpenSSL. `OPENSSL_RAW_DATA` and
+`OPENSSL_ZERO_PADDING` are covered by deterministic AES-CBC fixtures.
+`OPENSSL_DONT_ZERO_PAD_KEY` is exposed for PHP-visible constant parity but
+returns the selected false result until key-length override behavior is
+implemented. Selected cipher failures and unsupported public-key helpers append
+request-local OpenSSL error strings that `openssl_error_string()` drains in FIFO
+order, returning `false` when the queue is empty.
 `openssl_verify()` intentionally returns the explicit unsupported verification
 result covered by the selected fixture; it does not fake signature validation.
 
 ## Gaps
 
 Certificate parsing, key loading, signature verification parity,
-`openssl_encrypt`, `openssl_decrypt`, stream TLS contexts, host OpenSSL
-configuration, and certificate-store behavior remain unsupported until backed by
-deterministic fixtures and an approved dependency strategy.
+AEAD cipher modes, stream TLS contexts, host OpenSSL configuration, and
+certificate-store behavior remain unsupported until backed by deterministic
+fixtures and an approved dependency strategy.
 
 ## Source References
 

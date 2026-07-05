@@ -3,15 +3,15 @@
   "module":"zip",
   "priority":"plugin/theme archive handling",
   "selected_manifest":"tests/phpt/manifests/modules/zip.selected.jsonl",
-  "corpus_count":2,
-  "selected_count":2,
-  "pass_count":2,
+  "corpus_count":3,
+  "selected_count":3,
+  "pass_count":3,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":0,
-  "scope":["ZipArchive open","close","count","getFromName","getFromIndex","getNameIndex","locateName","statName","statIndex","extractTo"],
+  "scope":["ZipArchive open","close","count","getFromName","getFromIndex","getNameIndex","locateName","statName","statIndex","extractTo","zip_open","zip_read","zip_close","zip_entry_open","zip_entry_read","zip_entry_close","zip_entry_name","zip_entry_filesize","zip_entry_compressedsize","zip_entry_compressionmethod"],
   "non_scope":["encryption","archive comments","zip64 parity","zip:// stream wrapper","archive writing"],
   "target_gates":["nix develop -c cargo test -p php_vm","nix develop -c just phpt-dev-module MODULE=zip"],
-  "next_step":"Keep extraction root-constrained and add write/create support only with explicit fixtures."
+  "next_step":"Keep extraction root-constrained and expand write/create metadata only with explicit fixtures."
 }

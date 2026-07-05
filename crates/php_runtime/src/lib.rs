@@ -63,7 +63,10 @@ pub mod api {
     pub use crate::builtins::{
         ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
         BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState,
-        IconvEncodingState, InternalFunction, RuntimeSourceSpan, StreamContextState, StrtokState,
+        FtpOptionValue, FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction,
+        LdapState, OpcacheState, OpenSslErrorState, PcntlState, ReadlineState, RuntimeSourceSpan,
+        ShmopState, SoapState, SocketState, Ssh2State, StreamContextState, StrtokState,
+        SysvMessageQueueState, SysvSemaphoreState, SysvSharedMemoryState,
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
@@ -87,6 +90,11 @@ pub mod api {
         MYSQLI_REPORT_INDEX, MYSQLI_REPORT_OFF, MYSQLI_REPORT_STRICT, MYSQLI_SQLITE_COMPAT_ENV,
         MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION, MysqlCell, MysqlConnectOptions,
         MysqlConnection, MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
+    };
+    pub use crate::db::postgres::{
+        PGSQL_ASSOC, PGSQL_BOTH, PGSQL_NUM, POSTGRES_TEST_DSN_ENV, PostgresConnectOptions,
+        PostgresConnection, PostgresError, PostgresErrorKind, PostgresField, PostgresQueryResult,
+        PostgresRow, PostgresState,
     };
     pub use crate::diagnostic::{
         JsonDiagnosticContext, PhpReferenceClassification, RuntimeBringupDiagnosticContext,
@@ -202,8 +210,11 @@ pub use array::{
 pub use autoload::AutoloadRegistry;
 pub use builtins::{
     ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
-    BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState,
-    IconvEncodingState, InternalFunction, RuntimeSourceSpan, StreamContextState, StrtokState,
+    BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState, FtpOptionValue,
+    FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction, LdapState,
+    OpcacheState, OpenSslErrorState, PcntlState, ReadlineState, RuntimeSourceSpan, ShmopState,
+    SoapState, SocketState, Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState,
+    SysvSemaphoreState, SysvSharedMemoryState,
 };
 pub use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
@@ -226,6 +237,11 @@ pub use db::mysql::{
     MYSQLI_REPORT_INDEX, MYSQLI_REPORT_OFF, MYSQLI_REPORT_STRICT, MYSQLI_SQLITE_COMPAT_ENV,
     MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION, MysqlCell, MysqlConnectOptions, MysqlConnection,
     MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
+};
+pub use db::postgres::{
+    PGSQL_ASSOC, PGSQL_BOTH, PGSQL_NUM, POSTGRES_TEST_DSN_ENV, PostgresConnectOptions,
+    PostgresConnection, PostgresError, PostgresErrorKind, PostgresField, PostgresQueryResult,
+    PostgresRow, PostgresState,
 };
 pub use diagnostic::{
     JsonDiagnosticContext, PhpReferenceClassification, RuntimeBringupDiagnosticContext,

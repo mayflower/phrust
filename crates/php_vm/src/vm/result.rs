@@ -30,6 +30,8 @@ pub struct VmResult {
     pub(super) returned_explicitly: bool,
     /// Process exit code when PHP `exit`/`die` terminated the script.
     pub process_exit_code: Option<i32>,
+    /// Whether the process must terminate directly instead of returning to the caller.
+    pub process_exit_terminates_process: bool,
     pub(super) yielded: Option<super::GeneratorYield>,
     pub(super) fiber_suspension: Option<super::FiberSuspension>,
     pub(super) return_ref: Option<ReferenceCell>,
@@ -116,6 +118,7 @@ impl VmResult {
             return_value,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -144,6 +147,7 @@ impl VmResult {
             return_value,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -160,9 +164,10 @@ impl VmResult {
         Self::success_with_diagnostics(OutputBuffer::new(), return_value, diagnostics)
     }
 
-    pub(super) fn script_exit(output: OutputBuffer, code: i32) -> Self {
+    pub(super) fn script_exit(output: OutputBuffer, code: i32, terminates_process: bool) -> Self {
         let mut result = Self::success(output, None);
         result.process_exit_code = Some(code);
+        result.process_exit_terminates_process = terminates_process;
         result
     }
 
@@ -181,6 +186,7 @@ impl VmResult {
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -201,6 +207,7 @@ impl VmResult {
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -221,6 +228,7 @@ impl VmResult {
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,
@@ -247,6 +255,7 @@ impl VmResult {
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
+            process_exit_terminates_process: false,
             yielded: None,
             fiber_suspension: None,
             return_ref: None,

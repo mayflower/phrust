@@ -1,0 +1,2 @@
+{"path":"tests/phpt/generated/pdo_mysql/platform-checks.phpt"}
+{"path":"tests/phpt/generated/pdo_mysql/live-basic-dsn.phpt","module":"pdo_mysql","kind":"contract","generated_timestamp":"20260705T000000Z","generator_version":"phpt-pdo-mysql-v2","reason":"covers opt-in live PDO MySQL connection query prepare fetch and quote through PHRUST_MYSQL_TEST_DSN"}

@@ -1,0 +1,31 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "ssh2",
+  "priority": "Deterministic SSH2 facade and libssh2 backend gap",
+  "selected_manifest": "tests/phpt/manifests/modules/ssh2.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "Registered SSH2 functions, facade classes, and common constants",
+    "Request-local SSH2 session handles without implicit network access",
+    "Request-local SFTP handle modeling attached to sessions",
+    "Credential-safe auth failures without logging usernames, passwords, or key passphrases",
+    "Deterministic methods/fingerprint shapes for app control flow",
+    "Explicit failure for exec, shell, tunnel, SCP, and backend-required SFTP operations"
+  ],
+  "non_scope": [
+    "libssh2 backend integration",
+    "Live SSH server integration tests",
+    "Real authentication, command execution, channels, forwarding, SCP, SFTP filesystem mutation, and host key validation"
+  ],
+  "target_gates": [
+    "cargo test -p php_runtime ssh2 --no-fail-fast",
+    "just phpt-dev-module MODULE=ssh2"
+  ],
+  "next_step": "Add a libssh2-backed opt-in fixture before promoting live SSH2 integration tests."
+}

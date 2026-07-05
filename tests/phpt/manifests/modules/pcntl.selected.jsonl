@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/pcntl/basic.phpt","module":"pcntl","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers CLI process-control visibility, common constants, async signal flag state, handler storage, alarm cancellation, fork/waitpid status helpers, and errno behavior"}

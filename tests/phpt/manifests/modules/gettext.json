@@ -1,0 +1,27 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "gettext",
+  "priority": "gettext fallback and binding MVP",
+  "selected_manifest": "tests/phpt/manifests/modules/gettext.selected.jsonl",
+  "corpus_count": 19,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "ext/gettext function and reflection surface",
+    "Untranslated fallback behavior",
+    "Request-local textdomain, bindtextdomain, and codeset state",
+    "Plural fallback selection and LC_ALL category guard"
+  ],
+  "non_scope": [
+    "MO catalog parsing",
+    "Locale search paths",
+    "Plural-form expression evaluation",
+    "Native libintl binding"
+  ],
+  "target_gates": ["just phpt-dev-module MODULE=gettext"],
+  "next_step": "Add an MO parser or libintl-backed implementation with catalog fixtures and promote upstream ext/gettext PHPTs that exercise real locale data."
+}

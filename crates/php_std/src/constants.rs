@@ -58,6 +58,50 @@ pub const M_SQRT2: FloatValue = FloatValue::from_f64(std::f64::consts::SQRT_2);
 pub const M_SQRT1_2: FloatValue = FloatValue::from_f64(std::f64::consts::FRAC_1_SQRT_2);
 /// Square root of 3.
 pub const M_SQRT3: FloatValue = FloatValue::from_f64(1.732_050_807_568_877_2);
+
+/// Gregorian calendar ID.
+pub const CAL_GREGORIAN: i64 = 0;
+/// Julian calendar ID.
+pub const CAL_JULIAN: i64 = 1;
+/// Jewish calendar ID.
+pub const CAL_JEWISH: i64 = 2;
+/// French republican calendar ID.
+pub const CAL_FRENCH: i64 = 3;
+/// Number of calendar IDs.
+pub const CAL_NUM_CALS: i64 = 4;
+/// Return numeric day of week from `jddayofweek`.
+pub const CAL_DOW_DAYNO: i64 = 0;
+/// Return long day name from `jddayofweek`.
+pub const CAL_DOW_LONG: i64 = 1;
+/// Return abbreviated day name from `jddayofweek`.
+pub const CAL_DOW_SHORT: i64 = 2;
+/// Return abbreviated Gregorian month name from `jdmonthname`.
+pub const CAL_MONTH_GREGORIAN_SHORT: i64 = 0;
+/// Return long Gregorian month name from `jdmonthname`.
+pub const CAL_MONTH_GREGORIAN_LONG: i64 = 1;
+/// Return abbreviated Julian month name from `jdmonthname`.
+pub const CAL_MONTH_JULIAN_SHORT: i64 = 2;
+/// Return long Julian month name from `jdmonthname`.
+pub const CAL_MONTH_JULIAN_LONG: i64 = 3;
+/// Return Jewish month name from `jdmonthname`.
+pub const CAL_MONTH_JEWISH: i64 = 4;
+/// Return French republican month name from `jdmonthname`.
+pub const CAL_MONTH_FRENCH: i64 = 5;
+/// Default Easter calculation mode.
+pub const CAL_EASTER_DEFAULT: i64 = 0;
+/// Roman Easter calculation mode.
+pub const CAL_EASTER_ROMAN: i64 = 1;
+/// Always use Gregorian Easter calculation mode.
+pub const CAL_EASTER_ALWAYS_GREGORIAN: i64 = 2;
+/// Always use Julian Easter calculation mode.
+pub const CAL_EASTER_ALWAYS_JULIAN: i64 = 3;
+/// Hebrew formatting flag.
+pub const CAL_JEWISH_ADD_ALAFIM_GERESH: i64 = 2;
+/// Hebrew formatting flag.
+pub const CAL_JEWISH_ADD_ALAFIM: i64 = 4;
+/// Hebrew formatting flag.
+pub const CAL_JEWISH_ADD_GERESHAYIM: i64 = 8;
+
 /// Round halves away from zero.
 pub const PHP_ROUND_HALF_UP: i64 = 1;
 /// Round halves toward zero.
@@ -324,8 +368,10 @@ pub const IMAGETYPE_AVIF: i64 = 19;
 pub const IMAGETYPE_JPEG2000: i64 = IMAGETYPE_JPC;
 /// HEIF image type.
 pub const IMAGETYPE_HEIF: i64 = 20;
+/// SVG image type.
+pub const IMAGETYPE_SVG: i64 = 21;
 /// First dynamic image type id.
-pub const IMAGETYPE_COUNT: i64 = 21;
+pub const IMAGETYPE_COUNT: i64 = 22;
 
 /// PHP `PASSWORD_DEFAULT` algorithm marker.
 pub const PASSWORD_DEFAULT: &str = "2y";
@@ -352,19 +398,19 @@ pub const SORT_NATURAL: i64 = 6;
 pub const SORT_FLAG_CASE: i64 = 8;
 
 /// Locale category for all locale settings.
-pub const LC_ALL: i64 = 6;
+pub const LC_ALL: i64 = 0;
 /// Locale category for character classification and conversion.
-pub const LC_CTYPE: i64 = 0;
+pub const LC_CTYPE: i64 = 2;
 /// Locale category for numeric formatting.
-pub const LC_NUMERIC: i64 = 1;
+pub const LC_NUMERIC: i64 = 4;
 /// Locale category for date/time formatting.
-pub const LC_TIME: i64 = 2;
+pub const LC_TIME: i64 = 5;
 /// Locale category for string collation.
-pub const LC_COLLATE: i64 = 3;
+pub const LC_COLLATE: i64 = 1;
 /// Locale category for monetary formatting.
-pub const LC_MONETARY: i64 = 4;
+pub const LC_MONETARY: i64 = 3;
 /// Locale category for localized messages.
-pub const LC_MESSAGES: i64 = 5;
+pub const LC_MESSAGES: i64 = 6;
 
 /// Lowercase key conversion flag.
 pub const CASE_LOWER: i64 = 0;
@@ -566,8 +612,13 @@ mod tests {
         assert_eq!(SORT_LOCALE_STRING, 5);
         assert_eq!(SORT_NATURAL, 6);
         assert_eq!(SORT_FLAG_CASE, 8);
-        assert_eq!(LC_ALL, 6);
-        assert_eq!(LC_CTYPE, 0);
+        assert_eq!(LC_ALL, 0);
+        assert_eq!(LC_COLLATE, 1);
+        assert_eq!(LC_CTYPE, 2);
+        assert_eq!(LC_MONETARY, 3);
+        assert_eq!(LC_NUMERIC, 4);
+        assert_eq!(LC_TIME, 5);
+        assert_eq!(LC_MESSAGES, 6);
         assert_eq!(CASE_LOWER, 0);
         assert_eq!(CASE_UPPER, 1);
         assert_eq!(COUNT_NORMAL, 0);
@@ -600,11 +651,33 @@ mod tests {
         assert_eq!(IMAGETYPE_WEBP, 18);
         assert_eq!(IMAGETYPE_AVIF, 19);
         assert_eq!(IMAGETYPE_HEIF, 20);
-        assert_eq!(IMAGETYPE_COUNT, 21);
+        assert_eq!(IMAGETYPE_SVG, 21);
+        assert_eq!(IMAGETYPE_COUNT, 22);
         assert_eq!(M_PI.to_f64(), std::f64::consts::PI);
         assert_eq!(M_SQRTPI.to_f64(), 1.772453850905516);
         assert_eq!(M_EULER.to_f64(), 0.5772156649015329);
         assert_eq!(M_SQRT3.to_f64(), 1.7320508075688772);
+        assert_eq!(CAL_GREGORIAN, 0);
+        assert_eq!(CAL_JULIAN, 1);
+        assert_eq!(CAL_JEWISH, 2);
+        assert_eq!(CAL_FRENCH, 3);
+        assert_eq!(CAL_NUM_CALS, 4);
+        assert_eq!(CAL_DOW_DAYNO, 0);
+        assert_eq!(CAL_DOW_LONG, 1);
+        assert_eq!(CAL_DOW_SHORT, 2);
+        assert_eq!(CAL_MONTH_GREGORIAN_SHORT, 0);
+        assert_eq!(CAL_MONTH_GREGORIAN_LONG, 1);
+        assert_eq!(CAL_MONTH_JULIAN_SHORT, 2);
+        assert_eq!(CAL_MONTH_JULIAN_LONG, 3);
+        assert_eq!(CAL_MONTH_JEWISH, 4);
+        assert_eq!(CAL_MONTH_FRENCH, 5);
+        assert_eq!(CAL_EASTER_DEFAULT, 0);
+        assert_eq!(CAL_EASTER_ROMAN, 1);
+        assert_eq!(CAL_EASTER_ALWAYS_GREGORIAN, 2);
+        assert_eq!(CAL_EASTER_ALWAYS_JULIAN, 3);
+        assert_eq!(CAL_JEWISH_ADD_ALAFIM_GERESH, 2);
+        assert_eq!(CAL_JEWISH_ADD_ALAFIM, 4);
+        assert_eq!(CAL_JEWISH_ADD_GERESHAYIM, 8);
     }
 
     #[test]

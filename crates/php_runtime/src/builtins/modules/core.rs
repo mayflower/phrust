@@ -117,6 +117,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "get_resources",
+        builtin_get_resources,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "getenv",
         builtin_environment_requires_vm,
         BuiltinCompatibility::Php,
@@ -381,6 +386,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
         "user_error",
         builtin_error_handling_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "debug_zval_dump",
+        builtin_debug_zval_dump,
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("var_dump", builtin_var_dump, BuiltinCompatibility::Php),
@@ -827,6 +837,63 @@ pub(in crate::builtins::modules) fn builtin_get_resource_type(
     }
 }
 
+pub(in crate::builtins::modules) fn builtin_get_resources(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("get_resources", "zero or one argument(s)"));
+    }
+
+    let requested_type = match args.first().map(deref_value) {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(_) | Value::Resource(_)) => {
+            return Err(argument_type_error(
+                "get_resources",
+                "#1 ($type)",
+                "?string",
+                args.first().expect("checked presence"),
+            ));
+        }
+        Some(value) => Some(string_arg("get_resources", &value)?.to_string_lossy()),
+    };
+
+    let Some(resources) = context.resources() else {
+        return Ok(Value::Array(PhpArray::new()));
+    };
+    let resources = resources.resources();
+
+    if let Some(resource_type) = requested_type.as_deref() {
+        let has_matching_resource = resources
+            .iter()
+            .any(|resource| resource.resource_type() == resource_type);
+        let can_be_empty = matches!(resource_type, "stream" | "stream-context" | "Unknown");
+        if !has_matching_resource && !can_be_empty {
+            return Err(argument_value_error(
+                "get_resources",
+                "#1 ($type)",
+                "must be a valid resource type",
+            ));
+        }
+    }
+
+    let mut array = PhpArray::new();
+    for resource in resources {
+        if requested_type
+            .as_deref()
+            .is_none_or(|resource_type| resource.resource_type() == resource_type)
+        {
+            array.insert(
+                ArrayKey::Int(resource.id().get() as i64),
+                Value::Resource(resource),
+            );
+        }
+    }
+
+    Ok(Value::Array(array))
+}
+
 pub(in crate::builtins::modules) fn builtin_is_int(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -1132,6 +1199,22 @@ pub(in crate::builtins::modules) fn builtin_var_dump(
     let mut formatter = DebugFormatter::with_serialize_precision(serialize_precision);
     for value in &args {
         formatter.write_var_dump_value(context.output(), value, 0);
+    }
+    Ok(Value::Null)
+}
+
+pub(in crate::builtins::modules) fn builtin_debug_zval_dump(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    let serialize_precision = context
+        .ini_get("serialize_precision")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(-1);
+    let mut formatter = DebugFormatter::with_serialize_precision(serialize_precision);
+    for value in &args {
+        formatter.write_debug_zval_dump_value(context.output(), value, 0);
     }
     Ok(Value::Null)
 }
@@ -1840,7 +1923,7 @@ pub(in crate::builtins::modules) fn php_basename(path: &str) -> String {
 pub(in crate::builtins::modules) fn php_dirname_once(path: &str) -> String {
     let trimmed = trim_trailing_path_separators(path);
     if trimmed.is_empty() {
-        return ".".to_owned();
+        return String::new();
     }
     let Some(index) = trimmed.rfind(php_path_separators()) else {
         return ".".to_owned();
@@ -1860,9 +1943,6 @@ pub(in crate::builtins::modules) fn split_extension(basename: &str) -> (String, 
     let Some(index) = basename.rfind('.') else {
         return (basename.to_owned(), None);
     };
-    if index == 0 {
-        return (basename.to_owned(), None);
-    }
     (
         basename[..index].to_owned(),
         Some(basename[index + 1..].to_owned()),
@@ -6990,6 +7070,103 @@ mod tests {
     }
 
     #[test]
+    fn get_resources_returns_id_keyed_snapshot_and_filters_by_type() {
+        let mut output = OutputBuffer::new();
+        let mut resources = ResourceTable::new();
+        let first = resources.register_stream(
+            StreamFlags::new(true, false, false),
+            StreamMetadata::new("php", "stream", "r", "php://memory"),
+        );
+        let context_resource = resources.register_stream_context(PhpArray::new());
+        let second = resources.register_stream(
+            StreamFlags::new(true, true, false),
+            StreamMetadata::new("php", "stream", "r+", "php://temp"),
+        );
+        assert!(resources.close(first.id()));
+
+        assert_resource_array(
+            call_with_fs_resources(
+                "get_resources",
+                vec![],
+                &mut output,
+                PathBuf::from("/tmp"),
+                FilesystemCapabilities::none(),
+                &mut resources,
+            ),
+            &[
+                (1, first.clone()),
+                (2, context_resource.clone()),
+                (3, second.clone()),
+            ],
+        );
+        assert_resource_array(
+            call_with_fs_resources(
+                "get_resources",
+                vec![Value::string("Unknown")],
+                &mut output,
+                PathBuf::from("/tmp"),
+                FilesystemCapabilities::none(),
+                &mut resources,
+            ),
+            &[(1, first.clone())],
+        );
+        assert_resource_array(
+            call_with_fs_resources(
+                "get_resources",
+                vec![Value::string("stream")],
+                &mut output,
+                PathBuf::from("/tmp"),
+                FilesystemCapabilities::none(),
+                &mut resources,
+            ),
+            &[(3, second.clone())],
+        );
+        assert_resource_array(
+            call_with_fs_resources(
+                "get_resources",
+                vec![Value::string("stream-context")],
+                &mut output,
+                PathBuf::from("/tmp"),
+                FilesystemCapabilities::none(),
+                &mut resources,
+            ),
+            &[(2, context_resource.clone())],
+        );
+
+        let entry = BuiltinRegistry::new()
+            .get("get_resources")
+            .expect("builtin exists");
+        let mut context = BuiltinContext::with_runtime(
+            &mut output,
+            PathBuf::from("/tmp"),
+            FilesystemCapabilities::none(),
+            Some(&mut resources),
+        );
+        let error = (entry.function())(
+            &mut context,
+            vec![Value::string("not-a-type")],
+            RuntimeSourceSpan::default(),
+        )
+        .expect_err("invalid resource type should fail");
+        assert_eq!(
+            error.message(),
+            "get_resources(): Argument #1 ($type) must be a valid resource type"
+        );
+    }
+
+    fn assert_resource_array(value: Value, expected: &[(i64, crate::ResourceRef)]) {
+        let Value::Array(array) = value else {
+            panic!("expected array");
+        };
+        let actual = array.iter().collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for ((key, value), (expected_key, expected_resource)) in actual.iter().zip(expected) {
+            assert_eq!(**key, ArrayKey::Int(*expected_key));
+            assert_eq!(**value, Value::Resource(expected_resource.clone()));
+        }
+    }
+
+    #[test]
     fn path_helpers_cover_basename_dirname_and_pathinfo() {
         let mut output = OutputBuffer::new();
 
@@ -7002,8 +7179,20 @@ mod tests {
             Value::string("example")
         );
         assert_eq!(
+            call(
+                "basename",
+                vec![Value::string("example.php"), Value::string("example.php")],
+                &mut output
+            ),
+            Value::string("example.php")
+        );
+        assert_eq!(
             call("dirname", vec![Value::string("/tmp/a/b.php")], &mut output),
             Value::string("/tmp/a")
+        );
+        assert_eq!(
+            call("dirname", vec![Value::string("")], &mut output),
+            Value::string("")
         );
         let Value::Array(info) = call("pathinfo", vec![Value::string("/tmp/a/b.php")], &mut output)
         else {
@@ -7024,6 +7213,71 @@ mod tests {
         assert_eq!(
             info.get(&ArrayKey::String(PhpString::from_test_str("filename"))),
             Some(&Value::string("b"))
+        );
+        let Value::Array(empty_info) = call("pathinfo", vec![Value::string("")], &mut output)
+        else {
+            panic!("pathinfo should return array");
+        };
+        assert_eq!(
+            empty_info.get(&ArrayKey::String(PhpString::from_test_str("dirname"))),
+            None
+        );
+        assert_eq!(
+            empty_info.get(&ArrayKey::String(PhpString::from_test_str("basename"))),
+            Some(&Value::string(""))
+        );
+        assert_eq!(
+            empty_info.get(&ArrayKey::String(PhpString::from_test_str("filename"))),
+            Some(&Value::string(""))
+        );
+
+        let Value::Array(dot_info) = call("pathinfo", vec![Value::string(".")], &mut output) else {
+            panic!("pathinfo should return array");
+        };
+        assert_eq!(
+            dot_info.get(&ArrayKey::String(PhpString::from_test_str("extension"))),
+            Some(&Value::string(""))
+        );
+        assert_eq!(
+            dot_info.get(&ArrayKey::String(PhpString::from_test_str("filename"))),
+            Some(&Value::string(""))
+        );
+
+        let Value::Array(dotfile_info) =
+            call("pathinfo", vec![Value::string(".cvsignore")], &mut output)
+        else {
+            panic!("pathinfo should return array");
+        };
+        assert_eq!(
+            dotfile_info.get(&ArrayKey::String(PhpString::from_test_str("extension"))),
+            Some(&Value::string("cvsignore"))
+        );
+        assert_eq!(
+            dotfile_info.get(&ArrayKey::String(PhpString::from_test_str("filename"))),
+            Some(&Value::string(""))
+        );
+
+        assert_eq!(
+            call(
+                "pathinfo",
+                vec![
+                    Value::string("/usr/include/arpa/inet.h"),
+                    Value::Int(1 | 4 | 8),
+                ],
+                &mut output
+            ),
+            Value::string("/usr/include/arpa")
+        );
+        assert_eq!(
+            call(
+                "pathinfo",
+                vec![
+                    Value::string("/usr/include/arpa/inet.h"),
+                    Value::Int(2 | 4 | 8),
+                ],
+                &mut output
+            ),
+            Value::string("inet.h")
         );
     }
 
@@ -9188,6 +9442,29 @@ mod tests {
             ),
             Value::string("\\DebugBox::__set_state(array(\n   'x' => 1,\n))")
         );
+        let fixed_array =
+            ObjectRef::new_with_display_name(&empty_class("MySplFixedArray"), "MySplFixedArray");
+        fixed_array.set_property("__spl_runtime_class", Value::string("splfixedarray"));
+        fixed_array.set_property(
+            "__entries",
+            Value::packed_array(vec![Value::packed_array(vec![
+                Value::Int(0),
+                Value::Object(fixed_array.clone()),
+            ])]),
+        );
+        assert_eq!(
+            call(
+                "var_export",
+                vec![Value::Object(fixed_array), Value::Bool(true)],
+                &mut output
+            ),
+            Value::string("\\MySplFixedArray::__set_state(array(\n   0 => NULL,\n))")
+        );
+        assert!(
+            output
+                .to_string_lossy()
+                .contains("var_export does not handle circular references")
+        );
 
         let cell = ReferenceCell::new(Value::Null);
         let mut array = PhpArray::new();
@@ -9983,6 +10260,17 @@ mod tests {
                 &mut output,
             ),
             Value::string("a|b")
+        );
+        assert_eq!(
+            call(
+                "join",
+                vec![Value::packed_array(vec![
+                    Value::string("a"),
+                    Value::string("b")
+                ])],
+                &mut output,
+            ),
+            Value::string("ab")
         );
         assert_eq!(
             call(

@@ -18,7 +18,9 @@ pub(in crate::builtins::modules) fn builtin_pdo_drivers(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("pdo_drivers", &args, 0)?;
-    Ok(Value::Array(PhpArray::from_packed(vec![Value::string(
-        "sqlite",
-    )])))
+    Ok(Value::Array(PhpArray::from_packed(vec![
+        Value::string("mysql"),
+        Value::string("pgsql"),
+        Value::string("sqlite"),
+    ])))
 }

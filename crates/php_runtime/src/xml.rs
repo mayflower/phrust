@@ -7,9 +7,11 @@
 use crate::{
     ArrayKey, ClassEntry, ClassFlags, ObjectRef, PhpArray, PhpString, Value, normalize_class_name,
 };
+use std::collections::BTreeMap;
 
 const XML_STORAGE: &str = "__phrust_xml_document";
 const XML_NODE_PATH: &str = "__phrust_xml_path";
+const XML_TEXT_STORAGE: &str = "__phrust_xml_text";
 const XML_READER_EVENTS: &str = "__phrust_xml_reader_events";
 const XML_READER_INDEX: &str = "__phrust_xml_reader_index";
 const XML_WRITER_BUFFER: &str = "__phrust_xml_writer_buffer";
@@ -123,6 +125,16 @@ pub fn new_dom_node() -> ObjectRef {
     ObjectRef::new_with_display_name(&empty_internal_class("DOMNode"), "DOMNode")
 }
 
+pub fn new_dom_text(text: &str) -> ObjectRef {
+    let object = ObjectRef::new_with_display_name(&empty_internal_class("DOMText"), "DOMText");
+    object.set_property("nodeName", Value::string("#text"));
+    object.set_property("nodeValue", Value::string(text.as_bytes().to_vec()));
+    object.set_property("textContent", Value::string(text.as_bytes().to_vec()));
+    object.set_property("data", Value::string(text.as_bytes().to_vec()));
+    object.set_property(XML_TEXT_STORAGE, Value::string(text.as_bytes().to_vec()));
+    object
+}
+
 pub fn new_xml_parser() -> ObjectRef {
     ObjectRef::new_with_display_name(&empty_internal_class("XMLParser"), "XMLParser")
 }
@@ -177,15 +189,39 @@ pub fn new_simplexml_element(element: &XmlElement) -> ObjectRef {
         }),
     );
     object.set_property(XML_NODE_PATH, Value::string(Vec::<u8>::new()));
+    let mut children_by_name: BTreeMap<String, Vec<ObjectRef>> = BTreeMap::new();
     for child in element.children.iter().filter_map(|child| match child {
         XmlNode::Element(element) => Some(element),
         XmlNode::Text(_) => None,
     }) {
-        object.set_property(
-            child.name.clone(),
-            Value::Object(new_simplexml_element(child)),
-        );
+        children_by_name
+            .entry(child.name.clone())
+            .or_default()
+            .push(new_simplexml_element(child));
     }
+    for (name, children) in children_by_name {
+        let value = match children.as_slice() {
+            [child] => Value::Object(child.clone()),
+            _ => Value::Object(new_simplexml_element_list(&children)),
+        };
+        object.set_property(name, value);
+    }
+    object
+}
+
+fn new_simplexml_element_list(elements: &[ObjectRef]) -> ObjectRef {
+    let object = ObjectRef::new_with_display_name(
+        &empty_internal_class("SimpleXMLElement"),
+        "SimpleXMLElement",
+    );
+    object.set_property("__text", Value::string(Vec::<u8>::new()));
+    let mut entries = PhpArray::new();
+    for (index, element) in elements.iter().enumerate() {
+        let value = Value::Object(element.clone());
+        object.set_property(index.to_string(), value.clone());
+        entries.insert(ArrayKey::Int(index as i64), value);
+    }
+    object.set_property("__entries", Value::Array(entries));
     object
 }
 
@@ -248,6 +284,10 @@ pub fn dom_document_create_element(name: &str, value: Option<&str>) -> Value {
         attributes: Vec::new(),
         children,
     }))
+}
+
+pub fn dom_document_create_text_node(value: &str) -> Value {
+    Value::Object(new_dom_text(value))
 }
 
 pub fn dom_document_append_child(object: &ObjectRef, child: &ObjectRef) -> Value {
@@ -321,14 +361,19 @@ pub fn dom_element_append_child(object: &ObjectRef, child: &ObjectRef) -> Value 
     let Some(mut element) = element_from_object(object) else {
         return Value::Null;
     };
-    let Some(child_element) = element_from_object(child) else {
+    if let Some(child_element) = element_from_object(child) {
+        element
+            .children
+            .push(XmlNode::Element(child_element.clone()));
+        set_dom_element_object(object, &element);
+        return Value::Object(new_dom_element(&child_element));
+    }
+    let Some(text) = text_from_object(child) else {
         return Value::Null;
     };
-    element
-        .children
-        .push(XmlNode::Element(child_element.clone()));
+    element.children.push(XmlNode::Text(text.clone()));
     set_dom_element_object(object, &element);
-    Value::Object(new_dom_element(&child_element))
+    Value::Object(new_dom_text(&text))
 }
 
 pub fn dom_node_list_item(object: &ObjectRef, index: i64) -> Value {
@@ -592,6 +637,18 @@ fn document_from_object(object: &ObjectRef) -> Option<XmlDocument> {
 
 fn element_from_object(object: &ObjectRef) -> Option<XmlElement> {
     document_from_object(object).map(|document| document.root)
+}
+
+fn text_from_object(object: &ObjectRef) -> Option<String> {
+    if normalize_class_name(&object.class_name()) != "domtext" {
+        return None;
+    }
+    object
+        .get_property(XML_TEXT_STORAGE)
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.to_string_lossy()),
+            _ => None,
+        })
 }
 
 fn element_value(element: &XmlElement) -> Value {

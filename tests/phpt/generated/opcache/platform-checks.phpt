@@ -1,10 +1,48 @@
 --TEST--
-opcache: platform checks stay negative
+opcache: request-local API facade
 --DESCRIPTION--
-Generated Branch 4 data-platform coverage for Opcache/JIT classification without implementing a cache subsystem.
+Generated OPcache coverage for PHP-visible facade functions, deterministic
+request-local compile status, invalidation, and configuration/status arrays.
+--SKIPIF--
+<?php
+if (basename(PHP_BINARY) !== "phrust-php") {
+    die("skip phrust-only OPcache facade fixture");
+}
+?>
 --FILE--
 <?php
 var_dump(extension_loaded("opcache"));
+$file = __DIR__ . "/opcache-facade-target.php";
+file_put_contents($file, "<?php return 42;\n");
+var_dump(function_exists("opcache_get_status"));
+var_dump(opcache_is_script_cached($file));
+var_dump(opcache_compile_file($file));
+var_dump(opcache_is_script_cached($file));
+$status = opcache_get_status();
+var_dump(is_array($status));
+var_dump($status["opcache_enabled"]);
+var_dump($status["opcache_statistics"]["num_cached_scripts"] >= 1);
+var_dump(isset($status["scripts"][$file]));
+$config = opcache_get_configuration();
+var_dump(is_array($config["directives"]));
+var_dump($config["version"]["opcache_product_name"] !== "");
+var_dump(opcache_invalidate($file));
+var_dump(opcache_is_script_cached($file));
+var_dump(opcache_reset());
+@unlink($file);
 ?>
 --EXPECT--
+bool(true)
+bool(true)
 bool(false)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(false)
+bool(true)

@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/msgpack/basic.phpt","module":"msgpack","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers extension/function/class visibility and primitive/list/map MessagePack encoding and decoding"}

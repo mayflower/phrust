@@ -1,0 +1,31 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "imap",
+  "priority": "Deterministic IMAP facade and live-server backend gap",
+  "selected_manifest": "tests/phpt/manifests/modules/imap.selected.jsonl",
+  "corpus_count": 1,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "Registered IMAP functions, IMAP\\Connection, and common constants",
+    "Request-local IMAP\\Connection handles without implicit network access",
+    "Deterministic empty mailbox behavior for headers, search, fetch, status, counts, and mailbox info",
+    "Request-local delete and expunge state for app control-flow compatibility",
+    "Error and alert queue behavior through imap_last_error, imap_errors, and imap_alerts",
+    "Explicit backend failure for append and mail copy/move"
+  ],
+  "non_scope": [
+    "c-client or IMAP crate backend integration",
+    "Live IMAP/IMAPS server integration tests",
+    "TLS, authentication, MIME body parsing, server-side search, and mailbox mutation persistence"
+  ],
+  "target_gates": [
+    "cargo test -p php_runtime imap --no-fail-fast",
+    "just phpt-dev-module MODULE=imap"
+  ],
+  "next_step": "Add an opt-in IMAP backend and live server fixture before promoting any external IMAP integration tests."
+}

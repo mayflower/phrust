@@ -1431,7 +1431,7 @@ impl LoweringContext<'_> {
         let normalized_class_name = self
             .new_object_class_name(site.function, &class_name)
             .unwrap_or_else(|| normalize_class_name(&class_name));
-        if is_internal_throwable_class(&normalized_class_name) {
+        if is_internal_throwable_class(&normalized_class_name) && args.len() <= 1 {
             let message = args.first().map(|arg| arg.value);
             let (current, message) = if let Some(message) = message {
                 let value =
@@ -3377,14 +3377,16 @@ impl LoweringContext<'_> {
         if matches!(name, "isset" | "empty") {
             return self.lower_isset_empty_to_register(builder, site, name, args);
         }
-        let (operands, current) = self.lower_call_args(builder, site, &args)?;
+        let normalized_name = normalize_function_name(name);
+        let (operands, current) =
+            self.lower_call_args_for_function(builder, site, &normalized_name, &args)?;
         let dst = builder.alloc_register(site.function);
         let instruction = builder.emit(
             site.function,
             current,
             InstructionKind::CallFunction {
                 dst,
-                name: normalize_function_name(name),
+                name: normalized_name,
                 args: operands,
             },
             site.span,
@@ -9069,6 +9071,99 @@ impl LoweringContext<'_> {
             return Some(LoweredExpr {
                 register: if is_prefix { new } else { old },
                 block: object.block,
+            });
+        }
+        if let Some(target) = self.dynamic_property_target(inner) {
+            let object =
+                self.lower_expr_to_register(builder, site.function, site.block, target.receiver)?;
+            let property = self.lower_dynamic_member_name_to_register(
+                builder,
+                site,
+                object.block,
+                target.property,
+            )?;
+            let old = builder.alloc_register(site.function);
+            let fetch = builder.emit(
+                site.function,
+                property.block,
+                InstructionKind::FetchDynamicProperty {
+                    dst: old,
+                    object: Operand::Register(object.register),
+                    property: Operand::Register(property.register),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                property.block,
+                fetch,
+                site.expr,
+                site.span,
+            );
+            let one = builder.intern_constant(IrConstant::Int(1));
+            let one_reg = builder.alloc_register(site.function);
+            let load_one =
+                builder.emit_load_const(site.function, property.block, one_reg, one, site.span);
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                property.block,
+                load_one,
+                site.expr,
+                site.span,
+            );
+            let new = builder.alloc_register(site.function);
+            let op = if operator == "++" {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Sub
+            };
+            let arithmetic = builder.emit(
+                site.function,
+                property.block,
+                InstructionKind::Binary {
+                    dst: new,
+                    op,
+                    lhs: Operand::Register(old),
+                    rhs: Operand::Register(one_reg),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                property.block,
+                arithmetic,
+                site.expr,
+                site.span,
+            );
+            let assign_result = builder.alloc_register(site.function);
+            let assign = builder.emit(
+                site.function,
+                property.block,
+                InstructionKind::AssignDynamicProperty {
+                    dst: assign_result,
+                    object: Operand::Register(object.register),
+                    property: Operand::Register(property.register),
+                    value: Operand::Register(new),
+                },
+                site.span,
+            );
+            self.add_expr_source_map(
+                builder,
+                site.function,
+                property.block,
+                assign,
+                site.expr,
+                site.span,
+            );
+
+            let inner_range = self.span_for(SourceMappedId::from(inner));
+            let is_prefix = inner_range.end() == site.range.end();
+            return Some(LoweredExpr {
+                register: if is_prefix { new } else { old },
+                block: property.block,
             });
         }
         if let Some(target) = self.static_property_dim_target(inner)

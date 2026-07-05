@@ -3,15 +3,15 @@
   "module": "bcmath",
   "priority": "Bounded decimal math MVP",
   "selected_manifest": "tests/phpt/manifests/modules/bcmath.selected.jsonl",
-  "corpus_count": 1,
-  "selected_count": 1,
-  "pass_count": 1,
+  "corpus_count": 2,
+  "selected_count": 2,
+  "pass_count": 2,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["BigInt-backed decimal add/sub/mul/div/mod/pow/compare"],
-  "non_scope": ["Global bcscale persistence beyond current MVP default"],
+  "scope": ["BigInt-backed decimal add/sub/mul/div/mod/pow/compare", "request-local bcscale default persistence"],
+  "non_scope": ["Full bcmath rounding and warning-edge parity"],
   "target_gates": ["just phpt-dev-module MODULE=bcmath"],
-  "next_step": "Increase scale and edge-case fixtures after compatibility triage."
+  "next_step": "Increase rounding and warning-edge fixtures after compatibility triage."
 }

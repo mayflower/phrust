@@ -11,6 +11,8 @@ foreach ([
     "mb_substr",
     "mb_strtolower",
     "mb_strtoupper",
+    "mb_strpos",
+    "mb_stripos",
     "mb_detect_encoding",
     "mb_check_encoding",
     "mb_internal_encoding",
@@ -25,6 +27,8 @@ mb_strlen:yes
 mb_substr:yes
 mb_strtolower:yes
 mb_strtoupper:yes
+mb_strpos:yes
+mb_stripos:yes
 mb_detect_encoding:yes
 mb_check_encoding:yes
 mb_internal_encoding:yes

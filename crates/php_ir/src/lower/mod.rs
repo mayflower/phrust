@@ -1634,9 +1634,16 @@ fn named_constant_reference_from_resolution(
 }
 
 fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &HirCallArg) -> bool {
-    normalize_function_name(function) == "is_callable"
-        && !arg.unpack
-        && (index == 2 || arg.name.as_deref() == Some("callable_name"))
+    if arg.unpack {
+        return false;
+    }
+
+    match normalize_function_name(function).as_str() {
+        "apcu_dec" | "apcu_inc" => index == 2 || arg.name.as_deref() == Some("success"),
+        "is_callable" => index == 2 || arg.name.as_deref() == Some("callable_name"),
+        "preg_match" | "preg_match_all" => index == 2 || arg.name.as_deref() == Some("matches"),
+        _ => false,
+    }
 }
 
 /// Predefined stdlib constant initializers, built once per process.
@@ -3242,6 +3249,33 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_property_increment_lowers_through_fetch_and_assign_dynamic_property() {
+        let frontend = analyze_source(
+            "<?php class C {} $c = new C; $field = 'p'; $c->$field++; ++$c->$field;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert_eq!(
+            snapshot.matches("fetch_dynamic_property r").count(),
+            2,
+            "{snapshot}"
+        );
+        assert_eq!(
+            snapshot.matches("assign_dynamic_property r").count(),
+            2,
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+        assert!(
+            !snapshot.contains("E_PHP_IR_UNSUPPORTED_HIR_STATEMENT"),
+            "{snapshot}"
+        );
+    }
+
+    #[test]
     fn property_dimension_increment_lowers_through_assign_property_dim() {
         let frontend = analyze_source("<?php class C {} $c = new C; ++$c->p['n']; $c->p['n']--;");
         let result = lower_frontend_result(&frontend, LoweringOptions::default());
@@ -4634,6 +4668,20 @@ mod tests {
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
         let snapshot = result.unit.to_snapshot_text();
         assert!(snapshot.contains("by_ref_property_dim="), "{snapshot}");
+    }
+
+    #[test]
+    fn direct_builtin_call_uses_generated_by_ref_metadata() {
+        let frontend =
+            analyze_source("<?php $status = -1; pcntl_waitpid(123, $status); echo $status;");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(snapshot.contains("call_function r"), "{snapshot}");
+        assert!(snapshot.contains("\"pcntl_waitpid\""), "{snapshot}");
+        assert!(snapshot.contains("by_ref=local:"), "{snapshot}");
     }
 
     #[test]

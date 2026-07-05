@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/sysvsem/basic.phpt","module":"sysvsem","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers extension visibility, SysvSemaphore handles, deterministic acquire/release limit behavior, nonblocking acquisition failure, and removal semantics"}

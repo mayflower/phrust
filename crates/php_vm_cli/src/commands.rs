@@ -1190,11 +1190,15 @@ where
         return Ok(EXIT_COMPILE_ERROR);
     };
     match vm_result.status.exit_status() {
-        ExitStatus::Success => Ok(EXIT_SUCCESS),
+        ExitStatus::Success => Ok(vm_success_exit_code(&vm_result)),
         ExitStatus::CompileError => Ok(EXIT_COMPILE_ERROR),
         ExitStatus::RuntimeError | ExitStatus::Fatal => Ok(EXIT_RUNTIME_ERROR),
         ExitStatus::Unsupported => Ok(EXIT_UNSUPPORTED),
     }
+}
+
+fn vm_success_exit_code(result: &VmResult) -> i32 {
+    result.process_exit_code.unwrap_or(EXIT_SUCCESS)
 }
 
 struct Pipeline {

@@ -618,7 +618,7 @@ fn match_exact(atom: ArgType, value: &Value) -> Option<Value> {
         {
             Some(value.clone())
         }
-        (ArgType::Callable, Value::Callable(_)) => Some(value.clone()),
+        (ArgType::Callable, Value::Callable(_) | Value::String(_)) => Some(value.clone()),
         _ => None,
     }
 }
@@ -857,6 +857,25 @@ mod tests {
             .expect("closure object validates");
 
         assert_eq!(validated.values(), &[closure]);
+    }
+
+    #[test]
+    fn validates_string_names_as_callable_arguments() {
+        let info = FunctionArgInfo::new(
+            "callable_sample",
+            vec![ParameterInfo::required(
+                "callback",
+                TypeSpec::one(ArgType::Callable),
+            )],
+            TypeSpec::one(ArgType::Mixed),
+        );
+        let callback = Value::String(PhpString::from("strlen"));
+
+        let validated = ArgumentValidator::new(CoercionMode::Strict)
+            .validate(&info, std::slice::from_ref(&callback), span())
+            .expect("string callback validates");
+
+        assert_eq!(validated.values(), &[callback]);
     }
 
     #[test]

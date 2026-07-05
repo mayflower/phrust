@@ -1056,6 +1056,16 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
     };
     let mut functions = Vec::with_capacity(unit.functions.len());
     for function in &unit.functions {
+        if function_has_try_or_finally(function) {
+            let span = push_span(&mut dense.spans, IrSpan::default());
+            dense
+                .functions
+                .push(fallback_dense_function(function, span));
+            functions.push(DenseFunctionPlan::RichFallback {
+                reason: "try_finally".to_owned(),
+            });
+            continue;
+        }
         match lower_function(function, &mut dense.spans, &mut dense.names) {
             Ok(function) => {
                 dense.functions.push(function);
@@ -1085,6 +1095,19 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
         unit: dense,
         functions,
     }
+}
+
+fn function_has_try_or_finally(function: &IrFunction) -> bool {
+    function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::EnterTry { .. }
+                    | InstructionKind::LeaveTry
+                    | InstructionKind::EndFinally { .. }
+            )
+        })
+    })
 }
 
 fn lower_mixed_source_map_target(

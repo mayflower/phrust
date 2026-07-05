@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/imap/basic.phpt","reason":"Covers deterministic IMAP facade discovery, empty mailbox behavior, status/count shapes, error queues, and explicit backend failure without requiring a live IMAP server."}

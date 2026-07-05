@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/sysvmsg/basic.phpt","module":"sysvmsg","kind":"contract","generated_timestamp":"20260704T000000Z","generator_version":"manual-extension-pack","reason":"covers extension visibility, SysvMessageQueue handles, queue existence, serialized and raw payload send/receive, metadata, settings, and removal semantics"}

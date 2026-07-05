@@ -114,6 +114,7 @@ pub(in crate::builtins::modules) fn builtin_basename(
     let mut base = php_basename(&path);
     if let Some(suffix) = suffix
         && !suffix.is_empty()
+        && base.len() > suffix.len()
         && base.ends_with(&suffix)
     {
         base.truncate(base.len() - suffix.len());
@@ -161,13 +162,15 @@ pub(in crate::builtins::modules) fn builtin_pathinfo(
     match flags {
         None => {
             let mut array = crate::PhpArray::new();
-            array.insert(
-                string_array_key("dirname"),
-                Value::string(dirname.into_bytes()),
-            );
+            if !dirname.is_empty() {
+                array.insert(
+                    string_array_key("dirname"),
+                    Value::string(dirname.as_bytes().to_vec()),
+                );
+            }
             array.insert(
                 string_array_key("basename"),
-                Value::string(basename.into_bytes()),
+                Value::string(basename.as_bytes().to_vec()),
             );
             if let Some(extension) = extension.clone() {
                 array.insert(
@@ -177,16 +180,16 @@ pub(in crate::builtins::modules) fn builtin_pathinfo(
             }
             array.insert(
                 string_array_key("filename"),
-                Value::string(filename.into_bytes()),
+                Value::string(filename.as_bytes().to_vec()),
             );
             Ok(Value::Array(array))
         }
-        Some(1) => Ok(Value::string(dirname.into_bytes())),
-        Some(2) => Ok(Value::string(basename.into_bytes())),
-        Some(4) => {
+        Some(flags) if flags & 1 != 0 => Ok(Value::string(dirname.into_bytes())),
+        Some(flags) if flags & 2 != 0 => Ok(Value::string(basename.into_bytes())),
+        Some(flags) if flags & 4 != 0 => {
             Ok(extension.map_or(Value::string(""), |value| Value::string(value.into_bytes())))
         }
-        Some(8) => Ok(Value::string(filename.into_bytes())),
+        Some(flags) if flags & 8 != 0 => Ok(Value::string(filename.into_bytes())),
         Some(_) => Ok(Value::Array(crate::PhpArray::new())),
     }
 }

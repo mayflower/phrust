@@ -1,17 +1,17 @@
 {
   "schema_version":"phpt-module-plan-v1",
   "module":"pcre",
-  "priority":18,
+  "priority":18.6,
   "selected_manifest":"tests/phpt/manifests/modules/pcre.selected.jsonl",
   "corpus_count":165,
-  "selected_count":5,
-  "pass_count":5,
-  "skip_count":0,
+  "selected_count":84,
+  "pass_count":74,
+  "skip_count":10,
   "fail_count":0,
   "bork_count":0,
-  "known_failure_count":160,
+  "known_failure_count":86,
   "scope":["preg_match captures and offsets","preg_match_all set-order captures","preg_last_error state","preg_replace replacement/count MVP","preg_split flags MVP","preg_grep MVP","preg_quote delimiter escaping","preg_replace_callback named function and closure dispatch"],
-  "non_scope":["full ext/pcre corpus","PCRE JIT/callout parity","preg_filter","preg_replace_callback_array","byte-perfect warning text","locale-sensitive ctype behavior"],
+  "non_scope":["remaining 86 ext/pcre failures","PCRE JIT/callout parity","preg_filter","preg_replace_callback_array","byte-perfect warning text","locale-sensitive ctype behavior","advanced UTF-8 and malformed-pattern diagnostics"],
   "target_gates":["PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=pcre"],
-  "next_step":"Expand from focused generated PCRE coverage into upstream PHPT promotion as remaining warning, UTF-8, locale, callback-array, and advanced PCRE gaps close."
+  "next_step":"Close the remaining preg_match_all shape, warning parity, UTF-8, preg_filter, preg_replace_callback_array, and advanced replacement/split failures before the next upstream promotion."
 }

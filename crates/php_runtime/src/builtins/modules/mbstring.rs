@@ -41,6 +41,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_mb_strtoupper,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("mb_stripos", builtin_mb_stripos, BuiltinCompatibility::Php),
     BuiltinEntry::new("mb_strpos", builtin_mb_strpos, BuiltinCompatibility::Php),
     BuiltinEntry::new("mb_substr", builtin_mb_substr, BuiltinCompatibility::Php),
 ];
@@ -265,26 +266,43 @@ fn builtin_mb_strpos(
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
+    string_position_builtin(context, "mb_strpos", args, false)
+}
+
+fn builtin_mb_stripos(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    string_position_builtin(context, "mb_stripos", args, true)
+}
+
+fn string_position_builtin(
+    context: &mut BuiltinContext<'_>,
+    name: &'static str,
+    args: Vec<Value>,
+    case_insensitive: bool,
+) -> BuiltinResult {
     if !(2..=4).contains(&args.len()) {
-        return Err(arity_error("mb_strpos", "two to four argument(s)"));
+        return Err(arity_error(name, "two to four argument(s)"));
     }
-    let haystack = string_arg("mb_strpos", &args[0])?;
-    let needle = string_arg("mb_strpos", &args[1])?;
+    let haystack = string_arg(name, &args[0])?;
+    let needle = string_arg(name, &args[1])?;
     let offset = args
         .get(2)
-        .map(|value| int_arg("mb_strpos", value))
+        .map(|value| int_arg(name, value))
         .transpose()?
         .unwrap_or(0);
     let encoding = args
         .get(3)
-        .map(|value| encoding_arg("mb_strpos", value))
+        .map(|value| encoding_arg(name, value))
         .transpose()?
         .unwrap_or_else(|| context.mb_internal_encoding().to_owned());
     let Some(canonical) = canonical_encoding(&encoding) else {
-        return Err(unsupported_encoding_error("mb_strpos", &encoding));
+        return Err(unsupported_encoding_error(name, &encoding));
     };
-    let haystack_chars = encoded_chars("mb_strpos", haystack.as_bytes(), canonical)?;
-    let needle_string = encoded_chars("mb_strpos", needle.as_bytes(), canonical)?
+    let haystack_chars = encoded_chars(name, haystack.as_bytes(), canonical)?;
+    let needle_string = encoded_chars(name, needle.as_bytes(), canonical)?
         .into_iter()
         .collect::<String>();
     let start = if offset < 0 {
@@ -295,11 +313,20 @@ fn builtin_mb_strpos(
         (offset as usize).min(haystack_chars.len())
     };
     let tail = haystack_chars[start..].iter().collect::<String>();
+    let (tail, needle_string) = if case_insensitive {
+        (lowercase(&tail), lowercase(&needle_string))
+    } else {
+        (tail, needle_string)
+    };
     Ok(tail
         .find(&needle_string)
         .map_or(Value::Bool(false), |byte_offset| {
             Value::Int((start + tail[..byte_offset].chars().count()) as i64)
         }))
+}
+
+fn lowercase(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
 }
 
 fn encoded_chars(function: &str, bytes: &[u8], encoding: &str) -> Result<Vec<char>, BuiltinError> {
@@ -480,6 +507,22 @@ mod tests {
         )
         .expect("mb_strtoupper succeeds");
         assert_eq!(upper, Value::string("ÄÖÜ ABC"));
+
+        let position = (registry.get("mb_strpos").unwrap().function())(
+            &mut context,
+            vec![Value::string("Aé日é"), Value::string("é"), Value::Int(2)],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("mb_strpos succeeds");
+        assert_eq!(position, Value::Int(3));
+
+        let insensitive_position = (registry.get("mb_stripos").unwrap().function())(
+            &mut context,
+            vec![Value::string("Aé日É"), Value::string("é")],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("mb_stripos succeeds");
+        assert_eq!(insensitive_position, Value::Int(1));
     }
 
     #[test]

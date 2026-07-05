@@ -1,10 +1,11 @@
 //! Request-local APCu MVP.
 
-use super::core::{arity_error, assign_reference_arg, int_arg, string_arg};
-use crate::Value;
+use super::core::{arity_error, assign_reference_arg, conversion_error, int_arg, string_arg};
 use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinResult, RuntimeSourceSpan,
 };
+use crate::convert::to_bool;
+use crate::{ArrayKey, PhpArray, PhpString, Value};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("apcu_add", builtin_apcu_add, BuiltinCompatibility::Php),
@@ -13,6 +14,12 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_apcu_clear_cache,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new(
+        "apcu_cache_info",
+        builtin_apcu_cache_info,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new("apcu_dec", builtin_apcu_dec, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "apcu_delete",
         builtin_apcu_delete,
@@ -29,6 +36,12 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("apcu_fetch", builtin_apcu_fetch, BuiltinCompatibility::Php),
+    BuiltinEntry::new("apcu_inc", builtin_apcu_inc, BuiltinCompatibility::Php),
+    BuiltinEntry::new(
+        "apcu_sma_info",
+        builtin_apcu_sma_info,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("apcu_store", builtin_apcu_store, BuiltinCompatibility::Php),
 ];
 
@@ -130,4 +143,166 @@ fn builtin_apcu_clear_cache(
     }
     context.apcu_state().clear();
     Ok(Value::Bool(true))
+}
+
+fn builtin_apcu_inc(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    apcu_counter(context, "apcu_inc", args, CounterDirection::Increment)
+}
+
+fn builtin_apcu_dec(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    apcu_counter(context, "apcu_dec", args, CounterDirection::Decrement)
+}
+
+fn builtin_apcu_cache_info(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("apcu_cache_info", "zero or one argument"));
+    }
+    let limited = optional_bool("apcu_cache_info", args.first())?.unwrap_or(false);
+    let stats = context.apcu_state().stats();
+    let mut result = PhpArray::new();
+    result.insert(string_key("num_slots"), Value::Int(1));
+    result.insert(string_key("ttl"), Value::Int(0));
+    result.insert(string_key("num_hits"), Value::Int(stats.hits as i64));
+    result.insert(string_key("num_misses"), Value::Int(stats.misses as i64));
+    result.insert(string_key("num_inserts"), Value::Int(stats.inserts as i64));
+    result.insert(string_key("num_entries"), Value::Int(stats.entries as i64));
+    result.insert(string_key("expunges"), Value::Int(0));
+    result.insert(string_key("mem_size"), Value::Int(0));
+    result.insert(string_key("memory_type"), Value::string("request-local"));
+    if !limited {
+        result.insert(string_key("cache_list"), Value::Array(PhpArray::new()));
+    }
+    Ok(Value::Array(result))
+}
+
+fn builtin_apcu_sma_info(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("apcu_sma_info", "zero or one argument"));
+    }
+    let limited = optional_bool("apcu_sma_info", args.first())?.unwrap_or(false);
+    let mut result = PhpArray::new();
+    result.insert(string_key("num_seg"), Value::Int(1));
+    result.insert(string_key("seg_size"), Value::Int(0));
+    result.insert(string_key("avail_mem"), Value::Int(0));
+    if !limited {
+        result.insert(string_key("block_lists"), Value::Array(PhpArray::new()));
+    }
+    Ok(Value::Array(result))
+}
+
+#[derive(Clone, Copy)]
+enum CounterDirection {
+    Increment,
+    Decrement,
+}
+
+fn apcu_counter(
+    context: &mut BuiltinContext<'_>,
+    function: &'static str,
+    args: Vec<Value>,
+    direction: CounterDirection,
+) -> BuiltinResult {
+    if args.is_empty() || args.len() > 4 {
+        return Err(arity_error(function, "one to four arguments"));
+    }
+    let key = string_arg(function, &args[0])?;
+    let step = args
+        .get(1)
+        .map(|value| int_arg(function, value))
+        .transpose()?
+        .unwrap_or(1);
+    let _ttl = args
+        .get(3)
+        .map(|value| int_arg(function, value))
+        .transpose()?
+        .unwrap_or(0);
+    let next = match direction {
+        CounterDirection::Increment => context.apcu_state().increment(key.as_bytes(), step),
+        CounterDirection::Decrement => context.apcu_state().decrement(key.as_bytes(), step),
+    };
+    assign_reference_arg(args.get(2), Value::Bool(next.is_some()));
+    Ok(next.map(Value::Int).unwrap_or(Value::Bool(false)))
+}
+
+fn optional_bool(
+    function: &'static str,
+    value: Option<&Value>,
+) -> Result<Option<bool>, crate::builtins::BuiltinError> {
+    value
+        .map(|value| to_bool(value).map_err(|message| conversion_error(function, message)))
+        .transpose()
+}
+
+fn string_key(value: &str) -> ArrayKey {
+    ArrayKey::String(PhpString::from_test_str(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OutputBuffer;
+
+    fn call_with_context(name: &str, args: Vec<Value>, context: &mut BuiltinContext<'_>) -> Value {
+        ENTRIES
+            .iter()
+            .find(|entry| entry.name() == name)
+            .expect("entry")
+            .function()(context, args, RuntimeSourceSpan::default())
+        .expect("builtin succeeds")
+    }
+
+    #[test]
+    fn counters_and_info_cover_request_local_cache_slice() {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+
+        assert_eq!(
+            call_with_context(
+                "apcu_store",
+                vec![Value::string("count"), Value::Int(4)],
+                &mut context,
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call_with_context("apcu_inc", vec![Value::string("count")], &mut context),
+            Value::Int(5)
+        );
+        assert_eq!(
+            call_with_context(
+                "apcu_dec",
+                vec![Value::string("count"), Value::Int(2)],
+                &mut context,
+            ),
+            Value::Int(3)
+        );
+
+        let Value::Array(info) = call_with_context("apcu_cache_info", vec![], &mut context) else {
+            panic!("expected cache info array");
+        };
+        assert_eq!(info.get(&string_key("num_entries")), Some(&Value::Int(1)));
+        assert_eq!(info.get(&string_key("num_hits")), Some(&Value::Int(2)));
+        assert_eq!(info.get(&string_key("num_inserts")), Some(&Value::Int(1)));
+
+        let Value::Array(sma) = call_with_context("apcu_sma_info", vec![], &mut context) else {
+            panic!("expected sma info array");
+        };
+        assert_eq!(sma.get(&string_key("num_seg")), Some(&Value::Int(1)));
+    }
 }

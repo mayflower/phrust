@@ -10,8 +10,8 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["Request-local store/fetch/add/delete/exists/clear"],
-  "non_scope": ["Shared process cache persistence across independent VM executions"],
-  "target_gates": ["just phpt-dev-module MODULE=apcu"],
-  "next_step": "Add array-key multi-fetch/delete coverage after cache API expansion."
+  "scope": ["Request-local store/fetch/add/delete/exists/clear", "Existing-integer inc/dec counters", "Deterministic cache_info/sma_info probe shape"],
+  "non_scope": ["Shared process cache persistence across independent VM executions", "APCUIterator traversal", "Per-entry shared-memory accounting"],
+  "target_gates": ["cargo test -p php_runtime apcu", "cargo test -p php_std apcu", "just phpt-dev-module MODULE=apcu"],
+  "next_step": "Add array-key multi-fetch/delete coverage and APCUIterator traversal after cache API expansion."
 }

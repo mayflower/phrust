@@ -189,9 +189,11 @@ pub(in crate::builtins::modules) fn mime_for_bytes(
         || bytes.starts_with(b"PK\x07\x08")
     {
         "application/zip"
+    } else if is_svg_document(&trimmed) {
+        "image/svg+xml"
     } else if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
         "application/json"
-    } else if trimmed.starts_with(b"<?xml") || trimmed.starts_with(b"<svg") {
+    } else if trimmed.starts_with(b"<?xml") {
         "text/xml"
     } else if is_likely_text(bytes) {
         "text/plain"
@@ -199,6 +201,33 @@ pub(in crate::builtins::modules) fn mime_for_bytes(
         path.and_then(mime_from_extension)
             .unwrap_or("application/octet-stream")
     }
+}
+
+fn is_svg_document(trimmed: &[u8]) -> bool {
+    if starts_with_svg_tag(trimmed) {
+        return true;
+    }
+    let Some(after_declaration) = trimmed.strip_prefix(b"<?xml") else {
+        return false;
+    };
+    let Some(end) = after_declaration
+        .windows(2)
+        .position(|window| window == b"?>")
+    else {
+        return false;
+    };
+    starts_with_svg_tag(after_declaration[end + 2..].trim_ascii_start())
+}
+
+fn starts_with_svg_tag(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && bytes[0] == b'<'
+        && bytes[1].eq_ignore_ascii_case(&b's')
+        && bytes[2].eq_ignore_ascii_case(&b'v')
+        && bytes[3].eq_ignore_ascii_case(&b'g')
+        && bytes
+            .get(4)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
 }
 
 fn is_likely_text(bytes: &[u8]) -> bool {
@@ -219,6 +248,7 @@ fn mime_from_extension(path: &str) -> Option<&'static str> {
         "txt" => Some("text/plain"),
         "json" => Some("application/json"),
         "zip" => Some("application/zip"),
+        "svg" => Some("image/svg+xml"),
         _ => None,
     }
 }
@@ -466,6 +496,28 @@ mod tests {
         assert_eq!(
             image_size(bytes),
             Some((48, 64, IMAGETYPE_SVG, "image/svg+xml"))
+        );
+    }
+
+    #[test]
+    fn mime_for_bytes_distinguishes_svg_from_generic_xml() {
+        assert_eq!(
+            mime_for_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>"#,
+                None,
+            ),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            mime_for_bytes(
+                br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
+                None,
+            ),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            mime_for_bytes(br#"<?xml version="1.0"?><root></root>"#, None),
+            "text/xml"
         );
     }
 }

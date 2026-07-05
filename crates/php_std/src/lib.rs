@@ -103,40 +103,6 @@ impl ExtensionDescriptor {
         self.constants.sort_by_key(ConstantDescriptor::name);
         self.classes.sort_by_key(ClassDescriptor::name);
     }
-
-    fn add_generated_arginfo_classes(&mut self) {
-        if self.name == "test" || self.name == "zend_test" {
-            return;
-        }
-
-        for class in generated::arginfo::GENERATED_CLASSES
-            .iter()
-            .filter(|class| class.extension == self.name)
-        {
-            if self
-                .classes
-                .iter()
-                .any(|existing| existing.name.eq_ignore_ascii_case(class.name))
-            {
-                continue;
-            }
-
-            self.classes.push(ClassDescriptor::new(
-                class.name,
-                self.name,
-                generated_class_kind(class.kind),
-            ));
-        }
-    }
-}
-
-fn generated_class_kind(kind: &str) -> ClassKind {
-    match kind {
-        "interface" => ClassKind::Interface,
-        "trait" => ClassKind::Trait,
-        "enum" => ClassKind::Enum,
-        _ => ClassKind::Class,
-    }
 }
 
 /// Descriptor for an internal function symbol.
@@ -353,7 +319,6 @@ impl ExtensionRegistry {
         let mut map = BTreeMap::new();
         let mut enabled = BTreeSet::new();
         for mut extension in extensions {
-            extension.add_generated_arginfo_classes();
             extension.sort_symbols();
             if extension.is_enabled_by_default() {
                 enabled.insert(extension.name());
@@ -384,7 +349,17 @@ impl ExtensionRegistry {
             standard_library_pcre_extension(),
             standard_library_session_extension(),
             standard_library_pdo_extension(),
+            standard_library_pdo_mysql_extension(),
+            standard_library_pdo_pgsql_extension(),
             standard_library_pdo_sqlite_extension(),
+            standard_library_pgsql_extension(),
+            standard_library_pcntl_extension(),
+            standard_library_posix_extension(),
+            standard_library_readline_extension(),
+            standard_library_shmop_extension(),
+            standard_library_sysvmsg_extension(),
+            standard_library_sysvsem_extension(),
+            standard_library_sysvshm_extension(),
             standard_library_mysqli_extension(),
             standard_library_curl_extension(),
             standard_library_openssl_extension(),
@@ -397,8 +372,11 @@ impl ExtensionRegistry {
             standard_library_simplexml_extension(),
             standard_library_xmlreader_extension(),
             standard_library_xmlwriter_extension(),
+            standard_library_xsl_extension(),
             standard_library_hash_extension(),
+            standard_library_gettext_extension(),
             standard_library_ctype_extension(),
+            standard_library_calendar_extension(),
             standard_library_filter_extension(),
             standard_library_iconv_extension(),
             standard_library_sodium_extension(),
@@ -407,11 +385,19 @@ impl ExtensionRegistry {
             standard_library_apcu_extension(),
             standard_library_redis_extension(),
             standard_library_memcached_extension(),
+            standard_library_igbinary_extension(),
+            standard_library_msgpack_extension(),
+            standard_library_opcache_extension(),
+            standard_library_soap_extension(),
             standard_library_ftp_extension(),
+            standard_library_imap_extension(),
+            standard_library_ldap_extension(),
+            standard_library_ssh2_extension(),
             standard_library_sockets_extension(),
             standard_library_zlib_extension(),
             standard_library_zip_extension(),
             standard_library_fileinfo_extension(),
+            standard_library_ffi_extension(),
             standard_library_exif_extension(),
             standard_library_gd_extension(),
             standard_library_random_extension(),
@@ -563,6 +549,133 @@ pub enum RegistryError {
 mod tests {
     use super::*;
     use php_runtime::api::{BuiltinCompatibility, BuiltinEntry, BuiltinRegistry};
+
+    const FUNCTIONS_WITH_EXTERNAL_ARGINFO: &[&str] = &[
+        "apcu_add",
+        "apcu_cache_info",
+        "apcu_clear_cache",
+        "apcu_dec",
+        "apcu_delete",
+        "apcu_enabled",
+        "apcu_exists",
+        "apcu_fetch",
+        "apcu_inc",
+        "apcu_sma_info",
+        "apcu_store",
+        "igbinary_serialize",
+        "igbinary_unserialize",
+        "imap_8bit",
+        "imap_alerts",
+        "imap_append",
+        "imap_base64",
+        "imap_binary",
+        "imap_check",
+        "imap_close",
+        "imap_delete",
+        "imap_errors",
+        "imap_expunge",
+        "imap_fetch_overview",
+        "imap_fetchbody",
+        "imap_fetchheader",
+        "imap_fetchstructure",
+        "imap_gc",
+        "imap_headerinfo",
+        "imap_headers",
+        "imap_last_error",
+        "imap_list",
+        "imap_listscan",
+        "imap_mail_copy",
+        "imap_mail_move",
+        "imap_mailboxmsginfo",
+        "imap_num_msg",
+        "imap_num_recent",
+        "imap_open",
+        "imap_ping",
+        "imap_qprint",
+        "imap_reopen",
+        "imap_search",
+        "imap_sort",
+        "imap_status",
+        "imap_undelete",
+        "imap_utf7_decode",
+        "imap_utf7_encode",
+        "imap_utf8",
+        "msgpack_pack",
+        "msgpack_serialize",
+        "msgpack_unpack",
+        "msgpack_unserialize",
+        "print",
+        "ssh2_auth_hostbased_file",
+        "ssh2_auth_none",
+        "ssh2_auth_password",
+        "ssh2_auth_pubkey_file",
+        "ssh2_connect",
+        "ssh2_disconnect",
+        "ssh2_exec",
+        "ssh2_fingerprint",
+        "ssh2_forward_accept",
+        "ssh2_forward_listen",
+        "ssh2_methods_negotiated",
+        "ssh2_publickey_add",
+        "ssh2_publickey_init",
+        "ssh2_publickey_list",
+        "ssh2_publickey_remove",
+        "ssh2_scp_recv",
+        "ssh2_scp_send",
+        "ssh2_sftp",
+        "ssh2_sftp_chmod",
+        "ssh2_sftp_lstat",
+        "ssh2_sftp_mkdir",
+        "ssh2_sftp_readlink",
+        "ssh2_sftp_realpath",
+        "ssh2_sftp_rename",
+        "ssh2_sftp_rmdir",
+        "ssh2_sftp_stat",
+        "ssh2_sftp_symlink",
+        "ssh2_sftp_unlink",
+        "ssh2_shell",
+        "ssh2_tunnel",
+    ];
+
+    const CONSTANTS_WITH_EXTERNAL_ARGINFO: &[&str] = &[
+        "CL_EXPUNGE",
+        "CP_UID",
+        "FT_INTERNAL",
+        "FT_PEEK",
+        "FT_PREFETCHTEXT",
+        "FT_UID",
+        "NIL",
+        "OP_ANONYMOUS",
+        "OP_DEBUG",
+        "OP_EXPUNGE",
+        "OP_HALFOPEN",
+        "OP_READONLY",
+        "SA_ALL",
+        "SA_MESSAGES",
+        "SA_RECENT",
+        "SA_UIDNEXT",
+        "SA_UIDVALIDITY",
+        "SA_UNSEEN",
+        "SE_UID",
+        "SORTARRIVAL",
+        "SORTCC",
+        "SORTDATE",
+        "SORTFROM",
+        "SORTSIZE",
+        "SORTSUBJECT",
+        "SORTTO",
+        "SSH2_DEFAULT_TERMINAL",
+        "SSH2_DEFAULT_TERM_HEIGHT",
+        "SSH2_DEFAULT_TERM_UNIT",
+        "SSH2_DEFAULT_TERM_WIDTH",
+        "SSH2_FINGERPRINT_HEX",
+        "SSH2_FINGERPRINT_MD5",
+        "SSH2_FINGERPRINT_RAW",
+        "SSH2_FINGERPRINT_SHA1",
+        "SSH2_TERM_UNIT_CHARS",
+        "SSH2_TERM_UNIT_PIXELS",
+        "ST_UID",
+    ];
 
     #[test]
     fn registry_iteration_is_deterministic() {
@@ -764,12 +877,35 @@ mod tests {
     fn optional_hash_and_random_extensions_track_stdlib_symbols() {
         let registry = ExtensionRegistry::standard_library();
 
-        for name in ["hash", "hash_hmac", "hash_hmac_algos"] {
+        for name in [
+            "hash",
+            "hash_algos",
+            "hash_copy",
+            "hash_equals",
+            "hash_file",
+            "hash_final",
+            "hash_hmac",
+            "hash_hmac_algos",
+            "hash_hmac_file",
+            "hash_hkdf",
+            "hash_init",
+            "hash_pbkdf2",
+            "hash_update",
+            "hash_update_file",
+            "hash_update_stream",
+        ] {
             assert!(
                 registry.enabled_php_function(name).is_some(),
                 "{name} should be registered as a hash function"
             );
         }
+        assert!(registry.enabled_class("HashContext").is_some());
+        assert_eq!(
+            registry
+                .enabled_constant("HASH_HMAC")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(1))
+        );
         for name in ["random_bytes", "random_int"] {
             assert!(
                 registry.enabled_php_function(name).is_some(),
@@ -778,6 +914,108 @@ mod tests {
         }
         assert!(registry.is_extension_enabled("hash"));
         assert!(registry.is_extension_enabled("random"));
+    }
+
+    #[test]
+    fn shmop_extension_tracks_functions_and_class() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "shmop_open",
+            "shmop_read",
+            "shmop_write",
+            "shmop_size",
+            "shmop_delete",
+            "shmop_close",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a shmop function"
+            );
+        }
+        assert!(registry.enabled_class("Shmop").is_some());
+    }
+
+    #[test]
+    fn readline_extension_tracks_noninteractive_functions() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "readline",
+            "readline_info",
+            "readline_add_history",
+            "readline_clear_history",
+            "readline_list_history",
+            "readline_read_history",
+            "readline_write_history",
+            "readline_completion_function",
+            "readline_callback_handler_install",
+            "readline_callback_read_char",
+            "readline_callback_handler_remove",
+            "readline_redisplay",
+            "readline_on_new_line",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a readline function"
+            );
+        }
+        assert_eq!(
+            registry
+                .enabled_constant("READLINE_LIB")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::String("phrust"))
+        );
+    }
+
+    #[test]
+    fn sysv_extensions_track_functions_classes_and_constants() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "msg_get_queue",
+            "msg_send",
+            "msg_receive",
+            "msg_remove_queue",
+            "msg_stat_queue",
+            "msg_set_queue",
+            "msg_queue_exists",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a sysvmsg function"
+            );
+        }
+        for name in ["sem_get", "sem_acquire", "sem_release", "sem_remove"] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a sysvsem function"
+            );
+        }
+        for name in [
+            "shm_attach",
+            "shm_detach",
+            "shm_has_var",
+            "shm_put_var",
+            "shm_get_var",
+            "shm_remove_var",
+            "shm_remove",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a sysvshm function"
+            );
+        }
+
+        assert!(registry.enabled_class("SysvMessageQueue").is_some());
+        assert!(registry.enabled_class("SysvSemaphore").is_some());
+        assert!(registry.enabled_class("SysvSharedMemory").is_some());
+        assert_eq!(
+            registry
+                .enabled_constant("MSG_ENOMSG")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(libc::ENOMSG as i64))
+        );
     }
 
     #[test]
@@ -1042,6 +1280,81 @@ mod tests {
                 registry.enabled_php_function(name).is_some(),
                 "{name} should be registered as a process-surface function"
             );
+        }
+    }
+
+    #[test]
+    fn pcntl_extension_tracks_cli_process_control_symbols() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "pcntl_alarm",
+            "pcntl_async_signals",
+            "pcntl_exec",
+            "pcntl_fork",
+            "pcntl_signal",
+            "pcntl_signal_dispatch",
+            "pcntl_wait",
+            "pcntl_waitpid",
+            "pcntl_wexitstatus",
+            "pcntl_wifexited",
+        ] {
+            assert!(
+                registry.enabled_php_function(name).is_some(),
+                "{name} should be registered as a pcntl function"
+            );
+        }
+
+        for name in ["SIG_DFL", "SIG_IGN", "SIGCHLD", "SIGUSR1", "WNOHANG"] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a pcntl constant"
+            );
+        }
+    }
+
+    #[test]
+    fn ffi_extension_tracks_disabled_surface_metadata() {
+        let registry = ExtensionRegistry::standard_library();
+
+        let extension = registry.extension("ffi").expect("ffi extension");
+        assert!(extension.enabled_by_default);
+
+        for name in [
+            "FFI",
+            "FFI\\CData",
+            "FFI\\CType",
+            "FFI\\Exception",
+            "FFI\\ParserException",
+        ] {
+            let class = registry.enabled_class(name).expect("ffi class");
+            assert_eq!(class.extension, "ffi");
+            assert_eq!(class.kind, ClassKind::Class);
+        }
+
+        for name in [
+            "addr",
+            "alignof",
+            "arrayType",
+            "cast",
+            "cdef",
+            "free",
+            "isNull",
+            "load",
+            "memcmp",
+            "memcpy",
+            "memset",
+            "new",
+            "scope",
+            "sizeof",
+            "string",
+            "type",
+            "typeof",
+        ] {
+            let method =
+                generated::arginfo::method_metadata("FFI", name).expect("ffi method metadata");
+            assert_eq!(method.extension, "ffi");
+            assert!(method.is_static);
         }
     }
 
@@ -1565,7 +1878,15 @@ mod tests {
     fn filter_extension_tracks_option_constants_for_registered_builtins() {
         let registry = ExtensionRegistry::standard_library();
 
-        for name in ["filter_input", "filter_var"] {
+        for name in [
+            "filter_has_var",
+            "filter_input",
+            "filter_input_array",
+            "filter_var",
+            "filter_var_array",
+            "filter_list",
+            "filter_id",
+        ] {
             assert!(
                 registry.enabled_php_function(name).is_some(),
                 "{name} should be registered as a filter function"
@@ -1578,17 +1899,35 @@ mod tests {
             "INPUT_ENV",
             "INPUT_SERVER",
             "FILTER_DEFAULT",
+            "FILTER_UNSAFE_RAW",
+            "FILTER_FLAG_NONE",
+            "FILTER_REQUIRE_ARRAY",
+            "FILTER_REQUIRE_SCALAR",
+            "FILTER_FORCE_ARRAY",
             "FILTER_VALIDATE_BOOL",
             "FILTER_VALIDATE_BOOLEAN",
             "FILTER_VALIDATE_INT",
             "FILTER_VALIDATE_FLOAT",
+            "FILTER_VALIDATE_REGEXP",
             "FILTER_VALIDATE_URL",
             "FILTER_VALIDATE_EMAIL",
             "FILTER_VALIDATE_IP",
+            "FILTER_VALIDATE_MAC",
+            "FILTER_VALIDATE_DOMAIN",
+            "FILTER_SANITIZE_STRING",
+            "FILTER_SANITIZE_STRIPPED",
+            "FILTER_SANITIZE_ENCODED",
+            "FILTER_SANITIZE_SPECIAL_CHARS",
             "FILTER_SANITIZE_EMAIL",
             "FILTER_SANITIZE_URL",
             "FILTER_SANITIZE_NUMBER_INT",
+            "FILTER_SANITIZE_NUMBER_FLOAT",
+            "FILTER_SANITIZE_FULL_SPECIAL_CHARS",
+            "FILTER_SANITIZE_ADD_SLASHES",
             "FILTER_NULL_ON_FAILURE",
+            "FILTER_FLAG_ALLOW_FRACTION",
+            "FILTER_FLAG_ALLOW_THOUSAND",
+            "FILTER_FLAG_ALLOW_SCIENTIFIC",
             "FILTER_FLAG_IPV4",
             "FILTER_FLAG_IPV6",
             "FILTER_FLAG_PATH_REQUIRED",
@@ -1759,27 +2098,18 @@ mod tests {
     #[test]
     fn visible_stdlib_functions_have_generated_arginfo() {
         let registry = ExtensionRegistry::standard_library();
-        let missing = registry
+        let mut missing = registry
             .extensions()
             .flat_map(ExtensionDescriptor::functions)
             .filter(|function| function.visibility() == SymbolVisibility::PhpVisible)
             .filter(|function| function.arginfo().is_none())
             .map(FunctionDescriptor::name)
             .collect::<Vec<_>>();
+        missing.sort_unstable();
 
         assert_eq!(
-            missing,
-            [
-                "apcu_add",
-                "apcu_clear_cache",
-                "apcu_delete",
-                "apcu_enabled",
-                "apcu_exists",
-                "apcu_fetch",
-                "apcu_store",
-                "print"
-            ],
-            "`print` is a PHP language construct; APCu is a PECL-style surface; visible function descriptors should otherwise have generated php-src arginfo"
+            missing, FUNCTIONS_WITH_EXTERNAL_ARGINFO,
+            "`print` is a PHP language construct; external extension slices without pinned php-src stubs must be explicitly audited here; visible function descriptors should otherwise have generated php-src arginfo"
         );
     }
 
@@ -1794,15 +2124,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            missing,
-            Vec::<&str>::new(),
-            "registered constants should stay backed by generated php-src metadata"
+            missing, CONSTANTS_WITH_EXTERNAL_ARGINFO,
+            "registered constants should stay backed by generated php-src metadata unless their external extension slice is explicitly audited here"
         );
     }
 
     #[test]
     fn runtime_builtin_registry_entries_have_generated_arginfo() {
-        let missing = BuiltinRegistry::new()
+        let mut missing = BuiltinRegistry::new()
             .entries()
             .iter()
             .copied()
@@ -1810,20 +2139,11 @@ mod tests {
             .filter(|entry| generated::arginfo::function_metadata(entry.name()).is_none())
             .map(BuiltinEntry::name)
             .collect::<Vec<_>>();
+        missing.sort_unstable();
 
         assert_eq!(
-            missing,
-            [
-                "apcu_add",
-                "apcu_clear_cache",
-                "apcu_delete",
-                "apcu_enabled",
-                "apcu_exists",
-                "apcu_fetch",
-                "apcu_store",
-                "print"
-            ],
-            "`print` is a PHP language construct; APCu is a PECL-style surface; all function builtins should otherwise have generated php-src arginfo"
+            missing, FUNCTIONS_WITH_EXTERNAL_ARGINFO,
+            "`print` is a PHP language construct; external extension slices without pinned php-src stubs must be explicitly audited here; all function builtins should otherwise have generated php-src arginfo"
         );
     }
 

@@ -1,7 +1,7 @@
 {
   "schema_version": "phpt-module-plan-v1",
   "module": "sockets",
-  "priority": "Default-disabled sockets surface",
+  "priority": "Deterministic sockets loopback TCP subset",
   "selected_manifest": "tests/phpt/manifests/modules/sockets.selected.jsonl",
   "corpus_count": 1,
   "selected_count": 1,
@@ -10,8 +10,16 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["Socket constants and deterministic false creation"],
-  "non_scope": ["Network socket creation, connect, read, write, or select"],
+  "scope": [
+    "Socket class visibility",
+    "IPv4 TCP loopback create/bind/listen/connect/accept",
+    "Bidirectional socket_read/socket_write smoke",
+    "Socket local address reporting and last-error helpers"
+  ],
+  "non_scope": [
+    "External network access",
+    "IPv6, UDP, Unix sockets, socket_select, options, nonblocking, timeouts, ancillary data, addrinfo helpers, stream import/export, and Windows helpers"
+  ],
   "target_gates": ["just phpt-dev-module MODULE=sockets"],
-  "next_step": "Keep socket creation disabled unless host capabilities are explicitly introduced."
+  "next_step": "Expand remaining socket_* functions behind deterministic loopback or host-capability gates."
 }

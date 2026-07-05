@@ -1036,6 +1036,34 @@ fn server_exposes_query_superglobal() {
 }
 
 #[test]
+fn server_filter_input_array_reads_query_snapshot() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("filter.php"),
+        r#"<?php
+$result = filter_input_array(INPUT_GET, [
+    "id" => FILTER_VALIDATE_INT,
+    "missing" => FILTER_VALIDATE_INT,
+]);
+echo filter_has_var(INPUT_GET, "id") ? "yes|" : "no|";
+echo $result["id"], "|";
+var_dump($result["missing"]);
+"#,
+    )
+    .expect("write filter fixture");
+    let mut child = start_server(&docroot, &[]);
+
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/filter.php?id=42");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.ends_with("yes|42|NULL\n"), "{response}");
+}
+
+#[test]
 fn server_exposes_post_superglobal() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);

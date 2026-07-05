@@ -1,7 +1,7 @@
 {
   "schema_version": "phpt-module-plan-v1",
   "module": "redis",
-  "priority": "Disabled external Redis surface",
+  "priority": "Deterministic fake Redis backend for CI-safe core command coverage",
   "selected_manifest": "tests/phpt/manifests/modules/redis.selected.jsonl",
   "corpus_count": 1,
   "selected_count": 1,
@@ -10,8 +10,19 @@
   "fail_count": 0,
   "bork_count": 0,
   "known_failure_count": 0,
-  "scope": ["Extension and class introspection only"],
-  "non_scope": ["External Redis network connections and command emulation"],
+  "scope": [
+    "Extension and class introspection",
+    "Redis object construction and method_exists probes",
+    "Deterministic in-process connect/auth/select/close/ping behavior",
+    "Core key/value, mget/mset, counters, ttl/expire/persist/delete/exists",
+    "Basic hash, list, set, sorted-set, scan, option, and transaction placeholders"
+  ],
+  "non_scope": [
+    "External Redis TCP protocol and persistent sockets",
+    "Cluster, sentinel, pub/sub, Lua eval, streams, blocking commands",
+    "Serializer and compression compatibility",
+    "Real time-based expiration"
+  ],
   "target_gates": ["just phpt-dev-module MODULE=redis"],
-  "next_step": "Add explicit local adapter only after the contract is approved."
+  "next_step": "Expand REDIS-2 coverage with opt-in live Redis tests for protocol, cluster, sentinel, pub/sub, eval, streams, serializer, and compression behavior."
 }

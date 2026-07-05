@@ -1,0 +1,26 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "hash",
+  "priority": "Digest, HMAC, and streaming context parity",
+  "selected_manifest": "tests/phpt/manifests/modules/hash.selected.jsonl",
+  "corpus_count": 82,
+  "selected_count": 19,
+  "pass_count": 19,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 63,
+  "scope": [
+    "Selected upstream ext/hash rows for md5, sha1, SHA-2 digests, HMAC-md5, file hashing, HKDF, PBKDF2, and stream updates",
+    "hash_file and hash_hmac_file over local files",
+    "raw binary output for file digests",
+    "HashContext visibility, HASH_HMAC, hash_init/update/copy/final lifecycle",
+    "finalized HashContext rejection",
+    "hash_update_file and hash_update_stream digest accumulation",
+    "hash_pbkdf2 and hash_hkdf SHA-256 derivation",
+    "sha224, sha512/224, and sha512/256 digest/HMAC backends"
+  ],
+  "non_scope": ["Full php-src hash algorithm inventory", "HashContext magic serialization/debug-info parity"],
+  "target_gates": ["just phpt-dev-module MODULE=hash"],
+  "next_step": "Add remaining hash algorithms such as md2, md4, sha3, xxhash, ripemd, haval, tiger, snefru, gost, and whirlpool before promoting the full upstream corpus."
+}

@@ -1,0 +1,33 @@
+{
+  "schema_version": "phpt-module-plan-v1",
+  "module": "igbinary",
+  "priority": "igbinary extension primitive value compatibility slice",
+  "selected_manifest": "tests/phpt/manifests/modules/igbinary.selected.jsonl",
+  "corpus_count": 0,
+  "selected_count": 1,
+  "pass_count": 1,
+  "skip_count": 0,
+  "fail_count": 0,
+  "bork_count": 0,
+  "known_failure_count": 0,
+  "scope": [
+    "Extension and function introspection",
+    "igbinary_serialize and igbinary_unserialize",
+    "Null, boolean, integer, float, byte string, packed array, and mixed array encoding",
+    "Primitive igbinary scalar and array decoding with PHP int/string array keys",
+    "igbinary string table references for repeated non-empty strings in arrays"
+  ],
+  "non_scope": [
+    "Object serialization hooks and incomplete object restoration",
+    "Reference identity and cyclic structure preservation",
+    "Session serializer registration",
+    "Redis and Memcached serializer option integration",
+    "PECL constants not present in the current igbinary function stub"
+  ],
+  "target_gates": [
+    "nix develop -c cargo test -p php_runtime igbinary --no-fail-fast",
+    "nix develop -c cargo test -p php_std igbinary --no-fail-fast",
+    "nix develop -c just phpt-dev-module MODULE=igbinary"
+  ],
+  "next_step": "Promote upstream PECL igbinary PHPTs once object/reference semantics and Redis/Memcached serializer integration are implemented."
+}

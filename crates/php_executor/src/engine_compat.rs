@@ -6,7 +6,7 @@ use crate::pipeline::compile_source;
 use crate::request::{include_loader_for, runtime_context_for};
 use php_diagnostics::{DebugEvent, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase};
 use php_runtime::api::ExitStatus;
-use php_vm::api::Vm;
+use php_vm::api::{Vm, VmResult};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -155,7 +155,7 @@ where
         .write_all(result.output.as_bytes())
         .map_err(|error| error.to_string())?;
     match result.status.exit_status() {
-        ExitStatus::Success => Ok(EXIT_SUCCESS),
+        ExitStatus::Success => Ok(vm_success_exit_code(&result)),
         ExitStatus::CompileError => {
             if write_vm_compile_fatal_line(
                 stderr,
@@ -204,6 +204,16 @@ where
         write_frontend_diagnostics(stderr, &pipeline)?;
         Ok(EXIT_PHP_ERROR)
     }
+}
+
+fn vm_success_exit_code(result: &VmResult) -> i32 {
+    let code = result.process_exit_code.unwrap_or(EXIT_SUCCESS);
+    if result.process_exit_terminates_process {
+        unsafe {
+            libc::_exit(code);
+        }
+    }
+    code
 }
 
 pub fn read_script(path: &Path) -> Result<(String, PathBuf, String), String> {
@@ -320,6 +330,19 @@ mod tests {
 
         assert_eq!(status, EXIT_SUCCESS);
         assert_eq!(stdout, b"stop");
+        assert_eq!(stderr, b"");
+    }
+
+    #[test]
+    fn compatibility_entrypoint_preserves_script_exit_code() {
+        let input = test_input("<?php exit(23);");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = execute_php(input, &mut stdout, &mut stderr).expect("execute");
+
+        assert_eq!(status, 23);
+        assert_eq!(stdout, b"");
         assert_eq!(stderr, b"");
     }
 

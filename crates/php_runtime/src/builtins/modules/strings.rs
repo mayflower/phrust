@@ -79,6 +79,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new("implode", builtin_implode, BuiltinCompatibility::Php),
+    BuiltinEntry::new("join", builtin_implode, BuiltinCompatibility::Php),
     BuiltinEntry::new("lcfirst", builtin_lcfirst, BuiltinCompatibility::Php),
     BuiltinEntry::new("ltrim", builtin_ltrim, BuiltinCompatibility::Php),
     BuiltinEntry::new("md5", builtin_md5, BuiltinCompatibility::Php),

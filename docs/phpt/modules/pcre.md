@@ -1,9 +1,9 @@
 # pcre
 
-- Priority: 18.6 focused harness
+- Priority: 18.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- the selected close gate: 11 PASS, 0 SKIP, 0 FAIL, 0 BORK from 11 selected fixtures
-- Upstream corpus snapshot before the selected gate: 41 PASS, 5 SKIP, 117 FAIL, 0 BORK
+- the selected close gate: 74 PASS, 10 SKIP, 0 FAIL, 0 BORK from 84 selected fixtures
+- Upstream corpus snapshot before the selected gate: 69 PASS, 10 SKIP, 86 FAIL, 0 BORK
   from 165 corpus candidates
 
 ## Scope
@@ -22,7 +22,7 @@
 
 ## Non-Scope
 
-- Full upstream `ext/pcre` corpus promotion
+- Remaining 86 upstream `ext/pcre` failures
 - PCRE JIT, callouts, `(*MARK)`, and every PHP modifier edge
 - `preg_filter`, `preg_replace_callback_array`, array/method callback edge cases
 - Byte-perfect warning text, stack formatting, UTF-8 edge diagnostics, and
@@ -35,6 +35,7 @@
 - `tests/phpt/generated/pcre/preg-replace-split-grep-quote.phpt`
 - `tests/phpt/generated/pcre/preg-replace-callback.phpt`
 - `tests/phpt/generated/pcre/preg-replace-callback-invalid.phpt`
+- 79 target-green upstream rows from `ext/pcre/tests`
 - `ext/pcre/tests/preg_match_basic.phpt`
 - `ext/pcre/tests/preg_quote_basic.phpt`
 - `ext/pcre/tests/preg_split_basic.phpt`
@@ -74,11 +75,19 @@
 - The selected upstream PCRE promotion now covers basic `preg_match`,
   `preg_quote`, `preg_split`, `preg_grep`, and legacy `preg_match_all`-free
   regex cases that fit the existing runtime surface.
+- A full target-only upstream sweep on the PHP 8.5.7 oracle corpus measured
+  69 PASS, 10 SKIP, and 86 FAIL from 165 `ext/pcre/tests` rows; every PASS/SKIP
+  row from that sweep is now selected with the existing generated harness.
 
 ## Known Gaps
 
 - Full upstream `ext/pcre` still has unsupported feature, warning parity,
-  callback-array, UTF-8, and locale-sensitive cases.
+  callback-array, UTF-8, malformed-pattern diagnostics, and locale-sensitive
+  cases.
+- The remaining failure set includes `preg_match_all` capture shape variants,
+  `preg_filter`, `preg_replace_callback_array`, replacement backreference edge
+  cases, split edge cases, invalid UTF-8 offsets, recursion/backtrack limits,
+  JIT/callout/mark cases, and byte-perfect warning text.
 - Direct runtime-registry callback use remains limited to internal callables;
   userland callback dispatch is covered through the VM path.
 - Fatal stack formatting for invalid callbacks is intentionally matched by
@@ -87,6 +96,6 @@
 
 ## Next Step
 
-Expand from the generated selected harness into upstream `ext/pcre` PHPT
-promotion after the remaining warning, UTF-8, locale, callback-array, and
-advanced PCRE gaps close.
+Close the remaining `preg_match_all` shape, warning parity, UTF-8,
+`preg_filter`, `preg_replace_callback_array`, and advanced replacement/split
+failures before the next upstream promotion.

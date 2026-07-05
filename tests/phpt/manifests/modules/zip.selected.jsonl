@@ -1,2 +1,3 @@
 {"path":"tests/phpt/generated/zip/archive-basic.phpt"}
+{"path":"tests/phpt/generated/zip/legacy-resource-api.phpt"}
 {"path":"ext/zip/tests/oo_extract.phpt"}

@@ -463,9 +463,30 @@ impl CallStack {
         self.frames.pop()
     }
 
+    /// Pops a frame by stack depth from entry to current frame.
+    pub fn pop_frame(&mut self, index: usize) -> Option<Frame> {
+        if index >= self.frames.len() {
+            return None;
+        }
+        Some(self.frames.remove(index))
+    }
+
     /// Pops a completed frame into the request-local reuse pool.
     pub fn pop_recycle(&mut self) -> bool {
         let Some(mut frame) = self.frames.pop() else {
+            return false;
+        };
+        if !frame.reuse_eligible {
+            return false;
+        }
+        frame.clear_for_reuse();
+        self.frame_pool.push(frame);
+        true
+    }
+
+    /// Pops a completed frame by stack depth into the request-local reuse pool.
+    pub fn pop_frame_recycle(&mut self, index: usize) -> bool {
+        let Some(mut frame) = self.pop_frame(index) else {
             return false;
         };
         if !frame.reuse_eligible {
@@ -485,6 +506,11 @@ impl CallStack {
     /// Returns the top frame mutably.
     pub fn current_mut(&mut self) -> Option<&mut Frame> {
         self.frames.last_mut()
+    }
+
+    /// Returns a mutable frame by stack depth from entry to current frame.
+    pub fn frame_mut(&mut self, index: usize) -> Option<&mut Frame> {
+        self.frames.get_mut(index)
     }
 
     /// Returns frames from entry to current frame.

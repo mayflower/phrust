@@ -1,0 +1,1 @@
+{"path":"tests/phpt/generated/ssh2/basic.phpt","reason":"Covers deterministic SSH2 facade discovery, session/SFTP handles, credential-safe auth failure, methods/fingerprint shapes, and explicit backend-required false returns without a live SSH server."}

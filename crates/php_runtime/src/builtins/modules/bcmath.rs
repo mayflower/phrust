@@ -28,83 +28,103 @@ struct Decimal {
 }
 
 fn builtin_bcadd(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    binary_decimal("bcadd", args, |left, right, scale| {
-        let common = left.scale.max(right.scale);
-        let value = left.units_scaled(common) + right.units_scaled(common);
-        Ok(Decimal {
-            units: rescale_units(value, common, scale),
-            scale,
-        }
-        .format())
-    })
+    binary_decimal(
+        "bcadd",
+        context.bcmath_scale(),
+        args,
+        |left, right, scale| {
+            let common = left.scale.max(right.scale);
+            let value = left.units_scaled(common) + right.units_scaled(common);
+            Ok(Decimal {
+                units: rescale_units(value, common, scale),
+                scale,
+            }
+            .format())
+        },
+    )
 }
 
 fn builtin_bcsub(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    binary_decimal("bcsub", args, |left, right, scale| {
-        let common = left.scale.max(right.scale);
-        let value = left.units_scaled(common) - right.units_scaled(common);
-        Ok(Decimal {
-            units: rescale_units(value, common, scale),
-            scale,
-        }
-        .format())
-    })
+    binary_decimal(
+        "bcsub",
+        context.bcmath_scale(),
+        args,
+        |left, right, scale| {
+            let common = left.scale.max(right.scale);
+            let value = left.units_scaled(common) - right.units_scaled(common);
+            Ok(Decimal {
+                units: rescale_units(value, common, scale),
+                scale,
+            }
+            .format())
+        },
+    )
 }
 
 fn builtin_bcmul(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    binary_decimal("bcmul", args, |left, right, scale| {
-        let raw_scale = left.scale + right.scale;
-        Ok(Decimal {
-            units: rescale_units(left.units * right.units, raw_scale, scale),
-            scale,
-        }
-        .format())
-    })
+    binary_decimal(
+        "bcmul",
+        context.bcmath_scale(),
+        args,
+        |left, right, scale| {
+            let raw_scale = left.scale + right.scale;
+            Ok(Decimal {
+                units: rescale_units(left.units * right.units, raw_scale, scale),
+                scale,
+            }
+            .format())
+        },
+    )
 }
 
 fn builtin_bcdiv(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    binary_decimal("bcdiv", args, |left, right, scale| {
-        if right.units.is_zero() {
-            return Err(argument_value_error(
-                "bcdiv",
-                "#2 ($num2)",
-                "must not be zero",
-            ));
-        }
-        let mut numerator = left.units;
-        let mut denominator = right.units;
-        let exponent = scale as isize + right.scale as isize - left.scale as isize;
-        if exponent >= 0 {
-            numerator *= pow10(exponent as usize);
-        } else {
-            denominator *= pow10((-exponent) as usize);
-        }
-        Ok(Decimal {
-            units: numerator / denominator,
-            scale,
-        }
-        .format())
-    })
+    binary_decimal(
+        "bcdiv",
+        context.bcmath_scale(),
+        args,
+        |left, right, scale| {
+            if right.units.is_zero() {
+                return Err(argument_value_error(
+                    "bcdiv",
+                    "#2 ($num2)",
+                    "must not be zero",
+                ));
+            }
+            let mut numerator = left.units;
+            let mut denominator = right.units;
+            let exponent = scale as isize + right.scale as isize - left.scale as isize;
+            if exponent >= 0 {
+                numerator *= pow10(exponent as usize);
+            } else {
+                denominator *= pow10((-exponent) as usize);
+            }
+            Ok(Decimal {
+                units: numerator / denominator,
+                scale,
+            }
+            .format())
+        },
+    )
 }
 
 fn builtin_bcmod(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -120,7 +140,7 @@ fn builtin_bcmod(
             "must not be zero",
         ));
     }
-    let scale = scale_arg("bcmod", args.get(2))?;
+    let scale = scale_arg("bcmod", args.get(2), context.bcmath_scale())?;
     let common = left.scale.max(right.scale);
     Ok(Value::string(
         Decimal {
@@ -133,7 +153,7 @@ fn builtin_bcmod(
 }
 
 fn builtin_bcpow(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -145,7 +165,7 @@ fn builtin_bcpow(
     let exponent = exponent_text.trim().parse::<u32>().map_err(|_| {
         argument_value_error("bcpow", "#2 ($exponent)", "must be a non-negative integer")
     })?;
-    let scale = scale_arg("bcpow", args.get(2))?;
+    let scale = scale_arg("bcpow", args.get(2), context.bcmath_scale())?;
     let units = base.units.pow(exponent);
     let raw_scale = base.scale.saturating_mul(exponent as usize);
     Ok(Value::string(
@@ -158,14 +178,14 @@ fn builtin_bcpow(
 }
 
 fn builtin_bccomp(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(2..=3).contains(&args.len()) {
         return Err(arity_error("bccomp", "two or three arguments"));
     }
-    let scale = scale_arg("bccomp", args.get(2))?;
+    let scale = scale_arg("bccomp", args.get(2), context.bcmath_scale())?;
     let left = parse_decimal_arg("bccomp", &args[0])?.rescaled(scale);
     let right = parse_decimal_arg("bccomp", &args[1])?.rescaled(scale);
     Ok(Value::Int(match left.units.cmp(&right.units) {
@@ -176,7 +196,7 @@ fn builtin_bccomp(
 }
 
 fn builtin_bcscale(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -192,12 +212,14 @@ fn builtin_bcscale(
                 "must be non-negative",
             ));
         }
+        return Ok(Value::Int(context.set_bcmath_scale(scale as usize) as i64));
     }
-    Ok(Value::Int(0))
+    Ok(Value::Int(context.bcmath_scale() as i64))
 }
 
 fn binary_decimal(
     name: &'static str,
+    default_scale: usize,
     args: Vec<Value>,
     operation: impl FnOnce(Decimal, Decimal, usize) -> Result<Vec<u8>, BuiltinError>,
 ) -> BuiltinResult {
@@ -206,7 +228,7 @@ fn binary_decimal(
     }
     let left = parse_decimal_arg(name, &args[0])?;
     let right = parse_decimal_arg(name, &args[1])?;
-    let scale = scale_arg(name, args.get(2))?;
+    let scale = scale_arg(name, args.get(2), default_scale)?;
     operation(left, right, scale).map(Value::string)
 }
 
@@ -286,11 +308,15 @@ impl Decimal {
     }
 }
 
-fn scale_arg(name: &str, value: Option<&Value>) -> Result<usize, BuiltinError> {
+fn scale_arg(
+    name: &str,
+    value: Option<&Value>,
+    default_scale: usize,
+) -> Result<usize, BuiltinError> {
     let scale = value
         .map(|value| int_arg(name, value))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(default_scale as i64);
     if scale < 0 {
         Err(argument_value_error(name, "scale", "must be non-negative"))
     } else {
@@ -314,4 +340,57 @@ fn pow10(power: usize) -> BigInt {
         value *= 10;
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OutputBuffer, PhpString};
+
+    fn call(context: &mut BuiltinContext<'_>, name: &str, args: Vec<Value>) -> Value {
+        ENTRIES
+            .iter()
+            .find(|entry| entry.name() == name)
+            .expect("bcmath entry")
+            .function()(context, args, RuntimeSourceSpan::default())
+        .expect("bcmath succeeds")
+    }
+
+    fn string(value: &str) -> Value {
+        Value::String(PhpString::from_test_str(value))
+    }
+
+    #[test]
+    fn bcscale_updates_request_local_default_scale() {
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+
+        assert_eq!(call(&mut context, "bcscale", vec![]), Value::Int(0));
+        assert_eq!(
+            call(&mut context, "bcadd", vec![string("1.2"), string("3.45")]),
+            string("4")
+        );
+        assert_eq!(
+            call(&mut context, "bcscale", vec![Value::Int(3)]),
+            Value::Int(0)
+        );
+        assert_eq!(call(&mut context, "bcscale", vec![]), Value::Int(3));
+        assert_eq!(
+            call(&mut context, "bcadd", vec![string("1.2"), string("3.45")]),
+            string("4.650")
+        );
+        assert_eq!(
+            call(
+                &mut context,
+                "bcadd",
+                vec![string("1.2"), string("3.45"), Value::Int(1)]
+            ),
+            string("4.6")
+        );
+        assert_eq!(
+            call(&mut context, "bcscale", vec![Value::Int(0)]),
+            Value::Int(3)
+        );
+        assert_eq!(call(&mut context, "bcscale", vec![]), Value::Int(0));
+    }
 }
