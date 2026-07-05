@@ -153,7 +153,7 @@ fn validate_email(name: &str, value: &Value, failure: Value) -> BuiltinResult {
     if parts.next().is_none()
         && !local.is_empty()
         && domain.contains('.')
-        && !string.bytes().any(|byte| byte.is_ascii_whitespace())
+        && !php_source::byte_kernel::contains_ascii_whitespace(input.as_bytes())
     {
         Ok(Value::String(input))
     } else {
@@ -168,7 +168,7 @@ fn validate_url(name: &str, value: &Value, flags: i64, failure: Value) -> Builti
     let after_scheme = string.split_once("://").map(|(_, tail)| tail).unwrap_or("");
     let has_host = !after_scheme.is_empty()
         && !after_scheme.starts_with('/')
-        && !after_scheme.bytes().any(|byte| byte.is_ascii_whitespace());
+        && !php_source::byte_kernel::contains_ascii_whitespace(after_scheme.as_bytes());
     let path_ok = flags & FILTER_FLAG_PATH_REQUIRED == 0 || after_scheme.contains('/');
     let query_ok = flags & FILTER_FLAG_QUERY_REQUIRED == 0 || after_scheme.contains('?');
     if has_scheme && has_host && path_ok && query_ok {

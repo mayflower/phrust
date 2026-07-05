@@ -317,9 +317,7 @@ fn split_archive_and_entry(rest: &str) -> Result<(&str, &str), PharError> {
 }
 
 fn find_halt_offset(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(HALT_COMPILER.len())
-        .position(|window| window == HALT_COMPILER)
+    php_source::byte_kernel::find_bytes(bytes, HALT_COMPILER)
         .map(|index| index + HALT_COMPILER.len())
 }
 

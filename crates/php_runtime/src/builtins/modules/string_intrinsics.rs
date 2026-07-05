@@ -6,20 +6,32 @@
 //! functions, so the fast and generic paths cannot diverge.
 
 use super::core::{
-    HTML_ESCAPE_DEFAULT_FLAGS, default_trim_mask, find_bytes_from, html_escape_with_options,
-    normalize_offset, replace_all,
+    HTML_ESCAPE_DEFAULT_FLAGS, find_bytes_from, html_escape_with_options, normalize_offset,
+    replace_all,
 };
 use crate::{PhpArray, PhpString, Value};
+use php_source::byte_kernel;
 
 /// `strtoupper($string)`: PHP 8 case conversion is byte-based ASCII.
 ///
 /// Shares the input storage when no byte needs conversion.
 pub fn strtoupper_ascii(input: &PhpString) -> PhpString {
     let bytes = input.as_bytes();
-    if !bytes.iter().any(u8::is_ascii_lowercase) {
+    if !byte_kernel::contains_ascii_lowercase(bytes) {
         return input.clone();
     }
-    PhpString::from_bytes(bytes.iter().map(u8::to_ascii_uppercase).collect::<Vec<_>>())
+    PhpString::from_bytes(byte_kernel::ascii_uppercase_copy(bytes))
+}
+
+/// `strtolower($string)`: PHP 8 case conversion is byte-based ASCII.
+///
+/// Shares the input storage when no byte needs conversion.
+pub fn strtolower_ascii(input: &PhpString) -> PhpString {
+    let bytes = input.as_bytes();
+    if !byte_kernel::contains_ascii_uppercase(bytes) {
+        return input.clone();
+    }
+    PhpString::from_bytes(byte_kernel::ascii_lowercase_copy(bytes))
 }
 
 /// `str_replace($search, $replace, $subject)` with scalar string arguments.
@@ -49,10 +61,7 @@ pub fn str_replace_scalar(
 /// Shares the input storage when no byte belongs to the escape set.
 pub fn htmlspecialchars_default(input: &PhpString) -> PhpString {
     let bytes = input.as_bytes();
-    if !bytes
-        .iter()
-        .any(|byte| matches!(byte, b'&' | b'<' | b'>' | b'"' | b'\''))
-    {
+    if byte_kernel::find_html_escape_byte(bytes).is_none() {
         return input.clone();
     }
     PhpString::from_bytes(html_escape_with_options(
@@ -67,9 +76,9 @@ pub fn htmlspecialchars_default(input: &PhpString) -> PhpString {
 /// The parts vector is sized exactly from a separator pre-count.
 pub fn explode_single_byte(separator: u8, subject: &PhpString) -> PhpArray {
     let bytes = subject.as_bytes();
-    let mut parts = Vec::with_capacity(bytes.iter().filter(|byte| **byte == separator).count() + 1);
+    let mut parts = Vec::with_capacity(byte_kernel::count_byte(bytes, separator) + 1);
     let mut start = 0;
-    while let Some(offset) = bytes[start..].iter().position(|byte| *byte == separator) {
+    while let Some(offset) = byte_kernel::find_byte(&bytes[start..], separator) {
         parts.push(Value::string(bytes[start..start + offset].to_vec()));
         start += offset + 1;
     }
@@ -102,16 +111,8 @@ pub fn substr_bytes(string: &PhpString, offset: i64, length: Option<i64>) -> Php
 /// builtin's mask table; an untrimmed input shares its storage.
 #[must_use]
 pub fn trim_ascii_default(string: &PhpString) -> PhpString {
-    let mask = default_trim_mask();
     let bytes = string.as_bytes();
-    let start = bytes
-        .iter()
-        .position(|byte| !mask[usize::from(*byte)])
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !mask[usize::from(*byte)])
-        .map_or(start, |index| index + 1);
+    let (start, end) = byte_kernel::trim_default_bounds(bytes);
     if start == 0 && end == bytes.len() {
         return string.clone();
     }
@@ -138,6 +139,20 @@ mod tests {
         ] {
             let expected: Vec<u8> = input.iter().map(u8::to_ascii_uppercase).collect();
             assert_eq!(strtoupper_ascii(&string(input)).as_bytes(), &expected[..]);
+        }
+    }
+
+    #[test]
+    fn strtolower_matches_generic_byte_map() {
+        for input in [
+            &b""[..],
+            b"already lower 123",
+            b"MiXeD case",
+            b"binary \x00\xff\x80 tail",
+            b"umlaut \xc3\x84",
+        ] {
+            let expected: Vec<u8> = input.iter().map(u8::to_ascii_lowercase).collect();
+            assert_eq!(strtolower_ascii(&string(input)).as_bytes(), &expected[..]);
         }
     }
 

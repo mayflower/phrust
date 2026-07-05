@@ -218,10 +218,7 @@ pub fn take_cache_stats() -> NumericStringCacheStats {
 /// Classifies a byte string using the runtime-semantics PHP numeric-string subset.
 #[must_use]
 pub fn classify(bytes: &[u8]) -> NumericString {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
+    let start = php_source::byte_kernel::find_non_ascii_whitespace(bytes).unwrap_or(bytes.len());
     let original = bytes;
     let trimmed_start = &bytes[start..];
     if trimmed_start.is_empty() {
@@ -235,7 +232,7 @@ pub fn classify(bytes: &[u8]) -> NumericString {
         return non_numeric();
     };
     let trailing = &trimmed_start[prefix..];
-    if trailing.iter().all(u8::is_ascii_whitespace) {
+    if php_source::byte_kernel::all_ascii_whitespace(trailing) {
         let kind = if parsed.value.is_float() {
             NumericStringKind::FloatString
         } else {
@@ -283,18 +280,16 @@ fn non_numeric() -> NumericString {
 fn numeric_prefix_len(bytes: &[u8]) -> Option<usize> {
     let mut index = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
     let mut digits = 0usize;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        digits += 1;
-        index += 1;
-    }
+    let integer_digits = php_source::byte_kernel::ascii_digit_run_len(&bytes[index..]);
+    digits += integer_digits;
+    index += integer_digits;
     let mut has_fraction = false;
     if bytes.get(index) == Some(&b'.') {
         has_fraction = true;
         index += 1;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            digits += 1;
-            index += 1;
-        }
+        let fraction_digits = php_source::byte_kernel::ascii_digit_run_len(&bytes[index..]);
+        digits += fraction_digits;
+        index += fraction_digits;
     }
     if digits == 0 {
         return None;
@@ -306,9 +301,7 @@ fn numeric_prefix_len(bytes: &[u8]) -> Option<usize> {
             index += 1;
         }
         let exponent_start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
+        index += php_source::byte_kernel::ascii_digit_run_len(&bytes[index..]);
         if index == exponent_start {
             return Some(exponent_marker);
         }
@@ -380,7 +373,10 @@ fn canonical_integer_value(bytes: &[u8], value: NumericStringValue) -> Option<i6
         .strip_prefix(b"-")
         .map(|digits| (true, digits))
         .unwrap_or((false, bytes));
-    if bytes.starts_with(b"+") || digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    if bytes.starts_with(b"+")
+        || digits.is_empty()
+        || !php_source::byte_kernel::all_ascii_digits(digits)
+    {
         return None;
     }
     if digits.len() > 1 && digits[0] == b'0' {

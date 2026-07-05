@@ -1170,7 +1170,7 @@ fn parse_form_urlencoded(input: &[u8]) -> Vec<(String, String)> {
 }
 
 fn split_bytes_once(input: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
-    let index = input.iter().position(|byte| *byte == delimiter)?;
+    let index = php_source::byte_kernel::find_byte(input, delimiter)?;
     Some((&input[..index], &input[index + 1..]))
 }
 

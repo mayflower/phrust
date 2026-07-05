@@ -101,6 +101,14 @@ fn encode_array(array: &PhpArray, output: &mut String, depth: usize) -> Result<(
 /// `\/` and every non-ASCII scalar becomes lowercase `\uXXXX` (surrogate
 /// pairs above the BMP). Invalid UTF-8 defers to the generic path.
 fn encode_string(bytes: &[u8], output: &mut String) -> Result<(), &'static str> {
+    if php_source::byte_kernel::find_json_escape_byte(bytes).is_none() {
+        let text = std::str::from_utf8(bytes).map_err(|_| "invalid_utf8")?;
+        output.reserve(text.len() + 2);
+        output.push('"');
+        output.push_str(text);
+        output.push('"');
+        return Ok(());
+    }
     let text = std::str::from_utf8(bytes).map_err(|_| "invalid_utf8")?;
     output.reserve(text.len() + 2);
     output.push('"');

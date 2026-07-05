@@ -204,14 +204,14 @@ fn html_escaped_capacity(bytes: &[u8], flags: i64) -> usize {
 
 fn valid_html_entity_len(bytes: &[u8]) -> Option<usize> {
     debug_assert_eq!(bytes.first(), Some(&b'&'));
-    let semicolon = bytes.iter().position(|byte| *byte == b';')?;
+    let semicolon = php_source::byte_kernel::find_byte(bytes, b';')?;
     if semicolon < 3 {
         return None;
     }
     let entity = &bytes[1..semicolon];
     if let Some(decimal) = entity.strip_prefix(b"#")
         && !decimal.is_empty()
-        && decimal.iter().all(u8::is_ascii_digit)
+        && php_source::byte_kernel::all_ascii_digits(decimal)
     {
         return Some(semicolon + 1);
     }

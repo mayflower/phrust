@@ -1742,7 +1742,7 @@ pub(in crate::builtins::modules) fn parse_php_url_path(
 }
 
 pub(in crate::builtins::modules) fn parse_url_port(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+    if bytes.is_empty() || !php_source::byte_kernel::all_ascii_digits(bytes) {
         return None;
     }
     let value = std::str::from_utf8(bytes).ok()?.parse::<i64>().ok()?;
@@ -1765,10 +1765,7 @@ pub(in crate::builtins::modules) fn find_byte(
     start: usize,
     needle: u8,
 ) -> Option<usize> {
-    bytes[start..]
-        .iter()
-        .position(|byte| *byte == needle)
-        .map(|offset| start + offset)
+    php_source::byte_kernel::find_byte(&bytes[start..], needle).map(|offset| start + offset)
 }
 
 pub(in crate::builtins::modules) fn find_byte_before(
@@ -1777,10 +1774,7 @@ pub(in crate::builtins::modules) fn find_byte_before(
     end: usize,
     needle: u8,
 ) -> Option<usize> {
-    bytes[start..end]
-        .iter()
-        .position(|byte| *byte == needle)
-        .map(|offset| start + offset)
+    php_source::byte_kernel::find_byte(&bytes[start..end], needle).map(|offset| start + offset)
 }
 
 pub(in crate::builtins::modules) fn find_first_of(
@@ -1788,14 +1782,24 @@ pub(in crate::builtins::modules) fn find_first_of(
     start: usize,
     needles: &[u8],
 ) -> usize {
-    bytes[start..]
-        .iter()
-        .position(|byte| needles.contains(byte))
-        .map_or(bytes.len(), |offset| start + offset)
+    match needles {
+        [] => bytes.len(),
+        [one] => find_byte(bytes, start, *one).unwrap_or(bytes.len()),
+        [one, two] => php_source::byte_kernel::find_any2(&bytes[start..], *one, *two)
+            .map_or(bytes.len(), |offset| start + offset),
+        [one, two, three] => {
+            php_source::byte_kernel::find_any3(&bytes[start..], *one, *two, *three)
+                .map_or(bytes.len(), |offset| start + offset)
+        }
+        _ => bytes[start..]
+            .iter()
+            .position(|byte| needles.contains(byte))
+            .map_or(bytes.len(), |offset| start + offset),
+    }
 }
 
 pub(in crate::builtins::modules) fn find_last_byte(bytes: &[u8], needle: u8) -> Option<usize> {
-    bytes.iter().rposition(|byte| *byte == needle)
+    php_source::byte_kernel::rfind_byte(bytes, needle)
 }
 
 pub(in crate::builtins::modules) fn starts_with_at(
@@ -3217,10 +3221,10 @@ pub(in crate::builtins::modules) fn find_bytes_from(
     if start > haystack.len() || needle.len() > haystack.len().saturating_sub(start) {
         return None;
     }
-    haystack[start..]
-        .windows(needle.len())
-        .position(|window| bytes_equal(window, needle, case_insensitive))
-        .map(|index| index + start)
+    if !case_insensitive {
+        return php_source::byte_kernel::find_bytes_from(haystack, needle, start);
+    }
+    php_source::byte_kernel::find_bytes_ascii_case_insensitive_from(haystack, needle, start)
 }
 
 pub(in crate::builtins::modules) fn rfind_bytes(
@@ -3249,13 +3253,13 @@ pub(in crate::builtins::modules) fn rfind_bytes(
     } else {
         (0, start.min(max_start))
     };
-    (lower..=upper).rev().find(|index| {
-        bytes_equal(
-            &haystack[*index..*index + needle.len()],
-            needle,
-            case_insensitive,
-        )
-    })
+    let end = upper + needle.len();
+    let index = if case_insensitive {
+        php_source::byte_kernel::rfind_bytes_ascii_case_insensitive_before(haystack, needle, end)
+    } else {
+        php_source::byte_kernel::rfind_bytes_before(haystack, needle, end)
+    }?;
+    (index >= lower).then_some(index)
 }
 
 pub(in crate::builtins::modules) fn position_offset_error(name: &str) -> BuiltinError {
@@ -3294,18 +3298,6 @@ pub(in crate::builtins::modules) fn position_offset_arg(
     int_arg(name, value)
 }
 
-pub(in crate::builtins::modules) fn bytes_equal(
-    left: &[u8],
-    right: &[u8],
-    case_insensitive: bool,
-) -> bool {
-    if case_insensitive {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
 pub(in crate::builtins::modules) fn compare_strings(
     name: &str,
     args: &[Value],
@@ -3321,11 +3313,8 @@ pub(in crate::builtins::modules) fn compare_strings(
         right.truncate(limit);
     }
     if case_insensitive {
-        left.iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
-        right
-            .iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
+        php_source::byte_kernel::ascii_lowercase_in_place(&mut left);
+        php_source::byte_kernel::ascii_lowercase_in_place(&mut right);
     }
     Ok(Value::Int(binary_string_compare(&left, &right)))
 }
@@ -3494,7 +3483,7 @@ pub(in crate::builtins::modules) fn strip_tags_allowed_string(
 }
 
 pub(in crate::builtins::modules) fn lower_ascii_bytes(input: &[u8]) -> Vec<u8> {
-    input.iter().map(u8::to_ascii_lowercase).collect()
+    php_source::byte_kernel::ascii_lowercase_copy(input)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4079,7 +4068,7 @@ pub(in crate::builtins::modules) fn wordwrap_line(
     while line.len().saturating_sub(start) > width {
         let search_end = start + (width + 1).min(line.len() - start);
         let search = &line[start..search_end];
-        if let Some(space) = search.iter().rposition(|byte| byte.is_ascii_whitespace()) {
+        if let Some(space) = php_source::byte_kernel::rfind_ascii_whitespace(search) {
             if space > 0 {
                 output.extend_from_slice(&line[start..start + space]);
                 output.extend_from_slice(break_string);
@@ -4108,9 +4097,8 @@ pub(in crate::builtins::modules) fn wordwrap_line(
             if line.get(start).is_some_and(u8::is_ascii_whitespace) {
                 start += 1;
             }
-        } else if let Some(space) = line[start + width..]
-            .iter()
-            .position(|byte| byte.is_ascii_whitespace())
+        } else if let Some(space) =
+            php_source::byte_kernel::find_ascii_whitespace(&line[start + width..])
         {
             output.extend_from_slice(&line[start..start + width + space]);
             output.extend_from_slice(break_string);
@@ -4123,7 +4111,7 @@ pub(in crate::builtins::modules) fn wordwrap_line(
 }
 
 pub(in crate::builtins::modules) fn break_string_is_whitespace(break_string: &[u8]) -> bool {
-    break_string.iter().all(u8::is_ascii_whitespace)
+    php_source::byte_kernel::all_ascii_whitespace(break_string)
 }
 
 pub(in crate::builtins::modules) fn uuencode_bytes(input: &[u8]) -> Vec<u8> {
@@ -4220,11 +4208,19 @@ pub(in crate::builtins::modules) fn trim_builtin(
         .get(1)
         .map(|value| string_arg(name, value))
         .transpose()?;
+    let default_mask = mask.is_none();
     let mask = mask.as_ref().map_or_else(default_trim_mask, |mask| {
         trim_mask_from_charlist(context, name, mask.as_bytes(), span)
     });
     let bytes = string.as_bytes();
-    let start = if left {
+    let (default_start, default_end) = if default_mask {
+        php_source::byte_kernel::trim_default_bounds(bytes)
+    } else {
+        (0, bytes.len())
+    };
+    let start = if left && default_mask {
+        default_start
+    } else if left {
         bytes
             .iter()
             .position(|byte| !mask[usize::from(*byte)])
@@ -4232,7 +4228,9 @@ pub(in crate::builtins::modules) fn trim_builtin(
     } else {
         0
     };
-    let end = if right {
+    let end = if right && default_mask {
+        default_end
+    } else if right {
         bytes
             .iter()
             .rposition(|byte| !mask[usize::from(*byte)])

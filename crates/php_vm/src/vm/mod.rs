@@ -56982,8 +56982,8 @@ fn fast_builtin_stub_result_for_spec(
                 haystack.as_bytes().ends_with(needle.as_bytes()),
             ))
         }
-        (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::string(
-            php_source::byte_kernel::ascii_lowercase_copy(string.as_bytes()),
+        (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::strtolower_ascii(string),
         )),
         (BuiltinIntrinsicKind::StrToUpper, [Value::String(string)]) => Some(Value::String(
             php_runtime::builtins::string_intrinsics::strtoupper_ascii(string),

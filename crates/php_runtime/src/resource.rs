@@ -524,9 +524,7 @@ impl ResourceRef {
             | StreamData::File { buffer, cursor, .. }
             | StreamData::GzipFile { buffer, cursor, .. } => {
                 let remaining = &buffer[*cursor..];
-                let len = remaining
-                    .iter()
-                    .position(|byte| *byte == b'\n')
+                let len = php_source::byte_kernel::find_byte(remaining, b'\n')
                     .map_or(remaining.len(), |index| index + 1);
                 let end = *cursor + len;
                 let bytes = buffer[*cursor..end].to_vec();

@@ -2,7 +2,9 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use php_ir::{LoweringOptions, lower_frontend_result};
 use php_lexer::{LexerConfig, lex_all};
 use php_runtime::api::{ArrayKey, PhpArray, PhpString, Value};
+use php_runtime::builtins::string_intrinsics;
 use php_semantics::analyze_source;
+use php_source::byte_kernel;
 use php_syntax::parse_source_file;
 use php_vm::api::{CompiledUnit, InlineCacheMode, QuickeningMode, Vm, VmOptions};
 use std::time::Duration;
@@ -189,9 +191,151 @@ fn bench_runtime(c: &mut Criterion) {
     });
 }
 
+fn bench_byte_kernels(c: &mut Criterion) {
+    let ascii_text =
+        b"Alpha_beta_123 plain text with spaces and punctuation. ".repeat(256);
+    let mut json_text =
+        b"plain_ascii_payload_with_no_escapes_or_unicode_".repeat(256);
+    json_text.extend_from_slice(br#"needs " escaping after a long prefix"#);
+    let html_text =
+        b"plain html content with no entities until a late <tag> & quote ".repeat(192);
+    let mut trim_text = Vec::with_capacity(8192);
+    trim_text.extend(std::iter::repeat_n(b' ', 256));
+    trim_text.extend_from_slice(&ascii_text);
+    trim_text.extend(std::iter::repeat_n(b'\n', 256));
+
+    c.bench_function("performance/byte_kernel_find_subslice", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::find_bytes(
+                black_box(&ascii_text),
+                black_box(b"punctuation"),
+            ));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_rfind_subslice", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::rfind_bytes_before(
+                black_box(&ascii_text),
+                black_box(b"plain"),
+                black_box(ascii_text.len()),
+            ));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_ascii_ci_find_subslice", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::find_bytes_ascii_case_insensitive_from(
+                black_box(&ascii_text),
+                black_box(b"PUNCTUATION"),
+                black_box(0),
+            ));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_ascii_ci_rfind_subslice", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::rfind_bytes_ascii_case_insensitive_before(
+                black_box(&ascii_text),
+                black_box(b"ALPHA"),
+                black_box(ascii_text.len()),
+            ));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_count_byte", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::count_byte(black_box(&ascii_text), black_box(b' ')));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_digit_run", |b| {
+        let digits = b"1234567890".repeat(1024);
+        b.iter(|| {
+            black_box(byte_kernel::ascii_digit_run_len(black_box(&digits)));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_whitespace_scan", |b| {
+        let mut spaced = b" \t\n\r\x0c".repeat(1024);
+        spaced.extend_from_slice(b"content");
+        b.iter(|| {
+            black_box(byte_kernel::find_non_ascii_whitespace(black_box(&spaced)));
+            black_box(byte_kernel::rfind_ascii_whitespace(black_box(&spaced)));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_json_escape_scan", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::find_json_escape_byte(black_box(&json_text)));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_html_escape_scan", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::find_html_escape_byte(black_box(&html_text)));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_ascii_uppercase_copy", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::ascii_uppercase_copy(black_box(&ascii_text)));
+        });
+    });
+
+    c.bench_function("performance/byte_kernel_default_trim_bounds", |b| {
+        b.iter(|| {
+            black_box(byte_kernel::trim_default_bounds(black_box(&trim_text)));
+        });
+    });
+}
+
+fn bench_string_intrinsics(c: &mut Criterion) {
+    let mixed_case = PhpString::from_bytes(
+        b"Alpha Beta Gamma Delta epsilon zeta eta theta ".repeat(256),
+    );
+    let html = PhpString::from_bytes(
+        b"plain html until the last chunk contains <tag attr=\"value\"> & text"
+            .repeat(192),
+    );
+    let exploded = PhpString::from_bytes(b"field,".repeat(512));
+    let mut trim_bytes = Vec::with_capacity(8192);
+    trim_bytes.extend(std::iter::repeat_n(b' ', 128));
+    trim_bytes.extend_from_slice(b"content with default whitespace trimming");
+    trim_bytes.extend(std::iter::repeat_n(b'\t', 128));
+    let trim = PhpString::from_bytes(trim_bytes);
+
+    c.bench_function("performance/string_intrinsic_strtolower", |b| {
+        b.iter(|| {
+            black_box(string_intrinsics::strtolower_ascii(black_box(&mixed_case)));
+        });
+    });
+
+    c.bench_function("performance/string_intrinsic_htmlspecialchars", |b| {
+        b.iter(|| {
+            black_box(string_intrinsics::htmlspecialchars_default(black_box(&html)));
+        });
+    });
+
+    c.bench_function("performance/string_intrinsic_explode_single_byte", |b| {
+        b.iter(|| {
+            black_box(string_intrinsics::explode_single_byte(
+                black_box(b','),
+                black_box(&exploded),
+            ));
+        });
+    });
+
+    c.bench_function("performance/string_intrinsic_trim_default", |b| {
+        b.iter(|| {
+            black_box(string_intrinsics::trim_ascii_default(black_box(&trim)));
+        });
+    });
+}
+
 criterion_group! {
     name = perf_hotpaths;
     config = configured_criterion();
-    targets = bench_frontend, bench_vm, bench_runtime
+    targets = bench_frontend, bench_vm, bench_runtime, bench_byte_kernels, bench_string_intrinsics
 }
 criterion_main!(perf_hotpaths);

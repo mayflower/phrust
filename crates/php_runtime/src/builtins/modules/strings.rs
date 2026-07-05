@@ -640,13 +640,9 @@ pub(in crate::builtins::modules) fn builtin_strtolower(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("strtolower", &args, 1)?;
-    Ok(Value::string(
-        string_arg("strtolower", &args[0])?
-            .as_bytes()
-            .iter()
-            .map(u8::to_ascii_lowercase)
-            .collect::<Vec<_>>(),
-    ))
+    Ok(Value::String(super::string_intrinsics::strtolower_ascii(
+        &string_arg("strtolower", &args[0])?,
+    )))
 }
 
 pub(in crate::builtins::modules) fn builtin_ucfirst(
@@ -1460,17 +1456,15 @@ pub(in crate::builtins::modules) fn builtin_strrchr(
         .map_err(|message| conversion_error("strrchr", message))?
         .unwrap_or(false);
     let needle = needle.as_bytes().first().copied().unwrap_or(0);
-    Ok(haystack
-        .as_bytes()
-        .iter()
-        .rposition(|byte| *byte == needle)
-        .map_or(Value::Bool(false), |index| {
+    Ok(
+        find_last_byte(haystack.as_bytes(), needle).map_or(Value::Bool(false), |index| {
             if before_needle {
                 Value::string(haystack.as_bytes()[..index].to_vec())
             } else {
                 Value::string(haystack.as_bytes()[index..].to_vec())
             }
-        }))
+        }),
+    )
 }
 
 pub(in crate::builtins::modules) fn builtin_strstr(
@@ -1504,13 +1498,12 @@ pub(in crate::builtins::modules) fn builtin_strpbrk(
             "must be a non-empty string",
         ));
     }
-    Ok(haystack
-        .as_bytes()
-        .iter()
-        .position(|byte| chars.as_bytes().contains(byte))
-        .map_or(Value::Bool(false), |index| {
-            Value::string(haystack.as_bytes()[index..].to_vec())
-        }))
+    let index = find_first_of(haystack.as_bytes(), 0, chars.as_bytes());
+    Ok(if index == haystack.len() {
+        Value::Bool(false)
+    } else {
+        Value::string(haystack.as_bytes()[index..].to_vec())
+    })
 }
 
 pub(in crate::builtins::modules) fn builtin_strspn(
@@ -1634,11 +1627,8 @@ pub(in crate::builtins::modules) fn builtin_substr_compare(
         right.truncate(length as usize);
     }
     if case_insensitive {
-        left.iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
-        right
-            .iter_mut()
-            .for_each(|byte| *byte = byte.to_ascii_lowercase());
+        php_source::byte_kernel::ascii_lowercase_in_place(&mut left);
+        php_source::byte_kernel::ascii_lowercase_in_place(&mut right);
     }
     Ok(Value::Int(match left.cmp(&right) {
         std::cmp::Ordering::Less => -1,
@@ -2135,7 +2125,7 @@ fn version_parts(version: &str) -> Vec<VersionPart> {
 }
 
 fn push_version_part(parts: &mut Vec<VersionPart>, part: &str) {
-    if part.as_bytes().iter().all(u8::is_ascii_digit) {
+    if php_source::byte_kernel::all_ascii_digits(part.as_bytes()) {
         parts.push(VersionPart::Number(part.parse::<i64>().unwrap_or(i64::MAX)));
     } else {
         parts.push(VersionPart::Label(version_label_rank(part)));

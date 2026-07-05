@@ -1001,7 +1001,7 @@ fn http_response_complete(bytes: &[u8], method: &str) -> Result<bool, (i64, Stri
 }
 
 fn response_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    php_source::byte_kernel::find_bytes(bytes, b"\r\n\r\n")
 }
 
 fn parse_http_response(bytes: &[u8]) -> Result<CurlResponse, (i64, String)> {
@@ -1090,9 +1090,7 @@ fn chunked_response_complete(body: &[u8]) -> bool {
         };
         offset += line_end + 2;
         if size == 0 {
-            return body[offset..]
-                .windows(4)
-                .any(|window| window == b"\r\n\r\n")
+            return php_source::byte_kernel::find_bytes(&body[offset..], b"\r\n\r\n").is_some()
                 || body.get(offset..offset + 2) == Some(b"\r\n");
         }
         let next_offset = offset.saturating_add(size).saturating_add(2);
@@ -1138,7 +1136,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, (i64, String)> {
 }
 
 fn find_crlf(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(2).position(|window| window == b"\r\n")
+    php_source::byte_kernel::find_bytes(bytes, b"\r\n")
 }
 
 fn parse_http_url(url: &str) -> Result<ParsedUrl, (i64, String)> {

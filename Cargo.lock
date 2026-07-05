@@ -1467,6 +1467,7 @@ dependencies = [
  "pcre2",
  "php_diagnostics",
  "php_lexer",
+ "php_source",
  "php_testkit",
  "rusqlite",
  "serde_json",

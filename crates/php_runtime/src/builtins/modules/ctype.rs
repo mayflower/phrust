@@ -89,8 +89,6 @@ ctype_builtin!(builtin_ctype_alpha, "ctype_alpha", |byte: u8| byte
     .is_ascii_alphabetic());
 ctype_builtin!(builtin_ctype_cntrl, "ctype_cntrl", |byte: u8| byte
     .is_ascii_control());
-ctype_builtin!(builtin_ctype_digit, "ctype_digit", |byte: u8| byte
-    .is_ascii_digit());
 ctype_builtin!(builtin_ctype_graph, "ctype_graph", |byte: u8| byte
     .is_ascii_graphic());
 ctype_builtin!(builtin_ctype_lower, "ctype_lower", |byte: u8| byte
@@ -100,9 +98,37 @@ ctype_builtin!(builtin_ctype_print, "ctype_print", |byte: u8| byte
     || byte == b' ');
 ctype_builtin!(builtin_ctype_punct, "ctype_punct", |byte: u8| byte
     .is_ascii_punctuation());
-ctype_builtin!(builtin_ctype_space, "ctype_space", |byte: u8| byte
-    .is_ascii_whitespace());
 ctype_builtin!(builtin_ctype_upper, "ctype_upper", |byte: u8| byte
     .is_ascii_uppercase());
 ctype_builtin!(builtin_ctype_xdigit, "ctype_xdigit", |byte: u8| byte
     .is_ascii_hexdigit());
+
+fn builtin_ctype_digit(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error("ctype_digit", "one argument"));
+    }
+    let input = string_arg("ctype_digit", &args[0])?;
+    let bytes = input.as_bytes();
+    Ok(Value::Bool(
+        !bytes.is_empty() && php_source::byte_kernel::all_ascii_digits(bytes),
+    ))
+}
+
+fn builtin_ctype_space(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error("ctype_space", "one argument"));
+    }
+    let input = string_arg("ctype_space", &args[0])?;
+    let bytes = input.as_bytes();
+    Ok(Value::Bool(
+        !bytes.is_empty() && php_source::byte_kernel::all_ascii_whitespace(bytes),
+    ))
+}
