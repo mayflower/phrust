@@ -1805,6 +1805,7 @@ mod tests {
         let registry = ExtensionRegistry::standard_library();
 
         for name in [
+            "preg_filter",
             "preg_grep",
             "preg_last_error",
             "preg_last_error_msg",

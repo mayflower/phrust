@@ -2705,6 +2705,41 @@ pub(in crate::builtins::modules) fn preg_replace_subject_with_specs(
     }
 }
 
+pub(in crate::builtins::modules) fn preg_replace_filter_subject_with_specs(
+    specs: &[(std::sync::Arc<pcre::CompiledPattern>, Vec<u8>)],
+    subject: &Value,
+    limit: i64,
+    count: &mut i64,
+) -> Result<Value, pcre::PcreFailure> {
+    match deref_value(subject) {
+        Value::Array(array) => {
+            let mut output = PhpArray::new();
+            for (key, value) in array.iter() {
+                let text = to_string(value).map_err(|message| {
+                    pcre::PcreFailure::new(pcre::PREG_INTERNAL_ERROR, message)
+                })?;
+                let before = *count;
+                let replaced = preg_replace_bytes_with_specs(specs, text.as_bytes(), limit, count)?;
+                if *count > before {
+                    output.insert(key.clone(), Value::string(replaced));
+                }
+            }
+            Ok(Value::Array(output))
+        }
+        value => {
+            let text = to_string(&value)
+                .map_err(|message| pcre::PcreFailure::new(pcre::PREG_INTERNAL_ERROR, message))?;
+            let before = *count;
+            let replaced = preg_replace_bytes_with_specs(specs, text.as_bytes(), limit, count)?;
+            Ok(if *count > before {
+                Value::string(replaced)
+            } else {
+                Value::Null
+            })
+        }
+    }
+}
+
 fn preg_replace_bytes_with_specs(
     specs: &[(std::sync::Arc<pcre::CompiledPattern>, Vec<u8>)],
     subject: &[u8],
@@ -8517,6 +8552,52 @@ mod tests {
             Some(&Value::string("Aa"))
         );
         assert_eq!(keyed_subject_count.get(), Value::Int(2));
+
+        let filter_scalar_count = ReferenceCell::new(Value::Null);
+        assert_eq!(
+            call_in_context(
+                &mut context,
+                "preg_filter",
+                vec![
+                    Value::string("/z/"),
+                    Value::string("Z"),
+                    Value::string("abc"),
+                    Value::Int(-1),
+                    Value::Reference(filter_scalar_count.clone()),
+                ],
+            ),
+            Value::Null
+        );
+        assert_eq!(filter_scalar_count.get(), Value::Int(0));
+        let mut filter_subject = PhpArray::new();
+        filter_subject.insert(ArrayKey::Int(0), Value::string("1"));
+        filter_subject.insert(ArrayKey::Int(1), Value::string("a"));
+        filter_subject.insert(ArrayKey::Int(2), Value::string("B"));
+        let filter_count = ReferenceCell::new(Value::Null);
+        let filter_result = call_in_context(
+            &mut context,
+            "preg_filter",
+            vec![
+                Value::packed_array(vec![Value::string(r#"/\d/"#), Value::string("/[a-z]/")]),
+                Value::packed_array(vec![Value::string("A:$0"), Value::string("B:$0")]),
+                Value::Array(filter_subject),
+                Value::Int(-1),
+                Value::Reference(filter_count.clone()),
+            ],
+        );
+        let Value::Array(filter_result) = filter_result else {
+            panic!("expected keyed preg_filter subject array");
+        };
+        assert_eq!(filter_result.len(), 2);
+        assert_eq!(
+            filter_result.get(&ArrayKey::Int(0)),
+            Some(&Value::string("A:1"))
+        );
+        assert_eq!(
+            filter_result.get(&ArrayKey::Int(1)),
+            Some(&Value::string("B:a"))
+        );
+        assert_eq!(filter_count.get(), Value::Int(2));
 
         assert_eq!(
             call_in_context(

@@ -11,6 +11,11 @@ use std::sync::Arc;
 type PregReplaceSpec = (Arc<pcre::CompiledPattern>, Vec<u8>);
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new(
+        "preg_filter",
+        builtin_preg_filter,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("preg_grep", builtin_preg_grep, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "preg_last_error",
@@ -160,7 +165,7 @@ pub(in crate::builtins::modules) fn builtin_preg_replace(
         .map(|value| int_arg("preg_replace", value))
         .transpose()?
         .unwrap_or(-1);
-    let Some(specs) = preg_replace_specs(context, &args[0], &args[1])? else {
+    let Some(specs) = preg_replace_specs(context, "preg_replace", &args[0], &args[1])? else {
         return Ok(Value::Bool(false));
     };
     let mut count = 0;
@@ -173,8 +178,35 @@ pub(in crate::builtins::modules) fn builtin_preg_replace(
     Ok(result)
 }
 
+pub(in crate::builtins::modules) fn builtin_preg_filter(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 3 || args.len() > 5 {
+        return Err(arity_error("preg_filter", "three to five argument(s)"));
+    }
+    let limit = args
+        .get(3)
+        .map(|value| int_arg("preg_filter", value))
+        .transpose()?
+        .unwrap_or(-1);
+    let Some(specs) = preg_replace_specs(context, "preg_filter", &args[0], &args[1])? else {
+        return Ok(Value::Bool(false));
+    };
+    let mut count = 0;
+    let result = match preg_replace_filter_subject_with_specs(&specs, &args[2], limit, &mut count) {
+        Ok(result) => result,
+        Err(error) => return preg_failure(context, error),
+    };
+    assign_reference_arg(args.get(4), Value::Int(count));
+    context.clear_preg_last_error();
+    Ok(result)
+}
+
 fn preg_replace_specs(
     context: &mut BuiltinContext<'_>,
+    function_name: &str,
     pattern: &Value,
     replacement: &Value,
 ) -> Result<Option<Vec<PregReplaceSpec>>, BuiltinError> {
@@ -187,24 +219,24 @@ fn preg_replace_specs(
         Value::Array(array) => {
             let mut patterns = Vec::new();
             for (_, value) in array.iter() {
-                patterns.push(string_arg("preg_replace", value)?);
+                patterns.push(string_arg(function_name, value)?);
             }
             patterns
         }
         _ if replacement_array.is_some() => {
-            return Err(type_error("preg_replace", "array", pattern));
+            return Err(type_error(function_name, "array", pattern));
         }
-        _ => vec![string_arg("preg_replace", pattern)?],
+        _ => vec![string_arg(function_name, pattern)?],
     };
 
     let replacements = if let Some(array) = replacement_array {
         let mut replacements = Vec::new();
         for (_, value) in array.iter() {
-            replacements.push(string_arg("preg_replace", value)?.into_bytes());
+            replacements.push(string_arg(function_name, value)?.into_bytes());
         }
         PregReplaceReplacements::Array(replacements)
     } else {
-        PregReplaceReplacements::Scalar(string_arg("preg_replace", replacement)?.into_bytes())
+        PregReplaceReplacements::Scalar(string_arg(function_name, replacement)?.into_bytes())
     };
 
     let mut specs = Vec::new();

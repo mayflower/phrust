@@ -1459,6 +1459,7 @@ pub(super) fn standard_library_json_extension() -> ExtensionDescriptor {
 
 pub(super) fn standard_library_pcre_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("pcre")
+        .with_function(FunctionDescriptor::php("preg_filter", "pcre"))
         .with_function(FunctionDescriptor::php("preg_grep", "pcre"))
         .with_function(FunctionDescriptor::php("preg_last_error", "pcre"))
         .with_function(FunctionDescriptor::php("preg_last_error_msg", "pcre"))

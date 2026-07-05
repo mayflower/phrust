@@ -82,3 +82,4 @@
 {"path":"ext/pcre/tests/preg_replace_callback_basic.phpt"}
 {"path":"ext/pcre/tests/preg_replace_variation1.phpt"}
 {"path":"ext/pcre/tests/preg_split_basic.phpt"}
+{"path":"ext/pcre/tests/preg_filter.phpt"}

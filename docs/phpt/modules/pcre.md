@@ -2,8 +2,8 @@
 
 - Priority: 18.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/pcre.selected.jsonl`
-- the selected close gate: 74 PASS, 10 SKIP, 0 FAIL, 0 BORK from 84 selected fixtures
-- Upstream corpus snapshot before the selected gate: 69 PASS, 10 SKIP, 86 FAIL, 0 BORK
+- the selected close gate: 75 PASS, 10 SKIP, 0 FAIL, 0 BORK from 85 selected fixtures
+- Previous upstream corpus snapshot before this promotion: 69 PASS, 10 SKIP, 86 FAIL, 0 BORK
   from 165 corpus candidates
 
 ## Scope
@@ -19,12 +19,14 @@
 - `preg_grep` positive matching
 - `preg_quote` delimiter escaping
 - `preg_replace_callback` named function, closure, and invalid-callable dispatch
+- `preg_filter` replacement filtering with scalar `null` no-match behavior and
+  array key preservation
 
 ## Non-Scope
 
-- Remaining 86 upstream `ext/pcre` failures
+- Remaining 85 upstream `ext/pcre` failures
 - PCRE JIT, callouts, `(*MARK)`, and every PHP modifier edge
-- `preg_filter`, `preg_replace_callback_array`, array/method callback edge cases
+- `preg_replace_callback_array`, array/method callback edge cases
 - Byte-perfect warning text, stack formatting, UTF-8 edge diagnostics, and
   locale-sensitive ctype behavior
 
@@ -40,6 +42,7 @@
 - `ext/pcre/tests/preg_quote_basic.phpt`
 - `ext/pcre/tests/preg_split_basic.phpt`
 - `ext/pcre/tests/preg_grep_basic.phpt`
+- `ext/pcre/tests/preg_filter.phpt`
 - `ext/pcre/tests/001.phpt`
 - `ext/pcre/tests/grep.phpt`
 
@@ -72,12 +75,15 @@
   bridge.
 - `preg_replace_callback` uses real VM callable dispatch for named functions and
   closures.
+- `preg_filter` now shares the replacement engine while filtering out subjects
+  that did not match.
 - The selected upstream PCRE promotion now covers basic `preg_match`,
-  `preg_quote`, `preg_split`, `preg_grep`, and legacy `preg_match_all`-free
-  regex cases that fit the existing runtime surface.
-- A full target-only upstream sweep on the PHP 8.5.7 oracle corpus measured
-  69 PASS, 10 SKIP, and 86 FAIL from 165 `ext/pcre/tests` rows; every PASS/SKIP
-  row from that sweep is now selected with the existing generated harness.
+  `preg_quote`, `preg_split`, `preg_grep`, `preg_filter`, and legacy
+  `preg_match_all`-free regex cases that fit the existing runtime surface.
+- The previous full target-only upstream sweep on the PHP 8.5.7 oracle corpus
+  measured 69 PASS, 10 SKIP, and 86 FAIL from 165 `ext/pcre/tests` rows. This
+  branch promotes `preg_filter.phpt` from that failure set into the selected
+  gate.
 
 ## Known Gaps
 
@@ -85,9 +91,10 @@
   callback-array, UTF-8, malformed-pattern diagnostics, and locale-sensitive
   cases.
 - The remaining failure set includes `preg_match_all` capture shape variants,
-  `preg_filter`, `preg_replace_callback_array`, replacement backreference edge
-  cases, split edge cases, invalid UTF-8 offsets, recursion/backtrack limits,
-  JIT/callout/mark cases, and byte-perfect warning text.
+  `preg_replace_callback_array`, `preg_filter` edge cases, replacement
+  backreference edge cases, split edge cases, invalid UTF-8 offsets,
+  recursion/backtrack limits, JIT/callout/mark cases, and byte-perfect warning
+  text.
 - Direct runtime-registry callback use remains limited to internal callables;
   userland callback dispatch is covered through the VM path.
 - Fatal stack formatting for invalid callbacks is intentionally matched by
@@ -97,5 +104,5 @@
 ## Next Step
 
 Close the remaining `preg_match_all` shape, warning parity, UTF-8,
-`preg_filter`, `preg_replace_callback_array`, and advanced replacement/split
-failures before the next upstream promotion.
+`preg_replace_callback_array`, advanced replacement/split, and `preg_filter`
+edge-case failures before the next upstream promotion.
