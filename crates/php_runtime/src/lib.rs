@@ -211,10 +211,11 @@ pub use autoload::AutoloadRegistry;
 pub use builtins::{
     ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
     BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState, FtpOptionValue,
-    FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction, LdapState,
-    OpcacheState, OpenSslErrorState, PcntlState, ReadlineState, RuntimeSourceSpan, ShmopState,
-    SoapState, SocketState, Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState,
-    SysvSemaphoreState, SysvSharedMemoryState,
+    FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction, JSON_ERROR_RECURSION,
+    JSON_PARTIAL_OUTPUT_ON_ERROR, JSON_THROW_ON_ERROR, LdapState, OpcacheState, OpenSslErrorState,
+    PcntlState, ReadlineState, RuntimeSourceSpan, ShmopState, SoapState, SocketState, Ssh2State,
+    StreamContextState, StrtokState, SysvMessageQueueState, SysvSemaphoreState,
+    SysvSharedMemoryState,
 };
 pub use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,

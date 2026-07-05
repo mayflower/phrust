@@ -76594,6 +76594,45 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
     }
 
     #[test]
+    fn json_encode_invokes_jsonserializable_userland_methods() {
+        let result = execute_source(
+            "<?php
+            class Box implements JsonSerializable {
+                public $value;
+                public function __construct($value) { $this->value = $value; }
+                public function jsonSerialize(): mixed { return ['value' => $this->value]; }
+            }
+            class SelfBox implements JsonSerializable {
+                public $value = 3;
+                public function jsonSerialize(): mixed { return $this; }
+            }
+            echo json_encode(new Box(2)), '|', json_encode(new SelfBox());
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), br#"{"value":2}|{"value":3}"#);
+    }
+
+    #[test]
+    fn json_encode_jsonserializable_partial_recursion_sets_last_error() {
+        let result = execute_source(
+            "<?php
+            class RecursiveBox implements JsonSerializable {
+                public $value = 'x';
+                public function jsonSerialize(): mixed {
+                    return ['value' => $this->value, 'self' => $this];
+                }
+            }
+            echo json_encode(new RecursiveBox(), JSON_PARTIAL_OUTPUT_ON_ERROR), '|', json_last_error();
+            ",
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), br#"{"value":"x","self":null}|6"#);
+    }
+
+    #[test]
     fn generated_arginfo_deprecations_respect_error_reporting() {
         let result = execute_source(
             "<?php

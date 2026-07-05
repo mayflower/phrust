@@ -62,6 +62,11 @@ impl Vm {
         } else {
             values
         };
+        if name == "json_encode" {
+            return self.execute_json_encode_with_serializable(
+                entry, values, output, stack, state, compiled, call_span,
+            );
+        }
         if name == "curl_exec" {
             return self.execute_curl_exec_with_callbacks(
                 entry, values, output, stack, state, compiled, call_span,

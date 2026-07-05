@@ -2,7 +2,7 @@
 
 - Priority: 17.6 promoted
 - Selected manifest: `tests/phpt/manifests/modules/json.selected.jsonl`
-- the selected close gate: 72 PASS, 3 SKIP, 0 FAIL, 0 BORK from 75 selected fixtures
+- the selected close gate: 79 PASS, 3 SKIP, 0 FAIL, 0 BORK from 82 selected fixtures
 
 ## Scope
 
@@ -16,17 +16,16 @@
   and parity against selected `json_decode` inputs
 - `json_encode` invalid UTF-8 ignore/substitute modes and selected
   `JSON_THROW_ON_ERROR` error-clearing behavior
+- Selected `JsonSerializable` userland dispatch rows, including self-return,
+  exception propagation, nested encode, and partial recursion behavior.
 - All upstream `ext/json` rows that are currently target-green in the full
   target sweep, including decode error rows, invalid UTF-8 rows, U+2028/U+2029
   encoding, unsupported-type errors, and selected historical bug rows.
 
 ## Non-Scope
 
-- Remaining upstream rows that require `JsonSerializable` userland method
-  dispatch from the runtime builtin layer.
 - Exact `JsonException` debug/var_dump shape parity.
-- Recursion fixtures whose expected behavior depends on `JsonSerializable`
-  dispatch.
+- Remaining mutation-heavy `JsonSerializable` recursion fixtures.
 - Complete JSON flag parity beyond the promoted upstream rows
 
 ## Selected PHPT Fixtures
@@ -62,8 +61,15 @@
 - `ext/json/tests/json_validate_005.phpt`
 - `ext/json/tests/json_encode_invalid_utf8.phpt`
 - `ext/json/tests/json_exceptions_error_clearing.phpt`
+- `ext/json/tests/bug61978.phpt`
+- `ext/json/tests/bug66025.phpt`
+- `ext/json/tests/bug68992.phpt`
+- `ext/json/tests/bug71835.phpt`
+- `ext/json/tests/bug72069.phpt`
+- `ext/json/tests/bug73113.phpt`
+- `ext/json/tests/serialize.phpt`
 - all additional target-green upstream rows from the latest full `ext/json`
-  target sweep, for 70 selected upstream rows total.
+  target sweep, for 77 selected upstream rows total.
 
 ## Relevant Source Areas
 
@@ -91,6 +97,12 @@
 - Latest full upstream target sweep before promotion: 67 PASS, 3 SKIP, 18 FAIL.
 - Latest selected module gate after promotion, with reference reuse disabled:
   target 72 PASS / 3 SKIP; reference 75 PASS; 0 non-green outcomes.
+- Added a VM-backed `JsonSerializable` dispatch bridge for `json_encode`.
+  Focused PHPT probes for `serialize.phpt`, `bug61978.phpt`, `bug66025.phpt`,
+  `bug68992.phpt`, `bug71835.phpt`, `bug72069.phpt`, and `bug73113.phpt`
+  reached PASS with reference and target reuse disabled.
+- Latest selected module gate after `JsonSerializable` promotion, with reuse
+  disabled: target 79 PASS / 3 SKIP; reference 82 PASS; 0 non-green outcomes.
 
 ## Known Gaps
 
@@ -109,17 +121,15 @@
 - `JSON_THROW_ON_ERROR` decode failures now route to catchable `JsonException`
   through the existing VM throwable path and preserve selected last-error
   clearing semantics.
-- `JsonSerializable` remains `STDLIB-GAP-JSONSERIALIZABLE-DISPATCH`:
-  `json_encode` is a runtime builtin and there is not yet a clean VM method-call
-  bridge for invoking userland `jsonSerialize()`.
-- Remaining upstream failures are now narrowed to 18 rows:
-  `bug61978.phpt`, `bug66025.phpt`, `bug68992.phpt`, `bug71835.phpt`,
-  `bug72069.phpt`, `bug73113.phpt`, `bug77843.phpt`,
-  `json_decode_exceptions.phpt`, `json_encode_exceptions.phpt`,
+- `JsonSerializable` dispatch is now bridged through the VM for selected rows,
+  including userland return values, self-return public-property fallback,
+  callback exceptions, and partial recursion substitution.
+- Remaining upstream failures are now narrowed to 11 rows:
+  `bug77843.phpt`, `json_decode_exceptions.phpt`, `json_encode_exceptions.phpt`,
   `json_encode_recursion_01.phpt` through `json_encode_recursion_06.phpt`,
-  `pass001.1.phpt`, `pass001.1_64bit.phpt`, and `serialize.phpt`.
+  `pass001.1.phpt`, and `pass001.1_64bit.phpt`.
 
 ## Next Step
 
-Implement a VM-backed `JsonSerializable` dispatch bridge for runtime builtins,
-then promote the remaining upstream rows.
+Close the remaining mutation-heavy `JsonSerializable` recursion and
+`JsonException` debug-shape rows, then rerun the full upstream sweep.

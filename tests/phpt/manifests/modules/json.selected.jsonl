@@ -31,6 +31,7 @@
 {"path":"ext/json/tests/bug54484.phpt"}
 {"path":"ext/json/tests/bug55543.phpt"}
 {"path":"ext/json/tests/bug61537.phpt"}
+{"path":"ext/json/tests/bug61978.phpt"}
 {"path":"ext/json/tests/bug62010.phpt"}
 {"path":"ext/json/tests/bug62369.phpt"}
 {"path":"ext/json/tests/bug63737.phpt"}
@@ -38,12 +39,17 @@
 {"path":"ext/json/tests/bug64874_part1.phpt"}
 {"path":"ext/json/tests/bug64874_part2.phpt"}
 {"path":"ext/json/tests/bug66021.phpt"}
+{"path":"ext/json/tests/bug66025.phpt"}
 {"path":"ext/json/tests/bug68546.phpt"}
 {"path":"ext/json/tests/bug68567.phpt"}
 {"path":"ext/json/tests/bug68817.phpt"}
 {"path":"ext/json/tests/bug68938.phpt"}
+{"path":"ext/json/tests/bug68992.phpt"}
 {"path":"ext/json/tests/bug69187.phpt"}
+{"path":"ext/json/tests/bug71835.phpt"}
+{"path":"ext/json/tests/bug72069.phpt"}
 {"path":"ext/json/tests/bug72787.phpt"}
+{"path":"ext/json/tests/bug73113.phpt"}
 {"path":"ext/json/tests/bug73254.phpt"}
 {"path":"ext/json/tests/bug73991.phpt"}
 {"path":"ext/json/tests/bug81532.phpt"}
@@ -72,4 +78,5 @@
 {"path":"ext/json/tests/pass001.phpt"}
 {"path":"ext/json/tests/pass002.phpt"}
 {"path":"ext/json/tests/pass003.phpt"}
+{"path":"ext/json/tests/serialize.phpt"}
 {"path":"ext/json/tests/unsupported_type_error.phpt"}

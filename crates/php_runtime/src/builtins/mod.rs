@@ -8,10 +8,10 @@ mod signatures;
 
 pub use context::{
     ApcuState, BuiltinContext, FilesystemRuntimeState, FtpOptionValue, FtpState, GettextState,
-    IconvEncodingState, ImapState, LdapState, OpcacheState, OpenSslErrorState, PcntlState,
-    ReadlineState, RuntimeSourceSpan, ShmopState, SoapState, SocketState, Ssh2State,
-    StreamContextState, StrtokState, SysvMessageQueueState, SysvSemaphoreState,
-    SysvSharedMemoryState,
+    IconvEncodingState, ImapState, JSON_ERROR_RECURSION, JSON_PARTIAL_OUTPUT_ON_ERROR,
+    JSON_THROW_ON_ERROR, LdapState, OpcacheState, OpenSslErrorState, PcntlState, ReadlineState,
+    RuntimeSourceSpan, ShmopState, SoapState, SocketState, Ssh2State, StreamContextState,
+    StrtokState, SysvMessageQueueState, SysvSemaphoreState, SysvSharedMemoryState,
 };
 pub use error::{BuiltinError, BuiltinErrorContext};
 #[doc(hidden)]

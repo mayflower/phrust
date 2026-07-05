@@ -3,6 +3,189 @@
 use super::prelude::*;
 
 impl Vm {
+    pub(super) fn execute_json_encode_with_serializable(
+        &self,
+        entry: BuiltinEntry,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+    ) -> VmResult {
+        let flags = json_encode_flags(&values);
+        let Some(first) = values.first().cloned() else {
+            return execute_builtin_entry(
+                entry,
+                values,
+                output,
+                &self.options.runtime_context,
+                state,
+                builtin_source_span(compiled, call_span),
+            );
+        };
+        let mut transform_state = JsonSerializableEncodeState::default();
+        let transformed = match self.prepare_json_serializable_value(
+            first,
+            flags,
+            output,
+            stack,
+            state,
+            compiled,
+            &mut transform_state,
+        ) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        let mut transformed_values = values;
+        transformed_values[0] = transformed;
+        let mut result = execute_builtin_entry(
+            entry,
+            transformed_values,
+            output,
+            &self.options.runtime_context,
+            state,
+            builtin_source_span(compiled, call_span),
+        );
+        if result.status.is_success() && transform_state.recursion_error {
+            state.json_last_error = php_runtime::JSON_ERROR_RECURSION;
+        }
+        if !result.status.is_success() && transform_state.recursion_error {
+            result.return_value = Some(Value::Bool(false));
+            state.json_last_error = php_runtime::JSON_ERROR_RECURSION;
+        }
+        result
+    }
+
+    fn prepare_json_serializable_value(
+        &self,
+        value: Value,
+        flags: i64,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+        transform_state: &mut JsonSerializableEncodeState,
+    ) -> Result<Value, VmResult> {
+        match effective_value(&value) {
+            Value::Array(array) => {
+                let array_id = array.gc_debug_id();
+                if transform_state.active_arrays.contains(&array_id) {
+                    if flags & php_runtime::JSON_PARTIAL_OUTPUT_ON_ERROR != 0 {
+                        transform_state.recursion_error = true;
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::Array(array));
+                }
+                transform_state.active_arrays.push(array_id);
+                let mut transformed = PhpArray::new();
+                for (key, element) in array.iter() {
+                    let element = match self.prepare_json_serializable_value(
+                        element.clone(),
+                        flags,
+                        output,
+                        stack,
+                        state,
+                        compiled,
+                        transform_state,
+                    ) {
+                        Ok(value) => value,
+                        Err(result) => {
+                            let _ = transform_state.active_arrays.pop();
+                            return Err(result);
+                        }
+                    };
+                    transformed.insert(key, element);
+                }
+                let _ = transform_state.active_arrays.pop();
+                Ok(Value::Array(transformed))
+            }
+            Value::Object(object) => self.prepare_json_serializable_object(
+                object,
+                flags,
+                output,
+                stack,
+                state,
+                compiled,
+                transform_state,
+            ),
+            Value::Reference(cell) => self.prepare_json_serializable_value(
+                cell.get(),
+                flags,
+                output,
+                stack,
+                state,
+                compiled,
+                transform_state,
+            ),
+            value => Ok(value),
+        }
+    }
+
+    fn prepare_json_serializable_object(
+        &self,
+        object: ObjectRef,
+        flags: i64,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+        transform_state: &mut JsonSerializableEncodeState,
+    ) -> Result<Value, VmResult> {
+        if transform_state.active_objects.contains(&object.id()) {
+            if flags & php_runtime::JSON_PARTIAL_OUTPUT_ON_ERROR != 0 {
+                transform_state.recursion_error = true;
+                return Ok(Value::Null);
+            }
+            return Ok(Value::Object(object));
+        }
+        let implements_jsonserializable = match class_implements_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            "JsonSerializable",
+            &mut Vec::new(),
+        ) {
+            Ok(result) => result,
+            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+        };
+        if !implements_jsonserializable {
+            return Ok(Value::Object(object));
+        }
+        transform_state.active_objects.push(object.id());
+        let result = self.call_object_method_callable(
+            compiled,
+            object.clone(),
+            "jsonSerialize",
+            Vec::new(),
+            None,
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            let _ = transform_state.active_objects.pop();
+            return Err(result);
+        }
+        let serialized = result.return_value.unwrap_or(Value::Null);
+        if matches!(effective_value(&serialized), Value::Object(returned) if returned.id() == object.id())
+        {
+            let _ = transform_state.active_objects.pop();
+            return Ok(serialized);
+        }
+        let transformed = self.prepare_json_serializable_value(
+            serialized,
+            flags,
+            output,
+            stack,
+            state,
+            compiled,
+            transform_state,
+        );
+        let _ = transform_state.active_objects.pop();
+        transformed
+    }
+
     pub(super) fn execute_curl_exec_with_callbacks(
         &self,
         entry: BuiltinEntry,
@@ -684,5 +867,19 @@ impl Vm {
             message,
             diagnostic,
         ))
+    }
+}
+
+#[derive(Default)]
+struct JsonSerializableEncodeState {
+    active_arrays: Vec<usize>,
+    active_objects: Vec<u64>,
+    recursion_error: bool,
+}
+
+fn json_encode_flags(values: &[Value]) -> i64 {
+    match values.get(1).map(effective_value) {
+        Some(Value::Int(flags)) => flags,
+        _ => 0,
     }
 }

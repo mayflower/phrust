@@ -1348,7 +1348,7 @@ pub(in crate::builtins) const JSON_ERROR_STATE_MISMATCH: i64 = 2;
 pub(in crate::builtins) const JSON_ERROR_CTRL_CHAR: i64 = 3;
 pub(in crate::builtins) const JSON_ERROR_SYNTAX: i64 = 4;
 pub(in crate::builtins) const JSON_ERROR_UTF8: i64 = 5;
-pub(in crate::builtins) const JSON_ERROR_RECURSION: i64 = 6;
+pub const JSON_ERROR_RECURSION: i64 = 6;
 pub(in crate::builtins) const JSON_ERROR_INF_OR_NAN: i64 = 7;
 pub(in crate::builtins) const JSON_ERROR_UNSUPPORTED_TYPE: i64 = 8;
 pub(in crate::builtins) const JSON_ERROR_INVALID_PROPERTY_NAME: i64 = 9;
@@ -1362,14 +1362,14 @@ pub(in crate::builtins) const JSON_HEX_QUOT: i64 = 8;
 pub(in crate::builtins) const JSON_FORCE_OBJECT: i64 = 16;
 pub(in crate::builtins) const JSON_NUMERIC_CHECK: i64 = 32;
 pub(in crate::builtins) const JSON_PRETTY_PRINT: i64 = 128;
-pub(in crate::builtins) const JSON_PARTIAL_OUTPUT_ON_ERROR: i64 = 512;
+pub const JSON_PARTIAL_OUTPUT_ON_ERROR: i64 = 512;
 pub(in crate::builtins) const JSON_UNESCAPED_SLASHES: i64 = 64;
 pub(in crate::builtins) const JSON_UNESCAPED_UNICODE: i64 = 256;
 pub(in crate::builtins) const JSON_PRESERVE_ZERO_FRACTION: i64 = 1024;
 pub(in crate::builtins) const JSON_UNESCAPED_LINE_TERMINATORS: i64 = 2048;
 pub(in crate::builtins) const JSON_INVALID_UTF8_IGNORE: i64 = 1_048_576;
 pub(in crate::builtins) const JSON_INVALID_UTF8_SUBSTITUTE: i64 = 2_097_152;
-pub(in crate::builtins) const JSON_THROW_ON_ERROR: i64 = 4_194_304;
+pub const JSON_THROW_ON_ERROR: i64 = 4_194_304;
 
 /// Request-local OPcache facade state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
