@@ -998,6 +998,9 @@ where
             runtime_context,
             collect_counters,
             collect_profile_spans: false,
+            // The developer CLI keeps per-family attribution coupled to
+            // counter collection; the server splits these modes explicitly.
+            collect_layout_source_attribution: collect_counters,
         },
     );
     if let Some(timings) = timings.as_mut() {
@@ -4574,6 +4577,7 @@ mod tests {
             optimization_level: None,
             collect_counters: false,
             collect_profile_spans: false,
+            collect_layout_source_attribution: false,
         });
 
         assert_eq!(

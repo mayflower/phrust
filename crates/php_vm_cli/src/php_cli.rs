@@ -630,10 +630,10 @@ fn ini_options(defines: &[(String, String)]) -> CliIniOptions {
         overrides: defines
             .iter()
             .map(|(name, value)| {
-                if name == "error_reporting" {
-                    if let Some(mask) = parse_error_reporting_ini(value) {
-                        return (name.clone(), mask.to_string());
-                    }
+                if name == "error_reporting"
+                    && let Some(mask) = parse_error_reporting_ini(value)
+                {
+                    return (name.clone(), mask.to_string());
                 }
                 (name.clone(), value.clone())
             })

@@ -356,6 +356,9 @@ pub struct VmCounters {
     pub array_slice_packed_fast_hits: u64,
     pub count_array_shape_fast_hits: u64,
     pub map_update_slot_fast_hits: u64,
+    pub property_dim_assign_in_place_hits: u64,
+    pub property_dim_assign_generic_by_reason: BTreeMap<String, u64>,
+    pub property_dim_probe_borrowed_hits: u64,
     pub array_builtin_fast_fallback_by_reason: BTreeMap<String, u64>,
     pub specialized_builtin_opcode_hits: BTreeMap<String, u64>,
     pub slow_path_calls_by_reason: BTreeMap<String, u64>,
@@ -1723,6 +1726,21 @@ impl VmCounters {
 
     pub(crate) fn record_map_update_slot_fast_hit(&mut self) {
         self.map_update_slot_fast_hits += 1;
+    }
+
+    pub(crate) fn record_property_dim_assign_in_place_hit(&mut self) {
+        self.property_dim_assign_in_place_hits += 1;
+    }
+
+    pub(crate) fn record_property_dim_assign_generic(&mut self, reason: &str) {
+        *self
+            .property_dim_assign_generic_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_property_dim_probe_borrowed_hit(&mut self) {
+        self.property_dim_probe_borrowed_hits += 1;
     }
 
     pub(crate) fn record_array_builtin_fast_fallback(&mut self, builtin: &str, reason: &str) {
@@ -3489,6 +3507,24 @@ impl VmCounters {
             &mut json,
             "map_update_slot_fast_hits",
             self.map_update_slot_fast_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "property_dim_assign_in_place_hits",
+            self.property_dim_assign_in_place_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "property_dim_assign_generic_by_reason",
+            &self.property_dim_assign_generic_by_reason,
+            true,
+        );
+        push_field(
+            &mut json,
+            "property_dim_probe_borrowed_hits",
+            self.property_dim_probe_borrowed_hits,
             true,
         );
         push_string_u64_map_field(

@@ -587,6 +587,12 @@ struct RecordShape {
     keys: Vec<PhpString>,
     /// key -> slot index; probe keys compare by symbol identity or bytes.
     slot_by_key: HashMap<PhpString, u32>,
+    /// Memoized `shape + key -> extended shape` transitions. Growing a
+    /// string-key map appends one key per insert; without this cache every
+    /// insert re-interns and re-hashes the entire key sequence, making
+    /// registry-style array growth quadratic in the number of keys.
+    #[allow(clippy::mutable_key_type)] // PhpString hash/eq are byte-pure.
+    transitions: std::cell::RefCell<HashMap<PhpString, std::rc::Weak<RecordShape>>>,
 }
 
 impl std::fmt::Debug for RecordShape {
@@ -599,7 +605,7 @@ impl std::fmt::Debug for RecordShape {
 }
 
 thread_local! {
-    static RECORD_SHAPE_CACHE: std::cell::RefCell<HashMap<u64, Vec<Rc<RecordShape>>>> =
+    static RECORD_SHAPE_CACHE: std::cell::RefCell<HashMap<u64, Vec<std::rc::Weak<RecordShape>>>> =
         std::cell::RefCell::new(HashMap::new());
     static NEXT_RECORD_SHAPE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
@@ -614,21 +620,30 @@ fn record_shape_sequence_hash(keys: &[PhpString], appended: Option<&PhpString>) 
 }
 
 /// Interns the shape for `keys + appended`, reusing an existing shape with
-/// the same key sequence.
+/// the same key sequence. The cache holds weak handles so shapes owned by a
+/// single growing array can be extended in place ([`push_entry`]'s record
+/// arm); stale cache entries are pruned on lookup and, because candidates
+/// are re-verified key-by-key, a shape mutated after its cache registration
+/// simply stops matching its old sequence.
 fn record_shape_for(keys: &[PhpString], appended: Option<&PhpString>) -> Rc<RecordShape> {
     let sequence_hash = record_shape_sequence_hash(keys, appended);
     RECORD_SHAPE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let candidates = cache.entry(sequence_hash).or_default();
-        if let Some(existing) = candidates.iter().find(|shape| {
-            shape.keys.len() == keys.len() + usize::from(appended.is_some())
-                && shape
-                    .keys
-                    .iter()
-                    .zip(keys.iter().chain(appended))
-                    .all(|(a, b)| a.same_symbol_or_bytes(b))
-        }) {
-            return Rc::clone(existing);
+        candidates.retain(|shape| shape.strong_count() > 0);
+        if let Some(existing) = candidates
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|shape| {
+                shape.keys.len() == keys.len() + usize::from(appended.is_some())
+                    && shape
+                        .keys
+                        .iter()
+                        .zip(keys.iter().chain(appended))
+                        .all(|(a, b)| a.same_symbol_or_bytes(b))
+            })
+        {
+            return existing;
         }
         let interned_keys = keys
             .iter()
@@ -650,10 +665,71 @@ fn record_shape_for(keys: &[PhpString], appended: Option<&PhpString>) -> Rc<Reco
             shape_id,
             keys: interned_keys,
             slot_by_key,
+            transitions: std::cell::RefCell::new(HashMap::new()),
         });
-        candidates.push(Rc::clone(&shape));
+        candidates.push(Rc::downgrade(&shape));
         shape
     })
+}
+
+/// Key count past which a growing record array stops interning every
+/// intermediate shape and switches to a private, in-place-extendable shape.
+/// Small maps (config rows, translation entries) keep interned shared
+/// shapes; registry-style maps that keep growing would otherwise pay an
+/// O(len) shape rebuild per insert.
+const RECORD_SHAPE_PRIVATE_GROWTH_THRESHOLD: usize = 32;
+
+/// Builds `shape + key` as a private, cache-unregistered shape. The result
+/// has no weak registrations, so the owning array's next append can extend
+/// it in place through `Rc::get_mut` at O(1).
+fn record_shape_private_extended(shape: &RecordShape, key: &PhpString) -> Rc<RecordShape> {
+    let interned = PhpString::intern(key.as_bytes());
+    let mut keys = Vec::with_capacity(shape.keys.len() + 1);
+    keys.extend(shape.keys.iter().cloned());
+    #[allow(clippy::mutable_key_type)] // PhpString hash/eq are byte-pure.
+    let mut slot_by_key = shape.slot_by_key.clone();
+    slot_by_key.insert(interned.clone(), keys.len() as u32);
+    keys.push(interned);
+    let shape_id = NEXT_RECORD_SHAPE_ID.with(|next| {
+        let id = next.get();
+        next.set(id.wrapping_add(1));
+        id
+    });
+    Rc::new(RecordShape {
+        shape_id,
+        keys,
+        slot_by_key,
+        transitions: std::cell::RefCell::new(HashMap::new()),
+    })
+}
+
+/// Extends `shape` by one appended key, memoizing the transition on the
+/// parent shape so repeated growth of the same key sequence is O(1) per
+/// insert instead of re-interning the whole sequence.
+///
+/// A memoized target that was later extended in place by its sole owner no
+/// longer represents `parent + key`; the length check rejects it (prefixes
+/// are immutable, shapes only ever append), and a fresh shape is interned.
+fn record_shape_extended(shape: &Rc<RecordShape>, key: &PhpString) -> Rc<RecordShape> {
+    if let Some(next) = shape
+        .transitions
+        .borrow()
+        .get(key)
+        .and_then(std::rc::Weak::upgrade)
+        && next.keys.len() == shape.keys.len() + 1
+        && next
+            .keys
+            .last()
+            .is_some_and(|last| last.same_symbol_or_bytes(key))
+    {
+        return next;
+    }
+    let next = record_shape_for(&shape.keys, Some(key));
+    shape
+        .transitions
+        .borrow_mut()
+        .insert(next.keys[shape.keys.len()].clone(), Rc::downgrade(&next));
+    next
 }
 
 /// Record storage: stable string-key maps with a shared key shape and a
@@ -982,7 +1058,23 @@ impl ArrayStorage {
                     unreachable!("record pushes carry string keys; ints convert to mixed first");
                 };
                 debug_assert!(!storage.shape.slot_by_key.contains_key(key));
-                storage.shape = record_shape_for(&storage.shape.keys, Some(key));
+                // Sole owner of a private (unregistered) shape: append in
+                // place — O(1) per insert. `shape_id` stays: nothing guards
+                // on it, and existing slot indices are append-stable.
+                // Otherwise, large growing maps privatize (one O(len) copy,
+                // O(1) appends afterwards) while small maps keep interned
+                // shared shapes through the memoized transition chain.
+                if let Some(shape) = Rc::get_mut(&mut storage.shape) {
+                    let interned = PhpString::intern(key.as_bytes());
+                    shape
+                        .slot_by_key
+                        .insert(interned.clone(), shape.keys.len() as u32);
+                    shape.keys.push(interned);
+                } else if storage.shape.keys.len() >= RECORD_SHAPE_PRIVATE_GROWTH_THRESHOLD {
+                    storage.shape = record_shape_private_extended(&storage.shape, key);
+                } else {
+                    storage.shape = record_shape_extended(&storage.shape, key);
+                }
                 crate::layout_stats::record_record_slot_write();
                 storage.cached_metadata.add_record_value(&entry.value);
                 storage.values.push(entry.value);
@@ -1796,6 +1888,12 @@ impl PhpArray {
     fn storage_mut_for(&mut self, _intent: PhpArrayWriteIntent) -> &mut ArrayStorage {
         if self.is_shared() {
             crate::layout_stats::record_cow_separation();
+            // Attribute the element deep-copy performed by `Rc::make_mut` to
+            // the separation itself instead of the outer operation family.
+            let _source = crate::layout_stats::enter_layout_source_family(
+                crate::layout_stats::SOURCE_COW_SEPARATION_CONTENTS,
+            );
+            return Rc::make_mut(&mut self.storage);
         }
         Rc::make_mut(&mut self.storage)
     }

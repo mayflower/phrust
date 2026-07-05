@@ -114,9 +114,20 @@ fn attribution_json(trace: &PerfTraceEvent, counters: Option<&VmCounters>) -> Va
     attribution.insert("summary_counters".to_string(), summary_counters_json(trace));
     let Some(counters) = counters else {
         attribution.insert("vm_counters_collected".to_string(), Value::from(false));
+        attribution.insert(
+            "source_attribution_collected".to_string(),
+            Value::from(false),
+        );
         return Value::Object(attribution);
     };
     attribution.insert("vm_counters_collected".to_string(), Value::from(true));
+    attribution.insert(
+        "source_attribution_collected".to_string(),
+        Value::from(
+            !counters.value_clone_by_source_family.is_empty()
+                || !counters.array_handle_clone_by_source_family.is_empty(),
+        ),
+    );
     attribution.insert("execution".to_string(), execution_json(counters));
     attribution.insert("includes".to_string(), includes_json(counters));
     attribution.insert("calls".to_string(), calls_json(counters));
@@ -974,16 +985,14 @@ fn boundary_profiles_to_json(
                 "dense_instructions".to_string(),
                 Value::from(profile.dense_instructions),
             );
-            let average_inclusive = if profile.count == 0 {
-                0
-            } else {
-                profile.inclusive_nanos / profile.count
-            };
-            let average_exclusive = if profile.count == 0 {
-                0
-            } else {
-                profile.exclusive_nanos / profile.count
-            };
+            let average_inclusive = profile
+                .inclusive_nanos
+                .checked_div(profile.count)
+                .unwrap_or(0);
+            let average_exclusive = profile
+                .exclusive_nanos
+                .checked_div(profile.count)
+                .unwrap_or(0);
             entry.insert("average_nanos".to_string(), Value::from(average_inclusive));
             entry.insert(
                 "average_exclusive_nanos".to_string(),
@@ -1016,11 +1025,10 @@ fn operation_profiles_to_json(
                 "inclusive_nanos".to_string(),
                 Value::from(profile.inclusive_nanos),
             );
-            let average_inclusive = if profile.count == 0 {
-                0
-            } else {
-                profile.inclusive_nanos / profile.count
-            };
+            let average_inclusive = profile
+                .inclusive_nanos
+                .checked_div(profile.count)
+                .unwrap_or(0);
             entry.insert("average_nanos".to_string(), Value::from(average_inclusive));
             Value::Object(entry)
         })

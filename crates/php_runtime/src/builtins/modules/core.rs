@@ -2796,6 +2796,7 @@ pub(in crate::builtins::modules) fn preg_replace_bytes(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::builtins::modules) fn preg_replace_callback_subject(
     context: &mut BuiltinContext<'_>,
     compiled: &pcre::CompiledPattern,
@@ -2844,6 +2845,7 @@ pub(in crate::builtins::modules) fn preg_replace_callback_subject(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::builtins::modules) fn preg_replace_callback_bytes(
     context: &mut BuiltinContext<'_>,
     compiled: &pcre::CompiledPattern,
@@ -6292,6 +6294,7 @@ mod tests {
         let nested = Value::Array(PhpArray::from_packed(vec![Value::Int(1)]));
 
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
         let materialized = super::materialize_array_builtin_value(&nested);
         let stats = layout_stats::take_layout_stats();
         let source_stats = layout_stats::take_layout_source_stats();

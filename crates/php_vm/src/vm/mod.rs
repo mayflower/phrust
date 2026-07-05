@@ -888,6 +888,7 @@ enum BytecodeEntryAttempt {
     Unsupported(String),
 }
 
+#[allow(clippy::large_enum_variant)] // Continue variants carry the live FunctionCall.
 enum BytecodeFunctionAttempt<'a> {
     Executed(Box<VmResult>, BytecodeFunctionTier),
     Unsupported(String, FunctionCall<'a>),
@@ -898,6 +899,7 @@ enum BytecodeFunctionTier {
     RichFallback(String),
 }
 
+#[allow(clippy::large_enum_variant)] // Continue variants carry the live FunctionCall.
 enum CachedDenseFunctionDispatch<'a> {
     Executed(Box<VmResult>),
     Continue(FunctionCall<'a>),
@@ -1576,18 +1578,22 @@ struct DestructorSweep {
     outcome: Option<RaiseOutcome>,
 }
 
-fn release_unrooted_object_handles(value: &Value, stack: &CallStack, state: &ExecutionState) {
-    let candidates = destructor_candidates_for_value(value);
-    if candidates.is_empty() {
-        return;
-    }
-    let rooted_object_ids = php_visible_root_object_ids(stack, state);
-    for object in candidates {
-        if !rooted_object_ids.contains(&object.id()) {
-            object.release_php_handle();
-        }
-    }
-}
+/// Historical hook for eager PHP object-id recycling on value drops.
+///
+/// The previous implementation deep-walked the dropped value and then the
+/// entire PHP-visible heap (every local, global, static, and destructor
+/// entry, cloning every array element along the way) on every overwrite of
+/// an object-bearing value. On container-heavy workloads that turned each
+/// store into an O(heap) scan and dominated whole requests.
+///
+/// Object ids are recycled naturally when the last handle drops
+/// (`ObjectIdGuard` frees the id from the storage drop). Eager scanning only
+/// tightened id-reuse timing for objects kept alive by stale VM temporaries
+/// or reference cycles; those ids now recycle when the temporaries drop.
+/// Destructor timing is unaffected: it runs through the separate
+/// `run_destructors_for_unreferenced_value` path, which is gated on the
+/// destructor queue.
+fn release_unrooted_object_handles(_value: &Value, _stack: &CallStack, _state: &ExecutionState) {}
 
 fn foreach_iterator_candidate_value(iterator: ForeachIterator) -> Option<Value> {
     match iterator {
@@ -2140,6 +2146,13 @@ impl Vm {
         if self.options.collect_counters {
             php_runtime::numeric_string::reset_cache_and_stats();
             php_runtime::layout_stats::reset_layout_stats();
+            if self.options.collect_layout_source_attribution {
+                php_runtime::layout_stats::enable_layout_source_attribution();
+            } else {
+                php_runtime::layout_stats::disable_layout_source_attribution();
+            }
+        } else {
+            php_runtime::layout_stats::disable_layout_source_attribution();
         }
         reset_float_string_precision();
 
@@ -4764,6 +4777,33 @@ impl Vm {
         }
     }
 
+    fn record_counter_property_dim_assign_in_place_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_dim_assign_in_place_hit();
+        }
+    }
+
+    fn record_counter_property_dim_assign_generic(&self, reason: &'static str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_dim_assign_generic(reason);
+        }
+    }
+
+    fn record_counter_property_dim_probe_borrowed_hit(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_property_dim_probe_borrowed_hit();
+        }
+    }
+
     fn record_counter_array_slice_packed_fast_hit(&self) {
         if !self.options.collect_counters {
             return;
@@ -6199,6 +6239,7 @@ impl Vm {
             return Ok(plan);
         }
 
+        #[allow(clippy::arc_with_non_send_sync)] // plan sharing predates a Send-safe design
         let plan = Arc::new(self.build_dense_execution_plan(compiled)?);
         DENSE_EXECUTION_PLAN_THREAD_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -7180,150 +7221,6 @@ impl Vm {
                                 dst,
                                 src.index,
                             );
-                        if fused_const.is_none()
-                            && let Some(next_instruction) = instructions.get(instruction_offset + 1)
-                            && matches!(
-                                next_instruction.opcode,
-                                DenseOpcode::JumpIfFalse
-                                    | DenseOpcode::JumpIfTrue
-                                    | DenseOpcode::JumpIf
-                            )
-                        {
-                            let branch_condition = match next_instruction.operands {
-                                DenseOperands::JumpIf { condition, .. }
-                                | DenseOperands::JumpIfElse { condition, .. } => condition,
-                                _ => {
-                                    let result = self.invalid_bytecode_operand_shape(
-                                        output,
-                                        compiled,
-                                        stack,
-                                        next_instruction,
-                                    );
-                                    stack.pop_recycle();
-                                    return result;
-                                }
-                            };
-                            if branch_condition.kind == DenseOperandKind::Register
-                                && branch_condition.index == dst
-                            {
-                                let next_dense_instruction_index = start + instruction_offset + 1;
-                                let next_dense_instruction_index = match u32::try_from(
-                                    next_dense_instruction_index,
-                                ) {
-                                    Ok(index) => index,
-                                    Err(_) => {
-                                        let result = self.runtime_error(
-                                                output,
-                                                compiled,
-                                                stack,
-                                                "E_PHP_VM_DENSE_BYTECODE_SITE_INDEX_OVERFLOW: dense instruction index exceeds u32",
-                                            );
-                                        stack.pop_recycle();
-                                        return result;
-                                    }
-                                };
-                                self.record_counter_bytecode_instruction(next_instruction.opcode);
-                                self.record_counter_superinstruction_executed(
-                                    next_instruction.opcode,
-                                );
-                                self.observe_dense_quickening(
-                                    unit_id,
-                                    function_id,
-                                    next_dense_instruction_index,
-                                );
-                                let truthy = match self.load_local_branch_truthy(
-                                    compiled,
-                                    ir_function,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut diagnostics,
-                                    LocalId::new(src.index),
-                                    span,
-                                ) {
-                                    Ok(value) => value,
-                                    Err(result) => {
-                                        stack.pop_recycle();
-                                        return result;
-                                    }
-                                };
-                                match next_instruction.opcode {
-                                    DenseOpcode::JumpIfFalse | DenseOpcode::JumpIfTrue => {
-                                        let DenseOperands::JumpIf { target, .. } =
-                                            next_instruction.operands
-                                        else {
-                                            let result = self.invalid_bytecode_operand_shape(
-                                                output,
-                                                compiled,
-                                                stack,
-                                                next_instruction,
-                                            );
-                                            stack.pop_recycle();
-                                            return result;
-                                        };
-                                        let jump = if next_instruction.opcode
-                                            == DenseOpcode::JumpIfFalse
-                                        {
-                                            !truthy
-                                        } else {
-                                            truthy
-                                        };
-                                        let next_block = if jump {
-                                            target
-                                        } else {
-                                            match next_dense_block_index(
-                                                dense_function,
-                                                block_index,
-                                            ) {
-                                                Ok(next) => next,
-                                                Err(message) => {
-                                                    let result = self.runtime_error(
-                                                        output, compiled, stack, message,
-                                                    );
-                                                    stack.pop_recycle();
-                                                    return result;
-                                                }
-                                            }
-                                        };
-                                        self.record_counter_dense_branch(
-                                            function_id.raw(),
-                                            block_index,
-                                            next_block,
-                                            truthy,
-                                            !jump,
-                                        );
-                                        block_index = next_block;
-                                        continue 'dispatch;
-                                    }
-                                    DenseOpcode::JumpIf => {
-                                        let DenseOperands::JumpIfElse {
-                                            if_true, if_false, ..
-                                        } = next_instruction.operands
-                                        else {
-                                            let result = self.invalid_bytecode_operand_shape(
-                                                output,
-                                                compiled,
-                                                stack,
-                                                next_instruction,
-                                            );
-                                            stack.pop_recycle();
-                                            return result;
-                                        };
-                                        let next_block = if truthy { if_true } else { if_false };
-                                        self.record_counter_dense_branch(
-                                            function_id.raw(),
-                                            block_index,
-                                            next_block,
-                                            truthy,
-                                            false,
-                                        );
-                                        block_index = next_block;
-                                        continue 'dispatch;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
                         let value = match self.load_local_value(
                             compiled,
                             ir_function,
@@ -10843,51 +10740,6 @@ impl Vm {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn load_local_branch_truthy(
-        &self,
-        compiled: &CompiledUnit,
-        function: &IrFunction,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-        diagnostics: &mut Vec<RuntimeDiagnostic>,
-        local: LocalId,
-        span: IrSpan,
-    ) -> Result<bool, VmResult> {
-        if !is_globals_local(function, local) {
-            self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(stack, local));
-            let truthy = {
-                let frame = stack.current().expect("frame was pushed");
-                match frame.locals.get_slot(local) {
-                    Some(Slot::Value(value)) if !value.is_uninitialized() => Some(to_bool(value)),
-                    Some(Slot::Reference(cell)) => {
-                        let value = cell.borrow();
-                        Some(to_bool(&value))
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(truthy) = truthy {
-                return truthy
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message));
-            }
-        }
-
-        let value = self.load_local_value(
-            compiled,
-            function,
-            output,
-            stack,
-            state,
-            diagnostics,
-            local,
-            span,
-            false,
-        )?;
-        to_bool(&value).map_err(|message| self.runtime_error(output, compiled, stack, message))
-    }
-
     fn dense_runtime_error(
         &self,
         compiled: &CompiledUnit,
@@ -13618,110 +13470,6 @@ impl Vm {
                         release_unrooted_object_handles(&value, stack, state);
                     }
                     InstructionKind::LoadLocal { dst, local } => {
-                        if instruction_index + 1 == block.instructions.len() {
-                            let terminator_kind =
-                                block.terminator.as_ref().map(|terminator| &terminator.kind);
-                            match terminator_kind {
-                                Some(TerminatorKind::JumpIfFalse { condition, target })
-                                    if *condition == Operand::Register(*dst) =>
-                                {
-                                    let truthy = match self.load_local_branch_truthy(
-                                        compiled,
-                                        function,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut diagnostics,
-                                        *local,
-                                        instruction.span,
-                                    ) {
-                                        Ok(value) => value,
-                                        Err(result) => return result,
-                                    };
-                                    if truthy {
-                                        let next = match next_block_id(function, block_id) {
-                                            Ok(block_id) => block_id,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        };
-                                        self.record_tiering_backedge(function_id, block_id, next);
-                                        block_id = next;
-                                    } else {
-                                        self.record_tiering_backedge(
-                                            function_id,
-                                            block_id,
-                                            *target,
-                                        );
-                                        block_id = *target;
-                                    }
-                                    continue 'dispatch;
-                                }
-                                Some(TerminatorKind::JumpIfTrue { condition, target })
-                                    if *condition == Operand::Register(*dst) =>
-                                {
-                                    let truthy = match self.load_local_branch_truthy(
-                                        compiled,
-                                        function,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut diagnostics,
-                                        *local,
-                                        instruction.span,
-                                    ) {
-                                        Ok(value) => value,
-                                        Err(result) => return result,
-                                    };
-                                    if truthy {
-                                        self.record_tiering_backedge(
-                                            function_id,
-                                            block_id,
-                                            *target,
-                                        );
-                                        block_id = *target;
-                                    } else {
-                                        let next = match next_block_id(function, block_id) {
-                                            Ok(block_id) => block_id,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        };
-                                        self.record_tiering_backedge(function_id, block_id, next);
-                                        block_id = next;
-                                    }
-                                    continue 'dispatch;
-                                }
-                                Some(TerminatorKind::JumpIf {
-                                    condition,
-                                    if_true,
-                                    if_false,
-                                }) if *condition == Operand::Register(*dst) => {
-                                    let truthy = match self.load_local_branch_truthy(
-                                        compiled,
-                                        function,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut diagnostics,
-                                        *local,
-                                        instruction.span,
-                                    ) {
-                                        Ok(value) => value,
-                                        Err(result) => return result,
-                                    };
-                                    let next = if truthy { *if_true } else { *if_false };
-                                    self.record_tiering_backedge(function_id, block_id, next);
-                                    block_id = next;
-                                    continue 'dispatch;
-                                }
-                                _ => {}
-                            }
-                        }
                         let value = if is_globals_local(function, *local) {
                             self.record_counter_local_slot_fast_path(false);
                             Value::Array(state.globals.globals_array())
@@ -20263,16 +20011,43 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = property_state_value(compiled, state, stack, &object, property)
-                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten());
+                        // Borrowed probe: isset must not clone the property
+                        // container (the clone shares the array handle and
+                        // forces a full copy-on-write separation on the next
+                        // write to the same registry-style array).
+                        let borrowed = with_property_state_value(
+                            compiled,
+                            state,
+                            stack,
+                            &object,
+                            property,
+                            &mut |value| match value {
+                                Some(value) => with_borrowed_dim_path(value, &dims, &mut |leaf| {
+                                    !matches!(leaf, None | Some(Value::Null))
+                                }),
+                                None => Some(false),
+                            },
+                        )
+                        .flatten();
+                        let result = match borrowed {
+                            Some(result) => {
+                                self.record_counter_property_dim_probe_borrowed_hit();
+                                result
+                            }
+                            None => {
+                                let value =
+                                    property_state_value(compiled, state, stack, &object, property)
+                                        .and_then(|value| {
+                                            fetch_dim_path_value(&value, &dims).ok().flatten()
+                                        });
+                                !matches!(value, None | Some(Value::Null))
+                            }
+                        };
                         if let Err(message) = stack
                             .frame_mut(frame_index)
                             .expect("frame was pushed")
                             .registers
-                            .set(
-                                *dst,
-                                Value::Bool(!matches!(value, None | Some(Value::Null))),
-                            )
+                            .set(*dst, Value::Bool(result))
                         {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -20309,10 +20084,38 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let value = property_state_value(compiled, state, stack, &object, property)
-                            .and_then(|value| fetch_dim_path_value(&value, &dims).ok().flatten())
-                            .unwrap_or(Value::Uninitialized);
-                        let result = match php_empty_access_value(&value) {
+                        // Borrowed probe mirroring the isset arm: empty()
+                        // only needs a borrowed view of the leaf value.
+                        let borrowed = with_property_state_value(
+                            compiled,
+                            state,
+                            stack,
+                            &object,
+                            property,
+                            &mut |value| match value {
+                                Some(value) => with_borrowed_dim_path(value, &dims, &mut |leaf| {
+                                    php_empty_access_value(leaf.unwrap_or(&Value::Uninitialized))
+                                }),
+                                None => Some(php_empty_access_value(&Value::Uninitialized)),
+                            },
+                        )
+                        .flatten();
+                        let result = match borrowed {
+                            Some(result) => {
+                                self.record_counter_property_dim_probe_borrowed_hit();
+                                result
+                            }
+                            None => {
+                                let value =
+                                    property_state_value(compiled, state, stack, &object, property)
+                                        .and_then(|value| {
+                                            fetch_dim_path_value(&value, &dims).ok().flatten()
+                                        })
+                                        .unwrap_or(Value::Uninitialized);
+                                php_empty_access_value(&value)
+                            }
+                        };
+                        let result = match result {
                             Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
@@ -21754,6 +21557,56 @@ impl Vm {
                             }
                         };
                         if is_std_class_runtime_class(&object.class_name()) {
+                            // In-place fast path: mutate an existing array
+                            // property directly instead of clone → assign
+                            // (COW separation) → write-back. stdClass has no
+                            // declared properties, hooks, or types; userland
+                            // ArrayAccess dispatch only applies to object
+                            // values, which stay on the generic path.
+                            match try_assign_property_dim_in_place(
+                                &object,
+                                property,
+                                &dims,
+                                value.clone(),
+                                *append,
+                            ) {
+                                PropertyDimInPlace::Applied(Ok(())) => {
+                                    self.record_counter_property_dim_assign_in_place_hit();
+                                    if let Err(message) = stack
+                                        .frame_mut(frame_index)
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                PropertyDimInPlace::Applied(Err(message)) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                                PropertyDimInPlace::NotEligible => {
+                                    self.record_counter_property_dim_assign_generic(
+                                        "stdclass_non_array_slot",
+                                    );
+                                }
+                            }
                             let mut current = object.get_property(property).unwrap_or(Value::Null);
                             match self.try_userland_arrayaccess_offset_set_value(
                                 compiled,
@@ -21840,6 +21693,62 @@ impl Vm {
                         ) {
                             Ok(Some(resolved)) => resolved,
                             Ok(None) => {
+                                // In-place fast path for an existing dynamic
+                                // array property. Gated on the class allowing
+                                // dynamic properties so the deprecation
+                                // diagnostic behavior of the generic path is
+                                // preserved exactly for disallowing classes.
+                                if class_allows_dynamic_properties(compiled, state, &class) {
+                                    match try_assign_property_dim_in_place(
+                                        &object,
+                                        property,
+                                        &dims,
+                                        value.clone(),
+                                        *append,
+                                    ) {
+                                        PropertyDimInPlace::Applied(Ok(())) => {
+                                            self.record_counter_property_dim_assign_in_place_hit();
+                                            if let Err(message) = stack
+                                                .frame_mut(frame_index)
+                                                .expect("frame was pushed")
+                                                .registers
+                                                .set(*dst, value)
+                                            {
+                                                return self.runtime_error(
+                                                    output, compiled, stack, message,
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        PropertyDimInPlace::Applied(Err(message)) => {
+                                            match self.raise_runtime_error(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut exception_handlers,
+                                                &mut pending_control,
+                                                instruction.span,
+                                                message,
+                                            ) {
+                                                RaiseOutcome::Caught(target) => {
+                                                    block_id = target;
+                                                    continue 'dispatch;
+                                                }
+                                                RaiseOutcome::Done(result) => return *result,
+                                            }
+                                        }
+                                        PropertyDimInPlace::NotEligible => {
+                                            self.record_counter_property_dim_assign_generic(
+                                                "dynamic_non_array_slot",
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    self.record_counter_property_dim_assign_generic(
+                                        "dynamic_properties_disallowed",
+                                    );
+                                }
                                 let mut current =
                                     object.get_property(property).unwrap_or(Value::Null);
                                 match self.try_userland_arrayaccess_offset_set_value(
@@ -22067,6 +21976,65 @@ impl Vm {
                             );
                         }
                         let storage_name = property_storage_name(resolved_class, entry);
+                        // In-place fast path: untyped, non-readonly declared
+                        // property (visibility validated above, hooks
+                        // excluded) whose storage slot currently holds an
+                        // array. Typed properties keep the generic path so
+                        // post-assignment type checks stay exact; readonly
+                        // properties keep the generic error ordering.
+                        if entry.type_.is_none()
+                            && !entry.flags.is_readonly
+                            && !resolved_class.flags.is_readonly
+                        {
+                            match try_assign_property_dim_in_place(
+                                &object,
+                                &storage_name,
+                                &dims,
+                                value.clone(),
+                                *append,
+                            ) {
+                                PropertyDimInPlace::Applied(Ok(())) => {
+                                    self.record_counter_property_dim_assign_in_place_hit();
+                                    if let Err(message) = stack
+                                        .frame_mut(frame_index)
+                                        .expect("frame was pushed")
+                                        .registers
+                                        .set(*dst, value)
+                                    {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                    continue;
+                                }
+                                PropertyDimInPlace::Applied(Err(message)) => {
+                                    match self.raise_runtime_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        message,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
+                                    }
+                                }
+                                PropertyDimInPlace::NotEligible => {
+                                    self.record_counter_property_dim_assign_generic(
+                                        "declared_non_array_slot",
+                                    );
+                                }
+                            }
+                        } else {
+                            self.record_counter_property_dim_assign_generic(
+                                "typed_readonly_or_readonly_class",
+                            );
+                        }
                         let mut current =
                             property_state_value(compiled, state, stack, &object, property)
                                 .unwrap_or(Value::Null);
@@ -48936,6 +48904,58 @@ fn validate_property_write(
     Ok(())
 }
 
+/// Borrowed mirror of [`property_state_value`]: resolves the property the
+/// same way, then runs `f` against a borrowed view of the stored value
+/// instead of cloning it out of object storage. `None` (bail to the cloning
+/// path) only when object storage is already mutably borrowed. `f` receives
+/// `None` when the property is missing or visibility validation fails,
+/// mirroring `property_state_value`'s `None` results.
+fn with_property_state_value<R>(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    stack: &CallStack,
+    object: &ObjectRef,
+    property: &str,
+    f: &mut dyn FnMut(Option<&Value>) -> R,
+) -> Option<R> {
+    let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
+        return object
+            .try_with_property_lookup(property, property, &mut *f)
+            .ok();
+    };
+    let scope = current_scope_class(compiled, stack);
+    let resolved = match lookup_resolved_property_in_state(
+        compiled,
+        state,
+        &class,
+        property,
+        scope.as_deref(),
+    ) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return object
+                .try_with_property_lookup(property, property, &mut *f)
+                .ok();
+        }
+        Err(_) => return Some(f(None)),
+    };
+    if validate_property_access_in_state(
+        compiled,
+        state,
+        stack,
+        &resolved.class,
+        &resolved.property,
+    )
+    .is_err()
+    {
+        return Some(f(None));
+    }
+    let storage_name = property_storage_name(&resolved.class, &resolved.property);
+    object
+        .try_with_property_lookup(&storage_name, property, &mut *f)
+        .ok()
+}
+
 fn property_state_value(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -49440,6 +49460,24 @@ fn static_property_dim_isset_empty_result(
         let default =
             static_property_default(compiled, state, stack, &resolved.class, &resolved.property)?;
         state.static_properties.insert(key.clone(), default);
+    }
+    // Borrowed probe first: cloning the static container for a predicate
+    // shares its array handle and forces a copy-on-write separation on the
+    // next write to the same static registry array.
+    if let Some(stored) = state.static_properties.get(&key) {
+        let borrowed = with_borrowed_dim_path(stored, dims, &mut |leaf| {
+            if is_empty {
+                php_empty_access_value(leaf.unwrap_or(&Value::Uninitialized))
+            } else {
+                Ok(!matches!(
+                    leaf,
+                    None | Some(Value::Null) | Some(Value::Uninitialized)
+                ))
+            }
+        });
+        if let Some(result) = borrowed {
+            return result.map_err(StaticPropertyIssetEmptyError::Runtime);
+        }
     }
     let value = state
         .static_properties
@@ -54609,7 +54647,7 @@ fn call_pdo_connection_method(
                     Value::string(mysql.last_insert_id(id).to_string().into_bytes())
                 }
                 PdoDriver::Pgsql => {
-                    let Some(sequence) = values.get(0) else {
+                    let Some(sequence) = values.first() else {
                         return Ok(Value::Bool(false));
                     };
                     let sequence = to_string(sequence)?.to_string_lossy();
@@ -71319,6 +71357,46 @@ fn object_cast_property_name(key: &ArrayKey) -> String {
     }
 }
 
+/// Borrowed mirror of [`fetch_dim_path_value`] for read-only predicates.
+///
+/// Walks `value[dims...]` by reference and applies `f` to the leaf (`None`
+/// when a dimension is missing, mirroring `fetch_dim_path_value`'s `Ok(None)`
+/// results). Returns `None` — caller must use the cloning path — only for
+/// shapes whose reads have side effects or interior borrows the borrowed walk
+/// cannot model: SimpleXML dimension access and reference cells that are
+/// currently mutably borrowed. Cloning containers for mere isset/empty
+/// probes is what shares array handles and forces copy-on-write separations
+/// on the next write, so hot registry checks must stay on this path.
+fn with_borrowed_dim_path<R>(
+    value: &Value,
+    dims: &[ArrayKey],
+    f: &mut dyn FnMut(Option<&Value>) -> R,
+) -> Option<R> {
+    match value {
+        Value::Reference(cell) => cell
+            .try_with_value(|inner| with_borrowed_dim_path(inner, dims, f))
+            .ok()
+            .flatten(),
+        _ => {
+            let Some((first, rest)) = dims.split_first() else {
+                return Some(f(Some(value)));
+            };
+            match value {
+                Value::Array(array) => match array.get(first) {
+                    Some(child) => with_borrowed_dim_path(child, rest, f),
+                    None => Some(f(None)),
+                },
+                Value::String(string) => match string_offset_byte(string, first) {
+                    Some(byte) => with_borrowed_dim_path(&byte, rest, f),
+                    None => Some(f(None)),
+                },
+                Value::Object(object) if is_simplexml_object(object) => None,
+                _ => Some(f(None)),
+            }
+        }
+    }
+}
+
 fn fetch_dim_path_value(value: &Value, dims: &[ArrayKey]) -> Result<Option<Value>, String> {
     let mut current = effective_value(value);
     for key in dims {
@@ -73898,6 +73976,52 @@ fn write_string_offset(
     }
     bytes[index] = first;
     Ok(bytes)
+}
+
+/// Outcome of attempting an in-place property dimension assignment.
+enum PropertyDimInPlace {
+    /// The property held an array and `assign_dim_value` ran directly on
+    /// the stored value; carries that call's result.
+    Applied(Result<(), String>),
+    /// The property is missing, holds a non-array value, or the object
+    /// storage is unavailable; the caller must run the generic
+    /// read-clone → assign → write-back path.
+    NotEligible,
+}
+
+/// Assigns `object->property[dims...] = value` directly on the stored
+/// property value when it currently holds an array. This avoids the generic
+/// path's property read (which shares the array handle) followed by
+/// `assign_dim_value` on the copy (which then deep-copies the entire array
+/// storage through a COW separation) on every nested write.
+///
+/// Callers gate on property shape first: untyped, non-readonly,
+/// non-hooked properties only, with visibility already validated. Non-array
+/// slot values (objects, references, strings, scalars, null) report
+/// `NotEligible` so ArrayAccess dispatch, string offsets, vivification and
+/// error behavior stay on the generic path unchanged.
+fn try_assign_property_dim_in_place(
+    object: &ObjectRef,
+    storage_name: &str,
+    dims: &[ArrayKey],
+    value: Value,
+    append: bool,
+) -> PropertyDimInPlace {
+    let mut pending = Some(value);
+    match object.try_modify_property_value(storage_name, |slot| {
+        if !matches!(slot, Value::Array(_)) {
+            return None;
+        }
+        Some(assign_dim_value(
+            slot,
+            dims,
+            pending.take().expect("assign value consumed once"),
+            append,
+        ))
+    }) {
+        Ok(Some(Some(result))) => PropertyDimInPlace::Applied(result),
+        Ok(Some(None)) | Ok(None) | Err(_) => PropertyDimInPlace::NotEligible,
+    }
 }
 
 fn assign_dim_value(
@@ -78146,6 +78270,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78179,6 +78304,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78204,6 +78330,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
                 execution_format: ExecutionFormat::Ir,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78213,6 +78340,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
                 execution_format: ExecutionFormat::Bytecode,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -78263,6 +78391,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
                 execution_format: ExecutionFormat::Ir,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78272,6 +78401,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -78331,6 +78461,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78367,6 +78498,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 runtime_context: RuntimeContext::default()
                     .with_cwd(root.clone())
                     .with_filesystem_capabilities(
@@ -78648,6 +78780,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -78688,6 +78821,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -79295,6 +79429,7 @@ good"
                 include_cache: Some(Arc::clone(&cache)),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -79319,6 +79454,7 @@ good"
                 trace_includes: true,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -79382,6 +79518,7 @@ good"
                 trace_includes: true,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
             root.join("index.php").to_string_lossy().into_owned(),
@@ -79722,6 +79859,7 @@ good"
                 trace_includes: true,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
             root.join("index.php").to_string_lossy().into_owned(),
@@ -79781,6 +79919,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -79821,6 +79960,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -80020,6 +80160,7 @@ good"
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -80172,6 +80313,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80182,6 +80324,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80230,6 +80373,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80240,6 +80384,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80285,6 +80430,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80315,6 +80461,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80374,6 +80521,7 @@ good"
                         include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                         collect_counters: true,
                         collect_profile_spans: false,
+                        collect_layout_source_attribution: true,
                         inline_caches: InlineCacheMode::On,
                         ..VmOptions::default()
                     },
@@ -80425,6 +80573,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80446,6 +80595,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80455,6 +80605,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80501,6 +80652,7 @@ good"
                     .with_include_path(vec![first.clone(), second.clone()]),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80512,6 +80664,7 @@ good"
                 runtime_context: RuntimeContext::default().with_include_path(vec![second, first]),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80538,6 +80691,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80547,6 +80701,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80668,6 +80823,7 @@ good"
                     ),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -81292,6 +81448,7 @@ good"
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -82758,6 +82915,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -82785,6 +82943,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -82814,6 +82973,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -82851,6 +83011,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -82890,6 +83051,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -82923,6 +83085,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -82951,6 +83114,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Bytecode,
                 inline_caches: InlineCacheMode::On,
                 quickening: QuickeningMode::On,
@@ -82988,6 +83152,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -83029,6 +83194,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -83066,6 +83232,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -83140,6 +83307,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -83208,6 +83376,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -83250,6 +83419,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Bytecode,
                 dense_jump_threading: DenseJumpThreadingMode::Off,
                 ..VmOptions::default()
@@ -83260,6 +83430,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Bytecode,
                 dense_jump_threading: DenseJumpThreadingMode::On,
                 ..VmOptions::default()
@@ -83296,6 +83467,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Bytecode,
                 superinstructions: SuperinstructionMode::Off,
                 ..VmOptions::default()
@@ -83306,6 +83478,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Bytecode,
                 superinstructions: SuperinstructionMode::On,
                 ..VmOptions::default()
@@ -83354,6 +83527,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -83363,6 +83537,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -83394,6 +83569,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -83403,6 +83579,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -83429,6 +83606,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions {
                     enabled: false,
@@ -83456,6 +83634,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions::default(),
                 adaptive_tiny_unit_setup_threshold: Some(32),
@@ -83479,6 +83658,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions::default(),
                 adaptive_tiny_unit_setup_threshold: Some(1),
@@ -83502,6 +83682,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Ir,
                 quickening: QuickeningMode::On,
                 inline_caches: InlineCacheMode::On,
@@ -83535,6 +83716,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -83558,6 +83740,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -83580,6 +83763,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 jit_threshold: 2,
                 tiering: TieringOptions {
@@ -83608,6 +83792,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 jit_threshold: 1,
                 tiering: TieringOptions {
@@ -83635,6 +83820,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 jit_threshold: 1,
                 tiering: TieringOptions {
@@ -83663,6 +83849,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83697,6 +83884,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83726,6 +83914,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83739,6 +83928,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -83760,6 +83950,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83786,6 +83977,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83810,6 +84002,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83841,6 +84034,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83850,6 +84044,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83885,6 +84080,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83894,6 +84090,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83924,6 +84121,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83961,6 +84159,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83970,6 +84169,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84008,6 +84208,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84017,6 +84218,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84053,6 +84255,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84082,6 +84285,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84091,6 +84295,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84125,6 +84330,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84154,6 +84360,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84184,6 +84391,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84193,6 +84401,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84223,6 +84432,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84232,6 +84442,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84262,6 +84473,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84271,6 +84483,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84315,6 +84528,7 @@ echo perf_jit_unstable_types(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84324,6 +84538,7 @@ echo perf_jit_unstable_types(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84372,6 +84587,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 jit_blacklist: JitBlacklistMode::Off,
                 tiering: TieringOptions {
@@ -84404,6 +84620,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84434,6 +84651,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     jit_eager: true,
@@ -84532,6 +84750,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -84555,6 +84774,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84564,6 +84784,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -84587,6 +84808,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84596,6 +84818,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84639,6 +84862,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84648,6 +84872,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84671,6 +84896,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84691,6 +84917,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84825,6 +85052,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
                     execution_format: ExecutionFormat::Auto,
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     ..VmOptions::default()
                 },
             );
@@ -84846,6 +85074,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84867,6 +85096,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84887,6 +85117,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84896,6 +85127,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84921,6 +85153,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84930,6 +85163,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84954,6 +85188,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84963,6 +85198,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84987,6 +85223,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85008,6 +85245,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85045,6 +85283,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85065,6 +85304,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85081,6 +85321,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85103,6 +85344,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85126,6 +85368,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85174,6 +85417,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85183,6 +85427,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85217,6 +85462,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85255,6 +85501,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85280,6 +85527,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85306,6 +85554,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -85332,6 +85581,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -85358,6 +85608,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -85383,6 +85634,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -85421,6 +85673,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85430,6 +85683,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85453,6 +85707,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85462,6 +85717,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85497,6 +85753,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85543,6 +85800,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85579,6 +85837,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85612,6 +85871,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85633,6 +85893,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85654,6 +85915,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85685,6 +85947,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85703,6 +85966,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85725,6 +85989,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85744,6 +86009,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85776,6 +86042,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85795,6 +86062,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85863,6 +86131,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85882,6 +86151,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85908,6 +86178,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85935,6 +86206,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85961,6 +86233,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85970,6 +86243,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85993,6 +86267,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -86013,6 +86288,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -86033,6 +86309,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -86054,6 +86331,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -86074,6 +86352,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -86083,6 +86362,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -86108,6 +86388,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86117,6 +86398,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86155,6 +86437,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86164,6 +86447,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86185,6 +86469,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86194,6 +86479,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86229,6 +86515,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     quickening: QuickeningMode::Off,
                     ..VmOptions::default()
                 },
@@ -86238,6 +86525,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     quickening: QuickeningMode::On,
                     ..VmOptions::default()
                 },
@@ -86263,6 +86551,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86272,6 +86561,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86293,6 +86583,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86302,6 +86593,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86327,6 +86619,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86336,6 +86629,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86370,6 +86664,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     quickening: QuickeningMode::Off,
                     ..VmOptions::default()
                 },
@@ -86379,6 +86674,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     quickening: QuickeningMode::On,
                     ..VmOptions::default()
                 },
@@ -86404,6 +86700,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86413,6 +86710,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86437,6 +86735,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86446,6 +86745,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86468,6 +86768,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86477,6 +86778,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86506,6 +86808,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -86583,6 +86886,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -86609,6 +86913,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86618,6 +86923,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86639,6 +86945,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86648,6 +86955,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86668,6 +86976,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86702,6 +87011,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86711,6 +87021,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86759,6 +87070,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86786,6 +87098,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86811,6 +87124,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86843,6 +87157,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -86872,6 +87187,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -86910,6 +87226,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -86953,6 +87270,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86987,6 +87305,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -87029,6 +87348,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -87061,6 +87381,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -87089,6 +87410,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87108,6 +87430,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87127,6 +87450,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87174,6 +87498,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87192,6 +87517,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87211,6 +87537,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87273,6 +87600,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87333,6 +87661,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87352,6 +87681,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87376,6 +87706,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87398,6 +87729,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87420,6 +87752,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87451,6 +87784,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87470,6 +87804,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -87617,6 +87952,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -87694,6 +88030,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     quickening: QuickeningMode::On,
                     inline_caches: InlineCacheMode::On,
                     ..VmOptions::default()
@@ -88895,6 +89232,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88904,6 +89242,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88935,6 +89274,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88944,6 +89284,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88970,6 +89311,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88979,6 +89321,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88993,6 +89336,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -89027,6 +89371,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -89036,6 +89381,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -89066,6 +89412,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 internal_function_dispatch_cache: false,
                 ..VmOptions::default()
             },
@@ -89075,6 +89422,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 internal_function_dispatch_cache: true,
                 ..VmOptions::default()
             },
@@ -89133,6 +89481,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -89142,6 +89491,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -89216,6 +89566,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     internal_function_dispatch_cache: false,
                     ..VmOptions::default()
                 },
@@ -89225,6 +89576,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 VmOptions {
                     collect_counters: true,
                     collect_profile_spans: false,
+                    collect_layout_source_attribution: true,
                     internal_function_dispatch_cache: true,
                     ..VmOptions::default()
                 },
@@ -93802,6 +94154,7 @@ echo dense_supported(4), "\n", rich_fallback(), "\n";
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93863,6 +94216,7 @@ echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93914,6 +94268,7 @@ echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93995,6 +94350,7 @@ version_probe();
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94043,6 +94399,7 @@ echo $total, "|", $last;
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94100,6 +94457,7 @@ echo $m->title, "|", $m->missing, "|", $d->declared, "|", $d->extra;
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94109,6 +94467,7 @@ echo $m->title, "|", $m->missing, "|", $d->declared, "|", $d->extra;
             VmOptions {
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -94138,6 +94497,7 @@ try {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94159,6 +94519,7 @@ echo isset($items['missing']) ? '1' : '0';
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94201,6 +94562,7 @@ bind_array_dim_reference();
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94230,6 +94592,7 @@ echo DENSE_FETCH_CONST_PROBE;
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94279,6 +94642,7 @@ for ($i = 0; $i < 4; $i++) {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94362,6 +94726,7 @@ echo dense_property_read_name($hook), ';';
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );
@@ -94437,6 +94802,7 @@ echo dense_call_magic($magic);
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94488,6 +94854,7 @@ new DenseScopedChild();
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94508,6 +94875,7 @@ new DenseScopedChild();
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94543,6 +94911,7 @@ dense_property_write_typed_failure($typed, 'bad');
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: true,
                 ..VmOptions::default()
             },
         );

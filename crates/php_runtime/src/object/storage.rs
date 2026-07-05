@@ -127,6 +127,13 @@ impl ObjectStorage {
         self.dynamic_properties.get(name)
     }
 
+    fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+        if let Some(slot) = self.layout.slot_by_name.get(name).copied() {
+            return self.declared_slots[slot as usize].as_mut();
+        }
+        self.dynamic_properties.get_mut(name)
+    }
+
     fn set(&mut self, name: String, value: Value) {
         if let Some(slot) = self.layout.slot_by_name.get(&name).copied() {
             crate::layout_stats::record_object_declared_slot_write();
@@ -373,6 +380,62 @@ impl ObjectRef {
         self.storage
             .try_borrow_mut()
             .map(|mut storage| storage.set(name, value))
+    }
+
+    /// Runs `f` with a borrowed view of a property value, preferring
+    /// `storage_name` and falling back to `fallback_name`, without cloning
+    /// the stored value (and therefore without sharing container handles,
+    /// which would force copy-on-write separations on later writes).
+    /// `Err` means the storage is already mutably borrowed; callers fall
+    /// back to the cloning read path.
+    pub fn try_with_property_lookup<R>(
+        &self,
+        storage_name: &str,
+        fallback_name: &str,
+        f: impl FnOnce(Option<&Value>) -> R,
+    ) -> Result<R, BorrowError> {
+        let storage = self.storage.try_borrow()?;
+        let value = storage
+            .get(storage_name)
+            .or_else(|| storage.get(fallback_name));
+        Ok(f(value))
+    }
+
+    /// Modifies an existing property value in place, avoiding the
+    /// read-clone → mutate → write-back round trip that separates shared
+    /// array storage on every nested dimension write.
+    ///
+    /// The value is moved out of the slot (leaving `Value::Uninitialized`)
+    /// while `f` runs, so `f` may safely touch other objects' storage. `f`
+    /// must not trigger PHP-visible reads of this object; the VM only passes
+    /// closures that never re-enter PHP code. Returns `Ok(None)` without
+    /// calling `f` when the property does not exist. Fails with
+    /// `BorrowMutError` when the storage is already borrowed (caller falls
+    /// back to the generic clone/write-back path).
+    pub fn try_modify_property_value<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Value) -> R,
+    ) -> Result<Option<R>, BorrowMutError> {
+        let mut value = {
+            let mut storage = self.storage.try_borrow_mut()?;
+            let Some(slot) = storage.get_mut(name) else {
+                return Ok(None);
+            };
+            std::mem::replace(slot, Value::Uninitialized)
+        };
+        let result = f(&mut value);
+        let mut storage = self
+            .storage
+            .try_borrow_mut()
+            .expect("object storage re-borrowed across in-place property write");
+        if let Some(slot) = storage.get_mut(name) {
+            *slot = value;
+        } else {
+            // `f` cannot remove the slot; restore defensively regardless.
+            storage.set(name.to_owned(), value);
+        }
+        Ok(Some(result))
     }
 
     /// Returns the `var_dump` property label for a stored property name.

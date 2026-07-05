@@ -37,6 +37,10 @@ pub struct VmOptions {
     /// from aggregate counters so diagnostic counter runs do not pay timer and
     /// attribution-map costs unless the request profiler is explicitly enabled.
     pub collect_profile_spans: bool,
+    /// Collect per-family clone/COW source attribution on top of counters.
+    /// This pays per-event accounting on the hottest runtime paths and must
+    /// stay an explicit opt-in; it has no effect without `collect_counters`.
+    pub collect_layout_source_attribution: bool,
     /// Optional dense-bytecode execution mode. The default keeps the rich-IR
     /// interpreter as the only execution path.
     pub execution_format: ExecutionFormat,
@@ -93,6 +97,7 @@ impl Default for VmOptions {
             trace_includes: trace_includes_from_env(),
             collect_counters: false,
             collect_profile_spans: false,
+            collect_layout_source_attribution: false,
             execution_format: ExecutionFormat::Ir,
             dense_include_execution: DenseIncludeMode::Off,
             superinstructions: SuperinstructionMode::Off,

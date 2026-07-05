@@ -125,6 +125,8 @@ pub enum PackedToMixedReason {
 
 thread_local! {
     static LAYOUT_STATS_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAYOUT_SOURCE_ATTRIBUTION_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static LAYOUT_STATS: RefCell<RuntimeLayoutStats> =
         RefCell::new(RuntimeLayoutStats::default());
     static LAYOUT_SOURCE_STATS: RefCell<RuntimeLayoutSourceStats> =
@@ -147,6 +149,14 @@ pub const SOURCE_BY_REF_ARGUMENT_BINDING: &str = "by_ref_argument_binding";
 pub const SOURCE_CALL_ARGUMENT_SNAPSHOT: &str = "call_argument_snapshot";
 /// Value copied while binding a closure capture.
 pub const SOURCE_CLOSURE_CAPTURE_BINDING: &str = "closure_capture_binding";
+/// Value copied while a shared array storage separates for a write (element
+/// deep-copy performed by `Rc::make_mut` inside `storage_mut_for`).
+pub const SOURCE_COW_SEPARATION_CONTENTS: &str = "cow_separation_contents";
+/// Value copied inside a runtime builtin body (registry-dispatched builtins
+/// whose internal copies have no more specific attribution).
+pub const SOURCE_BUILTIN_BODY: &str = "builtin_body";
+/// Value copied while binding call arguments into frame locals/parameters.
+pub const SOURCE_ARGUMENT_BINDING: &str = "argument_binding";
 /// Value copied while materializing arguments for builtin parameter handling.
 pub const SOURCE_BUILTIN_ARGUMENT_MATERIALIZATION: &str = "builtin_argument_materialization";
 /// Value copied while materializing foreach-style iteration output.
@@ -179,6 +189,26 @@ pub(crate) fn disable_stats() {
     LAYOUT_STATS_ENABLED.with(|enabled| enabled.set(false));
 }
 
+/// Returns true when per-family source attribution is enabled. This is a
+/// separate opt-in on top of layout stats: aggregate counters (clone totals)
+/// are cheap, while per-event family attribution pays map updates and must
+/// only run when a caller explicitly asks for source-attributed layouts.
+#[inline(always)]
+pub(crate) fn source_attribution_enabled() -> bool {
+    LAYOUT_SOURCE_ATTRIBUTION_ENABLED.with(std::cell::Cell::get)
+}
+
+/// Enables per-family source attribution for the current thread. Only
+/// meaningful while layout stats are also enabled.
+pub fn enable_layout_source_attribution() {
+    LAYOUT_SOURCE_ATTRIBUTION_ENABLED.with(|enabled| enabled.set(true));
+}
+
+/// Disables per-family source attribution for the current thread.
+pub fn disable_layout_source_attribution() {
+    LAYOUT_SOURCE_ATTRIBUTION_ENABLED.with(|enabled| enabled.set(false));
+}
+
 macro_rules! layout_recorder {
     ($vis:vis $name:ident, $slow:ident, $field:ident) => {
         #[inline(always)]
@@ -199,7 +229,7 @@ macro_rules! layout_recorder {
 /// Enters a source family for subsequent layout events in this thread.
 #[must_use]
 pub fn enter_layout_source_family(family: &'static str) -> LayoutSourceGuard {
-    if !stats_enabled() {
+    if !source_attribution_enabled() {
         return LayoutSourceGuard { active: false };
     }
     LAYOUT_SOURCE_STACK.with(|stack| stack.borrow_mut().push(family));
@@ -209,7 +239,7 @@ pub fn enter_layout_source_family(family: &'static str) -> LayoutSourceGuard {
 /// Enters a source family only when no more specific source is active.
 #[must_use]
 pub fn enter_default_layout_source_family(family: &'static str) -> LayoutSourceGuard {
-    if !stats_enabled() {
+    if !source_attribution_enabled() {
         return LayoutSourceGuard { active: false };
     }
     LAYOUT_SOURCE_STACK.with(|stack| {
@@ -244,6 +274,9 @@ fn current_source_family() -> &'static str {
 }
 
 fn record_value_clone_source() {
+    if !source_attribution_enabled() {
+        return;
+    }
     let family = current_source_family();
     LAYOUT_SOURCE_STATS.with(|stats| {
         *stats
@@ -255,6 +288,9 @@ fn record_value_clone_source() {
 }
 
 fn record_array_handle_clone_source() {
+    if !source_attribution_enabled() {
+        return;
+    }
     let family = current_source_family();
     LAYOUT_SOURCE_STATS.with(|stats| {
         *stats
@@ -266,6 +302,9 @@ fn record_array_handle_clone_source() {
 }
 
 fn record_cow_separation_source() {
+    if !source_attribution_enabled() {
+        return;
+    }
     let family = current_source_family();
     LAYOUT_SOURCE_STATS.with(|stats| {
         *stats
@@ -277,6 +316,9 @@ fn record_cow_separation_source() {
 }
 
 fn record_reference_cell_creation_source() {
+    if !source_attribution_enabled() {
+        return;
+    }
     let family = current_source_family();
     LAYOUT_SOURCE_STATS.with(|stats| {
         *stats
@@ -549,6 +591,7 @@ pub fn take_layout_stats() -> RuntimeLayoutStats {
 #[must_use]
 pub fn take_layout_source_stats() -> RuntimeLayoutSourceStats {
     disable_stats();
+    disable_layout_source_attribution();
     LAYOUT_SOURCE_STATS.with(|stats| std::mem::take(&mut *stats.borrow_mut()))
 }
 
@@ -559,6 +602,7 @@ mod tests {
     #[test]
     fn layout_stats_record_safe_runtime_events() {
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
 
         let string = PhpString::from("abc");
         let _string_clone = string.clone();
@@ -648,8 +692,28 @@ mod tests {
     }
 
     #[test]
+    fn source_attribution_stays_off_when_only_counters_are_enabled() {
+        layout_stats::reset_layout_stats();
+
+        {
+            // Guard is inert without the explicit attribution opt-in.
+            let _source = layout_stats::enter_layout_source_family("test_value");
+            let _value_clone = Value::Array(PhpArray::new()).clone();
+        }
+
+        let stats = layout_stats::take_layout_stats();
+        assert!(stats.value_clones >= 1, "{stats:?}");
+        let source_stats = layout_stats::take_layout_source_stats();
+        assert!(
+            source_stats.value_clone_by_family.is_empty(),
+            "attribution must not record without the explicit opt-in: {source_stats:?}"
+        );
+    }
+
+    #[test]
     fn taking_source_stats_disables_later_hot_path_recording() {
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
         {
             let _source = layout_stats::enter_layout_source_family("test_value");
             let _value_clone = Value::Int(1).clone();
@@ -670,6 +734,7 @@ mod tests {
     #[test]
     fn default_source_scopes_classify_runtime_clone_sites() {
         layout_stats::reset_layout_stats();
+        layout_stats::enable_layout_source_attribution();
 
         let cell = ReferenceCell::new(Value::Int(1));
         let _value = cell.get();

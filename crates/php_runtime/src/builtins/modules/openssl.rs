@@ -538,10 +538,10 @@ fn public_key_for_verify(
     if let Ok(public_key) = PKey::public_key_from_pem(&key_bytes) {
         return Ok(Some(public_key));
     }
-    if let Ok(certificate) = X509::from_pem(&key_bytes) {
-        if let Ok(public_key) = certificate.public_key() {
-            return Ok(Some(public_key));
-        }
+    if let Ok(certificate) = X509::from_pem(&key_bytes)
+        && let Ok(public_key) = certificate.public_key()
+    {
+        return Ok(Some(public_key));
     }
     context.php_warning(
         "E_PHP_RUNTIME_OPENSSL_KEY",

@@ -136,6 +136,7 @@ impl PhpExecutor {
             runtime_context,
             collect_counters: input.collect_counters,
             collect_profile_spans: input.collect_profile_spans,
+            collect_layout_source_attribution: input.collect_layout_source_attribution,
             ..self.options.vm_options.clone()
         });
         let result = vm.execute(compiled.executable_unit());
@@ -172,6 +173,7 @@ impl PhpExecutor {
                 runtime_context: input.runtime_context,
                 collect_counters: input.collect_counters,
                 collect_profile_spans: input.collect_profile_spans,
+                collect_layout_source_attribution: input.collect_layout_source_attribution,
             },
         )
     }
@@ -283,6 +285,7 @@ mod tests {
             optimization_level: None,
             collect_counters: true,
             collect_profile_spans: false,
+            collect_layout_source_attribution: true,
         });
 
         assert_eq!(output.status, PhpExecutionStatus::Success);
@@ -321,6 +324,7 @@ mod tests {
             optimization_level: None,
             collect_counters: true,
             collect_profile_spans: false,
+            collect_layout_source_attribution: true,
         });
 
         assert_eq!(output.status, PhpExecutionStatus::Success);
@@ -363,6 +367,7 @@ mod tests {
                 runtime_context: RuntimeContext::controlled_cli("compiled-handle.php", Vec::new()),
                 collect_counters: false,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: false,
             },
         );
         let second = executor.execute_compiled(
@@ -374,6 +379,7 @@ mod tests {
                 runtime_context: RuntimeContext::controlled_cli("compiled-handle.php", Vec::new()),
                 collect_counters: false,
                 collect_profile_spans: false,
+                collect_layout_source_attribution: false,
             },
         );
         let after = compiled.executable_unit();

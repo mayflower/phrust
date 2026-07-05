@@ -829,10 +829,7 @@ fn simplexml_xpath_value(context: &XmlElement, path: &SimpleXmlXPath) -> Value {
         match &step.axis {
             SimpleXmlXPathAxis::Element(name) => {
                 if path.absolute && index == 0 && !step.descendant {
-                    current = current
-                        .into_iter()
-                        .filter(|element| simplexml_xpath_name_matches(&element.name, name))
-                        .collect();
+                    current.retain(|element| simplexml_xpath_name_matches(&element.name, name));
                 } else if step.descendant {
                     let mut next = Vec::new();
                     for element in &current {
