@@ -4,12 +4,12 @@
   "priority": "Validation and sanitization MVP",
   "selected_manifest": "tests/phpt/manifests/modules/filter.selected.jsonl",
   "corpus_count": 114,
-  "selected_count": 60,
-  "pass_count": 60,
+  "selected_count": 63,
+  "pass_count": 63,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 57,
+  "known_failure_count": 54,
   "scope": [
     "WordPress-relevant scalar validation and sanitization",
     "Common filter metadata and array helper paths",
@@ -33,13 +33,15 @@
     "filter_var_array encoded sanitizer and scalar/array shape interactions",
     "CLI PHPT request superglobal seeding for GET, POST, COOKIE, and REQUEST",
     "filter.default request input filtering for promoted special_chars and stripped rows",
-    "E_DEPRECATED-masked filter.default startup diagnostic suppression"
+    "E_DEPRECATED-masked filter.default startup diagnostic suppression",
+    "Runtime deprecations for FILTER_SANITIZE_STRING and FILTER_SANITIZE_STRIPPED constant access",
+    "FILTER_SANITIZE_STRING strip-high, strip-low, and tag-stripping combinations covered by promoted upstream rows"
   ],
   "non_scope": [
-    "Remaining 57 ext/filter upstream rows",
+    "Remaining 54 ext/filter upstream rows",
     "Full PHP filter option matrix",
     "VM-dispatched user callback and closure filter execution",
-    "Remaining exact filter flag behavior matrix and warning/deprecation text"
+    "Remaining exact filter flag behavior matrix, including deeper FILTER_SANITIZE_STRIPPED tag-stripping quirks"
   ],
   "target_gates": [
     "cargo test -p php_server server_filter_input_array_reads_query_snapshot",

@@ -2,14 +2,14 @@
 
 - Strategy: validation and sanitization MVP
 - Selected manifest: `tests/phpt/manifests/modules/filter.selected.jsonl`
-- Selected close gate: 60 PASS, 0 SKIP, 0 FAIL, 0 BORK from 60 selected fixtures
-- Upstream corpus snapshot before the selected gate: 57 PASS, 3 XFAIL, 54 FAIL,
+- Selected close gate: 63 PASS, 0 SKIP, 0 FAIL, 0 BORK from 63 selected fixtures
+- Upstream corpus snapshot before the selected gate: 60 PASS, 3 XFAIL, 51 FAIL,
   0 BORK from 114 corpus candidates
 - Selected fixtures:
   - `tests/phpt/generated/filter/basic.phpt`
   - `tests/phpt/generated/filter/arrays.phpt`
   - `tests/phpt/generated/filter/options-callback.phpt`
-  - 57 target-green upstream rows from `ext/filter/tests`
+  - 60 target-green upstream rows from `ext/filter/tests`
 
 ## Implemented Surface
 
@@ -77,6 +77,12 @@ return the normal filter failure value (`false` or `null` with
 The CLI startup path emits the upstream `filter.default` deprecation diagnostic
 when PHPT-style startup error display is enabled.
 
+Deprecated filter constants carry registry metadata and the VM emits the
+PHP-compatible `E_DEPRECATED` diagnostic when `FILTER_SANITIZE_STRING` and
+`FILTER_SANITIZE_STRIPPED` are accessed at runtime. The promoted rows cover the
+legacy string sanitizer warning surface plus strip-low, strip-high, and
+tag-stripping combinations that are now green.
+
 PHPT CLI request fixtures populate `$_GET`, `$_POST`, `$_COOKIE`, and
 `$_REQUEST` from the harness environment, including `filter.default` request
 input handling for promoted `special_chars` and stripped cases. The startup
@@ -87,15 +93,14 @@ deprecation for `filter.default` is suppressed when `error_reporting` masks
 
 The full PHP filter option matrix, remaining exact filter flag behavior,
 remaining request input edge cases, VM-dispatched user function and closure
-callbacks, throw-on-failure mode, remaining exact warning/deprecation text,
-remaining legacy string sanitizer deprecation output, and locale-specific
-numeric parsing remain out of scope.
+callbacks, throw-on-failure mode, remaining deeper `FILTER_SANITIZE_STRIPPED`
+tag-stripping quirks, and locale-specific numeric parsing remain out of scope.
 
-The full upstream target sweep measured 57 PASS, 3 XFAIL, and 54 FAIL from 114
+The full upstream target sweep measured 60 PASS, 3 XFAIL, and 51 FAIL from 114
 `ext/filter/tests` rows. The remaining unpromoted rows are dominated by
 stricter PHP URL/email/IP quirks, remaining filter flag behavior, callback
 dispatch, deeper request/superglobal edge cases, array-to-string conversion behavior,
-and exact warning/deprecation output.
+and exact sanitizer edge-case behavior.
 
 ## Target Gates
 

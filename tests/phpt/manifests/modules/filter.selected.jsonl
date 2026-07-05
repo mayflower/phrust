@@ -21,6 +21,7 @@
 {"path":"ext/filter/tests/022.phpt"}
 {"path":"ext/filter/tests/023.phpt"}
 {"path":"ext/filter/tests/024.phpt"}
+{"path":"ext/filter/tests/025.phpt"}
 {"path":"ext/filter/tests/027.phpt"}
 {"path":"ext/filter/tests/028.phpt"}
 {"path":"ext/filter/tests/030.phpt"}
@@ -28,6 +29,7 @@
 {"path":"ext/filter/tests/032.phpt"}
 {"path":"ext/filter/tests/034.phpt"}
 {"path":"ext/filter/tests/036.phpt"}
+{"path":"ext/filter/tests/042.phpt"}
 {"path":"ext/filter/tests/043.phpt"}
 {"path":"ext/filter/tests/044.phpt"}
 {"path":"ext/filter/tests/045.phpt"}
@@ -48,6 +50,7 @@
 {"path":"ext/filter/tests/bug64441.phpt"}
 {"path":"ext/filter/tests/bug67167.01.phpt"}
 {"path":"ext/filter/tests/bug69202.phpt"}
+{"path":"ext/filter/tests/bug69203.phpt"}
 {"path":"ext/filter/tests/bug76366.phpt"}
 {"path":"ext/filter/tests/bug7715.phpt"}
 {"path":"ext/filter/tests/bug7733.phpt"}

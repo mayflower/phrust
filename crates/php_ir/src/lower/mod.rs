@@ -1656,6 +1656,7 @@ static PREDEFINED_CONSTANT_INITIALIZERS: std::sync::LazyLock<HashMap<String, IrC
         registry
             .enabled_constants()
             .into_iter()
+            .filter(|constant| constant.deprecation().is_none())
             .filter_map(|constant| {
                 Some((
                     constant.name().to_owned(),

@@ -165,6 +165,7 @@ pub struct ConstantDescriptor {
     name: &'static str,
     extension: &'static str,
     value: Option<ConstantValue>,
+    deprecation: Option<ConstantDeprecation>,
 }
 
 impl ConstantDescriptor {
@@ -175,6 +176,7 @@ impl ConstantDescriptor {
             name,
             extension,
             value: None,
+            deprecation: None,
         }
     }
 
@@ -189,7 +191,15 @@ impl ConstantDescriptor {
             name,
             extension,
             value: Some(value),
+            deprecation: None,
         }
+    }
+
+    /// Marks this constant as deprecated in the upstream PHP surface.
+    #[must_use]
+    pub const fn deprecated(mut self, message: &'static str) -> Self {
+        self.deprecation = Some(ConstantDeprecation::new(message));
+        self
     }
 
     /// Stable constant name.
@@ -210,12 +220,38 @@ impl ConstantDescriptor {
         self.value
     }
 
+    /// Deprecation metadata, when accessing this constant should emit one.
+    #[must_use]
+    pub const fn deprecation(&self) -> Option<ConstantDeprecation> {
+        self.deprecation
+    }
+
     /// Generated php-src stub metadata for this constant, when available.
     #[must_use]
     pub fn source_metadata(
         &self,
     ) -> Option<&'static generated::arginfo::GeneratedConstantMetadata> {
         generated::arginfo::constant_metadata(None, self.name)
+    }
+}
+
+/// PHP deprecation metadata for an internal constant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstantDeprecation {
+    message: &'static str,
+}
+
+impl ConstantDeprecation {
+    /// Creates deprecation metadata with the PHP-visible diagnostic message.
+    #[must_use]
+    pub const fn new(message: &'static str) -> Self {
+        Self { message }
+    }
+
+    /// PHP-visible diagnostic message.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        self.message
     }
 }
 
@@ -2171,6 +2207,32 @@ mod tests {
             missing, CONSTANTS_WITH_EXTERNAL_ARGINFO,
             "registered constants should stay backed by generated php-src metadata unless their external extension slice is explicitly audited here"
         );
+    }
+
+    #[test]
+    fn deprecated_filter_string_constants_keep_oracle_messages() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for (name, message) in [
+            (
+                "FILTER_SANITIZE_STRING",
+                "Constant FILTER_SANITIZE_STRING is deprecated since 8.1, use htmlspecialchars() instead",
+            ),
+            (
+                "FILTER_SANITIZE_STRIPPED",
+                "Constant FILTER_SANITIZE_STRIPPED is deprecated since 8.1, use htmlspecialchars() instead",
+            ),
+        ] {
+            let constant = registry
+                .enabled_constant(name)
+                .unwrap_or_else(|| panic!("{name} should be registered"));
+            assert_eq!(
+                constant
+                    .deprecation()
+                    .map(|deprecation| deprecation.message()),
+                Some(message)
+            );
+        }
     }
 
     #[test]

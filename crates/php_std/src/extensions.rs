@@ -2795,11 +2795,15 @@ pub(super) fn standard_library_filter_extension() -> ExtensionDescriptor {
             "FILTER_SANITIZE_STRING",
             "filter",
             ConstantValue::Int(513),
+        ).deprecated(
+            "Constant FILTER_SANITIZE_STRING is deprecated since 8.1, use htmlspecialchars() instead",
         ))
         .with_constant(ConstantDescriptor::with_value(
             "FILTER_SANITIZE_STRIPPED",
             "filter",
             ConstantValue::Int(513),
+        ).deprecated(
+            "Constant FILTER_SANITIZE_STRIPPED is deprecated since 8.1, use htmlspecialchars() instead",
         ))
         .with_constant(ConstantDescriptor::with_value(
             "FILTER_SANITIZE_ENCODED",

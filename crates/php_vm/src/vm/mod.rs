@@ -7003,8 +7003,26 @@ impl Vm {
                                     .clone();
                                 Value::Resource(resource)
                             }
-                            _ => match lexical_constant_value(compiled, state, stack, name) {
-                                Ok(Some(value)) => value,
+                            _ => match lexical_constant_lookup(compiled, state, stack, name) {
+                                Ok(Some(resolved)) => {
+                                    if let Some(constant) = resolved.predefined {
+                                        if let Err(result) = self
+                                            .emit_predefined_constant_deprecation(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut diagnostics,
+                                                dense_instruction_span(dense, instruction),
+                                                constant,
+                                            )
+                                        {
+                                            stack.pop_recycle();
+                                            return result;
+                                        }
+                                    }
+                                    resolved.value
+                                }
                                 Ok(None) => {
                                     let result = self.runtime_error(
                                         output,
@@ -13174,8 +13192,24 @@ impl Vm {
                                     .clone();
                                 Value::Resource(resource)
                             }
-                            _ => match lexical_constant_value(compiled, state, stack, name) {
-                                Ok(Some(value)) => value,
+                            _ => match lexical_constant_lookup(compiled, state, stack, name) {
+                                Ok(Some(resolved)) => {
+                                    if let Some(constant) = resolved.predefined
+                                        && let Err(result) = self
+                                            .emit_predefined_constant_deprecation(
+                                                compiled,
+                                                output,
+                                                stack,
+                                                state,
+                                                &mut diagnostics,
+                                                instruction.span,
+                                                constant,
+                                            )
+                                    {
+                                        return result;
+                                    }
+                                    resolved.value
+                                }
                                 Ok(None) => {
                                     return self.runtime_error(
                                         output,
@@ -41058,6 +41092,49 @@ impl Vm {
         Ok(())
     }
 
+    fn emit_predefined_constant_deprecation(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
+        instruction_span: php_ir::IrSpan,
+        constant: &php_std::ConstantDescriptor,
+    ) -> Result<(), VmResult> {
+        let Some(deprecation) = constant.deprecation() else {
+            return Ok(());
+        };
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_DEPRECATED_CONSTANT",
+            RuntimeSeverity::Deprecation,
+            deprecation.message().to_owned(),
+            current_instruction_diagnostic_span(compiled, state, instruction_span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Deprecation),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_DEPRECATED,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_DEPRECATED) {
+            Self::record_last_error(state, php_runtime::PHP_E_DEPRECATED, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Deprecated,
+                php_runtime::PHP_E_DEPRECATED,
+            );
+            diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
     fn emit_spl_autoload_register_do_throw_notice(
         &self,
         compiled: &CompiledUnit,
@@ -65852,23 +65929,67 @@ fn dynamic_class_owner_index_in_state(state: &ExecutionState, class_name: &str) 
     })
 }
 
+struct ResolvedConstantValue {
+    value: Value,
+    predefined: Option<&'static php_std::ConstantDescriptor>,
+}
+
+fn global_constant_lookup(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    name: &str,
+) -> Result<Option<ResolvedConstantValue>, String> {
+    if let Some(constant) = compiled.lookup_constant(name) {
+        Ok(Some(ResolvedConstantValue {
+            value: inline_constant_value(constant),
+            predefined: None,
+        }))
+    } else if let Some(value) = dynamic_constant_value_in_state(state, name)? {
+        Ok(Some(ResolvedConstantValue {
+            value,
+            predefined: None,
+        }))
+    } else if let Some(value) = state.user_constants.get(name) {
+        Ok(Some(ResolvedConstantValue {
+            value: value.clone(),
+            predefined: None,
+        }))
+    } else if let Some(value) = class_constant_value_by_name(compiled, state, stack, name)? {
+        Ok(Some(ResolvedConstantValue {
+            value,
+            predefined: None,
+        }))
+    } else {
+        Ok(predefined_constant_lookup_for_state(state, name))
+    }
+}
+
 fn global_constant_value(
     compiled: &CompiledUnit,
     state: &mut ExecutionState,
     stack: &CallStack,
     name: &str,
 ) -> Result<Option<Value>, String> {
-    if let Some(constant) = compiled.lookup_constant(name) {
-        Ok(Some(inline_constant_value(constant)))
-    } else if let Some(value) = dynamic_constant_value_in_state(state, name)? {
-        Ok(Some(value))
-    } else if let Some(value) = state.user_constants.get(name) {
-        Ok(Some(value.clone()))
-    } else if let Some(value) = class_constant_value_by_name(compiled, state, stack, name)? {
-        Ok(Some(value))
-    } else {
-        Ok(predefined_constant_value_for_state(state, name))
+    Ok(global_constant_lookup(compiled, state, stack, name)?.map(|resolved| resolved.value))
+}
+
+fn lexical_constant_lookup(
+    compiled: &CompiledUnit,
+    state: &mut ExecutionState,
+    stack: &CallStack,
+    name: &str,
+) -> Result<Option<ResolvedConstantValue>, String> {
+    if let Some(resolved) = global_constant_lookup(compiled, state, stack, name)? {
+        return Ok(Some(resolved));
     }
+    let Some((_, global_name)) = name.rsplit_once('\\') else {
+        return Ok(None);
+    };
+    if global_name.is_empty() {
+        return Ok(None);
+    }
+    global_constant_lookup(compiled, state, stack, global_name)
 }
 
 fn lexical_constant_value(
@@ -65877,16 +65998,7 @@ fn lexical_constant_value(
     stack: &CallStack,
     name: &str,
 ) -> Result<Option<Value>, String> {
-    if let Some(value) = global_constant_value(compiled, state, stack, name)? {
-        return Ok(Some(value));
-    }
-    let Some((_, global_name)) = name.rsplit_once('\\') else {
-        return Ok(None);
-    };
-    if global_name.is_empty() {
-        return Ok(None);
-    }
-    global_constant_value(compiled, state, stack, global_name)
+    Ok(lexical_constant_lookup(compiled, state, stack, name)?.map(|resolved| resolved.value))
 }
 
 fn dynamic_constant_value_in_state(
@@ -66166,19 +66278,33 @@ fn class_constant_reference_display_class(reference: &ClassConstantReference) ->
     }
 }
 
-fn predefined_constant_value(name: &str) -> Option<Value> {
-    php_std::ExtensionRegistry::standard_library()
-        .enabled_constant(name)
-        .and_then(|constant| constant.value())
-        .map(php_std::constants::constant_to_value)
+fn predefined_constant_lookup(name: &str) -> Option<ResolvedConstantValue> {
+    let constant = php_std::ExtensionRegistry::standard_library().enabled_constant(name)?;
+    Some(ResolvedConstantValue {
+        value: php_std::constants::constant_to_value(constant.value()?),
+        predefined: Some(constant),
+    })
+}
+
+fn predefined_constant_lookup_for_state(
+    state: &ExecutionState,
+    name: &str,
+) -> Option<ResolvedConstantValue> {
+    match name {
+        "PHP_SAPI" => Some(ResolvedConstantValue {
+            value: Value::string(state.sapi_name.clone()),
+            predefined: None,
+        }),
+        "PHP_BINARY" => Some(ResolvedConstantValue {
+            value: Value::string(state.php_binary.clone()),
+            predefined: None,
+        }),
+        _ => predefined_constant_lookup(name),
+    }
 }
 
 fn predefined_constant_value_for_state(state: &ExecutionState, name: &str) -> Option<Value> {
-    match name {
-        "PHP_SAPI" => Some(Value::string(state.sapi_name.clone())),
-        "PHP_BINARY" => Some(Value::string(state.php_binary.clone())),
-        _ => predefined_constant_value(name),
-    }
+    predefined_constant_lookup_for_state(state, name).map(|resolved| resolved.value)
 }
 
 fn ini_option_name(value: &Value) -> Result<String, String> {
