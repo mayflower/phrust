@@ -290,7 +290,7 @@ pub(crate) fn write_vm_compile_fatal_line<W: Write>(
                     Some((payload, diagnostic.source_span()))
                 }
                 RuntimeDiagnosticPayload::JsonBuiltin(_) => None,
-                RuntimeDiagnosticPayload::WordPressBringup(_) => None,
+                RuntimeDiagnosticPayload::Bringup(_) => None,
             })
     else {
         return Ok(false);

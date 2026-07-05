@@ -1,4 +1,4 @@
-//! Bounded filter extension MVP for common WordPress validation and sanitization.
+//! Bounded filter extension MVP for common validation and sanitization.
 
 use super::core::{arity_error, conversion_error, deref_value, int_arg, string_arg};
 use crate::builtins::{

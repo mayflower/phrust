@@ -6,10 +6,12 @@ use super::{
     state::AppState,
 };
 use crate::{
+    config::BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV,
     multipart::{
         MultipartError, cleanup_uploaded_files, multipart_boundary, parse_multipart_into_context,
     },
     response::{self, ResponseBody},
+    routing::RequestRewriteRule,
 };
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -25,7 +27,7 @@ use php_executor::{
 };
 use php_runtime::api::{
     RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionLoadCallback,
-    SessionState, Value, parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
+    SessionState, Value, parse_cookie_header, parse_form_urlencoded_body,
 };
 use std::{
     collections::BTreeMap,
@@ -1202,6 +1204,7 @@ pub(crate) fn http_runtime_context(
         || parts.uri.path().to_string(),
         |value| value.as_str().to_string(),
     );
+    let request_uri = rewrite_request_uri(&request_uri, &state.route_config.request_rewrites);
     let host =
         header_value(&parts.headers, header::HOST).unwrap_or_else(|| "localhost".to_string());
     let (request_time, request_time_float_micros) = request_time_pair();
@@ -1221,7 +1224,6 @@ pub(crate) fn http_runtime_context(
     context.https = state.request_scheme == "https";
     context.php_self = php_self_for(script_name, path_info.as_deref());
     context.path_info = path_info;
-    apply_wordpress_rest_rewrite(&mut context);
     context.remote_addr = peer.ip().to_string();
     context.request_time = request_time;
     context.request_time_float_micros = request_time_float_micros;
@@ -1256,31 +1258,43 @@ pub(crate) fn http_runtime_context(
     context
 }
 
-fn apply_wordpress_rest_rewrite(context: &mut RuntimeHttpRequestContext) {
-    let Some(rest_route) = wordpress_rest_route_from_path_info(context.path_info.as_deref()) else {
-        return;
-    };
-    let rest_query = format!("rest_route={}", percent_encode_query_value(&rest_route));
-    context.query_string = if context.query_string.is_empty() {
-        rest_query
-    } else {
-        format!("{rest_query}&{}", context.query_string)
-    };
-    context.parsed_get = parse_query_string(&context.query_string);
+fn rewrite_request_uri(request_uri: &str, rules: &[RequestRewriteRule]) -> String {
+    let (path, query) = request_uri
+        .split_once('?')
+        .map_or((request_uri, ""), |(path, query)| (path, query));
+    for rule in rules {
+        let Some(route) = rewritten_route_for_prefix(path, &rule.path_prefix) else {
+            continue;
+        };
+        let rewrite_query = format!(
+            "{}={}",
+            rule.query_parameter,
+            percent_encode_query_value(&route)
+        );
+        return if query.is_empty() {
+            format!("/?{rewrite_query}")
+        } else {
+            format!("/?{rewrite_query}&{query}")
+        };
+    }
+    request_uri.to_string()
 }
 
-fn wordpress_rest_route_from_path_info(path_info: Option<&str>) -> Option<String> {
-    let path_info = path_info?;
-    let rest = match path_info {
-        "/wp-json" | "/wp-json/" => "",
-        path if path.starts_with("/wp-json/") => &path["/wp-json/".len()..],
-        _ => return None,
-    };
-    if rest.is_empty() {
-        Some("/".to_string())
-    } else {
-        Some(format!("/{rest}"))
+fn rewritten_route_for_prefix(path: &str, prefix: &str) -> Option<String> {
+    if prefix == "/" {
+        return Some(if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        });
     }
+    if path == prefix {
+        return Some("/".to_string());
+    }
+    let remainder = path.strip_prefix(prefix)?;
+    remainder
+        .starts_with('/')
+        .then(|| if remainder.is_empty() { "/" } else { remainder }.to_string())
 }
 
 fn percent_encode_query_value(value: &str) -> String {
@@ -1309,7 +1323,12 @@ fn hex_digit(nibble: u8) -> char {
 }
 
 pub(crate) fn server_env_for_request(state: &AppState) -> Vec<(String, String)> {
-    let mut env = state.env_snapshot.as_ref().clone();
+    let mut env = state
+        .env_snapshot
+        .iter()
+        .filter(|(name, _)| name != BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV)
+        .cloned()
+        .collect::<Vec<_>>();
     if state.network_requests_enabled && !env.iter().any(|(name, _)| name == "PHRUST_NET_TESTS") {
         env.push(("PHRUST_NET_TESTS".to_string(), "1".to_string()));
     }

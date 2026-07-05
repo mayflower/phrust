@@ -440,7 +440,7 @@ impl MysqlState {
         self.execute(id, &format!("USE `{escaped}`"))
     }
 
-    /// Sets the connection character set for the WordPress mysqli MVP.
+    /// Sets the connection character set for the mysqli client layer.
     pub fn set_charset(&mut self, id: i64, charset: &str) -> Result<(), MysqlError> {
         let normalized = match charset.to_ascii_lowercase().as_str() {
             "utf8" => "utf8",

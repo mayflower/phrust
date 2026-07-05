@@ -1,4 +1,4 @@
-//! Fileinfo MVP for common WordPress media MIME checks.
+//! Fileinfo MVP for common media MIME checks.
 
 use super::core::{arity_error, int_arg, read_file_value, resource_arg, string_arg};
 use crate::builtins::{

@@ -6070,7 +6070,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_accepts_wordpress_phpmailer_argument_shapes() {
+    fn mail_accepts_common_sender_argument_shapes() {
         let mut output = OutputBuffer::new();
         assert_eq!(
             call(
@@ -6080,7 +6080,7 @@ mod tests {
                     Value::string("Subject"),
                     Value::string("Body"),
                     Value::string("Header: value"),
-                    Value::string("-fwordpress@example.test"),
+                    Value::string("-fsender@example.test"),
                 ],
                 &mut output
             ),

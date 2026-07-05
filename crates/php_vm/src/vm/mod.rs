@@ -86,10 +86,10 @@ use php_runtime::{
     GeneratorCallContext, GeneratorRef, GeneratorState, GlobalSymbolTable, JsonDiagnosticContext,
     Lvalue, LvalueKind, NumericValue, ObjectRef, OutputBuffer, PhpArray, PhpArrayKind,
     PhpArrayShapeKind, PhpArrayShapeLookup, PhpArrayShapeLookupFallback, PhpString,
-    ProcessCapability, ReferenceCell, RuntimeContext, RuntimeDiagnostic, RuntimeDiagnosticPayload,
-    RuntimeHttpResponseState, RuntimeSeverity, RuntimeSourceSpan, RuntimeStackFrame, RuntimeType,
-    Slot, UnserializeOptions, UploadRegistry, Value, VmCompileDiagnostic,
-    WordPressDiagnosticContext, array_to_string_warning, compare, division_by_zero_mvp,
+    ProcessCapability, ReferenceCell, RuntimeBringupDiagnosticContext, RuntimeContext,
+    RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeHttpResponseState, RuntimeSeverity,
+    RuntimeSourceSpan, RuntimeStackFrame, RuntimeType, Slot, UnserializeOptions, UploadRegistry,
+    Value, VmCompileDiagnostic, array_to_string_warning, compare, division_by_zero_mvp,
     emit_php_diagnostic, equal, error_reporting_allows_level, identical,
     reset_float_string_precision, runtime_type_name, serialize as serialize_value,
     set_float_string_precision, to_arithmetic_number, to_bool, to_float, to_int, to_number,
@@ -36426,7 +36426,7 @@ impl Vm {
             stack,
             source_span,
         );
-        if let Some(payload) = wordpress_bringup_payload(
+        if let Some(payload) = runtime_bringup_payload(
             &diagnostic_message,
             diagnostic.id(),
             compiled,
@@ -36758,7 +36758,7 @@ struct BringupDiagnosticInput {
     argument_types: Option<String>,
 }
 
-fn wordpress_bringup_payload(
+fn runtime_bringup_payload(
     message: &str,
     id: &str,
     compiled: &CompiledUnit,
@@ -36768,10 +36768,10 @@ fn wordpress_bringup_payload(
 ) -> Option<RuntimeDiagnosticPayload> {
     let error_class = input
         .error_class
-        .or_else(|| infer_wordpress_error_class(id, message))?;
+        .or_else(|| infer_bringup_error_class(id, message))?;
     let lookup_kind = input
         .lookup_kind
-        .or_else(|| infer_wordpress_lookup_kind(id, message));
+        .or_else(|| infer_bringup_lookup_kind(id, message));
     let requested_name = input
         .requested_name
         .or_else(|| lookup_kind.and_then(|kind| requested_name_from_message(message, kind)));
@@ -36793,7 +36793,7 @@ fn wordpress_bringup_payload(
             .map(str::to_owned)
     });
 
-    let mut context = WordPressDiagnosticContext::new(error_class)
+    let mut context = RuntimeBringupDiagnosticContext::new(error_class)
         .with_optional_field("requested_name", requested_name.clone())
         .with_optional_field("normalized_name", normalized_name)
         .with_optional_field("lookup_kind", lookup_kind.map(str::to_owned))
@@ -36828,10 +36828,10 @@ fn wordpress_bringup_payload(
     if let Some(types) = input.argument_types {
         context = context.with_field("argument_types", types);
     }
-    Some(RuntimeDiagnosticPayload::WordPressBringup(context))
+    Some(RuntimeDiagnosticPayload::Bringup(context))
 }
 
-fn infer_wordpress_error_class(id: &str, message: &str) -> Option<&'static str> {
+fn infer_bringup_error_class(id: &str, message: &str) -> Option<&'static str> {
     let lower_message = message.to_ascii_lowercase();
     if id.contains("CALLABLE") || lower_message.contains("callback") {
         return Some("callable_resolution");
@@ -36853,7 +36853,7 @@ fn infer_wordpress_error_class(id: &str, message: &str) -> Option<&'static str> 
     None
 }
 
-fn infer_wordpress_lookup_kind(id: &str, message: &str) -> Option<&'static str> {
+fn infer_bringup_lookup_kind(id: &str, message: &str) -> Option<&'static str> {
     let lower_message = message.to_ascii_lowercase();
     if id.contains("EXTENSION") || lower_message.contains("extension ") {
         Some("extension")
@@ -36955,12 +36955,12 @@ fn infer_builtin_owner_for_name(name: &str) -> Option<&'static str> {
         })
 }
 
-fn wordpress_bringup_payload_without_state(
+fn runtime_bringup_payload_without_state(
     message: &str,
     id: &str,
 ) -> Option<RuntimeDiagnosticPayload> {
-    let error_class = infer_wordpress_error_class(id, message)?;
-    let lookup_kind = infer_wordpress_lookup_kind(id, message);
+    let error_class = infer_bringup_error_class(id, message)?;
+    let lookup_kind = infer_bringup_lookup_kind(id, message);
     let requested_name = lookup_kind.and_then(|kind| requested_name_from_message(message, kind));
     let normalized_name = requested_name
         .as_deref()
@@ -36974,12 +36974,12 @@ fn wordpress_bringup_payload_without_state(
         })
         .flatten()
         .map(str::to_owned);
-    let context = WordPressDiagnosticContext::new(error_class)
+    let context = RuntimeBringupDiagnosticContext::new(error_class)
         .with_optional_field("requested_name", requested_name)
         .with_optional_field("normalized_name", normalized_name)
         .with_optional_field("lookup_kind", lookup_kind.map(str::to_owned))
         .with_optional_field("builtin_owner", builtin_owner);
-    Some(RuntimeDiagnosticPayload::WordPressBringup(context))
+    Some(RuntimeDiagnosticPayload::Bringup(context))
 }
 
 fn runtime_diagnostic_for_message(
@@ -37002,7 +37002,7 @@ fn runtime_diagnostic_for_message(
         stack_trace(compiled, stack),
         php_runtime::PhpReferenceClassification::from_diagnostic_id(id),
     );
-    match wordpress_bringup_payload_without_state(message, id) {
+    match runtime_bringup_payload_without_state(message, id) {
         Some(payload) => diagnostic.with_diagnostic_payload(payload),
         None => diagnostic,
     }
@@ -37029,7 +37029,7 @@ fn runtime_diagnostic_for_message_with_source_span(
         stack_trace(compiled, stack),
         None,
     );
-    match wordpress_bringup_payload_without_state(message, id) {
+    match runtime_bringup_payload_without_state(message, id) {
         Some(payload) => diagnostic.with_diagnostic_payload(payload),
         None => diagnostic,
     }
@@ -37621,7 +37621,7 @@ fn uncaught_exception(
         diagnostic_stack,
         None,
     );
-    if let Some(payload) = wordpress_bringup_payload_without_state(&full, diagnostic.id()) {
+    if let Some(payload) = runtime_bringup_payload_without_state(&full, diagnostic.id()) {
         diagnostic = diagnostic.with_diagnostic_payload(payload);
     }
     VmResult::runtime_error_with_diagnostic(output.clone(), full.clone(), diagnostic)
@@ -57322,7 +57322,7 @@ fn set_filter_input_arrays(context: &mut BuiltinContext<'_>, runtime_context: &R
 
 fn unknown_builtin_result(name: &str, output: &OutputBuffer) -> VmResult {
     let message = format!("E_PHP_VM_UNKNOWN_BUILTIN: builtin {name} is not implemented");
-    let payload = WordPressDiagnosticContext::new("stdlib_builtin")
+    let payload = RuntimeBringupDiagnosticContext::new("stdlib_builtin")
         .with_field("requested_name", name)
         .with_field("normalized_name", normalize_function_name(name))
         .with_field("lookup_kind", "function")
@@ -57341,7 +57341,7 @@ fn unknown_builtin_result(name: &str, output: &OutputBuffer) -> VmResult {
             Vec::new(),
             None,
         )
-        .with_diagnostic_payload(RuntimeDiagnosticPayload::WordPressBringup(payload)),
+        .with_diagnostic_payload(RuntimeDiagnosticPayload::Bringup(payload)),
     )
 }
 
@@ -67499,9 +67499,9 @@ good"
 
         assert_eq!(unknown.status.exit_status(), ExitStatus::RuntimeError);
         assert_eq!(unknown.diagnostics[0].id(), "E_PHP_VM_UNKNOWN_CLASS");
-        let context = first_wordpress_bringup_payload(&unknown).fields();
+        let context = first_runtime_bringup_payload(&unknown).fields();
         assert_eq!(
-            context.get("wordpress_error_class").map(String::as_str),
+            context.get("bringup_error_class").map(String::as_str),
             Some("autoload_lookup")
         );
         assert_eq!(
@@ -67534,10 +67534,10 @@ good"
     fn bringup_diagnostics_classify_callable_and_builtin_failures() {
         let callable = execute_source("<?php array_map('missing_callback', [1]);");
         assert_eq!(callable.status.exit_status(), ExitStatus::RuntimeError);
-        let callable_context = first_wordpress_bringup_payload(&callable).fields();
+        let callable_context = first_runtime_bringup_payload(&callable).fields();
         assert_eq!(
             callable_context
-                .get("wordpress_error_class")
+                .get("bringup_error_class")
                 .map(String::as_str),
             Some("callable_resolution")
         );
@@ -67550,22 +67550,22 @@ good"
             Some("function")
         );
 
-        let builtin = execute_source("<?php missing_wp_function();");
+        let builtin = execute_source("<?php missing_app_function();");
         assert_eq!(builtin.status.exit_status(), ExitStatus::RuntimeError);
-        let builtin_context = first_wordpress_bringup_payload(&builtin).fields();
+        let builtin_context = first_runtime_bringup_payload(&builtin).fields();
         assert_eq!(
             builtin_context
-                .get("wordpress_error_class")
+                .get("bringup_error_class")
                 .map(String::as_str),
             Some("stdlib_builtin")
         );
         assert_eq!(
             builtin_context.get("requested_name").map(String::as_str),
-            Some("missing_wp_function")
+            Some("missing_app_function")
         );
         assert_eq!(
             builtin_context.get("normalized_name").map(String::as_str),
-            Some("missing_wp_function")
+            Some("missing_app_function")
         );
         assert_eq!(
             builtin_context.get("lookup_kind").map(String::as_str),
@@ -79651,25 +79651,25 @@ dense_property_write_typed_failure($typed, 'bad');
             .find_map(|diagnostic| match diagnostic.payload()? {
                 RuntimeDiagnosticPayload::VmCompile(payload) => Some(payload),
                 RuntimeDiagnosticPayload::JsonBuiltin(_) => None,
-                RuntimeDiagnosticPayload::WordPressBringup(_) => None,
+                RuntimeDiagnosticPayload::Bringup(_) => None,
             })
             .expect("compile error should carry VM compile payload")
     }
 
-    fn first_wordpress_bringup_payload(
+    fn first_runtime_bringup_payload(
         result: &VmResult,
-    ) -> &php_runtime::WordPressDiagnosticContext {
+    ) -> &php_runtime::RuntimeBringupDiagnosticContext {
         result
             .diagnostics
             .iter()
             .find_map(|diagnostic| match diagnostic.payload()? {
-                RuntimeDiagnosticPayload::WordPressBringup(payload) => Some(payload),
+                RuntimeDiagnosticPayload::Bringup(payload) => Some(payload),
                 RuntimeDiagnosticPayload::JsonBuiltin(_) => None,
                 RuntimeDiagnosticPayload::VmCompile(_) => None,
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "diagnostic should carry WordPress bring-up payload: {:#?}",
+                    "diagnostic should carry runtime bring-up payload: {:#?}",
                     result.diagnostics
                 )
             })

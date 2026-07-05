@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn date_create_immutable_from_format_returns_datetimeimmutable_for_wp_datetime() {
+    fn date_create_immutable_from_format_returns_datetimeimmutable_for_common_datetime() {
         let timezone = datetime::datetimezone_object("UTC").expect("timezone object");
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);

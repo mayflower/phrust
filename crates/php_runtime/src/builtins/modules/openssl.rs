@@ -238,7 +238,7 @@ mod tests {
     use crate::OutputBuffer;
 
     #[test]
-    fn openssl_digest_covers_wordpress_hash_methods() {
+    fn openssl_digest_covers_common_hash_methods() {
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
 

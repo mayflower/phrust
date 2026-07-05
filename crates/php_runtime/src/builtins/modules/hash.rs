@@ -1,4 +1,4 @@
-//! Hash extension builtins used by WordPress integrity and nonce flows.
+//! Hash extension builtins for common integrity and keyed-digest flows.
 
 use super::core::{expect_arity, string_arg};
 use super::strings::{builtin_hash, builtin_hash_hmac};
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_algos_exposes_wp_integrity_algorithms() {
+    fn hash_algos_exposes_common_integrity_algorithms() {
         let Value::Array(algos) = call("hash_algos", vec![]) else {
             panic!("expected array");
         };

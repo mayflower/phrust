@@ -197,6 +197,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             index: config.index,
             front_controller: config.front_controller,
             builtin_router: config.builtin_router,
+            request_rewrites: config.request_rewrites,
             metrics_endpoint_enabled: config.metrics_endpoint_enabled,
             cache_clear_endpoint_enabled: config.cache_clear_endpoint_enabled,
         },
@@ -256,6 +257,7 @@ mod tests {
             execute_compiled_php_with_state, http_runtime_context, php_runtime_context_for_http,
             server_env_for_request,
         },
+        routing::RequestRewriteRule,
         serve::clear_cache_response,
         static_files::{
             ByteRange, RangeParseError, accepts_encoding, parse_single_byte_range, weak_etag,
@@ -640,9 +642,9 @@ mod tests {
             vec![
                 (
                     "PHRUST_MYSQL_TEST_DSN".to_string(),
-                    "mysql://wordpress:secret@mariadb:3306/wordpress".to_string(),
+                    "mysql://app:secret@mariadb:3306/app".to_string(),
                 ),
-                ("WORDPRESS_DB_HOST".to_string(), "mariadb:3306".to_string()),
+                ("APP_DB_HOST".to_string(), "mariadb:3306".to_string()),
             ],
         );
 
@@ -652,7 +654,7 @@ mod tests {
                 .iter()
                 .find(|(key, _)| key == "PHRUST_MYSQL_TEST_DSN")
                 .map(|(_, value)| value.as_str()),
-            Some("mysql://wordpress:secret@mariadb:3306/wordpress")
+            Some("mysql://app:secret@mariadb:3306/app")
         );
         assert_eq!(context.stdin.as_ref(), b"request-body");
     }
@@ -670,6 +672,24 @@ mod tests {
                 .find(|(key, _)| key == "PHRUST_NET_TESTS")
                 .map(|(_, value)| value.as_str()),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn server_env_for_request_hides_rewrite_configuration() {
+        let fixture = ServerCacheFixture::new();
+        let mut state = test_state(&fixture, Arc::new(CompiledScriptCache::new(1)), false);
+        state.env_snapshot = Arc::new(vec![(
+            crate::config::BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV.to_string(),
+            "/api=route".to_string(),
+        )]);
+
+        let env = server_env_for_request(&state);
+
+        assert!(
+            env.iter()
+                .all(|(key, _)| key != crate::config::BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV),
+            "{env:?}"
         );
     }
 
@@ -728,14 +748,21 @@ mod tests {
     }
 
     #[test]
-    fn http_runtime_context_rewrites_wordpress_rest_path_info_query_var() {
+    fn http_runtime_context_applies_configured_prefix_query_rewrite() {
         let fixture = ServerCacheFixture::new();
         let mut state = test_state(&fixture, Arc::new(CompiledScriptCache::new(1)), false);
         state.local_addr = "127.0.0.1:18080".parse().expect("local addr");
+        state
+            .route_config
+            .request_rewrites
+            .push(RequestRewriteRule {
+                path_prefix: "/api".to_string(),
+                query_parameter: "route".to_string(),
+            });
         let script_path = fixture.write_named("index.php", "<?php echo 'ok';");
         let (parts, _) = Request::builder()
             .method("GET")
-            .uri("/wp-json/wp/v2/types?context=edit")
+            .uri("/api/v1/types?context=edit")
             .header(header::HOST, "127.0.0.1:18080")
             .body(())
             .expect("request")
@@ -746,24 +773,21 @@ mod tests {
             &state,
             &script_path,
             "/index.php",
-            Some("/wp-json/wp/v2/types".to_string()),
+            Some("/api/v1/types".to_string()),
             Arc::from(&b""[..]),
             "127.0.0.1:50123".parse().expect("peer addr"),
         );
 
-        assert_eq!(context.request_uri, "/wp-json/wp/v2/types?context=edit");
-        assert_eq!(
-            context.query_string,
-            "rest_route=%2Fwp%2Fv2%2Ftypes&context=edit"
-        );
+        assert_eq!(context.request_uri, "/?route=%2Fv1%2Ftypes&context=edit");
+        assert_eq!(context.query_string, "route=%2Fv1%2Ftypes&context=edit");
         assert_eq!(
             context.parsed_get,
             vec![
-                ("rest_route".to_string(), "/wp/v2/types".to_string()),
+                ("route".to_string(), "/v1/types".to_string()),
                 ("context".to_string(), "edit".to_string()),
             ]
         );
-        assert_eq!(context.path_info.as_deref(), Some("/wp-json/wp/v2/types"));
+        assert_eq!(context.path_info.as_deref(), Some("/api/v1/types"));
     }
 
     #[test]
@@ -791,6 +815,7 @@ mod tests {
                 index: "index.php".to_string(),
                 front_controller: None,
                 builtin_router: None,
+                request_rewrites: Vec::new(),
                 metrics_endpoint_enabled: true,
                 cache_clear_endpoint_enabled,
             },

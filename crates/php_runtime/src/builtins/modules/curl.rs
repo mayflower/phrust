@@ -7,8 +7,8 @@ use crate::builtins::{
 };
 use crate::{
     ArrayKey, ClassEntry, ClassFlags, FloatValue, ObjectRef, PhpArray, PhpString,
-    RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity, Value,
-    WordPressDiagnosticContext, normalize_class_name,
+    RuntimeBringupDiagnosticContext, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity,
+    Value, normalize_class_name,
 };
 use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslStream};
 use std::io::{ErrorKind, Read, Write};
@@ -1535,7 +1535,7 @@ fn record_curl_diagnostic(
         .chars()
         .take(512)
         .collect::<String>();
-    let payload = WordPressDiagnosticContext::new("db_network")
+    let payload = RuntimeBringupDiagnosticContext::new("db_network")
         .with_field("diagnostic_id", diagnostic.diagnostic_id)
         .with_field("function_name", diagnostic.function_name)
         .with_field("operation", diagnostic.operation)
@@ -1560,7 +1560,7 @@ fn record_curl_diagnostic(
             Vec::new(),
             Some(crate::PhpReferenceClassification::Warning),
         )
-        .with_diagnostic_payload(RuntimeDiagnosticPayload::WordPressBringup(payload)),
+        .with_diagnostic_payload(RuntimeDiagnosticPayload::Bringup(payload)),
     );
 }
 
@@ -1753,8 +1753,7 @@ mod tests {
         let diagnostics = context.take_diagnostics();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].id(), "E_PHP_CURL_CAPABILITY_DISABLED");
-        let Some(RuntimeDiagnosticPayload::WordPressBringup(payload)) = diagnostics[0].payload()
-        else {
+        let Some(RuntimeDiagnosticPayload::Bringup(payload)) = diagnostics[0].payload() else {
             panic!("expected db/network diagnostic payload");
         };
         assert_eq!(
@@ -1861,7 +1860,7 @@ mod tests {
             let mut request = [0_u8; 1024];
             let read = stream.read(&mut request).expect("read request");
             let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("GET /wp-json"));
+            assert!(request.starts_with("GET /api/status"));
             assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
@@ -1872,7 +1871,7 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let handle = builtin_curl_init(
             &mut context,
-            vec![Value::string(format!("http://127.0.0.1:{port}/wp-json"))],
+            vec![Value::string(format!("http://127.0.0.1:{port}/api/status"))],
             RuntimeSourceSpan::default(),
         )
         .expect("init");
@@ -2039,16 +2038,14 @@ mod tests {
         let handle = curl_handle_object();
         handle.set_property(
             "__curl_url",
-            Value::String(PhpString::from(
-                "https://api.wordpress.org/core/version-check/1.7/",
-            )),
+            Value::String(PhpString::from("https://updates.example.test/v1/check")),
         );
 
         assert!(build_request(&handle, false).is_err());
         let request = build_request(&handle, true).expect("external request allowed");
-        assert_eq!(request.host, "api.wordpress.org");
+        assert_eq!(request.host, "updates.example.test");
         assert_eq!(request.port, 443);
-        assert_eq!(request.path, "/core/version-check/1.7/");
+        assert_eq!(request.path, "/v1/check");
     }
 
     #[test]

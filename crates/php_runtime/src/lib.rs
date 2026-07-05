@@ -89,13 +89,13 @@ pub mod api {
         MysqlConnection, MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
     };
     pub use crate::diagnostic::{
-        JsonDiagnosticContext, PhpReferenceClassification, RuntimeDiagnostic,
-        RuntimeDiagnosticPayload, RuntimeError, RuntimeEventKind, RuntimeSeverity,
-        RuntimeStackFrame, VmCompileDiagnostic, WordPressDiagnosticContext,
-        argument_count_error_mvp, array_to_string_warning, division_by_zero_mvp,
-        leading_numeric_string_warning, non_numeric_string_type_error, type_error_mvp,
-        undefined_function, undefined_variable_warning, unhandled_match_error_mvp,
-        unsupported_feature, value_error_mvp,
+        JsonDiagnosticContext, PhpReferenceClassification, RuntimeBringupDiagnosticContext,
+        RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError, RuntimeEventKind,
+        RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic, argument_count_error_mvp,
+        array_to_string_warning, division_by_zero_mvp, leading_numeric_string_warning,
+        non_numeric_string_type_error, type_error_mvp, undefined_function,
+        undefined_variable_warning, unhandled_match_error_mvp, unsupported_feature,
+        value_error_mvp,
     };
     pub use crate::error_output::{
         PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,
@@ -228,9 +228,9 @@ pub use db::mysql::{
     MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
 };
 pub use diagnostic::{
-    JsonDiagnosticContext, PhpReferenceClassification, RuntimeDiagnostic, RuntimeDiagnosticPayload,
-    RuntimeError, RuntimeEventKind, RuntimeSeverity, RuntimeStackFrame, VmCompileDiagnostic,
-    WordPressDiagnosticContext, argument_count_error_mvp, array_to_string_warning,
+    JsonDiagnosticContext, PhpReferenceClassification, RuntimeBringupDiagnosticContext,
+    RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeError, RuntimeEventKind, RuntimeSeverity,
+    RuntimeStackFrame, VmCompileDiagnostic, argument_count_error_mvp, array_to_string_warning,
     division_by_zero_mvp, leading_numeric_string_warning, non_numeric_string_type_error,
     type_error_mvp, undefined_function, undefined_variable_warning, unhandled_match_error_mvp,
     unsupported_feature, value_error_mvp,

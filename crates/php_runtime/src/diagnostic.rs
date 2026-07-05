@@ -646,8 +646,8 @@ pub enum RuntimeDiagnosticPayload {
     VmCompile(VmCompileDiagnostic),
     /// JSON builtin diagnostic payload.
     JsonBuiltin(JsonDiagnosticContext),
-    /// WordPress bring-up diagnostic classification payload.
-    WordPressBringup(WordPressDiagnosticContext),
+    /// Runtime bring-up diagnostic classification payload.
+    Bringup(RuntimeBringupDiagnosticContext),
 }
 
 impl RuntimeDiagnosticPayload {
@@ -657,7 +657,7 @@ impl RuntimeDiagnosticPayload {
         match self {
             Self::VmCompile(payload) => payload.envelope_context(),
             Self::JsonBuiltin(payload) => payload.envelope_context(),
-            Self::WordPressBringup(payload) => payload.envelope_context(),
+            Self::Bringup(payload) => payload.envelope_context(),
         }
     }
 }
@@ -691,18 +691,18 @@ impl JsonDiagnosticContext {
     }
 }
 
-/// Additive diagnostic metadata for WordPress bring-up closure reports.
+/// Additive diagnostic metadata for runtime bring-up reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WordPressDiagnosticContext {
+pub struct RuntimeBringupDiagnosticContext {
     fields: BTreeMap<String, String>,
 }
 
-impl WordPressDiagnosticContext {
+impl RuntimeBringupDiagnosticContext {
     /// Creates a context with the required stable error class.
     #[must_use]
     pub fn new(error_class: impl Into<String>) -> Self {
         let mut fields = BTreeMap::new();
-        fields.insert("wordpress_error_class".to_string(), error_class.into());
+        fields.insert("bringup_error_class".to_string(), error_class.into());
         Self { fields }
     }
 
@@ -736,7 +736,7 @@ impl WordPressDiagnosticContext {
     #[must_use]
     pub fn envelope_context(&self) -> BTreeMap<String, String> {
         let mut context = BTreeMap::new();
-        context.insert("payload".to_string(), "wordpress_bringup".to_string());
+        context.insert("payload".to_string(), "runtime_bringup".to_string());
         context.extend(self.fields.clone());
         context
     }
@@ -1180,8 +1180,8 @@ pub fn undefined_function(
     stack_trace: Vec<RuntimeStackFrame>,
 ) -> RuntimeDiagnostic {
     let name = name.as_ref();
-    let payload = RuntimeDiagnosticPayload::WordPressBringup(
-        WordPressDiagnosticContext::new("stdlib_builtin")
+    let payload = RuntimeDiagnosticPayload::Bringup(
+        RuntimeBringupDiagnosticContext::new("stdlib_builtin")
             .with_field("requested_name", name)
             .with_field("normalized_name", name.to_ascii_lowercase())
             .with_field("lookup_kind", "function"),
@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(diagnostic.severity(), RuntimeSeverity::FatalError);
         assert_eq!(
             diagnostic.to_json(),
-            "{\"id\":\"E_PHP_RUNTIME_UNDEFINED_FUNCTION\",\"severity\":\"fatal_error\",\"message\":\"undefined function missing\",\"span\":{\"file\":\"fixture.php\",\"start\":1,\"end\":8},\"stack\":[{\"function\":\"main\"}],\"php_reference\":\"error\",\"context\":{\"lookup_kind\":\"function\",\"normalized_name\":\"missing\",\"payload\":\"wordpress_bringup\",\"requested_name\":\"missing\",\"wordpress_error_class\":\"stdlib_builtin\"}}"
+            "{\"id\":\"E_PHP_RUNTIME_UNDEFINED_FUNCTION\",\"severity\":\"fatal_error\",\"message\":\"undefined function missing\",\"span\":{\"file\":\"fixture.php\",\"start\":1,\"end\":8},\"stack\":[{\"function\":\"main\"}],\"php_reference\":\"error\",\"context\":{\"bringup_error_class\":\"stdlib_builtin\",\"lookup_kind\":\"function\",\"normalized_name\":\"missing\",\"payload\":\"runtime_bringup\",\"requested_name\":\"missing\"}}"
         );
     }
 
@@ -1286,7 +1286,7 @@ mod tests {
         assert_eq!(json["severity"], "fatal_error");
         assert_eq!(json["location"]["path"], "fixture.php");
         assert_eq!(json["context"]["php_reference"], "error");
-        assert_eq!(json["context"]["wordpress_error_class"], "stdlib_builtin");
+        assert_eq!(json["context"]["bringup_error_class"], "stdlib_builtin");
         assert_eq!(json["context"]["requested_name"], "missing");
         assert_eq!(json["context"]["normalized_name"], "missing");
         assert_eq!(json["context"]["lookup_kind"], "function");

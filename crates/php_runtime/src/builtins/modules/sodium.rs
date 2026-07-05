@@ -1,4 +1,4 @@
-//! Real-crypto sodium MVP for WordPress dependency probes.
+//! Real-crypto sodium MVP for common dependency probes.
 
 use super::core::{arity_error, int_arg, string_arg};
 use crate::Value;

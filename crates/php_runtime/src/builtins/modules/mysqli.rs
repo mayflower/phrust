@@ -9,8 +9,8 @@ use crate::{
     ArrayKey, MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_REPORT_ERROR,
     MYSQLI_REPORT_STRICT, MYSQLI_SQLITE_COMPAT_ENV, MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION,
     MysqlConnectOptions, MysqlError, ObjectRef, PhpArray, PhpString, ReferenceCell,
-    RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity, Value,
-    WordPressDiagnosticContext,
+    RuntimeBringupDiagnosticContext, RuntimeDiagnostic, RuntimeDiagnosticPayload, RuntimeSeverity,
+    Value,
 };
 use std::env;
 
@@ -1501,7 +1501,7 @@ fn record_mysqli_diagnostic(
         RuntimeSeverity::Warning
     };
     let mysql_error_message = sanitize_mysql_error(&mysql_error_message);
-    let payload = WordPressDiagnosticContext::new("db_network")
+    let payload = RuntimeBringupDiagnosticContext::new("db_network")
         .with_field("diagnostic_id", diagnostic_id)
         .with_field("function_name", function_name)
         .with_field("operation", operation)
@@ -1529,7 +1529,7 @@ fn record_mysqli_diagnostic(
             Vec::new(),
             Some(crate::PhpReferenceClassification::Warning),
         )
-        .with_diagnostic_payload(RuntimeDiagnosticPayload::WordPressBringup(payload)),
+        .with_diagnostic_payload(RuntimeDiagnosticPayload::Bringup(payload)),
     );
 }
 
@@ -1890,9 +1890,9 @@ mod tests {
             vec![
                 Value::Object(mysqli_object(None)),
                 Value::string("127.0.0.1"),
-                Value::string("wordpress"),
+                Value::string("app"),
                 Value::string("secret"),
-                Value::string("wordpress"),
+                Value::string("app"),
                 Value::Int(3306),
                 Value::Null,
                 Value::Int(0),
@@ -1915,8 +1915,7 @@ mod tests {
         let diagnostics = context.take_diagnostics();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].id(), "E_PHP_MYSQLI_CAPABILITY_DISABLED");
-        let Some(RuntimeDiagnosticPayload::WordPressBringup(payload)) = diagnostics[0].payload()
-        else {
+        let Some(RuntimeDiagnosticPayload::Bringup(payload)) = diagnostics[0].payload() else {
             panic!("expected db/network diagnostic payload");
         };
         assert_eq!(
@@ -1960,8 +1959,7 @@ mod tests {
         let diagnostics = context.take_diagnostics();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity(), RuntimeSeverity::RecoverableError);
-        let Some(RuntimeDiagnosticPayload::WordPressBringup(payload)) = diagnostics[0].payload()
-        else {
+        let Some(RuntimeDiagnosticPayload::Bringup(payload)) = diagnostics[0].payload() else {
             panic!("expected db/network diagnostic payload");
         };
         assert_eq!(

@@ -11,6 +11,8 @@ use php_diagnostics::{
 };
 use php_executor::EngineProfileName;
 
+use crate::routing::RequestRewriteRule;
+
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_INDEX: &str = "index.php";
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
@@ -24,6 +26,8 @@ const DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS: u64 = 0;
 const DEFAULT_SESSION_COOKIE_NAME: &str = "PHPSESSID";
 const DEFAULT_SESSION_COOKIE_PATH: &str = "/";
 const DEFAULT_MAX_IN_FLIGHT: usize = 200;
+pub(crate) const BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV: &str =
+    "PHRUST_SERVER_REWRITE_PREFIX_QUERY";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerConfig {
@@ -35,6 +39,7 @@ pub struct ServerConfig {
     pub index: String,
     pub front_controller: Option<PathBuf>,
     pub builtin_router: Option<PathBuf>,
+    pub request_rewrites: Vec<RequestRewriteRule>,
     pub max_body_bytes: usize,
     pub upload_temp_dir: PathBuf,
     pub max_upload_files: usize,
@@ -144,6 +149,7 @@ impl ServerConfig {
             .string("index")
             .unwrap_or_else(|| DEFAULT_INDEX.to_string());
         let mut front_controller = file_config.path("front_controller");
+        let mut request_rewrites = file_config.request_rewrites("rewrite_prefix_query")?;
         let mut max_body_bytes = file_config
             .positive_usize("max_body_bytes")?
             .unwrap_or(DEFAULT_MAX_BODY_BYTES);
@@ -240,6 +246,12 @@ impl ServerConfig {
                     let path = PathBuf::from(value);
                     validate_relative_path("--front-controller", &path)?;
                     front_controller = Some(path);
+                }
+                "--rewrite-prefix-query" => {
+                    request_rewrites.push(parse_request_rewrite_rule(
+                        &arg,
+                        &required_value(&arg, &mut args)?,
+                    )?);
                 }
                 "--max-body-bytes" => {
                     max_body_bytes = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
@@ -352,6 +364,7 @@ impl ServerConfig {
                 index,
                 front_controller,
                 builtin_router: None,
+                request_rewrites,
                 max_body_bytes,
                 upload_temp_dir,
                 max_upload_files,
@@ -397,6 +410,7 @@ impl ServerConfig {
             index,
             front_controller,
             builtin_router: None,
+            request_rewrites,
             max_body_bytes,
             upload_temp_dir,
             max_upload_files,
@@ -435,7 +449,25 @@ impl ServerConfig {
         docroot: PathBuf,
         router: Option<PathBuf>,
     ) -> Result<Self, ConfigError> {
+        Self::builtin_cli_server_with_env(listen, docroot, router, |name| env::var(name).ok())
+    }
+
+    fn builtin_cli_server_with_env<F>(
+        listen: &str,
+        docroot: PathBuf,
+        router: Option<PathBuf>,
+        env_get: F,
+    ) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let listen = parse_listen(listen)?;
+        let request_rewrites = env_get(BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV)
+            .map(|value| {
+                parse_request_rewrite_rules(BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV, &value)
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             listen,
             docroot,
@@ -445,6 +477,7 @@ impl ServerConfig {
             index: DEFAULT_INDEX.to_string(),
             front_controller: None,
             builtin_router: router,
+            request_rewrites,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             upload_temp_dir: std::env::temp_dir().join("phrust-uploads"),
             max_upload_files: DEFAULT_MAX_UPLOAD_FILES,
@@ -487,6 +520,7 @@ Options:\n\
   --docroot <path>             document root (required unless --help)\n\
   --index <name>               directory index file name (default: index.php)\n\
   --front-controller <path>    optional front controller, relative to docroot\n\
+  --rewrite-prefix-query <p=q> rewrite matching request paths to /?q=<suffix>\n\
   --max-body-bytes <n>         maximum request body bytes (default: 1048576)\n\
   --upload-temp-dir <path>     upload temp directory (default: OS temp/phrust-uploads)\n\
   --max-upload-files <n>       maximum uploaded files per request (default: 32)\n\
@@ -652,6 +686,13 @@ impl FileConfig {
             })
             .transpose()
     }
+
+    fn request_rewrites(&self, key: &str) -> Result<Vec<RequestRewriteRule>, ConfigError> {
+        let Some(value) = self.values.get(key) else {
+            return Ok(Vec::new());
+        };
+        parse_request_rewrite_rules(key, value)
+    }
 }
 
 fn normalize_config_key(key: &str) -> String {
@@ -763,6 +804,62 @@ fn parse_nonnegative_u64(flag: &str, value: &str) -> Result<u64, ConfigError> {
         .map_err(|error| ConfigError::new(format!("invalid {flag} `{value}`: {error}")))
 }
 
+fn parse_request_rewrite_rules(
+    flag: &str,
+    value: &str,
+) -> Result<Vec<RequestRewriteRule>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| parse_request_rewrite_rule(flag, rule))
+        .collect()
+}
+
+fn parse_request_rewrite_rule(flag: &str, value: &str) -> Result<RequestRewriteRule, ConfigError> {
+    let Some((path_prefix, query_parameter)) = value.split_once('=') else {
+        return Err(ConfigError::new(format!(
+            "{flag} must use /path-prefix=query_parameter"
+        )));
+    };
+    let path_prefix = path_prefix.trim();
+    let query_parameter = query_parameter.trim();
+    validate_rewrite_path_prefix(flag, path_prefix)?;
+    validate_query_parameter_name(flag, query_parameter)?;
+    Ok(RequestRewriteRule {
+        path_prefix: path_prefix.to_string(),
+        query_parameter: query_parameter.to_string(),
+    })
+}
+
+fn validate_rewrite_path_prefix(flag: &str, path_prefix: &str) -> Result<(), ConfigError> {
+    if path_prefix.is_empty()
+        || !path_prefix.starts_with('/')
+        || path_prefix.contains('?')
+        || path_prefix.contains('#')
+        || path_prefix.contains('\0')
+        || (path_prefix != "/" && path_prefix.ends_with('/'))
+    {
+        return Err(ConfigError::new(format!(
+            "{flag} path prefix must start with /, must not end with /, and must not contain ?, #, or NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_query_parameter_name(flag: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(ConfigError::new(format!(
+            "{flag} query parameter must contain only ASCII letters, digits, and _"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_index(index: &str) -> Result<(), ConfigError> {
     if index.is_empty() || index.contains('/') || index.contains('\\') || index.contains('\0') {
         return Err(ConfigError::new(
@@ -817,7 +914,7 @@ fn default_max_in_flight() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerConfig;
+    use super::{BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV, ServerConfig};
     use php_diagnostics::DiagnosticOutputFormat;
     use php_executor::EngineProfileName;
     use std::{
@@ -878,6 +975,7 @@ mod tests {
         assert!(!config.strict_preload);
         assert!(!config.cache_clear_endpoint_enabled);
         assert!(config.front_controller.is_none());
+        assert!(config.request_rewrites.is_empty());
         assert!(!config.help);
         assert_eq!(config.max_in_flight, 200);
     }
@@ -893,6 +991,8 @@ mod tests {
             "home.php",
             "--front-controller",
             "index.php",
+            "--rewrite-prefix-query",
+            "/api=route",
             "--max-body-bytes",
             "64",
             "--upload-temp-dir",
@@ -954,6 +1054,9 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:0".parse::<SocketAddr>().unwrap());
         assert_eq!(config.index, "home.php");
         assert_eq!(config.front_controller, Some(PathBuf::from("index.php")));
+        assert_eq!(config.request_rewrites.len(), 1);
+        assert_eq!(config.request_rewrites[0].path_prefix, "/api");
+        assert_eq!(config.request_rewrites[0].query_parameter, "route");
         assert_eq!(config.max_body_bytes, 64);
         assert_eq!(config.upload_temp_dir, PathBuf::from("uploads"));
         assert_eq!(config.max_upload_files, 4);
@@ -999,6 +1102,26 @@ mod tests {
     }
 
     #[test]
+    fn builtin_cli_server_reads_request_rewrites_from_server_env() {
+        let config = ServerConfig::builtin_cli_server_with_env(
+            "127.0.0.1:0",
+            PathBuf::from("public"),
+            None,
+            |name| {
+                (name == BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV)
+                    .then(|| "/api=route,/legacy=path".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.request_rewrites.len(), 2);
+        assert_eq!(config.request_rewrites[0].path_prefix, "/api");
+        assert_eq!(config.request_rewrites[0].query_parameter, "route");
+        assert_eq!(config.request_rewrites[1].path_prefix, "/legacy");
+        assert_eq!(config.request_rewrites[1].query_parameter, "path");
+    }
+
+    #[test]
     fn parses_config_file_and_cli_overrides_values() {
         let path = temp_config(
             r#"
@@ -1015,6 +1138,7 @@ strict_preload = true
 engine_preset = "baseline"
 max_vm_steps = 333000
 network_requests_enabled = true
+rewrite_prefix_query = "/api=route,/legacy=path"
 "#,
         );
 
@@ -1050,6 +1174,11 @@ network_requests_enabled = true
         assert!(config.network_requests_enabled);
         assert_eq!(config.engine_preset, EngineProfileName::Default);
         assert_eq!(config.max_vm_steps, 333_000);
+        assert_eq!(config.request_rewrites.len(), 2);
+        assert_eq!(config.request_rewrites[0].path_prefix, "/api");
+        assert_eq!(config.request_rewrites[0].query_parameter, "route");
+        assert_eq!(config.request_rewrites[1].path_prefix, "/legacy");
+        assert_eq!(config.request_rewrites[1].query_parameter, "path");
     }
 
     #[test]

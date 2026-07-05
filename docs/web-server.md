@@ -30,6 +30,15 @@ See [server functionality](server-functionality.md) for config keys,
 timeouts, access-log settings, metrics-token handling, cache options, and TLS
 options.
 
+Prefix request rewrites are a webserver-only routing feature. Configure them
+with `--rewrite-prefix-query /api=route` or
+`rewrite_prefix_query = "/api=route"` for `phrust-server`, or set
+`PHRUST_SERVER_REWRITE_PREFIX_QUERY=/api=route` for the PHP-compatible
+`phrust-php -S` entrypoint. Matching requests execute through `/` while
+prepending the matched suffix as a query parameter. The PHP engine only sees the
+resulting ordinary request URI and query string; it does not know which rewrite
+rule, if any, was applied.
+
 ## Run Server Checks
 
 ```bash

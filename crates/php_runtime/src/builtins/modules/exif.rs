@@ -1,4 +1,4 @@
-//! Bounded EXIF/media helpers for WordPress image checks.
+//! Bounded EXIF/media helpers for common image metadata checks.
 
 use super::core::{arity_error, read_file_value, string_arg, string_array_key};
 use super::fileinfo::{image_size, image_type, size_array};

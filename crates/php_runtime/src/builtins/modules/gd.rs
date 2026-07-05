@@ -1,4 +1,4 @@
-//! Bounded GD-compatible image helpers for WordPress media flows.
+//! Bounded GD-compatible image helpers for common media flows.
 
 use super::core::{
     argument_type_error, arity_error, int_arg, read_file_value, resolve_runtime_path, string_arg,

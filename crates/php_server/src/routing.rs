@@ -9,8 +9,15 @@ pub struct RouteConfig {
     pub index: String,
     pub front_controller: Option<PathBuf>,
     pub builtin_router: Option<PathBuf>,
+    pub request_rewrites: Vec<RequestRewriteRule>,
     pub metrics_endpoint_enabled: bool,
     pub cache_clear_endpoint_enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestRewriteRule {
+    pub path_prefix: String,
+    pub query_parameter: String,
 }
 
 #[derive(Clone, Debug)]
@@ -352,13 +359,13 @@ mod tests {
             ResolvedRoute::PhpScript { .. }
         ));
         assert!(matches!(
-            resolve_route("OPTIONS", "/wp-json/wp/v2/settings", &config),
+            resolve_route("OPTIONS", "/api/v1/settings", &config),
             ResolvedRoute::PhpScript { .. }
         ));
     }
 
     #[test]
-    fn maps_rest_write_methods_to_php_script() {
+    fn maps_front_controller_write_methods_to_php_script() {
         let fixture = Fixture::new();
         fixture.write("index.php", "<?php echo \"front\";");
         let mut config = fixture.config("index.php");
@@ -374,10 +381,10 @@ mod tests {
             );
             assert!(
                 matches!(
-                    resolve_route(method, "/wp-json/wp/v2/posts/1", &config),
+                    resolve_route(method, "/api/v1/posts/1", &config),
                     ResolvedRoute::PhpScript { .. }
                 ),
-                "{method} should route front-controller REST paths"
+                "{method} should route front-controller paths"
             );
         }
     }
@@ -581,6 +588,7 @@ mod tests {
                 index: index.to_string(),
                 front_controller: None,
                 builtin_router: None,
+                request_rewrites: Vec::new(),
                 metrics_endpoint_enabled: true,
                 cache_clear_endpoint_enabled: false,
             }

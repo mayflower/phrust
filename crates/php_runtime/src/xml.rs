@@ -1,8 +1,8 @@
 //! Bounded XML/DOM/SimpleXML runtime support.
 //!
-//! This module intentionally implements a strict, local XML subset for the
-//! WordPress compatibility slice. It rejects DTDs, processing instructions, and
-//! unresolved entities instead of fetching external resources or guessing.
+//! This module intentionally implements a strict, local XML subset. It rejects
+//! DTDs, processing instructions, and unresolved entities instead of fetching
+//! external resources or guessing.
 
 use crate::{
     ArrayKey, ClassEntry, ClassFlags, ObjectRef, PhpArray, PhpString, Value, normalize_class_name,
