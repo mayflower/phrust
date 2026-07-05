@@ -31,7 +31,7 @@ use crate::{
 pub(in crate::builtins::modules) use encoding::{
     HTML_ESCAPE_DEFAULT_FLAGS, PHP_QUERY_RFC3986, build_query_pairs, format_array_values,
     hash_digest_bytes, hex_decode, hex_encode, hex_nibble, hmac_digest_bytes, html_decode,
-    html_escape_with_options, url_decode, url_encode,
+    html_escape_with_options, htmlspecialchars_decode_with_flags, url_decode, url_encode,
 };
 use http::{
     builtin_header, builtin_header_remove, builtin_headers_list, builtin_headers_sent,
@@ -1645,7 +1645,9 @@ pub(in crate::builtins::modules) fn parse_url_component(
         other => {
             return Err(BuiltinError::new(
                 "E_PHP_RUNTIME_BUILTIN_VALUE",
-                format!("parse_url(): Argument #2 must be a valid URL component, {other} given"),
+                format!(
+                    "parse_url(): Argument #2 ($component) must be a valid URL component identifier, {other} given"
+                ),
             ));
         }
     };
@@ -10961,6 +10963,28 @@ mod tests {
         );
         assert_eq!(
             call(
+                "htmlspecialchars_decode",
+                vec![
+                    Value::string("Roy&#039;s &quot;quote&quot; &lt;tag&gt; &amp;"),
+                    Value::Int(2)
+                ],
+                &mut output
+            ),
+            Value::string("Roy&#039;s \"quote\" <tag> &")
+        );
+        assert_eq!(
+            call(
+                "htmlspecialchars_decode",
+                vec![
+                    Value::string("Roy&#039;s &quot;quote&quot; &lt;tag&gt; &amp;"),
+                    Value::Int(0)
+                ],
+                &mut output
+            ),
+            Value::string("Roy&#039;s &quot;quote&quot; <tag> &")
+        );
+        assert_eq!(
+            call(
                 "html_entity_decode",
                 vec![
                     Value::string("&lt;a&amp;&quot;&#039;&gt;"),
@@ -11194,6 +11218,14 @@ mod tests {
         assert_eq!(
             call("parse_url", vec![full.clone(), Value::Int(2)], &mut output),
             Value::Int(80)
+        );
+        assert_eq!(
+            call("parse_url", vec![full.clone(), Value::Int(-1)], &mut output),
+            Value::Array(full_parts.clone())
+        );
+        assert_eq!(
+            call_error("parse_url", vec![full.clone(), Value::Int(99)], &mut output),
+            "parse_url(): Argument #2 ($component) must be a valid URL component identifier, 99 given"
         );
         assert_eq!(
             call(

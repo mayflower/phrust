@@ -16,11 +16,14 @@
 {"path":"ext/standard/tests/url/parse_url_basic_009.phpt"}
 {"path":"ext/standard/tests/url/parse_url_basic_010.phpt"}
 {"path":"ext/standard/tests/url/parse_url_basic_011.phpt"}
+{"path":"ext/standard/tests/url/parse_url_error_002.phpt"}
 {"path":"ext/standard/tests/url/parse_url_relative_scheme.phpt"}
 {"path":"ext/standard/tests/strings/parse_str_basic1.phpt"}
 {"path":"ext/standard/tests/strings/parse_str_basic2.phpt"}
 {"path":"ext/standard/tests/strings/parse_str_basic4.phpt"}
 {"path":"ext/standard/tests/strings/parse_str_memory_error.phpt"}
+{"path":"ext/standard/tests/strings/htmlspecialchars_basic.phpt"}
+{"path":"ext/standard/tests/strings/htmlspecialchars_decode_basic.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt"}

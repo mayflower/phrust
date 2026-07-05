@@ -288,6 +288,41 @@ pub(in crate::builtins::modules) fn html_decode(text: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+pub(in crate::builtins::modules) fn htmlspecialchars_decode_with_flags(
+    text: &str,
+    flags: i64,
+) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let remaining = &bytes[index..];
+        let decoded = if remaining.starts_with(b"&lt;") {
+            Some((b'<', 4))
+        } else if remaining.starts_with(b"&gt;") {
+            Some((b'>', 4))
+        } else if remaining.starts_with(b"&amp;") {
+            Some((b'&', 5))
+        } else if flags & 2 != 0 && remaining.starts_with(b"&quot;") {
+            Some((b'"', 6))
+        } else if flags & 1 != 0 && remaining.starts_with(b"&#039;") {
+            Some((b'\'', 6))
+        } else if flags & 1 != 0 && remaining.starts_with(b"&#x27;") {
+            Some((b'\'', 6))
+        } else {
+            None
+        };
+        if let Some((byte, len)) = decoded {
+            output.push(byte);
+            index += len;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
 pub(in crate::builtins::modules) fn url_encode(bytes: &[u8], raw: bool) -> Vec<u8> {
     let mut output = Vec::new();
     for byte in bytes {

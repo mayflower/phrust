@@ -1252,8 +1252,12 @@ pub(in crate::builtins::modules) fn builtin_htmlspecialchars_decode(
             "builtin htmlspecialchars_decode expects one or two argument(s)",
         ));
     }
-    Ok(Value::string(html_decode(
+    let flags = args.get(1).map_or(Ok(HTML_ESCAPE_DEFAULT_FLAGS), |value| {
+        int_arg("htmlspecialchars_decode", value)
+    })?;
+    Ok(Value::string(htmlspecialchars_decode_with_flags(
         &string_arg("htmlspecialchars_decode", &args[0])?.to_string_lossy(),
+        flags,
     )))
 }
 
@@ -1322,7 +1326,10 @@ pub(in crate::builtins::modules) fn builtin_parse_url(
     };
 
     if let Some(component) = args.get(1) {
-        return parse_url_component(&parsed, int_arg("parse_url", component)?);
+        let component = int_arg("parse_url", component)?;
+        if component >= 0 {
+            return parse_url_component(&parsed, component);
+        }
     }
 
     let mut array = PhpArray::new();
