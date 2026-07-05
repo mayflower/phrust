@@ -997,6 +997,7 @@ where
             include_roots: Vec::new(),
             runtime_context,
             collect_counters,
+            collect_profile_spans: false,
         },
     );
     if let Some(timings) = timings.as_mut() {
@@ -4572,6 +4573,7 @@ mod tests {
             runtime_context: RuntimeContext::controlled_cli(&fixture_path, Vec::new()),
             optimization_level: None,
             collect_counters: false,
+            collect_profile_spans: false,
         });
 
         assert_eq!(

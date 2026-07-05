@@ -410,6 +410,7 @@ mod tests {
             fixture.path.clone(),
             runtime_context,
             true,
+            false,
         )
         .expect("server execution should succeed");
 
@@ -552,6 +553,7 @@ mod tests {
                     lookup,
                     fixture_path,
                     runtime_context,
+                    false,
                     false,
                 )
                 .expect("request execution");

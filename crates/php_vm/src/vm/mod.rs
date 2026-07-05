@@ -77923,6 +77923,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             ",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -77955,6 +77956,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             ",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -77979,6 +77981,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 execution_format: ExecutionFormat::Ir,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -77987,6 +77990,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 execution_format: ExecutionFormat::Bytecode,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -78036,6 +78040,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 execution_format: ExecutionFormat::Ir,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -78044,6 +78049,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -78102,6 +78108,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             ",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -78137,6 +78144,7 @@ class BadDateTimeInterfaceImplementation implements DateTimeInterface {}
             ",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 runtime_context: RuntimeContext::default()
                     .with_cwd(root.clone())
                     .with_filesystem_capabilities(
@@ -78386,6 +78394,7 @@ good"
             "<?php $a = 'a'; $b = 'b'; $value = 'id-' . 42; echo $value, '|', $a . $b;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -78425,6 +78434,7 @@ good"
             ",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79021,6 +79031,7 @@ good"
             VmOptions {
                 include_cache: Some(Arc::clone(&cache)),
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79044,6 +79055,7 @@ good"
                 include_cache: Some(Arc::clone(&cache)),
                 trace_includes: true,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79106,6 +79118,7 @@ good"
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 trace_includes: true,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
             root.join("index.php").to_string_lossy().into_owned(),
@@ -79445,6 +79458,7 @@ good"
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 trace_includes: true,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
             root.join("index.php").to_string_lossy().into_owned(),
@@ -79503,6 +79517,7 @@ good"
             "fixtures/runtime/valid/includes/include-missing.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79542,6 +79557,7 @@ good"
             "fixtures/runtime/invalid/includes/require-missing.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79740,6 +79756,7 @@ good"
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -79891,6 +79908,7 @@ good"
             VmOptions {
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -79900,6 +79918,7 @@ good"
             VmOptions {
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -79947,6 +79966,7 @@ good"
             VmOptions {
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -79956,6 +79976,7 @@ good"
             VmOptions {
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80000,6 +80021,7 @@ good"
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80029,6 +80051,7 @@ good"
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80087,6 +80110,7 @@ good"
                     VmOptions {
                         include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                         collect_counters: true,
+                        collect_profile_spans: false,
                         inline_caches: InlineCacheMode::On,
                         ..VmOptions::default()
                     },
@@ -80137,6 +80161,7 @@ good"
             VmOptions {
                 include_loader: Some(IncludeLoader::for_root(&workspace).expect("loader")),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80157,6 +80182,7 @@ good"
             "tests/fixtures/performance/inline_cache/include-path-cache.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80165,6 +80191,7 @@ good"
             "tests/fixtures/performance/inline_cache/include-path-cache.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80210,6 +80237,7 @@ good"
                 runtime_context: RuntimeContext::default()
                     .with_include_path(vec![first.clone(), second.clone()]),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80220,6 +80248,7 @@ good"
                 include_loader: Some(IncludeLoader::for_root(lib_root).expect("loader")),
                 runtime_context: RuntimeContext::default().with_include_path(vec![second, first]),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80245,6 +80274,7 @@ good"
             "fixtures/runtime/valid/includes/include-missing.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -80253,6 +80283,7 @@ good"
             "fixtures/runtime/valid/includes/include-missing.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80373,6 +80404,7 @@ good"
                             .with_allowed_roots(vec![root.clone()]),
                     ),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -80996,6 +81028,7 @@ good"
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -82461,6 +82494,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             "<?php function f($v) { return $v . 'x'; } class C { public $p = 0; } $a = [1]; $c = new C(); $ok = $c instanceof C; echo f($a[0]), $c->p;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -82487,6 +82521,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             "<?php $a = 'same'; $b = 'same'; echo $a, $b, 'same';",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -82515,6 +82550,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -82551,6 +82587,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -82589,6 +82626,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -82621,6 +82659,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -82648,6 +82687,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Bytecode,
                 inline_caches: InlineCacheMode::On,
                 quickening: QuickeningMode::On,
@@ -82684,6 +82724,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 &source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -82724,6 +82765,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -82760,6 +82802,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -82795,6 +82838,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
     fn rich_echo_borrows_register_operand_for_fast_scalar_output() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
+            collect_profile_spans: false,
             execution_format: ExecutionFormat::Ir,
             verify_ir: false,
             ..VmOptions::default()
@@ -82832,6 +82876,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     execution_format: format,
                     ..VmOptions::default()
                 },
@@ -82899,6 +82944,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -82940,6 +82986,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Bytecode,
                 dense_jump_threading: DenseJumpThreadingMode::Off,
                 ..VmOptions::default()
@@ -82949,6 +82996,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Bytecode,
                 dense_jump_threading: DenseJumpThreadingMode::On,
                 ..VmOptions::default()
@@ -82984,6 +83032,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Bytecode,
                 superinstructions: SuperinstructionMode::Off,
                 ..VmOptions::default()
@@ -82993,6 +83042,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Bytecode,
                 superinstructions: SuperinstructionMode::On,
                 ..VmOptions::default()
@@ -83040,6 +83090,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -83048,6 +83099,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -83078,6 +83130,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -83086,6 +83139,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -83111,6 +83165,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions {
                     enabled: false,
@@ -83137,6 +83192,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             "<?php echo \"tiny\\n\";",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions::default(),
                 adaptive_tiny_unit_setup_threshold: Some(32),
@@ -83159,6 +83215,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 tiering: TieringOptions::default(),
                 adaptive_tiny_unit_setup_threshold: Some(1),
@@ -83181,6 +83238,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Ir,
                 quickening: QuickeningMode::On,
                 inline_caches: InlineCacheMode::On,
@@ -83213,6 +83271,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -83235,6 +83294,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -83256,6 +83316,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 jit_threshold: 2,
                 tiering: TieringOptions {
@@ -83283,6 +83344,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 jit_threshold: 1,
                 tiering: TieringOptions {
@@ -83309,6 +83371,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 jit_threshold: 1,
                 tiering: TieringOptions {
@@ -83336,6 +83399,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83369,6 +83433,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83397,6 +83462,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83409,6 +83475,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -83429,6 +83496,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83454,6 +83522,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83477,6 +83546,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83507,6 +83577,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83515,6 +83586,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83549,6 +83621,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83557,6 +83630,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83586,6 +83660,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83622,6 +83697,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83630,6 +83706,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83667,6 +83744,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83675,6 +83753,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83710,6 +83789,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83738,6 +83818,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83746,6 +83827,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83779,6 +83861,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83807,6 +83890,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83836,6 +83920,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83844,6 +83929,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83873,6 +83959,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83881,6 +83968,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83910,6 +83998,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83918,6 +84007,7 @@ var_dump(unserialize('O:1:"C":0:{}'));
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -83961,6 +84051,7 @@ echo perf_jit_unstable_types(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -83969,6 +84060,7 @@ echo perf_jit_unstable_types(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84016,6 +84108,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 jit_blacklist: JitBlacklistMode::Off,
                 tiering: TieringOptions {
@@ -84047,6 +84140,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84076,6 +84170,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     jit_eager: true,
@@ -84173,6 +84268,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -84195,6 +84291,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Off,
                 ..VmOptions::default()
             },
@@ -84203,6 +84300,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 ..VmOptions::default()
             },
@@ -84225,6 +84323,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84233,6 +84332,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84275,6 +84375,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84283,6 +84384,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84305,6 +84407,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84324,6 +84427,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84457,6 +84561,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
                 VmOptions {
                     execution_format: ExecutionFormat::Auto,
                     collect_counters: true,
+                    collect_profile_spans: false,
                     ..VmOptions::default()
                 },
             );
@@ -84477,6 +84582,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             "tests/fixtures/performance/inline_cache/include-invalidation.php",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84497,6 +84603,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84516,6 +84623,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84524,6 +84632,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84548,6 +84657,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84556,6 +84666,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84579,6 +84690,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84587,6 +84699,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84610,6 +84723,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84630,6 +84744,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84666,6 +84781,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84685,6 +84801,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84700,6 +84817,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             "<?php class PerfMethodPrivate { private function secret() { return 1; } } (new PerfMethodPrivate())->secret();",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84721,6 +84839,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84743,6 +84862,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84790,6 +84910,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -84798,6 +84919,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84831,6 +84953,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84868,6 +84991,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84892,6 +85016,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -84917,6 +85042,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84942,6 +85068,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84967,6 +85094,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -84991,6 +85119,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 jit: JitMode::Cranelift,
                 tiering: TieringOptions {
                     function_entry_threshold: 1,
@@ -85028,6 +85157,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85036,6 +85166,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85058,6 +85189,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85066,6 +85198,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85100,6 +85233,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85145,6 +85279,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85180,6 +85315,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85212,6 +85348,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85232,6 +85369,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85252,6 +85390,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85282,6 +85421,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfilePolyA { public $value = 'A'; } class PerfProfilePolyB { public $value = 'B'; } function perf_profile_read($object) { return $object->value; } echo perf_profile_read(new PerfProfilePolyA()), perf_profile_read(new PerfProfilePolyB());",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85299,6 +85439,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfileMegaA { public $value = 'A'; } class PerfProfileMegaB { public $value = 'B'; } class PerfProfileMegaC { public $value = 'C'; } class PerfProfileMegaD { public $value = 'D'; } class PerfProfileMegaE { public $value = 'E'; } function perf_profile_mega_read($object) { return $object->value; } echo perf_profile_mega_read(new PerfProfileMegaA()), perf_profile_mega_read(new PerfProfileMegaB()), perf_profile_mega_read(new PerfProfileMegaC()), perf_profile_mega_read(new PerfProfileMegaD()), perf_profile_mega_read(new PerfProfileMegaE());",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85320,6 +85461,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85338,6 +85480,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfileDynamicProperty {} $object = new PerfProfileDynamicProperty(); $object->value = 'd'; echo $object->value;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85369,6 +85512,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85387,6 +85531,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfileMagicProperty { public function __get($name) { return $name . '!'; } } $object = new PerfProfileMagicProperty(); echo $object->missing;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85454,6 +85599,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85472,6 +85618,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfileHookProperty { public string $name { get { return 'hook'; } } } $object = new PerfProfileHookProperty(); echo $object->name;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85497,6 +85644,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfTypedProperty { public int $value; } $object = new PerfTypedProperty(); echo $object->value;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85523,6 +85671,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php class PerfProfileTypedProperty { public int $value; } $object = new PerfProfileTypedProperty(); echo $object->value;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85548,6 +85697,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85556,6 +85706,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85578,6 +85729,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85597,6 +85749,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85616,6 +85769,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85636,6 +85790,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85655,6 +85810,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -85663,6 +85819,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -85687,6 +85844,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85695,6 +85853,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85732,6 +85891,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85740,6 +85900,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85760,6 +85921,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85768,6 +85930,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85802,6 +85965,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     quickening: QuickeningMode::Off,
                     ..VmOptions::default()
                 },
@@ -85810,6 +85974,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     quickening: QuickeningMode::On,
                     ..VmOptions::default()
                 },
@@ -85834,6 +85999,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85842,6 +86008,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85862,6 +86029,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85870,6 +86038,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85894,6 +86063,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85902,6 +86072,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85935,6 +86106,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     quickening: QuickeningMode::Off,
                     ..VmOptions::default()
                 },
@@ -85943,6 +86115,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     quickening: QuickeningMode::On,
                     ..VmOptions::default()
                 },
@@ -85967,6 +86140,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -85975,6 +86149,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -85998,6 +86173,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86006,6 +86182,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86027,6 +86204,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86035,6 +86213,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86063,6 +86242,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -86139,6 +86319,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 execution_format: ExecutionFormat::Auto,
                 ..VmOptions::default()
             },
@@ -86164,6 +86345,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             mixed_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86172,6 +86354,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             mixed_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86192,6 +86375,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             numeric_string_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86200,6 +86384,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             numeric_string_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86219,6 +86404,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86252,6 +86438,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::Off,
                 ..VmOptions::default()
             },
@@ -86260,6 +86447,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86307,6 +86495,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             bounds_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86333,6 +86522,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             layout_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86357,6 +86547,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             cow_reference_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86388,6 +86579,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             record_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86416,6 +86608,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             small_map_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86453,6 +86646,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             fallback_source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86495,6 +86689,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86528,6 +86723,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86569,6 +86765,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86600,6 +86797,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             "<?php $s = 'abc'; echo $s + 1;",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -86627,6 +86825,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86645,6 +86844,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86663,6 +86863,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86709,6 +86910,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86726,6 +86928,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86744,6 +86947,7 @@ foreach ([new PerfRelationBase(), new PerfRelationOverride(), new PerfRelationBa
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86805,6 +87009,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86864,6 +87069,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86882,6 +87088,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86905,6 +87112,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86926,6 +87134,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86947,6 +87156,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86977,6 +87187,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             "<?php function frame_reuse_gen() { yield 'k' => 'v'; } $g = frame_reuse_gen(); echo $g->current();",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -86995,6 +87206,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             "<?php $fiber = new Fiber(function() { echo 'a'; Fiber::suspend('s'); echo 'b'; }); echo $fiber->start(); echo '|'; $fiber->resume('r');",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -87141,6 +87353,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             "<?php function sum_plain($n) { $s = 0; for ($i = 0; $i < $n; $i++) { $s = $s + $i; } return $s; } echo sum_plain(12);",
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 quickening: QuickeningMode::On,
                 ..VmOptions::default()
             },
@@ -87217,6 +87430,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     quickening: QuickeningMode::On,
                     inline_caches: InlineCacheMode::On,
                     ..VmOptions::default()
@@ -88417,6 +88631,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88425,6 +88640,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88455,6 +88671,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             weak,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88463,6 +88680,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             weak,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88488,6 +88706,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             by_ref,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88496,6 +88715,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             by_ref,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88509,6 +88729,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             variadic,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88542,6 +88763,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: true,
                 ..VmOptions::default()
             },
@@ -88550,6 +88772,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 typecheck_fast_paths: false,
                 ..VmOptions::default()
             },
@@ -88579,6 +88802,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 internal_function_dispatch_cache: false,
                 ..VmOptions::default()
             },
@@ -88587,6 +88811,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 internal_function_dispatch_cache: true,
                 ..VmOptions::default()
             },
@@ -88640,6 +88865,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::Off,
                 ..VmOptions::default()
             },
@@ -88648,6 +88874,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -88721,6 +88948,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     internal_function_dispatch_cache: false,
                     ..VmOptions::default()
                 },
@@ -88729,6 +88957,7 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 source,
                 VmOptions {
                     collect_counters: true,
+                    collect_profile_spans: false,
                     internal_function_dispatch_cache: true,
                     ..VmOptions::default()
                 },
@@ -93305,6 +93534,7 @@ echo dense_supported(4), "\n", rich_fallback(), "\n";
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93365,6 +93595,7 @@ echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93415,6 +93646,7 @@ echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
                 include_cache: Some(Arc::new(IncludeCache::new(1))),
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93495,6 +93727,7 @@ version_probe();
                 include_cache: Some(Arc::new(IncludeCache::new(1))),
                 runtime_context: RuntimeContext::default().with_cwd(root.clone()),
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93542,6 +93775,7 @@ echo $total, "|", $last;
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93598,6 +93832,7 @@ echo $m->title, "|", $m->missing, "|", $d->declared, "|", $d->extra;
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93606,6 +93841,7 @@ echo $m->title, "|", $m->missing, "|", $d->declared, "|", $d->extra;
             source,
             VmOptions {
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -93634,6 +93870,7 @@ try {
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93654,6 +93891,7 @@ echo isset($items['missing']) ? '1' : '0';
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93695,6 +93933,7 @@ bind_array_dim_reference();
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93723,6 +93962,7 @@ echo DENSE_FETCH_CONST_PROBE;
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93771,6 +94011,7 @@ for ($i = 0; $i < 4; $i++) {
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93853,6 +94094,7 @@ echo dense_property_read_name($hook), ';';
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );
@@ -93927,6 +94169,7 @@ echo dense_call_magic($magic);
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93977,6 +94220,7 @@ new DenseScopedChild();
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -93996,6 +94240,7 @@ new DenseScopedChild();
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 inline_caches: InlineCacheMode::On,
                 ..VmOptions::default()
             },
@@ -94030,6 +94275,7 @@ dense_property_write_typed_failure($typed, 'bad');
             VmOptions {
                 execution_format: ExecutionFormat::Auto,
                 collect_counters: true,
+                collect_profile_spans: false,
                 ..VmOptions::default()
             },
         );

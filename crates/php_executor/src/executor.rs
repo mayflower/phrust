@@ -135,6 +135,7 @@ impl PhpExecutor {
             include_loader,
             runtime_context,
             collect_counters: input.collect_counters,
+            collect_profile_spans: input.collect_profile_spans,
             ..self.options.vm_options.clone()
         });
         let result = vm.execute(compiled.executable_unit());
@@ -170,6 +171,7 @@ impl PhpExecutor {
                 include_roots: input.include_roots,
                 runtime_context: input.runtime_context,
                 collect_counters: input.collect_counters,
+                collect_profile_spans: input.collect_profile_spans,
             },
         )
     }
@@ -280,6 +282,7 @@ mod tests {
             runtime_context: RuntimeContext::controlled_cli("managed-fast-counter.php", Vec::new()),
             optimization_level: None,
             collect_counters: true,
+            collect_profile_spans: false,
         });
 
         assert_eq!(output.status, PhpExecutionStatus::Success);
@@ -290,6 +293,16 @@ mod tests {
         assert!(counters.bytecode_lower_attempts > 0, "{counters:?}");
         assert!(counters.quickening_attempts > 0, "{counters:?}");
         assert!(counters.inline_cache_observations > 0, "{counters:?}");
+        assert!(
+            counters.function_profiles_by_name.is_empty(),
+            "{counters:?}"
+        );
+        assert!(counters.method_profiles_by_name.is_empty(), "{counters:?}");
+        assert!(counters.builtin_profiles_by_name.is_empty(), "{counters:?}");
+        assert!(
+            counters.array_operation_profiles_by_family.is_empty(),
+            "{counters:?}"
+        );
     }
 
     #[test]
@@ -307,6 +320,7 @@ mod tests {
             ),
             optimization_level: None,
             collect_counters: true,
+            collect_profile_spans: false,
         });
 
         assert_eq!(output.status, PhpExecutionStatus::Success);
@@ -348,6 +362,7 @@ mod tests {
                 include_roots: Vec::new(),
                 runtime_context: RuntimeContext::controlled_cli("compiled-handle.php", Vec::new()),
                 collect_counters: false,
+                collect_profile_spans: false,
             },
         );
         let second = executor.execute_compiled(
@@ -358,6 +373,7 @@ mod tests {
                 include_roots: Vec::new(),
                 runtime_context: RuntimeContext::controlled_cli("compiled-handle.php", Vec::new()),
                 collect_counters: false,
+                collect_profile_spans: false,
             },
         );
         let after = compiled.executable_unit();

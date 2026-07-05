@@ -94,10 +94,10 @@ pub struct RuntimeLayoutStats {
 /// not enough to identify the VM source that produced them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeLayoutSourceStats {
-    pub value_clone_by_family: BTreeMap<String, u64>,
-    pub array_handle_clone_by_family: BTreeMap<String, u64>,
-    pub cow_separation_by_family: BTreeMap<String, u64>,
-    pub reference_cell_creation_by_family: BTreeMap<String, u64>,
+    pub value_clone_by_family: BTreeMap<&'static str, u64>,
+    pub array_handle_clone_by_family: BTreeMap<&'static str, u64>,
+    pub cow_separation_by_family: BTreeMap<&'static str, u64>,
+    pub reference_cell_creation_by_family: BTreeMap<&'static str, u64>,
 }
 
 /// Scope guard for request-local layout source attribution.
@@ -249,7 +249,7 @@ fn record_value_clone_source() {
         *stats
             .borrow_mut()
             .value_clone_by_family
-            .entry(family.to_owned())
+            .entry(family)
             .or_default() += 1;
     });
 }
@@ -260,7 +260,7 @@ fn record_array_handle_clone_source() {
         *stats
             .borrow_mut()
             .array_handle_clone_by_family
-            .entry(family.to_owned())
+            .entry(family)
             .or_default() += 1;
     });
 }
@@ -271,7 +271,7 @@ fn record_cow_separation_source() {
         *stats
             .borrow_mut()
             .cow_separation_by_family
-            .entry(family.to_owned())
+            .entry(family)
             .or_default() += 1;
     });
 }
@@ -282,7 +282,7 @@ fn record_reference_cell_creation_source() {
         *stats
             .borrow_mut()
             .reference_cell_creation_by_family
-            .entry(family.to_owned())
+            .entry(family)
             .or_default() += 1;
     });
 }

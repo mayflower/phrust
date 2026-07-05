@@ -800,12 +800,14 @@ pub(crate) fn execute_compiled_php_in_blocking_region(
 ) -> Result<PhpExecutionOutput, PhpExecutionError> {
     task::block_in_place(move || {
         let collect_counters = collect_vm_counters_for_request(&state);
+        let collect_profile_spans = collect_vm_profile_spans_for_request(&state);
         execute_compiled_php_with_state(
             &state,
             lookup,
             script_path,
             runtime_context,
             collect_counters,
+            collect_profile_spans,
         )
     })
 }
@@ -814,12 +816,17 @@ pub(crate) fn collect_vm_counters_for_request(state: &AppState) -> bool {
     state.request_profile.is_some() || (state.perf_trace.is_some() && state.perf_trace_vm_counters)
 }
 
+pub(crate) fn collect_vm_profile_spans_for_request(state: &AppState) -> bool {
+    state.request_profile.is_some()
+}
+
 pub(crate) fn execute_compiled_php_with_state(
     state: &AppState,
     lookup: CompiledScriptCacheLookup,
     script_path: PathBuf,
     runtime_context: RuntimeContext,
     collect_counters: bool,
+    collect_profile_spans: bool,
 ) -> Result<PhpExecutionOutput, PhpExecutionError> {
     state
         .metrics
@@ -839,6 +846,7 @@ pub(crate) fn execute_compiled_php_with_state(
             include_roots: include_roots_for_docroot(&state.route_config.docroot),
             runtime_context,
             collect_counters,
+            collect_profile_spans,
         },
     );
     let absorbed = state

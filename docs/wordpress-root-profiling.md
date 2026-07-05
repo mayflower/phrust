@@ -254,9 +254,13 @@ Every profile has these top-level fields:
 The `attribution` object includes:
 
 - `summary_counters`: flat counters also used by the performance trace.
-- `execution`: rich and dense instruction counts, opcode families, and dense
-  execution families, including `rich_fallback_functions_by_name` for dense
-  functions that resumed in the rich VM.
+- `execution`: rich and dense instruction counts, boundary-sampled dense/rich
+  execution time estimates, opcode families, and dense execution families,
+  including `rich_fallback_functions_by_name` for dense functions that resumed
+  in the rich VM. The time fields are
+  `profiled_boundary_exclusive_nanos`, `estimated_rich_execution_nanos`,
+  `estimated_dense_execution_nanos`, and
+  `unattributed_profiled_execution_nanos`.
 - `includes`: include counts, include-cache counters, include fallback reasons,
   `dense_include_entry_fallback_by_path`, and `include_profiles_by_path`
   entries with `count`, `inclusive_nanos`, `exclusive_nanos`,
@@ -290,7 +294,10 @@ source scopes, and request-local timing scopes. They expose clone, fallback,
 dense/rich, array, object, builtin, include, output, and native sources tracked
 by the VM. Include/function/method/builtin profiles are sampled at VM execution
 boundaries, so they are useful for ranking source sites by inclusive time,
-exclusive time, and instruction deltas. Array/object/output operation profiles
+exclusive time, and instruction deltas. Dense/rich execution time is estimated
+from exclusive boundary time and the rich/dense instruction mix inside each
+sampled boundary; it avoids per-instruction timers and should be read as a
+ranking signal, not a cycle-accurate split. Array/object/output operation profiles
 are generic family timings across rich IR and dense-bytecode execution funnels.
 Clone source-family maps are runtime-observed event attribution for the current
 VM source scope, with `unattributed` used when a lower-level runtime event had
@@ -309,8 +316,11 @@ For WordPress root latency, start with:
    `attribution.clones.value_clone_by_reason`, and
    `attribution.clones.value_clone_by_source_family`: identifies clone-heavy
    families and the VM source scopes that actually produced runtime clones.
-3. `attribution.execution.include_rich_instructions` and
-   `attribution.execution.dense_bytecode_instructions`: shows dense/rich split.
+3. `attribution.execution.include_rich_instructions`,
+   `attribution.execution.dense_bytecode_instructions`,
+   `attribution.execution.estimated_rich_execution_nanos`, and
+   `attribution.execution.estimated_dense_execution_nanos`: shows dense/rich
+   instruction and boundary-time split.
 4. `attribution.includes.*fallback*`: identifies include-entry and rich fallback
    reasons.
 5. `attribution.includes.include_profiles_by_path`: ranks include bodies by

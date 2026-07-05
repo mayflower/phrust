@@ -825,6 +825,7 @@ mod tests {
                 include_roots: Vec::new(),
                 runtime_context: RuntimeContext::controlled_cli("index.php", Vec::new()),
                 collect_counters: false,
+                collect_profile_spans: false,
             },
         )
     }

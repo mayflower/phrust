@@ -32,6 +32,11 @@ pub struct VmOptions {
     pub trace_includes: bool,
     /// Collect performance VM/runtime counters in the execution result.
     pub collect_counters: bool,
+    /// Collect request-profile wall-clock spans around include/call/builtin and
+    /// selected operation-family boundaries. This is intentionally separate
+    /// from aggregate counters so diagnostic counter runs do not pay timer and
+    /// attribution-map costs unless the request profiler is explicitly enabled.
+    pub collect_profile_spans: bool,
     /// Optional dense-bytecode execution mode. The default keeps the rich-IR
     /// interpreter as the only execution path.
     pub execution_format: ExecutionFormat,
@@ -87,6 +92,7 @@ impl Default for VmOptions {
             trace_runtime: false,
             trace_includes: trace_includes_from_env(),
             collect_counters: false,
+            collect_profile_spans: false,
             execution_format: ExecutionFormat::Ir,
             dense_include_execution: DenseIncludeMode::Off,
             superinstructions: SuperinstructionMode::Off,

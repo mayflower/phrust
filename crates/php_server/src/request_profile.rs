@@ -138,11 +138,28 @@ fn summary_counters_json(trace: &PerfTraceEvent) -> Value {
 }
 
 fn execution_json(counters: &VmCounters) -> Value {
+    let execution_time = sampled_execution_time_split(counters);
     object_from_pairs([
         ("rich_instructions", counters.instructions_executed),
         (
             "dense_bytecode_instructions",
             counters.bytecode_instructions_executed,
+        ),
+        (
+            "profiled_boundary_exclusive_nanos",
+            execution_time.profiled_boundary_exclusive_nanos,
+        ),
+        (
+            "estimated_rich_execution_nanos",
+            execution_time.estimated_rich_execution_nanos,
+        ),
+        (
+            "estimated_dense_execution_nanos",
+            execution_time.estimated_dense_execution_nanos,
+        ),
+        (
+            "unattributed_profiled_execution_nanos",
+            execution_time.unattributed_profiled_execution_nanos,
         ),
         (
             "entry_rich_instructions",
@@ -195,6 +212,63 @@ fn execution_json(counters: &VmCounters) -> Value {
         ),
     )
     .into()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SampledExecutionTimeSplit {
+    profiled_boundary_exclusive_nanos: u64,
+    estimated_rich_execution_nanos: u64,
+    estimated_dense_execution_nanos: u64,
+    unattributed_profiled_execution_nanos: u64,
+}
+
+fn sampled_execution_time_split(counters: &VmCounters) -> SampledExecutionTimeSplit {
+    let mut split = SampledExecutionTimeSplit::default();
+    for profile in counters
+        .include_profiles_by_path
+        .values()
+        .chain(counters.function_profiles_by_name.values())
+        .chain(counters.method_profiles_by_name.values())
+        .chain(counters.builtin_profiles_by_name.values())
+    {
+        accumulate_sampled_execution_time(&mut split, profile);
+    }
+    split
+}
+
+fn accumulate_sampled_execution_time(
+    split: &mut SampledExecutionTimeSplit,
+    profile: &BoundaryProfile,
+) {
+    split.profiled_boundary_exclusive_nanos = split
+        .profiled_boundary_exclusive_nanos
+        .saturating_add(profile.exclusive_nanos);
+    let instructions = profile
+        .rich_instructions
+        .saturating_add(profile.dense_instructions);
+    if instructions == 0 {
+        split.unattributed_profiled_execution_nanos = split
+            .unattributed_profiled_execution_nanos
+            .saturating_add(profile.exclusive_nanos);
+        return;
+    }
+    let rich_nanos = proportional_nanos(
+        profile.exclusive_nanos,
+        profile.rich_instructions,
+        instructions,
+    );
+    let dense_nanos = profile.exclusive_nanos.saturating_sub(rich_nanos);
+    split.estimated_rich_execution_nanos = split
+        .estimated_rich_execution_nanos
+        .saturating_add(rich_nanos);
+    split.estimated_dense_execution_nanos = split
+        .estimated_dense_execution_nanos
+        .saturating_add(dense_nanos);
+}
+
+fn proportional_nanos(total_nanos: u64, numerator: u64, denominator: u64) -> u64 {
+    ((u128::from(total_nanos) * u128::from(numerator)) / u128::from(denominator))
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn includes_json(counters: &VmCounters) -> Value {
@@ -1182,6 +1256,18 @@ mod tests {
         assert_eq!(
             profile["attribution"]["includes"]["include_profiles_by_path"][0]["dense_instructions"],
             Value::from(6)
+        );
+        assert_eq!(
+            profile["attribution"]["execution"]["profiled_boundary_exclusive_nanos"],
+            Value::from(750)
+        );
+        assert_eq!(
+            profile["attribution"]["execution"]["estimated_rich_execution_nanos"],
+            Value::from(649)
+        );
+        assert_eq!(
+            profile["attribution"]["execution"]["estimated_dense_execution_nanos"],
+            Value::from(101)
         );
         assert_eq!(
             profile["attribution"]["execution"]["rich_fallback_functions_by_name"][0]["name"],

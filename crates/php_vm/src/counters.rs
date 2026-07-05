@@ -1081,19 +1081,19 @@ impl VmCounters {
         &mut self,
         stats: php_runtime::layout_stats::RuntimeLayoutSourceStats,
     ) {
-        merge_counter_map(
+        merge_static_counter_map(
             &mut self.value_clone_by_source_family,
             stats.value_clone_by_family,
         );
-        merge_counter_map(
+        merge_static_counter_map(
             &mut self.array_handle_clone_by_source_family,
             stats.array_handle_clone_by_family,
         );
-        merge_counter_map(
+        merge_static_counter_map(
             &mut self.cow_separation_by_source_family,
             stats.cow_separation_by_family,
         );
-        merge_counter_map(
+        merge_static_counter_map(
             &mut self.reference_cell_creation_by_source_family,
             stats.reference_cell_creation_by_family,
         );
@@ -5341,9 +5341,12 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
-fn merge_counter_map(target: &mut BTreeMap<String, u64>, source: BTreeMap<String, u64>) {
+fn merge_static_counter_map(
+    target: &mut BTreeMap<String, u64>,
+    source: BTreeMap<&'static str, u64>,
+) {
     for (key, count) in source {
-        *target.entry(key).or_default() += count;
+        *target.entry(key.to_owned()).or_default() += count;
     }
 }
 
@@ -5436,21 +5439,12 @@ mod tests {
         counters.record_runtime_layout_source_stats(
             php_runtime::layout_stats::RuntimeLayoutSourceStats {
                 value_clone_by_family: BTreeMap::from([
-                    ("stack_register_local_move".to_string(), 5),
-                    ("return_value".to_string(), 2),
+                    ("stack_register_local_move", 5),
+                    ("return_value", 2),
                 ]),
-                array_handle_clone_by_family: BTreeMap::from([(
-                    "array_element_read".to_string(),
-                    3,
-                )]),
-                cow_separation_by_family: BTreeMap::from([(
-                    "by_ref_argument_binding".to_string(),
-                    2,
-                )]),
-                reference_cell_creation_by_family: BTreeMap::from([(
-                    "by_ref_argument_binding".to_string(),
-                    1,
-                )]),
+                array_handle_clone_by_family: BTreeMap::from([("array_element_read", 3)]),
+                cow_separation_by_family: BTreeMap::from([("by_ref_argument_binding", 2)]),
+                reference_cell_creation_by_family: BTreeMap::from([("by_ref_argument_binding", 1)]),
             },
         );
         counters.record_autoload();

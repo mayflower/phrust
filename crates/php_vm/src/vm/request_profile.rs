@@ -38,7 +38,7 @@ struct RequestProfileSample {
 
 impl Vm {
     pub(super) fn request_profile_boundary_start(&self) -> Option<RequestProfileBoundary> {
-        if !self.options.collect_counters {
+        if !self.options.collect_counters || !self.options.collect_profile_spans {
             return None;
         }
         let (rich_instructions, dense_instructions) = self.request_profile_instruction_snapshot();
@@ -127,7 +127,8 @@ impl Vm {
             vm: self,
             category,
             family,
-            start: self.options.collect_counters.then(Instant::now),
+            start: (self.options.collect_counters && self.options.collect_profile_spans)
+                .then(Instant::now),
         }
     }
 
