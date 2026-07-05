@@ -153,11 +153,8 @@ pub fn find_bytes_ascii_case_insensitive_from(
     let first = needle[0];
     let mut search = start;
     while search <= haystack.len().saturating_sub(needle.len()) {
-        let Some(index) =
-            find_ascii_folded_byte(&haystack[search..], first).map(|offset| search + offset)
-        else {
-            return None;
-        };
+        let index =
+            find_ascii_folded_byte(&haystack[search..], first).map(|offset| search + offset)?;
         if index + needle.len() > haystack.len() {
             return None;
         }
@@ -191,9 +188,7 @@ pub fn rfind_bytes_ascii_case_insensitive_before(
     let first = needle[0];
     let mut search_end = end - needle.len() + 1;
     while search_end > 0 {
-        let Some(index) = rfind_ascii_folded_byte(&haystack[..search_end], first) else {
-            return None;
-        };
+        let index = rfind_ascii_folded_byte(&haystack[..search_end], first)?;
         if haystack[index..index + needle.len()].eq_ignore_ascii_case(needle) {
             return Some(index);
         }
@@ -1217,7 +1212,7 @@ mod arch {
 
     pub(super) fn find_json_escape_byte(bytes: &[u8]) -> Option<usize> {
         // SAFETY: NEON is part of the supported aarch64 baseline here.
-        unsafe { find_escape_neon(bytes, &[b'"', b'\\', b'/'], true) }
+        unsafe { find_escape_neon(bytes, b"\"\\/", true) }
     }
 
     pub(super) fn find_html_escape_byte(bytes: &[u8]) -> Option<usize> {
