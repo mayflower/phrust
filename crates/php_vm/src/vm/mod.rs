@@ -55050,9 +55050,28 @@ fn call_xml_runtime_method(
             let index = to_int(&args[0])?;
             Ok(php_runtime::xml::dom_node_list_item(object, index))
         }
-        ("simplexmlelement", "asxml") => {
-            validate_xml_value_count("SimpleXMLElement::asXML", &args, 0, 0)?;
-            Ok(php_runtime::xml::simplexml_as_xml(object))
+        ("simplexmlelement", "asxml") | ("simplexmlelement", "savexml") => {
+            let display_method = if method == "savexml" {
+                "SimpleXMLElement::saveXML"
+            } else {
+                "SimpleXMLElement::asXML"
+            };
+            validate_xml_value_count(display_method, &args, 0, 1)?;
+            let xml = php_runtime::xml::simplexml_as_xml(object);
+            if let Some(value) = args.first()
+                && !matches!(value, Value::Null)
+            {
+                let path = xml_string_arg(display_method, value.clone())?;
+                let Value::String(bytes) = xml else {
+                    return Ok(Value::Bool(false));
+                };
+                return Ok(simplexml_write_xml_file(
+                    runtime_context,
+                    &path,
+                    bytes.as_bytes(),
+                ));
+            }
+            Ok(xml)
         }
         ("simplexmlelement", "attributes") => {
             validate_xml_value_count("SimpleXMLElement::attributes", &args, 0, 0)?;
@@ -55065,6 +55084,21 @@ fn call_xml_runtime_method(
         ("simplexmlelement", "getname") => {
             validate_xml_value_count("SimpleXMLElement::getName", &args, 0, 0)?;
             Ok(php_runtime::xml::simplexml_get_name(object))
+        }
+        ("simplexmlelement", "registerxpathnamespace") => {
+            validate_xml_value_count("SimpleXMLElement::registerXPathNamespace", &args, 2, 2)?;
+            let prefix =
+                xml_string_arg("SimpleXMLElement::registerXPathNamespace", args[0].clone())?;
+            let namespace =
+                xml_string_arg("SimpleXMLElement::registerXPathNamespace", args[1].clone())?;
+            Ok(php_runtime::xml::simplexml_register_xpath_namespace(
+                object, &prefix, &namespace,
+            ))
+        }
+        ("simplexmlelement", "xpath") => {
+            validate_xml_value_count("SimpleXMLElement::xpath", &args, 1, 1)?;
+            let expression = xml_string_arg("SimpleXMLElement::xpath", args[0].clone())?;
+            Ok(php_runtime::xml::simplexml_xpath(object, &expression))
         }
         ("simplexmlelement", "__tostring") => {
             validate_xml_value_count("SimpleXMLElement::__toString", &args, 0, 0)?;
@@ -55400,6 +55434,20 @@ fn xml_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
         _ => return None,
     };
     Some(Value::Int(value))
+}
+
+fn simplexml_write_xml_file(runtime_context: &RuntimeContext, path: &str, bytes: &[u8]) -> Value {
+    let resolved = spl_file_resolve_path(path, runtime_context);
+    if !runtime_context.filesystem.allows_path(&resolved) {
+        return Value::Bool(false);
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&resolved)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_or(Value::Bool(false), |_| Value::Bool(true))
 }
 
 fn xml_reader_open_source(path: &str, runtime_context: &RuntimeContext) -> Result<String, String> {

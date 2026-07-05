@@ -22,6 +22,8 @@ const SIMPLEXML_ENTRIES: &str = "__entries";
 const SIMPLEXML_ENTRY_NAMES: &str = "__entry_names";
 const SIMPLEXML_COUNT: &str = "__phrust_simplexml_count";
 const SIMPLEXML_NAME: &str = "__phrust_simplexml_name";
+const SIMPLEXML_XPATH_ATTRIBUTE: &str = "__phrust_simplexml_xpath_attribute";
+const SIMPLEXML_XPATH_NAMESPACES: &str = "__phrust_simplexml_xpath_namespaces";
 
 pub const XML_READER_NONE: i64 = 0;
 pub const XML_READER_ELEMENT: i64 = 1;
@@ -392,6 +394,13 @@ fn new_simplexml_attribute(name: &str, value: &str) -> ObjectRef {
     object
 }
 
+fn new_simplexml_xpath_attribute(name: &str, value: &str) -> ObjectRef {
+    let object = new_simplexml_attribute(name, value);
+    object.set_property(SIMPLEXML_COUNT, Value::Int(1));
+    object.set_property(SIMPLEXML_XPATH_ATTRIBUTE, Value::Bool(true));
+    object
+}
+
 pub fn new_xml_reader() -> ObjectRef {
     let object = ObjectRef::new_with_display_name(&empty_internal_class("XMLReader"), "XMLReader");
     set_xml_reader_current(&object, None);
@@ -549,6 +558,17 @@ pub fn simplexml_load_string(xml: &str) -> Result<Value, String> {
 }
 
 pub fn simplexml_as_xml(object: &ObjectRef) -> Value {
+    if simplexml_is_xpath_attribute(object) {
+        let name = match simplexml_get_name(object) {
+            Value::String(name) => name.to_string_lossy(),
+            _ => String::new(),
+        };
+        let value = match simplexml_text(object) {
+            Value::String(value) => value.to_string_lossy(),
+            _ => String::new(),
+        };
+        return Value::string(format!(" {name}=\"{}\"", escape_text(&value, true)).into_bytes());
+    }
     document_from_object(object)
         .map(|document| Value::string(serialize_document(&document).into_bytes()))
         .or_else(|| {
@@ -609,6 +629,33 @@ pub fn simplexml_dimension(object: &ObjectRef, key: &ArrayKey) -> Value {
     }
 }
 
+pub fn simplexml_register_xpath_namespace(
+    object: &ObjectRef,
+    prefix: &str,
+    namespace: &str,
+) -> Value {
+    let mut namespaces = match object.get_property(SIMPLEXML_XPATH_NAMESPACES) {
+        Some(Value::Array(namespaces)) => namespaces,
+        _ => PhpArray::new(),
+    };
+    namespaces.insert(
+        ArrayKey::String(PhpString::from(prefix.as_bytes().to_vec())),
+        Value::string(namespace.as_bytes().to_vec()),
+    );
+    object.set_property(SIMPLEXML_XPATH_NAMESPACES, Value::Array(namespaces));
+    Value::Bool(true)
+}
+
+pub fn simplexml_xpath(object: &ObjectRef, expression: &str) -> Value {
+    let Some(context) = simplexml_context_element(object) else {
+        return Value::Array(PhpArray::new());
+    };
+    let Some(path) = parse_simplexml_xpath(expression) else {
+        return Value::Bool(false);
+    };
+    simplexml_xpath_value(&context, &path)
+}
+
 pub fn simplexml_empty_access(object: &ObjectRef) -> bool {
     if let Some(entry) = first_simplexml_entry(object) {
         return simplexml_empty_access(&entry);
@@ -628,6 +675,9 @@ pub fn simplexml_empty_access(object: &ObjectRef) -> bool {
 fn simplexml_numeric_dimension(object: &ObjectRef, index: i64) -> Value {
     if index < 0 {
         return Value::Null;
+    }
+    if index == 0 && simplexml_is_xpath_attribute(object) {
+        return Value::Object(object.clone());
     }
     if let Some(Value::Array(entries)) = object.get_property(SIMPLEXML_ENTRIES) {
         return entries
@@ -670,6 +720,185 @@ fn simplexml_string_dimension(object: &ObjectRef, name: &str) -> Value {
 
 fn simplexml_entries_are_attributes(object: &ObjectRef) -> bool {
     first_simplexml_entry(object).is_some_and(|entry| document_from_object(&entry).is_none())
+}
+
+fn simplexml_is_xpath_attribute(object: &ObjectRef) -> bool {
+    matches!(
+        object.get_property(SIMPLEXML_XPATH_ATTRIBUTE),
+        Some(Value::Bool(true))
+    )
+}
+
+fn simplexml_context_element(object: &ObjectRef) -> Option<XmlElement> {
+    document_from_object(object)
+        .map(|document| document.root)
+        .or_else(|| {
+            first_simplexml_entry(object).and_then(|entry| simplexml_context_element(&entry))
+        })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SimpleXmlXPath {
+    absolute: bool,
+    steps: Vec<SimpleXmlXPathStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SimpleXmlXPathStep {
+    descendant: bool,
+    axis: SimpleXmlXPathAxis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SimpleXmlXPathAxis {
+    Element(String),
+    Attribute(String),
+}
+
+fn parse_simplexml_xpath(expression: &str) -> Option<SimpleXmlXPath> {
+    let mut expression = expression.trim();
+    if expression.is_empty()
+        || expression.contains('[')
+        || expression.contains(']')
+        || expression.contains('(')
+        || expression.contains(')')
+        || expression.contains('|')
+    {
+        return None;
+    }
+    if let Some(rest) = expression.strip_prefix("./") {
+        expression = rest;
+    }
+    let absolute = expression.starts_with('/') && !expression.starts_with("//");
+    if absolute {
+        expression = &expression[1..];
+    }
+
+    let mut steps = Vec::new();
+    let mut rest = expression;
+    while !rest.is_empty() {
+        let mut descendant = false;
+        if let Some(next) = rest.strip_prefix("//") {
+            descendant = true;
+            rest = next;
+        } else if let Some(next) = rest.strip_prefix('/') {
+            rest = next;
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(next) = rest.strip_prefix("./") {
+            rest = next;
+        }
+        let (segment, next) = rest
+            .split_once('/')
+            .map(|(segment, next)| (segment, Some(next)))
+            .unwrap_or((rest, None));
+        if segment.is_empty() || segment == "." {
+            return None;
+        }
+        let axis = if let Some(name) = segment.strip_prefix('@') {
+            if name.is_empty() || !simplexml_xpath_name_is_supported(name) {
+                return None;
+            }
+            SimpleXmlXPathAxis::Attribute(name.to_owned())
+        } else {
+            if !simplexml_xpath_name_is_supported(segment) {
+                return None;
+            }
+            SimpleXmlXPathAxis::Element(segment.to_owned())
+        };
+        steps.push(SimpleXmlXPathStep { descendant, axis });
+        rest = next.unwrap_or_default();
+    }
+
+    Some(SimpleXmlXPath { absolute, steps })
+}
+
+fn simplexml_xpath_name_is_supported(name: &str) -> bool {
+    name == "*"
+        || name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn simplexml_xpath_value(context: &XmlElement, path: &SimpleXmlXPath) -> Value {
+    let mut current = vec![context.clone()];
+    let mut attributes = Vec::new();
+    for (index, step) in path.steps.iter().enumerate() {
+        match &step.axis {
+            SimpleXmlXPathAxis::Element(name) => {
+                if path.absolute && index == 0 && !step.descendant {
+                    current = current
+                        .into_iter()
+                        .filter(|element| simplexml_xpath_name_matches(&element.name, name))
+                        .collect();
+                } else if step.descendant {
+                    let mut next = Vec::new();
+                    for element in &current {
+                        collect_simplexml_xpath_descendants(element, name, &mut next);
+                    }
+                    current = next;
+                } else {
+                    let mut next = Vec::new();
+                    for element in &current {
+                        for child in element_element_children(element) {
+                            if simplexml_xpath_name_matches(&child.name, name) {
+                                next.push(child.clone());
+                            }
+                        }
+                    }
+                    current = next;
+                }
+            }
+            SimpleXmlXPathAxis::Attribute(name) => {
+                if index + 1 != path.steps.len() {
+                    return Value::Array(PhpArray::new());
+                }
+                attributes.clear();
+                for element in &current {
+                    for (attr, value) in &element.attributes {
+                        if simplexml_xpath_name_matches(attr, name) {
+                            attributes.push((attr.clone(), value.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut array = PhpArray::new();
+    if path
+        .steps
+        .last()
+        .is_some_and(|step| matches!(step.axis, SimpleXmlXPathAxis::Attribute(_)))
+    {
+        for (name, value) in attributes {
+            array.append(Value::Object(new_simplexml_xpath_attribute(&name, &value)));
+        }
+    } else {
+        for element in current {
+            array.append(Value::Object(new_simplexml_element(&element)));
+        }
+    }
+    Value::Array(array)
+}
+
+fn collect_simplexml_xpath_descendants(
+    element: &XmlElement,
+    name: &str,
+    out: &mut Vec<XmlElement>,
+) {
+    if simplexml_xpath_name_matches(&element.name, name) {
+        out.push(element.clone());
+    }
+    for child in element_element_children(element) {
+        collect_simplexml_xpath_descendants(child, name, out);
+    }
+}
+
+fn simplexml_xpath_name_matches(candidate: &str, pattern: &str) -> bool {
+    pattern == "*" || candidate == pattern
 }
 
 pub fn simplexml_count_property() -> &'static str {

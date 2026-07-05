@@ -5,7 +5,7 @@
   `simplexml_load_file`, and
   `SimpleXMLElement`
 - Selected manifest: `tests/phpt/manifests/modules/simplexml.selected.jsonl`
-- Selected gate: 7 generated PHPTs covering platform visibility, object
+- Selected gate: 9 generated PHPTs covering platform visibility, object
   access, local file loading, and WordPress-style RSS/plugin/config snippets
 
 ## Runtime Contract
@@ -17,8 +17,10 @@
 - `SimpleXMLElement` supports text conversion, child property access,
   `children()`, `attributes()`, `count()`, `getName()`, array-style attribute
   offsets, numeric child selection offsets, direct `isset()`/`empty()` over
-  properties and offsets, iteration over child elements, duplicate child-list
-  iteration keys, and `asXML()`.
+  properties and offsets, bounded `xpath()` over strict XML elements and
+  attributes, `registerXPathNamespace()` prefix registration, iteration over
+  child elements, duplicate child-list iteration keys, `asXML()`, and
+  `saveXML()` string/filename output.
 - The selected WordPress-style slice covers RSS title/item reads, plugin
   metadata attributes, and simple config option iteration.
 
@@ -29,6 +31,8 @@
 - `tests/phpt/generated/simplexml/children-method.phpt`
 - `tests/phpt/generated/simplexml/count-selections.phpt`
 - `tests/phpt/generated/simplexml/array-offsets-getname.phpt`
+- `tests/phpt/generated/simplexml/xpath-basic.phpt`
+- `tests/phpt/generated/simplexml/asxml-savexml-file.phpt`
 - `tests/phpt/generated/simplexml/load-file.phpt`
 - `tests/phpt/generated/simplexml/wordpress-snippets.phpt`
 
@@ -36,7 +40,7 @@
 
 | Stable ID | Reference behavior summary | Current phrust behavior | Fixture path | Next owner layer |
 | --- | --- | --- | --- | --- |
-| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, `children()`, `count()`, `getName()`, attribute offsets, numeric child selection offsets, direct `isset()`/`empty()`, attributes, text, iteration, duplicate child-list keys, and serialization are implemented. | `tests/phpt/generated/simplexml/array-offsets-getname.phpt` | future SimpleXML/DOM integration |
+| `XML-DOM-INTL-SIMPLEXML-NAMESPACES-XPATH` | PHP SimpleXML supports namespace-aware access, XPath, DOM import, and iterator variants. | Strict string/file loading, direct child access, `children()`, `count()`, `getName()`, attribute offsets, numeric child selection offsets, direct `isset()`/`empty()`, bounded `xpath()`, `registerXPathNamespace()`, attributes, text, iteration, duplicate child-list keys, `asXML()`/`saveXML()`, and serialization are implemented. | `tests/phpt/generated/simplexml/xpath-basic.phpt` | future SimpleXML/DOM integration |
 | `XML-DOM-INTL-SIMPLEXML-LIBXML-ERRORS` | SimpleXML participates in libxml error handling and parse option behavior. | The shared strict parser rejects unsupported constructs without libxml error state. | `tests/phpt/generated/simplexml/simplexml-basic.phpt` | future libxml compatibility layer |
 
 ## Target Gates

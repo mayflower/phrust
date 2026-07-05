@@ -3,5 +3,7 @@
 {"path":"tests/phpt/generated/simplexml/children-method.phpt"}
 {"path":"tests/phpt/generated/simplexml/count-selections.phpt"}
 {"path":"tests/phpt/generated/simplexml/array-offsets-getname.phpt"}
+{"path":"tests/phpt/generated/simplexml/xpath-basic.phpt"}
+{"path":"tests/phpt/generated/simplexml/asxml-savexml-file.phpt"}
 {"path":"tests/phpt/generated/simplexml/load-file.phpt"}
 {"path":"tests/phpt/generated/simplexml/wordpress-snippets.phpt"}
