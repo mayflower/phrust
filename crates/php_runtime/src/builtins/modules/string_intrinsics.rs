@@ -6,7 +6,8 @@
 //! functions, so the fast and generic paths cannot diverge.
 
 use super::core::{
-    HTML_ESCAPE_DEFAULT_FLAGS, find_bytes_from, html_escape_with_options, replace_all,
+    HTML_ESCAPE_DEFAULT_FLAGS, default_trim_mask, find_bytes_from, html_escape_with_options,
+    normalize_offset, replace_all,
 };
 use crate::{PhpArray, PhpString, Value};
 
@@ -74,6 +75,47 @@ pub fn explode_single_byte(separator: u8, subject: &PhpString) -> PhpArray {
     }
     parts.push(Value::string(bytes[start..].to_vec()));
     PhpArray::from_packed(parts)
+}
+
+/// `substr($string, $offset, $length)` over byte offsets, sharing the
+/// generic builtin's normalization: negative offsets count from the end,
+/// negative lengths trim from the end, and out-of-range slices are empty.
+#[must_use]
+pub fn substr_bytes(string: &PhpString, offset: i64, length: Option<i64>) -> PhpString {
+    let bytes = string.as_bytes();
+    let start = normalize_offset(bytes.len(), offset);
+    let end = match length {
+        None => bytes.len(),
+        Some(length) if length >= 0 => start.saturating_add(length as usize).min(bytes.len()),
+        Some(length) => bytes.len().saturating_sub(length.unsigned_abs() as usize),
+    };
+    if start >= bytes.len() || end < start {
+        return PhpString::from(&b""[..]);
+    }
+    if start == 0 && end == bytes.len() {
+        return string.clone();
+    }
+    PhpString::from(&bytes[start..end])
+}
+
+/// `trim($string)` with the default character mask, sharing the generic
+/// builtin's mask table; an untrimmed input shares its storage.
+#[must_use]
+pub fn trim_ascii_default(string: &PhpString) -> PhpString {
+    let mask = default_trim_mask();
+    let bytes = string.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| !mask[usize::from(*byte)])
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !mask[usize::from(*byte)])
+        .map_or(start, |index| index + 1);
+    if start == 0 && end == bytes.len() {
+        return string.clone();
+    }
+    PhpString::from(&bytes[start..end])
 }
 
 #[cfg(test)]

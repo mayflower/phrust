@@ -1406,17 +1406,9 @@ pub(in crate::builtins::modules) fn builtin_substr(
         Some(Value::Null) | None => None,
         Some(value) => Some(int_arg("substr", &value)?),
     };
-    let bytes = string.as_bytes();
-    let start = normalize_offset(bytes.len(), offset);
-    let end = match length {
-        None => bytes.len(),
-        Some(length) if length >= 0 => start.saturating_add(length as usize).min(bytes.len()),
-        Some(length) => bytes.len().saturating_sub(length.unsigned_abs() as usize),
-    };
-    if start >= bytes.len() || end < start {
-        return Ok(Value::string(Vec::new()));
-    }
-    Ok(Value::string(bytes[start..end].to_vec()))
+    Ok(Value::String(super::string_intrinsics::substr_bytes(
+        &string, offset, length,
+    )))
 }
 
 pub(in crate::builtins::modules) fn builtin_strpos(

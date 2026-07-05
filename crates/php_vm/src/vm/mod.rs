@@ -56575,6 +56575,9 @@ enum BuiltinIntrinsicKind {
     StrStartsWith,
     StrToLower,
     StrToUpper,
+    SubstrBytes,
+    TrimDefault,
+    InArrayStrict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56593,6 +56596,9 @@ struct BuiltinIntrinsicSpec {
     counter_name: &'static str,
     return_type: &'static str,
     params: &'static [BuiltinIntrinsicParam],
+    /// Lowest supplied-argument count the fast path accepts.
+    min_arity: usize,
+    /// Highest supplied-argument count the fast path accepts.
     exact_arity: usize,
     kind: BuiltinIntrinsicKind,
 }
@@ -56723,12 +56729,94 @@ const INTRINSIC_STR_REPLACE_PARAMS: &[BuiltinIntrinsicParam] = &[
         by_ref: true,
     },
 ];
+const INTRINSIC_SUBSTR_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "offset",
+        type_decl: "int",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "length",
+        type_decl: "?int",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_TRIM_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "characters",
+        type_decl: "string",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_IN_ARRAY_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "needle",
+        type_decl: "mixed",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "haystack",
+        type_decl: "array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "strict",
+        type_decl: "bool",
+        optional: true,
+        by_ref: false,
+    },
+];
 const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
+    BuiltinIntrinsicSpec {
+        name: "substr",
+        counter_name: "substr_bytes",
+        return_type: "string",
+        params: INTRINSIC_SUBSTR_PARAMS,
+        min_arity: 2,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::SubstrBytes,
+    },
+    BuiltinIntrinsicSpec {
+        name: "trim",
+        counter_name: "trim_default",
+        return_type: "string",
+        params: INTRINSIC_TRIM_PARAMS,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::TrimDefault,
+    },
+    BuiltinIntrinsicSpec {
+        name: "in_array",
+        counter_name: "in_array_strict",
+        return_type: "bool",
+        params: INTRINSIC_IN_ARRAY_PARAMS,
+        min_arity: 3,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::InArrayStrict,
+    },
     BuiltinIntrinsicSpec {
         name: "array_key_exists",
         counter_name: "array_key_exists",
         return_type: "bool",
         params: INTRINSIC_ARRAY_KEY_EXISTS_PARAMS,
+        min_arity: 2,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::ArrayKeyExists,
     },
@@ -56737,6 +56825,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "count",
         return_type: "int",
         params: INTRINSIC_COUNT_PARAMS,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::CountArray,
     },
@@ -56745,6 +56834,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "explode_single_byte",
         return_type: "array",
         params: INTRINSIC_EXPLODE_PARAMS,
+        min_arity: 2,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::ExplodeSingleByte,
     },
@@ -56753,6 +56843,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "htmlspecialchars_default",
         return_type: "string",
         params: INTRINSIC_HTMLSPECIALCHARS_PARAMS,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::HtmlSpecialCharsDefault,
     },
@@ -56761,6 +56852,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "is_array",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::IsArray,
     },
@@ -56769,6 +56861,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "is_int",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::IsInt,
     },
@@ -56777,6 +56870,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "is_string",
         return_type: "bool",
         params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::IsString,
     },
@@ -56785,6 +56879,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "strlen",
         return_type: "int",
         params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::StrLen,
     },
@@ -56793,6 +56888,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "str_contains",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::StrContains,
     },
@@ -56801,6 +56897,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "str_ends_with",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::StrEndsWith,
     },
@@ -56809,6 +56906,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "str_replace_scalar",
         return_type: "string|array",
         params: INTRINSIC_STR_REPLACE_PARAMS,
+        min_arity: 3,
         exact_arity: 3,
         kind: BuiltinIntrinsicKind::StrReplaceScalar,
     },
@@ -56817,6 +56915,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "str_starts_with",
         return_type: "bool",
         params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
         exact_arity: 2,
         kind: BuiltinIntrinsicKind::StrStartsWith,
     },
@@ -56825,6 +56924,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "strtolower",
         return_type: "string",
         params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::StrToLower,
     },
@@ -56833,6 +56933,7 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         counter_name: "strtoupper_ascii",
         return_type: "string",
         params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
         exact_arity: 1,
         kind: BuiltinIntrinsicKind::StrToUpper,
     },
@@ -56910,6 +57011,34 @@ fn fast_builtin_stub_result_for_spec(
                 subject,
             ),
         )),
+        (
+            BuiltinIntrinsicKind::SubstrBytes,
+            [Value::String(string), Value::Int(offset), rest @ ..],
+        ) => {
+            let length = match rest {
+                [] | [Value::Null] => None,
+                [Value::Int(length)] => Some(*length),
+                _ => return None,
+            };
+            Some(Value::String(
+                php_runtime::builtins::string_intrinsics::substr_bytes(string, *offset, length),
+            ))
+        }
+        (BuiltinIntrinsicKind::TrimDefault, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::trim_ascii_default(string),
+        )),
+        (
+            BuiltinIntrinsicKind::InArrayStrict,
+            [
+                needle @ (Value::Int(_) | Value::String(_)),
+                Value::Array(haystack),
+                Value::Bool(true),
+            ],
+        ) => {
+            Some(Value::Bool(haystack.iter().any(|(_, value)| {
+                php_runtime::convert::identical(needle, value)
+            })))
+        }
         _ => None,
     }
 }
@@ -56944,7 +57073,7 @@ fn fast_builtin_stub_fallback_reason_for_spec(
     if !builtin_intrinsic_metadata_matches_cached(spec_index) {
         return Some("metadata");
     }
-    if values.len() != spec.exact_arity {
+    if values.len() < spec.min_arity || values.len() > spec.exact_arity {
         return Some("arity");
     }
     if values
@@ -57021,6 +57150,26 @@ fn builtin_intrinsic_type_fallback(
             BuiltinIntrinsicKind::StrReplaceScalar,
             [Value::String(_), Value::String(_), Value::String(_)],
         ) => None,
+        (
+            BuiltinIntrinsicKind::SubstrBytes,
+            [Value::String(_), Value::Int(_)]
+            | [Value::String(_), Value::Int(_), Value::Int(_) | Value::Null],
+        ) => None,
+        (BuiltinIntrinsicKind::TrimDefault, [Value::String(_)]) => None,
+        (
+            BuiltinIntrinsicKind::InArrayStrict,
+            [
+                Value::Int(_) | Value::String(_),
+                Value::Array(_),
+                Value::Bool(strict),
+            ],
+        ) => {
+            if *strict {
+                None
+            } else {
+                Some("loose_comparison")
+            }
+        }
         (BuiltinIntrinsicKind::StrReplaceScalar, [search, replace, subject]) => {
             if [search, replace, subject]
                 .iter()
@@ -60590,6 +60739,9 @@ fn internal_builtin_generated_named_args_supported(function: &str) -> bool {
         "array_key_exists"
             | "count"
             | "explode"
+            | "in_array"
+            | "substr"
+            | "trim"
             | "htmlspecialchars"
             | "is_array"
             | "is_int"
