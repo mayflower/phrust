@@ -3,24 +3,46 @@
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
 - Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- focused gate: 4 PASS, 0 FAIL, 0 BORK
+- focused gate: 22 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
 - URL encode/decode smoke coverage
 - `http_build_query` array MVP coverage
+- `http_build_query` null separator defaults, references, and RFC3986
+  `encoding_type` coverage
+- Basic `parse_url` component extraction and `PHP_URL_*` constant ordering
 - Default `htmlspecialchars` / `htmlentities` coverage
 
 ## Non-Scope
 
 - Complete entity tables
 - Non-default charsets and flags
-- Object query encoding and RFC mode options
-- Full URL/HTML upstream corpus
+- Object query encoding
+- `parse_url` edge cases beyond the basic upstream corpus
+- Full `parse_str` and URL/HTML upstream corpus
 
 ## Relevant PHPT Paths
 
 - `ext/standard/tests/url/bug53248.phpt`
+- `ext/standard/tests/http/http_build_query/http_build_query_with_null.phpt`
+- `ext/standard/tests/http/http_build_query/http_build_query_with_references.phpt`
+- `ext/standard/tests/http/http_build_query/http_build_query_variation2.phpt`
+- `ext/standard/tests/http/http_build_query/bug26819.phpt`
+- `ext/standard/tests/http/http_build_query/bug77608.phpt`
+- `ext/standard/tests/http/http_build_query/gh12745.phpt`
+- `ext/standard/tests/url/parse_url_basic_001.phpt`
+- `ext/standard/tests/url/parse_url_basic_002.phpt`
+- `ext/standard/tests/url/parse_url_basic_003.phpt`
+- `ext/standard/tests/url/parse_url_basic_004.phpt`
+- `ext/standard/tests/url/parse_url_basic_005.phpt`
+- `ext/standard/tests/url/parse_url_basic_006.phpt`
+- `ext/standard/tests/url/parse_url_basic_007.phpt`
+- `ext/standard/tests/url/parse_url_basic_008.phpt`
+- `ext/standard/tests/url/parse_url_basic_009.phpt`
+- `ext/standard/tests/url/parse_url_basic_010.phpt`
+- `ext/standard/tests/url/parse_url_basic_011.phpt`
+- `ext/standard/tests/url/parse_url_relative_scheme.phpt`
 - `tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt`
@@ -41,11 +63,17 @@
 
 - Added a dedicated selected manifest and generated smoke fixtures for the
   URL/HTML MVP.
-- Existing URL/HTML helpers matched the selected reference cases; no runtime
-  code changes were needed for this focused gate.
-- Latest focused target run: PASS, 4 selected PHPTs.
+- `PHP_QUERY_RFC1738` and `PHP_QUERY_RFC3986` are registered standard
+  constants for query-string encoding mode selection.
+- `http_build_query()` now keeps `null` separators on the PHP default `&`
+  path and honors RFC3986 encoding for named `encoding_type` calls.
+- `parse_url()` covers the basic upstream component extraction set, including
+  partial numeric ports and `PHP_URL_*` iteration order through
+  `get_defined_constants()`.
+- Latest focused target run: PASS, 22 selected PHPTs.
 
 ## Known Gaps
 
-- Full entity-table, charset, flag, RFC-mode, object, and URL edge-case
-  behavior remains outside the selected focused gate.
+- Full entity-table, charset, flag, object-query, `parse_url` edge-case,
+  `parse_str`, and URL edge-case behavior remains outside the selected focused
+  gate.

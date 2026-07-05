@@ -86,7 +86,7 @@ impl ExtensionDescriptor {
         &self.functions
     }
 
-    /// Constant descriptors in stable name order.
+    /// Constant descriptors in extension registration order.
     #[must_use]
     pub fn constants(&self) -> &[ConstantDescriptor] {
         &self.constants
@@ -100,7 +100,6 @@ impl ExtensionDescriptor {
 
     fn sort_symbols(&mut self) {
         self.functions.sort_by_key(FunctionDescriptor::name);
-        self.constants.sort_by_key(ConstantDescriptor::name);
         self.classes.sort_by_key(ClassDescriptor::name);
     }
 }
@@ -348,8 +347,9 @@ pub struct ExtensionRegistry {
 impl ExtensionRegistry {
     /// Creates a registry from descriptors.
     ///
-    /// Names are stored in sorted maps, and every descriptor's local symbol
-    /// lists are sorted, so iteration order is stable across platforms.
+    /// Names are stored in sorted maps. Functions and classes are sorted by
+    /// name, while constants preserve extension registration order because
+    /// PHP-visible APIs expose that order.
     #[must_use]
     pub fn from_extensions(extensions: impl IntoIterator<Item = ExtensionDescriptor>) -> Self {
         let mut map = BTreeMap::new();
@@ -510,7 +510,8 @@ impl ExtensionRegistry {
         functions
     }
 
-    /// Returns enabled constant descriptors in stable order.
+    /// Returns enabled constant descriptors in stable extension and
+    /// registration order.
     #[must_use]
     pub fn enabled_constants(&self) -> Vec<&ConstantDescriptor> {
         let mut constants = Vec::new();
@@ -520,7 +521,6 @@ impl ExtensionRegistry {
             };
             constants.extend(extension.constants());
         }
-        constants.sort_by_key(|constant| constant.name());
         constants
     }
 
@@ -880,6 +880,26 @@ mod tests {
                 "{name} should be registered with its PHP value"
             );
         }
+
+        let php_url_names: Vec<_> = registry
+            .enabled_constants()
+            .into_iter()
+            .map(ConstantDescriptor::name)
+            .filter(|name| name.starts_with("PHP_URL_"))
+            .collect();
+        assert_eq!(
+            php_url_names,
+            [
+                "PHP_URL_SCHEME",
+                "PHP_URL_HOST",
+                "PHP_URL_PORT",
+                "PHP_URL_USER",
+                "PHP_URL_PASS",
+                "PHP_URL_PATH",
+                "PHP_URL_QUERY",
+                "PHP_URL_FRAGMENT",
+            ]
+        );
     }
 
     #[test]

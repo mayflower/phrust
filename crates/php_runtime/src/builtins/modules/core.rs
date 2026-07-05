@@ -1786,11 +1786,15 @@ pub(in crate::builtins::modules) fn parse_php_url_host(
     let host_end = if let Some(port_separator) = port_separator {
         if parsed.port.is_none() {
             let port_start = port_separator + 1;
-            if e - port_start > 5 {
-                return None;
-            }
             if port_start < e {
-                parsed.port = Some(parse_url_port(&bytes[port_start..e])?);
+                let mut port_end = port_start;
+                while port_end < e && bytes[port_end].is_ascii_digit() {
+                    port_end += 1;
+                }
+                if port_end == port_start || port_end - port_start > 5 {
+                    return None;
+                }
+                parsed.port = Some(parse_url_port(&bytes[port_start..port_end])?);
             }
         }
         port_separator
@@ -11217,6 +11221,56 @@ mod tests {
                 );
                 Value::Array(expected)
             }
+        );
+        assert_eq!(
+            call("parse_url", vec![Value::string("x://::6.5")], &mut output,),
+            {
+                let mut expected = PhpArray::new();
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("scheme")),
+                    Value::string("x"),
+                );
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("host")),
+                    Value::string(":"),
+                );
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("port")),
+                    Value::Int(6),
+                );
+                Value::Array(expected)
+            }
+        );
+        assert_eq!(
+            call(
+                "parse_url",
+                vec![Value::string("http://example.com:80abc/path")],
+                &mut output,
+            ),
+            {
+                let mut expected = PhpArray::new();
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("scheme")),
+                    Value::string("http"),
+                );
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("host")),
+                    Value::string("example.com"),
+                );
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("port")),
+                    Value::Int(80),
+                );
+                expected.insert(
+                    ArrayKey::String(PhpString::from_test_str("path")),
+                    Value::string("/path"),
+                );
+                Value::Array(expected)
+            }
+        );
+        assert_eq!(
+            call("parse_url", vec![Value::string("x://::abc/?")], &mut output,),
+            Value::Bool(false)
         );
     }
 
