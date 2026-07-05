@@ -55059,6 +55059,19 @@ fn call_xml_runtime_method(
             let value = xml_string_arg("XMLWriter::text", args[0].clone())?;
             Ok(php_runtime::xml::xml_writer_text(object, &value))
         }
+        ("xmlwriter", "writeelement") => {
+            validate_xml_value_count("XMLWriter::writeElement", &args, 1, 2)?;
+            let name = xml_string_arg("XMLWriter::writeElement", args[0].clone())?;
+            let value = args
+                .get(1)
+                .map(|value| xml_string_arg("XMLWriter::writeElement", value.clone()))
+                .transpose()?;
+            Ok(php_runtime::xml::xml_writer_write_element(
+                object,
+                &name,
+                value.as_deref(),
+            ))
+        }
         ("xmlwriter", "endelement") => {
             validate_xml_value_count("XMLWriter::endElement", &args, 0, 0)?;
             Ok(php_runtime::xml::xml_writer_end_element(object))
@@ -55122,7 +55135,7 @@ fn call_normalizer_static_method(method: &str, args: Vec<Value>) -> Result<Value
 fn internal_extension_static_class(class_name: &str) -> bool {
     matches!(
         normalize_class_name(class_name).as_str(),
-        "normalizer" | "locale" | "pdo" | "phar" | "ffi"
+        "normalizer" | "locale" | "xmlwriter" | "pdo" | "phar" | "ffi"
     )
 }
 
@@ -55134,11 +55147,27 @@ fn call_internal_extension_static_method(
     match normalize_class_name(class_name).as_str() {
         "normalizer" => call_normalizer_static_method(method, args),
         "locale" => call_locale_static_method(method, args),
+        "xmlwriter" => call_xmlwriter_static_method(method, args),
         "pdo" => call_pdo_static_method(method, args),
         "phar" => call_phar_static_method(method, args),
         "ffi" => call_ffi_static_method(method, args),
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not defined"
+        )),
+    }
+}
+
+fn call_xmlwriter_static_method(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "tomemory" => {
+            validate_xml_value_count("XMLWriter::toMemory", &args, 0, 0)?;
+            let object = php_runtime::xml::new_xml_writer();
+            let _ = php_runtime::xml::xml_writer_open_memory(&object);
+            Ok(Value::Object(object))
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method XMLWriter::{method} is not implemented"
         )),
     }
 }

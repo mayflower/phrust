@@ -514,6 +514,18 @@ pub fn xml_writer_text(object: &ObjectRef, value: &str) -> Value {
     Value::Bool(true)
 }
 
+pub fn xml_writer_write_element(object: &ObjectRef, name: &str, value: Option<&str>) -> Value {
+    if !matches!(xml_writer_start_element(object, name), Value::Bool(true)) {
+        return Value::Bool(false);
+    }
+    if let Some(value) = value
+        && !matches!(xml_writer_text(object, value), Value::Bool(true))
+    {
+        return Value::Bool(false);
+    }
+    xml_writer_end_element(object)
+}
+
 pub fn xml_writer_end_element(object: &ObjectRef) -> Value {
     let mut stack = writer_stack(object);
     let names = stack

@@ -9,6 +9,51 @@ use crate::{Value, normalize_class_name, xml};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
+        "xmlwriter_open_memory",
+        builtin_xmlwriter_open_memory,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_start_document",
+        builtin_xmlwriter_start_document,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_start_element",
+        builtin_xmlwriter_start_element,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_write_attribute",
+        builtin_xmlwriter_write_attribute,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_text",
+        builtin_xmlwriter_text,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_write_element",
+        builtin_xmlwriter_write_element,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_end_element",
+        builtin_xmlwriter_end_element,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_end_document",
+        builtin_xmlwriter_end_document,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "xmlwriter_output_memory",
+        builtin_xmlwriter_output_memory,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "xml_parser_create",
         builtin_xml_parser_create,
         BuiltinCompatibility::Php,
@@ -75,6 +120,166 @@ const XML_PARSER_SKIP_WHITE: &str = "__phrust_xml_skip_white";
 const XML_PARSER_CURRENT_BYTE: &str = "__phrust_xml_current_byte";
 const XML_PARSER_CURRENT_LINE: &str = "__phrust_xml_current_line";
 const XML_PARSER_CURRENT_COLUMN: &str = "__phrust_xml_current_column";
+
+fn builtin_xmlwriter_open_memory(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !args.is_empty() {
+        return Err(arity_error("xmlwriter_open_memory", "no arguments"));
+    }
+    let object = xml::new_xml_writer();
+    let _ = xml::xml_writer_open_memory(&object);
+    Ok(Value::Object(object))
+}
+
+fn builtin_xmlwriter_start_document(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(1..=4).contains(&args.len()) {
+        return Err(arity_error(
+            "xmlwriter_start_document",
+            "one to four argument(s)",
+        ));
+    }
+    let writer = xml_writer_arg("xmlwriter_start_document", &args[0])?;
+    Ok(xml::xml_writer_start_document(&writer))
+}
+
+fn builtin_xmlwriter_start_element(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 2 {
+        return Err(arity_error("xmlwriter_start_element", "two arguments"));
+    }
+    let writer = xml_writer_arg("xmlwriter_start_element", &args[0])?;
+    let name = string_arg("xmlwriter_start_element", &args[1])?;
+    Ok(xml::xml_writer_start_element(
+        &writer,
+        &name.to_string_lossy(),
+    ))
+}
+
+fn builtin_xmlwriter_write_attribute(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 3 {
+        return Err(arity_error("xmlwriter_write_attribute", "three arguments"));
+    }
+    let writer = xml_writer_arg("xmlwriter_write_attribute", &args[0])?;
+    let name = string_arg("xmlwriter_write_attribute", &args[1])?;
+    let value = string_arg("xmlwriter_write_attribute", &args[2])?;
+    Ok(xml::xml_writer_write_attribute(
+        &writer,
+        &name.to_string_lossy(),
+        &value.to_string_lossy(),
+    ))
+}
+
+fn builtin_xmlwriter_text(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 2 {
+        return Err(arity_error("xmlwriter_text", "two arguments"));
+    }
+    let writer = xml_writer_arg("xmlwriter_text", &args[0])?;
+    let value = string_arg("xmlwriter_text", &args[1])?;
+    Ok(xml::xml_writer_text(&writer, &value.to_string_lossy()))
+}
+
+fn builtin_xmlwriter_write_element(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(arity_error(
+            "xmlwriter_write_element",
+            "two or three arguments",
+        ));
+    }
+    let writer = xml_writer_arg("xmlwriter_write_element", &args[0])?;
+    let name = string_arg("xmlwriter_write_element", &args[1])?;
+    let value = args
+        .get(2)
+        .map(string_arg_for_xmlwriter_content)
+        .transpose()?;
+    Ok(xml::xml_writer_write_element(
+        &writer,
+        &name.to_string_lossy(),
+        value.as_deref(),
+    ))
+}
+
+fn builtin_xmlwriter_end_element(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error("xmlwriter_end_element", "one argument"));
+    }
+    let writer = xml_writer_arg("xmlwriter_end_element", &args[0])?;
+    Ok(xml::xml_writer_end_element(&writer))
+}
+
+fn builtin_xmlwriter_end_document(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() != 1 {
+        return Err(arity_error("xmlwriter_end_document", "one argument"));
+    }
+    let writer = xml_writer_arg("xmlwriter_end_document", &args[0])?;
+    Ok(xml::xml_writer_end_document(&writer))
+}
+
+fn builtin_xmlwriter_output_memory(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if !(1..=2).contains(&args.len()) {
+        return Err(arity_error(
+            "xmlwriter_output_memory",
+            "one or two arguments",
+        ));
+    }
+    let writer = xml_writer_arg("xmlwriter_output_memory", &args[0])?;
+    Ok(xml::xml_writer_output_memory(&writer))
+}
+
+fn xml_writer_arg(function: &str, value: &Value) -> Result<crate::ObjectRef, BuiltinError> {
+    match value {
+        Value::Object(object) if normalize_class_name(&object.class_name()) == "xmlwriter" => {
+            Ok(object.clone())
+        }
+        value => Err(BuiltinError::new(
+            "E_PHP_RUNTIME_BUILTIN_TYPE",
+            format!(
+                "{function}(): Argument #1 ($writer) must be of type XMLWriter, {} given",
+                php_argument_type_name(value)
+            ),
+        )),
+    }
+}
+
+fn string_arg_for_xmlwriter_content(value: &Value) -> Result<String, BuiltinError> {
+    if matches!(value, Value::Null) {
+        return Ok(String::new());
+    }
+    Ok(string_arg("xmlwriter_write_element", value)?.to_string_lossy())
+}
 
 fn builtin_xml_parser_create(
     _context: &mut BuiltinContext<'_>,
