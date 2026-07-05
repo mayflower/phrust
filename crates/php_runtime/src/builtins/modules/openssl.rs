@@ -1,12 +1,18 @@
 //! OpenSSL-compatible helper builtin slice.
 
-use super::core::{expect_arity, hex_encode, int_arg, string_arg, value_error};
+use super::core::{
+    deref_value, expect_arity, hex_encode, int_arg, read_file_value, string_arg, value_error,
+};
 use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     RuntimeSourceSpan,
 };
 use crate::{ArrayKey, PhpArray, PhpString, Value};
+use ::openssl::hash::MessageDigest;
+use ::openssl::pkey::{PKey, Public};
+use ::openssl::sign::Verifier;
 use ::openssl::symm::{Cipher, Crypter, Mode};
+use ::openssl::x509::X509;
 use base64::{Engine, engine::general_purpose};
 use md5::{Digest as Md5Digest, Md5};
 use sha1::Sha1;
@@ -72,6 +78,12 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 
 const OPENSSL_MD_METHODS: &[&str] = &["md5", "sha1", "sha224", "sha256", "sha384", "sha512"];
 const OPENSSL_CIPHER_METHODS: &[&str] = &["aes-128-cbc", "aes-256-cbc"];
+const OPENSSL_ALGO_MD5: i64 = 2;
+const OPENSSL_ALGO_SHA1: i64 = 1;
+const OPENSSL_ALGO_SHA224: i64 = 6;
+const OPENSSL_ALGO_SHA256: i64 = 7;
+const OPENSSL_ALGO_SHA384: i64 = 8;
+const OPENSSL_ALGO_SHA512: i64 = 9;
 const OPENSSL_RAW_DATA: i64 = 1;
 const OPENSSL_ZERO_PADDING: i64 = 2;
 const OPENSSL_DONT_ZERO_PAD_KEY: i64 = 4;
@@ -383,31 +395,55 @@ fn normalized_cipher_input(input: &[u8], length: usize) -> Vec<u8> {
 pub(in crate::builtins::modules) fn builtin_openssl_verify(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
-    if !(3..=4).contains(&args.len()) {
+    if !(3..=5).contains(&args.len()) {
         return Err(BuiltinError::new(
             "E_PHP_RUNTIME_BUILTIN_ARITY",
-            "builtin openssl_verify expects three or four argument(s)",
+            "builtin openssl_verify expects three to five argument(s)",
         ));
     }
-    let _data = string_arg("openssl_verify", &args[0])?;
-    let _signature = string_arg("openssl_verify", &args[1])?;
-    let _public_key = string_arg("openssl_verify", &args[2])?;
-    if let Some(algorithm) = args.get(3) {
-        match algorithm {
-            Value::Int(_) => {}
-            value => {
-                let _ = string_arg("openssl_verify", value)?;
-            }
+    let data = string_arg("openssl_verify", &args[0])?;
+    let signature = string_arg("openssl_verify", &args[1])?;
+    let public_key = string_arg("openssl_verify", &args[2])?;
+    let Some(digest) = message_digest_for_verify(context, args.get(3))? else {
+        return Ok(Value::Int(-1));
+    };
+    if let Some(padding) = args.get(4) {
+        let padding = int_arg("openssl_verify", padding)?;
+        if padding != 0 {
+            queue_openssl_error(
+                context,
+                "openssl_verify",
+                "Signature padding modes are not implemented by this runtime",
+            );
+            return Ok(Value::Int(-1));
         }
     }
-    queue_openssl_error(
-        context,
-        "openssl_verify",
-        "Public-key verification is not implemented by this runtime",
-    );
-    Ok(Value::Int(-1))
+    let Some(public_key) =
+        public_key_for_verify(context, public_key.to_string_lossy().as_ref(), span)?
+    else {
+        return Ok(Value::Bool(false));
+    };
+    let mut verifier = match Verifier::new(digest, &public_key) {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            queue_openssl_error(context, "openssl_verify", error.to_string());
+            return Ok(Value::Int(-1));
+        }
+    };
+    if let Err(error) = verifier.update(data.as_bytes()) {
+        queue_openssl_error(context, "openssl_verify", error.to_string());
+        return Ok(Value::Int(-1));
+    }
+    match verifier.verify(signature.as_bytes()) {
+        Ok(true) => Ok(Value::Int(1)),
+        Ok(false) => Ok(Value::Int(0)),
+        Err(error) => {
+            queue_openssl_error(context, "openssl_verify", error.to_string());
+            Ok(Value::Int(-1))
+        }
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_openssl_pkey_get_public(
@@ -450,6 +486,71 @@ fn digest_bytes(method: &str, data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn message_digest_for_verify(
+    context: &mut BuiltinContext<'_>,
+    algorithm: Option<&Value>,
+) -> Result<Option<MessageDigest>, BuiltinError> {
+    let digest = match algorithm.map(deref_value) {
+        None => Some(MessageDigest::sha1()),
+        Some(Value::Int(OPENSSL_ALGO_MD5)) => Some(MessageDigest::md5()),
+        Some(Value::Int(OPENSSL_ALGO_SHA1)) => Some(MessageDigest::sha1()),
+        Some(Value::Int(OPENSSL_ALGO_SHA224)) => Some(MessageDigest::sha224()),
+        Some(Value::Int(OPENSSL_ALGO_SHA256)) => Some(MessageDigest::sha256()),
+        Some(Value::Int(OPENSSL_ALGO_SHA384)) => Some(MessageDigest::sha384()),
+        Some(Value::Int(OPENSSL_ALGO_SHA512)) => Some(MessageDigest::sha512()),
+        Some(Value::Int(_)) => None,
+        Some(value) => {
+            let algorithm = string_arg("openssl_verify", &value)?.to_string_lossy();
+            message_digest_for_name(&algorithm)
+        }
+    };
+    if digest.is_none() {
+        queue_openssl_error(context, "openssl_verify", "Unknown digest algorithm");
+    }
+    Ok(digest)
+}
+
+fn message_digest_for_name(name: &str) -> Option<MessageDigest> {
+    match name.to_ascii_lowercase().replace('-', "").as_str() {
+        "md5" => Some(MessageDigest::md5()),
+        "sha1" => Some(MessageDigest::sha1()),
+        "sha224" => Some(MessageDigest::sha224()),
+        "sha256" => Some(MessageDigest::sha256()),
+        "sha384" => Some(MessageDigest::sha384()),
+        "sha512" => Some(MessageDigest::sha512()),
+        _ => None,
+    }
+}
+
+fn public_key_for_verify(
+    context: &mut BuiltinContext<'_>,
+    key: &str,
+    span: RuntimeSourceSpan,
+) -> Result<Option<PKey<Public>>, BuiltinError> {
+    let key_bytes = if let Some(path) = key.strip_prefix("file://") {
+        match read_file_value(context, "openssl_verify", path, span.clone())? {
+            Value::String(bytes) => bytes.as_bytes().to_vec(),
+            _ => return Ok(None),
+        }
+    } else {
+        key.as_bytes().to_vec()
+    };
+    if let Ok(public_key) = PKey::public_key_from_pem(&key_bytes) {
+        return Ok(Some(public_key));
+    }
+    if let Ok(certificate) = X509::from_pem(&key_bytes) {
+        if let Ok(public_key) = certificate.public_key() {
+            return Ok(Some(public_key));
+        }
+    }
+    context.php_warning(
+        "E_PHP_RUNTIME_OPENSSL_KEY",
+        "openssl_verify(): Supplied key param cannot be coerced into a public key",
+        span,
+    );
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn openssl_md_methods_and_verify_gap_are_explicit() {
+    fn openssl_md_methods_and_verify_rsa_sha256() {
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
 
@@ -494,24 +595,49 @@ mod tests {
         assert!(methods.iter().any(|(_, value)| {
             matches!(value, Value::String(method) if method.as_bytes() == b"sha256")
         }));
+        let signature = general_purpose::STANDARD
+            .decode(concat!(
+                "HonyonljJhIXsVVzuSVTSJlOBAsBQpvkXx24d5jmyETYEBFSZBbcJkJJAq5fD1GX",
+                "V+tcY3UEH0rt2+l9WPdTAFnykcfiEiRfyQ4VuS4pGDvuyRv/K0qIIv8XPfY4+jwef",
+                "68g9gp+6GItQzCAeG67hVq/qVfC7tUmNsBkxlHo2kQ="
+            ))
+            .expect("base64 signature");
+        let public_key = concat!(
+            "-----BEGIN PUBLIC KEY-----\n",
+            "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDLXp6PkCtbpV+P1gwFQWH6Ez0U\n",
+            "83uEmS8IGnpeI8Fk8rY/vHOZzZZaxRCw+loyc342qCDIQheMOCNm5Fkevz06q757\n",
+            "/oooiLR3yryYGKiKG1IZIiplmtsC95oKrzUSKk60wuI1mbgpMUP5LKi/Tvxes5Pm\n",
+            "kUtXfimz2qgkeUcPpQIDAQAB\n",
+            "-----END PUBLIC KEY-----\n",
+        );
         assert_eq!(
             builtin_openssl_verify(
                 &mut context,
                 vec![
                     Value::string("data"),
-                    Value::string("signature"),
-                    Value::string("public-key"),
+                    Value::string(signature.clone()),
+                    Value::string(public_key),
+                    Value::Int(OPENSSL_ALGO_SHA256),
                 ],
                 RuntimeSourceSpan::default(),
             )
-            .expect("verify gap"),
-            Value::Int(-1)
+            .expect("verify valid signature"),
+            Value::Int(1)
         );
-        assert!(matches!(
-            builtin_openssl_error_string(&mut context, vec![], RuntimeSourceSpan::default())
-                .expect("queued verify error"),
-            Value::String(_)
-        ));
+        assert_eq!(
+            builtin_openssl_verify(
+                &mut context,
+                vec![
+                    Value::string("wrong"),
+                    Value::string(signature),
+                    Value::string(public_key),
+                    Value::Int(OPENSSL_ALGO_SHA256),
+                ],
+                RuntimeSourceSpan::default(),
+            )
+            .expect("verify invalid signature"),
+            Value::Int(0)
+        );
         assert_eq!(
             builtin_openssl_error_string(&mut context, vec![], RuntimeSourceSpan::default())
                 .expect("drained queue"),

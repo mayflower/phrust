@@ -115,10 +115,9 @@ Implemented functions: `openssl_random_pseudo_bytes`, `openssl_digest`,
 `openssl_get_publickey`, `openssl_error_string`, and `openssl_verify`.
 
 Digest methods: `md5`, `sha1`, `sha224`, `sha256`, `sha384`, and `sha512`.
-`openssl_verify` is present but returns `-1` as an explicit verification gap
-until a real key parser and signature verifier are introduced. Certificate
-parsing, key generation, PKCS#12, encrypt/decrypt APIs, and full OpenSSL parity
-remain gaps.
+`openssl_verify` performs selected PEM public-key RSA/SHA256 verification.
+Certificate/key object modeling, signature generation, PKCS#12, PSS padding,
+broader encrypt/decrypt APIs, and full OpenSSL parity remain gaps.
 
 ## Feature Status
 
@@ -136,6 +135,6 @@ remain gaps.
 - Local loopback HTTP GET/POST MVP is available behind `PHRUST_NET_TESTS=1`.
 - First-cause DB/network diagnostics are implemented for the selected MySQLi
   and cURL false-return paths and deliberately redact DSNs/passwords.
-- Selected digest/random/method helpers are implemented with an explicit
-  verification gap.
+- Selected digest/random/method helpers and RSA/SHA256 verification are
+  implemented.
 - Closeout reporting and non-network baseline gates are recorded.

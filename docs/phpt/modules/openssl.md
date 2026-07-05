@@ -17,7 +17,12 @@ application update, hashing, and security probes:
 - `openssl_get_cipher_methods`
 - `openssl_cipher_iv_length`
 - `openssl_verify`
+- `OPENSSL_ALGO_MD5`
+- `OPENSSL_ALGO_SHA1`
+- `OPENSSL_ALGO_SHA224`
 - `OPENSSL_ALGO_SHA256`
+- `OPENSSL_ALGO_SHA384`
+- `OPENSSL_ALGO_SHA512`
 - `OPENSSL_RAW_DATA`
 - `OPENSSL_ZERO_PADDING`
 - `OPENSSL_DONT_ZERO_PAD_KEY`
@@ -32,15 +37,16 @@ returns the selected false result until key-length override behavior is
 implemented. Selected cipher failures and unsupported public-key helpers append
 request-local OpenSSL error strings that `openssl_error_string()` drains in FIFO
 order, returning `false` when the queue is empty.
-`openssl_verify()` intentionally returns the explicit unsupported verification
-result covered by the selected fixture; it does not fake signature validation.
+`openssl_verify()` performs selected PEM public-key RSA/SHA256 verification and
+returns PHP-style `1`/`0` results for valid and invalid signatures.
 
 ## Gaps
 
-Certificate parsing, key loading, signature verification parity,
-AEAD cipher modes, stream TLS contexts, host OpenSSL configuration, and
-certificate-store behavior remain unsupported until backed by deterministic
-fixtures and an approved dependency strategy.
+Certificate/key object modeling, signature generation, PSS padding
+verification, broad certificate parsing, AEAD cipher modes, stream TLS
+contexts, host OpenSSL configuration, and certificate-store behavior remain
+unsupported until backed by deterministic fixtures and an approved dependency
+strategy.
 
 ## Source References
 

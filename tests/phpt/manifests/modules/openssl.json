@@ -10,8 +10,8 @@
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":203,
-  "scope":["openssl extension visibility","openssl_random_pseudo_bytes","openssl_digest","openssl_get_md_methods","openssl_get_cipher_methods","openssl_cipher_iv_length","selected openssl_encrypt/decrypt AES-CBC behavior","selected openssl_error_string queue drain behavior","explicit openssl_verify unsupported-result contract","OPENSSL_ALGO_SHA256","OPENSSL_RAW_DATA","OPENSSL_ZERO_PADDING","OPENSSL_DONT_ZERO_PAD_KEY"],
-  "non_scope":["certificate/key parsing","AEAD cipher modes","OPENSSL_DONT_ZERO_PAD_KEY behavior beyond explicit false result","signature verification parity","TLS stream transport","host OpenSSL configuration"],
+  "scope":["openssl extension visibility","openssl_random_pseudo_bytes","openssl_digest","openssl_get_md_methods","openssl_get_cipher_methods","openssl_cipher_iv_length","selected openssl_encrypt/decrypt AES-CBC behavior","selected openssl_error_string queue drain behavior","selected openssl_verify RSA/SHA256 PEM public-key behavior","OPENSSL_ALGO_MD5","OPENSSL_ALGO_SHA1","OPENSSL_ALGO_SHA224","OPENSSL_ALGO_SHA256","OPENSSL_ALGO_SHA384","OPENSSL_ALGO_SHA512","OPENSSL_RAW_DATA","OPENSSL_ZERO_PADDING","OPENSSL_DONT_ZERO_PAD_KEY"],
+  "non_scope":["certificate/key object model","AEAD cipher modes","OPENSSL_DONT_ZERO_PAD_KEY behavior beyond explicit false result","signature generation parity","PSS padding verification","TLS stream transport","host OpenSSL configuration"],
   "target_gates":["nix develop -c cargo test -p php_runtime openssl","nix develop -c just phpt-dev-module MODULE=openssl","nix develop -c just phpt-dev-module MODULE=closure.extensions"],
   "next_step":"Promote certificate/key helpers, AEAD cipher modes, and key/signature parsing only with dependency-backed deterministic fixtures."
 }

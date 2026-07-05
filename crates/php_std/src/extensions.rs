@@ -2119,14 +2119,34 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
 pub(super) fn standard_library_openssl_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("openssl")
         .with_constant(ConstantDescriptor::with_value(
+            "OPENSSL_ALGO_MD5",
+            "openssl",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "OPENSSL_ALGO_SHA1",
             "openssl",
             ConstantValue::Int(1),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "OPENSSL_ALGO_SHA224",
+            "openssl",
+            ConstantValue::Int(6),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "OPENSSL_ALGO_SHA256",
             "openssl",
             ConstantValue::Int(7),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "OPENSSL_ALGO_SHA384",
+            "openssl",
+            ConstantValue::Int(8),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "OPENSSL_ALGO_SHA512",
+            "openssl",
+            ConstantValue::Int(9),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "OPENSSL_RAW_DATA",

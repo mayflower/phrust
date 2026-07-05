@@ -25,7 +25,7 @@
   `openssl_get_md_methods`, `openssl_pkey_get_public`,
   `openssl_get_publickey`, `openssl_error_string`, and `openssl_verify`.
   Digest/random/method helpers are real; public-key helpers fail coherently and
-  `openssl_verify` returns `-1` as the explicit key-verification gap.
+  `openssl_verify` performs selected PEM public-key RSA/SHA256 verification.
 
 ## Fixtures
 
@@ -61,8 +61,8 @@ Rust cURL unit coverage uses an in-process loopback server.
   extension policy and known-gap reports.
 - cURL HTTPS transport is not implemented; SSL verification options are
   accepted but do not imply TLS support.
-- OpenSSL signature verification, certificate parsing, key management, and
-  encrypt/decrypt APIs remain gaps.
+- OpenSSL signature generation, broad certificate parsing, key management, PSS
+  padding, and broader encrypt/decrypt APIs remain gaps.
 - MySQL live behavior depends on an explicitly configured local
   `PHRUST_MYSQL_TEST_DSN`; default runs prove capability gating, not database
   availability.
