@@ -15127,6 +15127,23 @@ impl Vm {
                             }
                             continue;
                         }
+                        if is_xsl_runtime_class(&class_name) {
+                            let object = match new_xsl_object(&class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
                         if is_pdo_runtime_class(&class_name) {
                             let object = match new_pdo_object(
                                 &class_name,
@@ -16052,6 +16069,31 @@ impl Vm {
                                     }
                                 };
                             let object = match new_imagick_object(class_name, values) {
+                                Ok(object) => object,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame was pushed")
+                                .registers
+                                .set(*dst, Value::Object(object))
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_xsl_runtime_class(class_name) {
+                            let values =
+                                match read_call_args_at_frame(unit, stack, frame_index, args) {
+                                    Ok(values) => values,
+                                    Err(message) => {
+                                        return self
+                                            .runtime_error(output, compiled, stack, message);
+                                    }
+                                };
+                            let object = match new_xsl_object(class_name, values) {
                                 Ok(object) => object,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -25413,6 +25455,23 @@ impl Vm {
                         }
                         if is_imagick_runtime_class(&object.class_name()) {
                             let value = match call_imagick_method(&object, method, values) {
+                                Ok(value) => value,
+                                Err(message) => {
+                                    return self.runtime_error(output, compiled, stack, message);
+                                }
+                            };
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("frame is active")
+                                .registers
+                                .set(*dst, value)
+                            {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            continue;
+                        }
+                        if is_xsl_runtime_class(&object.class_name()) {
+                            let value = match call_xsl_method(&object, method, values) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -49800,6 +49859,7 @@ pub(crate) fn dense_new_object_lowering_supported(class_name: &str) -> bool {
         || is_spl_file_runtime_class(class_name)
         || is_std_class_runtime_class(class_name)
         || is_imagick_runtime_class(class_name)
+        || is_xsl_runtime_class(class_name)
         || is_date_time_runtime_class(class_name))
 }
 
@@ -51181,6 +51241,32 @@ fn call_imagick_method(
 ) -> Result<Value, String> {
     Err(format!(
         "E_PHP_VM_UNSUPPORTED_IMAGICK: method {}::{method} requires an ImageMagick backend capability gate",
+        object.display_name()
+    ))
+}
+
+fn is_xsl_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "xsltprocessor"
+}
+
+fn new_xsl_object(class_name: &str, _args: Vec<CallArgument>) -> Result<ObjectRef, String> {
+    if !is_xsl_runtime_class(class_name) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
+        ));
+    }
+    Err(format!(
+        "E_PHP_VM_UNSUPPORTED_XSL: class {class_name} requires a libxslt backend capability gate"
+    ))
+}
+
+fn call_xsl_method(
+    object: &ObjectRef,
+    method: &str,
+    _args: Vec<CallArgument>,
+) -> Result<Value, String> {
+    Err(format!(
+        "E_PHP_VM_UNSUPPORTED_XSL: method {}::{method} requires a libxslt backend capability gate",
         object.display_name()
     ))
 }
@@ -64114,6 +64200,7 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
         "xmlparser" => Some(internal_empty_class_entry("xmlparser", "XMLParser")),
         "xmlreader" => Some(internal_empty_class_entry("xmlreader", "XMLReader")),
         "xmlwriter" => Some(internal_empty_class_entry("xmlwriter", "XMLWriter")),
+        "xsltprocessor" => Some(internal_empty_class_entry("xsltprocessor", "XSLTProcessor")),
         "normalizer" => Some(internal_empty_class_entry("normalizer", "Normalizer")),
         "ffi" => Some(internal_empty_class_entry("ffi", "FFI")),
         "ffi\\cdata" => Some(internal_empty_class_entry("ffi\\cdata", "FFI\\CData")),
@@ -89860,6 +89947,27 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
             b"loaded|class|draw|method|Imagick:imagick|"
         );
         assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNSUPPORTED_IMAGICK");
+    }
+
+    #[test]
+    fn xsl_surface_fails_closed_without_libxslt_backend() {
+        let result = execute_source(
+            r#"<?php
+            echo extension_loaded("xsl") ? "loaded|" : "missing|";
+            echo class_exists("XSLTProcessor", false) ? "class|" : "no-class|";
+            echo method_exists("XSLTProcessor", "hasExsltSupport") ? "method|" : "no-method|";
+            $reflection = new ReflectionClass("XSLTProcessor");
+            echo $reflection->getName(), ":", $reflection->getExtensionName(), "|";
+            new XSLTProcessor();
+            "#,
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            result.output.as_bytes(),
+            b"loaded|class|method|XSLTProcessor:xsl|"
+        );
+        assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNSUPPORTED_XSL");
     }
 
     #[test]

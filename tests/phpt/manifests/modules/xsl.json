@@ -4,14 +4,14 @@
   "priority":"bounded-facade focused",
   "selected_manifest":"tests/phpt/manifests/modules/xsl.selected.jsonl",
   "corpus_count":72,
-  "selected_count":1,
-  "pass_count":1,
+  "selected_count":2,
+  "pass_count":2,
   "skip_count":0,
   "fail_count":0,
   "bork_count":0,
   "known_failure_count":72,
-  "scope":["extension_loaded(\"xsl\")","XSLTProcessor class visibility","stable XSL clone constants","stable XSL security-preference constants"],
-  "non_scope":["full upstream ext/xsl corpus","XSLTProcessor construction and methods","libxslt integration","stylesheet transforms","PHP callback registration","libxslt version constants"],
+  "scope":["extension_loaded(\"xsl\")","XSLTProcessor class visibility","XSLTProcessor reflection metadata","XSLTProcessor method visibility","stable XSL clone constants","stable XSL security-preference constants","deterministic libxslt backend gate for construction"],
+  "non_scope":["full upstream ext/xsl corpus","successful XSLTProcessor construction and methods","libxslt integration","stylesheet transforms","PHP callback registration","libxslt version constants"],
   "target_gates":["PHPT_REUSE_LAST=0 PHPT_DEV_REUSE_TARGET_PASS=0 nix develop -c just phpt-dev-module MODULE=xsl","nix develop -c just verify-phpt"],
-  "next_step":"Add a dedicated XSL owner layer and libxslt dependency decision before promoting transform PHPTs."
+  "next_step":"Add libxslt/libexslt integration and DOMDocument handle interop before promoting transform PHPTs."
 }
