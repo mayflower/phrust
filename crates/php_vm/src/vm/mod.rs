@@ -5972,10 +5972,11 @@ impl Vm {
                     ));
                 }
             }
-            if self.options.dense_jump_threading.is_enabled() {
+            if self.options.dense_jump_threading.is_enabled() && plan.unit.has_jump_trampolines() {
                 // Verifier-bracketed with rollback: a threading result that
                 // fails verification restores the pre-pass unit instead of
-                // dropping the whole plan.
+                // dropping the whole plan. The trampoline pre-scan keeps the
+                // snapshot clone off the common no-trampoline path.
                 let snapshot = plan.unit.clone();
                 let report = plan.unit.thread_jump_chains();
                 if report.threaded_edges > 0 && plan.unit.verify().is_err() {
@@ -6066,7 +6067,7 @@ impl Vm {
                 ));
             }
         }
-        if self.options.dense_jump_threading.is_enabled() {
+        if self.options.dense_jump_threading.is_enabled() && dense.has_jump_trampolines() {
             let snapshot = dense.clone();
             let report = dense.thread_jump_chains();
             if report.threaded_edges > 0 && dense.verify().is_err() {

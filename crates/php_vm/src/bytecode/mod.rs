@@ -919,6 +919,28 @@ impl DenseBytecodeUnit {
     /// dense instruction ids, source maps, and adaptive site keys stay
     /// stable. Chains resolve with a bounded hop count and cycles fall back
     /// to the original target.
+    /// Cheap pre-scan: true when any function contains a bare-jump
+    /// trampoline block. Callers use this to skip the rollback snapshot in
+    /// the common no-trampoline case.
+    #[must_use]
+    pub fn has_jump_trampolines(&self) -> bool {
+        self.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instruction_len == 1
+                    && function
+                        .instructions
+                        .get(block.terminator as usize)
+                        .is_some_and(|instruction| {
+                            instruction.opcode == DenseOpcode::Jump
+                                && matches!(
+                                    instruction.operands,
+                                    DenseOperands::Jump { target } if target != block.id
+                                )
+                        })
+            })
+        })
+    }
+
     pub fn thread_jump_chains(&mut self) -> DenseJumpThreadingReport {
         let mut report = DenseJumpThreadingReport::default();
         for function in &mut self.functions {

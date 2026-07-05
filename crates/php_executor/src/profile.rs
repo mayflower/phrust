@@ -109,7 +109,10 @@ impl EngineProfile {
             EngineProfileName::Default => {
                 vm_options.execution_format = ExecutionFormat::Auto;
                 vm_options.superinstructions = SuperinstructionMode::On;
-                vm_options.dense_jump_threading = DenseJumpThreadingMode::On;
+                // Measured at ~zero threaded edges on the corpus while the
+                // rollback snapshot clones the whole dense unit per request;
+                // stays opt-in via --dense-jump-threading until it pays.
+                vm_options.dense_jump_threading = DenseJumpThreadingMode::Off;
                 vm_options.bytecode_layout = BytecodeLayoutMode::Source;
                 vm_options.quickening = QuickeningMode::On;
                 vm_options.inline_caches = InlineCacheMode::On;
@@ -123,7 +126,10 @@ impl EngineProfile {
             EngineProfileName::ExperimentalJit => {
                 vm_options.execution_format = ExecutionFormat::Auto;
                 vm_options.superinstructions = SuperinstructionMode::On;
-                vm_options.dense_jump_threading = DenseJumpThreadingMode::On;
+                // Measured at ~zero threaded edges on the corpus while the
+                // rollback snapshot clones the whole dense unit per request;
+                // stays opt-in via --dense-jump-threading until it pays.
+                vm_options.dense_jump_threading = DenseJumpThreadingMode::Off;
                 vm_options.bytecode_layout = BytecodeLayoutMode::Source;
                 vm_options.quickening = QuickeningMode::On;
                 vm_options.inline_caches = InlineCacheMode::On;
@@ -171,6 +177,7 @@ impl PhpExecutorOptions {
         Self {
             optimization_level: profile.optimization_level,
             vm_options: profile.vm_options,
+            collect_quickening_feedback: false,
         }
     }
 }

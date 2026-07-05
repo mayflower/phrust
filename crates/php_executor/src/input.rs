@@ -12,6 +12,11 @@ use std::path::PathBuf;
 pub struct PhpExecutorOptions {
     pub optimization_level: OptimizationLevel,
     pub vm_options: VmOptions,
+    /// Export adaptive quickening sites after each execution. Off by
+    /// default: the export walks the whole quickening table, which
+    /// servers must not pay per request; the CLI enables it when it
+    /// persists a feedback sidecar.
+    pub collect_quickening_feedback: bool,
 }
 
 impl Default for PhpExecutorOptions {

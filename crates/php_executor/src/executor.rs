@@ -138,7 +138,11 @@ impl PhpExecutor {
             ..self.options.vm_options.clone()
         });
         let result = vm.execute(compiled.executable_unit());
-        let quickening_feedback = vm.export_persistent_quickening();
+        let quickening_feedback = if self.options.collect_quickening_feedback {
+            vm.export_persistent_quickening()
+        } else {
+            Vec::new()
+        };
         let mut output = execution_output_from_vm(&compiled.path, &compiled.source, result);
         output.quickening_feedback = quickening_feedback;
         output

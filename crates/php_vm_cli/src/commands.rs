@@ -963,17 +963,14 @@ where
         );
     }
     let jit_eligibility_json = build_jit_eligibility_json(compiled.ir_unit(), run_options.jit);
-    let persistent_feedback = prepare_persistent_feedback(
-        run_options,
-        path,
-        compiled.ir_unit(),
-        cache_context.as_ref(),
-    )?;
+    let persistent_feedback =
+        prepare_persistent_feedback(run_options, path, cache_context.as_ref())?;
     vm_options.quickening_seed = persistent_feedback.quickening_seed();
     let started = Instant::now();
     let executor = PhpExecutor::with_options(PhpExecutorOptions {
         optimization_level: run_options.opt_level,
         vm_options,
+        collect_quickening_feedback: persistent_feedback.write_path.is_some(),
     });
     if let Some(timings) = timings.as_mut() {
         timings.record_phase("vm_construct_ms", started);
@@ -1977,7 +1974,6 @@ fn persistent_feedback_env_enabled() -> bool {
 fn prepare_persistent_feedback(
     run_options: &RunOptions<'_>,
     path: &str,
-    unit: &IrUnit,
     cache_context: Option<&BytecodeCacheContext>,
 ) -> Result<PersistentFeedbackRuntime, String> {
     let default_enabled = persistent_feedback_env_enabled() && cache_context.is_some();
@@ -1994,7 +1990,7 @@ fn prepare_persistent_feedback(
             write_path: None,
         });
     }
-    let context = persistent_feedback_context(path, run_options, unit)?;
+    let context = persistent_feedback_context(path, run_options)?;
     let default_path = cache_context.and_then(|cache| {
         cache
             .cache_file
@@ -2069,7 +2065,6 @@ fn store_persistent_feedback(
 fn persistent_feedback_context(
     path: &str,
     run_options: &RunOptions<'_>,
-    unit: &IrUnit,
 ) -> Result<PersistentFeedbackContext, String> {
     let source = read_source_bytes(path)?;
     let source_path = fs::canonicalize(path)
@@ -2087,12 +2082,20 @@ fn persistent_feedback_context(
             .with_runtime_config("script_env_count", run_options.env.len().to_string()),
     )
     .map_err(|error| format!("persistent feedback fingerprint: {error}"))?;
+    // The IR is a deterministic function of (source digest, lowering
+    // revision, compile options), all already covered by the key, so derive
+    // the IR fingerprint from them instead of rendering the whole unit to
+    // text on every run - that render is O(unit) and dominated large-app
+    // startup.
+    let ir_fingerprint = stable_feedback_fingerprint(
+        format!("{}:{}", fingerprint.digest, php_ir::IR_LOWERING_REVISION).as_bytes(),
+    );
     Ok(PersistentFeedbackContext::new(
         fingerprint.digest,
         env!("CARGO_PKG_VERSION"),
         PHP_TARGET_VERSION,
         persistent_feedback_compile_options(run_options),
-        stable_feedback_fingerprint(unit.to_snapshot_text().as_bytes()),
+        ir_fingerprint,
         PersistentFeedbackEpochs::default(),
         rust_target_label(),
     ))

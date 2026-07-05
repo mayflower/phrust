@@ -15,6 +15,9 @@ use crate::source_map::{IrSourceMapTarget, IrSpan};
 #[derive(Debug)]
 pub struct IrBuilder {
     unit: IrUnit,
+    /// Normalized-name index over `unit.function_table` for O(1) call-site
+    /// resolution during lowering.
+    function_name_index: std::collections::HashMap<String, FunctionId>,
 }
 
 impl IrBuilder {
@@ -23,6 +26,7 @@ impl IrBuilder {
     pub fn new(id: UnitId) -> Self {
         Self {
             unit: IrUnit::new(id),
+            function_name_index: std::collections::HashMap::new(),
         }
     }
 
@@ -71,10 +75,11 @@ impl IrBuilder {
 
     /// Registers a normalized function lookup name.
     pub fn register_function_name(&mut self, name: impl Into<String>, function: FunctionId) {
-        self.unit.function_table.push(FunctionEntry {
-            name: name.into(),
-            function,
-        });
+        let name = name.into();
+        self.function_name_index.insert(name.clone(), function);
+        self.unit
+            .function_table
+            .push(FunctionEntry { name, function });
     }
 
     /// Registers a runtime-visible global constant name.
@@ -139,13 +144,12 @@ impl IrBuilder {
     }
 
     /// Resolves a registered (unconditional) unit function by normalized name.
+    ///
+    /// Constant-time: call lowering consults this per static call site, so a
+    /// table scan would make lowering quadratic in unit size.
     #[must_use]
     pub fn registered_function(&self, normalized_name: &str) -> Option<FunctionId> {
-        self.unit
-            .function_table
-            .iter()
-            .find(|entry| entry.name == normalized_name)
-            .map(|entry| entry.function)
+        self.function_name_index.get(normalized_name).copied()
     }
 
     /// Returns the declared parameters for a function.
