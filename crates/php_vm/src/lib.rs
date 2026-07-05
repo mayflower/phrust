@@ -69,7 +69,7 @@ pub mod api {
         ResolvedIncludePath,
     };
     pub use crate::inline_cache::InlineCacheMode;
-    pub use crate::quickening::QuickeningMode;
+    pub use crate::quickening::{QuickeningMode, QuickeningSiteKey, QuickeningSiteSnapshot};
     pub use crate::tiering::{TieringOptions, TieringStats};
     pub use crate::vm::{
         BytecodeLayoutMode, ExecutionFormat, JitBlacklistMode, JitMode, SuperinstructionMode, Vm,
@@ -151,8 +151,8 @@ pub mod experimental {
     };
     #[doc(hidden)]
     pub use crate::quickening::{
-        QuickeningMode, QuickeningObservation, QuickeningSpecialization, QuickeningState,
-        QuickeningTable,
+        QuickeningMode, QuickeningObservation, QuickeningSiteKey, QuickeningSiteSnapshot,
+        QuickeningSpecialization, QuickeningState, QuickeningTable,
     };
     #[doc(hidden)]
     pub use crate::region_profile::{
@@ -232,8 +232,8 @@ pub use persistent_feedback::{
 };
 #[doc(hidden)]
 pub use quickening::{
-    QuickeningMode, QuickeningObservation, QuickeningSpecialization, QuickeningState,
-    QuickeningTable,
+    QuickeningMode, QuickeningObservation, QuickeningSiteKey, QuickeningSiteSnapshot,
+    QuickeningSpecialization, QuickeningState, QuickeningTable,
 };
 #[doc(hidden)]
 pub use region_profile::{

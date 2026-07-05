@@ -2055,6 +2055,11 @@ impl Vm {
         self.argument_vector_observers.borrow_mut().clear();
         self.trivial_method_plans.borrow_mut().clear();
         *self.quickening.borrow_mut() = QuickeningTable::default();
+        if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
+            self.quickening
+                .borrow_mut()
+                .seed_persistent_sites(&self.options.quickening_seed);
+        }
         *self.inline_caches.borrow_mut() = InlineCacheTable::default();
         *self.jit.borrow_mut() = JitRuntimeState::default();
         *self.tiering.borrow_mut() = TieringState::new(self.options.tiering.clone());
@@ -2265,6 +2270,13 @@ impl Vm {
             result.tiering_stats = Some(self.tiering.borrow().stats());
         }
         result
+    }
+
+    /// Exports adaptive quickening sites observed by the last `execute` call
+    /// for persistent feedback. Empty when quickening was disabled.
+    #[must_use]
+    pub fn export_persistent_quickening(&self) -> Vec<crate::quickening::QuickeningSiteSnapshot> {
+        self.quickening.borrow().export_persistent_sites()
     }
 
     fn should_skip_adaptive_tiny_unit_setup(&self, unit: &IrUnit) -> bool {

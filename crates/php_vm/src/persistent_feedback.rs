@@ -6,6 +6,11 @@
 //! execution.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use crate::quickening::{
+    QuickeningSiteKey, QuickeningSiteSnapshot, QuickeningSpecialization, QuickeningState,
+};
 
 /// Stable line-format header for advisory persistent feedback files.
 pub const PERSISTENT_FEEDBACK_FORMAT_VERSION: &str = "phrust-persistent-feedback-v1";
@@ -128,6 +133,82 @@ impl PersistentFeedbackContext {
         }
 
         PersistentFeedbackLoadReport::new(store, stats)
+    }
+
+    /// Renders exported quickening sites into the v1 line format this
+    /// context will accept back on the next load.
+    #[must_use]
+    pub fn render_sites(&self, sites: &[QuickeningSiteSnapshot]) -> String {
+        let mut text = String::with_capacity(64 + sites.len() * 256);
+        text.push_str(PERSISTENT_FEEDBACK_FORMAT_VERSION);
+        text.push('\n');
+        for snapshot in sites {
+            let (function, instruction, site_fields) = match snapshot.site {
+                QuickeningSiteKey::Ir {
+                    function,
+                    block,
+                    instruction,
+                } => (function, instruction, format!("site=ir block={block}")),
+                QuickeningSiteKey::Dense {
+                    unit,
+                    function,
+                    instruction,
+                } => (
+                    function,
+                    instruction,
+                    format!("site=dense dense_unit={unit}"),
+                ),
+            };
+            let (quickening_state, callsite_state, blacklisted) = match snapshot.state {
+                QuickeningState::Specialized => ("specialized", "monomorphic", false),
+                QuickeningState::Blacklisted => ("blacklisted", "blacklisted", true),
+                QuickeningState::Uninitialized
+                | QuickeningState::Observing
+                | QuickeningState::Dequickened => continue,
+            };
+            let (specialization, scalars, array_fields) = match snapshot.specialization {
+                Some(QuickeningSpecialization::AddIntInt) => ("add_int_int", "int,int", ""),
+                Some(QuickeningSpecialization::SubIntInt) => ("sub_int_int", "int,int", ""),
+                Some(QuickeningSpecialization::MulIntInt) => ("mul_int_int", "int,int", ""),
+                Some(QuickeningSpecialization::ConcatStringString) => {
+                    ("concat_string_string", "string,string", "")
+                }
+                Some(QuickeningSpecialization::PackedArrayIntKey) => (
+                    "packed_array_int_key",
+                    "array",
+                    " array_layout=packed array_key=int",
+                ),
+                Some(QuickeningSpecialization::BoolBranchCondition) => {
+                    ("bool_branch_condition", "bool", "")
+                }
+                None => {
+                    if snapshot.state == QuickeningState::Specialized {
+                        continue;
+                    }
+                    ("none", "unknown", "")
+                }
+            };
+            let _ = writeln!(
+                text,
+                "entry source={} engine={} php={} compile={} function={function} ir={} \
+                 instruction={instruction} class_epoch={} function_epoch={} autoload_epoch={} \
+                 include_epoch={} target={} state={callsite_state} scalars={scalars}\
+                 {array_fields} guard_failures={} blacklisted={blacklisted} {site_fields} \
+                 quickening_state={quickening_state} specialization={specialization}",
+                self.source_fingerprint,
+                self.engine_version,
+                self.php_target_version,
+                self.compile_options,
+                self.ir_fingerprint,
+                self.epochs.class_table,
+                self.epochs.function_table,
+                self.epochs.autoload,
+                self.epochs.include_path,
+                self.target_arch_config,
+                snapshot.guard_failures,
+            );
+        }
+        text
     }
 
     fn validate_entry(
@@ -359,6 +440,8 @@ pub struct PersistentFeedbackPayload {
     pub branch_bias: Option<PersistentBranchBias>,
     pub include_autoload: Option<PersistentIncludeAutoloadStability>,
     pub guard_failures: PersistentGuardFailureSummary,
+    /// Adaptive quickening site snapshot, when the entry carries one.
+    pub quickening: Option<QuickeningSiteSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,6 +488,10 @@ fn parse_entry_line(line: &str) -> Result<PersistentFeedbackEntry, PersistentFee
         },
         target_arch_config: required(&fields, "target")?.to_owned(),
     };
+    let guard_failures = PersistentGuardFailureSummary {
+        failures: parse_u64(fields.get("guard_failures").copied().unwrap_or("0"))?,
+        blacklisted: parse_bool(fields.get("blacklisted").copied().unwrap_or("false"))?,
+    };
     let payload = PersistentFeedbackPayload {
         callsite_state: parse_callsite_state(required(&fields, "state")?)?,
         scalar_kinds: parse_scalar_kinds(fields.get("scalars").copied().unwrap_or("unknown"))?,
@@ -413,10 +500,13 @@ fn parse_entry_line(line: &str) -> Result<PersistentFeedbackEntry, PersistentFee
         object_shape: parse_object_shape(&fields)?,
         branch_bias: parse_optional_branch_bias(fields.get("branch").copied())?,
         include_autoload: parse_include_autoload(&fields)?,
-        guard_failures: PersistentGuardFailureSummary {
-            failures: parse_u64(fields.get("guard_failures").copied().unwrap_or("0"))?,
-            blacklisted: parse_bool(fields.get("blacklisted").copied().unwrap_or("false"))?,
-        },
+        guard_failures,
+        quickening: parse_quickening_site(
+            &fields,
+            key.function_id,
+            key.instruction_id,
+            guard_failures.failures,
+        )?,
     };
 
     Ok(PersistentFeedbackEntry {
@@ -576,6 +666,52 @@ fn parse_optional_branch_bias(
         .transpose()
 }
 
+fn parse_quickening_site(
+    fields: &BTreeMap<&str, &str>,
+    function: u32,
+    instruction: u32,
+    guard_failures: u64,
+) -> Result<Option<QuickeningSiteSnapshot>, PersistentFeedbackRejectReason> {
+    let Some(site_kind) = fields.get("site").copied() else {
+        return Ok(None);
+    };
+    let site = match site_kind {
+        "ir" => QuickeningSiteKey::Ir {
+            function,
+            block: parse_u32(required(fields, "block")?)?,
+            instruction,
+        },
+        "dense" => QuickeningSiteKey::Dense {
+            unit: parse_u32(required(fields, "dense_unit")?)?,
+            function,
+            instruction,
+        },
+        _ => return Err(PersistentFeedbackRejectReason::Corrupt),
+    };
+    let (state, specialization) = match required(fields, "quickening_state")? {
+        "specialized" => {
+            let specialization = match required(fields, "specialization")? {
+                "add_int_int" => QuickeningSpecialization::AddIntInt,
+                "sub_int_int" => QuickeningSpecialization::SubIntInt,
+                "mul_int_int" => QuickeningSpecialization::MulIntInt,
+                "concat_string_string" => QuickeningSpecialization::ConcatStringString,
+                "packed_array_int_key" => QuickeningSpecialization::PackedArrayIntKey,
+                "bool_branch_condition" => QuickeningSpecialization::BoolBranchCondition,
+                _ => return Err(PersistentFeedbackRejectReason::Corrupt),
+            };
+            (QuickeningState::Specialized, Some(specialization))
+        }
+        "blacklisted" => (QuickeningState::Blacklisted, None),
+        _ => return Err(PersistentFeedbackRejectReason::Corrupt),
+    };
+    Ok(Some(QuickeningSiteSnapshot {
+        site,
+        state,
+        specialization,
+        guard_failures,
+    }))
+}
+
 fn parse_include_autoload(
     fields: &BTreeMap<&str, &str>,
 ) -> Result<Option<PersistentIncludeAutoloadStability>, PersistentFeedbackRejectReason> {
@@ -667,6 +803,72 @@ mod tests {
         assert_eq!(report.stats.rejected_userland_state, 1);
         assert_eq!(report.stats.entries_accepted, 0);
         assert!(report.stats.fallback_to_baseline);
+    }
+
+    #[test]
+    fn render_sites_roundtrips_through_validation() {
+        let context = context();
+        let sites = vec![
+            QuickeningSiteSnapshot {
+                site: QuickeningSiteKey::Dense {
+                    unit: 0,
+                    function: 3,
+                    instruction: 17,
+                },
+                state: QuickeningState::Specialized,
+                specialization: Some(QuickeningSpecialization::AddIntInt),
+                guard_failures: 0,
+            },
+            QuickeningSiteSnapshot {
+                site: QuickeningSiteKey::Ir {
+                    function: 1,
+                    block: 2,
+                    instruction: 4,
+                },
+                state: QuickeningState::Specialized,
+                specialization: Some(QuickeningSpecialization::PackedArrayIntKey),
+                guard_failures: 1,
+            },
+            QuickeningSiteSnapshot {
+                site: QuickeningSiteKey::Dense {
+                    unit: 1,
+                    function: 0,
+                    instruction: 9,
+                },
+                state: QuickeningState::Blacklisted,
+                specialization: None,
+                guard_failures: 4,
+            },
+        ];
+
+        let text = context.render_sites(&sites);
+        let report = context.validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.entries_seen, 3);
+        assert_eq!(report.stats.entries_accepted, 3);
+        assert!(!report.stats.fallback_to_baseline);
+        let seeded: Vec<QuickeningSiteSnapshot> = report
+            .store
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.payload.quickening)
+            .collect();
+        assert_eq!(seeded, sites);
+    }
+
+    #[test]
+    fn corrupt_quickening_fields_are_rejected() {
+        let text = format!(
+            "{}\nentry source=source-1 engine=engine-1 php=8.5.7 compile=opt=2,exec=auto \
+             function=0 ir=ir-1 instruction=7 class_epoch=1 function_epoch=2 \
+             autoload_epoch=3 include_epoch=4 target=test-target state=monomorphic \
+             site=dense dense_unit=0 quickening_state=specialized specialization=bogus",
+            PERSISTENT_FEEDBACK_FORMAT_VERSION
+        );
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.rejected_corrupt, 1);
+        assert_eq!(report.stats.entries_accepted, 0);
     }
 
     #[test]

@@ -75,6 +75,84 @@ enum QuickeningKey {
     },
 }
 
+/// Stable coordinates of one quickening site, exportable across runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum QuickeningSiteKey {
+    Ir {
+        function: u32,
+        block: u32,
+        instruction: u32,
+    },
+    Dense {
+        unit: u32,
+        function: u32,
+        instruction: u32,
+    },
+}
+
+/// Metadata snapshot of one adaptive site for persistent feedback.
+///
+/// Snapshots are advisory: a seeded specialization still runs behind the
+/// regular runtime guards, so stale feedback can only cause guard misses and
+/// dequickening, never a semantic change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuickeningSiteSnapshot {
+    pub site: QuickeningSiteKey,
+    pub state: QuickeningState,
+    pub specialization: Option<QuickeningSpecialization>,
+    pub guard_failures: u64,
+}
+
+impl From<QuickeningKey> for QuickeningSiteKey {
+    fn from(key: QuickeningKey) -> Self {
+        match key {
+            QuickeningKey::Ir {
+                function,
+                block,
+                instruction,
+            } => Self::Ir {
+                function,
+                block,
+                instruction,
+            },
+            QuickeningKey::Dense {
+                unit,
+                function,
+                instruction,
+            } => Self::Dense {
+                unit,
+                function,
+                instruction,
+            },
+        }
+    }
+}
+
+impl From<QuickeningSiteKey> for QuickeningKey {
+    fn from(key: QuickeningSiteKey) -> Self {
+        match key {
+            QuickeningSiteKey::Ir {
+                function,
+                block,
+                instruction,
+            } => Self::Ir {
+                function,
+                block,
+                instruction,
+            },
+            QuickeningSiteKey::Dense {
+                unit,
+                function,
+                instruction,
+            } => Self::Dense {
+                unit,
+                function,
+                instruction,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QuickeningEntry {
     state: QuickeningState,
@@ -539,6 +617,65 @@ impl QuickeningTable {
         self.entry_mut(key).observe_candidate(specialization)
     }
 
+    /// Exports the sites worth persisting across runs: installed
+    /// specializations and blacklisted sites.
+    #[must_use]
+    pub fn export_persistent_sites(&self) -> Vec<QuickeningSiteSnapshot> {
+        let mut sites = Vec::new();
+        for (key, entry) in &self.entries {
+            if let Some(snapshot) = persistent_site_snapshot(*key, entry) {
+                sites.push(snapshot);
+            }
+        }
+        for slot in &self.dense_functions {
+            for (instruction, entry) in slot.entries.iter().enumerate() {
+                let key = QuickeningKey::Dense {
+                    unit: slot.unit,
+                    function: slot.function,
+                    instruction: instruction as u32,
+                };
+                if let Some(snapshot) = persistent_site_snapshot(key, entry) {
+                    sites.push(snapshot);
+                }
+            }
+        }
+        sites
+    }
+
+    /// Seeds adaptive state from a prior run's exported sites.
+    ///
+    /// Seeded specializations enter the table already installed but keep the
+    /// full guard/fallback protocol, so a wrong seed self-corrects through
+    /// dequickening. Blacklisted seeds skip doomed specialization attempts.
+    pub fn seed_persistent_sites(&mut self, sites: &[QuickeningSiteSnapshot]) {
+        for snapshot in sites {
+            match snapshot.state {
+                QuickeningState::Specialized => {
+                    let Some(specialization) = snapshot.specialization else {
+                        continue;
+                    };
+                    let entry = self.entry_mut(snapshot.site.into());
+                    if entry.state != QuickeningState::Uninitialized {
+                        continue;
+                    }
+                    entry.state = QuickeningState::Specialized;
+                    entry.specialization = Some(specialization);
+                    entry.executions = SPECIALIZE_AFTER_EXECUTIONS;
+                }
+                QuickeningState::Blacklisted => {
+                    let entry = self.entry_mut(snapshot.site.into());
+                    if entry.state != QuickeningState::Uninitialized {
+                        continue;
+                    }
+                    entry.state = QuickeningState::Blacklisted;
+                }
+                QuickeningState::Uninitialized
+                | QuickeningState::Observing
+                | QuickeningState::Dequickened => {}
+            }
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -558,6 +695,28 @@ impl QuickeningTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn persistent_site_snapshot(
+    key: QuickeningKey,
+    entry: &QuickeningEntry,
+) -> Option<QuickeningSiteSnapshot> {
+    if !entry.is_touched() {
+        return None;
+    }
+    let exportable = match entry.state {
+        QuickeningState::Specialized => entry.specialization.is_some(),
+        QuickeningState::Blacklisted => true,
+        QuickeningState::Uninitialized
+        | QuickeningState::Observing
+        | QuickeningState::Dequickened => false,
+    };
+    exportable.then(|| QuickeningSiteSnapshot {
+        site: key.into(),
+        state: entry.state,
+        specialization: entry.specialization,
+        guard_failures: entry.stats.guard_failures,
+    })
 }
 
 fn ir_quickening_key(function: FunctionId, block: BlockId, instruction: InstrId) -> QuickeningKey {
@@ -761,5 +920,113 @@ mod tests {
             table.dense_specialization(unit, function, instruction),
             None
         );
+    }
+
+    #[test]
+    fn export_persistent_sites_covers_installed_and_blacklisted_sites_only() {
+        let mut table = QuickeningTable::default();
+        let unit = UnitId::new(0);
+        let function = FunctionId::new(1);
+
+        // Installed dense specialization: exported.
+        for _ in 0..8 {
+            table.observe_dense(unit, function, 2);
+        }
+        table.observe_dense_concat_string_string_candidate(unit, function, 2);
+        // Still observing: not exported.
+        table.observe_dense(unit, function, 5);
+        // Specialized without an installed specialization: not exported.
+        for _ in 0..8 {
+            table.observe(FunctionId::new(0), BlockId::new(0), InstrId::new(0));
+        }
+
+        let sites = table.export_persistent_sites();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0].site,
+            super::QuickeningSiteKey::Dense {
+                unit: 0,
+                function: 1,
+                instruction: 2,
+            }
+        );
+        assert_eq!(sites[0].state, QuickeningState::Specialized);
+        assert_eq!(
+            sites[0].specialization,
+            Some(QuickeningSpecialization::ConcatStringString)
+        );
+    }
+
+    #[test]
+    fn seed_persistent_sites_installs_specialization_with_guard_protocol() {
+        let mut warm = QuickeningTable::default();
+        let unit = UnitId::new(0);
+        let function = FunctionId::new(0);
+        for _ in 0..8 {
+            warm.observe_dense(unit, function, 3);
+        }
+        warm.observe_dense_int_int_candidate(
+            unit,
+            function,
+            3,
+            QuickeningSpecialization::AddIntInt,
+        );
+        let exported = warm.export_persistent_sites();
+
+        let mut cold = QuickeningTable::default();
+        cold.seed_persistent_sites(&exported);
+        assert_eq!(
+            cold.dense_specialization(unit, function, 3),
+            Some(QuickeningSpecialization::AddIntInt)
+        );
+        assert_eq!(
+            cold.dense_state(unit, function, 3),
+            Some(QuickeningState::Specialized)
+        );
+
+        // A wrong seed still dequickens through the normal guard protocol.
+        cold.record_dense_specialized_guard(unit, function, 3, false);
+        let second = cold.record_dense_specialized_guard(unit, function, 3, false);
+        assert!(second.dequickened);
+        assert_eq!(cold.dense_specialization(unit, function, 3), None);
+    }
+
+    #[test]
+    fn seed_persistent_sites_respects_blacklists_and_touched_entries() {
+        let mut warm = QuickeningTable::default();
+        let function = FunctionId::new(2);
+        let block = BlockId::new(0);
+        let instruction = InstrId::new(1);
+        for _ in 0..8 {
+            warm.observe(function, block, instruction);
+        }
+        warm.observe_add_int_int_candidate(function, block, instruction);
+        let mut exported = warm.export_persistent_sites();
+        exported.push(super::QuickeningSiteSnapshot {
+            site: super::QuickeningSiteKey::Dense {
+                unit: 0,
+                function: 0,
+                instruction: 9,
+            },
+            state: QuickeningState::Blacklisted,
+            specialization: None,
+            guard_failures: 4,
+        });
+
+        let mut cold = QuickeningTable::default();
+        // A site the current run already touched is not overwritten.
+        cold.observe(function, block, instruction);
+        cold.seed_persistent_sites(&exported);
+        assert_eq!(
+            cold.state(function, block, instruction),
+            Some(QuickeningState::Observing)
+        );
+        assert_eq!(
+            cold.dense_state(UnitId::new(0), FunctionId::new(0), 9),
+            Some(QuickeningState::Blacklisted)
+        );
+        // Blacklisted seeds keep the site disabled.
+        let observation = cold.observe_dense(UnitId::new(0), FunctionId::new(0), 9);
+        assert!(!observation.attempt);
     }
 }

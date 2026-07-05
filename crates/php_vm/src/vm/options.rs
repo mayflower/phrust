@@ -1,7 +1,7 @@
 use crate::bytecode::BytecodeLayoutProfile;
 use crate::include::{IncludeCache, IncludeLoader};
 use crate::inline_cache::InlineCacheMode;
-use crate::quickening::QuickeningMode;
+use crate::quickening::{QuickeningMode, QuickeningSiteSnapshot};
 use crate::tiering::TieringOptions;
 use php_optimizer::OptimizationLevel;
 use php_runtime::RuntimeContext;
@@ -44,6 +44,9 @@ pub struct VmOptions {
     pub bytecode_layout_profile: Option<BytecodeLayoutProfile>,
     /// Maintain request-local quickening metadata without changing semantics.
     pub quickening: QuickeningMode,
+    /// Advisory quickening sites exported by a prior run. Seeded sites keep
+    /// the full guard/fallback protocol, so stale seeds self-correct.
+    pub quickening_seed: Vec<QuickeningSiteSnapshot>,
     /// Allocate request-local inline-cache slots without changing semantics.
     pub inline_caches: InlineCacheMode,
     /// Select the experimental performance JIT tier for eligible hot leaf functions.
@@ -84,6 +87,7 @@ impl Default for VmOptions {
             bytecode_layout: BytecodeLayoutMode::Source,
             bytecode_layout_profile: None,
             quickening: QuickeningMode::Off,
+            quickening_seed: Vec::new(),
             inline_caches: InlineCacheMode::Off,
             jit: JitMode::Off,
             jit_threshold: TieringOptions::default().function_entry_threshold,
