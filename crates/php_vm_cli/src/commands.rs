@@ -2939,6 +2939,7 @@ fn classify_baseline_stencil_instruction(opcode: DenseOpcode) -> BaselineStencil
         | DenseOpcode::DeclareFunction
         | DenseOpcode::DeclareClass
         | DenseOpcode::FetchClassConstant
+        | DenseOpcode::FetchStaticProperty
         | DenseOpcode::IssetProperty
         | DenseOpcode::EmptyProperty
         | DenseOpcode::LoadConstFetchDim
@@ -3292,7 +3293,7 @@ fn classify_copy_patch_stencil_instruction(
         DenseOpcode::DeclareFunction | DenseOpcode::DeclareClass => {
             unsupported_copy_patch_class("declaration_mutates_runtime_symbol_table")
         }
-        DenseOpcode::FetchClassConstant => {
+        DenseOpcode::FetchClassConstant | DenseOpcode::FetchStaticProperty => {
             unsupported_copy_patch_class("class_constant_requires_class_resolution_and_autoload")
         }
         DenseOpcode::IssetProperty | DenseOpcode::EmptyProperty => {
@@ -3623,7 +3624,7 @@ fn classify_mid_tier_instruction(
             );
             plan.deopt_points += 1;
         }
-        DenseOpcode::FetchClassConstant => {
+        DenseOpcode::FetchClassConstant | DenseOpcode::FetchStaticProperty => {
             push_unique(
                 &mut plan.rejection_reasons,
                 "class_constant_requires_class_resolution_and_autoload",

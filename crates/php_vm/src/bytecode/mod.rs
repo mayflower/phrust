@@ -198,6 +198,8 @@ pub enum DenseOpcode {
     IssetProperty = 85,
     /// `rN = empty(object->property)` (no dimensions).
     EmptyProperty = 86,
+    /// `rN = Class::$staticProperty`.
+    FetchStaticProperty = 87,
 }
 
 impl DenseOpcode {
@@ -305,6 +307,7 @@ impl DenseOpcode {
             Self::FetchClassConstant => "fetch_class_constant",
             Self::IssetProperty => "isset_property",
             Self::EmptyProperty => "empty_property",
+            Self::FetchStaticProperty => "fetch_static_property",
         }
     }
 
@@ -1968,7 +1971,8 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::DeclareClass
         | DenseOpcode::FetchClassConstant
         | DenseOpcode::IssetProperty
-        | DenseOpcode::EmptyProperty => None,
+        | DenseOpcode::EmptyProperty
+        | DenseOpcode::FetchStaticProperty => None,
     }
 }
 
@@ -2702,6 +2706,18 @@ fn lower_instruction(
                 dst: dst.raw(),
                 class_name: push_name(names, class_name).index() as u32,
                 constant: push_name(names, constant).index() as u32,
+            },
+        ),
+        InstructionKind::FetchStaticProperty {
+            dst,
+            class_name,
+            property,
+        } => (
+            DenseOpcode::FetchStaticProperty,
+            DenseOperands::FetchClassConstant {
+                dst: dst.raw(),
+                class_name: push_name(names, class_name).index() as u32,
+                constant: push_name(names, property).index() as u32,
             },
         ),
         InstructionKind::IssetProperty {
@@ -3530,7 +3546,7 @@ fn verify_instruction(
             verify_name(*name, unit, errors);
         }
         (
-            DenseOpcode::FetchClassConstant,
+            DenseOpcode::FetchClassConstant | DenseOpcode::FetchStaticProperty,
             DenseOperands::FetchClassConstant {
                 dst,
                 class_name,

@@ -19521,6 +19521,49 @@ echo $o->a, '|', $o->b, '|', $o->d;
 }
 
 #[test]
+fn dense_bytecode_auto_executes_fetch_static_property() {
+    // Class::$staticProperty fetches (public, typed, and private via self::)
+    // now execute on the dense bytecode path via the shared
+    // fetch_static_property_value helper.
+    let result = execute_source_with_options(
+        r#"<?php
+class DenseStatic {
+    public static $x = 5;
+    public static string $name = 'hi';
+    private static $secret = 99;
+    static function reveal() { return self::$secret; }
+}
+function dense_static_probe() {
+    return DenseStatic::$x . '|' . DenseStatic::$name . '|' . DenseStatic::reveal();
+}
+echo dense_static_probe();
+"#,
+        VmOptions {
+            execution_format: ExecutionFormat::Auto,
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            inline_caches: InlineCacheMode::On,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.to_string_lossy(), "5|hi|99");
+    let counters = result.counters.expect("counters should be collected");
+    assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+    assert!(
+        counters
+            .opcodes
+            .get("bytecode_fetch_static_property")
+            .copied()
+            .unwrap_or_default()
+            >= 2,
+        "{counters:?}"
+    );
+}
+
+#[test]
 fn dense_bytecode_auto_executes_property_isset_empty() {
     // isset($obj->prop) / empty($obj->prop) (no dimensions) now execute on the
     // dense bytecode path via the shared isset_property_value/empty_property_value
