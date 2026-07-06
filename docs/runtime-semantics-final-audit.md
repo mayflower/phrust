@@ -19,10 +19,11 @@ nix develop -c just verify-runtime
 nix develop -c cargo test --workspace
 ```
 
-`verify-runtime` includes formatting, linting, workspace tests, Runtime
-verification, Runtime semantics fixture gates, the Runtime semantics diff
-harness, PHPT smoke allowlist checks, hardening lints, the devshell toolchain
-audit, and documentation checks.
+`verify-runtime` runs bytecode snapshots, bytecode execution smoke, VM smoke,
+VM trace smoke, runtime fixtures, runtime known-gap validation, Runtime
+semantics fixture gates, the Runtime semantics diff harness, the VM semantics
+oracle, and runtime hardening lints. Formatting, general linting, and workspace
+tests are covered by `ci-rust`, `ci-local`, and the dedicated CI jobs.
 
 ## Evidence Map
 
@@ -46,11 +47,12 @@ audit, and documentation checks.
   coverage matrix, unsafe audit, and standard-library roadmap.
 - `AGENTS.md` keeps runtime semantics boundaries and requires `verify-runtime`
   before handing off runtime semantics changes.
-- `.github/workflows/runtime-semantics.yml` runs
-  `nix develop -c just verify-runtime` and uploads Runtime semantics/Runtime
-  report artifacts when present.
-- `scripts/verify/runtime-semantics.sh` asserts final docs, PHPT allowlist
-  categories, regression metadata, and minimization tooling.
+- `.github/workflows/ci.yml` runs `verify-runtime` in the domain-gates matrix;
+  the runtime job bootstraps the pinned reference PHP binary before running the
+  gate.
+- `scripts/verify/runtime-semantics.sh` remains the local closeout script for
+  full Runtime semantics verification, including final docs, PHPT allowlist
+  categories, regression metadata, minimization tooling, and `runtime-phpt-smoke`.
 
 ## Closure Criteria
 

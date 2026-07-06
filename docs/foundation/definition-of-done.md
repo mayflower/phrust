@@ -34,7 +34,8 @@ for a PHP 8.5 compatible core engine in Rust.
   - Runtime compatibility against `.phpt`.
   - Composer and framework smoke tests in later layers.
 - `AGENTS.md` documents the Foundation working rules.
-- `scripts/verify-foundation.sh` is the central verification script.
+- `scripts/verify/foundation.sh` is the central verification script and is
+  exposed through `just verify-foundation`.
 - Developer quickstart documents `nix develop`, `just help`,
   `just verify-foundation`, `just bootstrap-ref`, `just extract-ref-metadata`, and
   optional `just build-ref-php`.
@@ -50,8 +51,8 @@ for a PHP 8.5 compatible core engine in Rust.
 - `docs/foundation/license-and-copying-policy.md` documents how the project uses
   `php-src` without committing a vendored source copy.
 - `docs/foundation/final-audit.md` records the Foundation audit result.
-- `.github/workflows/foundation.yml` runs the required Nix-based Foundation gate in
-  CI.
+- `.github/workflows/ci.yml` runs the shared Nix-based repository gates in CI;
+  foundation-specific changes should still pass `just verify-foundation`.
 - `references/php-src.lock.example.toml` exists.
 - Local `php-src` checkouts are ignored and are not committed.
 

@@ -420,10 +420,10 @@ nix develop -c just object-semantics-fixtures
 nix develop -c just generator-fiber-fixtures
 nix develop -c just real-world-fixtures
 nix develop -c just regression-fixtures
-nix develop -c just runtime-semantics-phpt-smoke
+nix develop -c just runtime-phpt-smoke
 ```
 
-`runtime-semantics-phpt-smoke` is driven by
+`runtime-phpt-smoke` is driven by
 `fixtures/runtime_semantics/phpt_allowlist.toml`. The allowlist references a small curated
 set of pinned `php-src` PHPT files instead of vendoring the upstream test tree.
 Each entry carries a Runtime semantics category plus a disposition:
@@ -448,24 +448,24 @@ autoload and framework-container stdlib/reflection breadth.
 Local Composer or framework project experiments are opt-in:
 
 ```bash
-nix develop -c just runtime-semantics-local-composer-smoke path/to/local/project
-nix develop -c just runtime-semantics-composer-smoke
+nix develop -c just local-composer-smoke path/to/local/project
+nix develop -c just runtime-composer-smoke
 ```
 
 That target is not part of `verify-runtime`; it is for user-provided local paths
 only and must not introduce network downloads or committed vendor trees.
-`runtime-semantics-composer-smoke` is the environment-driven variant: it skips unless
+`runtime-composer-smoke` is the environment-driven variant: it skips unless
 `PHPRUST_COMPOSER_FIXTURE_DIR` points at an existing local project and writes
 its normalized gap report under `target/runtime-semantics/composer-smoke`.
 
 Optional local stress probes are also available:
 
 ```bash
-nix develop -c just runtime-semantics-fuzz-smoke
+nix develop -c just runtime-fuzz-smoke
 nix develop -c just runtime-bench-smoke
 ```
 
-`runtime-semantics-fuzz-smoke` generates a deterministic, bounded set of small programs
+`runtime-fuzz-smoke` generates a deterministic, bounded set of small programs
 for references, Copy-on-Write arrays, `unset`, and `foreach`, compares them
 against `REFERENCE_PHP` when the pinned reference binary exists, and stores
 minimization inputs under `target/runtime-semantics/fuzz-smoke`. It does not commit
@@ -647,8 +647,8 @@ Runtime semantics runtime hardening is tracked in `docs/runtime-semantics-unsafe
 Additional opt-in hardening targets are documented but are not part of the
 required gate:
 
-- `nix develop -c just runtime-semantics-miri-smoke`;
-- `nix develop -c just runtime-semantics-sanitizer-smoke`.
+- `nix develop -c just runtime-miri-smoke`;
+- `nix develop -c just runtime-sanitizer-smoke`.
 
 They skip cleanly when the active toolchain cannot support them. CI must not
 depend on external Rust component downloads or local user toolchains for these

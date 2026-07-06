@@ -30,13 +30,13 @@ runtime or VM fails `verify-runtime`.
 
 The remaining runtime/VM Clippy allowances are narrow:
 
-- `crates/php_vm/src/vm.rs` allows `clippy::result_large_err` because VM
+- `crates/php_vm/src/vm/mod.rs` allows `clippy::result_large_err` because VM
   runtime errors currently carry structured diagnostics and values.
-- `crates/php_vm/src/vm.rs` allows `clippy::too_many_arguments` for VM helper
+- `crates/php_vm/src/vm/mod.rs` allows `clippy::too_many_arguments` for VM helper
   functions that thread execution state explicitly. This is noisy but preferable
   to hiding mutable VM state in broader global abstractions during Runtime semantics.
-- `crates/php_ir/src/lower.rs` has one `too_many_arguments` helper from the
-  existing lowering pipeline.
+- `crates/php_ir/src/lower/expressions.rs` and `crates/php_ir/src/lower/statements.rs`
+  have `too_many_arguments` helpers from the existing lowering pipeline.
 
 No allow-list suppresses Rust unsafe-code lints.
 
@@ -72,7 +72,7 @@ not make Miri mandatory.
 Run:
 
 ```bash
-nix develop -c just runtime-semantics-miri-smoke
+nix develop -c just runtime-miri-smoke
 ```
 
 The target runs a small `php_runtime` reference model test when `cargo miri` is
@@ -87,7 +87,7 @@ part of CI or `verify-runtime`.
 Run:
 
 ```bash
-nix develop -c env PHRUST_RUN_SANITIZER=1 just runtime-semantics-sanitizer-smoke
+nix develop -c env PHRUST_RUN_SANITIZER=1 just runtime-sanitizer-smoke
 ```
 
 The target runs one GC smoke test with sanitizer flags when supported and skips

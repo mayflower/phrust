@@ -37,7 +37,7 @@
 
 - `crates/php_runtime/src/array.rs`
 - `crates/php_runtime/src/reference.rs`
-- `crates/php_ir/src/lower.rs`
+- `crates/php_ir/src/lower/mod.rs`
 - `crates/php_vm/src/vm/mod.rs`
 
 ## Target Gates

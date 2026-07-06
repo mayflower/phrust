@@ -114,7 +114,7 @@ are implementation details unless a Standard library ADR stabilizes them.
 
 - Keep committed smokes offline and handwritten. Do not vendor Composer
   projects into the repo.
-- Use `just runtime-semantics-local-composer-smoke <path>` or a Standard library successor for
+- Use `just local-composer-smoke <path>` or a Standard library successor for
   user-provided local projects.
 - Prioritize PSR-4 autoloading, class existence probes, Reflection-driven
   containers, enum-backed configuration, attributes, closures, and common
@@ -316,8 +316,8 @@ Scope checked: `crates/php_runtime`, `crates/php_vm`, `crates/php_vm_cli`,
 
 | Class | Current occurrences | Classification |
 | --- | --- | --- |
-| `expect("frame was pushed")`, `expect("caller frame is active")` in `php_vm/src/vm.rs` | repeated dispatch invariants after frame setup | internal VM invariant; should become controlled diagnostics only if a reachable malformed-state fixture appears |
-| `expect("target bounds checked")` in `php_vm/src/frame.rs` | frame target mutation after prior bounds check | internal invariant guarded by VM code |
+| `expect("frame was pushed")`, `expect("caller frame is active")` in `crates/php_vm/src/vm/mod.rs` | repeated dispatch invariants after frame setup | internal VM invariant; should become controlled diagnostics only if a reachable malformed-state fixture appears |
+| `expect("target bounds checked")` in `crates/php_vm/src/frame.rs` | frame target mutation after prior bounds check | internal invariant guarded by VM code |
 | Builtin `expect("checked arity")` | builtin implementations after registry arity validation | internal invariant; arity errors are surfaced before this point |
 | `panic!("expected server array")` in runtime context tests/support path | protects controlled superglobal construction invariant | not user PHP input reachable in normal VM execution |
 | Test and snapshot `unwrap`/`expect` | Rust tests, fixtures, snapshot serialization | acceptable test assertions |

@@ -11,7 +11,7 @@ Audited files:
 - `crates/php_jit/src/lib.rs`
 - `crates/php_jit/src/cranelift_lowering.rs`
 - `crates/php_jit/src/helpers.rs`
-- `crates/php_vm/src/vm.rs`
+- `crates/php_vm/src/vm/mod.rs`
 - `crates/php_runtime/src/jit_array.rs`
 - `crates/php_jit/Cargo.toml`
 - `justfile`
@@ -34,7 +34,7 @@ Out of scope for Performance:
 | Symbol registry safety | mitigated | `JIT_HELPER_SYMBOLS`, `helper_registry_is_stable`, `helper_registry_layout_summary` tests | Helper names, ids, argument kinds, return kinds, and side-effect flags are centralized. The two exported arithmetic helpers have local `SAFETY:` notes for their unsafe `no_mangle` attributes. |
 | ABI layout assumptions | mitigated | `JIT_RUNTIME_ABI_HASH`, `JIT_HELPER_REGISTRY_ABI_HASH`, handle invoke checks | Native handles check the runtime ABI hash before transmuting a raw address into an `extern "C"` function pointer. Stable C-facing metadata uses fixed integer/pointer shapes rather than Rust references. |
 | Lifetime of compiled functions | accepted | `leak_jit_module_for_handle_lifetime`; lifecycle test | Handles are cloneable pointer descriptors. The current safe lifetime rule is process lifetime for compiled modules. This trades bounded Performance memory growth for no use-after-free path. |
-| Frame/value pointer validity | mitigated | VM helper shims in `crates/php_vm/src/vm.rs` | Native entries receive opaque `usize` pointers only for synchronous calls. VM shims reject null pointers, point at stack-owned prepared values, and never store the pointers after return. |
+| Frame/value pointer validity | mitigated | VM helper shims in `crates/php_vm/src/vm/mod.rs` | Native entries receive opaque `usize` pointers only for synchronous calls. VM shims reject null pointers, point at stack-owned prepared values, and never store the pointers after return. |
 | Panic behavior | accepted | helper shims avoid explicit panics and return status/fallback codes | Performance native helpers are small Rust functions with explicit null, overflow, guard, and allocation-failure branches. A process-aborting Rust panic or OOM remains outside the Performance recovery model, so fast paths must keep helper logic minimal and deterministic. |
 | Side-exit live-state | mitigated | `JitInvokeError::side_exit`, guard report, diff fixtures | Native paths either write a scalar/result pointer and return success or return a status mapped to interpreter fallback counters. They do not resume at an arbitrary native PC or expose partial VM frames. |
 | Drop/destructor interactions | mitigated | string concat and property load helpers return `Box<Value>` consumed by VM immediately | Helpers that allocate PHP values transfer ownership with `Box::into_raw` only on success. The VM reconstructs the `Box<Value>` in the same synchronous call path, so Rust drops happen on the VM side after fallback/success accounting. |
@@ -51,7 +51,7 @@ All Rust unsafe boundaries in the audited Cranelift surface have local
 - `crates/php_jit/src/helpers.rs`: `write_checked_result` writes to a
   non-null out pointer; exported arithmetic helper symbols document their
   unsafe `no_mangle` boundary.
-- `crates/php_vm/src/vm.rs`: VM helper shims dereference synchronous
+- `crates/php_vm/src/vm/mod.rs`: VM helper shims dereference synchronous
   stack-owned value pointers and reconstruct VM-owned boxed result pointers.
 - `crates/php_jit/src/cranelift_lowering.rs`: test helper out-pointer writes
   are limited to stack-owned slots passed by JIT trampoline tests.

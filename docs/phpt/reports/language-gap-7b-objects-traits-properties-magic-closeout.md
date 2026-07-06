@@ -32,7 +32,7 @@ spelling. The affected selected PHPT rows were:
   The returned array is formatted through the existing runtime debug formatter
   as the original object handle, preserving string and integer debug labels.
 - Promoted runtime-semantics fixtures that now match the PHP reference:
-  - `fixtures/runtime_semantics/types/static-property-read.php`
+  - `fixtures/runtime_semantics/types/static-property.php`
   - `fixtures/runtime_semantics/enums/reflection-name.php`
   - `fixtures/runtime_semantics/reflection/attribute-newinstance.php`
   - `fixtures/runtime_semantics/objects/anonymous-class.php`

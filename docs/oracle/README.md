@@ -6,7 +6,7 @@ into a deterministic compatibility queue for Phrust.
 Start with the architecture and implementation plan:
 
 - [PHP source oracle gap closure](../php-source-oracle-gap-closure.md)
-- [Oracle gap closure loop](codex-loop.md)
+- [Oracle gap closure loop](gap-closure-loop.md)
 
 Generated artifacts:
 

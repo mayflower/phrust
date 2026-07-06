@@ -5,8 +5,8 @@ Current focused `zend.functions` status is tracked in
 implementation notes and backlog for functions, callables, arity, and type
 coercion.
 
-> Line numbers drift as you edit `crates/php_vm/src/vm.rs` (a ~32k-line file) and
-> `crates/php_ir/src/lower.rs`. Use the **symbol names** as the stable anchor and
+> Line numbers drift as you edit `crates/php_vm/src/vm/mod.rs` and the
+> `crates/php_ir/src/lower/` modules. Use the **symbol names** as the stable anchor and
 > re-`grep` for current lines.
 
 ---
@@ -70,7 +70,7 @@ landed this session. Relevant commits: `a1e60370`..`7ac08c17`.
   All routed through the shared helper `raise_runtime_error` (see §3).
 - **First-class callables from methods** — `$o->m(...)`, `Cls::m(...)` lower to
   `[recv,'m']` array callables (`lower_method_first_class_callable` in
-  `crates/php_ir/src/lower.rs`). Plain `f(...)` already worked.
+  `crates/php_ir/src/lower/expressions.rs`). Plain `f(...)` already worked.
 - **Extra positional args to user functions** are accepted and visible to
   `func_get_args()` (was wrongly an `ArgumentCountError`). See `prepare_arguments`.
 - **Static method via instance** `$obj->staticMethod()` no longer wrongly rejected.
@@ -88,7 +88,7 @@ regressions in greener modules (zend.basic 0, standard.strings 1, standard.array
 
 ## 3. Key patterns to reuse (the "how" for the VM layer)
 
-All in `crates/php_vm/src/vm.rs`:
+All in `crates/php_vm/src/vm/mod.rs` unless noted:
 
 - **`runtime_error_throwable(result) -> Option<Value>`** maps an error-id prefix
   to a throwable class (`E_PHP_VM_PARAM_TYPE_MISMATCH → TypeError`, the access
@@ -115,7 +115,7 @@ All in `crates/php_vm/src/vm.rs`:
   behavior (e.g. param-type/property-access tests assert
   `E_PHP_VM_UNCAUGHT_EXCEPTION` + output text now).
 
-IR layer (`crates/php_ir/src/lower.rs`):
+IR layer (`crates/php_ir/src/lower/expressions.rs`):
 - `lower_callable_expr_to_register` / `lower_method_first_class_callable` — the
   callable-lowering entry points.
 - Array build pattern: `InstructionKind::NewArray { dst }` then
@@ -147,7 +147,7 @@ Per-test PRIMARY blocker counts (current):
   are almost all `Zend/tests/first_class_callable/constexpr/*` doing
   `const X = f(...)` (a first-class callable in a const expression). `php_ir`:
   `lower_global_constant_declarations` → `global_const_initializers` →
-  `constant_from_expr` (handles only Literal/Name/Array). PHP 8.5 allows FCC in
+  `constant_from_expr` (in `crates/php_ir/src/lower/consts.rs`, handles only Literal/Name/Array). PHP 8.5 allows FCC in
   const-expr, producing a `Closure` constant. **Depends on the `Closure` class
   (cluster 2).** Lower priority unless you do `Closure` first.
 - **12 × "isset only supports locals, properties, and local array dimensions"** —
@@ -169,7 +169,7 @@ First-class callable *invocation* already works, but tests need the real
 `Closure::fromCallable`, `Closure::bind`/`bindTo`, `$fn->call($obj)`, and FCC
 yielding a `Closure` rather than the current array. Implement `Closure` as an
 internal runtime class (see how throwables are modeled: `make_exception_object`
-and `internal_throwable_*` in `vm.rs` are the template for an internal class with
+and `internal_throwable_*` in `crates/php_vm/src/vm/mod.rs` are the template for an internal class with
 methods). Tests live under `third_party/php-src/Zend/tests/closures/` and
 `.../first_class_callable/`.
 

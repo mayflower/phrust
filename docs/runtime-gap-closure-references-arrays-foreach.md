@@ -11,9 +11,8 @@
 
 ## Fixture movement
 
-- Moved
-  `fixtures/runtime_semantics/functions/param-by-ref-static-property-known-gap.php`
-  to `fixtures/runtime_semantics/functions/param-by-ref-static-property.php`.
+- The former static-property by-reference known-gap fixture now lives at
+  `fixtures/runtime_semantics/functions/param-by-ref-static-property.php`.
 - The moved fixture now has `runtime-semantics: category=functions expect=pass`
   and passes against PHP 8.5.7 and the Rust VM.
 
