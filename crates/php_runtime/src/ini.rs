@@ -107,9 +107,10 @@ impl IniRegistry {
     }
 }
 
-fn default_entries() -> [(&'static str, &'static str, &'static str, i64); 19] {
+fn default_entries() -> [(&'static str, &'static str, &'static str, i64); 20] {
     [
         ("standard", "arg_separator.input", "&", 7),
+        ("standard", "arg_separator.output", "&", 7),
         ("date", "date.timezone", "UTC", 7),
         ("standard", "default_charset", "UTF-8", 7),
         ("core", "display_errors", "1", 7),
@@ -145,6 +146,7 @@ mod tests {
         assert_eq!(registry.get("include_path"), Some("lib"));
         assert_eq!(registry.cfg_var("include_path"), Some("."));
         assert_eq!(registry.get("file_uploads"), Some("1"));
+        assert_eq!(registry.get("arg_separator.output"), Some("&"));
         assert_eq!(registry.get("upload_tmp_dir"), Some(""));
         assert_eq!(registry.get("upload_max_filesize"), Some("2M"));
         assert_eq!(registry.get("post_max_size"), Some("8M"));
@@ -169,6 +171,7 @@ mod tests {
             names,
             vec![
                 "arg_separator.input",
+                "arg_separator.output",
                 "date.timezone",
                 "default_charset",
                 "display_errors",

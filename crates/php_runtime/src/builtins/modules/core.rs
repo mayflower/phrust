@@ -11069,6 +11069,49 @@ mod tests {
             ),
             Value::string("a%20b=c%20d")
         );
+
+        let mut resource_table = ResourceTable::new();
+        let resource = resource_table.register_stdin(Vec::new());
+        let mut resource_query = PhpArray::new();
+        resource_query.insert(ArrayKey::Int(0), Value::Resource(resource));
+        resource_query.insert(ArrayKey::Int(1), Value::string("kept"));
+        assert_eq!(
+            call(
+                "http_build_query",
+                vec![Value::Array(resource_query)],
+                &mut output
+            ),
+            Value::string("1=kept")
+        );
+
+        let entry = BuiltinRegistry::new()
+            .get("http_build_query")
+            .expect("builtin exists");
+        let mut separator_ini = crate::IniRegistry::default();
+        assert_eq!(
+            separator_ini.set("arg_separator.output", ";"),
+            Some("&".to_owned())
+        );
+        let mut context = BuiltinContext::new(&mut output);
+        context.set_ini_registry(separator_ini);
+        let mut separated_query = PhpArray::new();
+        separated_query.insert(
+            ArrayKey::String(PhpString::from_test_str("a")),
+            Value::string("b"),
+        );
+        separated_query.insert(
+            ArrayKey::String(PhpString::from_test_str("c")),
+            Value::string("d"),
+        );
+        assert_eq!(
+            (entry.function())(
+                &mut context,
+                vec![Value::Array(separated_query)],
+                RuntimeSourceSpan::default()
+            )
+            .expect("builtin ok"),
+            Value::string("a=b;c=d")
+        );
     }
 
     #[test]

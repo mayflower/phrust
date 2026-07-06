@@ -1384,7 +1384,7 @@ fn input_ini_options(context: &BuiltinContext<'_>) -> RuntimeIniOptions {
 }
 
 pub(in crate::builtins::modules) fn builtin_http_build_query(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -1402,7 +1402,10 @@ pub(in crate::builtins::modules) fn builtin_http_build_query(
         .map(|value| string_arg("http_build_query", value))
         .transpose()?;
     let arg_separator = match args.get(2) {
-        Some(Value::Null) | None => "&".to_owned(),
+        Some(Value::Null) | None => context
+            .ini_get("arg_separator.output")
+            .unwrap_or("&")
+            .to_owned(),
         Some(value) => string_arg("http_build_query", value)?.to_string_lossy(),
     };
     let raw_encoding = args

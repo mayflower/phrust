@@ -387,7 +387,7 @@ pub(in crate::builtins::modules) fn build_query_pairs(
                 build_query_pairs(Some(name), numeric_prefix, raw_encoding, value, pairs)?;
             }
         }
-        Value::Null => {}
+        Value::Null | Value::Resource(_) => {}
         scalar => {
             let Some(name) = prefix else {
                 return Ok(());

@@ -3,14 +3,14 @@
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
 - Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- focused gate: 29 PASS, 0 FAIL, 0 BORK
+- focused gate: 31 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
 - URL encode/decode smoke coverage
 - `http_build_query` array MVP coverage
-- `http_build_query` null separator defaults, references, and RFC3986
-  `encoding_type` coverage
+- `http_build_query` null/output separator defaults, references, resources, and
+  RFC3986 `encoding_type` coverage
 - Basic `parse_url` component extraction, negative component fallback, invalid
   component diagnostics, and `PHP_URL_*` constant ordering
 - `parse_str` basics, custom `arg_separator.input`, malformed key recovery, and
@@ -35,6 +35,8 @@
 - `ext/standard/tests/http/http_build_query/bug26819.phpt`
 - `ext/standard/tests/http/http_build_query/bug77608.phpt`
 - `ext/standard/tests/http/http_build_query/gh12745.phpt`
+- `ext/standard/tests/http/http_build_query/http_build_query_variation3.phpt`
+- `ext/standard/tests/http/http_build_query/http_build_query_with_resource.phpt`
 - `ext/standard/tests/url/parse_url_basic_001.phpt`
 - `ext/standard/tests/url/parse_url_basic_002.phpt`
 - `ext/standard/tests/url/parse_url_basic_003.phpt`
@@ -77,7 +79,8 @@
 - `PHP_QUERY_RFC1738` and `PHP_QUERY_RFC3986` are registered standard
   constants for query-string encoding mode selection.
 - `http_build_query()` now keeps `null` separators on the PHP default `&`
-  path and honors RFC3986 encoding for named `encoding_type` calls.
+  path, reads `arg_separator.output` through the shared INI registry, omits
+  resource leaves, and honors RFC3986 encoding for named `encoding_type` calls.
 - `parse_url()` covers the selected upstream component extraction set,
   including partial numeric ports, negative component fallback to the full
   array, invalid positive component `ValueError` messages, and `PHP_URL_*`
@@ -88,11 +91,11 @@
   percent escape preservation, and the selected memory-safety regression.
 - `htmlspecialchars_decode()` now honors `ENT_COMPAT`, `ENT_NOQUOTES`, and
   `ENT_QUOTES` quote decoding for the selected upstream basic PHPT.
-- Latest focused target run: PASS, 29 selected PHPTs.
+- Latest focused target run: PASS, 31 selected PHPTs.
 
 ## Known Gaps
 
-- Full entity-table, charset, broader flag, object-query, `parse_url` edge-case,
-  remaining `parse_str`, including the separate startup `filter.default`
-  deprecation-output mismatch in `parse_str_basic3.phpt`, and URL edge-case
-  behavior remains outside the selected focused gate.
+- Full entity-table, charset, broader flag, object-query/property visibility,
+  `parse_url` edge-case, remaining `parse_str`, including the separate startup
+  `filter.default` deprecation-output mismatch in `parse_str_basic3.phpt`, and
+  URL edge-case behavior remains outside the selected focused gate.
