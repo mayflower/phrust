@@ -7021,6 +7021,18 @@ impl Vm {
                         let class_name = class_name.clone();
                         let constant = constant.clone();
                         let span = dense_instruction_span(dense, instruction);
+                        let cache_site = (
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                        );
+                        self.observe_dense_property_inline_cache(
+                            compiled,
+                            cache_site.0,
+                            cache_site.1,
+                            cache_site.2,
+                            InlineCacheKind::ClassConstantStaticProperty,
+                        );
                         // Dense functions carry no local exception handlers
                         // (try/catch keeps a function on the rich plan), so a
                         // raised \Error / autoload throwable propagates to outer
@@ -7029,7 +7041,7 @@ impl Vm {
                             compiled,
                             &class_name,
                             &constant,
-                            None,
+                            Some(cache_site),
                             span,
                             output,
                             stack,
@@ -7136,11 +7148,23 @@ impl Vm {
                         let class_name = class_name.clone();
                         let property = property.clone();
                         let span = dense_instruction_span(dense, instruction);
+                        let cache_site = (
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                        );
+                        self.observe_dense_property_inline_cache(
+                            compiled,
+                            cache_site.0,
+                            cache_site.1,
+                            cache_site.2,
+                            InlineCacheKind::ClassConstantStaticProperty,
+                        );
                         let value = match self.fetch_static_property_value(
                             compiled,
                             &class_name,
                             &property,
-                            None,
+                            Some(cache_site),
                             span,
                             output,
                             stack,
@@ -38443,8 +38467,7 @@ impl Vm {
     /// Resolves a `Class::CONSTANT` (or `Class::class`) fetch to its value,
     /// shared by the rich and dense executors. The caller writes the returned
     /// value to its destination; faults are translated by each executor's arm.
-    /// `cache_site` supplies the inline-cache key `(function, block, instr)` for
-    /// the rich interpreter; the dense executor passes `None` (no inline cache).
+    /// `cache_site` supplies the inline-cache key `(function, block, instr)`.
     #[allow(clippy::too_many_arguments)]
     fn fetch_class_constant_value(
         &self,
@@ -38786,8 +38809,8 @@ impl Vm {
 
     /// Resolves a `Class::$staticProperty` fetch to its value, shared by the
     /// rich and dense executors (mirrors `fetch_class_constant_value`). Faults
-    /// are returned for the caller to route; `cache_site` supplies the rich
-    /// interpreter's inline-cache key (dense passes `None`).
+    /// are returned for the caller to route; `cache_site` supplies the
+    /// inline-cache key.
     #[allow(clippy::too_many_arguments)]
     fn fetch_static_property_value(
         &self,
