@@ -8,7 +8,8 @@
   - selected `ext/hash/tests/*.phpt` rows for adler32, CRC/FNV/JOOAT,
     MD2/MD4, md5, MurmurHash3, RIPEMD, sha1, SHA-2/SHA3, Tiger 3-pass,
     Whirlpool, MurmurHash3/xxHash seed options and deprecation diagnostics,
-    hash_equals, HMAC-md5, file hashing, HKDF, PBKDF2, and stream updates
+    hash_equals, HMAC-md5, file hashing, HKDF, HKDF edge cases, PBKDF2,
+    and stream updates
 
 ## Implemented Surface
 
@@ -32,13 +33,15 @@ GOST, RIPEMD, sha1/SHA-2/SHA3/Tiger 3-pass/Whirlpool digest vectors,
 MurmurHash3/xxHash seeded one-shot and incremental vectors, HMAC-md5,
 upstream file hashing,
 `hash_update_file`, `hash_update_stream`, `hash_pbkdf2`, and RFC5869
-`hash_hkdf` vectors. The promoted error rows cover invalid algorithm ValueError
-wording for `hash`, `hash_file`, `hash_hmac`, `hash_hmac_file`, `hash_init`,
-`hash_pbkdf2`, and `hash_hkdf`, missing-file diagnostics for `hash_file`,
-null-byte filename diagnostics for `hash_hmac_file`, HMAC-mode algorithm/key
-diagnostics for `hash_init`, plus PBKDF2 iteration/length and HKDF key/length
-argument ValueErrors. The promoted `hash_equals` row covers constant-time string
-comparison behavior plus strict TypeError reporting for non-string arguments.
+`hash_hkdf` vectors, plus HKDF edge cases for default lengths, oversized
+lengths, and algorithm case-sensitivity. The promoted error rows cover invalid
+algorithm ValueError wording for `hash`, `hash_file`, `hash_hmac`,
+`hash_hmac_file`, `hash_init`, `hash_pbkdf2`, and `hash_hkdf`, missing-file
+diagnostics for `hash_file`, null-byte filename diagnostics for
+`hash_hmac_file`, HMAC-mode algorithm/key diagnostics for `hash_init`, plus
+PBKDF2 iteration/length and HKDF key/length argument ValueErrors. The promoted
+`hash_equals` row covers constant-time string comparison behavior plus strict
+TypeError reporting for non-string arguments.
 The promoted seed deprecation rows cover PHP's non-int seed diagnostics for
 MurmurHash3 and xxHash algorithms, including the xxh3/xxh128 ignored-seed
 behavior and xxHash non-string secret deprecation emission before catchable
@@ -67,4 +70,4 @@ MurmurHash3, Whirlpool, GOST, MurmurHash3/xxHash seed support, Tiger 3-pass
 support, strict hash_equals argument validation,
 hash/hash_file/HMAC/HMAC-file/hash_init/PBKDF2/HKDF ValueError wording, and
 MurmurHash3/xxHash seed deprecation diagnostics, the selected manifest contains
-49 green rows.
+50 green rows.

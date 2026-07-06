@@ -15,6 +15,7 @@
 {"path":"ext/hash/tests/hash_file_error.phpt"}
 {"path":"ext/hash/tests/hash_hmac_error.phpt"}
 {"path":"ext/hash/tests/hash_hmac_file_error.phpt"}
+{"path":"ext/hash/tests/hash_hkdf_edges.phpt"}
 {"path":"ext/hash/tests/hash_hkdf_error.phpt"}
 {"path":"ext/hash/tests/hash_hkdf_rfc5869.phpt"}
 {"path":"ext/hash/tests/hash_init_error.phpt"}

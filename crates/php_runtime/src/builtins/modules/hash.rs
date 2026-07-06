@@ -11,7 +11,10 @@ use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     RuntimeSourceSpan,
 };
-use crate::{ClassEntry, ClassFlags, ObjectRef, Value, normalize_class_name, to_bool};
+use crate::{
+    ClassEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ObjectRef, Value,
+    normalize_class_name, to_bool,
+};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("hash", builtin_hash, BuiltinCompatibility::Php),
@@ -617,7 +620,11 @@ fn hash_context_arg(name: &str, value: &Value) -> Result<ObjectRef, crate::built
             Some(Value::Bool(false))
         )
     {
-        return Err(type_error(name, "valid, non-finalized HashContext", value));
+        return Err(argument_value_error(
+            name,
+            "#1 ($context)",
+            "must be a valid, non-finalized HashContext",
+        ));
     }
     Ok(object)
 }
@@ -743,7 +750,16 @@ fn hash_context_class() -> ClassEntry {
         name: normalize_class_name(HASH_CONTEXT_CLASS),
         parent: None,
         interfaces: Vec::new(),
-        methods: Vec::new(),
+        methods: vec![ClassMethodEntry {
+            name: "__construct".to_owned(),
+            origin_class: normalize_class_name(HASH_CONTEXT_CLASS),
+            function_id: 0,
+            flags: ClassMethodFlags {
+                is_private: true,
+                ..ClassMethodFlags::default()
+            },
+            attributes: Vec::new(),
+        }],
         properties: Vec::new(),
         constants: Vec::new(),
         enum_cases: Vec::new(),
@@ -1704,7 +1720,12 @@ mod tests {
             call("hash_final", vec![context.clone()]),
             Value::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
-        assert!(call_with_error("hash_update", vec![context, Value::string("x")]).is_err());
+        let finalized_error = call_with_error("hash_update", vec![context, Value::string("x")])
+            .expect_err("finalized HashContext is rejected");
+        assert_eq!(
+            finalized_error.message(),
+            "hash_update(): Argument #1 ($context) must be a valid, non-finalized HashContext"
+        );
         assert_eq!(
             call("hash_final", vec![copy]),
             Value::string("fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603")
