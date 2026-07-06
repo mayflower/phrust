@@ -16,7 +16,11 @@ use crate::quickening::{
 pub const PERSISTENT_FEEDBACK_FORMAT_VERSION: &str = "phrust-persistent-feedback-v1";
 
 /// JSON/report schema version for persistent feedback stats.
-pub const PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 splits the collapsed `rejected_stale` counter into explicit
+/// epoch/architecture/config mismatch reasons and adds `entries_written`
+/// for the engine-owned writer path.
+pub const PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION: u32 = 2;
 
 /// Invalidation epochs that must match before feedback can be advisory input.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -111,6 +115,21 @@ impl PersistentFeedbackContext {
                         stats.rejected_stale = stats.rejected_stale.saturating_add(1);
                         stats.fallback_to_baseline = true;
                     }
+                    Err(PersistentFeedbackRejectReason::EpochMismatch) => {
+                        stats.rejected_epoch_mismatch =
+                            stats.rejected_epoch_mismatch.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
+                    Err(PersistentFeedbackRejectReason::ArchitectureMismatch) => {
+                        stats.rejected_architecture_mismatch =
+                            stats.rejected_architecture_mismatch.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
+                    Err(PersistentFeedbackRejectReason::ConfigMismatch) => {
+                        stats.rejected_config_mismatch =
+                            stats.rejected_config_mismatch.saturating_add(1);
+                        stats.fallback_to_baseline = true;
+                    }
                     Err(PersistentFeedbackRejectReason::UserlandState) => {
                         stats.rejected_userland_state =
                             stats.rejected_userland_state.saturating_add(1);
@@ -139,6 +158,17 @@ impl PersistentFeedbackContext {
     /// context will accept back on the next load.
     #[must_use]
     pub fn render_sites(&self, sites: &[QuickeningSiteSnapshot]) -> String {
+        self.render_sites_counted(sites).0
+    }
+
+    /// Engine-owned writer: renders exported quickening sites into the v1 line
+    /// format and reports how many validator-accepted entries were emitted, so
+    /// callers can record `entries_written` without re-parsing the output. The
+    /// emitted entries carry this context's epochs, so a writer fed real
+    /// invalidation epochs persists non-zero epochs.
+    #[must_use]
+    pub fn render_sites_counted(&self, sites: &[QuickeningSiteSnapshot]) -> (String, u64) {
+        let mut written = 0u64;
         let mut text = String::with_capacity(64 + sites.len() * 256);
         text.push_str(PERSISTENT_FEEDBACK_FORMAT_VERSION);
         text.push('\n');
@@ -207,8 +237,9 @@ impl PersistentFeedbackContext {
                 self.target_arch_config,
                 snapshot.guard_failures,
             );
+            written = written.saturating_add(1);
         }
-        text
+        (text, written)
     }
 
     fn validate_entry(
@@ -219,13 +250,22 @@ impl PersistentFeedbackContext {
             return Err(PersistentFeedbackRejectReason::UserlandState);
         }
         let key = &entry.key;
+        // Distinguish rejection classes so callers can tell an out-of-date
+        // deployment (config/arch/epoch) from a genuinely stale source. Order
+        // matters only for attribution; any single mismatch rejects the entry.
+        if key.compile_options != self.compile_options {
+            return Err(PersistentFeedbackRejectReason::ConfigMismatch);
+        }
+        if key.target_arch_config != self.target_arch_config {
+            return Err(PersistentFeedbackRejectReason::ArchitectureMismatch);
+        }
+        if key.epochs != self.epochs {
+            return Err(PersistentFeedbackRejectReason::EpochMismatch);
+        }
         if key.source_fingerprint != self.source_fingerprint
             || key.engine_version != self.engine_version
             || key.php_target_version != self.php_target_version
-            || key.compile_options != self.compile_options
             || key.ir_fingerprint != self.ir_fingerprint
-            || key.epochs != self.epochs
-            || key.target_arch_config != self.target_arch_config
         {
             return Err(PersistentFeedbackRejectReason::Stale);
         }
@@ -292,7 +332,11 @@ pub struct PersistentFeedbackStats {
     pub files_loaded: u64,
     pub entries_seen: u64,
     pub entries_accepted: u64,
+    pub entries_written: u64,
     pub rejected_stale: u64,
+    pub rejected_epoch_mismatch: u64,
+    pub rejected_architecture_mismatch: u64,
+    pub rejected_config_mismatch: u64,
     pub rejected_corrupt: u64,
     pub rejected_userland_state: u64,
     pub fallback_to_baseline: bool,
@@ -309,7 +353,11 @@ impl Default for PersistentFeedbackStats {
             files_loaded: 0,
             entries_seen: 0,
             entries_accepted: 0,
+            entries_written: 0,
             rejected_stale: 0,
+            rejected_epoch_mismatch: 0,
+            rejected_architecture_mismatch: 0,
+            rejected_config_mismatch: 0,
             rejected_corrupt: 0,
             rejected_userland_state: 0,
             fallback_to_baseline: false,
@@ -331,7 +379,11 @@ impl PersistentFeedbackStats {
                 "  \"files_loaded\": {},\n",
                 "  \"entries_seen\": {},\n",
                 "  \"entries_accepted\": {},\n",
+                "  \"entries_written\": {},\n",
                 "  \"rejected_stale\": {},\n",
+                "  \"rejected_epoch_mismatch\": {},\n",
+                "  \"rejected_architecture_mismatch\": {},\n",
+                "  \"rejected_config_mismatch\": {},\n",
                 "  \"rejected_corrupt\": {},\n",
                 "  \"rejected_userland_state\": {},\n",
                 "  \"fallback_to_baseline\": {},\n",
@@ -345,7 +397,11 @@ impl PersistentFeedbackStats {
             self.files_loaded,
             self.entries_seen,
             self.entries_accepted,
+            self.entries_written,
             self.rejected_stale,
+            self.rejected_epoch_mismatch,
+            self.rejected_architecture_mismatch,
+            self.rejected_config_mismatch,
             self.rejected_corrupt,
             self.rejected_userland_state,
             self.fallback_to_baseline,
@@ -446,7 +502,15 @@ pub struct PersistentFeedbackPayload {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PersistentFeedbackRejectReason {
+    /// Source/engine/PHP-target/IR identity no longer matches.
     Stale,
+    /// Class/function/autoload/include invalidation epoch mismatch.
+    EpochMismatch,
+    /// Target architecture/config label mismatch.
+    ArchitectureMismatch,
+    /// Compile-options (opt level, exec format, quickening, IC, cache, JIT,
+    /// tiering) mismatch.
+    ConfigMismatch,
     Corrupt,
     UserlandState,
 }
@@ -522,6 +586,10 @@ fn contains_forbidden_userland_state(fields: &BTreeMap<&str, &str>) -> bool {
         "object_handle",
         "array_value",
         "resource_handle",
+        "global",
+        "superglobal",
+        "output_buffer",
+        "session",
     ] {
         if fields
             .get(forbidden)
@@ -878,9 +946,99 @@ mod tests {
             .stats
             .to_json();
 
-        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"schema_version\": 2"));
         assert!(json.contains("\"advisory_only\": true"));
         assert!(json.contains("\"default_enabled\": false"));
         assert!(json.contains("\"entries_accepted\": 1"));
+        assert!(json.contains("\"entries_written\": 0"));
+        assert!(json.contains("\"rejected_epoch_mismatch\": 0"));
+        assert!(json.contains("\"rejected_architecture_mismatch\": 0"));
+        assert!(json.contains("\"rejected_config_mismatch\": 0"));
+    }
+
+    #[test]
+    fn epoch_mismatch_is_attributed_distinctly_from_stale() {
+        let text = valid_entry().replace("class_epoch=1", "class_epoch=99");
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert_eq!(report.stats.rejected_epoch_mismatch, 1);
+        assert_eq!(report.stats.rejected_stale, 0);
+        assert!(report.stats.fallback_to_baseline);
+    }
+
+    #[test]
+    fn architecture_mismatch_is_attributed_distinctly() {
+        let text = valid_entry().replace("target=test-target", "target=other-arch");
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert_eq!(report.stats.rejected_architecture_mismatch, 1);
+        assert_eq!(report.stats.rejected_stale, 0);
+        assert_eq!(report.stats.rejected_epoch_mismatch, 0);
+    }
+
+    #[test]
+    fn config_mismatch_is_attributed_distinctly() {
+        let text = valid_entry().replace("compile=opt=2,exec=auto", "compile=opt=0,exec=baseline");
+        let report = context().validate_bytes(text.as_bytes());
+
+        assert_eq!(report.stats.entries_accepted, 0);
+        assert_eq!(report.stats.rejected_config_mismatch, 1);
+        assert_eq!(report.stats.rejected_stale, 0);
+    }
+
+    #[test]
+    fn globals_superglobals_sessions_and_output_buffers_are_rejected() {
+        for forbidden in [
+            "global=x",
+            "superglobal=_GET",
+            "session=abc",
+            "output_buffer=1",
+        ] {
+            let text = valid_entry().replace(
+                "blacklisted=false",
+                &format!("blacklisted=false {forbidden}"),
+            );
+            let report = context().validate_bytes(text.as_bytes());
+            assert_eq!(
+                report.stats.rejected_userland_state, 1,
+                "{forbidden} must be rejected as userland state"
+            );
+            assert_eq!(report.stats.entries_accepted, 0, "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn render_sites_counted_reports_written_entries() {
+        let context = context();
+        let sites = vec![
+            QuickeningSiteSnapshot {
+                site: QuickeningSiteKey::Dense {
+                    unit: 0,
+                    function: 3,
+                    instruction: 17,
+                },
+                state: QuickeningState::Specialized,
+                specialization: Some(QuickeningSpecialization::AddIntInt),
+                guard_failures: 0,
+            },
+            // Observing sites are not persisted and must not be counted.
+            QuickeningSiteSnapshot {
+                site: QuickeningSiteKey::Ir {
+                    function: 1,
+                    block: 2,
+                    instruction: 4,
+                },
+                state: QuickeningState::Observing,
+                specialization: None,
+                guard_failures: 0,
+            },
+        ];
+
+        let (text, written) = context.render_sites_counted(&sites);
+        assert_eq!(written, 1, "only the specialized site is written");
+        let report = context.validate_bytes(text.as_bytes());
+        assert_eq!(report.stats.entries_accepted, written);
     }
 }

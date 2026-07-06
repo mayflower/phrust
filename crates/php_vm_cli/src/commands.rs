@@ -1077,14 +1077,18 @@ where
         };
         write_tiering_stats_json(path, stats)?;
     }
+    let mut entries_written = 0u64;
     if let (Some(write_path), Some(context)) = (
         persistent_feedback.write_path.as_deref(),
         persistent_feedback.context.as_ref(),
     ) {
-        store_persistent_feedback(write_path, context, &output.quickening_feedback);
+        entries_written =
+            store_persistent_feedback(write_path, context, &output.quickening_feedback);
     }
     if let Some(path) = run_options.persistent_feedback.stats_json.clone() {
-        write_persistent_feedback_stats_json(path, &persistent_feedback.report.stats)?;
+        let mut stats = persistent_feedback.report.stats.clone();
+        stats.entries_written = entries_written;
+        write_persistent_feedback_stats_json(path, &stats)?;
     }
     if run_options.bytecode_cache.stats {
         write_cache_stats_json(stderr, &cache_stats)?;
@@ -2047,27 +2051,33 @@ fn prepare_persistent_feedback(
 
 /// Persists this run's exported quickening sites. Feedback is advisory, so
 /// persistence failures never affect the run's outcome or output.
+/// Returns the number of validator-accepted entries actually persisted (0 on
+/// any write failure), so the caller can record `entries_written`.
 fn store_persistent_feedback(
     write_path: &Path,
     context: &PersistentFeedbackContext,
     sites: &[QuickeningSiteSnapshot],
-) {
+) -> u64 {
     if sites.is_empty() && !write_path.exists() {
-        return;
+        return 0;
     }
-    let text = context.render_sites(sites);
+    let (text, written) = context.render_sites_counted(sites);
     if let Some(parent) = write_path.parent()
         && fs::create_dir_all(parent).is_err()
     {
-        return;
+        return 0;
     }
     // Concurrent processes may share the sidecar location; write via a unique
     // temp file and rename so readers never observe partial entries.
     let temp_file = write_path.with_extension(format!("tmp.{}", std::process::id()));
-    if fs::write(&temp_file, text.as_bytes()).is_ok() && fs::rename(&temp_file, write_path).is_err()
-    {
-        let _ = fs::remove_file(&temp_file);
+    if fs::write(&temp_file, text.as_bytes()).is_err() {
+        return 0;
     }
+    if fs::rename(&temp_file, write_path).is_err() {
+        let _ = fs::remove_file(&temp_file);
+        return 0;
+    }
+    written
 }
 
 fn persistent_feedback_context(

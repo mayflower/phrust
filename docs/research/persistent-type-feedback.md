@@ -34,9 +34,10 @@ The persistent payload can represent:
 - guard-failure and blacklist summaries.
 
 The parser rejects explicit userland value state: VM `Value`s, object handles,
-array values, resource handles, and non-interned request strings. Interned or
-engine-owned immutable strings are the only string payload class accepted by the
-line-format validator.
+array values, resource handles, non-interned request strings, and — as of the
+writer-accounting slice — globals, superglobals, output buffers, and sessions.
+Interned or engine-owned immutable strings are the only string payload class
+accepted by the line-format validator.
 
 ## CLI Reporting
 
@@ -49,9 +50,13 @@ php-vm run \
   fixtures/runtime/valid/hello.php
 ```
 
-The stats JSON records advisory/default-off status, accepted entries, stale
-entries, corrupt entries, rejected userland-state entries, metadata bytes, and
-whether execution fell back to baseline.
+The stats JSON (schema v2) records advisory/default-off status, accepted
+entries, entries written by the engine-owned writer, and rejection counts split
+by cause — stale (source/engine/PHP-target/IR identity), epoch mismatch,
+architecture mismatch, config mismatch, corrupt, and userland-state — plus
+metadata bytes and whether execution fell back to baseline. Splitting the former
+single `rejected_stale` counter lets an operator tell an out-of-date deployment
+(config/arch/epoch) apart from a genuinely stale source.
 
 ## Matrix Policy
 
@@ -67,11 +72,25 @@ Both rows are optional/default-off. They exercise metadata validation and stats
 reporting, then compare PHP stdout, diagnostics, and exit status against the
 baseline row.
 
+## Writer Accounting (current slice)
+
+`PersistentFeedbackContext::render_sites_counted` is the engine-owned writer: it
+emits only validator-accepted entries and returns how many it wrote, which the
+CLI records as `entries_written`. Emitted entries carry the context's epochs, so
+a writer fed real epochs would persist non-zero epochs. Consumption stays
+default-off; the writer only widens metadata coverage and accounting.
+
 ## Remaining Work
 
-- persist accepted metadata through an owned engine cache writer;
+- **Capture non-zero epochs.** The `ExecutionState` class/function/autoload/
+  include epochs (`vm/mod.rs`) are request-local and dropped when `execute`
+  returns, so the write context still uses the cold-start zero epoch (a
+  conservative value that rejects as `epoch_mismatch`, never optimistic reuse).
+  The plumbing is: stash the final epochs out of `execute`, surface them on
+  `PhpExecutionOutput`, and build the write context with them.
+- persist the full accepted payload (callsite/scalar/array/object/branch/
+  include-autoload observations), not just the quickening sub-field, once the VM
+  produces those observations;
 - integrate accepted feedback with quickening, inline caches, and later tiers;
-- model non-zero class/function/autoload/include epochs from a persistent engine
-  context rather than the current cold-start zero epoch;
 - add Composer map fingerprints when the autoload graph model is promoted from
   request-local runtime behavior into persistent engine metadata.
