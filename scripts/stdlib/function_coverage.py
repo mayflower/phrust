@@ -14,7 +14,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = REPO_ROOT / "target/stdlib/function-coverage"
 JSON_REPORT = OUT_DIR / "coverage.json"
-DOC_REPORT = REPO_ROOT / "docs/stdlib-function-coverage.md"
+DOC_REPORT = REPO_ROOT / "docs/stdlib/function-coverage.md"
 RUST_DUMP = REPO_ROOT / "target/debug/dump_stdlib_registry"
 EXTENSIONS = ["core", "standard", "json", "pcre", "date", "spl", "reflection", "tokenizer"]
 KNOWN_GAP_BY_EXTENSION = {

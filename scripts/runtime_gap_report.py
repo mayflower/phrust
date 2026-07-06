@@ -13,8 +13,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "docs" / "known_gaps" / "runtime.jsonl"
-KNOWN_GAPS_DOC = ROOT / "docs" / "runtime-known-gaps.md"
-SUMMARY_DOC = ROOT / "docs" / "runtime-gap-closure-plan.md"
+KNOWN_GAPS_DOC = ROOT / "docs" / "runtime" / "known-gaps.md"
+SUMMARY_DOC = ROOT / "docs" / "runtime" / "gap-closure-plan.md"
 TARGET_DIR = ROOT / "target" / "runtime-gap-report"
 REPORT_JSON = TARGET_DIR / "runtime-gap-report.json"
 REPORT_MD = TARGET_DIR / "runtime-gap-report.md"

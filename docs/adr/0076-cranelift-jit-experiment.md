@@ -65,7 +65,7 @@ The JIT ABI is a narrow boundary between VM-owned state and native code:
 
 No raw internal Rust reference may be stored by JIT code or survive past the
 call boundary. If `unsafe` becomes necessary, it must be isolated in a small
-module with invariants documented in `docs/performance-safety-audit.md`.
+module with invariants documented in `docs/performance/safety-audit.md`.
 
 ## Guards and Deoptimization
 

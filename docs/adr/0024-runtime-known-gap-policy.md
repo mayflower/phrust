@@ -12,7 +12,7 @@ without being misreported as implemented or silently skipped by tests.
 ## Decision
 
 Every runtime compatibility gap needs a stable ID, a row in
-`docs/runtime-known-gaps.md`, and either an executable fixture or an explicit
+`docs/runtime/known-gaps.md`, and either an executable fixture or an explicit
 planned/deferred note with an example. Verifiers and smoke tests should keep
 known gaps separate from passing fixtures and actual failures.
 

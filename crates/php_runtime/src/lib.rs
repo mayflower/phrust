@@ -9,7 +9,7 @@
 //! migrated. New downstream imports should use the explicit facades instead of
 //! relying on the full crate root.
 //!
-//! Module ownership is grouped in `docs/runtime-module-boundaries.md`. New
+//! Module ownership is grouped in `docs/runtime/module-boundaries.md`. New
 //! top-level modules must be categorized there before they are exposed here.
 
 pub mod array;

@@ -93,8 +93,8 @@
 
 - `crates/php_runtime/src/builtins/modules/strings.rs`
 - `crates/php_runtime/src/builtins/modules/core.rs`
-- `docs/stdlib-encoding-hash-url.md`
-- `docs/stdlib-known-gaps.md`
+- `docs/stdlib/encoding-hash-url.md`
+- `docs/stdlib/known-gaps.md`
 
 ## Target Gates
 

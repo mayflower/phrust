@@ -5,6 +5,12 @@ use a stable numeric prefix; do not renumber accepted ADRs just to close gaps.
 When an older unnumbered or duplicate-numbered record is cleaned up, assign the
 next appropriate free number and update direct links.
 
+All ordered ADRs listed below are accepted unless the row explicitly says
+otherwise. Superseded, withdrawn, or experimental records must say so in this
+index and link to the replacement decision. Cranelift and native-tier addenda
+are accepted constraints for the current default-off experimental native tier;
+they do not make native execution a production default.
+
 ## Number Ranges
 
 | Range | Area |

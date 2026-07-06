@@ -110,17 +110,17 @@ def main() -> int:
         "composer-smoke",
     ]
     docs = [
-        "docs/stdlib-preflight.md",
-        "docs/stdlib-standard-library.md",
-        "docs/stdlib-extension-coverage.md",
-        "docs/stdlib-composer-compatibility.md",
-        "docs/stdlib-security-capabilities.md",
-        "docs/stdlib-known-gaps.md",
+        "docs/stdlib/preflight.md",
+        "docs/stdlib/standard-library.md",
+        "docs/stdlib/extension-coverage.md",
+        "docs/stdlib/composer-compatibility.md",
+        "docs/stdlib/security-capabilities.md",
+        "docs/stdlib/known-gaps.md",
     ]
     known_gap_docs = [
-        "docs/runtime-known-gaps.md",
-        "docs/runtime-semantics-known-gaps.md",
-        "docs/stdlib-known-gaps.md",
+        "docs/runtime/known-gaps.md",
+        "docs/runtime/semantics-known-gaps.md",
+        "docs/stdlib/known-gaps.md",
     ]
     report = {
         "area": "standard-library",

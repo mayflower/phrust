@@ -40,10 +40,10 @@ If a change documents or preserves unsupported behavior, update the relevant
 known-gap document and any owning JSONL manifest:
 
 - [Known-gap manifests](../known_gaps/README.md)
-- [Runtime known gaps](../runtime-known-gaps.md)
-- [Runtime semantics known gaps](../runtime-semantics-known-gaps.md)
-- [Standard library known gaps](../stdlib-known-gaps.md)
-- [Performance known gaps](../performance-known-gaps.md)
+- [Runtime known gaps](../runtime/known-gaps.md)
+- [Runtime semantics known gaps](../runtime/semantics-known-gaps.md)
+- [Standard library known gaps](../stdlib/known-gaps.md)
+- [Performance known gaps](../performance/known-gaps.md)
 - [PHPT known gaps](../phpt/known-gaps.md)
 
 Validate manifest consistency with:

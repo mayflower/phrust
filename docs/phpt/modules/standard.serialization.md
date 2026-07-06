@@ -53,7 +53,7 @@
 - `crates/php_runtime/src/serialization.rs`
 - `crates/php_runtime/src/value.rs`
 - `crates/php_runtime/src/object/`
-- `docs/stdlib-serialization.md`
+- `docs/stdlib/serialization.md`
 
 ## Target Gates
 

@@ -3,8 +3,8 @@
 This directory contains machine-readable mirrors for known-gap policy that was
 previously checked only through prose and shell greps.
 
-- `runtime.jsonl` mirrors `docs/runtime-known-gaps.md`.
-- `performance.jsonl` mirrors `docs/performance-known-gaps.md`.
+- `runtime.jsonl` mirrors `docs/runtime/known-gaps.md`.
+- `performance.jsonl` mirrors `docs/performance/known-gaps.md`.
 - `phpt-runner-smoke.jsonl` records current PHPT runner-smoke closure status.
 
 Each JSONL row uses the same required fields: `id`, `feature`, `status`,

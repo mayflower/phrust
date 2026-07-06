@@ -1,0 +1,34 @@
+# Runtime And VM Documentation
+
+This directory owns runtime, VM, execution, diagnostics, cache, and runtime
+semantics documentation.
+
+## Stable Contracts
+
+- [Runtime contract](contract.md)
+- [Runtime reference](reference.md)
+- [Runtime values](values.md)
+- [Runtime IR](ir.md)
+- [Runtime VM structure](vm-structure.md)
+- [Runtime known gaps](known-gaps.md)
+
+## Architecture
+
+- [Executor architecture](executor-architecture.md)
+- [Cache architecture](cache-architecture.md)
+- [Module boundaries](module-boundaries.md)
+- [Diagnostics architecture](diagnostics-architecture.md)
+- [Diagnostics debugging](diagnostics-debugging.md)
+
+## Runtime Semantics
+
+- [Runtime semantics contract](semantics-contract.md)
+- [Runtime semantics status](semantics-status.md)
+- [Runtime semantics known gaps](semantics-known-gaps.md)
+- [Runtime semantics coverage matrix](semantics-coverage-matrix.md)
+- [Runtime semantics final audit](semantics-final-audit.md)
+
+## Reports
+
+Committed runtime summaries live under [reports/](reports/). Raw diff outputs
+and local run artifacts stay under `target/`.

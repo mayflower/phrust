@@ -6,7 +6,7 @@ Accepted
 
 Historical. This ADR records the original foundation boundary. The current
 architecture is broader and is governed by the live layer docs, including
-`docs/api-facades.md`, `docs/runtime-module-boundaries.md`, and the
+`docs/api-facades.md`, `docs/runtime/module-boundaries.md`, and the
 source-integrity ratchets.
 
 ## Context

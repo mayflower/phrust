@@ -11,21 +11,21 @@ test -s target/stdlib/preflight.json
 grep -q '"version": "8.5.7"' target/stdlib/preflight.json
 grep -q '"verify-runtime": true' target/stdlib/preflight.json
 grep -q 'crates/php_std' target/stdlib/preflight.json
-grep -q '"docs/stdlib-known-gaps.md": true' target/stdlib/preflight.json
+grep -q '"docs/stdlib/known-gaps.md": true' target/stdlib/preflight.json
 
-test -f docs/stdlib-preflight.md
-test -f docs/stdlib-standard-library.md
-test -f docs/stdlib-extension-coverage.md
-test -f docs/stdlib-function-coverage.md
-test -f docs/stdlib-composer-compatibility.md
-test -f docs/stdlib-security-capabilities.md
-test -f docs/stdlib-known-gaps.md
-test -f docs/stdlib-phpt-extension-smoke.md
-test -f docs/stdlib-regression-corpus.md
-test -f docs/stdlib-stabilization-06-54.md
-test -f docs/stdlib-arginfo-coercion.md
-test -f docs/stdlib-platform-constants.md
-test -f docs/stdlib-final-audit.md
+test -f docs/stdlib/preflight.md
+test -f docs/stdlib/standard-library.md
+test -f docs/stdlib/extension-coverage.md
+test -f docs/stdlib/function-coverage.md
+test -f docs/stdlib/composer-compatibility.md
+test -f docs/stdlib/security-capabilities.md
+test -f docs/stdlib/known-gaps.md
+test -f docs/stdlib/phpt-extension-smoke.md
+test -f docs/stdlib/regression-corpus.md
+test -f docs/stdlib/stabilization-06-54.md
+test -f docs/stdlib/arginfo-coercion.md
+test -f docs/stdlib/platform-constants.md
+test -f docs/stdlib/final-audit.md
 test -f scripts/stdlib/diff_builtin_function.php
 test -x scripts/stdlib/function_coverage.py
 test -x scripts/stdlib/generate_arginfo.py
@@ -46,29 +46,29 @@ test "$(find tests/fixtures/stdlib/_harness/streams -name '*.php' | wc -l | tr -
 test "$(find tests/fixtures/stdlib/_harness/json-pcre-date -name '*.php' | wc -l | tr -d ' ')" -ge 3
 test "$(find tests/fixtures/stdlib/_harness/spl-reflection -name '*.php' | wc -l | tr -d ' ')" -ge 2
 
-grep -q 'PHP 8.5.7' docs/stdlib-standard-library.md
-grep -q 'php-8.5.7' docs/stdlib-standard-library.md
-grep -q 'PHAR' docs/stdlib-standard-library.md
-grep -q 'mbstring' docs/stdlib-standard-library.md
-grep -q 'intl' docs/stdlib-standard-library.md
-grep -q 'DOM/XML' docs/stdlib-standard-library.md
-grep -q 'PDO' docs/stdlib-standard-library.md
-grep -q 'curl' docs/stdlib-standard-library.md
-grep -q 'FPM' docs/stdlib-standard-library.md
-grep -q 'nix develop -c just verify-stdlib' docs/stdlib-standard-library.md
-grep -q 'composer-smoke-source' docs/stdlib-composer-compatibility.md
-grep -q 'PHRUST_STDLIB_COMPOSER_SOURCE_DIR' docs/stdlib-composer-compatibility.md
-grep -q 'Standard Library Function Coverage' docs/stdlib-function-coverage.md
-grep -q 'stdlib-coverage' docs/stdlib-function-coverage.md
-grep -q 'STDLIB-GAP-FULL-PARITY' docs/stdlib-known-gaps.md
-grep -q 'extension-phpt-smoke' docs/stdlib-phpt-extension-smoke.md
-grep -q 'normalized-report.json' docs/stdlib-phpt-extension-smoke.md
-grep -q 'extension-phpt-smoke' docs/stdlib-extension-coverage.md
-grep -q 'STDLIB-GAP-EXTENSION-PHPT-PROMOTION' docs/stdlib-known-gaps.md
-grep -q 'compat-corpus-smoke' docs/stdlib-regression-corpus.md
-grep -q 'reference-output' docs/stdlib-regression-corpus.md
-grep -q 'STDLIB_ARRAY_FLIP_WARNING' docs/stdlib-stabilization-06-54.md
-grep -q 'STDLIB-GAP-ARRAY-WALK-BY-REF-MUTATION' docs/stdlib-stabilization-06-54.md
+grep -q 'PHP 8.5.7' docs/stdlib/standard-library.md
+grep -q 'php-8.5.7' docs/stdlib/standard-library.md
+grep -q 'PHAR' docs/stdlib/standard-library.md
+grep -q 'mbstring' docs/stdlib/standard-library.md
+grep -q 'intl' docs/stdlib/standard-library.md
+grep -q 'DOM/XML' docs/stdlib/standard-library.md
+grep -q 'PDO' docs/stdlib/standard-library.md
+grep -q 'curl' docs/stdlib/standard-library.md
+grep -q 'FPM' docs/stdlib/standard-library.md
+grep -q 'nix develop -c just verify-stdlib' docs/stdlib/standard-library.md
+grep -q 'composer-smoke-source' docs/stdlib/composer-compatibility.md
+grep -q 'PHRUST_STDLIB_COMPOSER_SOURCE_DIR' docs/stdlib/composer-compatibility.md
+grep -q 'Standard Library Function Coverage' docs/stdlib/function-coverage.md
+grep -q 'stdlib-coverage' docs/stdlib/function-coverage.md
+grep -q 'STDLIB-GAP-FULL-PARITY' docs/stdlib/known-gaps.md
+grep -q 'extension-phpt-smoke' docs/stdlib/phpt-extension-smoke.md
+grep -q 'normalized-report.json' docs/stdlib/phpt-extension-smoke.md
+grep -q 'extension-phpt-smoke' docs/stdlib/extension-coverage.md
+grep -q 'STDLIB-GAP-EXTENSION-PHPT-PROMOTION' docs/stdlib/known-gaps.md
+grep -q 'compat-corpus-smoke' docs/stdlib/regression-corpus.md
+grep -q 'reference-output' docs/stdlib/regression-corpus.md
+grep -q 'STDLIB_ARRAY_FLIP_WARNING' docs/stdlib/stabilization-06-54.md
+grep -q 'STDLIB-GAP-ARRAY-WALK-BY-REF-MUTATION' docs/stdlib/stabilization-06-54.md
 grep -q 'STDLIB_CORPUS_JSON_CONFIG' tests/fixtures/stdlib/corpus/json_config.php
 grep -q 'purpose:' tests/fixtures/stdlib/corpus/reflection_attributes.php
 grep -q 'category = "standard"' fixtures/stdlib/phpt_extension_manifest.toml
@@ -80,21 +80,21 @@ grep -q 'category = "date"' fixtures/stdlib/phpt_extension_manifest.toml
 for adr in 0060 0061 0062 0063 0064 0065 0066; do
   test -f "docs/adr/${adr}-"*.md
 done
-grep -q 'ADR-0066' docs/stdlib-standard-library.md
-grep -q 'ADR-0066' docs/stdlib-composer-compatibility.md
-grep -q 'STDLIB-GAP-PHAR-REQUIRED' docs/stdlib-known-gaps.md
+grep -q 'ADR-0066' docs/stdlib/standard-library.md
+grep -q 'ADR-0066' docs/stdlib/composer-compatibility.md
+grep -q 'STDLIB-GAP-PHAR-REQUIRED' docs/stdlib/known-gaps.md
 
-grep -q 'performance_regression_smoke.sh' docs/stdlib-preflight.md
-grep -q 'ArgumentValidator' docs/stdlib-arginfo-coercion.md
-grep -q 'generate-arginfo' docs/stdlib-arginfo-coercion.md
-grep -q 'Strict' docs/stdlib-arginfo-coercion.md
-grep -q 'Weak' docs/stdlib-arginfo-coercion.md
-grep -q 'PHP_VERSION_ID' docs/stdlib-platform-constants.md
-grep -q 'DIRECTORY_SEPARATOR' docs/stdlib-platform-constants.md
-grep -q 'diff-streams' docs/stdlib-final-audit.md
-grep -q 'diff-json-pcre-date' docs/stdlib-final-audit.md
-grep -q 'diff-spl-reflection' docs/stdlib-final-audit.md
-grep -q 'STDLIB-GAP-HASH-RANDOM-ALGORITHMS' docs/stdlib-known-gaps.md
+grep -q 'performance_regression_smoke.sh' docs/stdlib/preflight.md
+grep -q 'ArgumentValidator' docs/stdlib/arginfo-coercion.md
+grep -q 'generate-arginfo' docs/stdlib/arginfo-coercion.md
+grep -q 'Strict' docs/stdlib/arginfo-coercion.md
+grep -q 'Weak' docs/stdlib/arginfo-coercion.md
+grep -q 'PHP_VERSION_ID' docs/stdlib/platform-constants.md
+grep -q 'DIRECTORY_SEPARATOR' docs/stdlib/platform-constants.md
+grep -q 'diff-streams' docs/stdlib/final-audit.md
+grep -q 'diff-json-pcre-date' docs/stdlib/final-audit.md
+grep -q 'diff-spl-reflection' docs/stdlib/final-audit.md
+grep -q 'STDLIB-GAP-HASH-RANDOM-ALGORITHMS' docs/stdlib/known-gaps.md
 
 scripts/stdlib/generate_arginfo.py \
   --php-src tests/fixtures/stdlib/arginfo/php-src \

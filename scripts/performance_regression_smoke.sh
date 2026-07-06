@@ -22,8 +22,8 @@ test -f docs/foundation/final-audit.md
 test -f docs/lexer/final-audit.md
 test -f docs/parser/final-audit.md
 test -f docs/frontend/final-audit.md
-test -f docs/runtime-known-gaps.md
-test -f docs/runtime-semantics-final-audit.md
-test -f docs/stdlib-roadmap.md
+test -f docs/runtime/known-gaps.md
+test -f docs/runtime/semantics-final-audit.md
+test -f docs/stdlib/roadmap.md
 
 printf '%s\n' '[pass] performance regression baseline smoke complete'

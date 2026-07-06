@@ -27,8 +27,8 @@ The repository currently contains:
 - integrated HTTP server;
 - PHPT indexing, execution, and reporting tools.
 
-See [PHP user interface matrix](php-user-interface-matrix.md) and
-[Switching from PHP](switching-from-php.md) for the current command-line and
+See [PHP user interface matrix](user/php-user-interface-matrix.md) and
+[Switching from PHP](user/switching-from-php.md) for the current command-line and
 built-in-server surfaces.
 
 ## Explicit Non-Goals
@@ -47,11 +47,11 @@ Phrust currently does not provide:
 Known gaps are documented explicitly so unsupported behavior is not mistaken for
 implemented compatibility.
 
-- [Runtime known gaps](runtime-known-gaps.md)
-- [Runtime semantics known gaps](runtime-semantics-known-gaps.md)
-- [Standard library known gaps](stdlib-known-gaps.md)
+- [Runtime known gaps](runtime/known-gaps.md)
+- [Runtime semantics known gaps](runtime/semantics-known-gaps.md)
+- [Standard library known gaps](stdlib/known-gaps.md)
 - [Server known gaps](server-known-gaps.md)
-- [Performance known gaps](performance-known-gaps.md)
+- [Performance known gaps](performance/known-gaps.md)
 - [PHPT known gaps](phpt/known-gaps.md)
 - [Known-gap manifests](known_gaps/README.md)
 

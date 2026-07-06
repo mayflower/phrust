@@ -1075,6 +1075,16 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
     };
     let mut functions = Vec::with_capacity(unit.functions.len());
     for function in &unit.functions {
+        if function.returns_by_ref {
+            let span = push_span(&mut dense.spans, IrSpan::default());
+            dense
+                .functions
+                .push(fallback_dense_function(function, span));
+            functions.push(DenseFunctionPlan::RichFallback {
+                reason: "by_reference_return".to_owned(),
+            });
+            continue;
+        }
         if function_has_try_or_finally(function) {
             let span = push_span(&mut dense.spans, IrSpan::default());
             dense

@@ -94307,6 +94307,26 @@ echo dense_supported(4), "\n", rich_fallback(), "\n";
     }
 
     #[test]
+    fn dense_bytecode_auto_falls_back_for_by_ref_return_functions() {
+        let result = execute_source_with_options(
+            "<?php function &bad_ref() { return 1; } $x =& bad_ref();",
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                collect_profile_spans: false,
+                collect_layout_source_attribution: true,
+                ..VmOptions::default()
+            },
+        );
+
+        assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            result.diagnostics[0].id(),
+            "E_PHP_VM_BY_REF_RETURN_TEMPORARY"
+        );
+    }
+
+    #[test]
     fn dense_bytecode_auto_falls_back_for_direct_nested_function_declare() {
         let result = execute_source_with_options(
             r#"<?php

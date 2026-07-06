@@ -60,8 +60,8 @@ developer-only VM inspection.
 
 ## Related Docs
 
-- [Switching from PHP](switching-from-php.md)
-- [PHP user interface matrix](php-user-interface-matrix.md)
+- [Switching from PHP](user/switching-from-php.md)
+- [PHP user interface matrix](user/php-user-interface-matrix.md)
 - [Web server](web-server.md)
 - [Compatibility](compatibility.md)
 - [Contributor guide](contributing.md)

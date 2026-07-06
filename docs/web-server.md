@@ -120,7 +120,7 @@ start `phrust-server`. Reports land under
 stability, controls, metrics deltas, and request-profile attribution when
 available.
 
-See [WordPress root request profiling](wordpress-root-profiling.md) for the
+See [WordPress root request profiling](app-smokes/wordpress/root-profiling.md) for the
 profile schema and how to interpret clone, fallback, dense/rich, array, object,
 builtin, include, output, and native attribution families.
 
@@ -138,10 +138,10 @@ request-profile JSON to include before/after clone counter deltas.
 ## Related Docs
 
 - [Server functionality](server-functionality.md)
-- [WordPress root request profiling](wordpress-root-profiling.md)
-- [PHP user interface matrix](php-user-interface-matrix.md)
-- [Switching from PHP](switching-from-php.md)
+- [WordPress root request profiling](app-smokes/wordpress/root-profiling.md)
+- [PHP user interface matrix](user/php-user-interface-matrix.md)
+- [Switching from PHP](user/switching-from-php.md)
 - [Server architecture](server-architecture.md)
 - [Server known gaps](server-known-gaps.md)
-- [Cache architecture](cache-architecture.md)
+- [Cache architecture](runtime/cache-architecture.md)
 - [API facades](api-facades.md)

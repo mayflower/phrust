@@ -79,7 +79,7 @@ must never be the only execution strategy.
   methods, properties, include paths, autoload state, and relevant config.
 - JIT execution remains experimental and feature-gated. Feature-off builds must
   not require executable memory.
-- Known gaps must be recorded in `docs/performance-known-gaps.md` with evidence.
+- Known gaps must be recorded in `docs/performance/known-gaps.md` with evidence.
 
 ## Abort Criteria
 

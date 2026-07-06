@@ -66,8 +66,8 @@ Primary guides:
 - [CLI usage](docs/cli.md)
 - [Web server](docs/web-server.md)
 - [Compatibility](docs/compatibility.md)
-- [PHP user interface matrix](docs/php-user-interface-matrix.md)
-- [Switching from PHP](docs/switching-from-php.md)
+- [PHP user interface matrix](docs/user/php-user-interface-matrix.md)
+- [Switching from PHP](docs/user/switching-from-php.md)
 - [Contributor guide](docs/contributing.md)
 
 Install the versioned git hooks once per checkout:
@@ -123,7 +123,7 @@ requests above that limit wait briefly for capacity before receiving `503
 Service Unavailable`.
 
 The server uses the process-local compiled-script cache described in
-`docs/cache-architecture.md`; the CLI bytecode artifact cache remains a separate
+`docs/runtime/cache-architecture.md`; the CLI bytecode artifact cache remains a separate
 disk cache for local execution and performance experiments.
 
 Runtime and VM public imports should use the facades documented in
@@ -270,19 +270,19 @@ Start with:
 - [Reference oracle ADR](docs/adr/0003-reference-oracle.md)
 - [No vendored php-src ADR](docs/adr/0004-no-vendored-php-src.md)
 - [Layer boundary ADR](docs/adr/0005-layer-boundaries.md)
-- [Executor architecture](docs/executor-architecture.md)
+- [Executor architecture](docs/runtime/executor-architecture.md)
 - [Server architecture](docs/server-architecture.md)
-- [Diagnostics architecture](docs/diagnostics-architecture.md)
-- [Cache architecture](docs/cache-architecture.md)
+- [Diagnostics architecture](docs/runtime/diagnostics-architecture.md)
+- [Cache architecture](docs/runtime/cache-architecture.md)
 - [Known-gap manifests](docs/known_gaps/README.md)
-- [Generated arginfo workflow](docs/stdlib-arginfo-coercion.md)
+- [Generated arginfo workflow](docs/stdlib/arginfo-coercion.md)
 - [API facade policy](docs/api-facades.md)
 - [Semantic frontend contract](docs/frontend/definition-of-done.md)
-- [Runtime contract](docs/runtime-contract.md)
-- [Runtime semantics contract](docs/runtime-semantics-contract.md)
-- [Performance methodology](docs/performance-methodology.md)
-- [Performance runtime](docs/performance-runtime.md)
-- [Performance known gaps](docs/performance-known-gaps.md)
+- [Runtime contract](docs/runtime/contract.md)
+- [Runtime semantics contract](docs/runtime/semantics-contract.md)
+- [Performance methodology](docs/performance/methodology.md)
+- [Performance runtime](docs/performance/runtime.md)
+- [Performance known gaps](docs/performance/known-gaps.md)
 - [PHPT runtime completion](docs/phpt/README.md)
 
 ## Git Hygiene

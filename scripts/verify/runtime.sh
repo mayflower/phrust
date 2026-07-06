@@ -23,15 +23,15 @@ require_grep() {
   printf '[ok] pattern found in %s: %s\n' "$path" "$pattern"
 }
 
-require_file docs/runtime-contract.md
-require_file docs/runtime-values.md
-require_file docs/runtime-vm.md
-require_file docs/runtime-ir.md
-require_file docs/runtime-reference.md
-require_file docs/runtime-reference-diff.md
-require_file docs/runtime-supported-subset.md
-require_file docs/runtime-known-gaps.md
-require_file docs/runtime-semantics-status.md
+require_file docs/runtime/contract.md
+require_file docs/runtime/values.md
+require_file docs/runtime/vm.md
+require_file docs/runtime/ir.md
+require_file docs/runtime/reference.md
+require_file docs/runtime/reference-diff.md
+require_file docs/runtime/supported-subset.md
+require_file docs/runtime/known-gaps.md
+require_file docs/runtime/semantics-status.md
 require_file docs/research/zend-opcode-mapping-runtime.md
 require_file docs/research/embedding-spike.md
 require_file docs/research/runtime-bench-smoke.md
@@ -209,18 +209,18 @@ require_file fixtures/phpt_smoke/array.phpt
 require_file fixtures/phpt_smoke/exception.phpt
 require_file fixtures/phpt_smoke/skipif-skipped.phpt
 require_file fixtures/phpt_smoke/ini-known-gap.phpt
-require_file docs/runtime-contract.md
+require_file docs/runtime/contract.md
 
-require_grep 'FetchDim' docs/runtime-ir.md
-require_grep 'AssignDim' docs/runtime-ir.md
-require_grep 'ReferenceCell' docs/runtime-values.md
-require_grep 'Include Execution' docs/runtime-vm.md
-require_grep 'normalize_runtime_stderr' docs/runtime-reference-diff.md
-require_grep 'runtime-semantics' docs/runtime-known-gaps.md
-require_grep 'Feature Matrix' docs/runtime-semantics-status.md
-require_grep 'Top 20 Reference Deviations' docs/runtime-semantics-status.md
-require_grep 'Runtime/VM Hardening Audit' docs/runtime-semantics-status.md
-require_grep 'Runtime Semantics Backlog' docs/runtime-semantics-status.md
+require_grep 'FetchDim' docs/runtime/ir.md
+require_grep 'AssignDim' docs/runtime/ir.md
+require_grep 'ReferenceCell' docs/runtime/values.md
+require_grep 'Include Execution' docs/runtime/vm.md
+require_grep 'normalize_runtime_stderr' docs/runtime/reference-diff.md
+require_grep 'runtime-semantics' docs/runtime/known-gaps.md
+require_grep 'Feature Matrix' docs/runtime/semantics-status.md
+require_grep 'Top 20 Reference Deviations' docs/runtime/semantics-status.md
+require_grep 'Runtime/VM Hardening Audit' docs/runtime/semantics-status.md
+require_grep 'Runtime Semantics Deferred Scope' docs/runtime/semantics-status.md
 require_grep 'Zend Opcode Mapping' docs/research/zend-opcode-mapping-runtime.md
 require_grep 'does not claim Zend bytecode compatibility' docs/research/zend-opcode-mapping-runtime.md
 require_grep 'Embedding and WASI Spike' docs/research/embedding-spike.md

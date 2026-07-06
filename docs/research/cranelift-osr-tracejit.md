@@ -91,7 +91,7 @@ Recommended path:
    expansion only where interpreter fallback and side exits already have stable
    reports.
 2. future runtime research only: build on the non-executing VM-owned metadata in
-   `php_vm::deopt` and `docs/performance-deopt-live-state-osr-metadata.md` for
+   `php_vm::deopt` and `docs/performance/deopt-live-state-osr-metadata.md` for
    dense resume points, live-state slots, foreach markers, and explicit
    rejection reasons.
 3. PHPT runtime: reconsider OSR only after deopt snapshots, live-state maps,

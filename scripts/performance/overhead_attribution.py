@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 OVERHEAD_SCHEMA = "phrust-app-flow-overhead-v1"
-COUNTER_FAMILY_DOC = "docs/performance-counter-families.md"
+COUNTER_FAMILY_DOC = "docs/performance/counter-families.md"
 MAX_REASONS_IN_MARKDOWN = 3
 MAX_REASON_TEXT = 90
 

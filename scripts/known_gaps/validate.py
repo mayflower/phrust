@@ -29,8 +29,8 @@ REQUIRED_FIELDS = {
 }
 STATUSES = {"planned", "known_gap", "implemented", "deferred"}
 DOC_LINKS = {
-    ROOT / "docs" / "runtime-known-gaps.md": "docs/known_gaps/runtime.jsonl",
-    ROOT / "docs" / "performance-known-gaps.md": "docs/known_gaps/performance.jsonl",
+    ROOT / "docs" / "runtime" / "known-gaps.md": "docs/known_gaps/runtime.jsonl",
+    ROOT / "docs" / "performance" / "known-gaps.md": "docs/known_gaps/performance.jsonl",
     ROOT / "docs" / "phpt" / "known-gaps.md": "docs/known_gaps/phpt-runner-smoke.jsonl",
 }
 
@@ -209,7 +209,7 @@ def validate_doc_links() -> None:
 
 
 def validate_doc_coverage(rows_by_manifest: dict[str, dict[str, dict[str, Any]]]) -> None:
-    runtime_ids = parse_markdown_table_ids(ROOT / "docs" / "runtime-known-gaps.md", "ID")
+    runtime_ids = parse_markdown_table_ids(ROOT / "docs" / "runtime" / "known-gaps.md", "ID")
     runtime_manifest_ids = set(rows_by_manifest["docs/known_gaps/runtime.jsonl"])
     missing_runtime = sorted(gap_id for gap_id in runtime_ids if gap_id not in runtime_manifest_ids)
     if missing_runtime:
@@ -219,7 +219,7 @@ def validate_doc_coverage(rows_by_manifest: dict[str, dict[str, dict[str, Any]]]
         fail(f"runtime manifest has IDs missing from docs: {undocumented_runtime}")
 
     performance_ids = parse_markdown_table_ids(
-        ROOT / "docs" / "performance-known-gaps.md", "Gap ID"
+        ROOT / "docs" / "performance" / "known-gaps.md", "Gap ID"
     )
     performance_manifest_ids = set(rows_by_manifest["docs/known_gaps/performance.jsonl"])
     missing_performance = sorted(

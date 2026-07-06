@@ -61,7 +61,7 @@ limits, preload, and the loopback-only cache-clear endpoint.
 The server consumes `php_executor::CompiledScriptCache`, an in-memory,
 process-local compiled entry-script cache. It is intentionally separate from
 the CLI disk bytecode artifact cache and is not an Opcache replacement. See
-`docs/cache-architecture.md` for key and invalidation rules.
+`docs/runtime/cache-architecture.md` for key and invalidation rules.
 
 The optional `/__phrust/metrics` endpoint exposes process-local counters for
 requests, overloads, response classes, upload parsing, execution timeouts,

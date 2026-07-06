@@ -795,7 +795,7 @@ superinstruction-smoke:
 
 superinstruction-patterns:
     cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/superinstruction_patterns.py --summary-doc docs/performance-superinstructions.md
+    scripts/performance/superinstruction_patterns.py --summary-doc docs/performance/superinstructions.md
 
 vm-smoke:
     cargo build -p php_vm_cli --bin php-vm
@@ -854,20 +854,20 @@ runtime-known-gaps:
     @just known-gaps
     scripts/runtime_gap_report.py --check
     cargo build -p php_vm_cli
-    test -s docs/runtime-known-gaps.md
-    grep -q 'E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_GENERATOR' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_YIELD_FROM' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_FIBER' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_EVAL' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_AUTOLOAD' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_REFLECTION' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_RUNTIME_SUPERGLOBALS_FULL_MATRIX' docs/runtime-known-gaps.md
-    grep -q 'E_PHP_RUNTIME_GLOBALS_ALIAS_MATRIX' docs/runtime-known-gaps.md
+    test -s docs/runtime/known-gaps.md
+    grep -q 'E_PHP_RUNTIME_UNSUPPORTED_REFERENCE_SEMANTICS' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_GENERATOR' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_YIELD_FROM' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_FIBER' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_EVAL' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_AUTOLOAD' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_REFLECTION' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_TRAIT_RUNTIME' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_ENUM_RUNTIME' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_PROPERTY_HOOKS' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_IR_UNSUPPORTED_BY_REF_FOREACH' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_RUNTIME_SUPERGLOBALS_FULL_MATRIX' docs/runtime/known-gaps.md
+    grep -q 'E_PHP_RUNTIME_GLOBALS_ALIAS_MATRIX' docs/runtime/known-gaps.md
     test -f fixtures/runtime/valid/generators/yield.php
     test -f fixtures/runtime/valid/generators/yield-from.php
     test -f fixtures/runtime/valid/fibers/fiber.php
@@ -1346,14 +1346,14 @@ fastest-engine-matrix:
     scripts/performance/fastest_engine_matrix.py
 
 hotpath-inventory:
-    scripts/performance/hotpath_inventory.py target/performance/benchmark-smoke.json --json-out target/performance/hotpaths.json --markdown-out docs/hotpath-inventory.md
+    scripts/performance/hotpath_inventory.py target/performance/benchmark-smoke.json --json-out target/performance/hotpaths.json --markdown-out docs/performance/reports/hotpath-inventory.md
 
 fastest-hotpath-report:
     cargo build -p php_vm_cli --bin php-vm
     @if [ ! -f target/performance/benchmark-smoke.json ]; then \
         scripts/performance/bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/performance/benchmark-smoke.json --repetitions "${PHRUST_PERF_BENCH_SMOKE_REPETITIONS:-1}" --warmups "${PHRUST_PERF_BENCH_SMOKE_WARMUPS:-0}" --timeout "${PHRUST_PERF_BENCH_TIMEOUT:-10.0}"; \
     fi
-    scripts/performance/fastest_hotpath_report.py --benchmark target/performance/benchmark-smoke.json --framework target/performance/framework-smoke/summary.json --acceleration target/performance/acceleration/summary.json --json-out target/performance/fastest/hotpath-report.json --markdown-out target/performance/fastest/hotpath-report.md --summary-doc docs/performance-fastest-hotpaths.md
+    scripts/performance/fastest_hotpath_report.py --benchmark target/performance/benchmark-smoke.json --framework target/performance/framework-smoke/summary.json --acceleration target/performance/acceleration/summary.json --json-out target/performance/fastest/hotpath-report.json --markdown-out target/performance/fastest/hotpath-report.md --summary-doc docs/performance/fastest-hotpaths.md
 
 perf-baseline:
     cargo build -p php_vm_cli --bin php-vm
@@ -1482,7 +1482,7 @@ safety-audit-smoke:
         printf '%s\n' '[fail] performance default JIT surface contains unaudited Rust unsafe' >&2; \
         exit 1; \
     fi
-    @test -f docs/safety-audit-cranelift.md
+    @test -f docs/performance/cranelift/safety-audit.md
     cargo test -p php_bytecode_cache corrupt
     cargo test -p php_vm_cli bytecode_cache
     @if ! command -v cargo-miri >/dev/null 2>&1 && ! cargo miri --version >/dev/null 2>&1; then \

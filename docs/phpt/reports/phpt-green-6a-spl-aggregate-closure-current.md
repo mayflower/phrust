@@ -183,6 +183,6 @@ nix develop -c just verify-phpt
 All final checks passed except the expected broad `spl` aggregate run, which
 exited non-zero with the visible remaining target failures listed above.
 `tests/phpt/manifests/modules/spl.selected.jsonl` was updated only to promote
-the reference/target-clean `gh14290.phpt` row. `docs/stdlib-known-gaps.md` and
+the reference/target-clean `gh14290.phpt` row. `docs/stdlib/known-gaps.md` and
 `docs/known_gaps/runtime.jsonl` were not changed because no known-gap evidence
 changed.

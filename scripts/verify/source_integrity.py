@@ -42,10 +42,10 @@ REQUIRED_FILES = [
     "scripts/verify/dependency_boundary_allowlist.json",
     "scripts/verify/panic_unwrap_policy.py",
     "scripts/verify/panic_unwrap_allowlist.jsonl",
-    "docs/repository-truth-ratchet.md",
-    "docs/runtime-module-boundaries.md",
-    "docs/performance-mode-matrix.md",
-    "docs/panic-unwrap-policy.md",
+    "docs/quality/repository-truth-ratchet.md",
+    "docs/runtime/module-boundaries.md",
+    "docs/performance/mode-matrix.md",
+    "docs/quality/panic-unwrap-policy.md",
 ]
 
 API_FACADE_ROOT_RE = re.compile(
@@ -63,8 +63,13 @@ VM_MOD_REQUIRED_SNIPPETS = [
     "mod options;",
     "mod prelude;",
     "mod result;",
-    "BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,",
-    "JitBlacklistMode, JitMode, SuperinstructionMode,",
+    "BytecodeLayoutMode",
+    "DenseIncludeMode",
+    "DenseJumpThreadingMode",
+    "ExecutionFormat",
+    "JitBlacklistMode",
+    "JitMode",
+    "SuperinstructionMode",
     "VmOptions",
     "pub use result::{VmControlFlow, VmResult};",
     "pub struct Vm",
@@ -107,8 +112,13 @@ VM_SUBMODULE_FORBIDDEN_SNIPPETS = {
 VM_LIB_REQUIRED_SNIPPETS = [
     "pub mod vm;",
     "pub use vm::{",
-    "BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,",
-    "JitBlacklistMode, JitMode, SuperinstructionMode,",
+    "BytecodeLayoutMode",
+    "DenseIncludeMode",
+    "DenseJumpThreadingMode",
+    "ExecutionFormat",
+    "JitBlacklistMode",
+    "JitMode",
+    "SuperinstructionMode",
     "VmOptions",
 ]
 
@@ -148,10 +158,10 @@ PHP_STD_CONSUMED_SYMBOLS = [
     "generated::arginfo::GENERATED_CLASSES",
 ]
 
-RUNTIME_MODULE_BOUNDARY_DOC = "docs/runtime-module-boundaries.md"
+RUNTIME_MODULE_BOUNDARY_DOC = "docs/runtime/module-boundaries.md"
 
 DOC_STALE_IMPORTS = {
-    "docs/runtime-semantics-status.md": [
+    "docs/runtime/semantics-status.md": [
         "php_vm::Vm",
         "php_runtime::Value",
     ],

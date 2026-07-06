@@ -46,12 +46,12 @@ Use these documents when you need exact contracts or current status.
 - [Server functionality](server-functionality.md)
 - [Server architecture](server-architecture.md)
 - [Known-gap manifests](known_gaps/README.md)
-- [Runtime known gaps](runtime-known-gaps.md)
-- [Standard library known gaps](stdlib-known-gaps.md)
-- [Performance known gaps](performance-known-gaps.md)
+- [Runtime and VM](runtime/README.md)
+- [Standard library](stdlib/README.md)
+- [Performance](performance/README.md)
 - [PHPT known gaps](phpt/known-gaps.md)
-- [PHP source callables reference](php-src-callables-reference.md)
-- [PHP source oracle gap closure](php-source-oracle-gap-closure.md)
+- [PHP source callables reference](oracle/php-src-callables-reference.md)
+- [PHP source oracle gap closure](oracle/php-source-gap-closure.md)
 
 ## Internals
 
@@ -63,24 +63,46 @@ contributors who need to change the implementation.
   and [CST model](parser/cst-model.md).
 - Frontend: [semantic frontend architecture](frontend/semantic-frontend-architecture.md),
   [HIR model](frontend/hir-model.md), and [declaration model](frontend/declaration-model.md).
-- Runtime and VM: [runtime reference](runtime-reference.md),
-  [runtime VM structure](runtime-vm-structure.md), [runtime values](runtime-values.md),
-  and [runtime semantics status](runtime-semantics-status.md).
-- Standard library: [standard library](stdlib-standard-library.md),
-  [extension coverage](stdlib-extension-coverage.md), and
-  [standard library roadmap](stdlib-roadmap.md).
-- Performance: [performance methodology](performance-methodology.md),
-  [performance runtime](performance-runtime.md),
-  [optimization gates](performance-optimization-gates.md), and
-  [bytecode cache](performance-bytecode-cache.md).
-- Decisions and research: [ADRs](adr/) and [research notes](research/).
+- Runtime and VM: [runtime index](runtime/README.md),
+  [runtime reference](runtime/reference.md),
+  [runtime VM structure](runtime/vm-structure.md), [runtime values](runtime/values.md),
+  and [runtime semantics status](runtime/semantics-status.md).
+- Standard library: [standard library index](stdlib/README.md),
+  [standard library](stdlib/standard-library.md),
+  [extension coverage](stdlib/extension-coverage.md), and
+  [standard library roadmap](stdlib/roadmap.md).
+- Performance: [performance index](performance/README.md),
+  [performance methodology](performance/methodology.md),
+  [performance runtime](performance/runtime.md),
+  [optimization gates](performance/optimization-gates.md), and
+  [bytecode cache](performance/bytecode-cache.md).
+- User-facing docs: [interface matrix](user/php-user-interface-matrix.md) and
+  [switching from PHP](user/switching-from-php.md).
+- Decisions, research, and quality: [ADRs](adr/), [research notes](research/),
+  and [quality checks](quality/README.md).
+- Real-world application smokes: [app smoke tests](app-smokes/README.md).
 
 ## Current Status
 
 The most useful current-status pages are:
 
 - [Compatibility](compatibility.md)
-- [Runtime known gaps](runtime-known-gaps.md)
-- [Standard library known gaps](stdlib-known-gaps.md)
+- [Runtime known gaps](runtime/known-gaps.md)
+- [Standard library known gaps](stdlib/known-gaps.md)
 - [Server known gaps](server-known-gaps.md)
 - [PHPT known gaps](phpt/known-gaps.md)
+
+## Directory Ownership
+
+Top-level pages are entrypoints and stable cross-cutting references. Domain
+material belongs under its owning directory:
+
+- `runtime/`, `stdlib/`, and `performance/` contain stable contracts, current
+  status, and domain-specific reports.
+- `performance/reports/`, `phpt/reports/`, and `runtime/reports/` contain
+  committed summaries generated from local artifacts; raw outputs stay under
+  `target/`.
+- `app-smokes/` contains representative application smoke documentation. These
+  docs must not define application-specific compatibility behavior.
+- `research/` contains exploratory notes and implementation notes that are not
+  accepted project contracts.
