@@ -878,6 +878,11 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("headers_sent", "standard"))
         .with_function(FunctionDescriptor::php("hex2bin", "standard"))
         .with_function(FunctionDescriptor::php("hexdec", "standard"))
+        .with_function(FunctionDescriptor::php("html_entity_decode", "standard"))
+        .with_function(FunctionDescriptor::php(
+            "get_html_translation_table",
+            "standard",
+        ))
         .with_function(FunctionDescriptor::php("htmlentities", "standard"))
         .with_function(FunctionDescriptor::php("htmlspecialchars", "standard"))
         .with_function(FunctionDescriptor::php(

@@ -3,7 +3,7 @@
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
 - Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- focused gate: 36 PASS, 0 FAIL, 0 BORK
+- focused gate: 42 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -16,13 +16,15 @@
 - `parse_str` basics, custom `arg_separator.input`, malformed key recovery, and
   invalid percent preservation
 - Default `htmlspecialchars` / `htmlentities` coverage, quote-flag-sensitive
-  `htmlspecialchars_decode`, and selected `html_entity_decode` document-type
-  and numeric entity filtering
+  `htmlspecialchars_decode`, numeric-basic `htmlspecialchars_decode`, and
+  selected `html_entity_decode` document-type and numeric entity filtering
+- `get_html_translation_table` coverage for special-character quote modes,
+  XML 1.0 basic entities, and HTML5/SJIS basic entities
 
 ## Non-Scope
 
-- Complete entity tables
-- Non-default charsets beyond selected UTF-8 coverage
+- Complete HTML4/HTML5/XHTML entity tables
+- Non-default charsets beyond selected UTF-8 and SJIS basic-entity coverage
 - Object query encoding
 - `parse_url` edge cases beyond the basic upstream corpus
 - Remaining `parse_str` edge cases and URL/HTML upstream corpus
@@ -57,11 +59,17 @@
 - `ext/standard/tests/strings/parse_str_memory_error.phpt`
 - `ext/standard/tests/strings/htmlspecialchars_basic.phpt`
 - `ext/standard/tests/strings/htmlspecialchars_decode_basic.phpt`
+- `ext/standard/tests/strings/htmlspecialchars_decode_variation3.phpt`
 - `ext/standard/tests/strings/htmlspecialchars_decode_variation4.phpt`
 - `ext/standard/tests/strings/htmlspecialchars_decode_variation5.phpt`
+- `ext/standard/tests/strings/htmlspecialchars_decode_variation6.phpt`
+- `ext/standard/tests/strings/htmlspecialchars_decode_variation7.phpt`
 - `ext/standard/tests/strings/htmlspecialchars.phpt`
 - `ext/standard/tests/strings/html_entity_decode2.phpt`
 - `ext/standard/tests/strings/html_entity_decode3.phpt`
+- `ext/standard/tests/strings/get_html_translation_table_basic3.phpt`
+- `ext/standard/tests/strings/get_html_translation_table_basic8.phpt`
+- `ext/standard/tests/strings/get_html_translation_table_basic9.phpt`
 - `tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt`
@@ -96,16 +104,20 @@
   selected upstream query fixture, root dot/space normalization, invalid
   percent escape preservation, and the selected memory-safety regression.
 - `htmlspecialchars_decode()` now honors `ENT_COMPAT`, `ENT_NOQUOTES`, and
-  `ENT_QUOTES` quote decoding for the selected upstream basic and variation
-  PHPTs.
+  `ENT_QUOTES` quote decoding, binary/heredoc inputs, document-type-sensitive
+  `&apos;`, and numeric basic-character entities for the selected upstream
+  basic and variation PHPTs.
 - `html_entity_decode()` now honors quote and document-type flags for `&apos;`
   and decodes numeric entities only when the selected HTML 4.01, XHTML, HTML5,
   XML 1.0, and default UTF-8 contracts allow the code point.
-- Latest focused target run: PASS, 36 selected PHPTs.
+- `get_html_translation_table()` now returns PHP arrays for
+  `HTML_SPECIALCHARS` quote modes plus XML 1.0 and HTML5/SJIS basic
+  `HTML_ENTITIES` tables.
+- Latest focused target run: PASS, 42 selected PHPTs.
 
 ## Known Gaps
 
-- Full entity-table, charset, object-query/property visibility,
+- Full HTML4/HTML5/XHTML entity-table, charset, object-query/property visibility,
   `parse_url` edge-case, remaining `parse_str`, including the separate startup
   `filter.default` deprecation-output mismatch in `parse_str_basic3.phpt`, and
   URL edge-case behavior remains outside the selected focused gate.

@@ -59,6 +59,11 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "get_html_translation_table",
+        builtin_get_html_translation_table,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "htmlentities",
         builtin_htmlentities,
         BuiltinCompatibility::Php,
@@ -1242,6 +1247,34 @@ pub(in crate::builtins::modules) fn builtin_html_entity_decode(
     Ok(Value::string(html_entity_decode_with_flags(
         &string_arg("html_entity_decode", &args[0])?.to_string_lossy(),
         flags,
+    )))
+}
+
+pub(in crate::builtins::modules) fn builtin_get_html_translation_table(
+    _context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 3 {
+        return Err(BuiltinError::new(
+            "E_PHP_RUNTIME_BUILTIN_ARITY",
+            "builtin get_html_translation_table expects at most three argument(s)",
+        ));
+    }
+    let table = args
+        .first()
+        .map_or(Ok(0), |value| int_arg("get_html_translation_table", value))?;
+    let flags = args.get(1).map_or(Ok(HTML_ESCAPE_DEFAULT_FLAGS), |value| {
+        int_arg("get_html_translation_table", value)
+    })?;
+    let encoding = args
+        .get(2)
+        .map(|value| string_arg("get_html_translation_table", value))
+        .transpose()?;
+    Ok(Value::Array(html_translation_table(
+        table,
+        flags,
+        encoding.as_ref(),
     )))
 }
 

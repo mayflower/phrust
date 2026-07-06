@@ -204,6 +204,8 @@ pub(in crate::builtins::modules) fn hex_nibble(byte: u8) -> Option<u8> {
 /// kinds (`ENT_QUOTES`); substitution/doctype bits are not modeled byte-wise.
 pub(in crate::builtins::modules) const HTML_ESCAPE_DEFAULT_FLAGS: i64 = 3;
 pub(in crate::builtins::modules) const PHP_QUERY_RFC3986: i64 = 2;
+const HTML_SPECIALCHARS: i64 = 0;
+const HTML_ENTITIES: i64 = 1;
 const ENT_XML1: i64 = 16;
 const ENT_XHTML: i64 = 32;
 const ENT_HTML5: i64 = 48;
@@ -412,6 +414,72 @@ fn is_html5_noncharacter(codepoint: u32) -> bool {
     (0xfdd0..=0xfdef).contains(&codepoint) || matches!(codepoint & 0xffff, 0xfffe | 0xffff)
 }
 
+pub(in crate::builtins::modules) fn html_translation_table(
+    table: i64,
+    flags: i64,
+    encoding: Option<&PhpString>,
+) -> PhpArray {
+    let document_type = html_document_type(flags);
+    if table == HTML_SPECIALCHARS || is_basic_only_entity_table(table, document_type, encoding) {
+        return basic_html_translation_table(flags, document_type);
+    }
+
+    // Full HTML4/HTML5/XHTML translation tables require the generated entity
+    // dataset; until that lands, expose the safe core subset instead.
+    basic_html_translation_table(flags, document_type)
+}
+
+fn is_basic_only_entity_table(
+    table: i64,
+    document_type: HtmlDocumentType,
+    encoding: Option<&PhpString>,
+) -> bool {
+    table == HTML_ENTITIES
+        && (document_type == HtmlDocumentType::Xml1
+            || (document_type == HtmlDocumentType::Html5
+                && encoding.is_some_and(is_basic_only_html5_encoding)))
+}
+
+fn basic_html_translation_table(flags: i64, document_type: HtmlDocumentType) -> PhpArray {
+    let mut entries = PhpArray::new();
+    insert_translation_entry(&mut entries, b"&", b"&amp;");
+    if flags & 1 != 0 {
+        insert_translation_entry(
+            &mut entries,
+            b"'",
+            html_translation_single_quote_entity(document_type),
+        );
+    }
+    insert_translation_entry(&mut entries, b">", b"&gt;");
+    insert_translation_entry(&mut entries, b"<", b"&lt;");
+    if flags & 2 != 0 {
+        insert_translation_entry(&mut entries, b"\"", b"&quot;");
+    }
+    entries
+}
+
+fn insert_translation_entry(entries: &mut PhpArray, character: &[u8], entity: &[u8]) {
+    entries.insert(
+        ArrayKey::String(PhpString::from_bytes(character.to_vec())),
+        Value::string(entity.to_vec()),
+    );
+}
+
+fn html_translation_single_quote_entity(document_type: HtmlDocumentType) -> &'static [u8] {
+    match document_type {
+        HtmlDocumentType::Html401 => b"&#039;",
+        HtmlDocumentType::Xml1 | HtmlDocumentType::Xhtml | HtmlDocumentType::Html5 => b"&apos;",
+    }
+}
+
+fn is_basic_only_html5_encoding(encoding: &PhpString) -> bool {
+    let encoding = encoding.to_string_lossy();
+    matches!(
+        encoding.to_ascii_lowercase().as_str(),
+        "sjis" | "shift_jis" | "shift-jis" | "cp932" | "windows-31j"
+    )
+}
+
 pub(in crate::builtins::modules) fn htmlspecialchars_decode_with_flags(
     text: &str,
     flags: i64,
@@ -433,6 +501,15 @@ pub(in crate::builtins::modules) fn htmlspecialchars_decode_with_flags(
             Some((b'\'', 6))
         } else if flags & 1 != 0 && remaining.starts_with(b"&#x27;") {
             Some((b'\'', 6))
+        } else if flags & 1 != 0
+            && html_document_type(flags) != HtmlDocumentType::Html401
+            && remaining.starts_with(b"&apos;")
+        {
+            Some((b'\'', 6))
+        } else if remaining.starts_with(b"&#")
+            && let Some((byte, len)) = decode_numeric_special_html_entity(remaining, flags)
+        {
+            Some((byte, len))
         } else {
             None
         };
@@ -445,6 +522,37 @@ pub(in crate::builtins::modules) fn htmlspecialchars_decode_with_flags(
         }
     }
     output
+}
+
+fn decode_numeric_special_html_entity(bytes: &[u8], flags: i64) -> Option<(u8, usize)> {
+    debug_assert_eq!(bytes.first(), Some(&b'&'));
+    let semicolon = php_source::byte_kernel::find_byte(bytes, b';')?;
+    let entity = &bytes[1..semicolon];
+    let codepoint = if let Some(decimal) = entity.strip_prefix(b"#")
+        && !decimal.is_empty()
+        && php_source::byte_kernel::all_ascii_digits(decimal)
+    {
+        parse_entity_codepoint(decimal, 10)?
+    } else if let Some(hex) = entity
+        .strip_prefix(b"#x")
+        .or_else(|| entity.strip_prefix(b"#X"))
+        && !hex.is_empty()
+        && hex.iter().all(u8::is_ascii_hexdigit)
+    {
+        parse_entity_codepoint(hex, 16)?
+    } else {
+        return None;
+    };
+
+    let decoded = match codepoint {
+        0x22 if flags & 2 != 0 => b'"',
+        0x27 if flags & 1 != 0 => b'\'',
+        0x26 => b'&',
+        0x3c => b'<',
+        0x3e => b'>',
+        _ => return None,
+    };
+    Some((decoded, semicolon + 1))
 }
 
 pub(in crate::builtins::modules) fn url_encode(bytes: &[u8], raw: bool) -> Vec<u8> {

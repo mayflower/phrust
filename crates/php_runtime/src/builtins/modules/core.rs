@@ -31,8 +31,8 @@ use crate::{
 pub(in crate::builtins::modules) use encoding::{
     HTML_ESCAPE_DEFAULT_FLAGS, PHP_QUERY_RFC3986, build_query_pairs, format_array_values,
     hash_digest_bytes, hex_decode, hex_encode, hex_nibble, hmac_digest_bytes,
-    html_entity_decode_with_flags, html_escape_with_options, htmlspecialchars_decode_with_flags,
-    url_decode, url_encode,
+    html_entity_decode_with_flags, html_escape_with_options, html_translation_table,
+    htmlspecialchars_decode_with_flags, url_decode, url_encode,
 };
 use http::{
     builtin_header, builtin_header_remove, builtin_headers_list, builtin_headers_sent,
@@ -10833,6 +10833,11 @@ mod tests {
     #[test]
     fn encoding_hash_html_and_url_builtins_cover_mvp_paths() {
         let mut output = OutputBuffer::new();
+        fn array_value(array: &PhpArray, key: &str) -> Option<Value> {
+            array
+                .get(&ArrayKey::String(PhpString::from_test_str(key)))
+                .cloned()
+        }
 
         assert_eq!(
             call("bin2hex", vec![Value::string("Hi")], &mut output),
@@ -10986,6 +10991,33 @@ mod tests {
         );
         assert_eq!(
             call(
+                "htmlspecialchars_decode",
+                vec![
+                    Value::string("&#x22;|&#34;|&#39;|&#x26;|&#60;|&#x3E;|&#63;"),
+                    Value::Int(3 | 48)
+                ],
+                &mut output
+            ),
+            Value::string("\"|\"|'|&|<|>|&#63;")
+        );
+        assert_eq!(
+            call(
+                "htmlspecialchars_decode",
+                vec![Value::string("&apos;|&#39;"), Value::Int(3)],
+                &mut output
+            ),
+            Value::string("&apos;|'")
+        );
+        assert_eq!(
+            call(
+                "htmlspecialchars_decode",
+                vec![Value::string("&apos;|&#39;"), Value::Int(3 | 16)],
+                &mut output
+            ),
+            Value::string("'|'")
+        );
+        assert_eq!(
+            call(
                 "html_entity_decode",
                 vec![
                     Value::string("&lt;a&amp;&quot;&#039;&gt;"),
@@ -11043,6 +11075,56 @@ mod tests {
                 &mut output
             ),
             Value::string("\x0c|&#x0D;|&#xFDD0;|&#x2FFFF;")
+        );
+        let Value::Array(compat_table) = call(
+            "get_html_translation_table",
+            vec![Value::Int(0), Value::Int(2), Value::string("UTF-8")],
+            &mut output,
+        ) else {
+            panic!("get_html_translation_table should return an array");
+        };
+        assert_eq!(compat_table.len(), 4);
+        assert_eq!(
+            array_value(&compat_table, "&"),
+            Some(Value::string("&amp;"))
+        );
+        assert_eq!(
+            array_value(&compat_table, "\""),
+            Some(Value::string("&quot;"))
+        );
+        assert_eq!(array_value(&compat_table, "'"), None);
+        let Value::Array(quotes_table) = call(
+            "get_html_translation_table",
+            vec![Value::Int(0), Value::Int(3), Value::string("UTF-8")],
+            &mut output,
+        ) else {
+            panic!("get_html_translation_table should return an array");
+        };
+        assert_eq!(quotes_table.len(), 5);
+        assert_eq!(
+            array_value(&quotes_table, "'"),
+            Some(Value::string("&#039;"))
+        );
+        let Value::Array(xml_table) = call(
+            "get_html_translation_table",
+            vec![Value::Int(1), Value::Int(3 | 16), Value::string("UTF-8")],
+            &mut output,
+        ) else {
+            panic!("get_html_translation_table should return an array");
+        };
+        assert_eq!(xml_table.len(), 5);
+        assert_eq!(array_value(&xml_table, "'"), Some(Value::string("&apos;")));
+        let Value::Array(html5_sjis_table) = call(
+            "get_html_translation_table",
+            vec![Value::Int(1), Value::Int(3 | 48), Value::string("SJIS")],
+            &mut output,
+        ) else {
+            panic!("get_html_translation_table should return an array");
+        };
+        assert_eq!(html5_sjis_table.len(), 5);
+        assert_eq!(
+            array_value(&html5_sjis_table, "\""),
+            Some(Value::string("&quot;"))
         );
         assert_eq!(
             call("htmlentities", vec![Value::string("<a&>")], &mut output),

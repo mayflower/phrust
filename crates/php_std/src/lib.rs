@@ -834,6 +834,8 @@ mod tests {
             "chr",
             "crc32",
             "hex2bin",
+            "get_html_translation_table",
+            "html_entity_decode",
             "htmlspecialchars",
             "htmlspecialchars_decode",
             "htmlentities",
