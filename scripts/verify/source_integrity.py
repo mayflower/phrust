@@ -63,7 +63,9 @@ VM_MOD_REQUIRED_SNIPPETS = [
     "mod options;",
     "mod prelude;",
     "mod result;",
-    "BytecodeLayoutMode, DenseJumpThreadingMode, ExecutionFormat, JitBlacklistMode, JitMode,",
+    "BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,",
+    "JitBlacklistMode, JitMode, SuperinstructionMode,",
+    "VmOptions",
     "pub use result::{VmControlFlow, VmResult};",
     "pub struct Vm",
     "impl Vm",
@@ -105,7 +107,9 @@ VM_SUBMODULE_FORBIDDEN_SNIPPETS = {
 VM_LIB_REQUIRED_SNIPPETS = [
     "pub mod vm;",
     "pub use vm::{",
-    "BytecodeLayoutMode, DenseJumpThreadingMode, ExecutionFormat, JitBlacklistMode, JitMode,",
+    "BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,",
+    "JitBlacklistMode, JitMode, SuperinstructionMode,",
+    "VmOptions",
 ]
 
 ARGINFO_REQUIRED_SNIPPETS = [

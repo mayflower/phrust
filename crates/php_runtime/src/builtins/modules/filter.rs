@@ -970,9 +970,9 @@ fn unsafe_raw(name: &str, value: &Value, flags: i64) -> BuiltinResult {
         encoded
             .into_iter()
             .filter(|byte| {
-                !(strip_low && is_filter_low(*byte))
-                    && !(strip_high && is_filter_high(*byte))
-                    && !(strip_backtick && *byte == b'`')
+                !(strip_low && is_filter_low(*byte)
+                    || strip_high && is_filter_high(*byte)
+                    || strip_backtick && *byte == b'`')
             })
             .collect::<Vec<_>>(),
     ))
@@ -986,9 +986,7 @@ fn sanitize_encoded(name: &str, value: &Value, flags: i64) -> BuiltinResult {
         .as_bytes()
         .iter()
         .copied()
-        .filter(|byte| {
-            !(strip_low && is_filter_low(*byte)) && !(strip_high && is_filter_high(*byte))
-        })
+        .filter(|byte| !(strip_low && is_filter_low(*byte) || strip_high && is_filter_high(*byte)))
         .collect();
     Ok(Value::string(encode_filter_bytes(&stripped, |byte| {
         !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -1036,9 +1034,9 @@ fn strip_filter_control_bytes(input: &[u8], flags: i64) -> Vec<u8> {
         .iter()
         .copied()
         .filter(|byte| {
-            !(strip_low && is_filter_low(*byte))
-                && !(strip_high && is_filter_high(*byte))
-                && !(strip_backtick && *byte == b'`')
+            !(strip_low && is_filter_low(*byte)
+                || strip_high && is_filter_high(*byte)
+                || strip_backtick && *byte == b'`')
         })
         .collect()
 }

@@ -752,13 +752,11 @@ pub(in crate::builtins::modules) fn html_entity_decode_with_flags(
             Some((b"&".as_slice(), 5))
         } else if flags & 2 != 0 && remaining.starts_with(b"&quot;") {
             Some((b"\"".as_slice(), 6))
-        } else if flags & 1 != 0 && remaining.starts_with(b"&#039;") {
-            Some((b"'".as_slice(), 6))
-        } else if flags & 1 != 0 && remaining.starts_with(b"&#x27;") {
-            Some((b"'".as_slice(), 6))
         } else if flags & 1 != 0
-            && html_document_type(flags) != HtmlDocumentType::Html401
-            && remaining.starts_with(b"&apos;")
+            && (remaining.starts_with(b"&#039;")
+                || remaining.starts_with(b"&#x27;")
+                || (html_document_type(flags) != HtmlDocumentType::Html401
+                    && remaining.starts_with(b"&apos;")))
         {
             Some((b"'".as_slice(), 6))
         } else if remaining.starts_with(b"&#")
@@ -949,13 +947,11 @@ pub(in crate::builtins::modules) fn htmlspecialchars_decode_with_flags(
             Some((b'&', 5))
         } else if flags & 2 != 0 && remaining.starts_with(b"&quot;") {
             Some((b'"', 6))
-        } else if flags & 1 != 0 && remaining.starts_with(b"&#039;") {
-            Some((b'\'', 6))
-        } else if flags & 1 != 0 && remaining.starts_with(b"&#x27;") {
-            Some((b'\'', 6))
         } else if flags & 1 != 0
-            && html_document_type(flags) != HtmlDocumentType::Html401
-            && remaining.starts_with(b"&apos;")
+            && (remaining.starts_with(b"&#039;")
+                || remaining.starts_with(b"&#x27;")
+                || (html_document_type(flags) != HtmlDocumentType::Html401
+                    && remaining.starts_with(b"&apos;")))
         {
             Some((b'\'', 6))
         } else if remaining.starts_with(b"&#")

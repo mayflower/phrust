@@ -7055,8 +7055,8 @@ impl Vm {
                             }
                             _ => match lexical_constant_lookup(compiled, state, stack, name) {
                                 Ok(Some(resolved)) => {
-                                    if let Some(constant) = resolved.predefined {
-                                        if let Err(result) = self
+                                    if let Some(constant) = resolved.predefined
+                                        && let Err(result) = self
                                             .emit_predefined_constant_deprecation(
                                                 compiled,
                                                 output,
@@ -7066,10 +7066,9 @@ impl Vm {
                                                 dense_instruction_span(dense, instruction),
                                                 constant,
                                             )
-                                        {
-                                            stack.pop_recycle();
-                                            return result;
-                                        }
+                                    {
+                                        stack.pop_recycle();
+                                        return result;
                                     }
                                     resolved.value
                                 }
@@ -51676,10 +51675,10 @@ fn php_token_name_value(object: &ObjectRef) -> Option<Value> {
     if let Some(name) = php_runtime::tokenizer::token_name_for_id(id) {
         return Some(Value::String(PhpString::from_test_str(name)));
     }
-    if (0..=u8::MAX as i64).contains(&id) {
-        if let Some(Value::String(text)) = object.get_property("text") {
-            return Some(Value::String(text));
-        }
+    if (0..=u8::MAX as i64).contains(&id)
+        && let Some(Value::String(text)) = object.get_property("text")
+    {
+        return Some(Value::String(text));
     }
     None
 }
@@ -93973,6 +93972,19 @@ $c = new foo;"#,
         let ret = execute_source("<?php function &bad_ref() { return 1; } $x =& bad_ref();");
         assert_eq!(ret.status.exit_status(), ExitStatus::RuntimeError);
         assert_eq!(ret.diagnostics[0].id(), "E_PHP_VM_BY_REF_RETURN_TEMPORARY");
+
+        let auto_ret = execute_source_with_options(
+            "<?php function &bad_ref() { return 1; } $x =& bad_ref();",
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                ..VmOptions::default()
+            },
+        );
+        assert_eq!(auto_ret.status.exit_status(), ExitStatus::RuntimeError);
+        assert_eq!(
+            auto_ret.diagnostics[0].id(),
+            "E_PHP_VM_BY_REF_RETURN_TEMPORARY"
+        );
     }
 
     #[test]

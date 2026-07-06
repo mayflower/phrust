@@ -2068,6 +2068,12 @@ fn lower_function(
     spans: &mut Vec<IrSpan>,
     names: &mut Vec<String>,
 ) -> Result<DenseFunction, DenseLowerError> {
+    if function.returns_by_ref {
+        return Err(DenseLowerError {
+            code: DenseLowerErrorCode::UnsupportedInstruction,
+            message: "by-reference return".to_owned(),
+        });
+    }
     let mut dense = DenseFunction {
         name: function.name.clone(),
         register_count: function.register_count,

@@ -1,6 +1,6 @@
 use crate::engine::{CliIniOptions, EngineInput, execute_php, lint_php, read_script};
 use php_diagnostics::DiagnosticOutputFormat;
-use php_runtime::{
+use php_runtime::api::{
     PHP_E_DEPRECATED, PHP_E_ERROR, PHP_E_NOTICE, PHP_E_USER_DEPRECATED, PHP_E_USER_ERROR,
     PHP_E_USER_NOTICE, PHP_E_USER_WARNING, PHP_E_WARNING, PhpDiagnosticChannel,
     PhpDiagnosticLocation, RuntimeInputFilter, error_reporting_allows_level,
