@@ -13,6 +13,11 @@ fixtures, and performance gate contracts.
 - [Bytecode cache](bytecode-cache.md): cache format, validation, and CLI
   behavior.
 - [Known gaps](known-gaps.md): performance gaps that remain intentionally open.
+- [Fastest-engine known gaps](fastest-engine-known-gaps.md): the `FPE-GAP-*`
+  catalog of remaining fastest-engine deltas and their closure requirements.
+- [Incremental fastest-engine delta guard](incremental-fastest-delta.md):
+  current-`main` present/partial/report-only/absent classification and the
+  smallest remaining deltas, to stop reimplementation of existing features.
 
 ## Optimization Areas
 
