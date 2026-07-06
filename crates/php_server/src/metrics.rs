@@ -43,6 +43,8 @@ pub(crate) struct ServerMetrics {
     pub(crate) request_headers_seen: AtomicU64,
     pub(crate) request_headers_materialized: AtomicU64,
     pub(crate) request_headers_skipped_direct: AtomicU64,
+    pub(crate) phase_admission_wait_count: AtomicU64,
+    pub(crate) phase_admission_wait_nanos: AtomicU64,
     pub(crate) phase_route_resolution_count: AtomicU64,
     pub(crate) phase_route_resolution_nanos: AtomicU64,
     pub(crate) phase_body_read_count: AtomicU64,
@@ -65,6 +67,10 @@ impl ServerMetrics {
     pub(crate) fn record_phase(&self, phase: RequestPhase, nanos: u128) {
         let nanos = nanos.min(u64::MAX as u128) as u64;
         let (count, total) = match phase {
+            RequestPhase::AdmissionWait => (
+                &self.phase_admission_wait_count,
+                &self.phase_admission_wait_nanos,
+            ),
             RequestPhase::RouteResolution => (
                 &self.phase_route_resolution_count,
                 &self.phase_route_resolution_nanos,
@@ -179,6 +185,8 @@ phrust_server_session_finalize_skipped_inactive_total {}\n\
 phrust_server_request_headers_seen_total {}\n\
 phrust_server_request_headers_materialized_total {}\n\
 phrust_server_request_headers_skipped_direct_total {}\n\
+phrust_server_request_phase_count{{phase=\"admission_wait\"}} {}\n\
+phrust_server_request_phase_nanos_total{{phase=\"admission_wait\"}} {}\n\
 phrust_server_request_phase_count{{phase=\"route_resolution\"}} {}\n\
 phrust_server_request_phase_nanos_total{{phase=\"route_resolution\"}} {}\n\
 phrust_server_request_phase_count{{phase=\"body_read\"}} {}\n\
@@ -259,6 +267,8 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             self.request_headers_seen.load(Ordering::Relaxed),
             self.request_headers_materialized.load(Ordering::Relaxed),
             self.request_headers_skipped_direct.load(Ordering::Relaxed),
+            self.phase_admission_wait_count.load(Ordering::Relaxed),
+            self.phase_admission_wait_nanos.load(Ordering::Relaxed),
             self.phase_route_resolution_count.load(Ordering::Relaxed),
             self.phase_route_resolution_nanos.load(Ordering::Relaxed),
             self.phase_body_read_count.load(Ordering::Relaxed),
@@ -294,6 +304,7 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestPhase {
+    AdmissionWait,
     RouteResolution,
     BodyRead,
     RequestContext,

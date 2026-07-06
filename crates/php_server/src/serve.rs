@@ -136,13 +136,23 @@ pub(crate) async fn handle(
             ),
         ]),
     );
+    let admission_started = Instant::now();
     let _permit = match timeout(
         REQUEST_ADMISSION_TIMEOUT,
         Arc::clone(&state.in_flight).acquire_owned(),
     )
     .await
     {
-        Ok(Ok(permit)) => permit,
+        Ok(Ok(permit)) => {
+            // Queue-wait signal: time spent waiting for an in-flight permit
+            // (the blocking-region admission gate). Near-zero under low load;
+            // grows as workers saturate.
+            state.metrics.record_phase(
+                super::metrics::RequestPhase::AdmissionWait,
+                admission_started.elapsed().as_nanos(),
+            );
+            permit
+        }
         Ok(Err(_)) | Err(_) => {
             state.metrics.overload.fetch_add(1, Ordering::Relaxed);
             let response = overloaded();

@@ -280,6 +280,16 @@ fn server_exposes_internal_metrics() {
         response.contains("phrust_server_php_responses_total"),
         "{response}"
     );
+    // Queue-wait/admission scalability signal: every served request records the
+    // in-flight admission wait as its own request phase.
+    assert!(
+        response.contains("phrust_server_request_phase_count{phase=\"admission_wait\"}"),
+        "{response}"
+    );
+    assert!(
+        response.contains("phrust_server_request_phase_nanos_total{phase=\"admission_wait\"}"),
+        "{response}"
+    );
     assert!(
         response.contains("phrust_server_script_cache_hits_total"),
         "{response}"

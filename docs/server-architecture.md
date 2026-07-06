@@ -67,8 +67,14 @@ The optional `/__phrust/metrics` endpoint exposes process-local counters for
 requests, overloads, response classes, upload parsing, execution timeouts,
 static streaming, script-cache hits/misses/stale invalidations, script-cache
 preload, include-cache hits/misses, compile errors, and current cache entries.
-It is an internal plain-text endpoint. It can be disabled with
-`--disable-metrics-endpoint` or protected with `--metrics-token`.
+It also exposes per-phase request timing as
+`phrust_server_request_phase_count`/`_nanos_total` labelled by `phase`,
+including an `admission_wait` phase that measures time spent waiting for an
+in-flight permit at the concurrency-limiter (blocking-region) admission gate —
+the queue-wait/worker-saturation signal, complementing the `in_flight` gauge and
+the `overload` rejection counter. It is an internal plain-text endpoint. It can
+be disabled with `--disable-metrics-endpoint` or protected with
+`--metrics-token`.
 
 ## Validation
 
