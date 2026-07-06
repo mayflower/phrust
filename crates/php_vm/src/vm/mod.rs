@@ -29401,12 +29401,22 @@ impl Vm {
                 };
                 if let Some((key, value)) = assignment.split_once('=') {
                     if key.is_empty() {
-                        return VmResult::success_no_output(Some(Value::Bool(false)));
+                        return self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_RUNTIME_BUILTIN_VALUE: putenv(): Argument #1 ($assignment) must have a valid syntax",
+                        );
                     }
                     set_env_entry(&mut state.env, key.to_string(), Some(value.to_string()));
                 } else {
                     if assignment.is_empty() {
-                        return VmResult::success_no_output(Some(Value::Bool(false)));
+                        return self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            "E_PHP_RUNTIME_BUILTIN_VALUE: putenv(): Argument #1 ($assignment) must have a valid syntax",
+                        );
                     }
                     set_env_entry(&mut state.env, assignment, None);
                 }
@@ -78619,6 +78629,16 @@ good"
             echo getenv('PHP_APP_HOME'), \"\\n\";
             putenv('PHP_APP_HOME');
             echo getenv('PHP_APP_HOME') === false ? 'unset' : 'bad', \"\\n\";
+            try {
+                putenv('=123');
+            } catch (ValueError $exception) {
+                echo $exception->getMessage(), \"\\n\";
+            }
+            try {
+                putenv('');
+            } catch (ValueError $exception) {
+                echo $exception->getMessage(), \"\\n\";
+            }
             ",
             VmOptions {
                 runtime_context: RuntimeContext::controlled_cli(
@@ -78640,7 +78660,7 @@ good"
         assert_eq!(
             result.output.to_string_lossy(),
             format!(
-                "/tmp/php-app\n/tmp/php-app-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Stdlib generic\nphrust\n/changed\nunset\n",
+                "/tmp/php-app\n/tmp/php-app-cache\nargv\n/tmp/controlled.php\ncli\nPhrust|localhost|{}\nPhrust localhost {} Stdlib generic\nphrust\n/changed\nunset\nputenv(): Argument #1 ($assignment) must have a valid syntax\nputenv(): Argument #1 ($assignment) must have a valid syntax\n",
                 php_source::reference_php_version(),
                 php_source::reference_php_version()
             )

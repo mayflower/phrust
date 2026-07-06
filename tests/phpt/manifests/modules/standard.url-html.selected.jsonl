@@ -37,6 +37,11 @@
 {"path":"ext/standard/tests/strings/get_html_translation_table_basic3.phpt"}
 {"path":"ext/standard/tests/strings/get_html_translation_table_basic8.phpt"}
 {"path":"ext/standard/tests/strings/get_html_translation_table_basic9.phpt"}
+{"path":"ext/standard/tests/general_functions/getenv.phpt"}
+{"path":"ext/standard/tests/general_functions/putenv.phpt"}
+{"path":"ext/standard/tests/general_functions/bug50690.phpt"}
+{"path":"ext/standard/tests/general_functions/bug79254.phpt"}
+{"path":"ext/standard/tests/general_functions/putenv_bug75574_utf8.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt"}
 {"path":"tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt"}

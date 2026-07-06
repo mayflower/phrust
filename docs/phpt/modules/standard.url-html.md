@@ -2,8 +2,8 @@
 
 - Priority: 16.8
 - Selected manifest: `tests/phpt/manifests/modules/standard.url-html.selected.jsonl`
-- Derived corpus baseline: 1 PASS, 0 SKIP, 63 FAIL, 5 BORK from 69 path-filtered candidates
-- focused gate: 42 PASS, 0 FAIL, 0 BORK
+- Derived corpus baseline: 1 PASS, 0 SKIP, 61 FAIL, 5 BORK from 74 path-filtered candidates
+- focused gate: 47 PASS, 0 FAIL, 0 BORK
 
 ## Scope
 
@@ -20,6 +20,9 @@
   selected `html_entity_decode` document-type and numeric entity filtering
 - `get_html_translation_table` coverage for special-character quote modes,
   XML 1.0 basic entities, and HTML5/SJIS basic entities
+- `getenv()` / `putenv()` request-environment lookup, mutation, unset,
+  empty-value, no-argument array snapshot, local-only lookup, UTF-8 value, and
+  invalid-assignment `ValueError` coverage
 
 ## Non-Scope
 
@@ -70,6 +73,11 @@
 - `ext/standard/tests/strings/get_html_translation_table_basic3.phpt`
 - `ext/standard/tests/strings/get_html_translation_table_basic8.phpt`
 - `ext/standard/tests/strings/get_html_translation_table_basic9.phpt`
+- `ext/standard/tests/general_functions/getenv.phpt`
+- `ext/standard/tests/general_functions/putenv.phpt`
+- `ext/standard/tests/general_functions/bug50690.phpt`
+- `ext/standard/tests/general_functions/bug79254.phpt`
+- `ext/standard/tests/general_functions/putenv_bug75574_utf8.phpt`
 - `tests/phpt/generated/standard.url-html/url-encode-decode-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/http-build-query-smoke.phpt`
 - `tests/phpt/generated/standard.url-html/htmlspecialchars-htmlentities-smoke.phpt`
@@ -113,7 +121,10 @@
 - `get_html_translation_table()` now returns PHP arrays for
   `HTML_SPECIALCHARS` quote modes plus XML 1.0 and HTML5/SJIS basic
   `HTML_ENTITIES` tables.
-- Latest focused target run: PASS, 42 selected PHPTs.
+- `getenv()` and `putenv()` now cover request-local environment mutation,
+  array snapshots after mutation, empty-string values, unsetting, local-only
+  lookup, UTF-8 values, and catchable `ValueError` invalid assignment syntax.
+- Latest focused target run: PASS, 47 selected PHPTs.
 
 ## Known Gaps
 
