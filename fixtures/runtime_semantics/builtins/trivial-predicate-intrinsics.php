@@ -11,6 +11,9 @@ $cases = [
     "int" => 7,
     "float" => 1.5,
     "string" => "s",
+    "int_string" => "42",
+    "float_string" => "3.14",
+    "leading_numeric" => "12abc",
     "array" => [1],
     "object" => new stdClass(),
     "closure" => function () {},
@@ -23,6 +26,7 @@ foreach ($cases as $label => $value) {
     echo is_scalar($value) ? "S" : "-";
     echo is_bool($value) ? "B" : "-";
     echo is_float($value) ? "F" : "-";
+    echo is_numeric($value) ? "M" : "-";
     echo "\n";
 }
 

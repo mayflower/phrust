@@ -26,6 +26,16 @@ The current priority comes from committed counter surfaces and stdlib coverage:
 | 12 | `json_encode` | JSON differential coverage exists, but flags, depth, request-local last-error state, objects, and `JsonSerializable` gaps make it stateful. | Deferred. |
 | 13 | `htmlspecialchars` | URL/HTML differential coverage exists; the default flags/double-encode runtime path now uses the byte-kernel HTML escape pre-scan, but non-default flags, encoding policy, double-encode variants, and diagnostics are wider than a safe VM intrinsic. | Deferred. |
 | 14 | `file_exists`, `is_file`, `realpath` | Filesystem coverage exists, but cwd, include path, open_basedir, stream wrappers, stat cache, and mutation invalidation make these path-semantics sensitive. | Deferred. |
+| 15 | `is_numeric` | Exact `mixed`→`bool` predicate reusing `php_runtime::numeric_string::classify_php_string` (`IntString`/`FloatString`); reference args fall back as `by_ref`. VM test asserts behavior parity with the generic builtin and a non-zero `intrinsic_hits.is_numeric`; the `trivial-predicate-intrinsics.php` fixture adds numeric-string and leading-numeric differential cases. | Added as an exact predicate intrinsic. |
+
+> The table above is the original FPE-25 ladder and its per-row rationale. The
+> intrinsic set has since grown well beyond it; the authoritative current set is
+> the `BUILTIN_INTRINSICS` table in `crates/php_vm/src/vm/mod.rs`. Several rows
+> once marked *Deferred* are now implemented (e.g. `array_key_exists`,
+> `in_array`, single-byte `explode`, `implode`, default `htmlspecialchars`),
+> alongside the `is_bool`/`is_float`/`is_null`/`is_object`/`is_scalar`/
+> `is_numeric` predicates, `current`/`key`, `array_keys`, `substr`, `trim`, and
+> `str_replace`. Each still passes the same exact-shape guards below.
 
 ## Eligibility
 

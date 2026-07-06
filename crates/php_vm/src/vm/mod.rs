@@ -69370,6 +69370,7 @@ enum BuiltinIntrinsicKind {
     IsFloat,
     IsInt,
     IsNull,
+    IsNumeric,
     IsObject,
     IsScalar,
     IsString,
@@ -69816,6 +69817,15 @@ const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
         kind: BuiltinIntrinsicKind::IsNull,
     },
     BuiltinIntrinsicSpec {
+        name: "is_numeric",
+        counter_name: "is_numeric",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsNumeric,
+    },
+    BuiltinIntrinsicSpec {
         name: "is_object",
         counter_name: "is_object",
         return_type: "bool",
@@ -69898,6 +69908,18 @@ fn fast_builtin_stub_result_for_spec(
             Some(Value::Bool(matches!(value, Value::Float(_))))
         }
         (BuiltinIntrinsicKind::IsNull, [value]) => Some(Value::Bool(matches!(value, Value::Null))),
+        (BuiltinIntrinsicKind::IsNumeric, [value]) => Some(Value::Bool(match value {
+            Value::Int(_) | Value::Float(_) => true,
+            // Matches the numeric-string classifier: only a whole trimmed
+            // int/float string is numeric; leading-numeric ("12abc") and
+            // non-numeric strings are not. References are rejected as by_ref
+            // before reaching here, so this sees the effective value.
+            Value::String(bytes) => matches!(
+                classify_php_string(bytes).kind,
+                NumericStringKind::IntString | NumericStringKind::FloatString
+            ),
+            _ => false,
+        })),
         (BuiltinIntrinsicKind::IsObject, [value]) => Some(Value::Bool(matches!(
             value,
             Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_)
@@ -70104,6 +70126,7 @@ fn builtin_intrinsic_type_fallback(
             | BuiltinIntrinsicKind::IsFloat
             | BuiltinIntrinsicKind::IsInt
             | BuiltinIntrinsicKind::IsNull
+            | BuiltinIntrinsicKind::IsNumeric
             | BuiltinIntrinsicKind::IsObject
             | BuiltinIntrinsicKind::IsScalar
             | BuiltinIntrinsicKind::IsString,
@@ -90041,6 +90064,56 @@ echo "dynamic=", call_user_func('tiny_frame_add', 2, 3), "\n";
                 .intrinsic_fallback_by_reason
                 .get("array_key_exists.type"),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn is_numeric_intrinsic_matches_generic_and_fires() {
+        let source = "<?php
+            echo is_numeric(42) ? '1' : '0';
+            echo is_numeric(1.5) ? '1' : '0';
+            echo is_numeric(\"123\") ? '1' : '0';
+            echo is_numeric(\"1.5e3\") ? '1' : '0';
+            echo is_numeric(\"12abc\") ? '1' : '0';
+            echo is_numeric(\"abc\") ? '1' : '0';
+            echo is_numeric(\"\") ? '1' : '0';
+            echo is_numeric(true) ? '1' : '0';
+            echo is_numeric(null) ? '1' : '0';
+            echo is_numeric([]) ? '1' : '0';
+        ";
+        let off = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::Off,
+                ..VmOptions::default()
+            },
+        );
+        let on = execute_source_with_options(
+            source,
+            VmOptions {
+                collect_counters: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(off.status.is_success(), "{:?}", off.status);
+        assert!(on.status.is_success(), "{:?}", on.status);
+        // Behavior-preserving: the intrinsic matches the generic builtin.
+        assert_eq!(on.output, off.output);
+        // int, float, int-string, float-string are numeric; leading-numeric,
+        // non-numeric, empty, bool, null, and array are not.
+        assert_eq!(on.output.as_bytes(), b"1111000000");
+        let on_counters = on.counters.expect("on counters");
+        assert!(
+            on_counters
+                .intrinsic_hits
+                .get("is_numeric")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "is_numeric intrinsic should fire: {on_counters:?}"
         );
     }
 
