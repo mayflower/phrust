@@ -200,6 +200,8 @@ pub enum DenseOpcode {
     EmptyProperty = 86,
     /// `rN = Class::$staticProperty`.
     FetchStaticProperty = 87,
+    /// `rN = clone object`.
+    CloneObject = 88,
 }
 
 impl DenseOpcode {
@@ -308,6 +310,7 @@ impl DenseOpcode {
             Self::IssetProperty => "isset_property",
             Self::EmptyProperty => "empty_property",
             Self::FetchStaticProperty => "fetch_static_property",
+            Self::CloneObject => "clone_object",
         }
     }
 
@@ -1972,7 +1975,8 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::FetchClassConstant
         | DenseOpcode::IssetProperty
         | DenseOpcode::EmptyProperty
-        | DenseOpcode::FetchStaticProperty => None,
+        | DenseOpcode::FetchStaticProperty
+        | DenseOpcode::CloneObject => None,
     }
 }
 
@@ -2744,6 +2748,13 @@ fn lower_instruction(
                 property: push_name(names, property).index() as u32,
             },
         ),
+        InstructionKind::CloneObject { dst, object } => (
+            DenseOpcode::CloneObject,
+            DenseOperands::RegOperand {
+                dst: dst.raw(),
+                src: lower_operand(*object),
+            },
+        ),
         other => return unsupported_instruction(instruction, format!("{other:?}")),
     };
     Ok(DenseInstruction {
@@ -3086,7 +3097,7 @@ fn verify_instruction(
             verify_constant(*constant, unit, errors);
         }
         (
-            DenseOpcode::Move | DenseOpcode::AcquireCallable,
+            DenseOpcode::Move | DenseOpcode::AcquireCallable | DenseOpcode::CloneObject,
             DenseOperands::RegOperand { dst, src },
         )
         | (

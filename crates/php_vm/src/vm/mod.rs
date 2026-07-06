@@ -7271,6 +7271,91 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::CloneObject => {
+                        let DenseOperands::RegOperand { dst, src } = &instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let dst = *dst;
+                        let src = *src;
+                        let object = match self.read_dense_operand(compiled, stack, src) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let value = match self
+                            .clone_object_value(compiled, &object, output, stack, state)
+                        {
+                            Ok(value) => value,
+                            Err(ClassConstantFetch::Throwable(result)) => {
+                                let result = *result;
+                                if let Some(throwable) = state
+                                    .pending_throw
+                                    .take()
+                                    .or_else(|| runtime_error_throwable(&result))
+                                {
+                                    stack.pop_recycle();
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            Err(ClassConstantFetch::Raise(span, message)) => {
+                                let mut exception_handlers = Vec::new();
+                                let mut pending_control = None;
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(_) => {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            "E_PHP_VM_DENSE_CLONE_HANDLER: dense functions have no local exception handlers".to_string(),
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                    RaiseOutcome::Done(result) => {
+                                        stack.pop_recycle();
+                                        return *result;
+                                    }
+                                }
+                            }
+                            Err(ClassConstantFetch::Fatal(message)) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) = stack
+                            .current_mut()
+                            .expect("bytecode frame was pushed")
+                            .registers
+                            .set(RegId::new(dst), value)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::LoadConst | DenseOpcode::LoadConstLoadConst => {
                         // The fused form appends a second constant load into
                         // another register after the unchanged first load.
@@ -17850,78 +17935,23 @@ impl Vm {
                     InstructionKind::CloneObject { dst, object } => {
                         let object = match read_operand_at_frame(unit, stack, frame_index, *object)
                         {
-                            Ok(Value::Object(object)) => object,
-                            Ok(other) => {
-                                return self.runtime_error(
-                                    output,
-                                    compiled,
-                                    stack,
-                                    format!(
-                                        "E_PHP_VM_CLONE_NON_OBJECT: cannot clone {}",
-                                        value_type_name(&other)
-                                    ),
-                                );
-                            }
+                            Ok(value) => value,
                             Err(message) => {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let class =
-                            match lookup_class_in_state(compiled, state, &object.class_name()) {
-                                Some(class) => class,
-                                None if internal_runtime_class_entry(&object.class_name())
-                                    .is_some() =>
+                        match self.clone_object_value(compiled, &object, output, stack, state) {
+                            Ok(value) => {
+                                if let Err(message) = stack
+                                    .frame_mut(frame_index)
+                                    .expect("frame was pushed")
+                                    .registers
+                                    .set(*dst, value)
                                 {
-                                    let copy = object.clone_shallow();
-                                    if let Err(message) = stack
-                                        .frame_mut(frame_index)
-                                        .expect("frame was pushed")
-                                        .registers
-                                        .set(*dst, Value::Object(copy))
-                                    {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                    continue;
+                                    return self.runtime_error(output, compiled, stack, message);
                                 }
-                                None => {
-                                    return self.runtime_error(
-                                        output,
-                                        compiled,
-                                        stack,
-                                        format!(
-                                            "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                                            object.class_name()
-                                        ),
-                                    );
-                                }
-                            };
-                        let class_owner = class_owner_in_state(compiled, state, &class.name);
-                        let runtime_class = match runtime_class_entry(
-                            &class_owner,
-                            state,
-                            &class,
-                            &|value| self.constant_value(class_owner.unit(), value),
-                            &|reference| {
-                                class_constant_reference_value(&class_owner, state, reference)
-                            },
-                            &|reference| {
-                                named_constant_reference_value(&class_owner, state, reference)
-                            },
-                        ) {
-                            Ok(class) => class,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
                             }
-                        };
-                        if let Err(message) = validate_object_mvp(&runtime_class) {
-                            return self.runtime_error(output, compiled, stack, message);
-                        }
-                        let copy = match self
-                            .clone_object_with_magic(compiled, object, &class, output, stack, state)
-                        {
-                            Ok(copy) => copy,
-                            Err(result) => {
+                            Err(ClassConstantFetch::Throwable(result)) => {
                                 match self.route_throwable_result(
                                     compiled,
                                     output,
@@ -17929,7 +17959,7 @@ impl Vm {
                                     state,
                                     &mut exception_handlers,
                                     &mut pending_control,
-                                    result,
+                                    *result,
                                 ) {
                                     RaiseOutcome::Caught(target) => {
                                         block_id = target;
@@ -17938,15 +17968,27 @@ impl Vm {
                                     RaiseOutcome::Done(result) => return *result,
                                 }
                             }
-                        };
-                        self.register_destructor_if_needed(compiled, &class, copy.clone(), state);
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("frame was pushed")
-                            .registers
-                            .set(*dst, Value::Object(copy))
-                        {
-                            return self.runtime_error(output, compiled, stack, message);
+                            Err(ClassConstantFetch::Raise(span, message)) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                            Err(ClassConstantFetch::Fatal(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
                         }
                     }
                     InstructionKind::CloneWith {
@@ -38893,6 +38935,66 @@ impl Vm {
             );
         }
         Ok(value)
+    }
+
+    /// `clone $object`, shared by the rich and dense executors. Returns the new
+    /// object; a throwing `__clone` is returned as `ClassConstantFetch::Throwable`
+    /// for the caller to route, other failures as `Fatal`. (`ClassConstantFetch`
+    /// is the shared opcode-fault type for these helpers.)
+    fn clone_object_value(
+        &self,
+        compiled: &CompiledUnit,
+        object: &Value,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ClassConstantFetch> {
+        let Value::Object(object) = object else {
+            return Err(ClassConstantFetch::Fatal(format!(
+                "E_PHP_VM_CLONE_NON_OBJECT: cannot clone {}",
+                value_type_name(object)
+            )));
+        };
+        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
+            Some(class) => class,
+            None if internal_runtime_class_entry(&object.class_name()).is_some() => {
+                return Ok(Value::Object(object.clone_shallow()));
+            }
+            None => {
+                return Err(ClassConstantFetch::Fatal(format!(
+                    "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                    object.class_name()
+                )));
+            }
+        };
+        let class_owner = class_owner_in_state(compiled, state, &class.name);
+        let runtime_class = match runtime_class_entry(
+            &class_owner,
+            state,
+            &class,
+            &|value| self.constant_value(class_owner.unit(), value),
+            &|reference| class_constant_reference_value(&class_owner, state, reference),
+            &|reference| named_constant_reference_value(&class_owner, state, reference),
+        ) {
+            Ok(class) => class,
+            Err(message) => return Err(ClassConstantFetch::Fatal(message.into())),
+        };
+        if let Err(message) = validate_object_mvp(&runtime_class) {
+            return Err(ClassConstantFetch::Fatal(message));
+        }
+        let copy = match self.clone_object_with_magic(
+            compiled,
+            object.clone(),
+            &class,
+            output,
+            stack,
+            state,
+        ) {
+            Ok(copy) => copy,
+            Err(result) => return Err(ClassConstantFetch::Throwable(Box::new(result))),
+        };
+        self.register_destructor_if_needed(compiled, &class, copy.clone(), state);
+        Ok(Value::Object(copy))
     }
 
     fn execute_cast(
@@ -60291,7 +60393,8 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         DenseOpcode::FetchProperty | DenseOpcode::AssignProperty => "properties",
         DenseOpcode::InstanceOf
         | DenseOpcode::FetchClassConstant
-        | DenseOpcode::FetchStaticProperty => "objects",
+        | DenseOpcode::FetchStaticProperty
+        | DenseOpcode::CloneObject => "objects",
         DenseOpcode::IssetPropertyDim
         | DenseOpcode::EmptyPropertyDim
         | DenseOpcode::IssetProperty

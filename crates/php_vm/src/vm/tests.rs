@@ -19521,6 +19521,52 @@ echo $o->a, '|', $o->b, '|', $o->d;
 }
 
 #[test]
+fn dense_bytecode_auto_executes_clone_object() {
+    // `clone $obj` (including a __clone magic method) now executes on the dense
+    // bytecode path via the shared clone_object_value helper.
+    let result = execute_source_with_options(
+        r#"<?php
+class DenseClonePt {
+    public $x = 1;
+    public $y = 2;
+    public $cloned = false;
+    function __clone() { $this->cloned = true; }
+}
+function dense_clone_probe() {
+    $a = new DenseClonePt();
+    $a->x = 10;
+    $b = clone $a;
+    $b->x = 20;
+    return $a->x . '|' . $b->x . '|' . $b->y . '|' . ($b->cloned ? '1' : '0');
+}
+echo dense_clone_probe();
+"#,
+        VmOptions {
+            execution_format: ExecutionFormat::Auto,
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            inline_caches: InlineCacheMode::On,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.to_string_lossy(), "10|20|2|1");
+    let counters = result.counters.expect("counters should be collected");
+    assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+    assert!(
+        counters
+            .opcodes
+            .get("bytecode_clone_object")
+            .copied()
+            .unwrap_or_default()
+            >= 1,
+        "{counters:?}"
+    );
+}
+
+#[test]
 fn dense_bytecode_auto_executes_fetch_static_property() {
     // Class::$staticProperty fetches (public, typed, and private via self::)
     // now execute on the dense bytecode path via the shared
