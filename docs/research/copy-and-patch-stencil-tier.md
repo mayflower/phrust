@@ -83,19 +83,21 @@ dense bytecode, then maps a tiny quickening-compatible dense subset to
 stencils. It never allocates executable memory.
 
 The current smoke summary covers five fixtures (including the `properties.php`
-fixture that exercises the guarded property fetch/assign stencils) and produced:
+fixture that exercises the guarded property fetch/assign stencils, and
+`arithmetic.php` whose loop condition exercises `guarded_int_comparison`) and
+produced:
 
 | Metric | Value |
 | --- | ---: |
 | Dense instructions | 354 |
-| Stencils | 285 |
-| Patch sites | 428 |
+| Stencils | 290 |
+| Patch sites | 448 |
 | Helper calls | 32 |
-| Live-state slots | 440 |
-| Deopt points | 48 |
-| Estimated code size | 3280 bytes |
-| Compile-cost units | 454 |
-| Work-to-compile ratio | 0.628 |
+| Live-state slots | 460 |
+| Deopt points | 53 |
+| Estimated code size | 3400 bytes |
+| Compile-cost units | 464 |
+| Work-to-compile ratio | 0.625 |
 
 ## Candidate Stencils
 
@@ -104,6 +106,7 @@ fixture that exercises the guarded property fetch/assign stencils) and produced:
 | Load local | `load_local` over `load_local` and fused `load_local_echo`. | Frame-layout epoch, local-slot patch, destination register, source span. |
 | Guard int/string/bool | Represented through guarded arithmetic, known builtin calls, and branch guards. | Exact value class feedback, source span, resume instruction, guard failure reason. |
 | Int add/sub/mul with overflow exit | `guarded_int_arithmetic` over `binary_add`, `binary_sub`, and `binary_mul`. | Operand registers, destination register, overflow exit, type exit, checked helper/inline op identity. |
+| Int comparison with type exit | `guarded_int_comparison` over the dense compare opcodes (`compare_equal`/`compare_not_equal`/`compare_identical`/`compare_not_identical`/`compare_less`/`compare_less_equal`/`compare_greater`/`compare_greater_equal`/`compare_spaceship`). Native integer compare once both operands are proven int. | Operand registers, destination register, `lhs_is_int`/`rhs_is_int` guards, type exit to the interpreter comparison ladder, resume instruction. |
 | Packed array guard/fetch | `packed_array_guard_fetch` over dense `fetch_dim`. | Packed-array guard, integer key guard, OOB exit, warning/diagnostic ordering, no by-reference element state. |
 | Object shape guard/property slot load | `guarded_property_fetch` over dense `fetch_property`, and `guarded_property_assignment` over dense `assign_property`. Dense bytecode now exposes property fetch/assign opcodes, so the stencil tier classifies them instead of reporting `object_shape_property_load_dense_opcode_absent`. | Receiver class/layout epoch, property slot, visibility scope, magic/get/hook rejection, uninitialized typed-property exit. |
 | Known builtin call | `known_builtin_call` for dense direct calls to `strlen` and `count`. | Function-table epoch, builtin identity, argument shape, helper return-status exit, diagnostics order. |
@@ -121,15 +124,18 @@ The prototype rejects or records gaps for:
   by-reference arguments need exact live-state maps;
 - foreach, because iterator position, mutation epoch, by-reference mode, and
   resume state are not native-representable yet;
-- string, comparison, division, modulo, bitwise, unary, and concat opcodes that
-  still need PHP-semantic helper contracts or string/allocation state.
+- string, division, modulo, bitwise, unary, and concat opcodes that still need
+  PHP-semantic helper contracts or string/allocation state.
 
 Object property fetch and assign are now supported candidates
 (`guarded_property_fetch` / `guarded_property_assignment`) once dense bytecode
 gained property opcodes; they still require the receiver class/layout-epoch
 guards, visibility scope, magic/`__get`/hook rejection, and uninitialized
 typed-property exits listed in the candidate table before an executable tier
-can emit them.
+can emit them. Integer comparison is likewise a supported candidate
+(`guarded_int_comparison`): the compare opcodes leave the generic
+PHP-semantic-helper bucket and gain `lhs_is_int`/`rhs_is_int` guards with a type
+exit to the interpreter comparison ladder for any non-int operand.
 
 ## Required Deopt Metadata
 

@@ -95,6 +95,7 @@ def main() -> int:
 
     required_kinds = {
         "guarded_int_arithmetic",
+        "guarded_int_comparison",
         "packed_array_guard_fetch",
         "known_builtin_call",
         "branch_guard",

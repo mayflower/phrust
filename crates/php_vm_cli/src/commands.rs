@@ -3102,6 +3102,40 @@ fn classify_copy_patch_stencil_instruction(
                 unsupported_reason: None,
             }
         }
+        DenseOpcode::CompareEqual
+        | DenseOpcode::CompareNotEqual
+        | DenseOpcode::CompareIdentical
+        | DenseOpcode::CompareNotIdentical
+        | DenseOpcode::CompareLess
+        | DenseOpcode::CompareLessEqual
+        | DenseOpcode::CompareGreater
+        | DenseOpcode::CompareGreaterEqual
+        | DenseOpcode::CompareSpaceship => CopyPatchStencilClass {
+            // Guarded-int comparison: when both operands are proven int, every
+            // PHP comparison (ordering, (non-)equality, (non-)identity, and the
+            // spaceship's sign) is a native integer compare with no type
+            // juggling. Non-int operands side-exit to the interpreter, which
+            // owns the full comparison-semantics ladder.
+            kind: "guarded_int_comparison",
+            patch_sites: &[
+                "lhs_register",
+                "rhs_register",
+                "destination_register",
+                "type_exit",
+            ],
+            guard_dependencies: &["lhs_is_int", "rhs_is_int"],
+            helper_calls: &[],
+            live_state_requirements: &[
+                "operand_registers",
+                "destination_register",
+                "source_span",
+                "resume_instruction",
+            ],
+            side_exit_target: "interpreter_comparison_type_exit",
+            code_size_bytes_estimate: 24,
+            compile_cost_units: 3,
+            unsupported_reason: None,
+        },
         DenseOpcode::FetchDim | DenseOpcode::IssetDim | DenseOpcode::EmptyDim => {
             CopyPatchStencilClass {
                 kind: "packed_array_guard_fetch",
@@ -3314,15 +3348,6 @@ fn classify_copy_patch_stencil_instruction(
         | DenseOpcode::BinaryBitXor
         | DenseOpcode::BinaryShiftLeft
         | DenseOpcode::BinaryShiftRight
-        | DenseOpcode::CompareEqual
-        | DenseOpcode::CompareNotEqual
-        | DenseOpcode::CompareIdentical
-        | DenseOpcode::CompareNotIdentical
-        | DenseOpcode::CompareLess
-        | DenseOpcode::CompareLessEqual
-        | DenseOpcode::CompareGreater
-        | DenseOpcode::CompareGreaterEqual
-        | DenseOpcode::CompareSpaceship
         | DenseOpcode::UnaryPlus
         | DenseOpcode::UnaryMinus
         | DenseOpcode::UnaryNot
@@ -4705,6 +4730,55 @@ mod tests {
             json["unsupported_by_reason"]["object_shape_property_load_dense_opcode_absent"]
                 .is_null(),
             "stale property-load absence gap should be gone: {json}"
+        );
+    }
+
+    #[test]
+    fn copy_patch_stencils_classify_guarded_int_comparison() {
+        // Integer comparison is a native operation once both operands are proven
+        // int, so the stencil tier classifies it as `guarded_int_comparison`
+        // rather than leaving it in the generic PHP-semantic-helper bucket.
+        let path = std::env::temp_dir().join(format!(
+            "phrust_p8_stencil_compare_{}.php",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "<?php\n\
+             $a = 3;\n\
+             $b = 4;\n\
+             $lt = $a < $b;\n\
+             $eq = $a === $b;\n\
+             $cmp = $a <=> $b;\n\
+             echo $lt, $eq, $cmp;\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-copy-patch-stencils".to_string(),
+                path_str,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        // No-exec invariant still holds.
+        assert_eq!(json["native_execution"], false);
+        assert_eq!(json["executable_memory"], false);
+        // Comparison opcodes are classified into the guarded int-comparison stencil.
+        assert!(
+            json["stencil_kinds"]["guarded_int_comparison"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "expected a guarded_int_comparison stencil: {json}"
         );
     }
 
