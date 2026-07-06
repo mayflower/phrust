@@ -642,12 +642,17 @@ impl QuickeningTable {
         sites
     }
 
-    /// Seeds adaptive state from a prior run's exported sites.
+    /// Seeds adaptive state from a prior run's exported sites and returns how
+    /// many sites were actually installed (specialized or blacklisted).
     ///
     /// Seeded specializations enter the table already installed but keep the
     /// full guard/fallback protocol, so a wrong seed self-corrects through
     /// dequickening. Blacklisted seeds skip doomed specialization attempts.
-    pub fn seed_persistent_sites(&mut self, sites: &[QuickeningSiteSnapshot]) {
+    /// Already-touched sites are left as-is, so the returned count reflects the
+    /// seeds that took effect (useful for reporting how much warm-up state a
+    /// persistent-feedback consumer actually restored).
+    pub fn seed_persistent_sites(&mut self, sites: &[QuickeningSiteSnapshot]) -> usize {
+        let mut seeded = 0usize;
         for snapshot in sites {
             match snapshot.state {
                 QuickeningState::Specialized => {
@@ -661,6 +666,7 @@ impl QuickeningTable {
                     entry.state = QuickeningState::Specialized;
                     entry.specialization = Some(specialization);
                     entry.executions = SPECIALIZE_AFTER_EXECUTIONS;
+                    seeded += 1;
                 }
                 QuickeningState::Blacklisted => {
                     let entry = self.entry_mut(snapshot.site.into());
@@ -668,12 +674,14 @@ impl QuickeningTable {
                         continue;
                     }
                     entry.state = QuickeningState::Blacklisted;
+                    seeded += 1;
                 }
                 QuickeningState::Uninitialized
                 | QuickeningState::Observing
                 | QuickeningState::Dequickened => {}
             }
         }
+        seeded
     }
 
     #[must_use]
@@ -974,7 +982,8 @@ mod tests {
         let exported = warm.export_persistent_sites();
 
         let mut cold = QuickeningTable::default();
-        cold.seed_persistent_sites(&exported);
+        let seeded = cold.seed_persistent_sites(&exported);
+        assert_eq!(seeded, 1, "one specialization was installed");
         assert_eq!(
             cold.dense_specialization(unit, function, 3),
             Some(QuickeningSpecialization::AddIntInt)
@@ -1016,7 +1025,11 @@ mod tests {
         let mut cold = QuickeningTable::default();
         // A site the current run already touched is not overwritten.
         cold.observe(function, block, instruction);
-        cold.seed_persistent_sites(&exported);
+        let seeded = cold.seed_persistent_sites(&exported);
+        assert_eq!(
+            seeded, 1,
+            "only the fresh blacklist installs; the already-touched site is skipped"
+        );
         assert_eq!(
             cold.state(function, block, instruction),
             Some(QuickeningState::Observing)

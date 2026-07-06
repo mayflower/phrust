@@ -80,6 +80,18 @@ CLI records as `entries_written`. Emitted entries carry the context's epochs, so
 a writer fed real epochs would persist non-zero epochs. Consumption stays
 default-off; the writer only widens metadata coverage and accounting.
 
+## Consumption (current state)
+
+Quickening seeding from accepted feedback already exists and is default-off
+(active only when a feedback source is loaded — `--persistent-feedback-read` for
+the CLI, or the server's persistent metadata store). `quickening_seed` flows to
+`QuickeningTable::seed_persistent_sites`, which installs specialized/blacklisted
+sites already-warm but behind the **full guard protocol**: a wrong seed
+self-corrects through dequickening and never changes PHP-visible behavior.
+`seed_persistent_sites` now returns how many sites it actually installed
+(already-touched sites are skipped), so a consumer can report how much warm-up
+state was restored — symmetric with the writer's `entries_written`.
+
 ## Remaining Work
 
 - **Capture non-zero epochs.** The `ExecutionState` class/function/autoload/
@@ -91,6 +103,8 @@ default-off; the writer only widens metadata coverage and accounting.
 - persist the full accepted payload (callsite/scalar/array/object/branch/
   include-autoload observations), not just the quickening sub-field, once the VM
   produces those observations;
-- integrate accepted feedback with quickening, inline caches, and later tiers;
+- extend consumption from quickening to **inline-cache** templates and later
+  tiers, under a dedicated `--persistent-feedback-consume` flag distinct from
+  the read/seed path, with per-entry seeded-vs-dequickened attribution;
 - add Composer map fingerprints when the autoload graph model is promoted from
   request-local runtime behavior into persistent engine metadata.
