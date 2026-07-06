@@ -918,6 +918,19 @@ enum ClassStaticCacheRead {
     Fallback,
 }
 
+/// Outcome of [`Vm::fetch_class_constant_value`] when it cannot produce a value.
+/// The shared helper never routes control flow itself; each executor's arm
+/// translates the fault into its own routing (the rich interpreter routes
+/// through in-frame handlers, the dense executor propagates to outer frames).
+enum ClassConstantFetch {
+    /// Autoload raised a throwable; carries the pre-routing result.
+    Throwable(Box<VmResult>),
+    /// A catchable runtime `\Error` must be raised at this span.
+    Raise(IrSpan, String),
+    /// A non-catchable internal error with this message.
+    Fatal(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InternalFunctionDispatchCacheOutcome {
     Hit,
@@ -19324,252 +19337,44 @@ impl Vm {
                         class_name,
                         constant,
                     } => {
-                        if constant.eq_ignore_ascii_case("class")
-                            && normalize_class_name(class_name) == "static"
-                            && let Some(called_class) =
-                                current_called_class_display(compiled, stack)
-                        {
-                            if let Err(message) = stack
-                                .frame_mut(frame_index)
-                                .expect("frame was pushed")
-                                .registers
-                                .set(*dst, Value::String(PhpString::from_test_str(&called_class)))
-                            {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                            continue;
-                        }
-                        if let Err(result) = self.autoload_static_class_if_missing(
+                        match self.fetch_class_constant_value(
                             compiled,
                             class_name,
+                            constant,
+                            Some((function_id, block_id, instruction.id)),
                             instruction.span,
-                            Some((
-                                compiled_unit_cache_key(compiled),
-                                function_id,
-                                block_id,
-                                instruction.id,
-                            )),
                             output,
                             stack,
                             state,
                         ) {
-                            match self.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                result,
-                            ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
-                                }
-                                RaiseOutcome::Done(result) => return *result,
-                            }
-                        }
-                        let class =
-                            match resolve_static_class_name(compiled, state, stack, class_name) {
-                                Ok(class) => class,
-                                Err(message) => {
-                                    match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
-                                        }
-                                        RaiseOutcome::Done(result) => return *result,
-                                    }
-                                }
-                            };
-                        let value = if constant.eq_ignore_ascii_case("class") {
-                            Value::String(PhpString::from_test_str(&class.display_name))
-                        } else if let Some(value) = pdo_class_constant_value(&class.name, constant)
-                        {
-                            value
-                        } else if let Some(value) = zip_class_constant_value(&class.name, constant)
-                        {
-                            value
-                        } else if let Some(value) =
-                            memcached_class_constant_value(&class.name, constant)
-                        {
-                            value
-                        } else if let Some(value) = xml_class_constant_value(&class.name, constant)
-                        {
-                            value
-                        } else if let Some(value) =
-                            date_time_class_constant_value(&class.name, constant)
-                        {
-                            value
-                        } else if let Some(value) = spl_class_constant_value_in_state(
-                            compiled,
-                            state,
-                            &class.name,
-                            constant,
-                        ) {
-                            value
-                        } else {
-                            let scope = current_scope_class(compiled, stack);
-                            let normalized_scope = scope.as_deref().map(normalize_class_name);
-                            let resolved_class = normalize_class_name(&class.name);
-                            let lookup_epoch = state.lookup_epoch();
-                            let cache_kind = if class.flags.is_enum
-                                && class
-                                    .enum_cases
-                                    .iter()
-                                    .any(|case| case.name.eq_ignore_ascii_case(constant))
-                            {
-                                ClassConstantStaticPropertyCacheKind::EnumCase
-                            } else {
-                                ClassConstantStaticPropertyCacheKind::ClassConstant
-                            };
-                            if let Some(target) = self
-                                .lookup_class_constant_static_property_inline_cache(
-                                    compiled,
-                                    function_id,
-                                    block_id,
-                                    instruction.id,
-                                    cache_kind,
-                                    &resolved_class,
-                                    constant,
-                                    normalized_scope.as_deref(),
-                                    lookup_epoch,
-                                )
-                            {
-                                match self.read_class_constant_static_property_target(
-                                    compiled, target, stack, state,
-                                ) {
-                                    Ok(ClassStaticCacheRead::Value(value)) => {
-                                        if let Err(message) = stack
-                                            .frame_mut(frame_index)
-                                            .expect("frame was pushed")
-                                            .registers
-                                            .set(*dst, value)
-                                        {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
-                                        }
-                                        continue;
-                                    }
-                                    Ok(ClassStaticCacheRead::Fallback) => {}
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                }
-                            }
-                            if class.flags.is_enum
-                                && let Some(case) = class
-                                    .enum_cases
-                                    .iter()
-                                    .find(|case| case.name.eq_ignore_ascii_case(constant))
-                            {
-                                let owner = class_owner_in_state(compiled, state, &class.name);
-                                let object =
-                                    match enum_case_object(&owner, state, &class, case, &|value| {
-                                        self.constant_value(owner.unit(), value)
-                                    }) {
-                                        Ok(object) => object,
-                                        Err(message) => {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
-                                        }
-                                    };
-                                let target =
-                                    match dynamic_class_owner_index_in_state(state, &class.name) {
-                                        Some(unit_index) => {
-                                            ClassConstantStaticPropertyCacheTarget::DynamicUnit {
-                                                unit_index,
-                                                kind:
-                                                    ClassConstantStaticPropertyCacheKind::EnumCase,
-                                                resolved_class: resolved_class.clone(),
-                                                declaring_class: class.name.clone(),
-                                                member: case.name.clone(),
-                                            }
-                                        }
-                                        None => {
-                                            ClassConstantStaticPropertyCacheTarget::CurrentUnit {
-                                                kind:
-                                                    ClassConstantStaticPropertyCacheKind::EnumCase,
-                                                resolved_class: resolved_class.clone(),
-                                                declaring_class: class.name.clone(),
-                                                member: case.name.clone(),
-                                            }
-                                        }
-                                    };
-                                self.install_class_constant_static_property_inline_cache(
-                                    compiled,
-                                    function_id,
-                                    block_id,
-                                    instruction.id,
-                                    ClassConstantStaticPropertyCacheKind::EnumCase,
-                                    &resolved_class,
-                                    constant,
-                                    None,
-                                    lookup_epoch,
-                                    target,
-                                );
+                            Ok(value) => {
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
                                     .expect("frame was pushed")
                                     .registers
-                                    .set(*dst, Value::Object(object))
+                                    .set(*dst, value)
                                 {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
-                                continue;
                             }
-                            let (resolved_class_entry, resolved_constant_entry) =
-                                match lookup_class_constant_in_state(
+                            Err(ClassConstantFetch::Throwable(result)) => {
+                                match self.route_throwable_result(
                                     compiled,
+                                    output,
+                                    stack,
                                     state,
-                                    &class.name,
-                                    &class.display_name,
-                                    constant,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    *result,
                                 ) {
-                                    Ok(Some(resolved)) => resolved,
-                                    Ok(None) => {
-                                        let message = format!(
-                                            "E_PHP_VM_UNKNOWN_CLASS_CONSTANT: Undefined constant {}::{constant}",
-                                            class.display_name
-                                        );
-                                        match self.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut exception_handlers,
-                                            &mut pending_control,
-                                            instruction.span,
-                                            message,
-                                        ) {
-                                            RaiseOutcome::Caught(target) => {
-                                                block_id = target;
-                                                continue 'dispatch;
-                                            }
-                                            RaiseOutcome::Done(result) => return *result,
-                                        }
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
                                     }
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                };
-                            if let Err(message) = validate_constant_access(
-                                compiled,
-                                stack,
-                                &resolved_class_entry,
-                                &resolved_constant_entry,
-                            ) {
+                                    RaiseOutcome::Done(result) => return *result,
+                                }
+                            }
+                            Err(ClassConstantFetch::Raise(span, message)) => {
                                 match self.raise_runtime_error(
                                     compiled,
                                     output,
@@ -19577,7 +19382,7 @@ impl Vm {
                                     state,
                                     &mut exception_handlers,
                                     &mut pending_control,
-                                    instruction.span,
+                                    span,
                                     message,
                                 ) {
                                     RaiseOutcome::Caught(target) => {
@@ -19587,96 +19392,9 @@ impl Vm {
                                     RaiseOutcome::Done(result) => return *result,
                                 }
                             }
-                            let cache_scope = if resolved_constant_entry.flags.is_private
-                                || resolved_constant_entry.flags.is_protected
-                            {
-                                normalized_scope.clone()
-                            } else {
-                                None
-                            };
-                            let target = match dynamic_class_owner_index_in_state(
-                                state,
-                                &resolved_class_entry.name,
-                            ) {
-                                Some(unit_index) => {
-                                    ClassConstantStaticPropertyCacheTarget::DynamicUnit {
-                                        unit_index,
-                                        kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
-                                        resolved_class: resolved_class.clone(),
-                                        declaring_class: resolved_class_entry.name.clone(),
-                                        member: resolved_constant_entry.name.clone(),
-                                    }
-                                }
-                                None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
-                                    kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
-                                    resolved_class: resolved_class.clone(),
-                                    declaring_class: resolved_class_entry.name.clone(),
-                                    member: resolved_constant_entry.name.clone(),
-                                },
-                            };
-                            let owner =
-                                class_owner_in_state(compiled, state, &resolved_class_entry.name);
-                            let value = match resolved_constant_entry.value {
-                                Some(value) => match constant_value(owner.unit(), value) {
-                                    Ok(value) => value,
-                                    Err(message) => {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                },
-                                None => {
-                                    if let Some(reference) =
-                                        &resolved_constant_entry.value_class_constant
-                                    {
-                                        match class_constant_reference_value(
-                                            compiled, state, reference,
-                                        ) {
-                                            Ok(value) => value,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        }
-                                    } else if let Some(reference) =
-                                        &resolved_constant_entry.value_named_constant
-                                    {
-                                        match named_constant_reference_value(
-                                            compiled, state, reference,
-                                        ) {
-                                            Ok(value) => value,
-                                            Err(message) => {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                            };
-                            self.install_class_constant_static_property_inline_cache(
-                                compiled,
-                                function_id,
-                                block_id,
-                                instruction.id,
-                                ClassConstantStaticPropertyCacheKind::ClassConstant,
-                                &resolved_class,
-                                constant,
-                                cache_scope.as_deref(),
-                                lookup_epoch,
-                                target,
-                            );
-                            value
-                        };
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("frame was pushed")
-                            .registers
-                            .set(*dst, value)
-                        {
-                            return self.runtime_error(output, compiled, stack, message);
+                            Err(ClassConstantFetch::Fatal(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
                         }
                     }
                     InstructionKind::FetchDynamicProperty {
@@ -38663,6 +38381,233 @@ impl Vm {
             execute_arithmetic(op, lhs_number, rhs_number)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message)),
         )
+    }
+
+    /// Resolves a `Class::CONSTANT` (or `Class::class`) fetch to its value,
+    /// shared by the rich and dense executors. The caller writes the returned
+    /// value to its destination; faults are translated by each executor's arm.
+    /// `cache_site` supplies the inline-cache key `(function, block, instr)` for
+    /// the rich interpreter; the dense executor passes `None` (no inline cache).
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_class_constant_value(
+        &self,
+        compiled: &CompiledUnit,
+        class_name: &str,
+        constant: &str,
+        cache_site: Option<(FunctionId, BlockId, InstrId)>,
+        span: IrSpan,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, ClassConstantFetch> {
+        if constant.eq_ignore_ascii_case("class")
+            && normalize_class_name(class_name) == "static"
+            && let Some(called_class) = current_called_class_display(compiled, stack)
+        {
+            return Ok(Value::String(PhpString::from_test_str(&called_class)));
+        }
+        let autoload_site = cache_site.map(|(function, block, instr)| {
+            (compiled_unit_cache_key(compiled), function, block, instr)
+        });
+        if let Err(result) = self.autoload_static_class_if_missing(
+            compiled,
+            class_name,
+            span,
+            autoload_site,
+            output,
+            stack,
+            state,
+        ) {
+            return Err(ClassConstantFetch::Throwable(Box::new(result)));
+        }
+        let class = match resolve_static_class_name(compiled, state, stack, class_name) {
+            Ok(class) => class,
+            Err(message) => return Err(ClassConstantFetch::Raise(span, message)),
+        };
+        let value = if constant.eq_ignore_ascii_case("class") {
+            Value::String(PhpString::from_test_str(&class.display_name))
+        } else if let Some(value) = pdo_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) = zip_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) = memcached_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) = xml_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) = date_time_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) =
+            spl_class_constant_value_in_state(compiled, state, &class.name, constant)
+        {
+            value
+        } else {
+            let scope = current_scope_class(compiled, stack);
+            let normalized_scope = scope.as_deref().map(normalize_class_name);
+            let resolved_class = normalize_class_name(&class.name);
+            let lookup_epoch = state.lookup_epoch();
+            let cache_kind = if class.flags.is_enum
+                && class
+                    .enum_cases
+                    .iter()
+                    .any(|case| case.name.eq_ignore_ascii_case(constant))
+            {
+                ClassConstantStaticPropertyCacheKind::EnumCase
+            } else {
+                ClassConstantStaticPropertyCacheKind::ClassConstant
+            };
+            if let Some((function_id, block_id, instruction_id)) = cache_site
+                && let Some(target) = self.lookup_class_constant_static_property_inline_cache(
+                    compiled,
+                    function_id,
+                    block_id,
+                    instruction_id,
+                    cache_kind,
+                    &resolved_class,
+                    constant,
+                    normalized_scope.as_deref(),
+                    lookup_epoch,
+                )
+            {
+                match self
+                    .read_class_constant_static_property_target(compiled, target, stack, state)
+                {
+                    Ok(ClassStaticCacheRead::Value(value)) => return Ok(value),
+                    Ok(ClassStaticCacheRead::Fallback) => {}
+                    Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                }
+            }
+            if class.flags.is_enum
+                && let Some(case) = class
+                    .enum_cases
+                    .iter()
+                    .find(|case| case.name.eq_ignore_ascii_case(constant))
+            {
+                let owner = class_owner_in_state(compiled, state, &class.name);
+                let object = match enum_case_object(&owner, state, &class, case, &|value| {
+                    self.constant_value(owner.unit(), value)
+                }) {
+                    Ok(object) => object,
+                    Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                };
+                if let Some((function_id, block_id, instruction_id)) = cache_site {
+                    let target = match dynamic_class_owner_index_in_state(state, &class.name) {
+                        Some(unit_index) => ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                            unit_index,
+                            kind: ClassConstantStaticPropertyCacheKind::EnumCase,
+                            resolved_class: resolved_class.clone(),
+                            declaring_class: class.name.clone(),
+                            member: case.name.clone(),
+                        },
+                        None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                            kind: ClassConstantStaticPropertyCacheKind::EnumCase,
+                            resolved_class: resolved_class.clone(),
+                            declaring_class: class.name.clone(),
+                            member: case.name.clone(),
+                        },
+                    };
+                    self.install_class_constant_static_property_inline_cache(
+                        compiled,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                        ClassConstantStaticPropertyCacheKind::EnumCase,
+                        &resolved_class,
+                        constant,
+                        None,
+                        lookup_epoch,
+                        target,
+                    );
+                }
+                return Ok(Value::Object(object));
+            }
+            let (resolved_class_entry, resolved_constant_entry) =
+                match lookup_class_constant_in_state(
+                    compiled,
+                    state,
+                    &class.name,
+                    &class.display_name,
+                    constant,
+                ) {
+                    Ok(Some(resolved)) => resolved,
+                    Ok(None) => {
+                        let message = format!(
+                            "E_PHP_VM_UNKNOWN_CLASS_CONSTANT: Undefined constant {}::{constant}",
+                            class.display_name
+                        );
+                        return Err(ClassConstantFetch::Raise(span, message));
+                    }
+                    Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                };
+            if let Err(message) = validate_constant_access(
+                compiled,
+                stack,
+                &resolved_class_entry,
+                &resolved_constant_entry,
+            ) {
+                return Err(ClassConstantFetch::Raise(span, message));
+            }
+            let cache_scope = if resolved_constant_entry.flags.is_private
+                || resolved_constant_entry.flags.is_protected
+            {
+                normalized_scope.clone()
+            } else {
+                None
+            };
+            let owner = class_owner_in_state(compiled, state, &resolved_class_entry.name);
+            let value = match resolved_constant_entry.value {
+                Some(value) => match constant_value(owner.unit(), value) {
+                    Ok(value) => value,
+                    Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                },
+                None => {
+                    if let Some(reference) = &resolved_constant_entry.value_class_constant {
+                        match class_constant_reference_value(compiled, state, reference) {
+                            Ok(value) => value,
+                            Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                        }
+                    } else if let Some(reference) = &resolved_constant_entry.value_named_constant {
+                        match named_constant_reference_value(compiled, state, reference) {
+                            Ok(value) => value,
+                            Err(message) => return Err(ClassConstantFetch::Fatal(message)),
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+            };
+            if let Some((function_id, block_id, instruction_id)) = cache_site {
+                let target =
+                    match dynamic_class_owner_index_in_state(state, &resolved_class_entry.name) {
+                        Some(unit_index) => ClassConstantStaticPropertyCacheTarget::DynamicUnit {
+                            unit_index,
+                            kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
+                            resolved_class: resolved_class.clone(),
+                            declaring_class: resolved_class_entry.name.clone(),
+                            member: resolved_constant_entry.name.clone(),
+                        },
+                        None => ClassConstantStaticPropertyCacheTarget::CurrentUnit {
+                            kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
+                            resolved_class: resolved_class.clone(),
+                            declaring_class: resolved_class_entry.name.clone(),
+                            member: resolved_constant_entry.name.clone(),
+                        },
+                    };
+                self.install_class_constant_static_property_inline_cache(
+                    compiled,
+                    function_id,
+                    block_id,
+                    instruction_id,
+                    ClassConstantStaticPropertyCacheKind::ClassConstant,
+                    &resolved_class,
+                    constant,
+                    cache_scope.as_deref(),
+                    lookup_epoch,
+                    target,
+                );
+            }
+            value
+        };
+        Ok(value)
     }
 
     fn execute_cast(
