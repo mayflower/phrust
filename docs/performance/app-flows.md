@@ -26,6 +26,32 @@ Admission rules:
 Unsupported PHP behavior is avoided in these fixtures instead of becoming a
 known-gap row.
 
+## Workload Shapes
+
+Each manifest scenario carries a `shape` classifying the PHP application shape it
+exercises, so counter families (dense/rich mix, array/object shapes, call
+frames, builtin intrinsics, allocation churn) can be compared across
+representative shapes rather than one-off fixtures. The `shape` is surfaced per
+scenario in `matrix.json`. This is classification metadata only — no runtime
+behavior is specialized per shape, and no framework/app is named in engine code.
+
+Current shapes (reusing existing generic fixtures):
+
+- `front_controller` — front-controller route dispatch
+- `routing_middleware` — middleware/event pipeline
+- `service_container` — DI/service resolution and hot lookups
+- `template_render` — HTML template render + escaping + output buffering
+- `config_record_arrays` — config/record-like array merge and traversal
+- `dto_hydration_json` — model/DTO hydration into a JSON response
+- `collection_array_helpers` — collection transform/pagination array helpers
+- `string_helpers` — translation lookup + string interpolation
+- `builtin_heavy_helpers` — request validation via builtin-heavy checks
+- `session_active` — session-backed auth/policy flow
+
+Not yet covered by a dedicated fixture (future evidence expansion): a standalone
+Composer classmap/autoload bootstrap, a session-light request, and a standalone
+JSON-response shape distinct from `dto_hydration_json`.
+
 ## Running
 
 CI-safe smoke mode:

@@ -43,6 +43,7 @@ class Scenario:
     id: str
     name: str
     group: str
+    shape: str
     fixture: Path
     expected_output: str
     expected_checksum: int
@@ -125,6 +126,7 @@ def load_manifest(path: Path = MANIFEST) -> list[Scenario]:
         "id",
         "name",
         "group",
+        "shape",
         "fixture",
         "expected_output",
         "expected_checksum",
@@ -157,6 +159,7 @@ def load_manifest(path: Path = MANIFEST) -> list[Scenario]:
                 id=scenario_id,
                 name=str(item["name"]),
                 group=str(item["group"]),
+                shape=str(item["shape"]),
                 fixture=fixture,
                 expected_output=expected_output + "\n",
                 expected_checksum=checksum,
@@ -587,6 +590,7 @@ def build_summary(
                 "id": scenario.id,
                 "name": scenario.name,
                 "group": scenario.group,
+                "shape": scenario.shape,
                 "fixture": rel(scenario.fixture),
                 "expected_output": scenario.expected_output.strip(),
                 "expected_checksum": scenario.expected_checksum,
