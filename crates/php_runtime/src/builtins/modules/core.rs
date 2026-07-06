@@ -31,9 +31,9 @@ use crate::{
 pub(in crate::builtins::modules) use encoding::{
     HTML_ESCAPE_DEFAULT_FLAGS, HashOptions, PHP_QUERY_RFC3986, build_query_pairs,
     format_array_values, hash_digest_bytes, hash_digest_bytes_with_options, hex_decode, hex_encode,
-    hex_nibble, hmac_digest_bytes, html_entity_decode_with_flags, html_escape_with_options,
-    html_translation_table, htmlspecialchars_decode_with_flags, parse_hash_options, url_decode,
-    url_encode,
+    hex_nibble, hmac_digest_bytes, hmac_hash_algorithm_value_error, html_entity_decode_with_flags,
+    html_escape_with_options, html_translation_table, htmlspecialchars_decode_with_flags,
+    parse_hash_options, url_decode, url_encode,
 };
 use http::{
     builtin_header, builtin_header_remove, builtin_headers_list, builtin_headers_sent,

@@ -236,8 +236,20 @@ pub(in crate::builtins::modules) fn hash_digest_bytes_with_options(
             };
             Ok(digest.to_be_bytes().to_vec())
         }
-        _ => Err(value_error(name, "unsupported hash algorithm")),
+        _ => Err(hash_algorithm_value_error(name)),
     }
+}
+
+pub(in crate::builtins::modules) fn hash_algorithm_value_error(name: &str) -> BuiltinError {
+    argument_value_error(name, "#1 ($algo)", "must be a valid hashing algorithm")
+}
+
+pub(in crate::builtins::modules) fn hmac_hash_algorithm_value_error(name: &str) -> BuiltinError {
+    argument_value_error(
+        name,
+        "#1 ($algo)",
+        "must be a valid cryptographic hashing algorithm",
+    )
 }
 
 fn adler32(input: &[u8]) -> u32 {
@@ -571,7 +583,7 @@ pub(in crate::builtins::modules) fn hmac_digest_bytes(
             32,
             |bytes| <Gost94CryptoPro as GostDigest>::digest(bytes).to_vec(),
         )),
-        _ => Err(value_error(name, "unsupported hash algorithm")),
+        _ => Err(hmac_hash_algorithm_value_error(name)),
     }
 }
 

@@ -1,8 +1,9 @@
 //! Hash extension builtins for common integrity and keyed-digest flows.
 
 use super::core::{
-    HashOptions, argument_type_error, arity_error, conversion_error, deref_value, expect_arity,
-    hash_digest_bytes, hash_digest_bytes_with_options, hex_encode, hmac_digest_bytes, int_arg,
+    HashOptions, argument_type_error, argument_value_error, arity_error, conversion_error,
+    deref_value, expect_arity, hash_digest_bytes, hash_digest_bytes_with_options, hex_encode,
+    hmac_digest_bytes, hmac_hash_algorithm_value_error, int_arg, nullable_string_arg,
     parse_hash_options, read_file_value, resource_arg, string_arg, type_error, value_error,
 };
 use super::strings::{builtin_hash, builtin_hash_hmac};
@@ -153,7 +154,16 @@ fn builtin_hash_init(
         .unwrap_or(0);
     let key = args
         .get(2)
-        .map(|value| string_arg("hash_init", value))
+        .map(|value| {
+            nullable_string_arg(
+                context,
+                "hash_init",
+                value,
+                "#3 ($key)",
+                "string",
+                span.clone(),
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let options = parse_hash_options(context, "hash_init", &algorithm, args.get(3), span)?;
@@ -161,7 +171,25 @@ fn builtin_hash_init(
     if flags & !HASH_HMAC_FLAG != 0 {
         return Err(value_error("hash_init", "unsupported hash flags"));
     }
-    if flags & HASH_HMAC_FLAG != 0 && !HASH_HMAC_ALGOS.contains(&algorithm.as_ref()) {
+    if flags & HASH_HMAC_FLAG != 0 {
+        if !HASH_HMAC_ALGOS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&algorithm))
+        {
+            hash_digest_bytes_with_options("hash_init", &algorithm, b"", &options)?;
+            return Err(argument_value_error(
+                "hash_init",
+                "#1 ($algo)",
+                "must be a cryptographic hashing algorithm if HMAC is requested",
+            ));
+        }
+        if key.as_bytes().is_empty() {
+            return Err(argument_value_error(
+                "hash_init",
+                "#3 ($key)",
+                "must not be empty when HMAC is requested",
+            ));
+        }
         hmac_digest_bytes("hash_init", &algorithm, key.as_bytes(), b"")?;
     } else {
         hash_digest_bytes_with_options("hash_init", &algorithm, b"", &options)?;
@@ -349,6 +377,7 @@ fn builtin_hash_file(
     }
     let algorithm = string_arg("hash_file", &args[0])?.to_string_lossy();
     let path = string_arg("hash_file", &args[1])?.to_string_lossy();
+    reject_null_byte_filename("hash_file", "#2 ($filename)", &path)?;
     let binary = args
         .get(2)
         .map(to_bool)
@@ -356,6 +385,7 @@ fn builtin_hash_file(
         .map_err(|message| conversion_error("hash_file", message))?
         .unwrap_or(false);
     let options = parse_hash_options(context, "hash_file", &algorithm, args.get(3), span.clone())?;
+    hash_digest_bytes_with_options("hash_file", &algorithm, b"", &options)?;
     let Value::String(input) = read_file_value(context, "hash_file", &path, span)? else {
         return Ok(Value::Bool(false));
     };
@@ -374,6 +404,7 @@ fn builtin_hash_hmac_file(
     }
     let algorithm = string_arg("hash_hmac_file", &args[0])?.to_string_lossy();
     let path = string_arg("hash_hmac_file", &args[1])?.to_string_lossy();
+    reject_null_byte_filename("hash_hmac_file", "#2 ($filename)", &path)?;
     let key = string_arg("hash_hmac_file", &args[2])?;
     let binary = args
         .get(3)
@@ -381,6 +412,7 @@ fn builtin_hash_hmac_file(
         .transpose()
         .map_err(|message| conversion_error("hash_hmac_file", message))?
         .unwrap_or(false);
+    hmac_digest_bytes("hash_hmac_file", &algorithm, key.as_bytes(), b"")?;
     let Value::String(input) = read_file_value(context, "hash_hmac_file", &path, span)? else {
         return Ok(Value::Bool(false));
     };
@@ -391,6 +423,22 @@ fn builtin_hash_hmac_file(
         input.as_bytes(),
     )?;
     Ok(hash_output(digest, binary))
+}
+
+fn reject_null_byte_filename(
+    name: &str,
+    argument: &str,
+    path: &str,
+) -> Result<(), crate::builtins::BuiltinError> {
+    if path.as_bytes().contains(&0) {
+        Err(argument_value_error(
+            name,
+            argument,
+            "must not contain any null bytes",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn builtin_hash_pbkdf2(
@@ -407,9 +455,10 @@ fn builtin_hash_pbkdf2(
     let salt = string_arg("hash_pbkdf2", &args[2])?;
     let iterations = int_arg("hash_pbkdf2", &args[3])?;
     if iterations <= 0 {
-        return Err(value_error(
+        return Err(argument_value_error(
             "hash_pbkdf2",
-            "iterations must be greater than 0",
+            "#4 ($iterations)",
+            "must be greater than 0",
         ));
     }
     let length = args
@@ -418,9 +467,10 @@ fn builtin_hash_pbkdf2(
         .transpose()?
         .unwrap_or(0);
     if length < 0 {
-        return Err(value_error(
+        return Err(argument_value_error(
             "hash_pbkdf2",
-            "length must be greater than or equal to 0",
+            "#5 ($length)",
+            "must be greater than or equal to 0",
         ));
     }
     let binary = args
@@ -466,6 +516,13 @@ fn builtin_hash_hkdf(
     let algorithm = string_arg("hash_hkdf", &args[0])?.to_string_lossy();
     ensure_hmac_algorithm("hash_hkdf", &algorithm)?;
     let key = string_arg("hash_hkdf", &args[1])?;
+    if key.as_bytes().is_empty() {
+        return Err(argument_value_error(
+            "hash_hkdf",
+            "#2 ($key)",
+            "must not be empty",
+        ));
+    }
     let digest_len = hash_digest_len(&algorithm)?;
     let length = args
         .get(2)
@@ -473,9 +530,10 @@ fn builtin_hash_hkdf(
         .transpose()?
         .unwrap_or(0);
     if length < 0 {
-        return Err(value_error(
+        return Err(argument_value_error(
             "hash_hkdf",
-            "length must be greater than or equal to 0",
+            "#3 ($length)",
+            "must be greater than or equal to 0",
         ));
     }
     let length = if length == 0 {
@@ -484,7 +542,11 @@ fn builtin_hash_hkdf(
         length as usize
     };
     if length > 255 * digest_len {
-        return Err(value_error("hash_hkdf", "length is too large"));
+        return Err(argument_value_error(
+            "hash_hkdf",
+            "#3 ($length)",
+            &format!("must be less than or equal to {}", 255 * digest_len),
+        ));
     }
     let info = args
         .get(3)
@@ -608,7 +670,7 @@ fn ensure_hmac_algorithm(name: &str, algorithm: &str) -> Result<(), crate::built
     {
         Ok(())
     } else {
-        Err(value_error(name, "unsupported hash algorithm"))
+        Err(hmac_hash_algorithm_value_error(name))
     }
 }
 
@@ -817,6 +879,198 @@ mod tests {
                 ]
             ),
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn hash_invalid_algorithm_errors_match_php() {
+        let hash = call_result("hash", vec![Value::string("foo"), Value::string("")])
+            .expect_err("invalid hash algorithm is rejected");
+        assert_eq!(hash.diagnostic_id(), "E_PHP_RUNTIME_BUILTIN_VALUE");
+        assert_eq!(
+            hash.message(),
+            "hash(): Argument #1 ($algo) must be a valid hashing algorithm"
+        );
+
+        let hash_init = call_result("hash_init", vec![Value::string("foo")])
+            .expect_err("invalid hash_init algorithm is rejected");
+        assert_eq!(
+            hash_init.message(),
+            "hash_init(): Argument #1 ($algo) must be a valid hashing algorithm"
+        );
+
+        let hash_init_non_crypto_hmac = call_result(
+            "hash_init",
+            vec![
+                Value::string("crc32"),
+                Value::Int(HASH_HMAC_FLAG),
+                Value::string("key"),
+            ],
+        )
+        .expect_err("non-cryptographic HMAC hash_init algorithm is rejected");
+        assert_eq!(
+            hash_init_non_crypto_hmac.message(),
+            "hash_init(): Argument #1 ($algo) must be a cryptographic hashing algorithm if HMAC is requested"
+        );
+
+        let hash_init_empty_key = call_result(
+            "hash_init",
+            vec![
+                Value::string("md5"),
+                Value::Int(HASH_HMAC_FLAG),
+                Value::string(""),
+            ],
+        )
+        .expect_err("empty HMAC hash_init key is rejected");
+        assert_eq!(
+            hash_init_empty_key.message(),
+            "hash_init(): Argument #3 ($key) must not be empty when HMAC is requested"
+        );
+
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new(&mut output);
+        let hash_init_null_key = call_with_context_result(
+            "hash_init",
+            vec![
+                Value::string("md5"),
+                Value::Int(HASH_HMAC_FLAG),
+                Value::Null,
+            ],
+            &mut context,
+        )
+        .expect_err("null HMAC hash_init key is rejected after deprecation");
+        assert_eq!(
+            hash_init_null_key.message(),
+            "hash_init(): Argument #3 ($key) must not be empty when HMAC is requested"
+        );
+        let diagnostics = context.take_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message(),
+            "hash_init(): Passing null to parameter #3 ($key) of type string is deprecated"
+        );
+
+        let hmac = call_result(
+            "hash_hmac",
+            vec![
+                Value::string("foo"),
+                Value::string(""),
+                Value::string("key"),
+            ],
+        )
+        .expect_err("invalid HMAC algorithm is rejected");
+        assert_eq!(
+            hmac.message(),
+            "hash_hmac(): Argument #1 ($algo) must be a valid cryptographic hashing algorithm"
+        );
+
+        let hmac_file = call_result(
+            "hash_hmac_file",
+            vec![
+                Value::string("foo"),
+                Value::string("missing.txt"),
+                Value::string("key"),
+            ],
+        )
+        .expect_err("invalid hash_hmac_file algorithm is rejected before file access");
+        assert_eq!(
+            hmac_file.message(),
+            "hash_hmac_file(): Argument #1 ($algo) must be a valid cryptographic hashing algorithm"
+        );
+
+        let hmac_file_null_path = call_result(
+            "hash_hmac_file",
+            vec![
+                Value::string("md5"),
+                Value::string(b"bad\0path".to_vec()),
+                Value::string("key"),
+            ],
+        )
+        .expect_err("hash_hmac_file rejects null bytes in filename");
+        assert_eq!(
+            hmac_file_null_path.message(),
+            "hash_hmac_file(): Argument #2 ($filename) must not contain any null bytes"
+        );
+
+        let pbkdf2 = call_result(
+            "hash_pbkdf2",
+            vec![
+                Value::string("foo"),
+                Value::string("password"),
+                Value::string("salt"),
+                Value::Int(1),
+            ],
+        )
+        .expect_err("invalid PBKDF2 algorithm is rejected");
+        assert_eq!(
+            pbkdf2.message(),
+            "hash_pbkdf2(): Argument #1 ($algo) must be a valid cryptographic hashing algorithm"
+        );
+
+        let pbkdf2_iterations = call_result(
+            "hash_pbkdf2",
+            vec![
+                Value::string("md5"),
+                Value::string("password"),
+                Value::string("salt"),
+                Value::Int(0),
+            ],
+        )
+        .expect_err("invalid PBKDF2 iteration count is rejected");
+        assert_eq!(
+            pbkdf2_iterations.message(),
+            "hash_pbkdf2(): Argument #4 ($iterations) must be greater than 0"
+        );
+
+        let pbkdf2_length = call_result(
+            "hash_pbkdf2",
+            vec![
+                Value::string("md5"),
+                Value::string("password"),
+                Value::string("salt"),
+                Value::Int(1),
+                Value::Int(-1),
+            ],
+        )
+        .expect_err("invalid PBKDF2 length is rejected");
+        assert_eq!(
+            pbkdf2_length.message(),
+            "hash_pbkdf2(): Argument #5 ($length) must be greater than or equal to 0"
+        );
+
+        let hkdf_key = call_result("hash_hkdf", vec![Value::string("sha1"), Value::string("")])
+            .expect_err("empty HKDF key is rejected");
+        assert_eq!(
+            hkdf_key.message(),
+            "hash_hkdf(): Argument #2 ($key) must not be empty"
+        );
+
+        let hkdf_length = call_result(
+            "hash_hkdf",
+            vec![
+                Value::string("sha1"),
+                Value::string("input key material"),
+                Value::Int(-1),
+            ],
+        )
+        .expect_err("invalid HKDF length is rejected");
+        assert_eq!(
+            hkdf_length.message(),
+            "hash_hkdf(): Argument #3 ($length) must be greater than or equal to 0"
+        );
+
+        let hkdf_max_length = call_result(
+            "hash_hkdf",
+            vec![
+                Value::string("sha1"),
+                Value::string("input key material"),
+                Value::Int(5101),
+            ],
+        )
+        .expect_err("oversized HKDF length is rejected");
+        assert_eq!(
+            hkdf_max_length.message(),
+            "hash_hkdf(): Argument #3 ($length) must be less than or equal to 5100"
         );
     }
 
