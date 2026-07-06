@@ -32,10 +32,12 @@
 {"path":"ext/hash/tests/murmur_seed_deprecation.phpt"}
 {"path":"ext/hash/tests/murmurhash3.phpt"}
 {"path":"ext/hash/tests/murmurhash3_seed.phpt"}
+{"path":"ext/hash/tests/new-context.phpt"}
 {"path":"ext/hash/tests/ripemd128.phpt"}
 {"path":"ext/hash/tests/ripemd160.phpt"}
 {"path":"ext/hash/tests/ripemd256.phpt"}
 {"path":"ext/hash/tests/ripemd320.phpt"}
+{"path":"ext/hash/tests/reuse.phpt"}
 {"path":"ext/hash/tests/sha1.phpt"}
 {"path":"ext/hash/tests/sha224.phpt"}
 {"path":"ext/hash/tests/sha256.phpt"}

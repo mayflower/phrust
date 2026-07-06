@@ -9,7 +9,7 @@
     MD2/MD4, md5, MurmurHash3, RIPEMD, sha1, SHA-2/SHA3, Tiger 3-pass,
     Whirlpool, MurmurHash3/xxHash seed options and deprecation diagnostics,
     hash_equals, HMAC-md5, file hashing, HKDF, HKDF edge cases, PBKDF2,
-    and stream updates
+    stream updates, and HashContext lifecycle diagnostics
 
 ## Implemented Surface
 
@@ -47,7 +47,8 @@ MurmurHash3 and xxHash algorithms, including the xxh3/xxh128 ignored-seed
 behavior and xxHash non-string secret deprecation emission before catchable
 ValueError paths. The context row covers `HashContext` visibility, incremental
 SHA-256 hashing, copying a partially updated context, HMAC contexts, and
-finalized context rejection.
+finalized context rejection. Promoted upstream HashContext rows cover direct
+construction visibility and finalized-context reuse diagnostics.
 
 ## Gaps
 
@@ -69,5 +70,6 @@ After adding Adler-32, CRC32/CRC32C, FNV, JOAAT, SHA3, RIPEMD, MD2, MD4,
 MurmurHash3, Whirlpool, GOST, MurmurHash3/xxHash seed support, Tiger 3-pass
 support, strict hash_equals argument validation,
 hash/hash_file/HMAC/HMAC-file/hash_init/PBKDF2/HKDF ValueError wording, and
-MurmurHash3/xxHash seed deprecation diagnostics, the selected manifest contains
-50 green rows.
+MurmurHash3/xxHash seed deprecation diagnostics, direct HashContext
+construction visibility, and finalized-context reuse diagnostics, the selected
+manifest contains 52 green rows.

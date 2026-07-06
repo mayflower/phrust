@@ -65317,7 +65317,7 @@ fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::Clas
         return Some(empty_internal_class_entry("stdClass", None, None, false));
     }
     if is_hash_context_runtime_class(normalized) {
-        return Some(empty_internal_class_entry("HashContext", None, None, false));
+        return Some(internal_hash_context_class_entry());
     }
     if is_php_token_runtime_class(normalized) {
         let mut entry = empty_internal_class_entry("PhpToken", None, None, false);
@@ -65430,6 +65430,23 @@ fn empty_internal_class_entry(
         },
         span: IrSpan::default(),
     }
+}
+
+fn internal_hash_context_class_entry() -> php_ir::module::ClassEntry {
+    let mut entry = empty_internal_class_entry("HashContext", None, None, false);
+    let constructor = FunctionId::new(u32::MAX);
+    entry.methods.push(php_ir::module::ClassMethodEntry {
+        name: "__construct".to_owned(),
+        origin_class: entry.name.clone(),
+        function: constructor,
+        flags: php_ir::module::ClassMethodFlags {
+            is_private: true,
+            ..php_ir::module::ClassMethodFlags::default()
+        },
+        attributes: Vec::new(),
+    });
+    entry.constructor = Some(constructor);
+    entry
 }
 
 fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {

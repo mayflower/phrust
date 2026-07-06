@@ -620,10 +620,9 @@ fn hash_context_arg(name: &str, value: &Value) -> Result<ObjectRef, crate::built
             Some(Value::Bool(false))
         )
     {
-        return Err(argument_value_error(
-            name,
-            "#1 ($context)",
-            "must be a valid, non-finalized HashContext",
+        return Err(BuiltinError::new(
+            "E_PHP_RUNTIME_BUILTIN_TYPE",
+            format!("{name}(): Argument #1 ($context) must be a valid, non-finalized HashContext"),
         ));
     }
     Ok(object)
@@ -1722,6 +1721,10 @@ mod tests {
         );
         let finalized_error = call_with_error("hash_update", vec![context, Value::string("x")])
             .expect_err("finalized HashContext is rejected");
+        assert_eq!(
+            finalized_error.diagnostic_id(),
+            "E_PHP_RUNTIME_BUILTIN_TYPE"
+        );
         assert_eq!(
             finalized_error.message(),
             "hash_update(): Argument #1 ($context) must be a valid, non-finalized HashContext"

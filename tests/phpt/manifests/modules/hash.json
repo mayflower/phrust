@@ -4,12 +4,12 @@
   "priority": "Digest, HMAC, and streaming context parity",
   "selected_manifest": "tests/phpt/manifests/modules/hash.selected.jsonl",
   "corpus_count": 82,
-  "selected_count": 50,
-  "pass_count": 50,
+  "selected_count": 52,
+  "pass_count": 52,
   "skip_count": 0,
   "fail_count": 0,
   "bork_count": 0,
-  "known_failure_count": 32,
+  "known_failure_count": 30,
   "scope": [
     "Selected upstream ext/hash rows for md2, md4, md5, GOST, MurmurHash3, sha1, SHA-2/SHA3, Tiger 3-pass, Whirlpool digests, HMAC-md5, file hashing, HKDF, PBKDF2, and stream updates",
     "hash_file and hash_hmac_file over local files",
@@ -22,6 +22,7 @@
     "HKDF edge-case length and algorithm case-sensitivity diagnostics",
     "raw binary output for file digests",
     "HashContext visibility, HASH_HMAC, hash_init/update/copy/final lifecycle",
+    "HashContext direct construction visibility diagnostics",
     "finalized HashContext rejection",
     "hash_update_file and hash_update_stream digest accumulation",
     "hash_pbkdf2 and hash_hkdf SHA-256 derivation",
@@ -31,7 +32,10 @@
     "MurmurHash3 and xxHash non-int seed deprecation diagnostics",
     "xxHash non-string secret deprecation diagnostics"
   ],
-  "non_scope": ["Full php-src hash algorithm inventory", "HashContext magic serialization/debug-info parity"],
+  "non_scope": [
+    "Full php-src hash algorithm inventory",
+    "HashContext magic serialization/debug-info parity"
+  ],
   "target_gates": ["just phpt-dev-module MODULE=hash"],
   "next_step": "Add remaining hash algorithms such as haval, tiger 4-pass variants, and snefru, plus full xxHash secret object/stringable diagnostics and HashContext serialization parity before promoting the full upstream corpus."
 }
