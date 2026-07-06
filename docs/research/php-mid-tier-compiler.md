@@ -162,4 +162,12 @@ Before this design can move beyond reports:
 - PHPT/reference fixtures must prove every enabled region preserves output,
   diagnostics, exit status, warning order, destructor order, and side effects.
 
+Method dispatch (`CallMethod`/`CallStaticMethod`) now surfaces its own metadata
+in the plan alongside the existing property-fetch/assign guards: the candidate
+optimization `monomorphic_method_dispatch_specialization`, the guards
+`receiver_class_epoch`, `method_table_epoch`, `method_slot`,
+`final_or_static_method`, and `by_reference_parameter_compatibility`, and the
+specific rejection reason `method_dispatch_requires_runtime_class_binding`. It
+stays rejected — this is metadata for a future tier, not eligibility.
+
 Until those prerequisites are complete, the mid-tier remains report-only.

@@ -3274,14 +3274,15 @@ fn classify_copy_patch_stencil_instruction(
         | DenseOpcode::Pipe
         | DenseOpcode::AcquireCallable
         | DenseOpcode::MakeClosure
-        | DenseOpcode::CallMethod
-        | DenseOpcode::CallStaticMethod
         | DenseOpcode::LoadConstFetchDim
         | DenseOpcode::LoadConstLoadConst
         | DenseOpcode::LoadConstArrayInsert
         | DenseOpcode::LoadLocalLoadConst => {
             unsupported_copy_patch_class("dynamic_or_userland_call_requires_frame_and_symbol_state")
         }
+        DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => unsupported_copy_patch_class(
+            "method_dispatch_requires_receiver_class_binding_and_frame_state",
+        ),
         DenseOpcode::Include => unsupported_copy_patch_class("include_requires_request_state"),
         DenseOpcode::NewArray
         | DenseOpcode::ArrayInsert
@@ -3502,6 +3503,29 @@ fn classify_mid_tier_instruction(
             push_unique(&mut plan.required_helpers, "known_builtin_helper");
             plan.deopt_points += 1;
         }
+        DenseOpcode::CallMethod | DenseOpcode::CallStaticMethod => {
+            // Method-dispatch metadata for a future tier: expose the guards a
+            // specialized monomorphic dispatch would need. This stays rejected
+            // (metadata-only, no execution) because resolving the receiver's
+            // runtime class binding and frame state is out of scope here.
+            push_unique(
+                &mut plan.candidate_optimizations,
+                "monomorphic_method_dispatch_specialization",
+            );
+            push_unique(&mut plan.expected_guards, "receiver_class_epoch");
+            push_unique(&mut plan.expected_guards, "method_table_epoch");
+            push_unique(&mut plan.expected_guards, "method_slot");
+            push_unique(&mut plan.expected_guards, "final_or_static_method");
+            push_unique(
+                &mut plan.expected_guards,
+                "by_reference_parameter_compatibility",
+            );
+            push_unique(
+                &mut plan.rejection_reasons,
+                "method_dispatch_requires_runtime_class_binding",
+            );
+            plan.deopt_points += 1;
+        }
         DenseOpcode::CallFunction
         | DenseOpcode::CallFunctionDiscard
         | DenseOpcode::NewObject
@@ -3513,8 +3537,6 @@ fn classify_mid_tier_instruction(
         | DenseOpcode::Pipe
         | DenseOpcode::AcquireCallable
         | DenseOpcode::MakeClosure
-        | DenseOpcode::CallMethod
-        | DenseOpcode::CallStaticMethod
         | DenseOpcode::Include
         | DenseOpcode::LoadConstFetchDim
         | DenseOpcode::LoadConstLoadConst
@@ -4468,6 +4490,50 @@ mod tests {
         let error = parse_dump_rule_selection_args(&args).expect_err("extra arg should fail");
 
         assert!(error.contains("unexpected dump-rule-selection argument"));
+    }
+
+    #[test]
+    fn mid_tier_plan_exposes_method_dispatch_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "phrust_p6_method_dispatch_{}.php",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "<?php\n\
+             class Svc { public function run(int $x): int { return $x + 1; } }\n\
+             $s = new Svc();\n\
+             echo $s->run(41);\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-mid-tier-plan".to_string(),
+                path_str,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let text = String::from_utf8(stdout).unwrap();
+        // Method dispatch is still rejected (metadata-only), but its guards and
+        // a specific rejection reason must now surface for a future tier.
+        assert!(
+            text.contains("method_dispatch_requires_runtime_class_binding"),
+            "mid-tier plan should attribute method dispatch specifically: {text}"
+        );
+        assert!(
+            text.contains("monomorphic_method_dispatch_specialization")
+                && text.contains("method_slot")
+                && text.contains("method_table_epoch"),
+            "mid-tier plan should expose method-dispatch guards: {text}"
+        );
     }
 
     #[test]
