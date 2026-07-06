@@ -157,11 +157,11 @@ impl RuntimeLayoutSourceCounts {
     }
 }
 
-fn family_map(counts: &[u64; LAYOUT_SOURCE_FAMILY_COUNT]) -> BTreeMap<String, u64> {
+fn family_map(counts: &[u64; LAYOUT_SOURCE_FAMILY_COUNT]) -> BTreeMap<&'static str, u64> {
     LayoutSourceFamily::ALL
         .iter()
         .filter(|family| counts[**family as usize] != 0)
-        .map(|family| (family.name().to_owned(), counts[*family as usize]))
+        .map(|family| (family.name(), counts[*family as usize]))
         .collect()
 }
 
