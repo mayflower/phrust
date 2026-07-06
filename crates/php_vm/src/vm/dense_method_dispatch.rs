@@ -733,14 +733,7 @@ impl Vm {
             return result;
         }
         let class_owner = class_owner_in_state(compiled, state, &class.name);
-        let runtime_class = match runtime_class_entry(
-            &class_owner,
-            state,
-            &class,
-            &|value| self.constant_value(class_owner.unit(), value),
-            &|reference| class_constant_reference_value(&class_owner, state, reference),
-            &|reference| named_constant_reference_value(&class_owner, state, reference),
-        ) {
+        let runtime_class = match self.cached_runtime_class_entry(&class_owner, state, &class) {
             Ok(runtime_class) => runtime_class,
             Err(error) => {
                 let location_span = error

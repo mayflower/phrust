@@ -117,6 +117,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2135,6 +2136,11 @@ pub struct Vm {
     /// body scan, so repeated calls to the same function do not re-scan its
     /// whole body on every invocation to classify the call frame.
     frame_shape_flags: RefCell<HashMap<(u64, u32), FrameShapeFlags>>,
+    /// Memoized resolved runtime class entries so repeated instantiations of a
+    /// class do not rebuild the whole entry (lineage walk, property/constant
+    /// evaluation, method mapping) on every `new`. Invalidated whenever the
+    /// class table changes (tracked by `ExecutionState::class_table_epoch`).
+    runtime_class_entry_cache: RefCell<RuntimeClassEntryCache>,
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
     include_execution_depth: Cell<u32>,
     request_profile_stack: RefCell<Vec<RequestProfileFrame>>,
@@ -2159,6 +2165,7 @@ impl Vm {
             argument_vector_observers: RefCell::new(HashMap::new()),
             trivial_method_plans: RefCell::new(HashMap::new()),
             frame_shape_flags: RefCell::new(HashMap::new()),
+            runtime_class_entry_cache: RefCell::new(RuntimeClassEntryCache::default()),
             quickening: RefCell::new(QuickeningTable::default()),
             inline_caches: RefCell::new(InlineCacheTable::default()),
             jit: RefCell::new(JitRuntimeState::default()),
@@ -2183,6 +2190,7 @@ impl Vm {
         self.argument_vector_observers.borrow_mut().clear();
         self.trivial_method_plans.borrow_mut().clear();
         self.frame_shape_flags.borrow_mut().clear();
+        *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
             self.quickening
@@ -4465,6 +4473,44 @@ impl Vm {
         };
         self.frame_shape_flags.borrow_mut().insert(key, shape);
         shape
+    }
+
+    /// Returns the resolved runtime class entry for a class, building it only on
+    /// the first instantiation within a class-table epoch and reusing the shared
+    /// `Rc` afterward. When the class table changes (new class declared or
+    /// autoloaded, tracked by `class_table_epoch`), the cache is dropped so
+    /// lineage/property/constant resolution is recomputed against the new table.
+    fn cached_runtime_class_entry(
+        &self,
+        class_owner: &CompiledUnit,
+        state: &ExecutionState,
+        class: &php_ir::module::ClassEntry,
+    ) -> Result<Rc<RuntimeClassEntry>, RuntimeClassEntryError> {
+        let epoch = state.class_table_epoch;
+        let key = normalize_class_name(&class.name);
+        {
+            let mut cache = self.runtime_class_entry_cache.borrow_mut();
+            if cache.epoch != epoch {
+                cache.entries.clear();
+                cache.epoch = epoch;
+            } else if let Some(entry) = cache.entries.get(&key) {
+                return Ok(Rc::clone(entry));
+            }
+        }
+        let entry = runtime_class_entry(
+            class_owner,
+            state,
+            class,
+            &|value| self.constant_value(class_owner.unit(), value),
+            &|reference| class_constant_reference_value(class_owner, state, reference),
+            &|reference| named_constant_reference_value(class_owner, state, reference),
+        )?;
+        let entry = Rc::new(entry);
+        self.runtime_class_entry_cache
+            .borrow_mut()
+            .entries
+            .insert(key, Rc::clone(&entry));
+        Ok(entry)
     }
 
     fn record_counter_direct_frame(&self, layout: &str, function: &IrFunction, elided: bool) {
@@ -44740,6 +44786,19 @@ impl From<RuntimeClassEntryError> for String {
     fn from(error: RuntimeClassEntryError) -> Self {
         error.into_message()
     }
+}
+
+/// Cache of resolved runtime class entries, keyed by normalized class name and
+/// guarded by the class-table epoch. Rebuilding a `RuntimeClassEntry` walks the
+/// lineage, evaluates property/constant defaults, and maps every method, so a
+/// hot instantiation site would otherwise pay that on every `new`. Entries are
+/// shared via `Rc` (the object model copies only the property defaults it needs
+/// and never retains the entry); property defaults are scalar/string/array-COW
+/// or shared enum-case singletons, so sharing a cached entry is behavior-neutral.
+#[derive(Clone, Debug, Default)]
+struct RuntimeClassEntryCache {
+    epoch: u64,
+    entries: HashMap<String, Rc<RuntimeClassEntry>>,
 }
 
 fn runtime_class_entry(
