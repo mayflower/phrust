@@ -489,7 +489,7 @@ fn rusage_value(usage: &libc::rusage) -> Value {
     );
     array.insert(
         string_key("ru_utime.tv_usec"),
-        Value::Int(usage.ru_utime.tv_usec as i64),
+        Value::Int(suseconds_to_i64(usage.ru_utime.tv_usec)),
     );
     array.insert(
         string_key("ru_stime.tv_sec"),
@@ -497,9 +497,25 @@ fn rusage_value(usage: &libc::rusage) -> Value {
     );
     array.insert(
         string_key("ru_stime.tv_usec"),
-        Value::Int(usage.ru_stime.tv_usec as i64),
+        Value::Int(suseconds_to_i64(usage.ru_stime.tv_usec)),
     );
     Value::Array(array)
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+))]
+fn suseconds_to_i64(value: libc::suseconds_t) -> i64 {
+    value
+}
+
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+)))]
+fn suseconds_to_i64(value: libc::suseconds_t) -> i64 {
+    value as i64
 }
 
 fn valid_signal(signal: i64) -> bool {

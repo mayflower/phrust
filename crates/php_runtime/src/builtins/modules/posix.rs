@@ -533,13 +533,41 @@ fn builtin_posix_times(
     }
     let times = unsafe { times.assume_init() };
     let mut array = PhpArray::new();
-    array.insert(string_key("ticks"), Value::Int(ticks as i64));
-    array.insert(string_key("utime"), Value::Int(times.tms_utime as i64));
-    array.insert(string_key("stime"), Value::Int(times.tms_stime as i64));
-    array.insert(string_key("cutime"), Value::Int(times.tms_cutime as i64));
-    array.insert(string_key("cstime"), Value::Int(times.tms_cstime as i64));
+    array.insert(string_key("ticks"), Value::Int(clock_t_to_i64(ticks)));
+    array.insert(
+        string_key("utime"),
+        Value::Int(clock_t_to_i64(times.tms_utime)),
+    );
+    array.insert(
+        string_key("stime"),
+        Value::Int(clock_t_to_i64(times.tms_stime)),
+    );
+    array.insert(
+        string_key("cutime"),
+        Value::Int(clock_t_to_i64(times.tms_cutime)),
+    );
+    array.insert(
+        string_key("cstime"),
+        Value::Int(clock_t_to_i64(times.tms_cstime)),
+    );
     context.set_posix_last_error(0);
     Ok(Value::Array(array))
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+))]
+fn clock_t_to_i64(value: libc::clock_t) -> i64 {
+    value
+}
+
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+)))]
+fn clock_t_to_i64(value: libc::clock_t) -> i64 {
+    value as i64
 }
 
 fn builtin_posix_get_last_error(
