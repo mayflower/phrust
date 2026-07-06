@@ -95420,6 +95420,33 @@ echo DENSE_FETCH_CONST_PROBE;
     }
 
     #[test]
+    fn conditional_class_applies_property_defaults() {
+        // Regression: a class declared conditionally (WordPress's ubiquitous
+        // `if (!class_exists(...)) { class ... }`) must instantiate with its
+        // property defaults applied, matching PHP. The semantics HIR lowering
+        // previously skipped property-default expressions for class
+        // declarations nested inside statements, so no const-expr id was
+        // assigned, the IR carried `default: None`, and the properties read
+        // null instead of their declared defaults.
+        let result = execute_source(
+            r#"<?php
+if (!class_exists('CondPropDefault')) {
+    class CondPropDefault {
+        const C = 9;
+        public $a = 'x';
+        public $b = 1 + 2;
+        public $d = self::C;
+    }
+}
+$o = new CondPropDefault();
+echo $o->a, '|', $o->b, '|', $o->d;
+"#,
+        );
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.to_string_lossy(), "x|3|9");
+    }
+
+    #[test]
     fn dense_bytecode_auto_executes_conditional_declarations() {
         // WordPress-style conditional declarations (e.g.
         // `if (!function_exists(...)) { function ... }`, found throughout
