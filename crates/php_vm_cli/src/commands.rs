@@ -3339,15 +3339,63 @@ fn classify_copy_patch_stencil_instruction(
         DenseOpcode::ForeachInit | DenseOpcode::ForeachNext | DenseOpcode::ForeachCleanup => {
             unsupported_copy_patch_class("foreach_requires_iterator_mutation_and_resume_state")
         }
+        DenseOpcode::BinaryBitAnd | DenseOpcode::BinaryBitOr | DenseOpcode::BinaryBitXor => {
+            // Bitwise AND/OR/XOR on two proven ints is a single native op. The
+            // string form (`"a" & "b"` bytewise) and every mixed/coercion case
+            // side-exits to the interpreter via the int guards.
+            CopyPatchStencilClass {
+                kind: "guarded_int_bitwise",
+                patch_sites: &[
+                    "lhs_register",
+                    "rhs_register",
+                    "destination_register",
+                    "type_exit",
+                ],
+                guard_dependencies: &["lhs_is_int", "rhs_is_int"],
+                helper_calls: &[],
+                live_state_requirements: &[
+                    "operand_registers",
+                    "destination_register",
+                    "source_span",
+                    "resume_instruction",
+                ],
+                side_exit_target: "interpreter_bitwise_type_exit",
+                code_size_bytes_estimate: 20,
+                compile_cost_units: 2,
+                unsupported_reason: None,
+            }
+        }
+        DenseOpcode::BinaryShiftLeft | DenseOpcode::BinaryShiftRight => {
+            // Integer shift is native, but PHP throws ArithmeticError on a
+            // negative shift amount and defines out-of-range shifts, so the
+            // stencil guards the shift amount and side-exits for the
+            // negative/out-of-range and non-int cases.
+            CopyPatchStencilClass {
+                kind: "guarded_int_shift",
+                patch_sites: &[
+                    "lhs_register",
+                    "rhs_register",
+                    "destination_register",
+                    "shift_range_exit",
+                ],
+                guard_dependencies: &["lhs_is_int", "rhs_is_int", "shift_amount_in_range"],
+                helper_calls: &[],
+                live_state_requirements: &[
+                    "operand_registers",
+                    "destination_register",
+                    "source_span",
+                    "resume_instruction",
+                ],
+                side_exit_target: "interpreter_shift_range_or_type_exit",
+                code_size_bytes_estimate: 24,
+                compile_cost_units: 3,
+                unsupported_reason: None,
+            }
+        }
         DenseOpcode::BinaryDiv
         | DenseOpcode::BinaryMod
         | DenseOpcode::BinaryConcat
         | DenseOpcode::BinaryPow
-        | DenseOpcode::BinaryBitAnd
-        | DenseOpcode::BinaryBitOr
-        | DenseOpcode::BinaryBitXor
-        | DenseOpcode::BinaryShiftLeft
-        | DenseOpcode::BinaryShiftRight
         | DenseOpcode::UnaryPlus
         | DenseOpcode::UnaryMinus
         | DenseOpcode::UnaryNot
@@ -4779,6 +4827,62 @@ mod tests {
                 .unwrap_or_default()
                 >= 1,
             "expected a guarded_int_comparison stencil: {json}"
+        );
+    }
+
+    #[test]
+    fn copy_patch_stencils_classify_guarded_int_bitwise_and_shift() {
+        // Bitwise AND/OR/XOR and shifts on proven ints are native ops; the
+        // stencil tier classifies them into guarded int bitwise/shift stencils
+        // rather than the generic PHP-semantic-helper bucket.
+        let path = std::env::temp_dir().join(format!(
+            "phrust_p8_stencil_bitwise_{}.php",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "<?php\n\
+             $a = 6;\n\
+             $b = 3;\n\
+             $and = $a & $b;\n\
+             $or = $a | $b;\n\
+             $xor = $a ^ $b;\n\
+             $shl = $a << $b;\n\
+             $shr = $a >> $b;\n\
+             echo $and, $or, $xor, $shl, $shr;\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-copy-patch-stencils".to_string(),
+                path_str,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(json["native_execution"], false);
+        assert_eq!(json["executable_memory"], false);
+        assert!(
+            json["stencil_kinds"]["guarded_int_bitwise"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "expected a guarded_int_bitwise stencil: {json}"
+        );
+        assert!(
+            json["stencil_kinds"]["guarded_int_shift"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "expected a guarded_int_shift stencil: {json}"
         );
     }
 

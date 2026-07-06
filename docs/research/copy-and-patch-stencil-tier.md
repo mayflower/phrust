@@ -107,6 +107,8 @@ produced:
 | Guard int/string/bool | Represented through guarded arithmetic, known builtin calls, and branch guards. | Exact value class feedback, source span, resume instruction, guard failure reason. |
 | Int add/sub/mul with overflow exit | `guarded_int_arithmetic` over `binary_add`, `binary_sub`, and `binary_mul`. | Operand registers, destination register, overflow exit, type exit, checked helper/inline op identity. |
 | Int comparison with type exit | `guarded_int_comparison` over the dense compare opcodes (`compare_equal`/`compare_not_equal`/`compare_identical`/`compare_not_identical`/`compare_less`/`compare_less_equal`/`compare_greater`/`compare_greater_equal`/`compare_spaceship`). Native integer compare once both operands are proven int. | Operand registers, destination register, `lhs_is_int`/`rhs_is_int` guards, type exit to the interpreter comparison ladder, resume instruction. |
+| Int bitwise with type exit | `guarded_int_bitwise` over `binary_bit_and`/`binary_bit_or`/`binary_bit_xor`. Single native op on two proven ints; the string form and coercion cases side-exit. | Operand registers, destination register, `lhs_is_int`/`rhs_is_int` guards, type exit to the interpreter bitwise ladder, resume instruction. |
+| Int shift with range exit | `guarded_int_shift` over `binary_shift_left`/`binary_shift_right`. Native shift on proven ints, but PHP throws on a negative shift amount and defines out-of-range shifts. | Operand registers, destination register, `lhs_is_int`/`rhs_is_int` guards, `shift_amount_in_range` guard, negative/out-of-range shift and type exit, resume instruction. |
 | Packed array guard/fetch | `packed_array_guard_fetch` over dense `fetch_dim`. | Packed-array guard, integer key guard, OOB exit, warning/diagnostic ordering, no by-reference element state. |
 | Object shape guard/property slot load | `guarded_property_fetch` over dense `fetch_property`, and `guarded_property_assignment` over dense `assign_property`. Dense bytecode now exposes property fetch/assign opcodes, so the stencil tier classifies them instead of reporting `object_shape_property_load_dense_opcode_absent`. | Receiver class/layout epoch, property slot, visibility scope, magic/get/hook rejection, uninitialized typed-property exit. |
 | Known builtin call | `known_builtin_call` for dense direct calls to `strlen` and `count`. | Function-table epoch, builtin identity, argument shape, helper return-status exit, diagnostics order. |
@@ -124,8 +126,9 @@ The prototype rejects or records gaps for:
   by-reference arguments need exact live-state maps;
 - foreach, because iterator position, mutation epoch, by-reference mode, and
   resume state are not native-representable yet;
-- string, division, modulo, bitwise, unary, and concat opcodes that still need
-  PHP-semantic helper contracts or string/allocation state.
+- string, division, modulo, power, unary, and concat opcodes that still need
+  PHP-semantic helper contracts or string/allocation state (integer bitwise and
+  shift opcodes now have guarded stencils; see the candidate table).
 
 Object property fetch and assign are now supported candidates
 (`guarded_property_fetch` / `guarded_property_assignment`) once dense bytecode
