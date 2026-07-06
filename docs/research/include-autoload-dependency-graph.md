@@ -22,10 +22,15 @@ configuration input before it can affect execution.
 - `include expression -> likely target set`: include-path cache keys record the
   literal requested path, `include_path`, request current working directory, and
   calling file directory.
-- `file -> inode/mtime/content hash/version`: the current safe file version is
-  `IncludePathFileFingerprint` with length, modified timestamp in Unix nanos
-  when available, and readonly bit. Content hashes and inode/device identifiers
-  are deferred until the filesystem abstraction exposes them portably.
+- `file -> inode/mtime/content hash/version`: the runtime `IncludePathFileFingerprint`
+  now records length, modified timestamp in Unix nanos when available, readonly
+  bit, and — where the platform exposes it (Unix) — `inode` and `device`. The
+  whole struct is compared by equality, so an atomic replace or symlink swap
+  that preserves length+mtime still invalidates the cached resolution. On
+  platforms without filesystem identity both fields are `None`, which only
+  matches another `None` and never widens reuse (fail-closed). Content hashes
+  remain deferred (they require reading the file on every revalidation) until an
+  evidence-backed hot path justifies the cost.
 - `directory -> version`: directory versioning is a required node for safe
   negative include-path caching. It is not used for include misses yet, so
   missing include paths fall back to normal resolution and diagnostics.
@@ -39,8 +44,10 @@ configuration input before it can affect execution.
 
 ## Correctness Blockers
 
-- Symlinks: cached paths use canonical paths, but production graph reuse needs
-  inode/device or equivalent identity to detect symlink swaps.
+- Symlinks: cached paths use canonical paths, and the runtime fingerprint now
+  carries inode/device on Unix so a symlink/atomic swap that keeps length+mtime
+  is detected. Non-Unix identity and content-hash confirmation remain future
+  work.
 - Case sensitivity: class names are normalized, but filesystem path case rules
   differ by platform and mounted volume.
 - `include_path`: included in the include cache key and autoload lookup key; any

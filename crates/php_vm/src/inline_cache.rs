@@ -3552,6 +3552,8 @@ mod tests {
                 len: 17,
                 modified_unix_nanos: Some(10),
                 readonly: false,
+                inode: None,
+                device: None,
             },
         };
 
@@ -3625,6 +3627,8 @@ mod tests {
                     len: 17,
                     modified_unix_nanos: Some(10),
                     readonly: false,
+                    inode: None,
+                    device: None,
                 },
             },
         );
@@ -3676,6 +3680,8 @@ mod tests {
                     len: 17,
                     modified_unix_nanos: Some(10),
                     readonly: false,
+                    inode: None,
+                    device: None,
                 },
             },
         );

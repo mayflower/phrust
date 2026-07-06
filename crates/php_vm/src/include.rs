@@ -27,11 +27,20 @@ pub struct LoadedInclude {
 }
 
 /// Metadata fingerprint used to validate cached include-path resolutions.
+///
+/// `inode`/`device` capture filesystem identity where the platform exposes it
+/// (Unix), so an atomic replace or symlink swap that preserves `len`+`mtime`
+/// still invalidates the cached resolution. They are `None` on platforms that
+/// do not expose identity; because the whole struct is compared by equality,
+/// a missing identity only ever matches another missing identity — it never
+/// widens reuse (fail-closed).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncludePathFileFingerprint {
     pub len: u64,
     pub modified_unix_nanos: Option<u128>,
     pub readonly: bool,
+    pub inode: Option<u64>,
+    pub device: Option<u64>,
 }
 
 /// Result of resolving one include target without loading its contents.
@@ -716,11 +725,28 @@ pub fn include_path_file_fingerprint(path: &Path) -> Result<IncludePathFileFinge
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
+    let (inode, device) = file_identity(&metadata);
     Ok(IncludePathFileFingerprint {
         len: metadata.len(),
         modified_unix_nanos,
         readonly: metadata.permissions().readonly(),
+        inode,
+        device,
     })
+}
+
+/// Filesystem identity `(inode, device)` when the platform exposes it. Unix
+/// reports both; other platforms report `(None, None)`, which keeps caching
+/// conservative rather than optimistic.
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt as _;
+    (Some(metadata.ino()), Some(metadata.dev()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 fn path_has_explicit_relative_prefix(path: &Path) -> bool {
@@ -1256,6 +1282,55 @@ mod tests {
     use super::*;
     use php_ir::instruction::{BinaryOp, InstructionKind};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn include_path_fingerprint_identity_participates_in_equality() {
+        let base = IncludePathFileFingerprint {
+            len: 17,
+            modified_unix_nanos: Some(10),
+            readonly: false,
+            inode: Some(1),
+            device: Some(2),
+        };
+        // An atomic replace can preserve len/mtime/readonly yet change the
+        // inode; the resolution must then be treated as stale.
+        let replaced = IncludePathFileFingerprint {
+            inode: Some(9),
+            ..base.clone()
+        };
+        assert_ne!(
+            base, replaced,
+            "inode must participate in fingerprint identity"
+        );
+        let moved = IncludePathFileFingerprint {
+            device: Some(99),
+            ..base.clone()
+        };
+        assert_ne!(
+            base, moved,
+            "device must participate in fingerprint identity"
+        );
+        assert_eq!(base, base.clone(), "identical identity is a cache hit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_path_fingerprint_captures_unix_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "phrust_p2_identity_{}_{}.php",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"<?php\n").unwrap();
+        let fingerprint = include_path_file_fingerprint(&path);
+        let _ = std::fs::remove_file(&path);
+        let fingerprint = fingerprint.expect("fingerprint for a readable temp file");
+        assert!(fingerprint.inode.is_some(), "unix exposes inode");
+        assert!(fingerprint.device.is_some(), "unix exposes device");
+    }
 
     #[test]
     fn include_cache_records_resolution_hits_and_misses() {
