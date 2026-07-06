@@ -57,6 +57,8 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 ];
 
 const HASH_ALGOS: &[&str] = &[
+    "md2",
+    "md4",
     "md5",
     "sha1",
     "sha224",
@@ -85,6 +87,8 @@ const HASH_ALGOS: &[&str] = &[
 ];
 
 const HASH_HMAC_ALGOS: &[&str] = &[
+    "md2",
+    "md4",
     "md5",
     "sha1",
     "sha224",
@@ -655,6 +659,8 @@ mod tests {
             .map(|(_, value)| value.to_string())
             .collect::<Vec<_>>();
         for algorithm in [
+            "md2",
+            "md4",
             "md5",
             "sha1",
             "sha224",
@@ -877,6 +883,48 @@ mod tests {
                 ]
             ),
             Value::string("b89bad7ab6f5ada8ab77f806aa7cbdb58cf053fc")
+        );
+    }
+
+    #[test]
+    fn hash_supports_md2_md4_vectors_and_hmac() {
+        assert_eq!(
+            call("hash", vec![Value::string("md2"), Value::string("")]),
+            Value::string("8350e5a3e24c153df2275c9f80692773")
+        );
+        assert_eq!(
+            call("hash", vec![Value::string("md2"), Value::string("abc")]),
+            Value::string("da853b0d3f88d99b30283a69e6ded6bb")
+        );
+        assert_eq!(
+            call("hash", vec![Value::string("md4"), Value::string("")]),
+            Value::string("31d6cfe0d16ae931b73c59d7e0c089c0")
+        );
+        assert_eq!(
+            call("hash", vec![Value::string("md4"), Value::string("abc")]),
+            Value::string("a448017aaf21d8525fc10ae87aa6729d")
+        );
+        assert_eq!(
+            call(
+                "hash_hmac",
+                vec![
+                    Value::string("md2"),
+                    Value::string("payload"),
+                    Value::string("key")
+                ]
+            ),
+            Value::string("6ed0e7a3502c41954afc993fcc87c735")
+        );
+        assert_eq!(
+            call(
+                "hash_hmac",
+                vec![
+                    Value::string("md4"),
+                    Value::string("payload"),
+                    Value::string("key")
+                ]
+            ),
+            Value::string("09c186d814e523835f522cd8de87b965")
         );
     }
 

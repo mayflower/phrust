@@ -1,4 +1,6 @@
 use super::*;
+use md2::Md2;
+use md4::Md4;
 use md5::{Digest, Md5};
 use ripemd::{Ripemd128, Ripemd160, Ripemd256, Ripemd320};
 use sha1::Sha1;
@@ -33,6 +35,8 @@ pub(in crate::builtins::modules) fn hash_digest_bytes(
     input: &[u8],
 ) -> Result<Vec<u8>, BuiltinError> {
     match normalized_hash_algorithm(algorithm).as_deref() {
+        Some("md2") => Ok(Md2::digest(input).to_vec()),
+        Some("md4") => Ok(Md4::digest(input).to_vec()),
         Some("md5") => Ok(Md5::digest(input).to_vec()),
         Some("sha1") => Ok(Sha1::digest(input).to_vec()),
         Some("sha224") => Ok(Sha224::digest(input).to_vec()),
@@ -158,6 +162,25 @@ pub(in crate::builtins::modules) fn hmac_digest_bytes(
     input: &[u8],
 ) -> Result<Vec<u8>, BuiltinError> {
     match normalized_hash_algorithm(algorithm).as_deref() {
+        Some("md2") => Ok(hmac_with_block(
+            if key.len() > 16 {
+                Md2::digest(key).to_vec()
+            } else {
+                key.to_vec()
+            },
+            input,
+            16,
+            |bytes| Md2::digest(bytes).to_vec(),
+        )),
+        Some("md4") => Ok(hmac_with_block_64(
+            if key.len() > 64 {
+                Md4::digest(key).to_vec()
+            } else {
+                key.to_vec()
+            },
+            input,
+            |bytes| Md4::digest(bytes).to_vec(),
+        )),
         Some("md5") => Ok(hmac_with_block_64(
             if key.len() > 64 {
                 Md5::digest(key).to_vec()
@@ -343,7 +366,9 @@ pub(in crate::builtins::modules) fn hmac_with_block(
 pub(in crate::builtins::modules) fn normalized_hash_algorithm(algorithm: &str) -> Option<String> {
     let normalized = algorithm.to_ascii_lowercase().replace('-', "");
     match normalized.as_str() {
-        "md5" | "sha1" | "adler32" | "crc32" | "crc32b" | "crc32c" => Some(normalized),
+        "md2" | "md4" | "md5" | "sha1" | "adler32" | "crc32" | "crc32b" | "crc32c" => {
+            Some(normalized)
+        }
         "fnv132" | "fnv1a32" | "fnv164" | "fnv1a64" | "joaat" => Some(normalized),
         "sha224" | "sha256" | "sha384" | "sha512" => Some(normalized),
         "sha3224" | "sha3256" | "sha3384" | "sha3512" => Some(normalized),
