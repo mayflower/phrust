@@ -391,16 +391,30 @@ verify-frontend:
     @just frontend-snapshots
 
 verify-runtime:
-    @just bytecode-snapshots
-    @just bytecode-exec-smoke
-    @just vm-smoke
-    @just vm-trace-smoke
-    @just runtime-fixtures
-    @just runtime-known-gaps
-    @just runtime-semantics-fixtures
-    @just runtime-semantics-diff
-    @just vm-semantics-oracle
-    @just runtime-hardening-lints
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Mirror CI: the runtime gate diffs against the pinned PHP 8.5.7 oracle.
+    # CI builds it and exports REFERENCE_PHP; locally (pre-push ci-local,
+    # manual runs) adopt the built reference automatically when REFERENCE_PHP
+    # is unset. An explicitly set REFERENCE_PHP always wins (strict), and the
+    # built binary is adopted only when it reports exactly 8.5.7, preserving
+    # the skip-unless-8.5.7 contract for php_ref_required fixtures.
+    if [[ -z "${REFERENCE_PHP:-}" && -x third_party/php-src/sapi/cli/php ]]; then
+      if third_party/php-src/sapi/cli/php --version 2>/dev/null | head -1 | grep -q 'PHP 8\.5\.7'; then
+        export REFERENCE_PHP="$PWD/third_party/php-src/sapi/cli/php"
+        printf '%s\n' "[verify-runtime] adopted built reference PHP: $REFERENCE_PHP"
+      fi
+    fi
+    just bytecode-snapshots
+    just bytecode-exec-smoke
+    just vm-smoke
+    just vm-trace-smoke
+    just runtime-fixtures
+    just runtime-known-gaps
+    just runtime-semantics-fixtures
+    just runtime-semantics-diff
+    just vm-semantics-oracle
+    just runtime-hardening-lints
 
 verify-stdlib:
     @just stdlib-docs
