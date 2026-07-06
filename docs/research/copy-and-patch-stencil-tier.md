@@ -142,6 +142,54 @@ needs:
 - invalidation epochs for functions, classes, properties, includes, autoload,
   array/object shape metadata, and persistent feedback.
 
+## Executable Prerequisites (report-only)
+
+These close non-execution prerequisites. None of them allocate executable
+memory or run native code; they define the contracts a future tier would need
+and are surfaced in the stencil report so drift is visible.
+
+### Helper ABI / status contract
+
+Stencils call VM-owned helper functions (e.g. `php_jit_property_fetch_slow`).
+A stable `helper_abi_hash` is computed over the sorted set of distinct helper
+symbols the report's stencils reference. It changes whenever the helper set
+changes, so a future code cache can reject stencils compiled against a stale
+helper ABI. The hash is report-only metadata today.
+
+### Code-cache key schema
+
+A future stencil code cache must be keyed so a stale or mismatched artifact is
+never reused. The schema is:
+
+- dense bytecode version;
+- function ID and IR fingerprint;
+- helper ABI hash (above);
+- target architecture / config label;
+- feature flags and tier configuration;
+- invalidation epochs (function, class, property, include, autoload, shape,
+  persistent feedback).
+
+The stencil report emits these fields so the key is defined and observable
+before any cache exists.
+
+### W^X / executable-memory policy
+
+The tier is **no-exec by construction**. Policy:
+
+- no page is ever mapped both writable and executable (W^X);
+- a future emitter would write stencil bytes to a writable, non-executable
+  buffer, then remap read-execute before any call, never both at once;
+- the current generator allocates **no** executable memory and performs **no**
+  `mmap`/`mprotect` with `PROT_EXEC`; `native_execution` and `executable_memory`
+  are hard-coded `false` in every report.
+
+### Verifier rule
+
+The report carries `native_execution: false` and `executable_memory: false`.
+A verifier/test asserts both remain `false`; if either becomes `true` without
+the full W^X, code-cache, deopt, and PHPT/reference prerequisites, the gate
+fails. This is the guard that keeps stencil research non-executable.
+
 ## Placement Against Existing Tiers
 
 | Situation | Preferred tier |

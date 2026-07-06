@@ -3787,8 +3787,21 @@ fn copy_patch_stencils_json(
             })
         })
         .collect();
+    // Helper ABI/status contract hash over the sorted distinct helper symbols
+    // the stencils would call. A future code cache rejects stencils compiled
+    // against a stale helper ABI. Report-only.
+    let mut helper_symbols: Vec<&str> = report
+        .stencils
+        .iter()
+        .flat_map(|stencil| stencil.helper_calls.iter().copied())
+        .collect();
+    helper_symbols.sort_unstable();
+    helper_symbols.dedup();
+    let helper_abi_hash = stable_feedback_fingerprint(helper_symbols.join("\n").as_bytes());
     to_json_string(&serde_json::json!({
         "ok": true,
+        // Additive fields (helper_abi_hash, code_cache_key) are backward
+        // compatible, so the report schema version is unchanged.
         "schema_version": 1,
         "backend": "copy-patch-stencil",
         "status": "no-exec",
@@ -3796,6 +3809,18 @@ fn copy_patch_stencils_json(
         "executable_memory": false,
         "path": path,
         "dense_bytecode_version": dense.version,
+        "helper_abi_hash": helper_abi_hash.clone(),
+        // Code-cache key schema for a future stencil cache. ir_fingerprint,
+        // feature_flags, and invalidation_epochs are null until an executable
+        // tier sources them; the schema is defined and observable now.
+        "code_cache_key": {
+            "dense_bytecode_version": dense.version,
+            "helper_abi_hash": helper_abi_hash,
+            "target_arch_config": rust_target_label(),
+            "ir_fingerprint": serde_json::Value::Null,
+            "feature_flags": serde_json::Value::Null,
+            "invalidation_epochs": serde_json::Value::Null,
+        },
         "input": "quickened dense bytecode metadata",
         "functions": report.functions,
         "blocks": report.blocks,
@@ -4534,6 +4559,55 @@ mod tests {
                 && text.contains("method_table_epoch"),
             "mid-tier plan should expose method-dispatch guards: {text}"
         );
+    }
+
+    #[test]
+    fn copy_patch_stencils_stay_no_exec_with_abi_and_cache_key() {
+        let path = std::env::temp_dir().join(format!(
+            "phrust_p8_stencil_prereqs_{}.php",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "<?php\n\
+             function add(int $a, int $b): int { return $a + $b; }\n\
+             echo add(1, 2);\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "dump-copy-patch-stencils".to_string(),
+                path_str,
+                "--json".to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        // Verifier rule: the stencil tier must remain non-executable.
+        assert_eq!(json["native_execution"], false);
+        assert_eq!(json["executable_memory"], false);
+        assert_eq!(json["status"], "no-exec");
+        // Executable prerequisites are defined and observable (report-only).
+        assert!(
+            json["helper_abi_hash"].is_string(),
+            "helper ABI hash should be present: {json}"
+        );
+        assert!(
+            json["code_cache_key"].is_object(),
+            "code-cache key schema should be present: {json}"
+        );
+        assert_eq!(
+            json["code_cache_key"]["dense_bytecode_version"],
+            json["dense_bytecode_version"]
+        );
+        assert!(json["code_cache_key"]["target_arch_config"].is_string());
     }
 
     #[test]
