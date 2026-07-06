@@ -931,6 +931,19 @@ enum ClassConstantFetch {
     Fatal(String),
 }
 
+/// Outcome of [`Vm::assign_property_dim_value`] when it cannot produce a value.
+/// Like [`ClassConstantFetch`], the shared helper never routes control flow; the
+/// caller translates the fault (rich routes/returns in-frame, dense propagates).
+enum PropertyDimAssign {
+    /// A catchable runtime `\Error` must be raised at this span.
+    Raise(IrSpan, String),
+    /// A non-catchable internal error with this message.
+    Fatal(String),
+    /// Return this result directly (a userland ArrayAccess::offsetSet threw or
+    /// otherwise produced a final result); it is not routed through handlers.
+    Return(Box<VmResult>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InternalFunctionDispatchCacheOutcome {
     Hit,
@@ -21668,500 +21681,20 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        if is_std_class_runtime_class(&object.class_name()) {
-                            // In-place fast path: mutate an existing array
-                            // property directly instead of clone → assign
-                            // (COW separation) → write-back. stdClass has no
-                            // declared properties, hooks, or types; userland
-                            // ArrayAccess dispatch only applies to object
-                            // values, which stay on the generic path.
-                            match try_assign_property_dim_in_place(
-                                &object,
-                                property,
-                                &dims,
-                                value.clone(),
-                                *append,
-                            ) {
-                                PropertyDimInPlace::Applied(Ok(())) => {
-                                    self.record_counter_property_dim_assign_in_place_hit();
-                                    if let Err(message) = stack
-                                        .frame_mut(frame_index)
-                                        .expect("frame was pushed")
-                                        .registers
-                                        .set(*dst, value)
-                                    {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                    continue;
-                                }
-                                PropertyDimInPlace::Applied(Err(message)) => {
-                                    match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
-                                        }
-                                        RaiseOutcome::Done(result) => return *result,
-                                    }
-                                }
-                                PropertyDimInPlace::NotEligible => {
-                                    self.record_counter_property_dim_assign_generic(
-                                        "stdclass_non_array_slot",
-                                    );
-                                }
-                            }
-                            let mut current = object.get_property(property).unwrap_or(Value::Null);
-                            match self.try_userland_arrayaccess_offset_set_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &current,
-                                &dims,
-                                *append,
-                                value.clone(),
-                                instruction.span,
-                            ) {
-                                Ok(true) => {
-                                    if let Err(message) = stack
-                                        .frame_mut(frame_index)
-                                        .expect("frame was pushed")
-                                        .registers
-                                        .set(*dst, value)
-                                    {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                    continue;
-                                }
-                                Ok(false) => {}
-                                Err(result) => return result,
-                            }
-                            if matches!(current, Value::Uninitialized | Value::Null) {
-                                current = Value::Array(PhpArray::new());
-                            }
-                            if let Err(message) =
-                                assign_dim_value(&mut current, &dims, value.clone(), *append)
-                            {
-                                match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut exception_handlers,
-                                    &mut pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
-                                    RaiseOutcome::Caught(target) => {
-                                        block_id = target;
-                                        continue 'dispatch;
-                                    }
-                                    RaiseOutcome::Done(result) => return *result,
-                                }
-                            }
-                            object.set_property(property, current);
-                            if let Err(message) = stack
-                                .frame_mut(frame_index)
-                                .expect("frame was pushed")
-                                .registers
-                                .set(*dst, value)
-                            {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                            continue;
-                        }
-                        let class =
-                            match lookup_class_in_state(compiled, state, &object.class_name()) {
-                                Some(class) => class,
-                                None => {
-                                    return self.runtime_error(
-                                        output,
-                                        compiled,
-                                        stack,
-                                        format!(
-                                            "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                                            object.class_name()
-                                        ),
-                                    );
-                                }
-                            };
-                        let scope = current_scope_class(compiled, stack);
-                        let resolved = match lookup_resolved_property_in_state(
+                        match self.assign_property_dim_value(
                             compiled,
-                            state,
-                            &class,
+                            object,
                             property,
-                            scope.as_deref(),
-                        ) {
-                            Ok(Some(resolved)) => resolved,
-                            Ok(None) => {
-                                // In-place fast path for an existing dynamic
-                                // array property. Gated on the class allowing
-                                // dynamic properties so the deprecation
-                                // diagnostic behavior of the generic path is
-                                // preserved exactly for disallowing classes.
-                                if class_allows_dynamic_properties(compiled, state, &class) {
-                                    match try_assign_property_dim_in_place(
-                                        &object,
-                                        property,
-                                        &dims,
-                                        value.clone(),
-                                        *append,
-                                    ) {
-                                        PropertyDimInPlace::Applied(Ok(())) => {
-                                            self.record_counter_property_dim_assign_in_place_hit();
-                                            if let Err(message) = stack
-                                                .frame_mut(frame_index)
-                                                .expect("frame was pushed")
-                                                .registers
-                                                .set(*dst, value)
-                                            {
-                                                return self.runtime_error(
-                                                    output, compiled, stack, message,
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        PropertyDimInPlace::Applied(Err(message)) => {
-                                            match self.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut exception_handlers,
-                                                &mut pending_control,
-                                                instruction.span,
-                                                message,
-                                            ) {
-                                                RaiseOutcome::Caught(target) => {
-                                                    block_id = target;
-                                                    continue 'dispatch;
-                                                }
-                                                RaiseOutcome::Done(result) => return *result,
-                                            }
-                                        }
-                                        PropertyDimInPlace::NotEligible => {
-                                            self.record_counter_property_dim_assign_generic(
-                                                "dynamic_non_array_slot",
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    self.record_counter_property_dim_assign_generic(
-                                        "dynamic_properties_disallowed",
-                                    );
-                                }
-                                let mut current =
-                                    object.get_property(property).unwrap_or(Value::Null);
-                                match self.try_userland_arrayaccess_offset_set_value(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &current,
-                                    &dims,
-                                    *append,
-                                    value.clone(),
-                                    instruction.span,
-                                ) {
-                                    Ok(true) => {
-                                        if let Err(message) = stack
-                                            .frame_mut(frame_index)
-                                            .expect("frame was pushed")
-                                            .registers
-                                            .set(*dst, value)
-                                        {
-                                            return self
-                                                .runtime_error(output, compiled, stack, message);
-                                        }
-                                        continue;
-                                    }
-                                    Ok(false) => {}
-                                    Err(result) => return result,
-                                }
-                                if matches!(current, Value::Uninitialized | Value::Null) {
-                                    current = Value::Array(PhpArray::new());
-                                }
-                                if let Err(message) =
-                                    assign_dim_value(&mut current, &dims, value.clone(), *append)
-                                {
-                                    match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
-                                        }
-                                        RaiseOutcome::Done(result) => return *result,
-                                    }
-                                }
-                                if let Some(diagnostic) = dynamic_property_deprecation_diagnostic(
-                                    compiled,
-                                    state,
-                                    &class,
-                                    &object,
-                                    property.as_ref(),
-                                    stack,
-                                ) {
-                                    diagnostics.push(diagnostic);
-                                }
-                                object.set_property(property, current);
-                                if let Err(message) = stack
-                                    .frame_mut(frame_index)
-                                    .expect("frame was pushed")
-                                    .registers
-                                    .set(*dst, value)
-                                {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                                continue;
-                            }
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        let resolved_class = &resolved.class;
-                        let entry = &resolved.property;
-                        if entry.flags.is_static {
-                            if let Err(message) = validate_property_access_in_state(
-                                compiled,
-                                state,
-                                stack,
-                                resolved_class,
-                                entry,
-                            )
-                            .and_then(|()| {
-                                validate_property_set_access_in_state(
-                                    compiled,
-                                    state,
-                                    stack,
-                                    resolved_class,
-                                    entry,
-                                )
-                            }) {
-                                match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut exception_handlers,
-                                    &mut pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
-                                    RaiseOutcome::Caught(target) => {
-                                        block_id = target;
-                                        continue 'dispatch;
-                                    }
-                                    RaiseOutcome::Done(result) => return *result,
-                                }
-                            }
-                            emit_static_property_as_non_static_notice(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                resolved_class,
-                                entry,
-                                instruction.span,
-                            );
-                            let mut current = object.get_property(property).unwrap_or(Value::Null);
-                            match self.try_userland_arrayaccess_offset_set_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &current,
-                                &dims,
-                                *append,
-                                value.clone(),
-                                instruction.span,
-                            ) {
-                                Ok(true) => {
-                                    if let Err(message) = stack
-                                        .frame_mut(frame_index)
-                                        .expect("frame was pushed")
-                                        .registers
-                                        .set(*dst, value)
-                                    {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                    continue;
-                                }
-                                Ok(false) => {}
-                                Err(result) => return result,
-                            }
-                            if matches!(current, Value::Uninitialized | Value::Null) {
-                                current = Value::Array(PhpArray::new());
-                            }
-                            if let Err(message) =
-                                assign_dim_value(&mut current, &dims, value.clone(), *append)
-                            {
-                                match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut exception_handlers,
-                                    &mut pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
-                                    RaiseOutcome::Caught(target) => {
-                                        block_id = target;
-                                        continue 'dispatch;
-                                    }
-                                    RaiseOutcome::Done(result) => return *result,
-                                }
-                            }
-                            object.set_property(property, current);
-                            if let Err(message) = stack
-                                .frame_mut(frame_index)
-                                .expect("frame was pushed")
-                                .registers
-                                .set(*dst, value)
-                            {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                            continue;
-                        }
-                        if let Err(message) = validate_property_access_in_state(
-                            compiled,
-                            state,
-                            stack,
-                            resolved_class,
-                            entry,
-                        )
-                        .and_then(|()| {
-                            validate_property_set_access_in_state(
-                                compiled,
-                                state,
-                                stack,
-                                resolved_class,
-                                entry,
-                            )
-                        }) {
-                            match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                instruction.span,
-                                message,
-                            ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
-                                }
-                                RaiseOutcome::Done(result) => return *result,
-                            }
-                        }
-                        if entry.hooks.get.is_some() || entry.hooks.set.is_some() {
-                            return self.runtime_error(
-                                output,
-                                compiled,
-                                stack,
-                                format!(
-                                    "E_PHP_VM_PROPERTY_DIM_HOOK: property {}::${} dimension assignment through hooks is not implemented",
-                                    resolved_class.name, entry.name
-                                ),
-                            );
-                        }
-                        let storage_name = property_storage_name(resolved_class, entry);
-                        // In-place fast path: untyped, non-readonly declared
-                        // property (visibility validated above, hooks
-                        // excluded) whose storage slot currently holds an
-                        // array. Typed properties keep the generic path so
-                        // post-assignment type checks stay exact; readonly
-                        // properties keep the generic error ordering.
-                        if entry.type_.is_none()
-                            && !entry.flags.is_readonly
-                            && !resolved_class.flags.is_readonly
-                        {
-                            match try_assign_property_dim_in_place(
-                                &object,
-                                &storage_name,
-                                &dims,
-                                value.clone(),
-                                *append,
-                            ) {
-                                PropertyDimInPlace::Applied(Ok(())) => {
-                                    self.record_counter_property_dim_assign_in_place_hit();
-                                    if let Err(message) = stack
-                                        .frame_mut(frame_index)
-                                        .expect("frame was pushed")
-                                        .registers
-                                        .set(*dst, value)
-                                    {
-                                        return self
-                                            .runtime_error(output, compiled, stack, message);
-                                    }
-                                    continue;
-                                }
-                                PropertyDimInPlace::Applied(Err(message)) => {
-                                    match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut exception_handlers,
-                                        &mut pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
-                                        RaiseOutcome::Caught(target) => {
-                                            block_id = target;
-                                            continue 'dispatch;
-                                        }
-                                        RaiseOutcome::Done(result) => return *result,
-                                    }
-                                }
-                                PropertyDimInPlace::NotEligible => {
-                                    self.record_counter_property_dim_assign_generic(
-                                        "declared_non_array_slot",
-                                    );
-                                }
-                            }
-                        } else {
-                            self.record_counter_property_dim_assign_generic(
-                                "typed_readonly_or_readonly_class",
-                            );
-                        }
-                        let mut current =
-                            property_state_value(compiled, state, stack, &object, property)
-                                .unwrap_or(Value::Null);
-                        match self.try_userland_arrayaccess_offset_set_value(
-                            compiled,
+                            &dims,
+                            *append,
+                            value,
+                            instruction.span,
+                            &mut diagnostics,
                             output,
                             stack,
                             state,
-                            &current,
-                            &dims,
-                            *append,
-                            value.clone(),
-                            instruction.span,
                         ) {
-                            Ok(true) => {
+                            Ok(value) => {
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
                                     .expect("frame was pushed")
@@ -22170,89 +21703,29 @@ impl Vm {
                                 {
                                     return self.runtime_error(output, compiled, stack, message);
                                 }
-                                continue;
                             }
-                            Ok(false) => {}
-                            Err(result) => return result,
-                        }
-                        if matches!(current, Value::Uninitialized | Value::Null) {
-                            current = Value::Array(PhpArray::new());
-                        }
-                        if let Err(message) =
-                            assign_dim_value(&mut current, &dims, value.clone(), *append)
-                        {
-                            match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                instruction.span,
-                                message,
-                            ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
+                            Err(PropertyDimAssign::Raise(span, message)) => {
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
+                                    }
+                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                                RaiseOutcome::Done(result) => return *result,
                             }
-                        }
-                        let property_type = ir_runtime_type(entry.type_.as_ref());
-                        if let Err(message) = check_property_type(
-                            compiled,
-                            Some(state),
-                            resolved_class.display_name.as_str(),
-                            property,
-                            &property_type,
-                            &current,
-                            self.typecheck_fast_path_context(),
-                        ) {
-                            match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                instruction.span,
-                                message,
-                            ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
-                                }
-                                RaiseOutcome::Done(result) => return *result,
+                            Err(PropertyDimAssign::Fatal(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
                             }
-                        }
-                        if let Err(message) =
-                            validate_property_write(resolved_class, entry, &object, stack, compiled)
-                        {
-                            match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut exception_handlers,
-                                &mut pending_control,
-                                instruction.span,
-                                message,
-                            ) {
-                                RaiseOutcome::Caught(target) => {
-                                    block_id = target;
-                                    continue 'dispatch;
-                                }
-                                RaiseOutcome::Done(result) => return *result,
-                            }
-                        }
-                        object.set_property(storage_name, current);
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("frame was pushed")
-                            .registers
-                            .set(*dst, value)
-                        {
-                            return self.runtime_error(output, compiled, stack, message);
+                            Err(PropertyDimAssign::Return(result)) => return *result,
                         }
                     }
                     InstructionKind::AssignStaticProperty {
@@ -39018,6 +38491,303 @@ impl Vm {
         };
         self.register_destructor_if_needed(compiled, &class, copy.clone(), state);
         Ok(Value::Object(copy))
+    }
+
+    /// `$object->property[dims...] = value` (or `[] =` append), shared by the
+    /// rich and dense executors. Extracted verbatim from the rich handler; only
+    /// the exit paths are rewritten (produce -> Ok, raise -> Raise, ArrayAccess
+    /// offsetSet result -> Return, internal error -> Fatal). The caller writes
+    /// the returned value to its destination register.
+    #[allow(clippy::too_many_arguments)]
+    fn assign_property_dim_value(
+        &self,
+        compiled: &CompiledUnit,
+        object: ObjectRef,
+        property: &str,
+        dims: &[ArrayKey],
+        append: bool,
+        value: Value,
+        span: IrSpan,
+        diagnostics: &mut Vec<RuntimeDiagnostic>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Value, PropertyDimAssign> {
+        if is_std_class_runtime_class(&object.class_name()) {
+            // In-place fast path: mutate an existing array
+            // property directly instead of clone → assign
+            // (COW separation) → write-back. stdClass has no
+            // declared properties, hooks, or types; userland
+            // ArrayAccess dispatch only applies to object
+            // values, which stay on the generic path.
+            match try_assign_property_dim_in_place(&object, property, dims, value.clone(), append) {
+                PropertyDimInPlace::Applied(Ok(())) => {
+                    self.record_counter_property_dim_assign_in_place_hit();
+                    return Ok(value);
+                }
+                PropertyDimInPlace::Applied(Err(message)) => {
+                    return Err(PropertyDimAssign::Raise(span, message));
+                }
+                PropertyDimInPlace::NotEligible => {
+                    self.record_counter_property_dim_assign_generic("stdclass_non_array_slot");
+                }
+            }
+            let mut current = object.get_property(property).unwrap_or(Value::Null);
+            match self.try_userland_arrayaccess_offset_set_value(
+                compiled,
+                output,
+                stack,
+                state,
+                &current,
+                dims,
+                append,
+                value.clone(),
+                span,
+            ) {
+                Ok(true) => return Ok(value),
+                Ok(false) => {}
+                Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+            }
+            if matches!(current, Value::Uninitialized | Value::Null) {
+                current = Value::Array(PhpArray::new());
+            }
+            if let Err(message) = assign_dim_value(&mut current, dims, value.clone(), append) {
+                return Err(PropertyDimAssign::Raise(span, message));
+            }
+            object.set_property(property, current);
+            return Ok(value);
+        }
+        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
+            Some(class) => class,
+            None => {
+                return Err(PropertyDimAssign::Fatal(format!(
+                    "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
+                    object.class_name()
+                )));
+            }
+        };
+        let scope = current_scope_class(compiled, stack);
+        let resolved = match lookup_resolved_property_in_state(
+            compiled,
+            state,
+            &class,
+            property,
+            scope.as_deref(),
+        ) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                // In-place fast path for an existing dynamic
+                // array property. Gated on the class allowing
+                // dynamic properties so the deprecation
+                // diagnostic behavior of the generic path is
+                // preserved exactly for disallowing classes.
+                if class_allows_dynamic_properties(compiled, state, &class) {
+                    match try_assign_property_dim_in_place(
+                        &object,
+                        property,
+                        dims,
+                        value.clone(),
+                        append,
+                    ) {
+                        PropertyDimInPlace::Applied(Ok(())) => {
+                            self.record_counter_property_dim_assign_in_place_hit();
+                            return Ok(value);
+                        }
+                        PropertyDimInPlace::Applied(Err(message)) => {
+                            return Err(PropertyDimAssign::Raise(span, message));
+                        }
+                        PropertyDimInPlace::NotEligible => {
+                            self.record_counter_property_dim_assign_generic(
+                                "dynamic_non_array_slot",
+                            );
+                        }
+                    }
+                } else {
+                    self.record_counter_property_dim_assign_generic(
+                        "dynamic_properties_disallowed",
+                    );
+                }
+                let mut current = object.get_property(property).unwrap_or(Value::Null);
+                match self.try_userland_arrayaccess_offset_set_value(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    &current,
+                    dims,
+                    append,
+                    value.clone(),
+                    span,
+                ) {
+                    Ok(true) => return Ok(value),
+                    Ok(false) => {}
+                    Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+                }
+                if matches!(current, Value::Uninitialized | Value::Null) {
+                    current = Value::Array(PhpArray::new());
+                }
+                if let Err(message) = assign_dim_value(&mut current, dims, value.clone(), append) {
+                    return Err(PropertyDimAssign::Raise(span, message));
+                }
+                if let Some(diagnostic) = dynamic_property_deprecation_diagnostic(
+                    compiled,
+                    state,
+                    &class,
+                    &object,
+                    property,
+                    stack,
+                ) {
+                    diagnostics.push(diagnostic);
+                }
+                object.set_property(property, current);
+                return Ok(value);
+            }
+            Err(message) => {
+                return Err(PropertyDimAssign::Fatal(message));
+            }
+        };
+        let resolved_class = &resolved.class;
+        let entry = &resolved.property;
+        if entry.flags.is_static {
+            if let Err(message) =
+                validate_property_access_in_state(compiled, state, stack, resolved_class, entry)
+                    .and_then(|()| {
+                        validate_property_set_access_in_state(
+                            compiled,
+                            state,
+                            stack,
+                            resolved_class,
+                            entry,
+                        )
+                    })
+            {
+                return Err(PropertyDimAssign::Raise(span, message));
+            }
+            emit_static_property_as_non_static_notice(
+                compiled,
+                output,
+                stack,
+                state,
+                resolved_class,
+                entry,
+                span,
+            );
+            let mut current = object.get_property(property).unwrap_or(Value::Null);
+            match self.try_userland_arrayaccess_offset_set_value(
+                compiled,
+                output,
+                stack,
+                state,
+                &current,
+                dims,
+                append,
+                value.clone(),
+                span,
+            ) {
+                Ok(true) => return Ok(value),
+                Ok(false) => {}
+                Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+            }
+            if matches!(current, Value::Uninitialized | Value::Null) {
+                current = Value::Array(PhpArray::new());
+            }
+            if let Err(message) = assign_dim_value(&mut current, dims, value.clone(), append) {
+                return Err(PropertyDimAssign::Raise(span, message));
+            }
+            object.set_property(property, current);
+            return Ok(value);
+        }
+        if let Err(message) =
+            validate_property_access_in_state(compiled, state, stack, resolved_class, entry)
+                .and_then(|()| {
+                    validate_property_set_access_in_state(
+                        compiled,
+                        state,
+                        stack,
+                        resolved_class,
+                        entry,
+                    )
+                })
+        {
+            return Err(PropertyDimAssign::Raise(span, message));
+        }
+        if entry.hooks.get.is_some() || entry.hooks.set.is_some() {
+            return Err(PropertyDimAssign::Fatal(format!(
+                "E_PHP_VM_PROPERTY_DIM_HOOK: property {}::${} dimension assignment through hooks is not implemented",
+                resolved_class.name, entry.name
+            )));
+        }
+        let storage_name = property_storage_name(resolved_class, entry);
+        // In-place fast path: untyped, non-readonly declared
+        // property (visibility validated above, hooks
+        // excluded) whose storage slot currently holds an
+        // array. Typed properties keep the generic path so
+        // post-assignment type checks stay exact; readonly
+        // properties keep the generic error ordering.
+        if entry.type_.is_none() && !entry.flags.is_readonly && !resolved_class.flags.is_readonly {
+            match try_assign_property_dim_in_place(
+                &object,
+                &storage_name,
+                dims,
+                value.clone(),
+                append,
+            ) {
+                PropertyDimInPlace::Applied(Ok(())) => {
+                    self.record_counter_property_dim_assign_in_place_hit();
+                    return Ok(value);
+                }
+                PropertyDimInPlace::Applied(Err(message)) => {
+                    return Err(PropertyDimAssign::Raise(span, message));
+                }
+                PropertyDimInPlace::NotEligible => {
+                    self.record_counter_property_dim_assign_generic("declared_non_array_slot");
+                }
+            }
+        } else {
+            self.record_counter_property_dim_assign_generic("typed_readonly_or_readonly_class");
+        }
+        let mut current =
+            property_state_value(compiled, state, stack, &object, property).unwrap_or(Value::Null);
+        match self.try_userland_arrayaccess_offset_set_value(
+            compiled,
+            output,
+            stack,
+            state,
+            &current,
+            dims,
+            append,
+            value.clone(),
+            span,
+        ) {
+            Ok(true) => return Ok(value),
+            Ok(false) => {}
+            Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+        }
+        if matches!(current, Value::Uninitialized | Value::Null) {
+            current = Value::Array(PhpArray::new());
+        }
+        if let Err(message) = assign_dim_value(&mut current, dims, value.clone(), append) {
+            return Err(PropertyDimAssign::Raise(span, message));
+        }
+        let property_type = ir_runtime_type(entry.type_.as_ref());
+        if let Err(message) = check_property_type(
+            compiled,
+            Some(state),
+            resolved_class.display_name.as_str(),
+            property,
+            &property_type,
+            &current,
+            self.typecheck_fast_path_context(),
+        ) {
+            return Err(PropertyDimAssign::Raise(span, message));
+        }
+        if let Err(message) =
+            validate_property_write(resolved_class, entry, &object, stack, compiled)
+        {
+            return Err(PropertyDimAssign::Raise(span, message));
+        }
+        object.set_property(storage_name, current);
+        Ok(value)
     }
 
     fn execute_cast(
