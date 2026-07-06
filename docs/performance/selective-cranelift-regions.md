@@ -87,6 +87,35 @@ method guard exits, side-exit reasons, blacklist reasons, tiering cold/hot/eager
 decisions, budget rejections, blacklist rejections, and compile-cache
 hit/miss/invalidation counts.
 
+## Candidate Evaluation (incremental tranche)
+
+The evaluated next candidate is extending `PackedForeachIntSumCandidate` to the
+other associative all-int packed-foreach reductions — `min`/`max`/`product` — the
+narrowest family adjacent to the one already eligible. It shares the same
+runtime-owned packed metadata guards, overflow/layout side-exit shape, and
+by-value foreach constraints, so its correctness surface is understood.
+
+**Decision: not added this tranche.** The pack's gate requires *positive
+work-to-compile evidence* before a native region is added, and no fresh
+Cranelift benchmark was run here — the tier is feature-gated (`jit-cranelift`),
+its benchmarks are host-noisy, and the committed evidence
+(`target/performance/cranelift/results.md`, local only) currently justifies a
+real performance-win claim only for the existing all-int packed foreach *sum*
+reduction. Adding native codegen for a new reduction without that evidence would
+violate the evidence-gate and the reject-by-default discipline, so the candidate
+stays interpreter-only.
+
+A future expansion of this candidate must show, on the reduction fixture:
+
+- a work-to-compile ratio above 1 (compile cost amortized by executed work);
+- bounded, enumerated side exits (overflow, mixed layout, reference/COW,
+  numeric-string keys) each with a fixture;
+- zero PHP-visible output/diagnostic/exit-status change vs. the interpreter;
+- no default-runtime regression (Cranelift stays optional/non-default).
+
+Until then the eligible set is unchanged and the interpreter remains the
+fallback for every rejected or unproven shape.
+
 ## Current Decision
 
 The selective Cranelift region gate is closed for current fastest-engine work:
