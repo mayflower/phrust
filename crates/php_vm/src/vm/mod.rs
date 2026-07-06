@@ -6897,6 +6897,69 @@ impl Vm {
                 self.observe_dense_quickening(unit_id, function_id, dense_instruction_index);
                 match instruction.opcode {
                     DenseOpcode::Nop => {}
+                    DenseOpcode::DeclareFunction => {
+                        let DenseOperands::DeclareFunction { name, function } =
+                            instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(name) = dense.names.get(name as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode function declaration name n{name}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let name = name.clone();
+                        if let Err(message) = declare_runtime_function(
+                            compiled,
+                            state,
+                            &name,
+                            FunctionId::new(function),
+                        ) {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
+                    DenseOpcode::DeclareClass => {
+                        let DenseOperands::DeclareClass { name } = instruction.operands else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let Some(name) = dense.names.get(name as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode class declaration name n{name}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let name = name.clone();
+                        if let Err(message) = declare_runtime_class(compiled, state, &name) {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::LoadConst | DenseOpcode::LoadConstLoadConst => {
                         // The fused form appends a second constant load into
                         // another register after the unchanged first load.
@@ -75191,6 +75254,7 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         | DenseOpcode::JumpIf
         | DenseOpcode::Exit => "control_flow",
         DenseOpcode::Return => "returns",
+        DenseOpcode::DeclareFunction | DenseOpcode::DeclareClass => "declarations",
         DenseOpcode::Discard | DenseOpcode::Nop => "bookkeeping",
     }
 }
@@ -94815,7 +94879,7 @@ echo dense_supported(4), "\n", rich_fallback(), "\n";
     }
 
     #[test]
-    fn dense_bytecode_auto_falls_back_for_direct_nested_function_declare() {
+    fn dense_bytecode_auto_executes_direct_nested_function_declare() {
         let result = execute_source_with_options(
             r#"<?php
 function outer_direct_nested() {
@@ -94843,17 +94907,23 @@ echo '|', function_exists('inner_direct_nested') ? 'late' : 'missing';
         let counters = result.counters.expect("counters should be collected");
         assert_eq!(counters.bytecode_lower_attempts, 1, "{counters:?}");
         assert_eq!(counters.bytecode_lower_successes, 1, "{counters:?}");
+        // The nested `function inner_direct_nested()` declaration now lowers and
+        // runs on the dense bytecode path, so the enclosing function no longer
+        // deopts to the rich interpreter for the declaration.
         assert!(
-            counters.rich_fallback_functions_executed >= 1,
+            counters
+                .dense_instruction_families_executed
+                .get("declarations")
+                .copied()
+                .unwrap_or_default()
+                >= 1,
             "{counters:?}"
         );
         assert!(
-            counters
+            !counters
                 .dense_call_fallback_by_reason
-                .iter()
-                .any(|(reason, count)| reason
-                    .contains("DeclareFunction { name: \"inner_direct_nested\"")
-                    && *count == 1),
+                .keys()
+                .any(|reason| reason.contains("DeclareFunction")),
             "{counters:?}"
         );
     }
@@ -95345,6 +95415,50 @@ echo DENSE_FETCH_CONST_PROBE;
                 .copied()
                 .unwrap_or_default()
                 >= 1,
+            "{counters:?}"
+        );
+    }
+
+    #[test]
+    fn dense_bytecode_auto_executes_conditional_declarations() {
+        // WordPress-style conditional declarations (e.g.
+        // `if (!function_exists(...)) { function ... }`, found throughout
+        // pluggable.php, sodium_compat, and pomo/*) lower to runtime
+        // DeclareFunction/DeclareClass instructions. These previously forced
+        // the whole enclosing (usually include-entry) function onto the rich
+        // interpreter; they now execute on the dense bytecode path.
+        let result = execute_source_with_options(
+            r#"<?php
+if (!function_exists('dense_declared_probe')) {
+    function dense_declared_probe() { return 'fn-ok'; }
+}
+if (!class_exists('DenseDeclaredProbe')) {
+    class DenseDeclaredProbe {}
+}
+echo dense_declared_probe(), ':', class_exists('DenseDeclaredProbe') ? 'class-ok' : 'no';
+"#,
+            VmOptions {
+                execution_format: ExecutionFormat::Auto,
+                collect_counters: true,
+                collect_profile_spans: false,
+                collect_layout_source_attribution: true,
+                inline_caches: InlineCacheMode::On,
+                ..VmOptions::default()
+            },
+        );
+
+        assert!(result.status.is_success(), "{:?}", result.status);
+        assert_eq!(result.output.as_bytes(), b"fn-ok:class-ok");
+        let counters = result.counters.expect("counters should be collected");
+        assert_eq!(counters.bytecode_unsupported_fallbacks, 0, "{counters:?}");
+        assert!(counters.dense_functions_executed >= 1, "{counters:?}");
+        assert!(
+            counters
+                .dense_instruction_families_executed
+                .get("declarations")
+                .copied()
+                .unwrap_or_default()
+                >= 2,
             "{counters:?}"
         );
     }

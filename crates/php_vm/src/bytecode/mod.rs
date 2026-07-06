@@ -188,6 +188,10 @@ pub enum DenseOpcode {
     IssetPropertyDim = 80,
     /// `rN = empty(object->property[dims...])`.
     EmptyPropertyDim = 81,
+    /// Conditionally declare a runtime function at the point of execution.
+    DeclareFunction = 82,
+    /// Conditionally declare a runtime class at the point of execution.
+    DeclareClass = 83,
 }
 
 impl DenseOpcode {
@@ -290,6 +294,8 @@ impl DenseOpcode {
             Self::InstanceOf => "instance_of",
             Self::IssetPropertyDim => "isset_property_dim",
             Self::EmptyPropertyDim => "empty_property_dim",
+            Self::DeclareFunction => "declare_function",
+            Self::DeclareClass => "declare_class",
         }
     }
 
@@ -601,6 +607,10 @@ pub enum DenseOperands {
         kind: IncludeKind,
         path: DenseOperand,
     },
+    /// Conditional function declaration: name side-table index and IR function id.
+    DeclareFunction { name: u32, function: u32 },
+    /// Conditional class declaration: name side-table index.
+    DeclareClass { name: u32 },
 }
 
 /// One dense closure capture: name side-table index, source operand, and
@@ -1938,7 +1948,9 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::UnaryMinus
         | DenseOpcode::UnaryNot
         | DenseOpcode::UnaryBitNot
-        | DenseOpcode::BinaryPow => None,
+        | DenseOpcode::BinaryPow
+        | DenseOpcode::DeclareFunction
+        | DenseOpcode::DeclareClass => None,
     }
 }
 
@@ -2647,6 +2659,19 @@ fn lower_instruction(
                 dst: dst.raw(),
                 kind: *kind,
                 path: lower_operand(*path),
+            },
+        ),
+        InstructionKind::DeclareFunction { name, function } => (
+            DenseOpcode::DeclareFunction,
+            DenseOperands::DeclareFunction {
+                name: push_name(names, name).index() as u32,
+                function: function.raw(),
+            },
+        ),
+        InstructionKind::DeclareClass { name } => (
+            DenseOpcode::DeclareClass,
+            DenseOperands::DeclareClass {
+                name: push_name(names, name).index() as u32,
             },
         ),
         other => return unsupported_instruction(instruction, format!("{other:?}")),
@@ -3444,6 +3469,12 @@ fn verify_instruction(
             verify_register(*dst, function, errors);
             verify_operand(*path, unit, function, errors);
         }
+        (DenseOpcode::DeclareFunction, DenseOperands::DeclareFunction { name, .. }) => {
+            verify_name(*name, unit, errors);
+        }
+        (DenseOpcode::DeclareClass, DenseOperands::DeclareClass { name }) => {
+            verify_name(*name, unit, errors);
+        }
         _ => errors.push(error(
             DenseVerifyErrorCode::InvalidOperandShape,
             format!(
@@ -3970,6 +4001,10 @@ fn render_operands(operands: &DenseOperands) -> String {
         DenseOperands::Include { dst, kind, path } => {
             format!("r{dst} {kind:?} {}", render_operand(*path))
         }
+        DenseOperands::DeclareFunction { name, function } => {
+            format!("n{name} fn{function}")
+        }
+        DenseOperands::DeclareClass { name } => format!("n{name}"),
     }
 }
 

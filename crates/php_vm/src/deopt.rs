@@ -1216,7 +1216,9 @@ fn reasons_for_instruction(instruction: &DenseInstruction) -> Vec<VmDeoptReason>
         | DenseOpcode::MakeClosure
         | DenseOpcode::CallMethod
         | DenseOpcode::CallStaticMethod
-        | DenseOpcode::Include => vec![VmDeoptReason::CallFrameBoundary],
+        | DenseOpcode::Include
+        | DenseOpcode::DeclareFunction
+        | DenseOpcode::DeclareClass => vec![VmDeoptReason::CallFrameBoundary],
         DenseOpcode::IssetDim => vec![VmDeoptReason::HelperStatus],
         DenseOpcode::LoadConstEcho | DenseOpcode::Echo => {
             vec![VmDeoptReason::OutputBufferState]

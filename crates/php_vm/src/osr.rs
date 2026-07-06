@@ -403,7 +403,9 @@ fn collect_live_slots(function: &DenseFunction, header: u32, backedge: u32) -> V
 
 fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSet<OsrVmSlot>) {
     match &instruction.operands {
-        DenseOperands::None => {}
+        DenseOperands::None
+        | DenseOperands::DeclareFunction { .. }
+        | DenseOperands::DeclareClass { .. } => {}
         DenseOperands::RegConst { dst, .. }
         | DenseOperands::RegName { dst, .. }
         | DenseOperands::Dst { dst } => {
