@@ -18,7 +18,8 @@ use std::collections::HashMap;
 
 use php_ir::instruction::TerminatorKind;
 use php_ir::{
-    BinaryOp, InstructionKind, IrConstant, IrFunction, IrReturnType, LocalId, Operand, RegId,
+    BasicBlock, BinaryOp, CompareOp, ConstId, InstructionKind, IrConstant, IrFunction,
+    IrReturnType, LocalId, Operand, RegId,
 };
 
 use crate::aarch64::{Aarch64Assembler, Cond, Label, Reg, X0, X3, X4, X5, X6};
@@ -553,17 +554,275 @@ pub fn build_scalar_int_region(
     Some((builder.finish(), result))
 }
 
-/// Recognize and lower a scalar-int leaf function to native code in one step.
-///
-/// Returns `None` when the function is outside the subset ([`build_scalar_int_region`])
-/// or the region cannot be compiled ([`compile_scalar_int_region`]).
+/// Recognize and lower a scalar-int function to native code in one step: a
+/// straight-line leaf ([`build_scalar_int_region`]) or a canonical counted `for`
+/// loop ([`compile_counted_loop_function`]). Returns `None` when the function is
+/// outside both subsets.
 pub fn compile_scalar_int_function(
     function: &IrFunction,
     constants: &[IrConstant],
     region_id: u32,
 ) -> Option<CompiledScalarRegion> {
-    let (graph, result) = build_scalar_int_region(function, constants, region_id)?;
-    compile_scalar_int_region(&graph, result).ok()
+    if let Some((graph, result)) = build_scalar_int_region(function, constants, region_id)
+        && let Ok(compiled) = compile_scalar_int_region(&graph, result)
+    {
+        return Some(compiled);
+    }
+    compile_counted_loop_function(function, constants)
+}
+
+/// Non-`Discard` instruction kinds of a block. `Discard` is a register-lifetime
+/// hint with no scalar-int semantics, so filtering it makes the shape matching
+/// direct.
+fn meaningful_kinds(block: &BasicBlock) -> Vec<InstructionKind> {
+    block
+        .instructions
+        .iter()
+        .map(|instruction| instruction.kind.clone())
+        .filter(|kind| !matches!(kind, InstructionKind::Discard { .. }))
+        .collect()
+}
+
+fn int_constant(constants: &[IrConstant], id: ConstId) -> Option<i64> {
+    match constants.get(id.index()) {
+        Some(IrConstant::Int(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Recognize a canonical counted `for` loop and lower it to a native
+/// [`CountedLoop`]. The matched shape (as the frontend lowers
+/// `for ($i = c; $i < $n; $i++) { $acc = $acc <op> $var; … }` in an
+/// `int`-returning free function) is exactly five blocks:
+///
+/// - entry: `[LoadConst; StoreLocal]*` initializers, then `jump header`;
+/// - header: `load counter; load limit; compare less; jump_if body exit`;
+/// - body: one or more `$L = $A <op> $B` accumulator statements, then `jump incr`;
+/// - incr: `$counter = $counter + 1`, then `jump header`;
+/// - exit: `load result; return result`.
+///
+/// Locals map to slots by index (`LocalId::raw`), matching the marshaling
+/// convention. Returns `None` for any other shape (the interpreter runs it).
+fn compile_counted_loop_function(
+    function: &IrFunction,
+    constants: &[IrConstant],
+) -> Option<CompiledScalarRegion> {
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    if function.return_type != Some(IrReturnType::Int) {
+        return None;
+    }
+    for param in &function.params {
+        if param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || param.type_ != Some(IrReturnType::Int)
+        {
+            return None;
+        }
+    }
+
+    let blocks = &function.blocks;
+    if blocks.len() != 5 {
+        return None;
+    }
+
+    // Entry block: initializer stores, then jump to the loop header.
+    let entry = blocks.first()?;
+    let entry_kinds = meaningful_kinds(entry);
+    if !entry_kinds.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut prologue = Vec::new();
+    for pair in entry_kinds.chunks_exact(2) {
+        let (
+            InstructionKind::LoadConst { dst, constant },
+            InstructionKind::StoreLocal {
+                local,
+                src: Operand::Register(store_reg),
+            },
+        ) = (&pair[0], &pair[1])
+        else {
+            return None;
+        };
+        if store_reg != dst {
+            return None;
+        }
+        prologue.push(ScalarIntOp::Const {
+            dst: local.raw(),
+            value: int_constant(constants, *constant)?,
+        });
+    }
+    let TerminatorKind::Jump { target: header_id } = entry.terminator.as_ref()?.kind else {
+        return None;
+    };
+
+    // Header block: `counter < limit`, branching to body / exit.
+    let header = blocks.get(header_id.index())?;
+    let (counter, limit, body_id, exit_id) = match meaningful_kinds(header).as_slice() {
+        [
+            InstructionKind::LoadLocal {
+                dst: counter_reg,
+                local: counter,
+            },
+            InstructionKind::LoadLocal {
+                dst: limit_reg,
+                local: limit,
+            },
+            InstructionKind::Compare {
+                dst: cmp,
+                op: CompareOp::Less,
+                lhs: Operand::Register(cmp_lhs),
+                rhs: Operand::Register(cmp_rhs),
+            },
+        ] if cmp_lhs == counter_reg && cmp_rhs == limit_reg => {
+            let TerminatorKind::JumpIf {
+                condition: Operand::Register(cond),
+                if_true,
+                if_false,
+            } = header.terminator.as_ref()?.kind
+            else {
+                return None;
+            };
+            if cond != *cmp {
+                return None;
+            }
+            (*counter, *limit, if_true, if_false)
+        }
+        _ => return None,
+    };
+
+    // Body block: accumulator statements, then jump to the increment block.
+    let body = blocks.get(body_id.index())?;
+    let body_kinds = meaningful_kinds(body);
+    if body_kinds.is_empty() || !body_kinds.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut loop_body = Vec::new();
+    for stmt in body_kinds.chunks_exact(4) {
+        let (
+            InstructionKind::LoadLocal {
+                dst: lhs_reg,
+                local: lhs_local,
+            },
+            InstructionKind::LoadLocal {
+                dst: rhs_reg,
+                local: rhs_local,
+            },
+            InstructionKind::Binary {
+                dst: result_reg,
+                op,
+                lhs: Operand::Register(bin_lhs),
+                rhs: Operand::Register(bin_rhs),
+            },
+            InstructionKind::StoreLocal {
+                local: store_local,
+                src: Operand::Register(store_reg),
+            },
+        ) = (&stmt[0], &stmt[1], &stmt[2], &stmt[3])
+        else {
+            return None;
+        };
+        if bin_lhs != lhs_reg || bin_rhs != rhs_reg || store_reg != result_reg {
+            return None;
+        }
+        loop_body.push(ScalarIntOp::Binary {
+            op: int_bin_op(*op)?,
+            dst: store_local.raw(),
+            lhs: lhs_local.raw(),
+            rhs: rhs_local.raw(),
+        });
+    }
+    let TerminatorKind::Jump { target: incr_id } = body.terminator.as_ref()?.kind else {
+        return None;
+    };
+
+    // Increment block: `counter = counter + 1`, then back to the header.
+    let incr = blocks.get(incr_id.index())?;
+    match meaningful_kinds(incr).as_slice() {
+        [
+            InstructionKind::LoadLocal {
+                dst: load_reg,
+                local: incr_local,
+            },
+            InstructionKind::LoadConst {
+                dst: one_reg,
+                constant: one,
+            },
+            InstructionKind::Binary {
+                dst: sum_reg,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(add_lhs),
+                rhs: Operand::Register(add_rhs),
+            },
+            InstructionKind::StoreLocal {
+                local: store_local,
+                src: Operand::Register(store_reg),
+            },
+        ] if *incr_local == counter
+            && *store_local == counter
+            && add_lhs == load_reg
+            && add_rhs == one_reg
+            && store_reg == sum_reg
+            && int_constant(constants, *one) == Some(1) => {}
+        _ => return None,
+    }
+    let TerminatorKind::Jump {
+        target: incr_target,
+    } = incr.terminator.as_ref()?.kind
+    else {
+        return None;
+    };
+    if incr_target != header_id {
+        return None;
+    }
+
+    // Exit block: return a local.
+    let exit = blocks.get(exit_id.index())?;
+    let result_local = match meaningful_kinds(exit).as_slice() {
+        [InstructionKind::LoadLocal { dst, local }] => {
+            let TerminatorKind::Return {
+                value: Some(Operand::Register(ret_reg)),
+                by_ref_local: None,
+            } = exit.terminator.as_ref()?.kind
+            else {
+                return None;
+            };
+            if ret_reg != *dst {
+                return None;
+            }
+            *local
+        }
+        _ => return None,
+    };
+
+    let counted = CountedLoop {
+        prologue,
+        counter: counter.raw(),
+        limit: limit.raw(),
+        body: loop_body,
+    };
+    let code = emit_counted_loop(&counted).ok()?;
+    Some(CompiledScalarRegion {
+        code,
+        result_slot: result_local.raw(),
+        buffer_slots: function.local_count,
+    })
+}
+
+/// Map an IR `BinaryOp` to the native scalar-int subset.
+fn int_bin_op(op: BinaryOp) -> Option<IntBinOp> {
+    match op {
+        BinaryOp::Add => Some(IntBinOp::Add),
+        BinaryOp::Sub => Some(IntBinOp::Sub),
+        BinaryOp::Mul => Some(IntBinOp::Mul),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -579,8 +838,9 @@ mod tests {
     };
     use php_ir::instruction::TerminatorKind;
     use php_ir::{
-        BasicBlock, BinaryOp, BlockId, FunctionFlags, InstrId, Instruction, InstructionKind,
-        IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId, Terminator,
+        BasicBlock, BinaryOp, BlockId, CompareOp, ConstId, FunctionFlags, InstrId, Instruction,
+        InstructionKind, IrConstant, IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId,
+        Terminator,
     };
 
     fn int_param(name: &str, local: u32) -> IrParam {
@@ -828,5 +1088,155 @@ mod tests {
         // Concatenation is a valid BinaryOp but outside the scalar-int subset.
         let function = binary_leaf(BinaryOp::Concat, IrReturnType::Int);
         assert!(build_scalar_int_region(&function, &[], 1).is_none());
+    }
+
+    /// Hand-build the IR the frontend lowers for
+    /// `function sum_to(int $n): int { $s = 0; for ($i=0; $i<$n; $i++) { $s = $s + $i; } return $s; }`
+    /// (locals: 0=$n, 1=$s, 2=$i), matching `php-vm dump-ir`.
+    fn sum_to_loop_function() -> php_ir::IrFunction {
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let load_local = |dst, local| {
+            ins(InstructionKind::LoadLocal {
+                dst: RegId::new(dst),
+                local: LocalId::new(local),
+            })
+        };
+        let load_const = |dst, constant| {
+            ins(InstructionKind::LoadConst {
+                dst: RegId::new(dst),
+                constant: ConstId::new(constant),
+            })
+        };
+        let store_local = |local, reg| {
+            ins(InstructionKind::StoreLocal {
+                local: LocalId::new(local),
+                src: Operand::Register(RegId::new(reg)),
+            })
+        };
+        let discard = |reg| {
+            ins(InstructionKind::Discard {
+                src: Operand::Register(RegId::new(reg)),
+            })
+        };
+        let add = |dst, lhs, rhs| {
+            ins(InstructionKind::Binary {
+                dst: RegId::new(dst),
+                op: BinaryOp::Add,
+                lhs: Operand::Register(RegId::new(lhs)),
+                rhs: Operand::Register(RegId::new(rhs)),
+            })
+        };
+        let term = |kind| Some(Terminator { span, kind });
+        let jump = |target| {
+            term(TerminatorKind::Jump {
+                target: BlockId::new(target),
+            })
+        };
+        let block = |id, instructions, terminator| BasicBlock {
+            id: BlockId::new(id),
+            instructions,
+            terminator,
+        };
+
+        php_ir::IrFunction {
+            name: "sum_to".to_string(),
+            params: vec![int_param("n", 0)],
+            locals: vec!["n".to_string(), "s".to_string(), "i".to_string()],
+            local_count: 3,
+            register_count: 12,
+            blocks: vec![
+                block(
+                    0,
+                    vec![
+                        load_const(0, 0),
+                        store_local(1, 0),
+                        discard(0),
+                        load_const(1, 0),
+                        store_local(2, 1),
+                        discard(1),
+                    ],
+                    jump(1),
+                ),
+                block(
+                    1,
+                    vec![
+                        load_local(2, 2),
+                        load_local(3, 0),
+                        ins(InstructionKind::Compare {
+                            dst: RegId::new(4),
+                            op: CompareOp::Less,
+                            lhs: Operand::Register(RegId::new(2)),
+                            rhs: Operand::Register(RegId::new(3)),
+                        }),
+                    ],
+                    term(TerminatorKind::JumpIf {
+                        condition: Operand::Register(RegId::new(4)),
+                        if_true: BlockId::new(3),
+                        if_false: BlockId::new(2),
+                    }),
+                ),
+                block(
+                    2,
+                    vec![load_local(11, 1)],
+                    term(TerminatorKind::Return {
+                        value: Some(Operand::Register(RegId::new(11))),
+                        by_ref_local: None,
+                    }),
+                ),
+                block(
+                    3,
+                    vec![
+                        load_local(5, 1),
+                        load_local(6, 2),
+                        add(7, 5, 6),
+                        store_local(1, 7),
+                        discard(7),
+                    ],
+                    jump(4),
+                ),
+                block(
+                    4,
+                    vec![
+                        load_local(8, 2),
+                        load_const(9, 1),
+                        add(10, 8, 9),
+                        store_local(2, 10),
+                        discard(8),
+                    ],
+                    jump(1),
+                ),
+            ],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recognizes_a_counted_for_loop() {
+        let function = sum_to_loop_function();
+        let constants = [IrConstant::Int(0), IrConstant::Int(1)];
+        let compiled = compile_scalar_int_function(&function, &constants, 1)
+            .expect("counted for-loop recognized and compiled");
+        // Locals map to slots: $n=0 (limit), $s=1 (result), $i=2 (counter).
+        assert_eq!(compiled.result_slot, 1);
+        assert_eq!(compiled.buffer_slots, 3);
+        assert!(!compiled.code.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_loop_that_increments_by_a_non_one_step() {
+        // Change the increment constant from 1 to 2: no longer a `$i++` loop.
+        let function = sum_to_loop_function();
+        let constants = [IrConstant::Int(0), IrConstant::Int(2)];
+        assert!(compile_scalar_int_function(&function, &constants, 1).is_none());
     }
 }
