@@ -16590,29 +16590,28 @@ impl Vm {
                             return result;
                         }
                         let class_owner = class_owner_in_state(compiled, state, &class.name);
-                        let runtime_class = match self
-                            .cached_runtime_class_entry(&class_owner, state, &class)
-                        {
-                            Ok(class) => class,
-                            Err(error) => {
-                                match self.raise_runtime_class_entry_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut exception_handlers,
-                                    &mut pending_control,
-                                    instruction.span,
-                                    error,
-                                ) {
-                                    RaiseOutcome::Caught(target) => {
-                                        block_id = target;
-                                        continue 'dispatch;
+                        let runtime_class =
+                            match self.cached_runtime_class_entry(&class_owner, state, &class) {
+                                Ok(class) => class,
+                                Err(error) => {
+                                    match self.raise_runtime_class_entry_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        error,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
                                     }
-                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                            }
-                        };
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             match self.raise_runtime_error(
                                 compiled,
@@ -17977,29 +17976,28 @@ impl Vm {
                             }
                         }
                         let class_owner = class_owner_in_state(compiled, state, &class.name);
-                        let runtime_class = match self
-                            .cached_runtime_class_entry(&class_owner, state, &class)
-                        {
-                            Ok(class) => class,
-                            Err(error) => {
-                                match self.raise_runtime_class_entry_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut exception_handlers,
-                                    &mut pending_control,
-                                    instruction.span,
-                                    error,
-                                ) {
-                                    RaiseOutcome::Caught(target) => {
-                                        block_id = target;
-                                        continue 'dispatch;
+                        let runtime_class =
+                            match self.cached_runtime_class_entry(&class_owner, state, &class) {
+                                Ok(class) => class,
+                                Err(error) => {
+                                    match self.raise_runtime_class_entry_error(
+                                        compiled,
+                                        output,
+                                        stack,
+                                        state,
+                                        &mut exception_handlers,
+                                        &mut pending_control,
+                                        instruction.span,
+                                        error,
+                                    ) {
+                                        RaiseOutcome::Caught(target) => {
+                                            block_id = target;
+                                            continue 'dispatch;
+                                        }
+                                        RaiseOutcome::Done(result) => return *result,
                                     }
-                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                            }
-                        };
+                            };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
                             match self.raise_runtime_error(
                                 compiled,
