@@ -37,6 +37,14 @@ pub const XZR: Reg = 31;
 /// Link register (return address), used by `ret`.
 pub const LR: Reg = 30;
 
+/// Double-precision FP scratch registers (a separate register file from the
+/// `x` GPRs; the same small indices address `d0..d31` in FP-form instructions).
+pub const D0: Reg = 0;
+/// Double-precision FP scratch register.
+pub const D1: Reg = 1;
+/// Double-precision FP scratch register.
+pub const D2: Reg = 2;
+
 /// Condition codes for conditional branches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cond {
@@ -271,6 +279,61 @@ impl Aarch64Assembler {
     pub fn str_x(&mut self, rt: Reg, rn: Reg, byte_offset: u32) {
         let imm12 = byte_offset / 8;
         self.emit(0xF900_0000 | (imm12 << 10) | (u32::from(rn) << 5) | u32::from(rt));
+    }
+
+    // --- Double-precision floating point ---
+    //
+    // FP registers `d0..d31` are a separate register file from `x0..x30`; the
+    // same small indices (`D0 = 0`, …) address them inside FP-form instructions.
+    // The native tier stores a PHP float as the raw IEEE-754 bits in the slot
+    // payload (tag `FloatBits`), so a float slot is loaded/stored with `ldr_d` /
+    // `str_d` at the same payload offset an `i64` would use.
+
+    /// `ldr Dt, [Xn, #byte_offset]` — load a 64-bit double. Multiple of 8.
+    pub fn ldr_d(&mut self, dt: Reg, rn: Reg, byte_offset: u32) {
+        let imm12 = byte_offset / 8;
+        self.emit(0xFD40_0000 | (imm12 << 10) | (u32::from(rn) << 5) | u32::from(dt));
+    }
+
+    /// `str Dt, [Xn, #byte_offset]` — store a 64-bit double. Multiple of 8.
+    pub fn str_d(&mut self, dt: Reg, rn: Reg, byte_offset: u32) {
+        let imm12 = byte_offset / 8;
+        self.emit(0xFD00_0000 | (imm12 << 10) | (u32::from(rn) << 5) | u32::from(dt));
+    }
+
+    /// `fmov Dd, Xn` — copy the raw 64-bit pattern of a general register into a
+    /// double register (materializing a constant float loaded via `mov_imm64`).
+    pub fn fmov_gp_to_fp(&mut self, dd: Reg, rn: Reg) {
+        self.emit(0x9E67_0000 | (u32::from(rn) << 5) | u32::from(dd));
+    }
+
+    /// `fadd Dd, Dn, Dm` (double-precision add).
+    pub fn fadd(&mut self, dd: Reg, dn: Reg, dm: Reg) {
+        self.emit(0x1E60_2800 | (u32::from(dm) << 16) | (u32::from(dn) << 5) | u32::from(dd));
+    }
+
+    /// `fsub Dd, Dn, Dm` (double-precision subtract).
+    pub fn fsub(&mut self, dd: Reg, dn: Reg, dm: Reg) {
+        self.emit(0x1E60_3800 | (u32::from(dm) << 16) | (u32::from(dn) << 5) | u32::from(dd));
+    }
+
+    /// `fmul Dd, Dn, Dm` (double-precision multiply).
+    pub fn fmul(&mut self, dd: Reg, dn: Reg, dm: Reg) {
+        self.emit(0x1E60_0800 | (u32::from(dm) << 16) | (u32::from(dn) << 5) | u32::from(dd));
+    }
+
+    /// `fdiv Dd, Dn, Dm` (double-precision divide). PHP `/` throws on a zero
+    /// divisor, so callers guard the divisor with [`Aarch64Assembler::fcmp_zero`]
+    /// and side-exit before dividing.
+    pub fn fdiv(&mut self, dd: Reg, dn: Reg, dm: Reg) {
+        self.emit(0x1E60_1800 | (u32::from(dm) << 16) | (u32::from(dn) << 5) | u32::from(dd));
+    }
+
+    /// `fcmp Dn, #0.0` — compare a double against zero, setting the flags. `+0.0`
+    /// and `-0.0` both set `Z` (equal), so a following `b.eq` catches both signed
+    /// zeros; a NaN operand sets the unordered flags (neither `<`/`>` nor `==`).
+    pub fn fcmp_zero(&mut self, dn: Reg) {
+        self.emit(0x1E60_2008 | (u32::from(dn) << 5));
     }
 
     /// `cmp Wn, #imm12` — compare a 32-bit register to an immediate, setting

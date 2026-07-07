@@ -48,7 +48,12 @@ function sum_below(int $n): int {
     return $s;
 }
 
+function fma(float $a, float $b): float {
+    return $a * $b + $a / 2.0;
+}
+
 $acc = 0;
+$facc = 0.0;
 for ($i = 0; $i < 8; $i++) {
     $acc = $acc + arith($i, 3);
     $acc = $acc + modulo($i, 5);
@@ -57,5 +62,7 @@ for ($i = 0; $i < 8; $i++) {
     $acc = $acc + (is_less($i, 4) ? 100 : 200);
     $acc = $acc + max2($i, 4);
     $acc = $acc + sum_below($i);
+    $facc = $facc + fma($i + 0.5, 1.5);
 }
 echo $acc, "\n";
+echo $facc, "\n";

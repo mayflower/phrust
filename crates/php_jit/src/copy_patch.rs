@@ -22,7 +22,7 @@ use php_ir::{
     IrReturnType, LocalId, Operand, RegId,
 };
 
-use crate::aarch64::{Aarch64Assembler, Cond, Label, Reg, X0, X3, X4, X5, X6};
+use crate::aarch64::{Aarch64Assembler, Cond, D0, D1, D2, Label, Reg, X0, X3, X4, X5, X6};
 use crate::abi::JitCValueTag;
 use crate::region_ir::{
     NodeId, RegionBuilder, RegionCompareOp, RegionConst, RegionGraph, RegionId, RegionNode,
@@ -31,6 +31,7 @@ use crate::region_ir::{
 
 const INT_TAG: u16 = JitCValueTag::Int as u16;
 const BOOL_TAG: u16 = JitCValueTag::Bool as u16;
+const FLOAT_TAG: u16 = JitCValueTag::FloatBits as u16;
 
 /// A single guarded PHP integer-add step: `slot[dst] = slot[lhs] + slot[rhs]`.
 ///
@@ -191,6 +192,103 @@ pub enum ScalarIntOp {
     Copy { dst: u32, src: u32 },
 }
 
+/// A binary PHP float operation over IEEE-754 doubles. Add/Sub/Mul never fault
+/// (they saturate to ±inf / NaN like PHP); Div carries a zero-divisor guard
+/// because PHP `/` raises `DivisionByZeroError` on a zero divisor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatBinOp {
+    /// `lhs + rhs`.
+    Add,
+    /// `lhs - rhs`.
+    Sub,
+    /// `lhs * rhs`.
+    Mul,
+    /// `lhs / rhs`, side exit on a zero divisor (`+0.0` and `-0.0`).
+    Div,
+}
+
+impl FloatBinOp {
+    /// Emit the operation on `D0`/`D1` into `D2`, taking `deopt` on a zero
+    /// divisor (Div only).
+    fn emit(self, asm: &mut Aarch64Assembler, deopt: Label) {
+        match self {
+            FloatBinOp::Add => asm.fadd(D2, D0, D1),
+            FloatBinOp::Sub => asm.fsub(D2, D0, D1),
+            FloatBinOp::Mul => asm.fmul(D2, D0, D1),
+            FloatBinOp::Div => {
+                asm.fcmp_zero(D1);
+                asm.b_cond(Cond::Equal, deopt);
+                asm.fdiv(D2, D0, D1);
+            }
+        }
+    }
+}
+
+/// A single scalar-float operation over the flat slot buffer. Mirrors
+/// [`ScalarIntOp`] for `FloatBits`-tagged values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarFloatOp {
+    /// Materialize a statically-known `float` (given as its IEEE-754 bits) into
+    /// `slot[dst]` (no guard needed).
+    Const { dst: u32, bits: u64 },
+    /// Copy a whole value (tag + payload + aux) `slot[dst] = slot[src]`.
+    Copy { dst: u32, src: u32 },
+    /// Guarded binary float op `slot[dst] = slot[lhs] <op> slot[rhs]`, with
+    /// `FloatBits` guards on both operands and a zero-divisor side exit for Div.
+    Binary {
+        op: FloatBinOp,
+        dst: u32,
+        lhs: u32,
+        rhs: u32,
+    },
+}
+
+fn check_float_op_slots(op: ScalarFloatOp) -> Result<(), SlotSequenceError> {
+    match op {
+        ScalarFloatOp::Const { dst, .. } => check_slot(dst),
+        ScalarFloatOp::Copy { dst, src } => {
+            check_slot(dst)?;
+            check_slot(src)
+        }
+        ScalarFloatOp::Binary { dst, lhs, rhs, .. } => {
+            check_slot(dst)?;
+            check_slot(lhs)?;
+            check_slot(rhs)
+        }
+    }
+}
+
+/// Emit a copy of the whole 24-byte value `slot[dst] = slot[src]` (tag +
+/// payload + aux); the tag travels with the value so downstream ops still guard.
+fn emit_value_copy(asm: &mut Aarch64Assembler, dst: u32, src: u32) {
+    asm.ldr_w(X3, X0, tag_off(src));
+    asm.str_w(X3, X0, tag_off(dst));
+    asm.ldr_x(X4, X0, payload_off(src));
+    asm.str_x(X4, X0, payload_off(dst));
+    asm.ldr_x(X5, X0, aux_off(src));
+    asm.str_x(X5, X0, aux_off(dst));
+}
+
+fn emit_float_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarFloatOp) {
+    match op {
+        ScalarFloatOp::Const { dst, bits } => {
+            asm.mov_imm64(X6, bits);
+            asm.movz(X3, FLOAT_TAG);
+            asm.str_w(X3, X0, tag_off(dst));
+            asm.str_x(X6, X0, payload_off(dst));
+        }
+        ScalarFloatOp::Copy { dst, src } => emit_value_copy(asm, dst, src),
+        ScalarFloatOp::Binary { op, dst, lhs, rhs } => {
+            emit_float_guard(asm, deopt, lhs);
+            emit_float_guard(asm, deopt, rhs);
+            asm.ldr_d(D0, X0, payload_off(lhs));
+            asm.ldr_d(D1, X0, payload_off(rhs));
+            op.emit(asm, deopt);
+            emit_store_float(asm, dst, D2);
+        }
+    }
+}
+
 fn check_slot(slot: u32) -> Result<(), SlotSequenceError> {
     if slot > MAX_SLOT {
         Err(SlotSequenceError::SlotIndexOutOfRange(slot))
@@ -227,6 +325,20 @@ fn emit_store_bool(asm: &mut Aarch64Assembler, dst: u32, value: Reg) {
     asm.movz(X3, BOOL_TAG);
     asm.str_w(X3, X0, tag_off(dst));
     asm.str_x(value, X0, payload_off(dst));
+}
+
+/// Guard that `slot`'s tag is `FloatBits`, taking the side exit otherwise.
+fn emit_float_guard(asm: &mut Aarch64Assembler, deopt: Label, slot: u32) {
+    asm.ldr_w(X3, X0, tag_off(slot));
+    asm.cmp_imm_w(X3, FLOAT_TAG);
+    asm.b_cond(Cond::NotEqual, deopt);
+}
+
+/// Write the double register `value` to `slot[dst]` tagged as `FloatBits`.
+fn emit_store_float(asm: &mut Aarch64Assembler, dst: u32, value: Reg) {
+    asm.movz(X3, FLOAT_TAG);
+    asm.str_w(X3, X0, tag_off(dst));
+    asm.str_d(value, X0, payload_off(dst));
 }
 
 /// Emit a native `extern "C" fn(slot_base: *mut JitCValue) -> i32` that applies
@@ -267,16 +379,7 @@ fn emit_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarIntOp) {
             asm.mov_imm64(X6, value as u64);
             emit_store_int(asm, dst, X6);
         }
-        ScalarIntOp::Copy { dst, src } => {
-            // Move the whole 24-byte value (tag + payload + aux); no guard, the
-            // tag travels with the value so downstream ops still guard correctly.
-            asm.ldr_w(X3, X0, tag_off(src));
-            asm.str_w(X3, X0, tag_off(dst));
-            asm.ldr_x(X4, X0, payload_off(src));
-            asm.str_x(X4, X0, payload_off(dst));
-            asm.ldr_x(X5, X0, aux_off(src));
-            asm.str_x(X5, X0, aux_off(dst));
-        }
+        ScalarIntOp::Copy { dst, src } => emit_value_copy(asm, dst, src),
         ScalarIntOp::Binary { op, dst, lhs, rhs } => {
             emit_int_guard(asm, deopt, lhs);
             emit_int_guard(asm, deopt, rhs);
@@ -317,6 +420,26 @@ pub fn emit_scalar_int_ops(ops: &[ScalarIntOp]) -> Result<Vec<u8>, SlotSequenceE
     let deopt = asm.new_label();
     for op in ops {
         emit_op(&mut asm, deopt, *op);
+    }
+    asm.movz(X0, 0);
+    asm.ret();
+    asm.bind(deopt);
+    asm.movz(X0, 1);
+    asm.ret();
+    Ok(asm.finish())
+}
+
+/// Emit a native `extern "C" fn(slot_base: *mut JitCValue) -> i32` that applies
+/// each scalar-float op in order over the caller's flat slot buffer. Returns `0`
+/// on success, `1` on a side exit (non-`FloatBits` operand or a zero divisor).
+pub fn emit_scalar_float_ops(ops: &[ScalarFloatOp]) -> Result<Vec<u8>, SlotSequenceError> {
+    for op in ops {
+        check_float_op_slots(*op)?;
+    }
+    let mut asm = Aarch64Assembler::new();
+    let deopt = asm.new_label();
+    for op in ops {
+        emit_float_op(&mut asm, deopt, *op);
     }
     asm.movz(X0, 0);
     asm.ret();
@@ -738,7 +861,10 @@ pub fn compile_scalar_int_function(
     if let Some(compiled) = compile_counted_loop_function(function, constants) {
         return Some(compiled);
     }
-    compile_scalar_int_cfg(function, constants)
+    if let Some(compiled) = compile_scalar_int_cfg(function, constants) {
+        return Some(compiled);
+    }
+    compile_scalar_float_leaf(function, constants)
 }
 
 /// Non-`Discard` instruction kinds of a block. `Discard` is a register-lifetime
@@ -1194,6 +1320,132 @@ fn compile_scalar_int_cfg(
 
     Some(CompiledScalarRegion {
         code: asm.finish(),
+        result_slot,
+        buffer_slots,
+    })
+}
+
+/// Map an IR `BinaryOp` to the native scalar-float subset (`Div` is included
+/// because float `/` is float-typed, unlike int `/`).
+fn float_bin_op(op: BinaryOp) -> Option<FloatBinOp> {
+    match op {
+        BinaryOp::Add => Some(FloatBinOp::Add),
+        BinaryOp::Sub => Some(FloatBinOp::Sub),
+        BinaryOp::Mul => Some(FloatBinOp::Mul),
+        BinaryOp::Div => Some(FloatBinOp::Div),
+        _ => None,
+    }
+}
+
+fn float_constant(constants: &[IrConstant], id: ConstId) -> Option<u64> {
+    match constants.get(id.index()) {
+        Some(IrConstant::Float(value)) => Some(value.to_bits()),
+        _ => None,
+    }
+}
+
+/// Recognize and lower a straight-line scalar-**float** leaf function to native
+/// code: a single block of `float`-typed by-value params returning `float`,
+/// whose body is `LoadLocal` / `LoadConst`(float) / `Move` / `Binary`
+/// (`Add`/`Sub`/`Mul`/`Div`) over register operands, then `Return`. Every SSA
+/// register gets its own slot (like [`compile_scalar_int_cfg`]); the returned
+/// value is copied to a dedicated result slot. Returns `None` for any other
+/// shape (the interpreter runs it). Div carries a zero-divisor side exit.
+fn compile_scalar_float_leaf(
+    function: &IrFunction,
+    constants: &[IrConstant],
+) -> Option<CompiledScalarRegion> {
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    if function.return_type != Some(IrReturnType::Float) {
+        return None;
+    }
+    for param in &function.params {
+        if param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || param.type_ != Some(IrReturnType::Float)
+        {
+            return None;
+        }
+    }
+    // Single-block leaf only; branches/loops over floats are a later step.
+    if function.blocks.len() != 1 {
+        return None;
+    }
+    let block = function.blocks.first()?;
+
+    let local_count = function.local_count;
+    let result_slot = local_count.checked_add(function.register_count)?;
+    let buffer_slots = result_slot.checked_add(1)?;
+    if result_slot > MAX_SLOT {
+        return None;
+    }
+    let reg_slot = |r: RegId| local_count + r.raw();
+
+    let mut ops = Vec::new();
+    for kind in meaningful_kinds(block) {
+        let op = match &kind {
+            InstructionKind::LoadLocal { dst, local }
+            | InstructionKind::LoadLocalQuiet { dst, local } => ScalarFloatOp::Copy {
+                dst: reg_slot(*dst),
+                src: local.raw(),
+            },
+            InstructionKind::LoadConst { dst, constant } => ScalarFloatOp::Const {
+                dst: reg_slot(*dst),
+                bits: float_constant(constants, *constant)?,
+            },
+            InstructionKind::Move {
+                dst,
+                src: Operand::Register(src),
+            } => ScalarFloatOp::Copy {
+                dst: reg_slot(*dst),
+                src: reg_slot(*src),
+            },
+            InstructionKind::Move {
+                dst,
+                src: Operand::Constant(c),
+            } => ScalarFloatOp::Const {
+                dst: reg_slot(*dst),
+                bits: float_constant(constants, *c)?,
+            },
+            InstructionKind::Binary {
+                dst,
+                op,
+                lhs: Operand::Register(lhs),
+                rhs: Operand::Register(rhs),
+            } => ScalarFloatOp::Binary {
+                op: float_bin_op(*op)?,
+                dst: reg_slot(*dst),
+                lhs: reg_slot(*lhs),
+                rhs: reg_slot(*rhs),
+            },
+            _ => return None,
+        };
+        ops.push(op);
+    }
+
+    // Terminator: return a register value, copied into the result slot.
+    let TerminatorKind::Return {
+        value: Some(Operand::Register(reg)),
+        by_ref_local: None,
+    } = &block.terminator.as_ref()?.kind
+    else {
+        return None;
+    };
+    ops.push(ScalarFloatOp::Copy {
+        dst: result_slot,
+        src: reg_slot(*reg),
+    });
+
+    let code = emit_scalar_float_ops(&ops).ok()?;
+    Some(CompiledScalarRegion {
+        code,
         result_slot,
         buffer_slots,
     })
@@ -1933,6 +2185,96 @@ mod tests {
         assert_eq!(compiled.result_slot, 8);
         assert_eq!(compiled.buffer_slots, 9);
         assert!(!compiled.code.is_empty());
+    }
+
+    fn float_param(name: &str, local: u32) -> IrParam {
+        IrParam {
+            name: name.to_string(),
+            local: LocalId::new(local),
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Float),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        }
+    }
+
+    /// `function fma(float $a, float $b): float { return $a * $b + $a; }`
+    fn float_leaf_function(op: BinaryOp, return_type: IrReturnType) -> php_ir::IrFunction {
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        php_ir::IrFunction {
+            name: "f".to_string(),
+            params: vec![float_param("a", 0), float_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 4,
+            blocks: vec![BasicBlock {
+                id: BlockId::new(0),
+                instructions: vec![
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(0),
+                        local: LocalId::new(0),
+                    }),
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(1),
+                        local: LocalId::new(1),
+                    }),
+                    ins(InstructionKind::Binary {
+                        dst: RegId::new(2),
+                        op,
+                        lhs: Operand::Register(RegId::new(0)),
+                        rhs: Operand::Register(RegId::new(1)),
+                    }),
+                ],
+                terminator: Some(Terminator {
+                    span,
+                    kind: TerminatorKind::Return {
+                        value: Some(Operand::Register(RegId::new(2))),
+                        by_ref_local: None,
+                    },
+                }),
+            }],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(return_type),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recognizes_a_scalar_float_leaf() {
+        // function f(float $a, float $b): float { return $a / $b; }
+        let function = float_leaf_function(BinaryOp::Div, IrReturnType::Float);
+        let compiled = compile_scalar_int_function(&function, &[], 1)
+            .expect("scalar-float leaf recognized and compiled");
+        // Locals 0,1; registers 0..4 map to slots 2..6; result slot at 2+4 = 6.
+        assert_eq!(compiled.result_slot, 6);
+        assert_eq!(compiled.buffer_slots, 7);
+        assert!(!compiled.code.is_empty());
+    }
+
+    #[test]
+    fn float_leaf_rejects_a_non_float_return() {
+        // A float-param body returning int is not the float-leaf shape (and the
+        // int leaf rejects float params), so no native lowering applies.
+        let function = float_leaf_function(BinaryOp::Add, IrReturnType::Int);
+        assert!(compile_scalar_int_function(&function, &[], 1).is_none());
+    }
+
+    #[test]
+    fn float_bin_op_rejects_out_of_subset_ops() {
+        // Modulo and concat are not float-native; only +,-,*,/ are.
+        assert_eq!(super::float_bin_op(BinaryOp::Mod), None);
+        assert_eq!(super::float_bin_op(BinaryOp::Concat), None);
+        assert!(super::float_bin_op(BinaryOp::Div).is_some());
     }
 
     #[test]

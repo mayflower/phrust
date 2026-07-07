@@ -856,6 +856,61 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored --nocapture"]
+    fn bench_native_float_throughput() {
+        use crate::JitCValue;
+        use crate::copy_patch::{FloatBinOp, ScalarFloatOp, emit_scalar_float_ops};
+        use std::time::Instant;
+
+        // A chain of guarded float adds: acc = a + a, then acc += a repeatedly.
+        const ADD_OPS: usize = 500;
+        let mut ops = vec![ScalarFloatOp::Binary {
+            op: FloatBinOp::Add,
+            dst: 2,
+            lhs: 0,
+            rhs: 0,
+        }];
+        for _ in 1..ADD_OPS {
+            ops.push(ScalarFloatOp::Binary {
+                op: FloatBinOp::Add,
+                dst: 2,
+                lhs: 2,
+                rhs: 0,
+            });
+        }
+        let code = emit_scalar_float_ops(&ops).expect("float ops emit");
+        let mem = CodeMemory::new(&code).expect("code memory should finalize");
+        // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
+        let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut JitCValue) -> i32>(mem.as_ptr())
+        };
+
+        let mut buffer = [
+            JitCValue::float(1.0),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+        ];
+        for _ in 0..1000 {
+            assert_eq!(run(buffer.as_mut_ptr()), 0);
+        }
+
+        let iters: u64 = 200_000;
+        let start = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(run(buffer.as_mut_ptr()));
+        }
+        let elapsed = start.elapsed();
+
+        let total_ops = iters * ADD_OPS as u64;
+        let ns_per_op = elapsed.as_nanos() as f64 / total_ops as f64;
+        println!(
+            "native scalar-float add: {ns_per_op:.3} ns/op  ({iters} iters x {ADD_OPS} ops = {total_ops} ops in {elapsed:?})"
+        );
+        // acc = 1.0 (a+a) then +1.0 each of the remaining ops => ADD_OPS + 1.
+        assert_eq!(f64::from_bits(buffer[2].payload), (ADD_OPS as f64) + 1.0);
+    }
+
     // A native counted loop executed end-to-end: for (i=0; i<n; i++) s += i.
     // The whole loop runs natively with no per-iteration interpreter dispatch —
     // the shape where the tier's real speedup lives.
@@ -997,6 +1052,22 @@ mod tests {
         use crate::JitCValue;
         use crate::copy_patch::emit_scalar_int_ops;
         let code = emit_scalar_int_ops(ops).expect("scalar-int ops emit");
+        let mem = CodeMemory::new(&code).expect("code memory should finalize");
+        // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
+        let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut JitCValue) -> i32>(mem.as_ptr())
+        };
+        run(slots.as_mut_ptr())
+    }
+
+    /// Flat scalar-**float** op-sequence variant of [`run_scalar_ops`].
+    fn run_scalar_float_ops(
+        ops: &[crate::copy_patch::ScalarFloatOp],
+        slots: &mut [crate::JitCValue],
+    ) -> i32 {
+        use crate::JitCValue;
+        use crate::copy_patch::emit_scalar_float_ops;
+        let code = emit_scalar_float_ops(ops).expect("scalar-float ops emit");
         let mem = CodeMemory::new(&code).expect("code memory should finalize");
         // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
         let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
@@ -1380,6 +1451,246 @@ mod tests {
         zero[0] = JitCValue::int(0);
         assert_eq!(run(zero.as_mut_ptr()), 0);
         assert_eq!(zero[result].payload as i64, 0);
+    }
+
+    #[test]
+    fn executes_native_float_arithmetic() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::{FloatBinOp, ScalarFloatOp};
+
+        // slot[2] = (a + b) via a Const rhs and a Binary; a=1.5, then + 2.25.
+        let mut slots = [
+            JitCValue::float(1.5),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[
+                    ScalarFloatOp::Const {
+                        dst: 1,
+                        bits: 2.25f64.to_bits(),
+                    },
+                    ScalarFloatOp::Binary {
+                        op: FloatBinOp::Add,
+                        dst: 2,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                ],
+                &mut slots,
+            ),
+            0
+        );
+        assert_eq!(slots[2].tag, JitCValueTag::FloatBits);
+        assert_eq!(f64::from_bits(slots[2].payload), 3.75);
+
+        // 10.0 / 4.0 = 2.5 (float division is float-typed).
+        let mut div = [
+            JitCValue::float(10.0),
+            JitCValue::float(4.0),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[ScalarFloatOp::Binary {
+                    op: FloatBinOp::Div,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }],
+                &mut div,
+            ),
+            0
+        );
+        assert_eq!(f64::from_bits(div[2].payload), 2.5);
+
+        // Sub and Mul: (3.0 - 0.5) * 2.0 chained through slot 2.
+        let mut chain = [
+            JitCValue::float(3.0),
+            JitCValue::float(0.5),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[
+                    ScalarFloatOp::Binary {
+                        op: FloatBinOp::Sub,
+                        dst: 2,
+                        lhs: 0,
+                        rhs: 1,
+                    },
+                    ScalarFloatOp::Const {
+                        dst: 1,
+                        bits: 2.0f64.to_bits(),
+                    },
+                    ScalarFloatOp::Binary {
+                        op: FloatBinOp::Mul,
+                        dst: 2,
+                        lhs: 2,
+                        rhs: 1,
+                    },
+                ],
+                &mut chain,
+            ),
+            0
+        );
+        assert_eq!(f64::from_bits(chain[2].payload), 5.0);
+    }
+
+    #[test]
+    fn executes_scalar_float_leaf_end_to_end() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::compile_scalar_int_function;
+        use php_ir::instruction::TerminatorKind;
+        use php_ir::{
+            BasicBlock, BinaryOp, BlockId, FunctionFlags, InstrId, Instruction, InstructionKind,
+            IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId, Terminator,
+        };
+
+        // function div(float $a, float $b): float { return $a / $b; }
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let float_param = |name: &str, local| IrParam {
+            name: name.to_string(),
+            local: LocalId::new(local),
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Float),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        };
+        let function = php_ir::IrFunction {
+            name: "div".to_string(),
+            params: vec![float_param("a", 0), float_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 3,
+            blocks: vec![BasicBlock {
+                id: BlockId::new(0),
+                instructions: vec![
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(0),
+                        local: LocalId::new(0),
+                    }),
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(1),
+                        local: LocalId::new(1),
+                    }),
+                    ins(InstructionKind::Binary {
+                        dst: RegId::new(2),
+                        op: BinaryOp::Div,
+                        lhs: Operand::Register(RegId::new(0)),
+                        rhs: Operand::Register(RegId::new(1)),
+                    }),
+                ],
+                terminator: Some(Terminator {
+                    span,
+                    kind: TerminatorKind::Return {
+                        value: Some(Operand::Register(RegId::new(2))),
+                        by_ref_local: None,
+                    },
+                }),
+            }],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Float),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        };
+
+        let compiled = compile_scalar_int_function(&function, &[], 1).expect("float leaf compiles");
+        let mem = CodeMemory::new(&compiled.code).expect("code memory should finalize");
+        // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
+        let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut JitCValue) -> i32>(mem.as_ptr())
+        };
+        let result = compiled.result_slot as usize;
+
+        // 7.0 / 2.0 = 3.5.
+        let mut slots = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        slots[0] = JitCValue::float(7.0);
+        slots[1] = JitCValue::float(2.0);
+        assert_eq!(run(slots.as_mut_ptr()), 0);
+        assert_eq!(slots[result].tag, JitCValueTag::FloatBits);
+        assert_eq!(f64::from_bits(slots[result].payload), 3.5);
+
+        // Zero divisor -> side exit (interpreter raises DivisionByZeroError).
+        let mut zero = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        zero[0] = JitCValue::float(1.0);
+        zero[1] = JitCValue::float(0.0);
+        assert_eq!(run(zero.as_mut_ptr()), 1);
+    }
+
+    #[test]
+    fn float_div_by_zero_and_non_float_operand_side_exit() {
+        use crate::JitCValue;
+        use crate::copy_patch::{FloatBinOp, ScalarFloatOp};
+
+        // x / 0.0 -> side exit (the interpreter raises DivisionByZeroError).
+        let mut by_zero = [
+            JitCValue::float(1.0),
+            JitCValue::float(0.0),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[ScalarFloatOp::Binary {
+                    op: FloatBinOp::Div,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }],
+                &mut by_zero,
+            ),
+            1
+        );
+
+        // -0.0 divisor also side-exits (fcmp treats +0.0 and -0.0 as equal).
+        let mut neg_zero = [
+            JitCValue::float(1.0),
+            JitCValue::float(-0.0),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[ScalarFloatOp::Binary {
+                    op: FloatBinOp::Div,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }],
+                &mut neg_zero,
+            ),
+            1
+        );
+
+        // A non-float (int) operand fails the FloatBits guard.
+        let mut wrong_tag = [
+            JitCValue::float(1.0),
+            JitCValue::int(2),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(
+            run_scalar_float_ops(
+                &[ScalarFloatOp::Binary {
+                    op: FloatBinOp::Add,
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                }],
+                &mut wrong_tag,
+            ),
+            1
+        );
     }
 
     #[test]

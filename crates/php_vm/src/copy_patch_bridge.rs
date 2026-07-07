@@ -39,26 +39,30 @@ use std::rc::Rc;
 
 /// Marshal a VM `Value` into the flat-buffer `JitCValue` the native tier reads.
 ///
-/// Only scalar ints and bools cross as themselves. Every other value (strings,
-/// arrays, objects, references, floats, null, uninitialized, …) becomes
-/// `Uninitialized`, so the region's `Int` guard takes the interpreter side exit
-/// instead of misinterpreting a heap handle or non-int scalar as an integer.
+/// Only scalar ints, bools, and floats cross as themselves. Every other value
+/// (strings, arrays, objects, references, null, uninitialized, …) becomes
+/// `Uninitialized`, so the region's type guard takes the interpreter side exit
+/// instead of misinterpreting a heap handle or wrong-typed scalar.
 #[cfg(all(unix, target_arch = "aarch64"))]
 fn marshal_local(value: &Value) -> JitCValue {
     match value {
         Value::Int(int) => JitCValue::int(*int),
         Value::Bool(boolean) => JitCValue::bool(*boolean),
+        Value::Float(float) => JitCValue::float(float.to_f64()),
         _ => JitCValue::uninitialized(),
     }
 }
 
 /// Marshal a native result `JitCValue` back to a VM `Value`. Returns `None` for
-/// any tag the scalar-int tier does not produce as a committed result.
+/// any tag the scalar tier does not produce as a committed result.
 #[cfg(all(unix, target_arch = "aarch64"))]
 fn unmarshal_result(value: &JitCValue) -> Option<Value> {
     match value.tag {
         JitCValueTag::Int => Some(Value::Int(value.payload as i64)),
         JitCValueTag::Bool => Some(Value::Bool(value.payload != 0)),
+        JitCValueTag::FloatBits => Some(Value::Float(php_runtime::FloatValue::from_f64(
+            f64::from_bits(value.payload),
+        ))),
         _ => None,
     }
 }
