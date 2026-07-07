@@ -27,7 +27,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "target/debug/php-vm"
 FIXTURE_DIR = ROOT / "tests/fixtures/performance/native_tier"
-FIXTURES = (FIXTURE_DIR / "scalar_leaves.php",)
+FIXTURES = (
+    FIXTURE_DIR / "scalar_leaves.php",
+    FIXTURE_DIR / "inlined_calls.php",
+)
 
 # Version pinned by ADR 0001; a non-8.5.7 php mis-tokenizes 8.5 syntax.
 REFERENCE_VERSION = "8.5.7"
