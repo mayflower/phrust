@@ -532,4 +532,80 @@ mod tests {
         let mut over: i64 = 0;
         assert_ne!(call(i64::MAX, 1, &mut over), JIT_HELPER_STATUS_OK);
     }
+
+    // The copy-and-patch sequencer (`copy_patch::emit_guarded_int_add_sequence`)
+    // lowering a multi-step region over the flat slot buffer, executed
+    // end-to-end. Steps chain through the buffer: step 2 reads slot 2, which
+    // step 1 wrote. Verifies the success path, a mid-sequence side exit with its
+    // resume-consistent partial store, and an overflow side exit.
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn executes_guarded_int_add_sequence() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::{GuardedIntAddStep, emit_guarded_int_add_sequence};
+
+        // slot[2] = slot[0] + slot[1]; slot[4] = slot[2] + slot[3].
+        let steps = [
+            GuardedIntAddStep {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            GuardedIntAddStep {
+                dst: 4,
+                lhs: 2,
+                rhs: 3,
+            },
+        ];
+        let code = emit_guarded_int_add_sequence(&steps).expect("sequence emits");
+        let mem = CodeMemory::new(&code).expect("code memory should finalize");
+        // SAFETY: the emitted bytes are a valid `extern "C" fn(*mut JitCValue) -> i32`
+        // over a read-execute region; each buffer below is a live, aligned,
+        // contiguous `[JitCValue; 5]` (24-byte stride) that outlives the call.
+        let run: extern "C" fn(*mut JitCValue) -> i32 =
+            unsafe { core::mem::transmute(mem.as_ptr()) };
+
+        // Success: (10 + 20) + 12 = 42, chained through slot 2.
+        let mut slots = [
+            JitCValue::int(10),
+            JitCValue::int(20),
+            JitCValue::uninitialized(),
+            JitCValue::int(12),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(slots.as_mut_ptr()), 0);
+        assert_eq!(slots[2].payload as i64, 30);
+        assert_eq!(slots[4].tag, JitCValueTag::Int);
+        assert_eq!(slots[4].payload as i64, 42);
+
+        // Mid-sequence side exit: slot 3 is non-Int, so step 2's guard fails.
+        // Step 1 already ran, so slot 2 keeps its result (resume-consistent).
+        let mut typed = [
+            JitCValue::int(10),
+            JitCValue::int(20),
+            JitCValue::uninitialized(),
+            JitCValue::null(),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(typed.as_mut_ptr()), 1);
+        assert_eq!(
+            typed[2].payload as i64, 30,
+            "a completed step's store survives the later side exit"
+        );
+        assert_eq!(typed[4].tag, JitCValueTag::Uninitialized);
+
+        // Overflow in step 1 takes the side exit before its store, so nothing
+        // downstream is written.
+        let mut over = [
+            JitCValue::int(i64::MAX),
+            JitCValue::int(1),
+            JitCValue::uninitialized(),
+            JitCValue::int(7),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(over.as_mut_ptr()), 1);
+        assert_eq!(over[2].tag, JitCValueTag::Uninitialized);
+        assert_eq!(over[4].tag, JitCValueTag::Uninitialized);
+    }
 }
