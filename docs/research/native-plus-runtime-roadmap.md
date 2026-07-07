@@ -142,11 +142,22 @@ register allocation. The leaf and counted-loop recognizers stay ahead of it (tig
 code); it is the catch-all fallback for the int/bool subset. `foreach`, nested-loop
 edge cases, and the sea-of-nodes `opt/` passes on the emit path remain future work.
 
-**(b) Calls + a real helper ABI — the keystone.** Native code cannot call another
-PHP function or a builtin. The encoder has `blr`/`push_fp_lr`/`pop_fp_lr` and
-`helpers.rs` defines a stable helper-symbol ABI, but no stencil emits a call and no
-helper is registered/linked. Every recognizer rejects `Call`. This is the
-prerequisite for anything resembling real WordPress code.
+**(b) Calls + a real helper ABI — the keystone.** — **PARTIALLY LANDED**
+(native→native inlining). A bridge-side pre-inline pass
+(`copy_patch_bridge.rs` `inline_scalar_leaf_calls`) now splices same-unit
+scalar-leaf callee bodies into a caller, so a function that only delegates to
+recognized scalar leaves compiles natively instead of being rejected for
+containing a `Call`. It is bounded-transitive (depth ≤ 8, self-recursion
+rejected), so `poly → scale → fma` collapses bottom-up; a callee is inlined only
+when it reduces to a single-block, one-register-return, register-only scalar
+leaf whose body reads only its by-value int/float params (pure register
+substitution, no new local slots), with plain positional register/constant args.
+Verified against PHP 8.5.7 via the differential harness. **Still missing:**
+native→**builtin** and native→**userland** calls, which need a VM re-entry ABI
+(pass a context pointer + a helper that re-enters the interpreter) — the
+`blr`/`push_fp_lr`/`pop_fp_lr` ops and the `helpers.rs` symbol ABI exist but no
+stencil emits such a call yet. That re-entry path is the remaining keystone work
+for real WordPress code (which calls builtins and non-leaf userland functions).
 
 **(c) Mid-region deopt / OSR.** Deopt is **entry-only**: a guard/overflow side exit
 returns `1` and `NativeLeaf::run` returns `None`, so the whole call falls back to
