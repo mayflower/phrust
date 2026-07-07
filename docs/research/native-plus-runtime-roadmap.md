@@ -239,13 +239,22 @@ array/string contents), not the refcount bumps.
   (`"PHPSESSID"`/`"nocache"`/`"files"`). That session is a placeholder — inner
   returns discard it and the request boundary overwrites the top-level result
   from `state.session` — so an allocation-free placeholder is behavior-preserving.
-  Same-load 3M-call loop: ~3280 → ~3199 ms (~2.5%, ~27 ns/call). **Profiling
-  finding:** the dominant remaining R1 cost is `bind_arguments` for **typed**
-  params — they miss the untyped A3 fast path and pay the `bound:
-  Vec<Option<CallArgument>>` allocation + named/variadic/default scanning. A
-  typed-scalar fast path is the next R1 lever but must reuse
-  `precheck_bound_argument_types` verbatim to avoid diverging from PHP's
-  coercion/strict-types/`TypeError` semantics.
+  Same-load 3M-call loop: ~3280 → ~3199 ms (~2.5%, ~27 ns/call).
+- **R1 — lean arg-binding extended to typed params** (`arguments.rs`
+  `bind_arguments` fast-path guard). The profiled dominant call cost:
+  typed by-value params missed the A3 fast path and paid the general path's
+  `bound: Vec<Option<CallArgument>>` allocation + required/variadic/named/default
+  scanning. Relaxing the guard to `type_.is_none() || default.is_none()` admits
+  typed-without-default (and keeps every previously-fast shape — no regression).
+  This is behavior-identical because **neither** path coerces inside
+  `bind_arguments` — both produce raw values, and coercion/strict-types/
+  `TypeError` are applied by the shared post-binding loop (`coerce_or_check_param_type`
+  at the two `prepare_arguments` call sites), so feeding it identical raw values
+  at the identical point is provably equivalent. Same-load 3M-call loop of
+  `leaf(int $a, int $b)`: ~3679 → ~3125 ms (**~15%, ~185 ns/call**) — the biggest
+  R1 win so far, and WordPress uses typed params heavily. Verified against PHP
+  8.5.7 across typed/untyped-default/strict/typed-default cases. *Remaining R1:*
+  deeper frame pooling / `RegisterFile`/`LocalFile` setup — needs further profiling.
 - **R2 — `ClassEntry` shared via `Arc`** (`compiled_unit.rs` `class_table:
   Vec<Arc<ClassEntry>>` + `lookup_class_arc`; `vm/mod.rs` `ClassLookup::Shared`,
   `into_arc`, `ResolvedMethodOwned`/`DynamicClassEntry` hold `Arc`). The method/
