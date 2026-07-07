@@ -1151,7 +1151,7 @@ struct DynamicFunctionEntry {
 #[derive(Clone, Debug, PartialEq)]
 struct DynamicClassEntry {
     lookup_name: String,
-    class: php_ir::module::ClassEntry,
+    class: Arc<php_ir::module::ClassEntry>,
     unit_index: usize,
     origin: DeclarationOrigin,
 }
@@ -31980,7 +31980,8 @@ impl Vm {
             }
         };
         let Some(declaring_class) = owner.lookup_class(&declaring_class_name).or_else(|| {
-            dynamic_class_entry_in_state(state, &declaring_class_name).map(|entry| &entry.class)
+            dynamic_class_entry_in_state(state, &declaring_class_name)
+                .map(|entry| entry.class.as_ref())
         }) else {
             return self.runtime_error(
                 output,
@@ -42291,7 +42292,7 @@ impl Vm {
             .unwrap_or_else(|| dynamic_or_retain_unit_index(state, compiled));
         state.dynamic_classes.push(DynamicClassEntry {
             lookup_name: normalize_class_name(&alias_name),
-            class,
+            class: Arc::new(class),
             unit_index,
             origin: declaration_origin(
                 compiled,
@@ -46769,7 +46770,7 @@ struct ResolvedMethod<'a> {
 
 #[derive(Clone)]
 struct ResolvedMethodOwned {
-    class: php_ir::module::ClassEntry,
+    class: Arc<php_ir::module::ClassEntry>,
     method: php_ir::module::ClassMethodEntry,
 }
 
@@ -46781,28 +46782,36 @@ struct ResolvedProperty<'a> {
 
 #[derive(Clone)]
 struct ResolvedPropertyOwned {
-    class: php_ir::module::ClassEntry,
+    class: Arc<php_ir::module::ClassEntry>,
     property: php_ir::module::ClassPropertyEntry,
 }
 
-enum ClassLookup<'a> {
-    Borrowed(&'a php_ir::module::ClassEntry),
+enum ClassLookup {
     /// Boxed: `ClassEntry` is ~272 bytes and would dominate the enum size.
     Owned(Box<php_ir::module::ClassEntry>),
+    /// Shared handle into a class table; cloning is a cheap refcount bump.
+    Shared(Arc<php_ir::module::ClassEntry>),
 }
 
-impl<'a> ClassLookup<'a> {
+impl ClassLookup {
     fn as_ref(&self) -> &php_ir::module::ClassEntry {
         match self {
-            Self::Borrowed(class) => class,
             Self::Owned(class) => class,
+            Self::Shared(class) => class,
         }
     }
 
     fn into_owned(self) -> php_ir::module::ClassEntry {
         match self {
-            Self::Borrowed(class) => class.clone(),
             Self::Owned(class) => *class,
+            Self::Shared(class) => (*class).clone(),
+        }
+    }
+
+    fn into_arc(self) -> Arc<php_ir::module::ClassEntry> {
+        match self {
+            Self::Shared(class) => class,
+            Self::Owned(class) => Arc::new(*class),
         }
     }
 }
@@ -50819,7 +50828,7 @@ fn register_dynamic_classes(
         }
         state.dynamic_classes.push(DynamicClassEntry {
             lookup_name: normalized,
-            class: class.clone(),
+            class: Arc::new(class.clone()),
             unit_index,
             origin: declaration_origin(
                 compiled,
@@ -50885,7 +50894,7 @@ fn declare_runtime_class(
             DeclarationKind::ClassLike,
             DeclarationLoadKind::Conditional,
         ),
-        class,
+        class: Arc::new(class),
         unit_index,
     });
     state.bump_class_table_epoch();
@@ -50931,13 +50940,13 @@ fn dynamic_class_entry_in_state<'a>(
         .find(|entry| entry.lookup_name == normalized)
 }
 
-fn dynamic_class_in_loaded_units<'a>(
-    state: &'a ExecutionState,
+fn dynamic_class_in_loaded_units(
+    state: &ExecutionState,
     class_name: &str,
-) -> Option<&'a php_ir::module::ClassEntry> {
+) -> Option<Arc<php_ir::module::ClassEntry>> {
     let normalized = normalize_class_name(class_name);
     state.dynamic_units.iter().rev().find_map(|unit| {
-        unit.lookup_class(&normalized)
+        unit.lookup_class_arc(&normalized)
             .filter(|class| normalize_class_name(&class.name) == normalized)
     })
 }
@@ -51008,20 +51017,20 @@ fn lookup_class_in_state(
     lookup_class_in_state_ref(compiled, state, class_name).map(ClassLookup::into_owned)
 }
 
-fn lookup_class_in_state_ref<'a>(
-    compiled: &'a CompiledUnit,
-    state: &'a ExecutionState,
+fn lookup_class_in_state_ref(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
     class_name: &str,
-) -> Option<ClassLookup<'a>> {
+) -> Option<ClassLookup> {
     let normalized = normalize_class_name(class_name);
     if let Some(entry) = dynamic_class_entry_in_state(state, &normalized) {
-        return Some(ClassLookup::Borrowed(&entry.class));
+        return Some(ClassLookup::Shared(Arc::clone(&entry.class)));
     }
-    if let Some(class) = compiled.lookup_class(class_name) {
-        return Some(ClassLookup::Borrowed(class));
+    if let Some(class) = compiled.lookup_class_arc(class_name) {
+        return Some(ClassLookup::Shared(class));
     }
     if let Some(class) = dynamic_class_in_loaded_units(state, &normalized) {
-        return Some(ClassLookup::Borrowed(class));
+        return Some(ClassLookup::Shared(class));
     }
     if state.failed_class_declarations.contains(&normalized) {
         return None;
@@ -52644,7 +52653,7 @@ fn lookup_resolved_method_in_state(
     lookup_resolved_method_in_state_inner(
         compiled,
         state,
-        class.as_ref(),
+        class.into_arc(),
         method,
         caller_scope,
         &mut Vec::new(),
@@ -52678,7 +52687,7 @@ fn lookup_private_method_in_caller_scope_in_state(
         return Ok(None);
     };
     Ok(Some(ResolvedMethodOwned {
-        class: scope_class.into_owned(),
+        class: scope_class.into_arc(),
         method: scope_method,
     }))
 }
@@ -52686,7 +52695,7 @@ fn lookup_private_method_in_caller_scope_in_state(
 fn lookup_resolved_method_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: &php_ir::module::ClassEntry,
+    class: Arc<php_ir::module::ClassEntry>,
     method: &str,
     caller_scope: Option<&str>,
     seen: &mut Vec<String>,
@@ -52715,7 +52724,7 @@ fn lookup_resolved_method_in_state_inner(
             && let Some(parent_method) = lookup_resolved_method_in_state_inner(
                 compiled,
                 state,
-                parent_class.as_ref(),
+                parent_class.into_arc(),
                 method.name.as_str(),
                 caller_scope,
                 seen,
@@ -52726,7 +52735,7 @@ fn lookup_resolved_method_in_state_inner(
         }
         seen.pop();
         return Ok(Some(ResolvedMethodOwned {
-            class: class.clone(),
+            class: Arc::clone(&class),
             method: method.clone(),
         }));
     }
@@ -52738,7 +52747,7 @@ fn lookup_resolved_method_in_state_inner(
         let resolved = lookup_resolved_method_in_state_inner(
             compiled,
             state,
-            parent_class.as_ref(),
+            parent_class.into_arc(),
             method,
             caller_scope,
             seen,
@@ -52816,7 +52825,7 @@ fn lookup_private_property_in_state_caller_scope(
         return Ok(None);
     };
     Ok(Some(ResolvedPropertyOwned {
-        class: scope_class.into_owned(),
+        class: scope_class.into_arc(),
         property: scope_property,
     }))
 }
@@ -52859,7 +52868,7 @@ fn lookup_resolved_property_in_state_inner(
         }
         seen.pop();
         return Ok(Some(ResolvedPropertyOwned {
-            class: class.clone(),
+            class: Arc::new(class.clone()),
             property: entry.clone(),
         }));
     }
@@ -53170,12 +53179,12 @@ fn declared_classes_in_state(
 ) -> Vec<php_ir::module::ClassEntry> {
     let mut seen = BTreeSet::new();
     let mut classes = Vec::new();
-    for class in compiled
-        .unit()
-        .classes
-        .iter()
-        .chain(state.dynamic_classes.iter().map(|entry| &entry.class))
-    {
+    for class in compiled.unit().classes.iter().chain(
+        state
+            .dynamic_classes
+            .iter()
+            .map(|entry| entry.class.as_ref()),
+    ) {
         let normalized = normalize_class_name(&class.name);
         if seen.insert(normalized) {
             classes.push(class.clone());
