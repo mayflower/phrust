@@ -2148,6 +2148,10 @@ pub struct Vm {
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
     include_execution_depth: Cell<u32>,
     request_profile_stack: RefCell<Vec<RequestProfileFrame>>,
+    /// Memoized per-(unit, function) last-use move plans (Runtime lever R3).
+    /// Built only when `options.last_use_moves` is on; empty and never consulted
+    /// otherwise, keeping the default dense read path byte-identical.
+    last_use_move_plans: RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>,
 }
 
 impl Vm {
@@ -2179,6 +2183,7 @@ impl Vm {
             adaptive_tiny_unit_setup_skipped: Cell::new(false),
             include_execution_depth: Cell::new(0),
             request_profile_stack: RefCell::new(Vec::new()),
+            last_use_move_plans: RefCell::new(HashMap::new()),
         }
     }
 
@@ -2195,6 +2200,7 @@ impl Vm {
         self.argument_vector_observers.borrow_mut().clear();
         self.trivial_method_plans.borrow_mut().clear();
         self.frame_shape_flags.borrow_mut().clear();
+        self.last_use_move_plans.borrow_mut().clear();
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
         *self.ir_class_entry_cache.borrow_mut() = IrClassEntryCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
@@ -4437,6 +4443,76 @@ impl Vm {
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_value_clone_by_reason(reason);
         }
+    }
+
+    fn record_counter_last_use_move_applied(&self, clone_avoided: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_last_use_move_applied(clone_avoided);
+        }
+    }
+
+    /// Folds a freshly built plan's build-time rejection reasons into the
+    /// counters exactly once (called only when a plan is first analyzed).
+    fn record_counter_last_use_move_ineligible(&self, plan: &crate::last_use::LastUseMovePlan) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            for (reason, count) in plan.ineligible_by_reason() {
+                counters.record_last_use_move_ineligible(reason, *count);
+            }
+        }
+    }
+
+    /// Returns the memoized last-use move plan for a dense function, building it
+    /// on first use. Returns `None` when the R3 flag is off, so callers keep the
+    /// unchanged clone path.
+    fn last_use_move_plan(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        dense_function: &DenseFunction,
+    ) -> Option<Rc<crate::last_use::LastUseMovePlan>> {
+        if !self.options.last_use_moves {
+            return None;
+        }
+        let key = (compiled_unit_cache_key(compiled), function_id.raw());
+        if let Some(plan) = self.last_use_move_plans.borrow().get(&key) {
+            return Some(Rc::clone(plan));
+        }
+        let plan = Rc::new(crate::last_use::LastUseMovePlan::analyze(dense_function));
+        self.record_counter_last_use_move_ineligible(&plan);
+        self.last_use_move_plans
+            .borrow_mut()
+            .insert(key, Rc::clone(&plan));
+        Some(plan)
+    }
+
+    /// Reads a dense source operand, moving the value out of its register when
+    /// the last-use plan marks this exact `(instruction, register)` read as a
+    /// provably-safe last use. With `move_plan` `None` (R3 off) this is exactly
+    /// `read_dense_operand` (a clone). Only register operands are ever moved;
+    /// locals/constants take the clone path.
+    fn read_dense_operand_last_use(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &mut CallStack,
+        operand: DenseOperand,
+        move_plan: Option<&crate::last_use::LastUseMovePlan>,
+        dense_instruction_index: u32,
+    ) -> Result<Value, String> {
+        if let Some(plan) = move_plan
+            && operand.kind == DenseOperandKind::Register
+            && plan.is_move_eligible(dense_instruction_index, operand.index)
+        {
+            let value = self.take_consumed_dense_operand(compiled, stack, operand)?;
+            self.record_counter_last_use_move_applied(value_clone_is_heap(&value));
+            return Ok(value);
+        }
+        self.read_dense_operand(compiled, stack, operand)
     }
 
     /// Memoized: can this function's body observe its argument vector?
@@ -7047,6 +7123,10 @@ impl Vm {
             }
         }
         let unit_id = compiled.unit().id;
+        // Runtime lever R3: `None` unless the flag is on, so the hot read path is
+        // unchanged by default. Built once per (unit, function) and reused.
+        let move_plan = self.last_use_move_plan(compiled, function_id, dense_function);
+        let move_plan = move_plan.as_deref();
         let mut foreach_iterators: HashMap<RegId, ForeachIterator> = HashMap::new();
         let mut block_index = 0_u32;
         let mut steps = 0_usize;
@@ -7940,7 +8020,13 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let value = match self.read_dense_operand(compiled, stack, src) {
+                        let value = match self.read_dense_operand_last_use(
+                            compiled,
+                            stack,
+                            src,
+                            move_plan,
+                            dense_instruction_index,
+                        ) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -7970,7 +8056,13 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        let src = match self.read_dense_operand(compiled, stack, src) {
+                        let src = match self.read_dense_operand_last_use(
+                            compiled,
+                            stack,
+                            src,
+                            move_plan,
+                            dense_instruction_index,
+                        ) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -10068,7 +10160,13 @@ impl Vm {
                                 }
                             }
                         } else {
-                            match self.read_dense_operand(compiled, stack, value) {
+                            match self.read_dense_operand_last_use(
+                                compiled,
+                                stack,
+                                value,
+                                move_plan,
+                                dense_instruction_index,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     let result =
@@ -10686,7 +10784,13 @@ impl Vm {
                                 return result;
                             }
                         };
-                        let value = match self.read_dense_operand(compiled, stack, value) {
+                        let value = match self.read_dense_operand_last_use(
+                            compiled,
+                            stack,
+                            value,
+                            move_plan,
+                            dense_instruction_index,
+                        ) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
@@ -45251,6 +45355,23 @@ fn script_exit_result(output: &OutputBuffer, state: &ExecutionState, code: i32) 
 
 fn compiled_unit_cache_key(compiled: &CompiledUnit) -> u64 {
     std::ptr::from_ref(compiled.unit()) as usize as u64
+}
+
+/// True when cloning `value` would allocate or bump a refcount (a refcounted
+/// heap value), i.e. a last-use move genuinely avoided clone work. Scalars are
+/// `Copy`-like and moving them saves nothing observable.
+fn value_clone_is_heap(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::String(_)
+            | Value::Array(_)
+            | Value::Object(_)
+            | Value::Resource(_)
+            | Value::Fiber(_)
+            | Value::Generator(_)
+            | Value::Callable(_)
+            | Value::Reference(_)
+    )
 }
 
 fn instruction_runtime_error_context(

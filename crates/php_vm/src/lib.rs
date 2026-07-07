@@ -38,6 +38,8 @@ pub mod include;
 #[doc(hidden)]
 pub mod inline_cache;
 #[doc(hidden)]
+pub mod last_use;
+#[doc(hidden)]
 pub mod literal_pool;
 #[doc(hidden)]
 pub mod osr;

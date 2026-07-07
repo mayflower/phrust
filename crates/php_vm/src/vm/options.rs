@@ -81,6 +81,11 @@ pub struct VmOptions {
     /// Skip adaptive quickening/tiering setup for tiny units with at most this
     /// many IR instructions. `None` keeps adaptive setup always enabled.
     pub adaptive_tiny_unit_setup_threshold: Option<u32>,
+    /// Runtime lever R3: move (instead of clone) a dense register operand when a
+    /// conservative last-use analysis proves the read is the register's block-local
+    /// last use. Default-off; with it off the dense read path is byte-identical to
+    /// today and this analysis is never built. Preserves COW/reference semantics.
+    pub last_use_moves: bool,
 }
 
 impl Default for VmOptions {
@@ -115,6 +120,7 @@ impl Default for VmOptions {
             typecheck_fast_paths: true,
             internal_function_dispatch_cache: true,
             adaptive_tiny_unit_setup_threshold: None,
+            last_use_moves: false,
         }
     }
 }

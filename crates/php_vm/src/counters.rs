@@ -552,6 +552,14 @@ pub struct VmCounters {
     pub autoload_class_lookup_ic_guard_failures: u64,
     pub property_fetch_profiles: BTreeMap<String, PropertyFetchProfile>,
     pub method_call_profiles: BTreeMap<String, MethodCallProfile>,
+    /// Runtime lever R3: dense register reads moved instead of cloned because a
+    /// conservative last-use analysis proved the read was a block-local last use.
+    pub last_use_moves_applied: u64,
+    /// Subset of `last_use_moves_applied` where the moved value was a refcounted
+    /// heap value (array/string/object/...), so a real clone/allocation was avoided.
+    pub last_use_move_clones_avoided: u64,
+    /// Candidate register reads left cloning, grouped by stable rejection reason.
+    pub last_use_move_ineligible_by_reason: BTreeMap<String, u64>,
 }
 
 /// Diagnostic metadata for one successful Cranelift compile.
@@ -1173,6 +1181,24 @@ impl VmCounters {
 
     pub(crate) fn record_dense_function_executed(&mut self) {
         self.dense_functions_executed += 1;
+    }
+
+    /// Records one applied last-use move; `clone_avoided` is true when the moved
+    /// value was a refcounted heap value and cloning it would have allocated or
+    /// bumped a refcount.
+    pub(crate) fn record_last_use_move_applied(&mut self, clone_avoided: bool) {
+        self.last_use_moves_applied += 1;
+        if clone_avoided {
+            self.last_use_move_clones_avoided += 1;
+        }
+    }
+
+    /// Attributes one candidate register read left cloning to a stable reason.
+    pub(crate) fn record_last_use_move_ineligible(&mut self, reason: &str, count: u64) {
+        *self
+            .last_use_move_ineligible_by_reason
+            .entry(reason.to_owned())
+            .or_default() += count;
     }
 
     pub(crate) fn record_dense_property_fetch_hit(&mut self) {

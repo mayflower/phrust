@@ -20442,3 +20442,163 @@ fn manual_unsupported_unit_for(diagnostic_id: &str) -> php_ir::IrUnit {
     builder.set_entry(function);
     builder.finish()
 }
+
+// ---------------------------------------------------------------------------
+// Runtime lever R3: last-use move correctness fixtures.
+//
+// Each fixture asserts identical PHP-visible output under three configurations:
+// the rich-IR interpreter (independent oracle), dense bytecode with
+// `last_use_moves` OFF (the default clone path), and dense bytecode with
+// `last_use_moves` ON. All three must equal the pinned PHP 8.5.7 output.
+// ---------------------------------------------------------------------------
+
+fn run_last_use_config(source: &str, format: ExecutionFormat, last_use_moves: bool) -> VmResult {
+    execute_source_with_options(
+        source,
+        VmOptions {
+            execution_format: format,
+            last_use_moves,
+            collect_counters: true,
+            ..VmOptions::default()
+        },
+    )
+}
+
+#[track_caller]
+fn assert_last_use_move_parity(source: &str, expected: &str) {
+    let reference = run_last_use_config(source, ExecutionFormat::Ir, false);
+    assert!(
+        reference.status.is_success(),
+        "rich-IR reference failed: {:?}",
+        reference.status
+    );
+    assert_eq!(
+        reference.output.to_string_lossy(),
+        expected,
+        "rich-IR reference output mismatch"
+    );
+
+    let flag_off = run_last_use_config(source, ExecutionFormat::Auto, false);
+    assert!(
+        flag_off.status.is_success(),
+        "dense flag-off failed: {:?}",
+        flag_off.status
+    );
+    assert_eq!(
+        flag_off.output.to_string_lossy(),
+        expected,
+        "dense last-use-moves=off output mismatch"
+    );
+
+    let flag_on = run_last_use_config(source, ExecutionFormat::Auto, true);
+    assert!(
+        flag_on.status.is_success(),
+        "dense flag-on failed: {:?}",
+        flag_on.status
+    );
+    assert_eq!(
+        flag_on.output.to_string_lossy(),
+        expected,
+        "dense last-use-moves=on output mismatch"
+    );
+
+    // The move optimization must never change PHP-visible output.
+    assert_eq!(
+        flag_on.output.to_string_lossy(),
+        flag_off.output.to_string_lossy(),
+        "last-use-moves changed observable output"
+    );
+}
+
+#[test]
+fn last_use_move_preserves_array_copy_on_write() {
+    assert_last_use_move_parity(
+        "<?php\n$b = [1, 2, 3];\n$a = $b;\n$b[] = 4;\necho count($a), \"|\", count($b), \"\\n\";\necho implode(\",\", $a), \"|\", implode(\",\", $b), \"\\n\";\n",
+        "3|4\n1,2,3|1,2,3,4\n",
+    );
+}
+
+#[test]
+fn last_use_move_preserves_foreach_by_value_and_by_reference() {
+    assert_last_use_move_parity(
+        "<?php\n$arr = [1, 2, 3];\nforeach ($arr as $v) { $v = $v * 10; }\necho implode(\",\", $arr), \"\\n\";\nforeach ($arr as &$r) { $r = $r * 10; }\nunset($r);\necho implode(\",\", $arr), \"\\n\";\n",
+        "1,2,3\n10,20,30\n",
+    );
+}
+
+#[test]
+fn last_use_move_preserves_reference_identity() {
+    assert_last_use_move_parity(
+        "<?php\n$x = 1;\n$r = &$x;\n$r = 5;\necho $x, \"\\n\";\n$y = [1, 2];\n$ry = &$y;\n$ry[] = 3;\necho implode(\",\", $y), \"\\n\";\n",
+        "5\n1,2,3\n",
+    );
+}
+
+#[test]
+fn last_use_move_preserves_nested_dim_writes() {
+    assert_last_use_move_parity(
+        "<?php\n$m = [];\n$m[\"a\"][\"b\"] = 1;\n$m[\"a\"][\"c\"] = 2;\n$n = $m;\n$n[\"a\"][\"b\"] = 99;\necho $m[\"a\"][\"b\"], \"|\", $m[\"a\"][\"c\"], \"\\n\";\necho $n[\"a\"][\"b\"], \"|\", $n[\"a\"][\"c\"], \"\\n\";\n",
+        "1|2\n99|2\n",
+    );
+}
+
+#[test]
+fn last_use_move_does_not_corrupt_value_read_twice() {
+    assert_last_use_move_parity(
+        "<?php\n$s = \"abc\";\n$t = $s . $s;\necho $t, \"\\n\";\necho $s, \"\\n\";\n$a = [1, 2];\n$b = $a + $a;\necho count($b), \"\\n\";\necho implode(\",\", $a), \"\\n\";\n",
+        "abcabc\nabc\n2\n1,2\n",
+    );
+}
+
+#[test]
+fn last_use_move_preserves_array_passed_by_value() {
+    assert_last_use_move_parity(
+        "<?php\nfunction sum_arr(array $a): int {\n    $t = 0;\n    foreach ($a as $v) { $t += $v; }\n    return $t;\n}\n$data = [1, 2, 3];\n$s = sum_arr($data);\n$data[] = 4;\necho $s, \"\\n\";\necho implode(\",\", $data), \"\\n\";\n",
+        "6\n1,2,3,4\n",
+    );
+}
+
+#[test]
+fn last_use_move_preserves_string_copy_on_write() {
+    assert_last_use_move_parity(
+        "<?php\n$s = \"hello\";\n$t = $s;\n$t .= \" world\";\necho $s, \"\\n\";\necho $t, \"\\n\";\n",
+        "hello\nhello world\n",
+    );
+}
+
+#[test]
+fn last_use_move_fires_on_dense_cast_of_register_value() {
+    // The `$a . $b` concat lands a heap string in a register whose sole,
+    // block-local last use is the `(int)` cast source: the flag-on run must move
+    // it (a real string clone avoided) while producing identical output.
+    let source = "<?php\n$a = \"12\";\n$b = \"34\";\n$n = (int)($a . $b);\necho $n, \"\\n\";\n";
+
+    let flag_off = run_last_use_config(source, ExecutionFormat::Bytecode, false);
+    assert!(
+        flag_off.status.is_success(),
+        "flag-off failed: {:?}",
+        flag_off.status
+    );
+    assert_eq!(flag_off.output.to_string_lossy(), "1234\n");
+    let off_counters = flag_off.counters.expect("counters enabled");
+    assert_eq!(off_counters.last_use_moves_applied, 0);
+
+    let flag_on = run_last_use_config(source, ExecutionFormat::Bytecode, true);
+    assert!(
+        flag_on.status.is_success(),
+        "flag-on failed: {:?}",
+        flag_on.status
+    );
+    assert_eq!(flag_on.output.to_string_lossy(), "1234\n");
+    let on_counters = flag_on.counters.expect("counters enabled");
+    assert!(
+        on_counters.last_use_moves_applied >= 1,
+        "expected at least one applied last-use move, got {}",
+        on_counters.last_use_moves_applied
+    );
+    assert!(
+        on_counters.last_use_move_clones_avoided >= 1,
+        "expected a heap clone to be avoided, got {}",
+        on_counters.last_use_move_clones_avoided
+    );
+}
