@@ -200,7 +200,18 @@ pub fn cached_leaf(
         cache
             .borrow_mut()
             .entry((unit_id, function_id))
-            .or_insert_with(|| NativeLeaf::compile(function, constants, function_id).map(Rc::new))
+            .or_insert_with(|| {
+                let leaf = NativeLeaf::compile(function, constants, function_id).map(Rc::new);
+                if std::env::var_os("PHRUST_JIT_COPY_PATCH_DEBUG").is_some() {
+                    eprintln!(
+                        "[copy-patch] fn={} (id={}) recognized={}",
+                        function.name,
+                        function_id,
+                        leaf.is_some()
+                    );
+                }
+                leaf
+            })
             .clone()
     })
 }

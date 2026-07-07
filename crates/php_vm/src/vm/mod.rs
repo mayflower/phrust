@@ -5855,24 +5855,38 @@ impl Vm {
     }
 
     /// Copy-and-patch native leaf tier (default-off, behind `jit-copy-patch` +
-    /// the `PHRUST_JIT_COPY_PATCH` env gate). If the callee is a recognized
-    /// scalar-int leaf, compile it once (cached), run it natively over the
-    /// argument values, and return the result — otherwise `None` to fall through
-    /// to the interpreter. By-reference arguments are rejected (value-only
-    /// marshal). Guards/overflow inside the region take the interpreter side exit
-    /// via `None`, so behavior is identical to interpreting the function.
+    /// the `PHRUST_JIT_COPY_PATCH` env gate). Runs before the dense-dispatch and
+    /// interpreter paths: if the callee is a recognized scalar-int leaf called
+    /// with plain positional value arguments, compile it once (cached), run it
+    /// natively over the argument values, and return the result — otherwise
+    /// `None` to fall through. Methods (`$this`), closures (captures), named
+    /// arguments, by-reference arguments, and arity mismatches are rejected here;
+    /// non-int operands and overflow take the region's side exit (also `None`),
+    /// so behavior is identical to interpreting the function.
     #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
     fn try_execute_copy_patch_leaf(
         &self,
         compiled: &CompiledUnit,
         function_id: FunctionId,
         function: &IrFunction,
-        args: &[PreparedArg],
+        call: &FunctionCall<'_>,
     ) -> Option<Value> {
         if !crate::copy_patch_bridge::copy_patch_leaf_enabled() {
             return None;
         }
-        if args.iter().any(|arg| arg.reference.is_some()) {
+        // Free function, plain positional value arguments only.
+        if call.this_value.is_some() || !call.captures.is_empty() {
+            return None;
+        }
+        if call.args.len() != function.params.len() {
+            return None;
+        }
+        // Named args would misalign positional slots. By-reference *arg* fields
+        // (`by_ref_local` etc.) only track a variable arg's source location for
+        // potential write-back; they are set for any variable passed positionally
+        // and are moot here because the recognizer already rejects functions with
+        // by-reference *parameters* — the value is passed by value regardless.
+        if call.args.iter().any(|arg| arg.name.is_some()) {
             return None;
         }
         let unit = compiled.unit();
@@ -5882,7 +5896,7 @@ impl Vm {
             function,
             &unit.constants,
         )?;
-        let params: Vec<Value> = args.iter().map(|arg| arg.value.clone()).collect();
+        let params: Vec<Value> = call.args.iter().map(|arg| arg.value.clone()).collect();
         leaf.run(&params)
     }
 
@@ -5893,7 +5907,7 @@ impl Vm {
         _compiled: &CompiledUnit,
         _function_id: FunctionId,
         _function: &IrFunction,
-        _args: &[PreparedArg],
+        _call: &FunctionCall<'_>,
     ) -> Option<Value> {
         None
     }
@@ -13582,6 +13596,14 @@ impl Vm {
         {
             return self.execute_function(&owner, function_id, call, output, stack, state);
         }
+        // Copy-and-patch native leaf tier runs before dense dispatch so a
+        // recognized scalar-int leaf executes natively rather than densely.
+        #[cfg(feature = "jit-copy-patch")]
+        if let Some(value) =
+            self.try_execute_copy_patch_leaf(compiled, function_id, function, &call)
+        {
+            return VmResult::success_no_output(Some(value));
+        }
         call = match self.try_execute_cached_dense_function_dispatch(
             compiled,
             function_id,
@@ -13827,12 +13849,6 @@ impl Vm {
                         generator_context,
                     ),
                 )));
-            }
-            #[cfg(feature = "jit-copy-patch")]
-            if let Some(value) =
-                self.try_execute_copy_patch_leaf(compiled, function_id, function, &args)
-            {
-                return VmResult::success_no_output(Some(value));
             }
             if let Some(value) = self.try_execute_jit_leaf(
                 compiled,
