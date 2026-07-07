@@ -221,6 +221,17 @@ array/string contents), not the refcount bumps.
 - **Frame-shape memoization** (`FrameShapeFlags`): per-call body-scan
   classification (try/finally, destructor-sensitivity, inline blockers) is memoized
   per `(unit, function)` instead of re-scanned every call. ~5.6% on 100K calls.
+- **R2 — `ClassEntry` shared via `Arc`** (`compiled_unit.rs` `class_table:
+  Vec<Arc<ClassEntry>>` + `lookup_class_arc`; `vm/mod.rs` `ClassLookup::Shared`,
+  `into_arc`, `ResolvedMethodOwned`/`DynamicClassEntry` hold `Arc`). The method/
+  constructor resolver (`lookup_resolved_method_in_state_inner`) is threaded so
+  the hot path is a refcount bump end-to-end instead of a deep clone of the
+  (~272-byte + maps) `ClassEntry`. Unlike the caches above this cuts an
+  **absolute per-op cost**, so it helps one-shot WordPress. Same-load micro:
+  ~8.2% on a WP-sized class (30 props/40 methods; ~1760 ns/iter over `new` +
+  a method call), ~3.5% on a small class — the win scales with class size.
+  818 php_vm tests green; behavior-preserving. *Remaining:* the property
+  resolver and a few cold declaration paths still deep-clone (follow-ups).
 
 **Critical lesson baked into every runtime item:** per-request memoization does
 *not* help WordPress. WP is one-shot-distributed — functions run 1–2× per request,
