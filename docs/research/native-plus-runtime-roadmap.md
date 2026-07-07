@@ -278,6 +278,25 @@ array/string contents), not the refcount bumps.
   object creation 10663 → 7323 ns/iter. *Remaining:* the property *resolver*
   (`lookup_resolved_property_in_state_inner`, IC-cached/miss-only) and a few cold
   declaration paths still deep-clone (documented follow-ups).
+- **R3 — default-off last-use register moves** (`php_vm/src/last_use.rs` +
+  dense executor). A conservative block-local analysis marks a dense register
+  read move-eligible only when the register is block-local, first-occurrence is
+  a def (not live-in → not live-out across a self-loop back-edge), the marked
+  read is its last and reads it exactly once, and it is the opcode's single
+  movable source. Four value-operand sites (`Move`/`Cast`/`AssignDim`/`AppendDim`/
+  `ArrayInsert`) then *move* (`take_consumed_dense_operand`) the register instead
+  of cloning, handing a heap temporary to its consumer without a refcount bump /
+  potential COW separation. Gated behind **default-off** `--last-use-moves`
+  (`VmOptions::last_use_moves`); flag-off is byte-identical (plan never built).
+  Counters `last_use_moves_applied`/`clones_avoided`/`ineligible_by_reason`. The
+  def/use enumerator is exhaustive (no wildcard → new operand variants must be
+  classified) and a `debug_assertions` verifier re-derives the invariants.
+  Verified: 831 tests, COW/reference parity flag-on == flag-off == rich-IR oracle
+  == PHP 8.5.7. Structural clone-avoidance rises on the opt-in path; wall-clock is
+  neutral on the micro-benchmarks tested (consistent with the ~1 ns refcount-bump
+  correction above), so it lands as a correct, default-off, structurally-measured
+  foundation. *Remaining:* the array-container COW deep-copy (`Rc::make_mut` in
+  `assign_dim`) needs the transient-read-clone eliminated too — a follow-up.
 
 **Critical lesson baked into every runtime item:** per-request memoization does
 *not* help WordPress. WP is one-shot-distributed — functions run 1–2× per request,
