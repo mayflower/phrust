@@ -221,6 +221,20 @@ array/string contents), not the refcount bumps.
 - **Frame-shape memoization** (`FrameShapeFlags`): per-call body-scan
   classification (try/finally, destructor-sensitivity, inline blockers) is memoized
   per `(unit, function)` instead of re-scanned every call. ~5.6% on 100K calls.
+- **R1 — per-call session allocation removed** (`session.rs`
+  `SessionState::placeholder()`; `result.rs` `success`/`success_with_diagnostics`).
+  A macOS `sample` of a call-heavy loop showed every function return building a
+  `VmResult` whose `SessionState::default()` heap-allocates three Strings
+  (`"PHPSESSID"`/`"nocache"`/`"files"`). That session is a placeholder — inner
+  returns discard it and the request boundary overwrites the top-level result
+  from `state.session` — so an allocation-free placeholder is behavior-preserving.
+  Same-load 3M-call loop: ~3280 → ~3199 ms (~2.5%, ~27 ns/call). **Profiling
+  finding:** the dominant remaining R1 cost is `bind_arguments` for **typed**
+  params — they miss the untyped A3 fast path and pay the `bound:
+  Vec<Option<CallArgument>>` allocation + named/variadic/default scanning. A
+  typed-scalar fast path is the next R1 lever but must reuse
+  `precheck_bound_argument_types` verbatim to avoid diverging from PHP's
+  coercion/strict-types/`TypeError` semantics.
 - **R2 — `ClassEntry` shared via `Arc`** (`compiled_unit.rs` `class_table:
   Vec<Arc<ClassEntry>>` + `lookup_class_arc`; `vm/mod.rs` `ClassLookup::Shared`,
   `into_arc`, `ResolvedMethodOwned`/`DynamicClassEntry` hold `Arc`). The method/
