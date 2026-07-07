@@ -59,10 +59,12 @@ pub enum SlotSequenceError {
 const STRIDE: u32 = 24;
 const TAG_OFF: u32 = 0;
 const PAYLOAD_OFF: u32 = 8;
+const AUX_OFF: u32 = 16;
 
 /// The `tag` word load (`ldr_w` at `slot * 24`, encoding `imm12 = slot * 6`) is
 /// the binding scaled-immediate constraint: `slot * 6 <= 4095`. The payload
-/// double-word (`imm12 = slot * 3 + 1`) is looser, so this bound covers both.
+/// (`imm12 = slot * 3 + 1`) and aux (`imm12 = slot * 3 + 2`) double-words are
+/// looser, so this bound covers all three accesses.
 const MAX_SLOT: u32 = 4095 / 6;
 
 const fn tag_off(slot: u32) -> u32 {
@@ -71,6 +73,10 @@ const fn tag_off(slot: u32) -> u32 {
 
 const fn payload_off(slot: u32) -> u32 {
     slot * STRIDE + PAYLOAD_OFF
+}
+
+const fn aux_off(slot: u32) -> u32 {
+    slot * STRIDE + AUX_OFF
 }
 
 /// A binary PHP integer operation. Add/Sub/Mul carry a type + overflow guard;
@@ -179,6 +185,10 @@ pub enum ScalarIntOp {
         lhs: u32,
         rhs: i64,
     },
+    /// Copy a whole value (tag + payload + aux) `slot[dst] = slot[src]`. Used by
+    /// the general CFG lowering to move values between the register and local
+    /// slot ranges without a type guard (downstream ops guard as needed).
+    Copy { dst: u32, src: u32 },
 }
 
 fn check_slot(slot: u32) -> Result<(), SlotSequenceError> {
@@ -193,6 +203,15 @@ fn check_slot(slot: u32) -> Result<(), SlotSequenceError> {
 fn emit_int_guard(asm: &mut Aarch64Assembler, deopt: Label, slot: u32) {
     asm.ldr_w(X3, X0, tag_off(slot));
     asm.cmp_imm_w(X3, INT_TAG);
+    asm.b_cond(Cond::NotEqual, deopt);
+}
+
+/// Guard that `slot`'s tag is `Bool`, taking the side exit otherwise. Used on a
+/// branch condition so arbitrary-truthiness conditions (int, string, …) fall
+/// back to the interpreter rather than being mis-tested here.
+fn emit_bool_guard(asm: &mut Aarch64Assembler, deopt: Label, slot: u32) {
+    asm.ldr_w(X3, X0, tag_off(slot));
+    asm.cmp_imm_w(X3, BOOL_TAG);
     asm.b_cond(Cond::NotEqual, deopt);
 }
 
@@ -223,6 +242,10 @@ fn emit_store_bool(asm: &mut Aarch64Assembler, dst: u32, value: Reg) {
 fn check_op_slots(op: ScalarIntOp) -> Result<(), SlotSequenceError> {
     match op {
         ScalarIntOp::Const { dst, .. } => check_slot(dst),
+        ScalarIntOp::Copy { dst, src } => {
+            check_slot(dst)?;
+            check_slot(src)
+        }
         ScalarIntOp::BinaryConst { dst, lhs, .. } => {
             check_slot(dst)?;
             check_slot(lhs)
@@ -243,6 +266,16 @@ fn emit_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarIntOp) {
         ScalarIntOp::Const { dst, value } => {
             asm.mov_imm64(X6, value as u64);
             emit_store_int(asm, dst, X6);
+        }
+        ScalarIntOp::Copy { dst, src } => {
+            // Move the whole 24-byte value (tag + payload + aux); no guard, the
+            // tag travels with the value so downstream ops still guard correctly.
+            asm.ldr_w(X3, X0, tag_off(src));
+            asm.str_w(X3, X0, tag_off(dst));
+            asm.ldr_x(X4, X0, payload_off(src));
+            asm.str_x(X4, X0, payload_off(dst));
+            asm.ldr_x(X5, X0, aux_off(src));
+            asm.str_x(X5, X0, aux_off(dst));
         }
         ScalarIntOp::Binary { op, dst, lhs, rhs } => {
             emit_int_guard(asm, deopt, lhs);
@@ -681,10 +714,17 @@ pub fn build_scalar_int_region(
     Some((builder.finish(), result))
 }
 
-/// Recognize and lower a scalar-int function to native code in one step: a
-/// straight-line leaf ([`build_scalar_int_region`]) or a canonical counted `for`
-/// loop ([`compile_counted_loop_function`]). Returns `None` when the function is
-/// outside both subsets.
+/// Recognize and lower a scalar-int function to native code in one step, trying
+/// the most specialized lowering first: a straight-line leaf
+/// ([`build_scalar_int_region`]), then a canonical counted `for` loop
+/// ([`compile_counted_loop_function`]), then the general control-flow compiler
+/// ([`compile_scalar_int_cfg`]) for arbitrary `if`/`else`/`while` shapes.
+/// Returns `None` when the function is outside every subset.
+///
+/// The leaf and counted-loop paths stay ahead of the general compiler because
+/// they emit tighter code (locals read directly, native loop increment) for the
+/// shapes they recognize; the CFG compiler is the catch-all that trades a few
+/// extra slot copies for covering everything else in the int/bool subset.
 pub fn compile_scalar_int_function(
     function: &IrFunction,
     constants: &[IrConstant],
@@ -695,7 +735,10 @@ pub fn compile_scalar_int_function(
     {
         return Some(compiled);
     }
-    compile_counted_loop_function(function, constants)
+    if let Some(compiled) = compile_counted_loop_function(function, constants) {
+        return Some(compiled);
+    }
+    compile_scalar_int_cfg(function, constants)
 }
 
 /// Non-`Discard` instruction kinds of a block. `Discard` is a register-lifetime
@@ -964,6 +1007,198 @@ fn compile_counted_loop_function(
     })
 }
 
+/// Lower a value-producing move into `dst` from an operand: a register or local
+/// becomes a whole-value [`ScalarIntOp::Copy`], an int constant becomes a
+/// [`ScalarIntOp::Const`]. `None` for any other operand form.
+fn move_to_slot(
+    dst: u32,
+    src: &Operand,
+    constants: &[IrConstant],
+    local_count: u32,
+) -> Option<ScalarIntOp> {
+    match src {
+        Operand::Register(r) => Some(ScalarIntOp::Copy {
+            dst,
+            src: local_count + r.raw(),
+        }),
+        Operand::Local(l) => Some(ScalarIntOp::Copy { dst, src: l.raw() }),
+        Operand::Constant(c) => Some(ScalarIntOp::Const {
+            dst,
+            value: int_constant(constants, *c)?,
+        }),
+    }
+}
+
+/// Lower an arbitrary scalar-int control-flow graph (`if`/`else`, `while`, and
+/// their combinations) to native code. Every SSA register and every local gets
+/// its own slot, so values flow through the slot buffer and control flow is just
+/// branches between per-block labels — no cross-block register allocation or phi
+/// handling is needed. This is the general fallback after the straight-line leaf
+/// and canonical counted-loop recognizers; it accepts the int/bool instruction
+/// subset plus `Jump` / `JumpIf` / `Return(value)` terminators and returns `None`
+/// (the interpreter runs the function) for anything else.
+///
+/// Slot layout: locals occupy `[0, local_count)`, registers occupy
+/// `[local_count, local_count + register_count)`, and every `Return` copies its
+/// value to a dedicated result slot just above them, so the caller always finds
+/// the result in the same place regardless of which return fired.
+fn compile_scalar_int_cfg(
+    function: &IrFunction,
+    constants: &[IrConstant],
+) -> Option<CompiledScalarRegion> {
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    if !matches!(
+        function.return_type,
+        Some(IrReturnType::Int) | Some(IrReturnType::Bool)
+    ) {
+        return None;
+    }
+    for param in &function.params {
+        if param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || param.type_ != Some(IrReturnType::Int)
+        {
+            return None;
+        }
+    }
+    if function.blocks.is_empty() {
+        return None;
+    }
+
+    let local_count = function.local_count;
+    let result_slot = local_count.checked_add(function.register_count)?;
+    let buffer_slots = result_slot.checked_add(1)?;
+    if result_slot > MAX_SLOT {
+        return None;
+    }
+    let reg_slot = |r: RegId| local_count + r.raw();
+
+    // Translate one instruction to its slot op. `None` means "outside the
+    // subset", which aborts the whole compile (the interpreter runs it).
+    let to_op = |kind: &InstructionKind| -> Option<ScalarIntOp> {
+        match kind {
+            InstructionKind::LoadLocal { dst, local }
+            | InstructionKind::LoadLocalQuiet { dst, local } => Some(ScalarIntOp::Copy {
+                dst: reg_slot(*dst),
+                src: local.raw(),
+            }),
+            InstructionKind::LoadConst { dst, constant } => Some(ScalarIntOp::Const {
+                dst: reg_slot(*dst),
+                value: int_constant(constants, *constant)?,
+            }),
+            InstructionKind::Move { dst, src } => {
+                move_to_slot(reg_slot(*dst), src, constants, local_count)
+            }
+            InstructionKind::StoreLocal { local, src } => {
+                move_to_slot(local.raw(), src, constants, local_count)
+            }
+            InstructionKind::Binary {
+                dst,
+                op,
+                lhs: Operand::Register(lhs),
+                rhs,
+            } => {
+                let op = int_bin_op(*op)?;
+                let dst = reg_slot(*dst);
+                let lhs = reg_slot(*lhs);
+                match rhs {
+                    Operand::Register(rhs) => Some(ScalarIntOp::Binary {
+                        op,
+                        dst,
+                        lhs,
+                        rhs: reg_slot(*rhs),
+                    }),
+                    Operand::Constant(c) => Some(ScalarIntOp::BinaryConst {
+                        op,
+                        dst,
+                        lhs,
+                        rhs: int_constant(constants, *c)?,
+                    }),
+                    Operand::Local(_) => None,
+                }
+            }
+            InstructionKind::Compare {
+                dst,
+                op,
+                lhs: Operand::Register(lhs),
+                rhs: Operand::Register(rhs),
+            } => Some(ScalarIntOp::Compare {
+                cond: region_compare_to_cond(ir_compare_to_region(*op)?),
+                dst: reg_slot(*dst),
+                lhs: reg_slot(*lhs),
+                rhs: reg_slot(*rhs),
+            }),
+            _ => None,
+        }
+    };
+
+    let mut asm = Aarch64Assembler::new();
+    let deopt = asm.new_label();
+    let block_labels: Vec<Label> = function.blocks.iter().map(|_| asm.new_label()).collect();
+    // Block IDs need not equal their vec position, so index labels by id.
+    let mut label_of = HashMap::new();
+    for (pos, block) in function.blocks.iter().enumerate() {
+        label_of.insert(block.id.index(), block_labels[pos]);
+    }
+
+    for (pos, block) in function.blocks.iter().enumerate() {
+        asm.bind(block_labels[pos]);
+        for kind in meaningful_kinds(block) {
+            emit_op(&mut asm, deopt, to_op(&kind)?);
+        }
+        match &block.terminator.as_ref()?.kind {
+            TerminatorKind::Jump { target } => {
+                asm.b(*label_of.get(&target.index())?);
+            }
+            TerminatorKind::JumpIf {
+                condition: Operand::Register(cond),
+                if_true,
+                if_false,
+            } => {
+                let slot = reg_slot(*cond);
+                emit_bool_guard(&mut asm, deopt, slot);
+                asm.ldr_x(X4, X0, payload_off(slot));
+                asm.cmp_imm_x(X4, 0);
+                asm.b_cond(Cond::NotEqual, *label_of.get(&if_true.index())?);
+                asm.b(*label_of.get(&if_false.index())?);
+            }
+            TerminatorKind::Return {
+                value: Some(Operand::Register(reg)),
+                by_ref_local: None,
+            } => {
+                emit_op(
+                    &mut asm,
+                    deopt,
+                    ScalarIntOp::Copy {
+                        dst: result_slot,
+                        src: reg_slot(*reg),
+                    },
+                );
+                asm.movz(X0, 0);
+                asm.ret();
+            }
+            _ => return None,
+        }
+    }
+
+    asm.bind(deopt);
+    asm.movz(X0, 1);
+    asm.ret();
+
+    Some(CompiledScalarRegion {
+        code: asm.finish(),
+        result_slot,
+        buffer_slots,
+    })
+}
+
 /// Map an IR `BinaryOp` to the native scalar-int subset.
 fn int_bin_op(op: BinaryOp) -> Option<IntBinOp> {
     match op {
@@ -1012,8 +1247,8 @@ fn ir_compare_to_region(op: CompareOp) -> Option<RegionCompareOp> {
 mod tests {
     use super::{
         GuardedIntAddStep, MAX_SLOT, RegionCompileError, SlotSequenceError,
-        build_scalar_int_region, compile_scalar_int_function, compile_scalar_int_region,
-        emit_guarded_int_add_sequence, int_bin_op,
+        build_scalar_int_region, compile_counted_loop_function, compile_scalar_int_function,
+        compile_scalar_int_region, emit_guarded_int_add_sequence, int_bin_op,
     };
     use crate::region_ir::{
         NodeId, RegionConst, RegionEffects, RegionGraph, RegionId, RegionNode, RegionNodeKind,
@@ -1416,11 +1651,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_loop_that_increments_by_a_non_one_step() {
-        // Change the increment constant from 1 to 2: no longer a `$i++` loop.
+    fn counted_loop_recognizer_rejects_a_non_one_step() {
+        // Change the increment constant from 1 to 2: no longer a canonical `$i++`
+        // loop, so the specialized counted-loop recognizer declines it...
         let function = sum_to_loop_function();
         let constants = [IrConstant::Int(0), IrConstant::Int(2)];
-        assert!(compile_scalar_int_function(&function, &constants, 1).is_none());
+        assert!(compile_counted_loop_function(&function, &constants).is_none());
+        // ...but the general CFG compiler still lowers it (it is a valid `while`).
+        assert!(compile_scalar_int_function(&function, &constants, 1).is_some());
     }
 
     /// `function acc(int $n): int { $s = 0; for ($i=0; $i<$n; $i++) { $s = $s <op> C; } return $s; }`
@@ -1596,6 +1834,120 @@ mod tests {
         assert_eq!(int_bin_op(BinaryOp::Div), None);
         assert_eq!(int_bin_op(BinaryOp::Pow), None);
         assert_eq!(int_bin_op(BinaryOp::Concat), None);
+    }
+
+    /// `function max2(int $a, int $b): int { if ($a > $b) { return $a; } return $b; }`
+    /// (locals: 0=$a, 1=$b) — an if/else diamond the counted-loop and leaf
+    /// recognizers reject, exercising the general CFG compiler.
+    fn max2_function() -> php_ir::IrFunction {
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let block = |id, instructions, terminator| BasicBlock {
+            id: BlockId::new(id),
+            instructions,
+            terminator,
+        };
+        let ret = |reg| {
+            Some(Terminator {
+                span,
+                kind: TerminatorKind::Return {
+                    value: Some(Operand::Register(RegId::new(reg))),
+                    by_ref_local: None,
+                },
+            })
+        };
+
+        php_ir::IrFunction {
+            name: "max2".to_string(),
+            params: vec![int_param("a", 0), int_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 6,
+            blocks: vec![
+                // entry: cmp = $a > $b; jump_if then else.
+                block(
+                    0,
+                    vec![
+                        ins(InstructionKind::LoadLocal {
+                            dst: RegId::new(0),
+                            local: LocalId::new(0),
+                        }),
+                        ins(InstructionKind::LoadLocal {
+                            dst: RegId::new(1),
+                            local: LocalId::new(1),
+                        }),
+                        ins(InstructionKind::Compare {
+                            dst: RegId::new(2),
+                            op: CompareOp::Greater,
+                            lhs: Operand::Register(RegId::new(0)),
+                            rhs: Operand::Register(RegId::new(1)),
+                        }),
+                    ],
+                    Some(Terminator {
+                        span,
+                        kind: TerminatorKind::JumpIf {
+                            condition: Operand::Register(RegId::new(2)),
+                            if_true: BlockId::new(1),
+                            if_false: BlockId::new(2),
+                        },
+                    }),
+                ),
+                // then: return $a.
+                block(
+                    1,
+                    vec![ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(3),
+                        local: LocalId::new(0),
+                    })],
+                    ret(3),
+                ),
+                // else: return $b.
+                block(
+                    2,
+                    vec![ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(4),
+                        local: LocalId::new(1),
+                    })],
+                    ret(4),
+                ),
+            ],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn general_cfg_compiler_recognizes_if_else_diamond() {
+        let function = max2_function();
+        let compiled = compile_scalar_int_function(&function, &[], 1)
+            .expect("if/else diamond compiled by the general CFG compiler");
+        // Slot layout: locals 0,1; registers 2..8; result slot at 2 + 6 = 8.
+        assert_eq!(compiled.result_slot, 8);
+        assert_eq!(compiled.buffer_slots, 9);
+        assert!(!compiled.code.is_empty());
+    }
+
+    #[test]
+    fn general_cfg_compiler_rejects_a_non_int_body_op() {
+        // Swap the comparison for a string concat: outside the int/bool subset.
+        let mut function = max2_function();
+        function.blocks[0].instructions[2].kind = InstructionKind::Binary {
+            dst: RegId::new(2),
+            op: BinaryOp::Concat,
+            lhs: Operand::Register(RegId::new(0)),
+            rhs: Operand::Register(RegId::new(1)),
+        };
+        // The JumpIf now reads a non-bool from a rejected op — but the op itself
+        // is out of subset, so the whole compile bails to the interpreter.
+        assert!(compile_scalar_int_function(&function, &[], 1).is_none());
     }
 
     #[test]

@@ -1095,6 +1095,294 @@ mod tests {
     }
 
     #[test]
+    fn executes_general_cfg_if_else_diamond() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::compile_scalar_int_function;
+        use php_ir::instruction::TerminatorKind;
+        use php_ir::{
+            BasicBlock, BlockId, CompareOp, FunctionFlags, InstrId, Instruction, InstructionKind,
+            IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId, Terminator,
+        };
+
+        // function max2(int $a, int $b): int { if ($a > $b) return $a; return $b; }
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let load = |dst, local| {
+            ins(InstructionKind::LoadLocal {
+                dst: RegId::new(dst),
+                local: LocalId::new(local),
+            })
+        };
+        let ret = |reg| {
+            Some(Terminator {
+                span,
+                kind: TerminatorKind::Return {
+                    value: Some(Operand::Register(RegId::new(reg))),
+                    by_ref_local: None,
+                },
+            })
+        };
+        let int_param = |name: &str, local| IrParam {
+            name: name.to_string(),
+            local: LocalId::new(local),
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Int),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        };
+        let function = php_ir::IrFunction {
+            name: "max2".to_string(),
+            params: vec![int_param("a", 0), int_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 6,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId::new(0),
+                    instructions: vec![
+                        load(0, 0),
+                        load(1, 1),
+                        ins(InstructionKind::Compare {
+                            dst: RegId::new(2),
+                            op: CompareOp::Greater,
+                            lhs: Operand::Register(RegId::new(0)),
+                            rhs: Operand::Register(RegId::new(1)),
+                        }),
+                    ],
+                    terminator: Some(Terminator {
+                        span,
+                        kind: TerminatorKind::JumpIf {
+                            condition: Operand::Register(RegId::new(2)),
+                            if_true: BlockId::new(1),
+                            if_false: BlockId::new(2),
+                        },
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId::new(1),
+                    instructions: vec![load(3, 0)],
+                    terminator: ret(3),
+                },
+                BasicBlock {
+                    id: BlockId::new(2),
+                    instructions: vec![load(4, 1)],
+                    terminator: ret(4),
+                },
+            ],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        };
+
+        let compiled =
+            compile_scalar_int_function(&function, &[], 1).expect("max2 compiles via CFG path");
+        let mem = CodeMemory::new(&compiled.code).expect("code memory should finalize");
+        // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
+        let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut JitCValue) -> i32>(mem.as_ptr())
+        };
+        let result = compiled.result_slot as usize;
+
+        // Buffer holds all slots; params in slots 0,1. a > b -> returns a.
+        let mut slots = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        slots[0] = JitCValue::int(7);
+        slots[1] = JitCValue::int(3);
+        assert_eq!(run(slots.as_mut_ptr()), 0);
+        assert_eq!(slots[result].tag, JitCValueTag::Int);
+        assert_eq!(slots[result].payload as i64, 7);
+
+        // a <= b -> returns b (the else arm).
+        let mut other = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        other[0] = JitCValue::int(2);
+        other[1] = JitCValue::int(9);
+        assert_eq!(run(other.as_mut_ptr()), 0);
+        assert_eq!(other[result].payload as i64, 9);
+
+        // Non-int argument -> the operand guard side-exits.
+        let mut bad = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        bad[0] = JitCValue::int(7);
+        // slot 1 left Uninitialized (not Int) -> the compare's guard deopts.
+        assert_eq!(run(bad.as_mut_ptr()), 1);
+    }
+
+    #[test]
+    fn executes_general_cfg_while_loop_with_back_edge() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::compile_scalar_int_function;
+        use php_ir::instruction::TerminatorKind;
+        use php_ir::{
+            BasicBlock, BinaryOp, BlockId, CompareOp, ConstId, FunctionFlags, InstrId, Instruction,
+            InstructionKind, IrConstant, IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId,
+            Terminator,
+        };
+
+        // function sumn(int $n): int {
+        //   $s = 0; $i = 0; while ($i < $n) { $s = $s + $i; $i = $i + 1; } return $s;
+        // }
+        // A 4-block while loop (body folds in the increment), so the 5-block
+        // counted-loop recognizer declines it and the CFG compiler emits the
+        // back-edge itself. Locals: $n=0, $s=1, $i=2.
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let load = |dst, local| {
+            ins(InstructionKind::LoadLocal {
+                dst: RegId::new(dst),
+                local: LocalId::new(local),
+            })
+        };
+        let load_const = |dst, c| {
+            ins(InstructionKind::LoadConst {
+                dst: RegId::new(dst),
+                constant: ConstId::new(c),
+            })
+        };
+        let store = |local, reg| {
+            ins(InstructionKind::StoreLocal {
+                local: LocalId::new(local),
+                src: Operand::Register(RegId::new(reg)),
+            })
+        };
+        let add = |dst, lhs, rhs| {
+            ins(InstructionKind::Binary {
+                dst: RegId::new(dst),
+                op: BinaryOp::Add,
+                lhs: Operand::Register(RegId::new(lhs)),
+                rhs: Operand::Register(RegId::new(rhs)),
+            })
+        };
+        let jump = |target| {
+            Some(Terminator {
+                span,
+                kind: TerminatorKind::Jump {
+                    target: BlockId::new(target),
+                },
+            })
+        };
+        let function = php_ir::IrFunction {
+            name: "sumn".to_string(),
+            params: vec![IrParam {
+                name: "n".to_string(),
+                local: LocalId::new(0),
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            }],
+            locals: vec!["n".to_string(), "s".to_string(), "i".to_string()],
+            local_count: 3,
+            register_count: 12,
+            blocks: vec![
+                // entry: $s = 0; $i = 0; jump header.
+                BasicBlock {
+                    id: BlockId::new(0),
+                    instructions: vec![
+                        load_const(0, 0),
+                        store(1, 0),
+                        load_const(1, 0),
+                        store(2, 1),
+                    ],
+                    terminator: jump(1),
+                },
+                // header: $i < $n ? body : exit.
+                BasicBlock {
+                    id: BlockId::new(1),
+                    instructions: vec![
+                        load(2, 2),
+                        load(3, 0),
+                        ins(InstructionKind::Compare {
+                            dst: RegId::new(4),
+                            op: CompareOp::Less,
+                            lhs: Operand::Register(RegId::new(2)),
+                            rhs: Operand::Register(RegId::new(3)),
+                        }),
+                    ],
+                    terminator: Some(Terminator {
+                        span,
+                        kind: TerminatorKind::JumpIf {
+                            condition: Operand::Register(RegId::new(4)),
+                            if_true: BlockId::new(2),
+                            if_false: BlockId::new(3),
+                        },
+                    }),
+                },
+                // body: $s = $s + $i; $i = $i + 1; jump header (back-edge).
+                BasicBlock {
+                    id: BlockId::new(2),
+                    instructions: vec![
+                        load(5, 1),
+                        load(6, 2),
+                        add(7, 5, 6),
+                        store(1, 7),
+                        load(8, 2),
+                        load_const(9, 1),
+                        add(10, 8, 9),
+                        store(2, 10),
+                    ],
+                    terminator: jump(1),
+                },
+                // exit: return $s.
+                BasicBlock {
+                    id: BlockId::new(3),
+                    instructions: vec![load(11, 1)],
+                    terminator: Some(Terminator {
+                        span,
+                        kind: TerminatorKind::Return {
+                            value: Some(Operand::Register(RegId::new(11))),
+                            by_ref_local: None,
+                        },
+                    }),
+                },
+            ],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let constants = [IrConstant::Int(0), IrConstant::Int(1)];
+
+        let compiled = compile_scalar_int_function(&function, &constants, 1)
+            .expect("while loop compiles via CFG path");
+        let mem = CodeMemory::new(&compiled.code).expect("code memory should finalize");
+        // SAFETY: valid `extern "C" fn(*mut JitCValue) -> i32` over a read-execute region.
+        let run: extern "C" fn(*mut JitCValue) -> i32 = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut JitCValue) -> i32>(mem.as_ptr())
+        };
+        let result = compiled.result_slot as usize;
+
+        // n = 5 -> sum(0..4) = 10.
+        let mut slots = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        slots[0] = JitCValue::int(5);
+        assert_eq!(run(slots.as_mut_ptr()), 0);
+        assert_eq!(slots[result].tag, JitCValueTag::Int);
+        assert_eq!(slots[result].payload as i64, 10);
+
+        // n = 0 -> the body never runs, $s stays 0.
+        let mut zero = vec![JitCValue::uninitialized(); compiled.buffer_slots as usize];
+        zero[0] = JitCValue::int(0);
+        assert_eq!(run(zero.as_mut_ptr()), 0);
+        assert_eq!(zero[result].payload as i64, 0);
+    }
+
+    #[test]
     fn mod_by_zero_and_out_of_range_shift_take_the_side_exit() {
         use crate::JitCValue;
         use crate::copy_patch::{IntBinOp, ScalarIntOp};
