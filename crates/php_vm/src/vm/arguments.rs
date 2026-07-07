@@ -102,6 +102,54 @@ fn bind_arguments(
     by_ref_warning_callable_name: Option<&str>,
     elide_frame_args: bool,
 ) -> Result<PreparedArguments, VmError> {
+    // Fast path: a plain positional call with exact arity to a function whose
+    // parameters are all untyped, non-variadic, and by-value, with frame args
+    // elided. This is the overwhelmingly common call shape; binding it directly
+    // skips the general path's per-call `bound` vector, the required/variadic
+    // scans, and the named/variadic/default machinery. It is behavior-identical
+    // to the general path for this shape: no type checks apply (all params are
+    // untyped), no by-ref references are produced, no defaults are needed
+    // (exact arity), `frame_args` is empty (elided), and `diagnostics` is empty
+    // (no by-ref value warnings). Values are moved rather than re-cloned.
+    if elide_frame_args
+        && args.len() == function.params.len()
+        && args.iter().all(|arg| {
+            arg.name.is_none()
+                && !matches!(arg.value_kind, IrCallArgValueKind::ByRefLocationPlaceholder)
+        })
+        && function
+            .params
+            .iter()
+            .all(|param| !param.variadic && !param.by_ref && param.type_.is_none())
+    {
+        let mut prepared = Vec::with_capacity(function.params.len());
+        let mut trace_args = Vec::with_capacity(function.params.len());
+        for (arg, param) in args.into_iter().zip(function.params.iter()) {
+            let value = match arg.value {
+                Value::Reference(cell) => cell.get(),
+                other => other,
+            };
+            trace_args.push(FrameTraceArgument {
+                name: None,
+                value: if param_is_sensitive(param) {
+                    trace_value_for_param(&value, true)
+                } else {
+                    value.clone()
+                },
+            });
+            prepared.push(PreparedArg {
+                value,
+                reference: None,
+            });
+        }
+        return Ok(PreparedArguments {
+            args: prepared,
+            frame_args: Vec::new(),
+            trace_args,
+            diagnostics: Vec::new(),
+        });
+    }
+
     let min = function
         .params
         .iter()
