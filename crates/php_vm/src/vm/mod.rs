@@ -5854,6 +5854,50 @@ impl Vm {
         None
     }
 
+    /// Copy-and-patch native leaf tier (default-off, behind `jit-copy-patch` +
+    /// the `PHRUST_JIT_COPY_PATCH` env gate). If the callee is a recognized
+    /// scalar-int leaf, compile it once (cached), run it natively over the
+    /// argument values, and return the result — otherwise `None` to fall through
+    /// to the interpreter. By-reference arguments are rejected (value-only
+    /// marshal). Guards/overflow inside the region take the interpreter side exit
+    /// via `None`, so behavior is identical to interpreting the function.
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    fn try_execute_copy_patch_leaf(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        function: &IrFunction,
+        args: &[PreparedArg],
+    ) -> Option<Value> {
+        if !crate::copy_patch_bridge::copy_patch_leaf_enabled() {
+            return None;
+        }
+        if args.iter().any(|arg| arg.reference.is_some()) {
+            return None;
+        }
+        let unit = compiled.unit();
+        let leaf = crate::copy_patch_bridge::cached_leaf(
+            unit.id.raw(),
+            function_id.raw(),
+            function,
+            &unit.constants,
+        )?;
+        let params: Vec<Value> = args.iter().map(|arg| arg.value.clone()).collect();
+        leaf.run(&params)
+    }
+
+    /// Hosts without the copy-patch emitter always fall back to the interpreter.
+    #[cfg(all(feature = "jit-copy-patch", not(all(unix, target_arch = "aarch64"))))]
+    fn try_execute_copy_patch_leaf(
+        &self,
+        _compiled: &CompiledUnit,
+        _function_id: FunctionId,
+        _function: &IrFunction,
+        _args: &[PreparedArg],
+    ) -> Option<Value> {
+        None
+    }
+
     #[cfg(feature = "jit-cranelift")]
     fn try_execute_jit_leaf(
         &self,
@@ -13783,6 +13827,12 @@ impl Vm {
                         generator_context,
                     ),
                 )));
+            }
+            #[cfg(feature = "jit-copy-patch")]
+            if let Some(value) =
+                self.try_execute_copy_patch_leaf(compiled, function_id, function, &args)
+            {
+                return VmResult::success_no_output(Some(value));
             }
             if let Some(value) = self.try_execute_jit_leaf(
                 compiled,
