@@ -414,6 +414,87 @@ mod tests {
         assert_eq!(typed.tag, JitCValueTag::Uninitialized);
     }
 
+    // The Frame-Local Slot ABI made executable: a dense function's working set
+    // is a single flat `[JitCValue]` slot buffer that the VM marshals in/out
+    // around the call. Native code addresses slot `i` at `slot_base + i*24`
+    // directly through the emitter's scaled-offset loads/stores — no per-access
+    // helper. This computes `slot[2] = slot[0] + slot[1]` (the "add two locals
+    // into a third local" kernel) with Int type guards and an overflow side
+    // exit, reading and writing three slots of one contiguous buffer.
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn executes_add_over_a_flat_slot_buffer() {
+        use crate::JitCValue;
+        use crate::aarch64::{Aarch64Assembler, Cond, X0, X3, X4, X5, X6};
+        use crate::abi::JitCValueTag;
+
+        const INT_TAG: u16 = JitCValueTag::Int as u16;
+        // `JitCValue` is repr(C) and 24 bytes (tag@0 u32, payload@8 u64,
+        // aux@16 u64), so slot `i` lives at `i * 24` and every field lands on a
+        // legal scaled-immediate boundary.
+        const STRIDE: u32 = 24;
+        const TAG: u32 = 0;
+        const PAYLOAD: u32 = 8;
+
+        // extern "C" fn(slot_base: *mut JitCValue) -> i32, computing
+        //   slot[2] = slot[0] + slot[1]  (Int-guarded, overflow -> side exit)
+        // x0 = slot_base; x3 = scratch/tag; x4/x5 = payloads; x6 = sum.
+        let mut asm = Aarch64Assembler::new();
+        let deopt = asm.new_label();
+        asm.ldr_w(X3, X0, TAG); // slot[0].tag
+        asm.cmp_imm_w(X3, INT_TAG);
+        asm.b_cond(Cond::NotEqual, deopt);
+        asm.ldr_w(X3, X0, STRIDE + TAG); // slot[1].tag
+        asm.cmp_imm_w(X3, INT_TAG);
+        asm.b_cond(Cond::NotEqual, deopt);
+        asm.ldr_x(X4, X0, PAYLOAD); // slot[0].payload
+        asm.ldr_x(X5, X0, STRIDE + PAYLOAD); // slot[1].payload
+        asm.adds(X6, X4, X5); // sum + flags
+        asm.b_cond(Cond::Overflow, deopt);
+        asm.movz(X3, INT_TAG);
+        asm.str_w(X3, X0, 2 * STRIDE + TAG); // slot[2].tag = Int
+        asm.str_x(X6, X0, 2 * STRIDE + PAYLOAD); // slot[2].payload = sum
+        asm.movz(X0, 0);
+        asm.ret();
+        asm.bind(deopt);
+        asm.movz(X0, 1);
+        asm.ret();
+        let mem = CodeMemory::new(&asm.finish()).expect("code memory should finalize");
+        // SAFETY: the emitted bytes are a valid `extern "C" fn(*mut JitCValue) -> i32`
+        // over a read-execute region; the buffer below is a live, aligned,
+        // contiguous `[JitCValue; 3]` (24-byte stride) that outlives the call.
+        let run: extern "C" fn(*mut JitCValue) -> i32 =
+            unsafe { core::mem::transmute(mem.as_ptr()) };
+
+        // Fast path: slot[0]=20, slot[1]=22 -> slot[2]=42.
+        let mut slots = [
+            JitCValue::int(20),
+            JitCValue::int(22),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(slots.as_mut_ptr()), 0);
+        assert_eq!(slots[2].tag, JitCValueTag::Int);
+        assert_eq!(slots[2].payload as i64, 42);
+
+        // Type-guard side exit: slot[1] is not Int -> result slot untouched.
+        let mut typed = [
+            JitCValue::int(1),
+            JitCValue::null(),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(typed.as_mut_ptr()), 1);
+        assert_eq!(typed[2].tag, JitCValueTag::Uninitialized);
+
+        // Overflow side exit: result slot untouched.
+        let mut over = [
+            JitCValue::int(i64::MAX),
+            JitCValue::int(1),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(over.as_mut_ptr()), 1);
+        assert_eq!(over[2].tag, JitCValueTag::Uninitialized);
+    }
+
     // The native<->VM-helper call boundary: copy-and-patch-emitted code
     // materializes a runtime-resolved helper address and `blr`s into a real VM
     // helper (with a saved link register), returning the helper's status. This
