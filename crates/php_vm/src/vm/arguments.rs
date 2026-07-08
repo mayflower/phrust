@@ -88,6 +88,36 @@ pub(super) fn prepare_arguments(
     )
 }
 
+/// The plain-positional, exact-arity, by-value call shape that both the
+/// `bind_arguments` fast path and the dense executor's direct-to-locals fast
+/// path recognize. Sharing one predicate keeps the two in lockstep so they can
+/// never diverge on which calls skip the general machinery.
+///
+/// For this shape the general path and the fast path are behavior-identical:
+/// both hand the caller *raw* (uncoerced) by-value arguments and let the shared
+/// post-binding loop apply parameter-type coercion, strict-types enforcement,
+/// and `TypeError` reporting via `coerce_or_check_param_type` at the identical
+/// program point. Untyped params (with or without a default) and typed params
+/// without a default both bind by position and are coerced there; exact arity
+/// means a supplied param never consults its default, so typed-without-default
+/// is identical to the general path here. Only typed-with-default stays on the
+/// general path, conservatively.
+///
+/// The shape guarantees: no by-ref references are produced (all params are
+/// by-value), no defaults are consulted (exact arity supplies every param), no
+/// variadic expansion, and no named/unpacked arguments. Callers must still
+/// require `elide_frame_args` before taking either fast path.
+pub(super) fn is_direct_bind_fast_shape(function: &IrFunction, args: &[CallArgument]) -> bool {
+    args.len() == function.params.len()
+        && args.iter().all(|arg| {
+            arg.name.is_none()
+                && !matches!(arg.value_kind, IrCallArgValueKind::ByRefLocationPlaceholder)
+        })
+        && function.params.iter().all(|param| {
+            !param.variadic && !param.by_ref && (param.type_.is_none() || param.default.is_none())
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bind_arguments(
     compiled: &CompiledUnit,
@@ -126,25 +156,7 @@ fn bind_arguments(
     // arity means every param is supplied), `frame_args` is empty (elided), and
     // `diagnostics` is empty (no by-ref value warnings). Values are moved rather
     // than re-cloned.
-    if elide_frame_args
-        && args.len() == function.params.len()
-        && args.iter().all(|arg| {
-            arg.name.is_none()
-                && !matches!(arg.value_kind, IrCallArgValueKind::ByRefLocationPlaceholder)
-        })
-        && function.params.iter().all(|param| {
-            !param.variadic
-                    && !param.by_ref
-                    // Untyped params (with or without a default) kept the fast
-                    // path before this change; typed params without a default
-                    // are the R1 win added here. Both bind by-position and are
-                    // coerced by the shared post-binding loop, so both are
-                    // behavior-identical to the general path at exact arity
-                    // (a supplied param never consults its default). Only
-                    // typed-with-default stays on the general path, conservatively.
-                    && (param.type_.is_none() || param.default.is_none())
-        })
-    {
+    if elide_frame_args && is_direct_bind_fast_shape(function, &args) {
         let mut prepared = Vec::with_capacity(function.params.len());
         for arg in args {
             let value = match arg.value {

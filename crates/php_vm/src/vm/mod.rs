@@ -1962,7 +1962,7 @@ fn function_is_specialized_tiny_leaf_candidate(
 fn specialized_call_frame_fallback_reason(
     layout: &str,
     frame_reuse_blocked_reason: Option<&'static str>,
-    args: &[PreparedArg],
+    has_by_ref_arg: bool,
 ) -> Option<&'static str> {
     if layout == "tiny_leaf_frame" && frame_reuse_blocked_reason.is_none() {
         return None;
@@ -1976,18 +1976,10 @@ fn specialized_call_frame_fallback_reason(
         "include_eval_frame" => Some("include_eval"),
         "dynamic_reflection_call_frame" => Some("dynamic_reflection"),
         "known_function_frame" | "tiny_leaf_frame" => frame_reuse_blocked_reason
-            .or_else(|| {
-                args.iter()
-                    .any(|arg| arg.reference.is_some())
-                    .then_some("by_ref_argument")
-            })
+            .or_else(|| has_by_ref_arg.then_some("by_ref_argument"))
             .or(Some("not_tiny_leaf")),
         _ => frame_reuse_blocked_reason
-            .or_else(|| {
-                args.iter()
-                    .any(|arg| arg.reference.is_some())
-                    .then_some("by_ref_argument")
-            })
+            .or_else(|| has_by_ref_arg.then_some("by_ref_argument"))
             .or(Some("unsupported_layout")),
     }
 }
@@ -7238,50 +7230,87 @@ impl Vm {
         let argument_policy = call.argument_binding_policy(compiled);
         let elide_frame_args = self.frame_args_elidable(compiled, function_id, ir_function);
         self.record_counter_direct_frame(frame_layout, ir_function, elide_frame_args);
-        let prepared = match arguments::prepare_arguments(
-            compiled,
-            ir_function,
-            call.args,
-            stack,
-            state,
-            self.typecheck_fast_path_context(),
-            argument_policy,
-            call.allow_by_ref_value_warnings,
-            call.call_span,
-            call.by_ref_warning_callable_name.as_deref(),
-            elide_frame_args,
-        ) {
-            Ok(args) => args,
-            Err(message) => {
-                let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
-                let error_span = call.call_span.unwrap_or(ir_function.span);
-                let caller_only_trace = message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
-                let result = self.runtime_error(output, error_compiled, stack, message);
-                if let Some(throwable) = runtime_error_throwable(&result) {
-                    tag_throwable_location(&throwable, error_compiled, error_span);
-                    state.pending_trace = Some(if caller_only_trace {
-                        capture_backtrace_string(error_compiled, stack)
-                    } else {
-                        capture_backtrace_string_with_failed_call(
-                            error_compiled,
-                            stack,
-                            ir_function,
-                            error_span,
-                        )
-                    });
-                    state.pending_throw = Some(throwable);
-                    return VmResult::propagating_exception(output.clone());
+        // R1 fast path: an exact-arity plain-positional by-value call binds its
+        // arguments straight into the callee frame's locals, reusing the
+        // incoming `Vec<CallArgument>` as the hand-off buffer and skipping the
+        // per-call `Vec<PreparedArg>` allocation. Guarded to the identical shape
+        // as `bind_arguments`'s fast path, so coercion, strict-types, TypeError
+        // reporting, and the backtrace snapshot stay byte-identical (see the
+        // shared `is_direct_bind_fast_shape`, `coerce_or_check_param_type`, and
+        // `trace_value_for_bound_param`).
+        let direct_bind =
+            elide_frame_args && arguments::is_direct_bind_fast_shape(ir_function, &call.args);
+        let mut direct_args: Vec<CallArgument> = Vec::new();
+        let mut prepared_args: Vec<PreparedArg> = Vec::new();
+        let mut frame_args: Vec<Value> = Vec::new();
+        let mut binding_diagnostics: Vec<RuntimeDiagnostic> = Vec::new();
+        let has_by_ref_arg;
+        if direct_bind {
+            // Resolve reference arguments in place, exactly as the fast path in
+            // `bind_arguments` does, so the trace snapshot and the locals both
+            // observe the dereferenced value. The shape guarantees no by-ref
+            // params, no defaults, no variadic, and no named arguments, so
+            // `frame_args`/`binding_diagnostics` stay empty as they would on the
+            // general path for this shape.
+            let mut args = std::mem::take(&mut call.args);
+            for arg in &mut args {
+                if let Value::Reference(cell) = &arg.value {
+                    arg.value = cell.get();
                 }
-                return result;
             }
-        };
-        let frame_reuse_blocked_reason = frame_reuse_call_shape_reason
-            .or_else(|| frame_reuse_prepared_args_blocked_reason(&prepared.args));
+            direct_args = args;
+            has_by_ref_arg = false;
+        } else {
+            let prepared = match arguments::prepare_arguments(
+                compiled,
+                ir_function,
+                std::mem::take(&mut call.args),
+                stack,
+                state,
+                self.typecheck_fast_path_context(),
+                argument_policy,
+                call.allow_by_ref_value_warnings,
+                call.call_span,
+                call.by_ref_warning_callable_name.as_deref(),
+                elide_frame_args,
+            ) {
+                Ok(args) => args,
+                Err(message) => {
+                    let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
+                    let error_span = call.call_span.unwrap_or(ir_function.span);
+                    let caller_only_trace =
+                        message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
+                    let result = self.runtime_error(output, error_compiled, stack, message);
+                    if let Some(throwable) = runtime_error_throwable(&result) {
+                        tag_throwable_location(&throwable, error_compiled, error_span);
+                        state.pending_trace = Some(if caller_only_trace {
+                            capture_backtrace_string(error_compiled, stack)
+                        } else {
+                            capture_backtrace_string_with_failed_call(
+                                error_compiled,
+                                stack,
+                                ir_function,
+                                error_span,
+                            )
+                        });
+                        state.pending_throw = Some(throwable);
+                        return VmResult::propagating_exception(output.clone());
+                    }
+                    return result;
+                }
+            };
+            has_by_ref_arg = frame_reuse_prepared_args_blocked_reason(&prepared.args).is_some();
+            frame_args = prepared.frame_args;
+            binding_diagnostics = prepared.diagnostics;
+            prepared_args = prepared.args;
+        }
+        let frame_reuse_blocked_reason =
+            frame_reuse_call_shape_reason.or_else(|| has_by_ref_arg.then_some("by_ref_argument"));
         self.record_counter_call_frame_layout(frame_layout);
         let specialized_frame_fallback = specialized_call_frame_fallback_reason(
             frame_layout,
             frame_reuse_blocked_reason,
-            &prepared.args,
+            has_by_ref_arg,
         );
         let specialized_tiny_frame = specialized_frame_fallback.is_none();
         if frame_layout == "tiny_leaf_frame" {
@@ -7319,9 +7348,7 @@ impl Vm {
             dense_function.register_count,
             dense_function.local_count,
         );
-        let args = prepared.args;
-        let frame_args = prepared.frame_args;
-        for diagnostic in prepared.diagnostics {
+        for diagnostic in binding_diagnostics {
             let handled = match self.dispatch_error_handler(
                 compiled,
                 output,
@@ -7349,9 +7376,14 @@ impl Vm {
         }
         {
             let frame = stack.current_mut().expect("bytecode frame was pushed");
+            let args_is_empty = if direct_bind {
+                direct_args.is_empty()
+            } else {
+                prepared_args.is_empty()
+            };
             if specialized_tiny_frame {
                 self.record_counter_specialized_frame_hit();
-                if !args.is_empty() {
+                if !args_is_empty {
                     self.record_counter_arg_array_avoided();
                 }
                 if reused_frame {
@@ -7363,7 +7395,19 @@ impl Vm {
                 // vector (from the raw args, before they move into locals),
                 // rather than allocating one per call and discarding it for the
                 // tiny-frame fast path above.
-                build_frame_trace_arguments(&mut frame.trace_arguments, &args, &ir_function.params);
+                if direct_bind {
+                    build_frame_trace_arguments_direct(
+                        &mut frame.trace_arguments,
+                        &direct_args,
+                        &ir_function.params,
+                    );
+                } else {
+                    build_frame_trace_arguments(
+                        &mut frame.trace_arguments,
+                        &prepared_args,
+                        &ir_function.params,
+                    );
+                }
             }
         }
         if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
@@ -7390,46 +7434,90 @@ impl Vm {
         } else if ir_function.flags.is_top_level {
             bind_top_level_global_locals(ir_function, stack, state);
         }
-        for (arg_index, (param, mut arg)) in ir_function.params.iter().zip(args).enumerate() {
-            if let Err(message) = coerce_or_check_param_type(
-                compiled,
-                state,
-                ir_function,
-                param,
-                arg_index,
-                &mut arg.value,
-                arg.reference.is_some(),
-                self.typecheck_fast_path_context(),
-                argument_policy.call_site_strict_types,
-                call.call_span,
-            ) {
-                let result = self.runtime_error(output, compiled, stack, message);
-                if let Some(throwable) = runtime_error_throwable(&result) {
-                    tag_throwable_location(&throwable, compiled, ir_function.span);
-                    state.pending_trace = Some(capture_backtrace_string(compiled, stack));
-                    return self.propagate_exception(output, stack, state, throwable);
+        if direct_bind {
+            // Direct-to-locals: coerce each raw by-value argument with the same
+            // `coerce_or_check_param_type` at the same program point as the
+            // general path, then write it straight into the frame's locals. The
+            // fast shape has no by-ref params, so there is no reference cell to
+            // bind (`coerce_or_check_param_type` ignores the by-ref flag anyway).
+            for (arg_index, (param, arg)) in ir_function.params.iter().zip(direct_args).enumerate()
+            {
+                let mut value = arg.value;
+                if let Err(message) = coerce_or_check_param_type(
+                    compiled,
+                    state,
+                    ir_function,
+                    param,
+                    arg_index,
+                    &mut value,
+                    false,
+                    self.typecheck_fast_path_context(),
+                    argument_policy.call_site_strict_types,
+                    call.call_span,
+                ) {
+                    let result = self.runtime_error(output, compiled, stack, message);
+                    if let Some(throwable) = runtime_error_throwable(&result) {
+                        tag_throwable_location(&throwable, compiled, ir_function.span);
+                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                        return self.propagate_exception(output, stack, state, throwable);
+                    }
+                    stack.pop_recycle();
+                    return result;
                 }
-                stack.pop_recycle();
-                return result;
+                let locals = &mut stack
+                    .current_mut()
+                    .expect("bytecode frame was pushed")
+                    .locals;
+                if let Err(message) = locals.set(param.local, value) {
+                    let result = self.runtime_error(output, compiled, stack, message);
+                    stack.pop_recycle();
+                    return result;
+                }
             }
-            let locals = &mut stack
-                .current_mut()
-                .expect("bytecode frame was pushed")
-                .locals;
-            let result = if param.by_ref {
-                if let Some(reference) = arg.reference {
-                    reference.set(arg.value);
-                    locals.bind_reference_cell(param.local, reference)
+        } else {
+            for (arg_index, (param, mut arg)) in
+                ir_function.params.iter().zip(prepared_args).enumerate()
+            {
+                if let Err(message) = coerce_or_check_param_type(
+                    compiled,
+                    state,
+                    ir_function,
+                    param,
+                    arg_index,
+                    &mut arg.value,
+                    arg.reference.is_some(),
+                    self.typecheck_fast_path_context(),
+                    argument_policy.call_site_strict_types,
+                    call.call_span,
+                ) {
+                    let result = self.runtime_error(output, compiled, stack, message);
+                    if let Some(throwable) = runtime_error_throwable(&result) {
+                        tag_throwable_location(&throwable, compiled, ir_function.span);
+                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                        return self.propagate_exception(output, stack, state, throwable);
+                    }
+                    stack.pop_recycle();
+                    return result;
+                }
+                let locals = &mut stack
+                    .current_mut()
+                    .expect("bytecode frame was pushed")
+                    .locals;
+                let result = if param.by_ref {
+                    if let Some(reference) = arg.reference {
+                        reference.set(arg.value);
+                        locals.bind_reference_cell(param.local, reference)
+                    } else {
+                        locals.set(param.local, arg.value)
+                    }
                 } else {
                     locals.set(param.local, arg.value)
+                };
+                if let Err(message) = result {
+                    let result = self.runtime_error(output, compiled, stack, message);
+                    stack.pop_recycle();
+                    return result;
                 }
-            } else {
-                locals.set(param.local, arg.value)
-            };
-            if let Err(message) = result {
-                let result = self.runtime_error(output, compiled, stack, message);
-                stack.pop_recycle();
-                return result;
             }
         }
         let unit_id = compiled.unit().id;
@@ -14251,7 +14339,7 @@ impl Vm {
             let specialized_frame_fallback = specialized_call_frame_fallback_reason(
                 frame_layout,
                 frame_reuse_blocked_reason,
-                &prepared.args,
+                frame_reuse_prepared_args_blocked_reason(&prepared.args).is_some(),
             );
             let specialized_tiny_frame = specialized_frame_fallback.is_none();
             if frame_layout == "tiny_leaf_frame" {
@@ -56715,18 +56803,15 @@ fn build_frame_trace_arguments(
                 break;
             }
             Some(param) => {
-                let value = if param_is_sensitive(param) {
-                    trace_value_for_param(&arg.value, true)
-                } else if arg.trace_holds_reference {
-                    Value::Reference(
-                        arg.reference
-                            .clone()
-                            .expect("by-ref trace argument retains its cell"),
-                    )
-                } else {
-                    arg.value.clone()
-                };
-                trace.push(FrameTraceArgument { name: None, value });
+                trace.push(FrameTraceArgument {
+                    name: None,
+                    value: trace_value_for_bound_param(
+                        param,
+                        &arg.value,
+                        arg.reference.as_ref(),
+                        arg.trace_holds_reference,
+                    ),
+                });
             }
             // Extra positional arguments beyond the declared parameters have no
             // parameter to consult, so they are neither named nor redacted.
@@ -56737,6 +56822,53 @@ fn build_frame_trace_arguments(
                 });
             }
         }
+    }
+}
+
+/// The backtrace-visible value for one bound positional parameter: redacted for
+/// `#[\SensitiveParameter]`, the live by-ref cell when the trace must observe
+/// writes through the parameter, otherwise a value snapshot. Shared by the
+/// prepared-arguments trace builder and the dense direct-bind trace builder so
+/// both produce byte-identical entries.
+fn trace_value_for_bound_param(
+    param: &IrParam,
+    value: &Value,
+    reference: Option<&ReferenceCell>,
+    trace_holds_reference: bool,
+) -> Value {
+    if param_is_sensitive(param) {
+        trace_value_for_param(value, true)
+    } else if trace_holds_reference {
+        Value::Reference(
+            reference
+                .cloned()
+                .expect("by-ref trace argument retains its cell"),
+        )
+    } else {
+        value.clone()
+    }
+}
+
+/// Builds a frame's backtrace-visible arguments for the dense executor's
+/// direct-to-locals fast path, reading the raw (reference-resolved, pre-coercion)
+/// call arguments instead of a `Vec<PreparedArg>`. The fast shape guarantees
+/// exact arity with no by-ref, variadic, or extra positional arguments, so every
+/// argument maps to a declared parameter and produces exactly the entry
+/// `build_frame_trace_arguments` would for the equivalent prepared arguments
+/// (`reference: None`, `trace_holds_reference: false`). Read the arguments before
+/// they move into the frame's locals.
+fn build_frame_trace_arguments_direct(
+    trace: &mut Vec<FrameTraceArgument>,
+    args: &[CallArgument],
+    params: &[IrParam],
+) {
+    debug_assert!(trace.is_empty());
+    trace.reserve(args.len());
+    for (param, arg) in params.iter().zip(args) {
+        trace.push(FrameTraceArgument {
+            name: None,
+            value: trace_value_for_bound_param(param, &arg.value, None, false),
+        });
     }
 }
 
