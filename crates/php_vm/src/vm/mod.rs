@@ -2167,6 +2167,12 @@ pub struct Vm {
     /// `ExecutionState::class_table_epoch`, so a redefinition rebuilds it from
     /// the current class entry.
     default_slot_template_cache: RefCell<DefaultSlotTemplateCache>,
+    /// Memoized `__construct` resolution outcomes so the hot `new C(...)` path
+    /// does not re-run the inheritance + visibility method-resolution walk on
+    /// every instantiation. Keyed by (normalized class name, normalized caller
+    /// scope) and guarded by `ExecutionState::class_table_epoch`, so a
+    /// redeclaration or autoload (both bump the epoch) drops stale outcomes.
+    constructor_resolution_cache: RefCell<ConstructorResolutionCache>,
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
     include_execution_depth: Cell<u32>,
     request_profile_stack: RefCell<Vec<RequestProfileFrame>>,
@@ -2198,6 +2204,7 @@ impl Vm {
             runtime_class_entry_cache: RefCell::new(RuntimeClassEntryCache::default()),
             ir_class_entry_cache: RefCell::new(IrClassEntryCache::default()),
             default_slot_template_cache: RefCell::new(DefaultSlotTemplateCache::default()),
+            constructor_resolution_cache: RefCell::new(ConstructorResolutionCache::default()),
             quickening: RefCell::new(QuickeningTable::default()),
             inline_caches: RefCell::new(InlineCacheTable::default()),
             jit: RefCell::new(JitRuntimeState::default()),
@@ -2227,6 +2234,7 @@ impl Vm {
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
         *self.ir_class_entry_cache.borrow_mut() = IrClassEntryCache::default();
         *self.default_slot_template_cache.borrow_mut() = DefaultSlotTemplateCache::default();
+        *self.constructor_resolution_cache.borrow_mut() = ConstructorResolutionCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
             self.quickening
@@ -4723,6 +4731,60 @@ impl Vm {
             .entries
             .insert(key, Rc::clone(&template));
         template
+    }
+
+    /// Returns the resolved `__construct` for a class as seen from `caller_scope`,
+    /// running the inheritance + visibility method-resolution walk only on the
+    /// first `new` of each (class, caller scope) pair within a class-table epoch
+    /// and reusing the memoized outcome afterward.
+    ///
+    /// The outcome is exactly what `lookup_resolved_method_in_state` returns for
+    /// `"__construct"` — `Ok(Some(resolved))`, `Ok(None)` (no constructor → default
+    /// construction), or `Err(message)` (e.g. an inheritance-cycle diagnostic) — so
+    /// a cache hit reproduces the same result byte-for-byte, including errors. The
+    /// caller scope is part of the key because private/protected resolution depends
+    /// on it, and it is normalized (as `lookup_resolved_method_in_state` compares
+    /// scopes case-insensitively) so equivalent scopes share one entry. When the
+    /// class table changes (redeclaration or autoload, both bump
+    /// `class_table_epoch`), the cache is dropped so resolution is recomputed
+    /// against the new table.
+    ///
+    /// Downstream visibility enforcement (`validate_constructor_callable_in_state_scope`,
+    /// abstract-class instantiation checks) runs on the returned `ResolvedMethodOwned`
+    /// exactly as before and is not memoized here.
+    fn cached_constructor_resolution(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        class_name: &str,
+        caller_scope: Option<&str>,
+    ) -> Result<Option<ResolvedMethodOwned>, String> {
+        let epoch = state.class_table_epoch;
+        let key = (
+            normalize_class_name(class_name),
+            caller_scope.map(normalize_class_name),
+        );
+        {
+            let mut cache = self.constructor_resolution_cache.borrow_mut();
+            if cache.epoch != epoch {
+                cache.entries.clear();
+                cache.epoch = epoch;
+            } else if let Some(outcome) = cache.entries.get(&key) {
+                return outcome.clone();
+            }
+        }
+        let outcome = lookup_resolved_method_in_state(
+            compiled,
+            state,
+            class_name,
+            "__construct",
+            caller_scope,
+        );
+        self.constructor_resolution_cache
+            .borrow_mut()
+            .entries
+            .insert(key, outcome.clone());
+        outcome
     }
 
     fn record_counter_direct_frame(&self, layout: &str, function: &IrFunction, elided: bool) {
@@ -17162,11 +17224,10 @@ impl Vm {
                             );
                         }
                         let caller_scope = current_scope_class(compiled, stack);
-                        let constructor = match lookup_resolved_method_in_state(
+                        let constructor = match self.cached_constructor_resolution(
                             compiled,
                             state,
                             &class.name,
-                            "__construct",
                             caller_scope.as_deref(),
                         ) {
                             Ok(constructor) => constructor,
@@ -18562,11 +18623,10 @@ impl Vm {
                             );
                         }
                         let caller_scope = current_scope_class(compiled, stack);
-                        let constructor = match lookup_resolved_method_in_state(
+                        let constructor = match self.cached_constructor_resolution(
                             compiled,
                             state,
                             &class.name,
-                            "__construct",
                             caller_scope.as_deref(),
                         ) {
                             Ok(constructor) => constructor,
@@ -45338,6 +45398,24 @@ struct DefaultSlotTemplateCache {
     entries: HashMap<String, Rc<Vec<Option<Value>>>>,
 }
 
+/// Cache of `__construct` resolution outcomes, keyed by (normalized class name,
+/// normalized caller scope) and guarded by the class-table epoch. Resolving a
+/// constructor runs a private-scope probe plus the full inheritance + visibility
+/// walk (`lookup_resolved_method_in_state`); a hot instantiation site would
+/// otherwise pay that on every `new`. Caching the whole `Result` — `Ok(Some)`,
+/// `Ok(None)`, and `Err` alike — reproduces the exact outcome on a hit (a
+/// visibility/cycle diagnostic is replayed, never re-walked or bypassed). The
+/// caller scope is part of the key because private/protected resolution differs
+/// by calling scope. Cloning the cached `ResolvedMethodOwned` bumps the shared
+/// `Arc<ClassEntry>` and clones the resolved method entry, which is exactly what
+/// the walk's terminal step does, so a hit is behavior-neutral; the cache is
+/// dropped when the epoch changes.
+#[derive(Clone, Debug, Default)]
+struct ConstructorResolutionCache {
+    epoch: u64,
+    entries: HashMap<(String, Option<String>), Result<Option<ResolvedMethodOwned>, String>>,
+}
+
 fn runtime_class_entry(
     compiled: &CompiledUnit,
     state: &ExecutionState,
@@ -47204,7 +47282,7 @@ struct ResolvedMethod<'a> {
     method: &'a php_ir::module::ClassMethodEntry,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ResolvedMethodOwned {
     class: Arc<php_ir::module::ClassEntry>,
     method: php_ir::module::ClassMethodEntry,
