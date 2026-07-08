@@ -181,13 +181,26 @@ const JIT_BLACKLIST_GUARD_FAILURE_THRESHOLD: u64 = 2;
 const JIT_BLACKLIST_COMPILE_ERROR_THRESHOLD: u64 = 1;
 #[cfg(feature = "jit-cranelift")]
 const JIT_BLACKLIST_ABI_MISMATCH_THRESHOLD: u64 = 1;
-#[cfg(feature = "jit-cranelift")]
+// The property-load fetch status codes are shared by both native tiers'
+// property-load helpers (Cranelift and copy-and-patch), so the three the shared
+// fetch core returns are available whenever either tier is compiled. LAYOUT_EXIT
+// is only produced/attributed on the Cranelift path, so it stays gated there.
+#[cfg(any(
+    feature = "jit-cranelift",
+    all(feature = "jit-copy-patch", unix, target_arch = "aarch64")
+))]
 const JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT: i32 = 21;
 #[cfg(feature = "jit-cranelift")]
 const JIT_PROPERTY_LOAD_STATUS_LAYOUT_EXIT: i32 = 22;
-#[cfg(feature = "jit-cranelift")]
+#[cfg(any(
+    feature = "jit-cranelift",
+    all(feature = "jit-copy-patch", unix, target_arch = "aarch64")
+))]
 const JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT: i32 = 23;
-#[cfg(feature = "jit-cranelift")]
+#[cfg(any(
+    feature = "jit-cranelift",
+    all(feature = "jit-copy-patch", unix, target_arch = "aarch64")
+))]
 const JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT: i32 = 24;
 
 #[cfg(feature = "jit-cranelift")]
@@ -368,6 +381,50 @@ extern "C" fn jit_concat_string_string_fast(
     php_jit::JIT_HELPER_STATUS_OK
 }
 
+/// Shared monomorphic property-load fetch core reused by both native tiers'
+/// property-load helpers: the Cranelift [`jit_property_load_monomorphic_fast`]
+/// and the copy-and-patch `copy_patch_property_load_abi` (in
+/// `crate::copy_patch_bridge`). It performs the *layout guard* — the value must
+/// be an object whose runtime class equals the metadata's expected receiver
+/// class, so a polymorphic/subclass instance reaching the same site is rejected
+/// rather than read at a wrong slot — and reads the declared property by its
+/// runtime storage name.
+///
+/// Returns `Ok(value)` with the property's initialized value, or `Err(status)`
+/// with the specific side-exit status: a non-object or class mismatch is
+/// [`JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT`], an absent property is
+/// [`JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT`], and an uninitialized typed property
+/// is [`JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT`] (the interpreter then throws
+/// the exact `Error`). It only reads a declared property slot — it never mutates,
+/// invokes a hook/`__get` (those shapes are excluded at recognition time), or
+/// re-enters the VM.
+#[cfg(any(
+    feature = "jit-cranelift",
+    all(feature = "jit-copy-patch", unix, target_arch = "aarch64")
+))]
+pub(crate) fn jit_property_load_fetch(
+    value: &Value,
+    metadata: &php_jit::JitPropertyLoadMetadata,
+) -> Result<Value, i32> {
+    let effective = match value {
+        Value::Reference(cell) => cell.get(),
+        other => other.clone(),
+    };
+    let Value::Object(object) = effective else {
+        return Err(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    };
+    if normalize_class_name(&object.class_name()) != metadata.receiver_class {
+        return Err(JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT);
+    }
+    let Some(value) = object.get_property(&metadata.storage_name) else {
+        return Err(JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT);
+    };
+    if value.is_uninitialized() {
+        return Err(JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT);
+    }
+    Ok(value)
+}
+
 #[cfg(feature = "jit-cranelift")]
 extern "C" fn jit_property_load_monomorphic_fast(
     value_ptr: usize,
@@ -383,30 +440,19 @@ extern "C" fn jit_property_load_monomorphic_fast(
     // SAFETY: The VM passes a pointer to the handle-owned metadata for the
     // duration of this synchronous native invocation.
     let metadata = unsafe { &*(metadata_ptr as *const php_jit::JitPropertyLoadMetadata) };
-    let effective = match value {
-        Value::Reference(cell) => cell.get(),
-        other => other.clone(),
-    };
-    let Value::Object(object) = effective else {
-        return JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT;
-    };
-    if normalize_class_name(&object.class_name()) != metadata.receiver_class {
-        return JIT_PROPERTY_LOAD_STATUS_CLASS_EXIT;
+    match jit_property_load_fetch(value, metadata) {
+        Ok(value) => {
+            let result = Box::new(value);
+            // SAFETY: The out pointer was checked for null and points to the
+            // native caller's stack-owned output slot. The VM reclaims the boxed
+            // value immediately after the native call returns successfully.
+            unsafe {
+                *out = Box::into_raw(result) as usize;
+            }
+            php_jit::JIT_HELPER_STATUS_OK
+        }
+        Err(status) => status,
     }
-    let Some(value) = object.get_property(&metadata.storage_name) else {
-        return JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT;
-    };
-    if value.is_uninitialized() {
-        return JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT;
-    }
-    let result = Box::new(value);
-    // SAFETY: The out pointer was checked for null and points to the native
-    // caller's stack-owned output slot. The VM reclaims the boxed value
-    // immediately after the native call returns successfully.
-    unsafe {
-        *out = Box::into_raw(result) as usize;
-    }
-    php_jit::JIT_HELPER_STATUS_OK
 }
 
 fn output_preallocation_hint(unit: &IrUnit) -> usize {

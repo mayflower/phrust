@@ -23,7 +23,7 @@ use php_ir::{
 };
 
 use crate::aarch64::{
-    Aarch64Assembler, Cond, D0, D1, D2, Label, Reg, SP, X0, X1, X3, X4, X5, X6, X9,
+    Aarch64Assembler, Cond, D0, D1, D2, Label, Reg, SP, X0, X1, X2, X3, X4, X5, X6, X9,
 };
 use crate::abi::JitCValueTag;
 use crate::helpers::{JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_TAILCALL, phrust_jit_abs_i64};
@@ -38,6 +38,7 @@ const BOOL_TAG: u16 = JitCValueTag::Bool as u16;
 const FLOAT_TAG: u16 = JitCValueTag::FloatBits as u16;
 const STRING_TAG: u16 = JitCValueTag::OpaqueString as u16;
 const ARRAY_TAG: u16 = JitCValueTag::OpaqueArray as u16;
+const OBJECT_TAG: u16 = JitCValueTag::OpaqueObject as u16;
 
 /// A single guarded PHP integer-add step: `slot[dst] = slot[lhs] + slot[rhs]`.
 ///
@@ -261,6 +262,35 @@ pub enum ScalarIntOp {
         dst: u32,
         arg: u32,
         expected_tag: u16,
+    },
+    /// Guarded native call reading a monomorphic declared *scalar* property:
+    /// `slot[dst] = <object at slot[arg]>-><declared property>`. Guards
+    /// `slot[arg]` is an `OpaqueObject`, then `blr`s the property-load ABI
+    /// wrapper at `helper` over the C ABI (fp/lr saved; a 32-byte scratch frame
+    /// holding the out `JitCValue` and the saved slot base). The object slot's
+    /// payload is a borrowed `*const Value` the VM marshaled for the call's
+    /// duration; `metadata_ptr` is a borrowed `*const JitPropertyLoadMetadata`
+    /// the VM keeps alive for the whole life of the compiled leaf.
+    ///
+    /// The helper performs the *layout guard* (the object's runtime class must
+    /// equal the expected receiver class the metadata records — else a
+    /// polymorphic/subclass instance reaching the same site side-exits, never
+    /// reading a wrong slot) and reads the declared property; it never invokes a
+    /// hook/`__get` or re-enters the VM (those shapes are excluded at recognition
+    /// time). Only when the property value is a scalar `Int`/`Bool`/`Float` does
+    /// the helper marshal it into the out `JitCValue` and return `OK`; a
+    /// non-scalar value (string/array/object/null), an uninitialized typed
+    /// property, an absent property, a class mismatch, or a non-object slot
+    /// returns a non-`OK` status and side-exits, so the interpreter produces the
+    /// exact value/error. `php_jit` cannot name the runtime symbol or build the
+    /// class metadata, so both addresses are carried in the op (the VM bridge
+    /// recognizes the leaf and supplies them; see the bridge's
+    /// `recognize_property_load_leaf`).
+    CallPropertyLoadScalar {
+        dst: u32,
+        arg: u32,
+        metadata_ptr: u64,
+        helper: u64,
     },
 }
 
@@ -639,6 +669,92 @@ fn emit_call_strlen(asm: &mut Aarch64Assembler, deopt: Label, dst: u32, arg: u32
     asm.bind(done);
 }
 
+/// Guard that `slot`'s tag is `OpaqueObject`, taking the side exit otherwise.
+/// Only a genuine object slot reaches the property-load helper — a scalar, a
+/// string, an array, `null`, or any other value side-exits here so the
+/// interpreter reproduces the exact property-access semantics/errors.
+fn emit_object_guard(asm: &mut Aarch64Assembler, deopt: Label, slot: u32) {
+    asm.ldr_w(X3, X0, tag_off(slot));
+    asm.cmp_imm_w(X3, OBJECT_TAG);
+    asm.b_cond(Cond::NotEqual, deopt);
+}
+
+/// Emit a guarded native call `slot[dst] = <object>-><scalar property>` through
+/// the monomorphic property-load ABI wrapper at `helper` (an `extern "C"
+/// fn(value_ptr: usize, metadata_ptr: usize, out: *mut JitCValue) -> i32`).
+///
+/// Mirrors [`emit_call_count`]'s non-leaf frame discipline, differing in three
+/// ways: the guard (the arg must be an `OpaqueObject`), a third C-ABI argument
+/// (`metadata_ptr`, the borrowed layout metadata), and a full-`JitCValue` out
+/// slot (24 bytes) rather than an `i64`. In order:
+/// 1. Guard `slot[arg]` is an `OpaqueObject` (while `X0` still holds the slot
+///    base), taking the shared side exit otherwise.
+/// 2. Load the object slot's `payload` — a borrowed `*const Value` the VM
+///    marshaled for the call's duration — into a scratch register.
+/// 3. Enter a non-leaf frame: `push_fp_lr` then a 32-byte scratch reserving
+///    `[sp+0 .. sp+24)` for the helper's out `JitCValue` and `[sp+24]` for the
+///    saved slot base (`sp` stays 16-byte aligned per AAPCS64).
+/// 4. Marshal the C-ABI arguments: `x0 = value_ptr`, `x1 = metadata_ptr`,
+///    `x2 = &out` (`sp+0`).
+/// 5. Materialize the helper address into `x9` and `blr x9`.
+/// 6. Check `w0` (the status): a non-`OK` status — the object's layout does not
+///    match the expected class, the property is absent/uninitialized, or the
+///    property value is non-scalar — tears the frame down and takes the shared
+///    side exit so the interpreter produces the exact value/error.
+/// 7. On `OK`: reload the slot base, copy the marshaled 24-byte `JitCValue`
+///    result from the scratch into `slot[dst]`, and tear the frame down.
+///
+/// Nothing is assumed to survive the `blr` except through the stack; the helper
+/// only reads the borrowed object's declared property and never mutates, frees,
+/// invokes a hook/`__get`, or re-enters the VM.
+fn emit_property_load(
+    asm: &mut Aarch64Assembler,
+    deopt: Label,
+    dst: u32,
+    arg: u32,
+    metadata_ptr: u64,
+    helper: u64,
+) {
+    // 1–2: guard the arg is an object + read its borrowed-pointer payload while
+    // X0 is still the slot base.
+    emit_object_guard(asm, deopt, arg);
+    asm.ldr_x(X4, X0, payload_off(arg));
+    // 3: non-leaf frame + 32-byte scratch ([sp+0..24)=out JitCValue,
+    // [sp+24]=slot base).
+    asm.push_fp_lr();
+    asm.sub_imm(SP, SP, 32);
+    asm.str_x(X0, SP, 24);
+    // 4: C-ABI args — x0 = value_ptr, x1 = metadata_ptr, x2 = &out.
+    asm.mov(X0, X4);
+    asm.mov_imm64(X1, metadata_ptr);
+    asm.add_imm(X2, SP, 0);
+    // 5: call helper(value_ptr, metadata_ptr, &out) -> status in w0.
+    asm.mov_imm64(X9, helper);
+    asm.blr(X9);
+    // 6: on a non-OK status, tear the frame down and take the shared side exit.
+    let call_deopt = asm.new_label();
+    let done = asm.new_label();
+    asm.cmp_imm_w(X0, JIT_HELPER_STATUS_OK as u16);
+    asm.b_cond(Cond::NotEqual, call_deopt);
+    // 7: OK — reload the slot base, copy the 24-byte result (tag+reserved,
+    // payload, aux) into slot[dst], free the frame.
+    asm.ldr_x(X0, SP, 24);
+    asm.ldr_x(X3, SP, 0);
+    asm.str_x(X3, X0, tag_off(dst));
+    asm.ldr_x(X4, SP, 8);
+    asm.str_x(X4, X0, payload_off(dst));
+    asm.ldr_x(X5, SP, 16);
+    asm.str_x(X5, X0, aux_off(dst));
+    asm.add_imm(SP, SP, 32);
+    asm.pop_fp_lr();
+    asm.b(done);
+    asm.bind(call_deopt);
+    asm.add_imm(SP, SP, 32);
+    asm.pop_fp_lr();
+    asm.b(deopt);
+    asm.bind(done);
+}
+
 /// Emit a pure type-predicate stencil `slot[dst] = (slot[arg].tag ==
 /// expected_tag)`, guarding that the marshaled tag is decidable.
 ///
@@ -704,6 +820,7 @@ fn check_op_slots(op: ScalarIntOp) -> Result<(), SlotSequenceError> {
         | ScalarIntOp::CallAbsI64 { dst, arg: src }
         | ScalarIntOp::CallCountI64 { dst, arg: src, .. }
         | ScalarIntOp::CallStrlenI64 { dst, arg: src, .. }
+        | ScalarIntOp::CallPropertyLoadScalar { dst, arg: src, .. }
         | ScalarIntOp::IsType { dst, arg: src, .. } => {
             check_slot(dst)?;
             check_slot(src)
@@ -746,6 +863,12 @@ fn emit_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarIntOp) {
             arg,
             expected_tag,
         } => emit_is_type(asm, deopt, dst, arg, expected_tag),
+        ScalarIntOp::CallPropertyLoadScalar {
+            dst,
+            arg,
+            metadata_ptr,
+            helper,
+        } => emit_property_load(asm, deopt, dst, arg, metadata_ptr, helper),
         ScalarIntOp::Binary { op, dst, lhs, rhs } => {
             emit_int_guard(asm, deopt, lhs);
             emit_int_guard(asm, deopt, rhs);
@@ -1571,6 +1694,46 @@ fn compile_scalar_int_is_type_leaf(
         code,
         result_slot: leaf.result_slot,
         buffer_slots: leaf.buffer_slots,
+        tail_call: None,
+    })
+}
+
+/// Lower a recognized monomorphic scalar property-load leaf to native code: a
+/// single [`ScalarIntOp::CallPropertyLoadScalar`] over the flat slot buffer.
+///
+/// The VM bridge (which owns class/property resolution) recognizes the
+/// `return $o->prop;` leaf shape and builds the `JitPropertyLoadMetadata` the
+/// layout guard needs, passing its (borrowed, VM-owned, outlives-the-leaf)
+/// pointer as `metadata_ptr` and the property-load ABI wrapper address as
+/// `helper`. `object_slot` is the object parameter's VM slot (its `LocalId`
+/// index); `result_slot` is a dedicated slot above locals + registers;
+/// `buffer_slots` sizes the caller's marshaled buffer. Returns `None` if either
+/// address is unavailable (`0`) or a slot is outside the addressable range.
+///
+/// `php_jit` never recognizes this shape itself (it cannot resolve classes), so
+/// with no bridge caller this is dead-inert; it only lowers the exact `(slot,
+/// metadata, helper)` triple the bridge hands it.
+pub fn compile_property_load_leaf(
+    object_slot: u32,
+    result_slot: u32,
+    buffer_slots: u32,
+    metadata_ptr: u64,
+    helper: u64,
+) -> Option<CompiledScalarRegion> {
+    if helper == 0 || metadata_ptr == 0 {
+        return None;
+    }
+    let code = emit_scalar_int_ops(&[ScalarIntOp::CallPropertyLoadScalar {
+        dst: result_slot,
+        arg: object_slot,
+        metadata_ptr,
+        helper,
+    }])
+    .ok()?;
+    Some(CompiledScalarRegion {
+        code,
+        result_slot,
+        buffer_slots,
         tail_call: None,
     })
 }

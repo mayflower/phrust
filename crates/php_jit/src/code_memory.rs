@@ -1331,6 +1331,122 @@ mod tests {
         assert_eq!(bad[1].tag, JitCValueTag::Uninitialized);
     }
 
+    // The monomorphic property-load call stencil executed end-to-end:
+    // `slot[dst] = <object>-><declared scalar property>` over a read-only
+    // borrowed object handle. The object crosses as an `OpaqueObject` slot whose
+    // payload is a pointer the emitted code passes to a property-load ABI wrapper,
+    // along with a borrowed layout-metadata pointer (arg x1) and a full-`JitCValue`
+    // out slot (arg x2, a 32-byte scratch frame that also saves the slot base).
+    // The object-tag guard fires before the call (a non-object side-exits), and
+    // the helper's layout guard side-exits for a non-matching class — so a
+    // polymorphic call site never reads a wrong slot. The helper here stands in
+    // for the VM's `copy_patch_property_load_abi` (php_jit cannot depend on the
+    // VM), exercising the exact call boundary, the OpaqueObject tag, the layout
+    // guard, and the marshaled scalar result.
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn executes_native_property_load_call_stencil() {
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::ScalarIntOp;
+
+        // Stand-in for the VM's copy_patch_property_load_abi. The object handle's
+        // payload points at a `TestObject { layout_id, scalar }` (modeling an
+        // object at a known layout holding a scalar property); the metadata
+        // pointer points at the expected layout id. A matching layout marshals the
+        // Int scalar into the out JitCValue and returns OK; a mismatch reports a
+        // non-OK status (the layout side exit) so the stencil defers to the
+        // interpreter, never reading a wrong slot.
+        #[repr(C)]
+        struct TestObject {
+            layout_id: u64,
+            scalar: i64,
+        }
+        extern "C" fn test_property_load(
+            value_ptr: usize,
+            metadata_ptr: usize,
+            out: *mut JitCValue,
+        ) -> i32 {
+            if value_ptr == 0 || metadata_ptr == 0 || out.is_null() {
+                return crate::JIT_HELPER_STATUS_FALLBACK;
+            }
+            // SAFETY: the test parks a live `TestObject` at `value_ptr` and a live
+            // expected-layout `u64` at `metadata_ptr` for the call's duration.
+            let object = unsafe { &*(value_ptr as *const TestObject) };
+            let expected = unsafe { *(metadata_ptr as *const u64) };
+            if object.layout_id != expected {
+                return crate::JIT_HELPER_STATUS_FALLBACK; // layout mismatch -> side exit
+            }
+            // SAFETY: `out` is the stencil's stack scratch, a valid 24-byte JitCValue.
+            unsafe {
+                *out = JitCValue::int(object.scalar);
+            }
+            crate::JIT_HELPER_STATUS_OK
+        }
+
+        let helper = test_property_load as *const () as usize as u64;
+        let expected_layout: u64 = 0xABCD;
+        let metadata_ptr = (&expected_layout as *const u64) as u64;
+        let object_slot = |obj: &TestObject| JitCValue {
+            tag: JitCValueTag::OpaqueObject,
+            reserved: 0,
+            payload: (obj as *const TestObject) as u64,
+            aux: 0,
+        };
+        let op = ScalarIntOp::CallPropertyLoadScalar {
+            dst: 1,
+            arg: 0,
+            metadata_ptr,
+            helper,
+        };
+
+        // Matching layout: the property read runs natively and writes the Int
+        // scalar to slot[1].
+        let matching = TestObject {
+            layout_id: 0xABCD,
+            scalar: 42,
+        };
+        let mut slots = [object_slot(&matching), JitCValue::uninitialized()];
+        assert_eq!(
+            run_scalar_ops(&[op], &mut slots),
+            0,
+            "a matching-layout property load runs natively"
+        );
+        assert_eq!(slots[1].tag, JitCValueTag::Int);
+        assert_eq!(slots[1].payload as i64, 42);
+
+        // Layout mismatch (a different class reaching the same monomorphic site):
+        // the helper reports non-OK, so the stencil side-exits and the result slot
+        // is untouched — the guard fires before any commit, never a wrong slot.
+        let mismatch = TestObject {
+            layout_id: 0x1234,
+            scalar: 99,
+        };
+        let mut wrong = [object_slot(&mismatch), JitCValue::uninitialized()];
+        assert_eq!(
+            run_scalar_ops(&[op], &mut wrong),
+            1,
+            "a layout-mismatch object handle side-exits"
+        );
+        assert_eq!(wrong[1].tag, JitCValueTag::Uninitialized);
+
+        // A non-object argument (an Int) trips the OpaqueObject tag guard before
+        // the call — the helper is never reached and the result slot is untouched.
+        let mut not_object = [JitCValue::int(7), JitCValue::uninitialized()];
+        assert_eq!(
+            run_scalar_ops(&[op], &mut not_object),
+            1,
+            "a non-object argument side-exits at the tag guard"
+        );
+        assert_eq!(not_object[1].tag, JitCValueTag::Uninitialized);
+
+        // Uninitialized (how the bridge marshals a non-object/non-handle value)
+        // also side-exits at the tag guard.
+        let mut uninit = [JitCValue::uninitialized(), JitCValue::uninitialized()];
+        assert_eq!(run_scalar_ops(&[op], &mut uninit), 1);
+        assert_eq!(uninit[1].tag, JitCValueTag::Uninitialized);
+    }
+
     // The is_TYPE() predicate stencils executed end-to-end: `slot[dst] =
     // (slot[arg].tag == expected_tag)`. No call and no payload deref — the answer
     // is exactly the marshaled tag. For each predicate, a matching marshaled value
