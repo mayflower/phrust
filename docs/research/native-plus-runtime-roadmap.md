@@ -160,30 +160,45 @@ stencil to emit an actual call, closing the "encoder has `blr` but no stencil
 calls" gap. Safe (a normal C-ABI call to a pure `extern "C"` fn, no VM re-entry);
 the VM gates it via `NativeCallPermits` (only when `abs` resolves to the real
 builtin, never a user/namespaced shadow); `abs(INT_MIN)` side-exits so the
-interpreter yields the float — all byte-identical to PHP 8.5.7. **Still missing:**
-native→**userland** and native→**stateful/context builtins**, which need the
-*unsafe* VM re-entry ABI (a context pointer + a helper that re-enters the
-interpreter). That re-entry path is the remaining keystone work for broad real
-WordPress code (non-leaf userland + heap builtins); it is the one deliberately-
-deferred piece.
+interpreter yields the float — all byte-identical to PHP 8.5.7. **native→userland
+(tail-call shape) also landed:** a scalar-int leaf whose terminator returns the
+result of a `CallFunction` to a non-inlinable userland function now compiles —
+the native region computes the args, returns region status `3`
+(`JIT_HELPER_STATUS_TAILCALL`), and the VM performs the call on the normal
+`execute_function` path. **There is no unsafe VM re-entry** (see the correction
+below); the native code *returns to Rust first*, then Rust makes the call with
+its ordinary `&mut` state params. `execute_copy_patch_tailcall` materializes the
+leaf's own frame (id, guaranteed-int args, call-site spans) around the call so a
+throwing/stack-inspecting callee sees the identical stack, and the region guards
+every param as `Int` at entry so args are genuine ints (no coercion divergence).
+Runtime-gated to plain userland functions (rejects builtins, methods/closures/
+generators, by-ref return, by-ref/variadic params, arity mismatch → interpret
+the whole leaf). Verified byte-identical native-off == native-on == PHP 8.5.7
+(strict, built 8.5.7 reference) incl. uncaught-fatal trace, `getTraceAsString`,
+`debug_backtrace()`, and a 3-deep throwing tail-call chain.
 
-*Why it is deferred (the precise blocker, not hand-waving):* a re-entry helper
-must hold a `*mut` to VM state and, inside the `blr`, reconstruct `&mut self` to
-call `execute_function`. But the region fn is invoked from `run_scalar_int_region`
-while a borrow of `self` is live up the stack — so materializing `&mut Vm` from
-the context pointer inside the helper *aliases* that live borrow, which is
-undefined behavior, not merely unproven. Making it sound requires restructuring
-the whole VM call path so **no** `&`/`&mut self` borrow is live across a native
-region call (raw-pointer threading through `execute_function` /
-`execute_bytecode_function` / the bridge, reconstructing the borrow only inside
-the helper). That is a cross-cutting change to the VM's borrow discipline plus
-mid-region resume (it converges with (c)'s deferred execution-OSR — a native
-leaf must resume *after* the call rather than re-run from entry). Two risk
-surfaces the harness here cannot cover — FFI aliasing UB (Miri cannot run the
-JIT'd machine code) and OSR-resume correctness — so it warrants design review and
-a focused, supervised implementation rather than unsupervised grinding. Every
-other roadmap item (gaps a/c/d/e/f, R1–R5, and gap-b's native→native +
-native→pure-builtin) is landed and verified.
+*Perf (honest):* this is a **coverage/correctness milestone, not a speedup** — on
+a tight microbench the native tail-call path is **~7% slower** than interpreting
+(200k iters, debug: ~2.49s on vs ~2.32s off) because frame materialization +
+marshal-out + name resolution outweigh the tiny native-prefix saving. Default-off,
+so the regression only touches the opt-in tier. The real win needs OSR (keep
+post-call work native, avoid re-marshaling) — the documented extension below.
+
+*Correction — the earlier "unsafe / deferred" claim was wrong.* A prior revision
+here asserted native→userland required an *unsafe* VM re-entry ABI reconstructing
+`&mut self` from a raw pointer while a borrow was live (aliasing UB), needing a
+cross-cutting borrow-discipline refactor, and deferred it. That was based on a
+false premise: `Vm::execute_function` takes **`&self`** (interior mutability;
+mutable state threaded through `output`/`stack`/`state` *parameters*). The sound
+design needs no unsafe code and no re-entry — the native region *returns* to Rust,
+which then calls through the normal path. **Still open (extensions, all sound —
+not unsafe):** multi-block prefixes (need the general CFG lowering with a
+tail-call terminator), float-returning tail-call leaves, native→builtin
+tail-calls, and *post-call native work* (true OSR: return-and-resume with slot
+spill/reload — converges with (c); a resume-state bug is wrong output the harness
+catches, not UB, since slot addressing stays bounded). Every other roadmap item
+(gaps a/c/d/e/f, R1–R5, and gap-b's native→native + native→pure-builtin) is
+landed and verified.
 
 **(c) Mid-region deopt / OSR.** — **report-only metadata precision LANDED;
 execution-OSR deferred.** Deopt is still **entry-only** (a guard/overflow side
