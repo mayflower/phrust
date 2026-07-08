@@ -1,8 +1,14 @@
 # Persistent Type Feedback and Invalidation
 
-FPE-20 adds the first engine-owned persistent feedback contract. The current
-implementation is advisory and default-off: metadata can be loaded, validated,
-and reported, but accepted entries do not change VM execution.
+FPE-20 adds the first engine-owned persistent feedback contract. Metadata is
+loaded, validated, and reported; validator-accepted quickening sites may also
+seed the next run's adaptive state. Consumption is governed by a dedicated
+policy (`--persistent-feedback-consume=off|quickening`,
+`PHRUST_PERSISTENT_FEEDBACK_CONSUME`) that is separate from reading, writing,
+and stats. The `php-vm run` default follows the sidecar default (consume on,
+like the bytecode cache); seeded sites always run behind the full runtime guard
+protocol, so a stale seed self-corrects through dequickening and never changes
+PHP-visible behavior.
 
 ## Key Model
 
@@ -50,13 +56,21 @@ php-vm run \
   fixtures/runtime/valid/hello.php
 ```
 
-The stats JSON (schema v2) records advisory/default-off status, accepted
-entries, entries written by the engine-owned writer, and rejection counts split
-by cause — stale (source/engine/PHP-target/IR identity), epoch mismatch,
+The stats JSON (schema v3) records the resolved consumption policy
+(`consume_mode`, plus `advisory_only` = consumption off), accepted entries,
+entries written by the engine-owned writer, and rejection counts split by
+cause — stale (source/engine/PHP-target/IR identity), epoch mismatch,
 architecture mismatch, config mismatch, corrupt, and userland-state — plus
 metadata bytes and whether execution fell back to baseline. Splitting the former
 single `rejected_stale` counter lets an operator tell an out-of-date deployment
 (config/arch/epoch) apart from a genuinely stale source.
+
+Seeded execution is attributed in the VM counters JSON (`--counters-json`):
+`persistent_feedback_seeded_sites` (installed at request start),
+`persistent_feedback_seeded_guard_hits` (specialized executions that came from
+a seed), and `persistent_feedback_seeded_dequickens` (seeds the guard protocol
+rejected). These make a consumed-feedback run separately measurable from an
+identical run with `--persistent-feedback-consume=off`.
 
 ## Matrix Policy
 
@@ -68,29 +82,40 @@ The fastest-engine matrix includes `phrust-persistent-feedback-optional` only
 with `--include-persistent-feedback` or
 `PHRUST_FASTEST_MATRIX_PERSISTENT_FEEDBACK=1`.
 
-Both rows are optional/default-off. They exercise metadata validation and stats
-reporting, then compare PHP stdout, diagnostics, and exit status against the
-baseline row.
+Both rows are optional/default-off. They pin
+`--persistent-feedback-consume=quickening`, exercise metadata validation, stats
+reporting, and seeded execution, then compare PHP stdout, diagnostics, and exit
+status against the baseline row.
 
 ## Writer Accounting (current slice)
 
 `PersistentFeedbackContext::render_sites_counted` is the engine-owned writer: it
 emits only validator-accepted entries and returns how many it wrote, which the
 CLI records as `entries_written`. Emitted entries carry the context's epochs, so
-a writer fed real epochs would persist non-zero epochs. Consumption stays
-default-off; the writer only widens metadata coverage and accounting.
+a writer fed real epochs would persist non-zero epochs. Writing is governed
+independently of consumption: `--persistent-feedback-consume=off` still writes
+the sidecar, which is what makes a seeded-vs-cold A/B run possible.
 
 ## Consumption (current state)
 
-Quickening seeding from accepted feedback already exists and is default-off
-(active only when a feedback source is loaded — `--persistent-feedback-read` for
-the CLI, or the server's persistent metadata store). `quickening_seed` flows to
-`QuickeningTable::seed_persistent_sites`, which installs specialized/blacklisted
-sites already-warm but behind the **full guard protocol**: a wrong seed
-self-corrects through dequickening and never changes PHP-visible behavior.
-`seed_persistent_sites` now returns how many sites it actually installed
-(already-touched sites are skipped), so a consumer can report how much warm-up
-state was restored — symmetric with the writer's `entries_written`.
+Quickening seeding from accepted feedback is active whenever a feedback source
+is loaded (the default sidecar next to the cached unit, an explicit
+`--persistent-feedback-read`, or the server's persistent metadata store) *and*
+the consume policy allows it. `php-vm run` consumes by default, matching the
+default-on sidecar introduced with the default-on bytecode cache; the explicit
+off switches are `--persistent-feedback-consume=off` and
+`PHRUST_PERSISTENT_FEEDBACK_CONSUME=off` (and `PHRUST_PERSISTENT_FEEDBACK=off`
+disables the sidecar wholesale). `--engine-preset=baseline` runs uncached and
+never consumes.
+
+`quickening_seed` flows to `QuickeningTable::seed_persistent_sites`, which
+installs specialized/blacklisted sites already-warm but behind the **full guard
+protocol**: a wrong seed self-corrects through dequickening and never changes
+PHP-visible behavior. The installed count is recorded as
+`persistent_feedback_seeded_sites`, and every guard hit or dequicken on a
+seeded site is attributed via `persistent_feedback_seeded_guard_hits` /
+`persistent_feedback_seeded_dequickens` — symmetric with the writer's
+`entries_written`.
 
 ## Remaining Work
 
@@ -104,7 +129,7 @@ state was restored — symmetric with the writer's `entries_written`.
   include-autoload observations), not just the quickening sub-field, once the VM
   produces those observations;
 - extend consumption from quickening to **inline-cache** templates and later
-  tiers, under a dedicated `--persistent-feedback-consume` flag distinct from
-  the read/seed path, with per-entry seeded-vs-dequickened attribution;
+  tiers, as additional `--persistent-feedback-consume` modes (the flag and the
+  seeded/dequickened attribution exist; IC seeding does not);
 - add Composer map fingerprints when the autoload graph model is promoted from
   request-local runtime behavior into persistent engine metadata.

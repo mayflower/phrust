@@ -283,9 +283,12 @@ def run_once(
     counters_path = run_dir / f"iter-{iteration}.counters.json"
     feedback_args: list[str] = []
     if variant.persistent_feedback:
+        # Pin the consumption policy so the row keeps measuring seeded
+        # execution even if the engine default changes.
         feedback_args = [
             "--persistent-feedback-read",
             str(run_dir / "advisory-feedback.pff"),
+            "--persistent-feedback-consume=quickening",
             "--persistent-feedback-stats-json",
             str(run_dir / f"iter-{iteration}.persistent-feedback.json"),
         ]

@@ -2274,8 +2274,10 @@ impl Vm {
         *self.default_slot_template_cache.borrow_mut() = DefaultSlotTemplateCache::default();
         *self.constructor_resolution_cache.borrow_mut() = ConstructorResolutionCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
+        let mut persistent_feedback_seeded_sites = 0usize;
         if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
-            self.quickening
+            persistent_feedback_seeded_sites = self
+                .quickening
                 .borrow_mut()
                 .seed_persistent_sites(&self.options.quickening_seed);
         }
@@ -2289,6 +2291,11 @@ impl Vm {
             counters.set_jit_config(self.options.jit.as_str(), self.options.jit_threshold);
             if skip_adaptive_tiny_unit_setup {
                 counters.record_adaptive_tiny_unit_setup_skip();
+            }
+            if persistent_feedback_seeded_sites > 0 {
+                counters.record_persistent_feedback_seeded_sites(
+                    persistent_feedback_seeded_sites as u64,
+                );
             }
             counters
         });

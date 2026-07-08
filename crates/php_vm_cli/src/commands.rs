@@ -967,7 +967,12 @@ where
     let jit_eligibility_json = build_jit_eligibility_json(compiled.ir_unit(), run_options.jit);
     let persistent_feedback =
         prepare_persistent_feedback(run_options, path, cache_context.as_ref())?;
-    vm_options.quickening_seed = persistent_feedback.quickening_seed();
+    // Consumption is governed separately from reading/validating/writing: with
+    // `--persistent-feedback-consume=off` the sidecar still round-trips and
+    // reports stats, but adaptive execution starts cold.
+    if run_options.persistent_feedback.consume.enabled() {
+        vm_options.quickening_seed = persistent_feedback.quickening_seed();
+    }
     let started = Instant::now();
     let executor = PhpExecutor::with_options(PhpExecutorOptions {
         optimization_level: run_options.opt_level,
@@ -1991,6 +1996,7 @@ fn prepare_persistent_feedback(
     cache_context: Option<&BytecodeCacheContext>,
 ) -> Result<PersistentFeedbackRuntime, String> {
     let default_enabled = persistent_feedback_env_enabled() && cache_context.is_some();
+    let consume = run_options.persistent_feedback.consume;
     if run_options.persistent_feedback.read.is_none()
         && run_options.persistent_feedback.write.is_none()
         && !default_enabled
@@ -2038,6 +2044,8 @@ fn prepare_persistent_feedback(
         )
     };
     report.stats.default_enabled = default_enabled;
+    report.stats.consume_mode = consume.as_str();
+    report.stats.advisory_only = !consume.enabled();
     let write_path = run_options
         .persistent_feedback
         .write
@@ -2742,7 +2750,7 @@ fn region_profile_json_from_env() -> Option<String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2] [--timings-json <path>]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-rule-selection <file> [--json]\n  php-vm dump-dependency-units <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--engine-preset baseline|default|fast|experimental-jit] [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--timings-json <path>] [developer engine flags] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nEngine presets:\n  default          managed fast runtime with guarded native tier where available; also accepted as fast\n  baseline         compatibility/debug oracle with adaptive VM features off\n  experimental-jit developer native diagnostics profile using the same guarded tier\n\nCaching defaults:\n  run uses a read-write bytecode cache plus a persistent-feedback sidecar in the user cache directory\n  (override dir: PHRUST_BYTECODE_CACHE_DIR; disable: PHRUST_BYTECODE_CACHE=off, PHRUST_PERSISTENT_FEEDBACK=off;\n  --engine-preset=baseline runs uncached)\n\nAdvanced engine flags (developer diagnostics):\n  --opt-level 0|1|2 --exec-format ir|auto|bytecode --superinstructions off|on --last-use-moves off|on --reuse-class-context-frames off|on --dense-jump-threading off|on --bytecode-layout source|profiled --bytecode-layout-profile <path> --quickening off|on --inline-caches off|on --jit off|noop|cranelift --jit-threshold N --jit-max-compile-us N --jit-max-functions N --jit-eager --jit-blacklist off|on --jit-dump-clif PATH --jit-stats json --tiering off|on --tiering-function-threshold N --tiering-loop-threshold N --tiering-ic-stability-threshold N --tiering-guard-failure-threshold N --tiering-stats-json <path> --persistent-feedback-read <path> --persistent-feedback-write <path> --persistent-feedback-stats-json <path> --counters-json <path> --timings-json <path> --region-profile-json <path>"
+        "Usage:\n  php-vm compile <file> [--json] [--opt-level 0|1|2] [--timings-json <path>]\n  php-vm dump-ir <file> [--with-source]\n  php-vm dump-bytecode-patterns <file> [--json]\n  php-vm dump-rule-selection <file> [--json]\n  php-vm dump-dependency-units <file> [--json]\n  php-vm dump-baseline-native-stencil <file> [--json]\n  php-vm dump-copy-patch-stencils <file> [--json]\n  php-vm dump-mid-tier-plan <file> [--json]\n  php-vm dump-cranelift-clif\n  php-vm run [--engine-preset baseline|default|fast|experimental-jit] [--trace] [--trace-runtime] [--env KEY=VALUE] [--bytecode-cache=off|read|write|read-write] [--bytecode-cache-dir <path>] [--bytecode-cache-stats] [--clear-bytecode-cache] [--timings-json <path>] [developer engine flags] <file> [-- arg ...]\n  php-vm report <file> [--format markdown|html]\n  php-vm compare <file>\n\nEngine presets:\n  default          managed fast runtime with guarded native tier where available; also accepted as fast\n  baseline         compatibility/debug oracle with adaptive VM features off\n  experimental-jit developer native diagnostics profile using the same guarded tier\n\nCaching defaults:\n  run uses a read-write bytecode cache plus a persistent-feedback sidecar in the user cache directory,\n  and accepted feedback seeds quickening sites behind the full runtime guard protocol\n  (override dir: PHRUST_BYTECODE_CACHE_DIR; disable: PHRUST_BYTECODE_CACHE=off, PHRUST_PERSISTENT_FEEDBACK=off,\n  PHRUST_PERSISTENT_FEEDBACK_CONSUME=off; --engine-preset=baseline runs uncached)\n\nAdvanced engine flags (developer diagnostics):\n  --opt-level 0|1|2 --exec-format ir|auto|bytecode --superinstructions off|on --last-use-moves off|on --reuse-class-context-frames off|on --dense-jump-threading off|on --bytecode-layout source|profiled --bytecode-layout-profile <path> --quickening off|on --inline-caches off|on --jit off|noop|cranelift --jit-threshold N --jit-max-compile-us N --jit-max-functions N --jit-eager --jit-blacklist off|on --jit-dump-clif PATH --jit-stats json --tiering off|on --tiering-function-threshold N --tiering-loop-threshold N --tiering-ic-stability-threshold N --tiering-guard-failure-threshold N --tiering-stats-json <path> --persistent-feedback-read <path> --persistent-feedback-write <path> --persistent-feedback-consume off|quickening --persistent-feedback-stats-json <path> --counters-json <path> --timings-json <path> --region-profile-json <path>"
     )
     .map_err(|error| error.to_string())
 }
@@ -4313,10 +4321,11 @@ fn workspace_relative_path(path: &str) -> PathBuf {
 mod tests {
     use super::{
         BytecodeCacheMode, EXIT_COMPILE_ERROR, EXIT_PHP_FATAL_ERROR, EXIT_RUNTIME_ERROR,
-        EXIT_SUCCESS, EXIT_USAGE, JitStatsMode, OptimizationLevel, PersistentFeedbackOptions,
-        QuickeningMode, cache_file_for, compile_pipeline_with_optimization,
-        default_bytecode_cache_mode, parse_compile_args, parse_dump_dependency_units_args,
-        parse_dump_rule_selection_args, parse_run_args, run, run_with_stdin,
+        EXIT_SUCCESS, EXIT_USAGE, JitStatsMode, OptimizationLevel, PersistentFeedbackConsumeMode,
+        PersistentFeedbackOptions, QuickeningMode, cache_file_for,
+        compile_pipeline_with_optimization, default_bytecode_cache_mode, parse_compile_args,
+        parse_dump_dependency_units_args, parse_dump_rule_selection_args, parse_run_args, run,
+        run_with_stdin,
     };
     use php_bytecode_cache::{CacheFingerprint, CacheFingerprintInput};
     use php_runtime::api::RuntimeContext;
@@ -5858,6 +5867,7 @@ mod tests {
             "6".to_string(),
             "--tiering-stats-json=target/performance/tiering.json".to_string(),
             "--persistent-feedback-read=target/performance/feedback/input.pff".to_string(),
+            "--persistent-feedback-consume=off".to_string(),
             "--persistent-feedback-stats-json".to_string(),
             "target/performance/feedback/stats.json".to_string(),
             "fixtures/runtime/valid/hello.php".to_string(),
@@ -5911,6 +5921,10 @@ mod tests {
             options.persistent_feedback.stats_json,
             Some("target/performance/feedback/stats.json".to_string())
         );
+        assert_eq!(
+            options.persistent_feedback.consume,
+            PersistentFeedbackConsumeMode::Off
+        );
     }
 
     #[test]
@@ -5963,6 +5977,7 @@ mod tests {
                 "run".to_string(),
                 "--persistent-feedback-read".to_string(),
                 feedback_path.display().to_string(),
+                "--persistent-feedback-consume=off".to_string(),
                 "--persistent-feedback-stats-json".to_string(),
                 stats_path.display().to_string(),
                 fixture("fixtures/runtime/valid/hello.php"),
@@ -5978,6 +5993,7 @@ mod tests {
         let _ = std::fs::remove_file(&feedback_path);
         let _ = std::fs::remove_file(&stats_path);
         assert!(json.contains("\"advisory_only\": true"));
+        assert!(json.contains("\"consume_mode\": \"off\""));
         assert!(json.contains("\"default_enabled\": false"));
         assert!(json.contains("\"rejected_corrupt\": 1"));
         assert!(json.contains("\"fallback_to_baseline\": true"));
@@ -6018,6 +6034,8 @@ mod tests {
         assert!(feedback.starts_with("phrust-persistent-feedback-v1"));
         assert!(feedback.contains("specialization=add_int_int"));
 
+        let counters_path = base.with_extension("counters.json");
+        let _ = std::fs::remove_file(&counters_path);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run(
@@ -6025,8 +6043,11 @@ mod tests {
                 "run".to_string(),
                 "--persistent-feedback-read".to_string(),
                 feedback_path.display().to_string(),
+                "--persistent-feedback-consume=quickening".to_string(),
                 "--persistent-feedback-stats-json".to_string(),
                 stats_path.display().to_string(),
+                "--counters-json".to_string(),
+                counters_path.display().to_string(),
                 source_path.display().to_string(),
             ],
             &mut stdout,
@@ -6035,12 +6056,13 @@ mod tests {
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
         assert_eq!(stdout, b"2016\n");
         let json = std::fs::read_to_string(&stats_path).expect("feedback JSON should be written");
-        let _ = std::fs::remove_file(&source_path);
-        let _ = std::fs::remove_file(&feedback_path);
-        let _ = std::fs::remove_file(&stats_path);
+        let counters =
+            std::fs::read_to_string(&counters_path).expect("counters JSON should be written");
         assert!(json.contains("\"rejected_stale\": 0"));
         assert!(json.contains("\"rejected_corrupt\": 0"));
         assert!(json.contains("\"fallback_to_baseline\": false"));
+        assert!(json.contains("\"advisory_only\": false"));
+        assert!(json.contains("\"consume_mode\": \"quickening\""));
         let accepted: u64 = json
             .lines()
             .find_map(|line| {
@@ -6052,6 +6074,49 @@ mod tests {
             })
             .expect("entries_accepted present");
         assert!(accepted > 0, "expected accepted entries, got: {json}");
+        let seeded: u64 = counters
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("\"persistent_feedback_seeded_sites\": ")?
+                    .trim_end_matches(',')
+                    .parse()
+                    .ok()
+            })
+            .expect("persistent_feedback_seeded_sites present");
+        assert!(seeded > 0, "expected seeded sites, got: {counters}");
+
+        // Consumption off: the sidecar still validates and reports, but the
+        // VM starts cold and no seeded-site attribution appears.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "run".to_string(),
+                "--persistent-feedback-read".to_string(),
+                feedback_path.display().to_string(),
+                "--persistent-feedback-consume=off".to_string(),
+                "--persistent-feedback-stats-json".to_string(),
+                stats_path.display().to_string(),
+                "--counters-json".to_string(),
+                counters_path.display().to_string(),
+                source_path.display().to_string(),
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"2016\n");
+        let json = std::fs::read_to_string(&stats_path).expect("feedback JSON should be written");
+        let counters =
+            std::fs::read_to_string(&counters_path).expect("counters JSON should be written");
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&feedback_path);
+        let _ = std::fs::remove_file(&stats_path);
+        let _ = std::fs::remove_file(&counters_path);
+        assert!(json.contains("\"advisory_only\": true"));
+        assert!(json.contains("\"consume_mode\": \"off\""));
+        assert!(counters.contains("\"persistent_feedback_seeded_sites\": 0"));
     }
 
     #[test]

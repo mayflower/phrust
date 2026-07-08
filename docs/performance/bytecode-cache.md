@@ -89,9 +89,13 @@ sites that finished the run specialized or blacklisted, and the next run with a
 matching feedback fingerprint seeds its quickening table from it. Seeded
 specializations keep the full runtime guard/fallback protocol, so stale or
 wrong feedback can only cause guard misses and dequickening, never a semantic
-change. `PHRUST_PERSISTENT_FEEDBACK=off` disables the sidecar;
-`--persistent-feedback-read`, `--persistent-feedback-write`, and
-`--persistent-feedback-stats-json` give explicit control. Entries are validated
+change. `PHRUST_PERSISTENT_FEEDBACK=off` disables the sidecar wholesale;
+`--persistent-feedback-consume=off|quickening` (or
+`PHRUST_PERSISTENT_FEEDBACK_CONSUME=off`) governs seeding separately from
+reading/writing, so a consumed run can be A/B-compared against a cold-start
+run over the same sidecar; `--persistent-feedback-read`,
+`--persistent-feedback-write`, and `--persistent-feedback-stats-json` give
+explicit control. Entries are validated
 against source fingerprint, engine version, PHP target, compile options, IR
 fingerprint, epochs, and target before use; anything stale or corrupt falls
 back to a cold start.

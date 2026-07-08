@@ -537,6 +537,7 @@ mod tests {
             dequickened: false,
             megamorphic: false,
             disabled: false,
+            seeded: false,
         });
         state.record_inline_cache(InlineCacheObservation {
             candidate: true,

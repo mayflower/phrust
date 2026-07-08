@@ -20,7 +20,7 @@ pub const PERSISTENT_FEEDBACK_FORMAT_VERSION: &str = "phrust-persistent-feedback
 /// v2 splits the collapsed `rejected_stale` counter into explicit
 /// epoch/architecture/config mismatch reasons and adds `entries_written`
 /// for the engine-owned writer path.
-pub const PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION: u32 = 2;
+pub const PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION: u32 = 3;
 
 /// Invalidation epochs that must match before feedback can be advisory input.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -323,10 +323,17 @@ impl PersistentFeedbackLoadReport {
 }
 
 /// Feedback load/validation counters. These are reported outside PHP stdout.
+///
+/// `advisory_only` reports the consumption *policy* of the run that produced
+/// the stats: `true` means accepted entries could not seed adaptive VM state.
+/// `consume_mode` names the resolved mode (`off` or `quickening`). The
+/// validator itself never consumes, so both default to the advisory reading;
+/// the embedding CLI/server stamps the real policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentFeedbackStats {
     pub schema_version: u32,
     pub advisory_only: bool,
+    pub consume_mode: &'static str,
     pub default_enabled: bool,
     pub files_considered: u64,
     pub files_loaded: u64,
@@ -348,6 +355,7 @@ impl Default for PersistentFeedbackStats {
         Self {
             schema_version: PERSISTENT_FEEDBACK_STATS_SCHEMA_VERSION,
             advisory_only: true,
+            consume_mode: "off",
             default_enabled: false,
             files_considered: 0,
             files_loaded: 0,
@@ -374,6 +382,7 @@ impl PersistentFeedbackStats {
                 "{{\n",
                 "  \"schema_version\": {},\n",
                 "  \"advisory_only\": {},\n",
+                "  \"consume_mode\": \"{}\",\n",
                 "  \"default_enabled\": {},\n",
                 "  \"files_considered\": {},\n",
                 "  \"files_loaded\": {},\n",
@@ -392,6 +401,7 @@ impl PersistentFeedbackStats {
             ),
             self.schema_version,
             self.advisory_only,
+            self.consume_mode,
             self.default_enabled,
             self.files_considered,
             self.files_loaded,
@@ -946,8 +956,9 @@ mod tests {
             .stats
             .to_json();
 
-        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"schema_version\": 3"));
         assert!(json.contains("\"advisory_only\": true"));
+        assert!(json.contains("\"consume_mode\": \"off\""));
         assert!(json.contains("\"default_enabled\": false"));
         assert!(json.contains("\"entries_accepted\": 1"));
         assert!(json.contains("\"entries_written\": 0"));

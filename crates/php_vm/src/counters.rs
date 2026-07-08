@@ -426,6 +426,9 @@ pub struct VmCounters {
     pub quickening_dequickened_by_reason: BTreeMap<String, u64>,
     pub quickening_megamorphic: u64,
     pub quickening_disabled: u64,
+    pub persistent_feedback_seeded_sites: u64,
+    pub persistent_feedback_seeded_guard_hits: u64,
+    pub persistent_feedback_seeded_dequickens: u64,
     pub adaptive_tiny_unit_setup_skips: u64,
     pub native_candidates: u64,
     pub native_compiled_regions: u64,
@@ -1893,6 +1896,9 @@ impl VmCounters {
         }
         if observation.guard_hit {
             self.quickening_guard_hits += 1;
+            if observation.seeded {
+                self.persistent_feedback_seeded_guard_hits += 1;
+            }
             if let Some(family) = family {
                 *self
                     .quickened_executions_by_family
@@ -1922,6 +1928,9 @@ impl VmCounters {
         }
         if observation.dequickened {
             self.quickening_dequickens += 1;
+            if observation.seeded {
+                self.persistent_feedback_seeded_dequickens += 1;
+            }
             *self
                 .quickening_dequickened_by_reason
                 .entry("guard_failure_threshold".to_owned())
@@ -1937,6 +1946,10 @@ impl VmCounters {
 
     pub(crate) fn record_adaptive_tiny_unit_setup_skip(&mut self) {
         self.adaptive_tiny_unit_setup_skips += 1;
+    }
+
+    pub(crate) fn record_persistent_feedback_seeded_sites(&mut self, installed: u64) {
+        self.persistent_feedback_seeded_sites += installed;
     }
 
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
@@ -3950,6 +3963,24 @@ impl VmCounters {
         );
         push_field(
             &mut json,
+            "persistent_feedback_seeded_sites",
+            self.persistent_feedback_seeded_sites,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_feedback_seeded_guard_hits",
+            self.persistent_feedback_seeded_guard_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_feedback_seeded_dequickens",
+            self.persistent_feedback_seeded_dequickens,
+            true,
+        );
+        push_field(
+            &mut json,
             "adaptive_tiny_unit_setup_skips",
             self.adaptive_tiny_unit_setup_skips,
             true,
@@ -5650,6 +5681,7 @@ mod tests {
             dequickened: true,
             megamorphic: true,
             disabled: true,
+            seeded: true,
         });
         counters.record_adaptive_tiny_unit_setup_skip();
         counters.record_native_candidate();
@@ -6093,6 +6125,8 @@ mod tests {
         );
         assert_eq!(counters.quickening_megamorphic, 1);
         assert_eq!(counters.quickening_disabled, 1);
+        assert_eq!(counters.persistent_feedback_seeded_guard_hits, 1);
+        assert_eq!(counters.persistent_feedback_seeded_dequickens, 1);
         assert_eq!(counters.adaptive_tiny_unit_setup_skips, 1);
         assert_eq!(counters.native_candidates, 1);
         assert_eq!(counters.native_platform_unavailable, 1);
@@ -6459,6 +6493,9 @@ mod tests {
         assert!(json.contains("\"quickening_dequickened_by_reason\": {}"));
         assert!(json.contains("\"quickening_megamorphic\": 0"));
         assert!(json.contains("\"quickening_disabled\": 0"));
+        assert!(json.contains("\"persistent_feedback_seeded_sites\": 0"));
+        assert!(json.contains("\"persistent_feedback_seeded_guard_hits\": 0"));
+        assert!(json.contains("\"persistent_feedback_seeded_dequickens\": 0"));
         assert!(json.contains("\"adaptive_tiny_unit_setup_skips\": 0"));
         assert!(json.contains("\"native_candidates\": 0"));
         assert!(json.contains("\"native_compiled_regions\": 0"));

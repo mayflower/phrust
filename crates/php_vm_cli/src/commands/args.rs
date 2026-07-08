@@ -253,6 +253,43 @@ pub(super) struct PersistentFeedbackOptions {
     pub(super) read: Option<String>,
     pub(super) write: Option<String>,
     pub(super) stats_json: Option<String>,
+    pub(super) consume: PersistentFeedbackConsumeMode,
+}
+
+/// Whether validator-accepted persistent feedback may seed adaptive VM state.
+/// Reading/validating/writing the sidecar is separate: with consumption off,
+/// stats and the writer still run but execution starts cold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PersistentFeedbackConsumeMode {
+    Off,
+    Quickening,
+}
+
+impl PersistentFeedbackConsumeMode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Quickening => "quickening",
+        }
+    }
+
+    pub(super) const fn enabled(self) -> bool {
+        matches!(self, Self::Quickening)
+    }
+}
+
+/// Consumption follows the sidecar default (on, like the bytecode cache); the
+/// `PHRUST_PERSISTENT_FEEDBACK_CONSUME` environment variable overrides the
+/// default and the `--persistent-feedback-consume` flag overrides both.
+/// Unrecognized values keep the default so a typo cannot silently change the
+/// consumption policy.
+impl Default for PersistentFeedbackConsumeMode {
+    fn default() -> Self {
+        match std::env::var("PHRUST_PERSISTENT_FEEDBACK_CONSUME").as_deref() {
+            Ok("off") | Ok("0") | Ok("false") => Self::Off,
+            _ => Self::Quickening,
+        }
+    }
 }
 
 impl Default for BytecodeCacheOptions {
@@ -914,6 +951,18 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
             arg if let Some(value) = arg.strip_prefix("--persistent-feedback-stats-json=") => {
                 persistent_feedback.stats_json = Some(value.to_owned());
             }
+            "--persistent-feedback-consume" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(
+                        "run --persistent-feedback-consume requires off or quickening".to_string(),
+                    );
+                };
+                persistent_feedback.consume = parse_persistent_feedback_consume_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--persistent-feedback-consume=") => {
+                persistent_feedback.consume = parse_persistent_feedback_consume_mode(value)?;
+            }
             "--counters-json" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -1108,6 +1157,18 @@ pub(super) fn parse_quickening_mode(value: &str) -> Result<QuickeningMode, Strin
         "on" => Ok(QuickeningMode::On),
         _ => Err(format!(
             "unsupported quickening mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+pub(super) fn parse_persistent_feedback_consume_mode(
+    value: &str,
+) -> Result<PersistentFeedbackConsumeMode, String> {
+    match value {
+        "off" => Ok(PersistentFeedbackConsumeMode::Off),
+        "quickening" => Ok(PersistentFeedbackConsumeMode::Quickening),
+        _ => Err(format!(
+            "unsupported persistent-feedback-consume mode `{value}`; expected off or quickening"
         )),
     }
 }
