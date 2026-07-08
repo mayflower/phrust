@@ -512,12 +512,17 @@ struct AutoloadTraceOrigin {
 struct PreparedArg {
     value: Value,
     reference: Option<ReferenceCell>,
+    /// When true, this argument's backtrace entry must hold the live by-ref
+    /// cell so the trace observes later writes through the parameter (matching
+    /// the reference engine). Set only for a *supplied* by-ref parameter that
+    /// bound a cell; a by-ref parameter that fell back to its default keeps a
+    /// value snapshot instead, so it stays false.
+    trace_holds_reference: bool,
 }
 
 struct PreparedArguments {
     args: Vec<PreparedArg>,
     frame_args: Vec<Value>,
-    trace_args: Vec<FrameTraceArgument>,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -6140,13 +6145,13 @@ impl Vm {
             },
         );
         if let Some(frame) = stack.current_mut() {
-            frame.trace_arguments = leaf_args
-                .iter()
-                .map(|value| FrameTraceArgument {
+            frame.trace_arguments.reserve(leaf_args.len());
+            for value in leaf_args.iter() {
+                frame.trace_arguments.push(FrameTraceArgument {
                     name: None,
                     value: value.clone(),
-                })
-                .collect();
+                });
+            }
             frame.arguments = leaf_args.to_vec();
         }
 
@@ -7206,7 +7211,6 @@ impl Vm {
         );
         let args = prepared.args;
         let frame_args = prepared.frame_args;
-        let trace_args = prepared.trace_args;
         for diagnostic in prepared.diagnostics {
             let handled = match self.dispatch_error_handler(
                 compiled,
@@ -7245,7 +7249,11 @@ impl Vm {
                 }
             } else {
                 frame.arguments = frame_args;
-                frame.trace_arguments = trace_args;
+                // Build the backtrace snapshot straight into the frame's pooled
+                // vector (from the raw args, before they move into locals),
+                // rather than allocating one per call and discarding it for the
+                // tiny-frame fast path above.
+                build_frame_trace_arguments(&mut frame.trace_arguments, &args, &ir_function.params);
             }
         }
         if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
@@ -14144,7 +14152,6 @@ impl Vm {
             }
             let args = prepared.args;
             let frame_args = prepared.frame_args;
-            let trace_args = prepared.trace_args;
             for diagnostic in prepared.diagnostics {
                 let handled = match self.dispatch_error_handler(
                     compiled,
@@ -14249,7 +14256,11 @@ impl Vm {
             }
             {
                 let frame = stack.current_mut().expect("frame was pushed");
-                frame.trace_arguments = trace_args;
+                // This executor keeps the backtrace snapshot for every frame
+                // (tiny frames included), so build it unconditionally, directly
+                // into the frame's pooled vector from the raw args before they
+                // move into locals.
+                build_frame_trace_arguments(&mut frame.trace_arguments, &args, &function.params);
                 if specialized_tiny_frame {
                     if !args.is_empty() {
                         self.record_counter_arg_array_avoided();
@@ -56506,6 +56517,70 @@ fn trace_value_for_param(value: &Value, sensitive: bool) -> Value {
         sensitive_parameter_value()
     } else {
         value.clone()
+    }
+}
+
+/// Rebuilds a frame's backtrace-visible arguments in place, pushing directly
+/// into the frame's (capacity-retained) vector instead of allocating a fresh
+/// one per call. It reproduces exactly the snapshot the argument binder used to
+/// return: one entry per bound positional argument (a supplied by-ref parameter
+/// holds the live cell, `#[\SensitiveParameter]` values are redacted), a
+/// variadic tail expanded to its elements with their named labels, and extra
+/// positional arguments appended verbatim without redaction. Call it only for
+/// frames that will actually keep their trace arguments; the raw (pre-coercion)
+/// `prepared_args` must be read before they are moved into the frame's locals.
+fn build_frame_trace_arguments(
+    trace: &mut Vec<FrameTraceArgument>,
+    prepared_args: &[PreparedArg],
+    params: &[IrParam],
+) {
+    debug_assert!(trace.is_empty());
+    trace.reserve(prepared_args.len());
+    for (index, arg) in prepared_args.iter().enumerate() {
+        match params.get(index) {
+            // The variadic parameter collapses its tail into one prepared array
+            // argument; expand it back into one trace entry per element, keyed
+            // by the named-argument labels the array preserves in order. No
+            // parameters follow a variadic one.
+            Some(param) if param.variadic => {
+                let sensitive = param_is_sensitive(param);
+                if let Value::Array(array) = &arg.value {
+                    for (key, value) in array.iter() {
+                        let name = match key {
+                            ArrayKey::String(name) => Some(name.to_string_lossy()),
+                            ArrayKey::Int(_) => None,
+                        };
+                        trace.push(FrameTraceArgument {
+                            name,
+                            value: trace_value_for_param(value, sensitive),
+                        });
+                    }
+                }
+                break;
+            }
+            Some(param) => {
+                let value = if param_is_sensitive(param) {
+                    trace_value_for_param(&arg.value, true)
+                } else if arg.trace_holds_reference {
+                    Value::Reference(
+                        arg.reference
+                            .clone()
+                            .expect("by-ref trace argument retains its cell"),
+                    )
+                } else {
+                    arg.value.clone()
+                };
+                trace.push(FrameTraceArgument { name: None, value });
+            }
+            // Extra positional arguments beyond the declared parameters have no
+            // parameter to consult, so they are neither named nor redacted.
+            None => {
+                trace.push(FrameTraceArgument {
+                    name: None,
+                    value: arg.value.clone(),
+                });
+            }
+        }
     }
 }
 

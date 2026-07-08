@@ -110,8 +110,8 @@ fn bind_arguments(
     // named/variadic/default machinery.
     //
     // It is behavior-identical to the general path for this shape. Both paths
-    // hand the caller *raw* (uncoerced) by-value arguments plus a raw trace
-    // snapshot; parameter type coercion, strict-types enforcement, and
+    // hand the caller *raw* (uncoerced) by-value arguments; parameter type
+    // coercion, strict-types enforcement, and
     // TypeError reporting are then applied uniformly by the shared post-binding
     // loop that calls `coerce_or_check_param_type` on every prepared argument
     // (see the two `prepare_arguments` call sites in `mod.rs`). The general
@@ -146,29 +146,20 @@ fn bind_arguments(
         })
     {
         let mut prepared = Vec::with_capacity(function.params.len());
-        let mut trace_args = Vec::with_capacity(function.params.len());
-        for (arg, param) in args.into_iter().zip(function.params.iter()) {
+        for arg in args {
             let value = match arg.value {
                 Value::Reference(cell) => cell.get(),
                 other => other,
             };
-            trace_args.push(FrameTraceArgument {
-                name: None,
-                value: if param_is_sensitive(param) {
-                    trace_value_for_param(&value, true)
-                } else {
-                    value.clone()
-                },
-            });
             prepared.push(PreparedArg {
                 value,
                 reference: None,
+                trace_holds_reference: false,
             });
         }
         return Ok(PreparedArguments {
             args: prepared,
             frame_args: Vec::new(),
-            trace_args,
             diagnostics: Vec::new(),
         });
     }
@@ -267,6 +258,7 @@ fn bind_arguments(
             extra_positional.push(PreparedArg {
                 value: arg.value,
                 reference: None,
+                trace_holds_reference: false,
             });
             positional_index += 1;
             supplied_count += 1;
@@ -337,7 +329,6 @@ fn bind_arguments(
 
     let mut prepared = Vec::with_capacity(function.params.len());
     let mut frame_args = Vec::new();
-    let mut trace_args = Vec::new();
     let mut diagnostics = Vec::new();
     for (index, param) in function.params.iter().enumerate() {
         if param.variadic {
@@ -349,14 +340,10 @@ fn bind_arguments(
                         .map(|arg| arg.value.clone()),
                 );
             }
-            let sensitive = param_is_sensitive(param);
-            trace_args.extend(variadic_tail.iter().map(|arg| FrameTraceArgument {
-                name: arg.key.clone(),
-                value: trace_value_for_param(&arg.value, sensitive),
-            }));
             prepared.push(PreparedArg {
                 value: variadic_array(variadic_tail),
                 reference: None,
+                trace_holds_reference: false,
             });
             break;
         }
@@ -418,32 +405,24 @@ fn bind_arguments(
             {
                 value = cell.get();
             }
-            trace_args.push(FrameTraceArgument {
-                name: None,
-                value: if param_is_sensitive(param) {
-                    trace_value_for_param(&value, true)
-                } else if let Some(cell) = &reference {
-                    // Traces observe later writes through by-ref parameters
-                    // (matching the reference engine), and holding the cell
-                    // instead of a value snapshot keeps the argument's
-                    // copy-on-write handle unshared for the frame's lifetime.
-                    Value::Reference(cell.clone())
-                } else {
-                    value.clone()
-                },
-            });
+            // Traces observe later writes through by-ref parameters (matching
+            // the reference engine): a supplied by-ref parameter's backtrace
+            // entry holds the live cell rather than a value snapshot, which also
+            // keeps the argument's copy-on-write handle unshared for the frame's
+            // lifetime. `build_frame_trace_arguments` reconstructs that entry.
+            let trace_holds_reference = reference.is_some();
             if !elide_frame_args
                 && highest_frame_param_index.is_some_and(|highest| index <= highest)
             {
                 frame_args.push(value.clone());
             }
-            prepared.push(PreparedArg { value, reference });
+            prepared.push(PreparedArg {
+                value,
+                reference,
+                trace_holds_reference,
+            });
         } else if let Some(default) = &param.default {
             let value = inline_constant_value(default);
-            trace_args.push(FrameTraceArgument {
-                name: None,
-                value: trace_value_for_param(&value, param_is_sensitive(param)),
-            });
             if param.by_ref {
                 let reference = ReferenceCell::new(value.clone());
                 if !elide_frame_args
@@ -451,9 +430,13 @@ fn bind_arguments(
                 {
                     frame_args.push(value.clone());
                 }
+                // A by-ref parameter that falls back to its default keeps a
+                // value snapshot in the trace (not the fresh cell), so
+                // `trace_holds_reference` stays false.
                 prepared.push(PreparedArg {
                     value,
                     reference: Some(reference),
+                    trace_holds_reference: false,
                 });
                 continue;
             }
@@ -465,6 +448,7 @@ fn bind_arguments(
             prepared.push(PreparedArg {
                 value,
                 reference: None,
+                trace_holds_reference: false,
             });
         } else if param.required {
             return Err(VmError::fatal(
@@ -490,10 +474,6 @@ fn bind_arguments(
             .with_context("parameter", &param.name));
         }
     }
-    trace_args.extend(extra_positional.iter().map(|arg| FrameTraceArgument {
-        name: None,
-        value: arg.value.clone(),
-    }));
     if !elide_frame_args {
         frame_args.extend(extra_positional.iter().map(|arg| arg.value.clone()));
     }
@@ -501,7 +481,6 @@ fn bind_arguments(
     Ok(PreparedArguments {
         args: prepared,
         frame_args,
-        trace_args,
         diagnostics,
     })
 }
