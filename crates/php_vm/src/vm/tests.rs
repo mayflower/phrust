@@ -20662,3 +20662,217 @@ fn last_use_array_read_release_eliminates_false_sharing_cow() {
         on_counters.cow_separations
     );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime lever R4: class-context frame-reuse correctness fixtures.
+//
+// Every fixture asserts byte-identical PHP-visible output with
+// `reuse_class_context_frames` OFF (the default fresh-frame path, where every
+// class-context call is blocked with reason `class_context`) and ON (the
+// class-context pooling path). Method/constructor/static calls that clear every
+// other reuse guard must reuse a pooled frame without changing `$this` identity,
+// destructor order, reference identity, static-local state, recursion results,
+// or exception/finally unwinding. Parity is checked on both the rich-IR path and
+// the dense-bytecode path (both call sites thread the flag).
+// ---------------------------------------------------------------------------
+
+fn run_reuse_class_context_config(
+    source: &str,
+    format: ExecutionFormat,
+    reuse_class_context_frames: bool,
+) -> VmResult {
+    execute_source_with_options(
+        source,
+        VmOptions {
+            execution_format: format,
+            reuse_class_context_frames,
+            collect_counters: true,
+            ..VmOptions::default()
+        },
+    )
+}
+
+#[track_caller]
+fn assert_reuse_class_context_parity(source: &str, expected: &str) {
+    // Rich-IR path pins the expected bytes and proves the flag is a no-op there.
+    let ir_off = run_reuse_class_context_config(source, ExecutionFormat::Ir, false);
+    assert!(
+        ir_off.status.is_success(),
+        "rich-IR flag-off failed: {:?}",
+        ir_off.status
+    );
+    assert_eq!(
+        ir_off.output.to_string_lossy(),
+        expected,
+        "rich-IR flag-off output mismatch"
+    );
+    let ir_on = run_reuse_class_context_config(source, ExecutionFormat::Ir, true);
+    assert!(
+        ir_on.status.is_success(),
+        "rich-IR flag-on failed: {:?}",
+        ir_on.status
+    );
+    assert_eq!(
+        ir_on.output.to_string_lossy(),
+        ir_off.output.to_string_lossy(),
+        "rich-IR: reuse-class-context-frames changed observable output"
+    );
+
+    // Dense-bytecode path: the flag must not change observable output either.
+    let dense_off = run_reuse_class_context_config(source, ExecutionFormat::Auto, false);
+    assert!(
+        dense_off.status.is_success(),
+        "dense flag-off failed: {:?}",
+        dense_off.status
+    );
+    let dense_on = run_reuse_class_context_config(source, ExecutionFormat::Auto, true);
+    assert!(
+        dense_on.status.is_success(),
+        "dense flag-on failed: {:?}",
+        dense_on.status
+    );
+    assert_eq!(
+        dense_on.output.to_string_lossy(),
+        dense_off.output.to_string_lossy(),
+        "dense: reuse-class-context-frames changed observable output"
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_recursive_method_results() {
+    // Recursive method (`$this->fact`) invoked in a loop: each recursion level
+    // gets a distinct frame while parents are live, and the sibling iterations
+    // reuse recycled frames. A wrong result would prove a reused frame aliased a
+    // still-live parent.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Math {\n    function fact(int $n): int {\n        if ($n <= 1) return 1;\n        return $n * $this->fact($n - 1);\n    }\n}\n$m = new Math();\n$total = 0;\nfor ($i = 1; $i <= 8; $i++) { $total += $m->fact($i); }\necho $total, \"\\n\";\necho $m->fact(12), \"\\n\";\n",
+        "46233\n479001600\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_does_not_leak_stale_this() {
+    // A method stores `$this` in a static local, then a later call from a
+    // different object must observe the new `$this`, never the pooled prior
+    // occupant's. Also exercises static-local persistence across reused frames.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Box {\n    public int $id;\n    function __construct(int $id) { $this->id = $id; }\n    function remember(): void {\n        static $last = null;\n        if ($last !== null) { echo \"prev={$last->id} cur={$this->id}\\n\"; }\n        else { echo \"first cur={$this->id}\\n\"; }\n        $last = $this;\n    }\n}\n$a = new Box(1);\n$b = new Box(2);\n$c = new Box(3);\n$a->remember();\n$b->remember();\n$c->remember();\n$a->remember();\n",
+        "first cur=1\nprev=1 cur=2\nprev=2 cur=3\nprev=3 cur=1\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_destructor_order() {
+    // Objects with `__destruct` created and freed across method calls: the
+    // object-creating function stays fresh (destructor-sensitive body), while the
+    // `label()` method it calls is reuse-eligible. Destructor print order must be
+    // identical flag-off and flag-on.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Node {\n    public int $id;\n    function __construct(int $id) { $this->id = $id; echo \"make {$id}\\n\"; }\n    function __destruct() { echo \"destroy {$this->id}\\n\"; }\n    function label(): string { return \"node{$this->id}\"; }\n}\nfunction process(int $id): string {\n    $n = new Node($id);\n    return $n->label();\n}\nfor ($i = 1; $i <= 4; $i++) {\n    echo process($i), \"\\n\";\n}\necho \"done\\n\";\n",
+        "make 1\ndestroy 1\nnode1\nmake 2\ndestroy 2\nnode2\nmake 3\ndestroy 3\nnode3\nmake 4\ndestroy 4\nnode4\ndone\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_this_property_and_reference_identity() {
+    // Property mutation through `$this` across reused-frame calls, plus a
+    // reference bound to a `$this` property inside a reused method body.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Acc {\n    public int $total = 0;\n    function add(int $v): void { $this->total += $v; }\n    function get(): int { return $this->total; }\n}\n$acc = new Acc();\nfor ($i = 1; $i <= 10; $i++) { $acc->add($i); }\necho $acc->get(), \"\\n\";\n\nclass RefBox {\n    public int $v = 0;\n    function bump(): void { $r = &$this->v; $r++; }\n}\n$b = new RefBox();\n$b->bump(); $b->bump(); $b->bump();\necho $b->v, \"\\n\";\n",
+        "55\n3\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_exception_and_finally_unwinding() {
+    // Methods with try/finally stay fresh (try_finally guard), but sibling
+    // reuse-eligible methods interleave. Exception propagation and finally order
+    // must be identical flag-off and flag-on.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Worker {\n    function risky(int $n): int {\n        try {\n            if ($n % 2 === 0) { throw new RuntimeException(\"even {$n}\"); }\n            return $n * 10;\n        } finally {\n            echo \"finally {$n}\\n\";\n        }\n    }\n    function safe(int $n): int { return $n + 1; }\n}\n$w = new Worker();\nfor ($i = 1; $i <= 4; $i++) {\n    try {\n        echo \"got \", $w->risky($i), \"\\n\";\n    } catch (RuntimeException $e) {\n        echo \"caught \", $e->getMessage(), \"\\n\";\n    }\n    echo \"safe \", $w->safe($i), \"\\n\";\n}\n",
+        "got finally 1\n10\nsafe 2\ngot finally 2\ncaught even 2\nsafe 3\ngot finally 3\n30\nsafe 4\ngot finally 4\ncaught even 4\nsafe 5\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_static_local_persistence() {
+    // A per-method static counter must keep incrementing across reused frames.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Seq {\n    function next(): int {\n        static $n = 0;\n        $n++;\n        return $n;\n    }\n}\n$s = new Seq();\n$out = \"\";\nfor ($i = 0; $i < 6; $i++) { $out .= $s->next(); }\necho $out, \"\\n\";\n",
+        "123456\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_preserves_deep_oop_call_chain() {
+    // A four-deep method chain driven in a loop: recycled frames from one
+    // iteration feed the next without corrupting the running sum.
+    assert_reuse_class_context_parity(
+        "<?php\nclass Chain {\n    function a(int $x): int { return $this->b($x + 1); }\n    function b(int $x): int { return $this->c($x + 1); }\n    function c(int $x): int { return $this->d($x + 1); }\n    function d(int $x): int { return $x + 1; }\n}\n$ch = new Chain();\n$sum = 0;\nfor ($i = 0; $i < 100; $i++) { $sum += $ch->a($i); }\necho $sum, \"\\n\";\n",
+        "5350\n",
+    );
+}
+
+#[test]
+fn reuse_class_context_signal_reuses_frames_and_clears_blocker() {
+    // Signal proof: on a method-call loop the default path reuses nothing and
+    // reports `class_context` for every call; with the flag on, frames are reused,
+    // allocations drop, and `class_context` no longer appears — output unchanged.
+    let source = "<?php\nclass Calc {\n    function add(int $a, int $b): int { return $a + $b; }\n}\n$c = new Calc();\n$sum = 0;\nfor ($i = 0; $i < 50; $i++) { $sum += $c->add($i, $i); }\necho $sum, \"\\n\";\n";
+
+    let flag_off = run_reuse_class_context_config(source, ExecutionFormat::Ir, false);
+    assert!(
+        flag_off.status.is_success(),
+        "flag-off failed: {:?}",
+        flag_off.status
+    );
+    assert_eq!(flag_off.output.to_string_lossy(), "2450\n");
+    let off = flag_off.counters.expect("counters enabled");
+    assert_eq!(
+        off.frames_reused, 0,
+        "flag-off must reuse no frames for method calls"
+    );
+    assert!(
+        off.frame_reuse_blocked_by_reason
+            .get("class_context")
+            .copied()
+            .unwrap_or(0)
+            >= 50,
+        "flag-off must block every method call on class_context, got {:?}",
+        off.frame_reuse_blocked_by_reason.get("class_context")
+    );
+
+    let flag_on = run_reuse_class_context_config(source, ExecutionFormat::Ir, true);
+    assert!(
+        flag_on.status.is_success(),
+        "flag-on failed: {:?}",
+        flag_on.status
+    );
+    assert_eq!(
+        flag_on.output.to_string_lossy(),
+        flag_off.output.to_string_lossy(),
+        "reuse-class-context-frames changed observable output"
+    );
+    let on = flag_on.counters.expect("counters enabled");
+    assert!(
+        on.frames_reused >= 1,
+        "flag-on must reuse class-context frames, got {}",
+        on.frames_reused
+    );
+    assert_eq!(
+        on.frames_reused, on.register_files_reused,
+        "frame and register-file reuse must track together"
+    );
+    assert!(
+        !on.frame_reuse_blocked_by_reason
+            .contains_key("class_context"),
+        "flag-on must not report class_context, got {:?}",
+        on.frame_reuse_blocked_by_reason
+    );
+    assert!(
+        on.frames_allocated < off.frames_allocated,
+        "flag-on must allocate fewer frames: off={} on={}",
+        off.frames_allocated,
+        on.frames_allocated
+    );
+}

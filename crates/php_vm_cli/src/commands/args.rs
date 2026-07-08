@@ -195,6 +195,7 @@ pub(super) struct RunOptions<'a> {
     pub(super) execution_format: ExecutionFormat,
     pub(super) superinstructions: SuperinstructionMode,
     pub(super) last_use_moves: bool,
+    pub(super) reuse_class_context_frames: bool,
     pub(super) dense_jump_threading: DenseJumpThreadingMode,
     pub(super) bytecode_layout: BytecodeLayoutMode,
     pub(super) bytecode_layout_profile: Option<String>,
@@ -499,6 +500,7 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
     let mut execution_format = default_options.vm_options.execution_format;
     let mut superinstructions = default_options.vm_options.superinstructions;
     let mut last_use_moves = default_options.vm_options.last_use_moves;
+    let mut reuse_class_context_frames = default_options.vm_options.reuse_class_context_frames;
     let mut dense_jump_threading = default_options.vm_options.dense_jump_threading;
     let mut bytecode_layout = default_options.vm_options.bytecode_layout;
     let mut bytecode_layout_profile = None;
@@ -672,6 +674,16 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
             }
             arg if let Some(value) = arg.strip_prefix("--last-use-moves=") => {
                 last_use_moves = parse_last_use_moves_mode(value)?;
+            }
+            "--reuse-class-context-frames" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("run --reuse-class-context-frames requires off or on".to_string());
+                };
+                reuse_class_context_frames = parse_reuse_class_context_frames_mode(value)?;
+            }
+            arg if let Some(value) = arg.strip_prefix("--reuse-class-context-frames=") => {
+                reuse_class_context_frames = parse_reuse_class_context_frames_mode(value)?;
             }
             "--bytecode-layout" => {
                 index += 1;
@@ -967,6 +979,7 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
                     execution_format,
                     superinstructions,
                     last_use_moves,
+                    reuse_class_context_frames,
                     dense_jump_threading,
                     bytecode_layout,
                     bytecode_layout_profile,
@@ -1017,6 +1030,7 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
         execution_format,
         superinstructions,
         last_use_moves,
+        reuse_class_context_frames,
         dense_jump_threading,
         bytecode_layout,
         bytecode_layout_profile,
@@ -1125,6 +1139,16 @@ pub(super) fn parse_last_use_moves_mode(value: &str) -> Result<bool, String> {
         "on" => Ok(true),
         _ => Err(format!(
             "unsupported last-use-moves mode `{value}`; expected off or on"
+        )),
+    }
+}
+
+pub(super) fn parse_reuse_class_context_frames_mode(value: &str) -> Result<bool, String> {
+    match value {
+        "off" => Ok(false),
+        "on" => Ok(true),
+        _ => Err(format!(
+            "unsupported reuse-class-context-frames mode `{value}`; expected off or on"
         )),
     }
 }

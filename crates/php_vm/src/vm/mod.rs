@@ -1827,6 +1827,7 @@ fn frame_reuse_call_shape_blocked_reason(
     function: &IrFunction,
     call: &FunctionCall<'_>,
     shape: FrameShapeFlags,
+    reuse_class_context: bool,
 ) -> Option<&'static str> {
     if function.flags.is_generator {
         return Some("generator");
@@ -1852,12 +1853,22 @@ fn frame_reuse_call_shape_blocked_reason(
             },
         );
     }
-    if call.this_value.is_some()
+    // Runtime lever R4: class-context calls (methods/constructors/static calls,
+    // or any call carrying `$this`/scope/called/declaring class) are reuse-blocked
+    // by default. With `reuse_class_context` on, they become reuse-eligible only
+    // if they clear every *other* guard below (shared-top-level-locals,
+    // try/finally, destructor-sensitive body) and the by-ref-argument guard the
+    // caller ORs in afterwards. The reuse/reset path fully resets `$this` and all
+    // class-context frame state (`reset_with_activation_context` overwrites
+    // scope/called/declaring class and re-zeroes every local/register, so the
+    // `$this` local is dropped and re-initialized per call), and teardown drops
+    // the prior occupant's values at the same `pop_recycle` point as a fresh frame.
+    let has_class_context = call.this_value.is_some()
         || call.scope_class.is_some()
         || call.called_class.is_some()
         || call.declaring_class.is_some()
-        || function.flags.is_method
-    {
+        || function.flags.is_method;
+    if has_class_context && !reuse_class_context {
         return Some("class_context");
     }
     if call.shared_top_level_locals.is_some() {
@@ -6961,8 +6972,12 @@ impl Vm {
         }
         let mut diagnostics = Vec::new();
         let frame_shape = self.frame_shape_flags(compiled, function_id, ir_function);
-        let frame_reuse_call_shape_reason =
-            frame_reuse_call_shape_blocked_reason(ir_function, &call, frame_shape);
+        let frame_reuse_call_shape_reason = frame_reuse_call_shape_blocked_reason(
+            ir_function,
+            &call,
+            frame_shape,
+            self.options.reuse_class_context_frames,
+        );
         let frame_layout = call_frame_layout_class(ir_function, &call, frame_shape);
         let argument_policy = call.argument_binding_policy(compiled);
         let elide_frame_args = self.frame_args_elidable(compiled, function_id, ir_function);
@@ -13911,8 +13926,12 @@ impl Vm {
                 && call.running_generator.is_none()
                 && call.running_fiber.is_none();
             let frame_shape = self.frame_shape_flags(compiled, function_id, function);
-            let frame_reuse_call_shape_reason =
-                frame_reuse_call_shape_blocked_reason(function, &call, frame_shape);
+            let frame_reuse_call_shape_reason = frame_reuse_call_shape_blocked_reason(
+                function,
+                &call,
+                frame_shape,
+                self.options.reuse_class_context_frames,
+            );
             let frame_layout = call_frame_layout_class(function, &call, frame_shape);
             let argument_policy = call.argument_binding_policy(compiled);
             let elide_frame_args = self.frame_args_elidable(compiled, function_id, function);
