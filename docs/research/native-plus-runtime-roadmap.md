@@ -295,8 +295,23 @@ array/string contents), not the refcount bumps.
   == PHP 8.5.7. Structural clone-avoidance rises on the opt-in path; wall-clock is
   neutral on the micro-benchmarks tested (consistent with the ~1 ns refcount-bump
   correction above), so it lands as a correct, default-off, structurally-measured
-  foundation. *Remaining:* the array-container COW deep-copy (`Rc::make_mut` in
-  `assign_dim`) needs the transient-read-clone eliminated too — a follow-up.
+  foundation.
+- **R3 — array-read false-sharing COW eliminated** (`last_use.rs`
+  `array_release_eligible` + `release_dead_shared_array_register`). Diagnosed via
+  the `cow_separations` counter: a dim fetch (`$map["k"]`) loads the array into a
+  register (an `Rc` handle clone) that lingers past the read, so a following
+  in-place write (`$map["j"]=…`) sees the array shared and `Rc::make_mut`
+  deep-copies all contents *every iteration* (`cow_separations = n`; write-only
+  was `0`). Reusing R3's block-local last-use proof, the `FetchDim` handler now
+  takes-and-drops that register when it is the register's provable last use **and**
+  holds a *shared* `Value::Array` — releasing the clone so the write mutates the
+  sole owner in place. Only shared arrays are dropped (refcount decrement, no
+  contents freed, no destructor change); the fetch result is an owned copy (no
+  alias); by-ref binding uses another opcode. Default-off (`--last-use-moves`).
+  Read+write workload: `cow_separations` **n → 0** flag-on, stdout identical;
+  wall-clock scales with array size — ~1% (3-element) to **~21%** (60-element,
+  166→130 ms/200k) — so WordPress-sized config/record arrays benefit most. 836
+  tests; COW/reference parity fixtures byte-identical flag-off/on/PHP.
 
 **Critical lesson baked into every runtime item:** per-request memoization does
 *not* help WordPress. WP is one-shot-distributed — functions run 1–2× per request,
