@@ -5993,7 +5993,10 @@ impl Vm {
         function_id: FunctionId,
         function: &IrFunction,
         call: &FunctionCall<'_>,
-    ) -> Option<Value> {
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<VmResult> {
         if !crate::copy_patch_bridge::copy_patch_leaf_enabled() {
             return None;
         }
@@ -6019,7 +6022,142 @@ impl Vm {
             &compiled.unit().constants,
         )?;
         let params: Vec<Value> = call.args.iter().map(|arg| arg.value.clone()).collect();
-        leaf.run(&params)
+        match leaf.run_outcome(&params) {
+            crate::copy_patch_bridge::LeafOutcome::Value(value) => {
+                Some(VmResult::success_no_output(Some(value)))
+            }
+            crate::copy_patch_bridge::LeafOutcome::Fallback => None,
+            // The native prefix computed the arguments and requested the userland
+            // call. The bridge never re-enters the VM; the call runs here, on the
+            // identical normal path, so behavior matches the interpreter exactly.
+            crate::copy_patch_bridge::LeafOutcome::TailCall { callee_name, args } => self
+                .execute_copy_patch_tailcall(
+                    compiled,
+                    function_id,
+                    function,
+                    call.call_span,
+                    &params,
+                    &callee_name,
+                    args,
+                    &call.running_fiber,
+                    output,
+                    stack,
+                    state,
+                ),
+        }
+    }
+
+    /// Perform a copy-and-patch tail call: resolve `callee_name` exactly as the
+    /// interpreter resolves an unqualified `CallFunction`, validate it is a plain
+    /// userland function whose by-value arity matches the natively-computed
+    /// `args`, then run it through the normal [`Self::execute_function`] path and
+    /// return its result faithfully (exceptions/errors included).
+    ///
+    /// Materializes the leaf's own stack frame around the call so a throwing or
+    /// stack-inspecting callee observes the identical call stack (name, arguments,
+    /// and call-site spans) it would under the interpreter. The leaf is a free
+    /// function whose parameters are all int-by-value, and the native region only
+    /// requested the tail call after guarding every parameter as `Int`, so
+    /// `leaf_args` are exactly the int values the leaf was called with — no
+    /// argument-coercion divergence. The callee pops its own frame on every exit
+    /// (return, runtime error, and `propagate_exception`), so popping the leaf
+    /// frame afterward keeps the stack balanced, mirroring the interpreter popping
+    /// the leaf once its body returns.
+    ///
+    /// Returns `None` — so the caller falls back to interpreting the *whole* leaf
+    /// — when the callee is a builtin, a dynamic miss, a method/closure/generator,
+    /// declared by-reference return, or has any by-reference/variadic parameter or
+    /// a mismatched arity. A tail call to a userland scalar leaf simply re-enters
+    /// `execute_function`, which may itself run natively.
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_copy_patch_tailcall(
+        &self,
+        compiled: &CompiledUnit,
+        leaf_function_id: FunctionId,
+        leaf_function: &IrFunction,
+        leaf_call_span: Option<php_ir::IrSpan>,
+        leaf_args: &[Value],
+        callee_name: &str,
+        args: Vec<Value>,
+        running_fiber: &Option<FiberRef>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<VmResult> {
+        let normalized = normalize_function_name(callee_name);
+        let (callee_unit, callee_id) =
+            match self.resolve_function_call_target(compiled, state, &normalized)? {
+                FunctionCallCacheTarget::CurrentUnit { function } => (compiled.clone(), function),
+                FunctionCallCacheTarget::DynamicUnit {
+                    unit_index,
+                    function,
+                } => (state.dynamic_units.get(unit_index).cloned()?, function),
+                // A builtin tail call is out of scope; interpret the whole leaf.
+                FunctionCallCacheTarget::Builtin { .. } => return None,
+            };
+        let callee = callee_unit.unit().functions.get(callee_id.index())?;
+        let flags = callee.flags;
+        if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+            return None;
+        }
+        if callee.returns_by_ref || callee.params.len() != args.len() {
+            return None;
+        }
+        if callee
+            .params
+            .iter()
+            .any(|param| param.by_ref || param.variadic)
+        {
+            return None;
+        }
+
+        // The tail call's call-site span (where the leaf calls the callee). The
+        // leaf is single-block with exactly one `CallFunction` (the tail call), so
+        // the last `CallFunction` instruction is it; used for the callee frame's
+        // backtrace line.
+        let callee_call_span = leaf_function
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .rev()
+            .find_map(|instruction| match instruction.kind {
+                InstructionKind::CallFunction { .. } => Some(instruction.span),
+                _ => None,
+            });
+
+        // Materialize the leaf's frame (free function: no class scope) with its
+        // guaranteed-int arguments, so the callee sees the same stack.
+        stack.push_fresh_frame(
+            leaf_function_id,
+            leaf_function.register_count,
+            leaf_function.local_count,
+            FrameActivationContext {
+                scope_class: None,
+                called_class: None,
+                declaring_class: None,
+                call_span: leaf_call_span,
+            },
+        );
+        if let Some(frame) = stack.current_mut() {
+            frame.trace_arguments = leaf_args
+                .iter()
+                .map(|value| FrameTraceArgument {
+                    name: None,
+                    value: value.clone(),
+                })
+                .collect();
+            frame.arguments = leaf_args.to_vec();
+        }
+
+        let sub_args: Vec<CallArgument> = args.into_iter().map(CallArgument::positional).collect();
+        let sub_call = FunctionCall::new(sub_args, Vec::new())
+            .with_call_site_strict_types(compiled.unit().strict_types)
+            .with_optional_call_span(callee_call_span)
+            .inherit_fiber_context(running_fiber);
+        let result = self.execute_function(&callee_unit, callee_id, sub_call, output, stack, state);
+        stack.pop_recycle();
+        Some(result)
     }
 
     /// Hosts without the copy-patch emitter always fall back to the interpreter.
@@ -6030,7 +6168,10 @@ impl Vm {
         _function_id: FunctionId,
         _function: &IrFunction,
         _call: &FunctionCall<'_>,
-    ) -> Option<Value> {
+        _output: &mut OutputBuffer,
+        _stack: &mut CallStack,
+        _state: &mut ExecutionState,
+    ) -> Option<VmResult> {
         None
     }
 
@@ -9323,11 +9464,14 @@ impl Vm {
                                         function,
                                         ir_function,
                                         &call,
+                                        output,
+                                        stack,
+                                        state,
                                     );
                                     #[cfg(not(feature = "jit-copy-patch"))]
-                                    let native: Option<Value> = None;
-                                    if let Some(value) = native {
-                                        VmResult::success_no_output(Some(value))
+                                    let native: Option<VmResult> = None;
+                                    if let Some(result) = native {
+                                        result
                                     } else {
                                         self.execute_bytecode_function(
                                             compiled,
@@ -13792,12 +13936,21 @@ impl Vm {
             return self.execute_function(&owner, function_id, call, output, stack, state);
         }
         // Copy-and-patch native leaf tier runs before dense dispatch so a
-        // recognized scalar-int leaf executes natively rather than densely.
+        // recognized scalar-int leaf executes natively rather than densely. A
+        // recognized native→userland tail call performs the callee here, on the
+        // normal path, so the returned `VmResult` (result or exception) is
+        // propagated faithfully.
         #[cfg(feature = "jit-copy-patch")]
-        if let Some(value) =
-            self.try_execute_copy_patch_leaf(compiled, function_id, function, &call)
-        {
-            return VmResult::success_no_output(Some(value));
+        if let Some(result) = self.try_execute_copy_patch_leaf(
+            compiled,
+            function_id,
+            function,
+            &call,
+            output,
+            stack,
+            state,
+        ) {
+            return result;
         }
         call = match self.try_execute_cached_dense_function_dispatch(
             compiled,

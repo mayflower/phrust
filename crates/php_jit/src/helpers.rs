@@ -12,6 +12,15 @@ pub const JIT_HELPER_STATUS_OK: i32 = 0;
 pub const JIT_HELPER_STATUS_FALLBACK: i32 = 1;
 /// Native inline arithmetic overflowed and the VM must fall back.
 pub const JIT_HELPER_STATUS_OVERFLOW: i32 = 2;
+/// A copy-and-patch region requested a native→userland tail call: the region's
+/// prefix ran, left each positional `Int` argument in its buffer slot (see
+/// `copy_patch::TailCallPlan`), and returned without computing a result. The VM
+/// bridge reads the argument slots and performs the userland call through the
+/// normal interpreter path. This is a *region* return status alongside the
+/// region's `0` (OK, result in `result_slot`) and `1` (guard/overflow side
+/// exit); the value `3` is chosen so it never aliases the Cranelift ABI's
+/// [`JIT_HELPER_STATUS_OVERFLOW`] (`2`).
+pub const JIT_HELPER_STATUS_TAILCALL: i32 = 3;
 
 /// Stable helper id.
 #[repr(transparent)]

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use php_ir::instruction::TerminatorKind;
+use php_ir::instruction::{IrCallArgValueKind, TerminatorKind};
 use php_ir::{
     BasicBlock, BinaryOp, CompareOp, ConstId, InstructionKind, IrConstant, IrFunction,
     IrReturnType, LocalId, Operand, RegId,
@@ -26,7 +26,7 @@ use crate::aarch64::{
     Aarch64Assembler, Cond, D0, D1, D2, Label, Reg, SP, X0, X1, X3, X4, X5, X6, X9,
 };
 use crate::abi::JitCValueTag;
-use crate::helpers::{JIT_HELPER_STATUS_OK, phrust_jit_abs_i64};
+use crate::helpers::{JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_TAILCALL, phrust_jit_abs_i64};
 use crate::region_ir::{
     NodeId, RegionBuilder, RegionCompareOp, RegionConst, RegionGraph, RegionId, RegionNode,
     RegionNodeKind, RegionValueType, VmSlotId,
@@ -219,6 +219,17 @@ pub struct NativeCallPermits {
     /// builtin `abs` (not a user-defined or namespaced function that shadows
     /// it). Set by the VM bridge after checking the function registry.
     pub builtin_abs: bool,
+    /// True when the compiler may lower a native→userland *tail call* (a leaf
+    /// whose result is exactly a `CallFunction`'s result) to the tail-call form:
+    /// the region computes the arguments natively and returns
+    /// [`JIT_HELPER_STATUS_TAILCALL`] so the
+    /// VM bridge performs the call through its normal interpreter path. Unlike
+    /// `builtin_abs`, this permits *lowering the shape*; the callee's identity
+    /// (userland vs. builtin, arity, by-reference parameters) is validated by the
+    /// VM at call time, which falls back to interpreting the whole leaf when the
+    /// callee is out of scope. Defaults to false so the shape is never lowered
+    /// without an opt-in.
+    pub allow_userland_tailcall: bool,
 }
 
 /// A binary PHP float operation over IEEE-754 doubles. Add/Sub/Mul never fault
@@ -615,16 +626,40 @@ pub fn emit_guarded_int_add_sequence(
     emit_scalar_int_ops(&ops)
 }
 
+/// The plan for a native→userland tail call recognized in a scalar-int leaf.
+///
+/// When the region returns
+/// [`JIT_HELPER_STATUS_TAILCALL`], its prefix
+/// has already left each positional argument — guaranteed `Int`-tagged — in the
+/// buffer slots named by `arg_slots` (in call order). The VM bridge reads those
+/// slots as the arguments and performs the call to `callee_name` through the
+/// normal interpreter path, so the callee runs identically to a fully
+/// interpreted call. The region itself never re-enters the VM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TailCallPlan {
+    /// Callee name exactly as written at the call site; the VM normalizes and
+    /// resolves it (and validates it is a plain userland function) at call time.
+    pub callee_name: String,
+    /// Buffer slots holding the marshaled positional `Int` arguments, in order.
+    pub arg_slots: Vec<u32>,
+}
+
 /// A region lowered to the scalar-int subset: native code plus the slot-buffer
 /// layout the VM must marshal against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledScalarRegion {
     /// Emitted `extern "C" fn(slot_base: *mut JitCValue) -> i32`.
     pub code: Vec<u8>,
-    /// Slot holding the region result after a successful (`0`) return.
+    /// Slot holding the region result after a successful (`0`) return. Unused on
+    /// the tail-call path (the VM produces the result from the userland call).
     pub result_slot: u32,
     /// Number of `JitCValue` slots the caller's buffer must provide.
     pub buffer_slots: u32,
+    /// `Some` when the region is a native→userland tail call: it returns
+    /// [`JIT_HELPER_STATUS_TAILCALL`] rather
+    /// than a result, and the VM bridge performs the call named here. `None` for
+    /// every ordinary region (result in `result_slot` on a `0` return).
+    pub tail_call: Option<TailCallPlan>,
 }
 
 /// Reason a region cannot be lowered to the scalar-int subset.
@@ -767,6 +802,7 @@ pub fn compile_scalar_int_region(
         code,
         result_slot,
         buffer_slots: next_temp.max(max_param_slot + 1),
+        tail_call: None,
     })
 }
 
@@ -950,6 +986,11 @@ pub fn compile_scalar_int_function(
 /// and reaches the general CFG compiler, which honors `permits` to lower the
 /// call to a guarded native helper (e.g. `abs` → [`ScalarIntOp::CallAbsI64`]).
 /// With the default permits this is identical to [`compile_scalar_int_function`].
+///
+/// The native→userland tail-call recognizer runs *last*, after the CFG compiler,
+/// so a call the CFG compiler already lowers natively (e.g. `return abs($x)`)
+/// keeps its tighter form and only a call outside every other subset — a
+/// non-inlinable userland tail call — reaches `compile_scalar_int_tailcall_leaf`.
 pub fn compile_scalar_int_function_with_permits(
     function: &IrFunction,
     constants: &[IrConstant],
@@ -967,7 +1008,10 @@ pub fn compile_scalar_int_function_with_permits(
     if let Some(compiled) = compile_scalar_int_cfg(function, constants, permits) {
         return Some(compiled);
     }
-    compile_scalar_float_leaf(function, constants)
+    if let Some(compiled) = compile_scalar_float_leaf(function, constants) {
+        return Some(compiled);
+    }
+    compile_scalar_int_tailcall_leaf(function, constants, permits)
 }
 
 /// Non-`Discard` instruction kinds of a block. `Discard` is a register-lifetime
@@ -1233,6 +1277,7 @@ fn compile_counted_loop_function(
         code,
         result_slot: result_local.raw(),
         buffer_slots: function.local_count,
+        tail_call: None,
     })
 }
 
@@ -1255,6 +1300,75 @@ fn move_to_slot(
             dst,
             value: int_constant(constants, *c)?,
         }),
+    }
+}
+
+/// Lower one non-call scalar-int instruction to its slot op, using the CFG slot
+/// mapping (`reg_slot` for registers, raw index for locals). Shared by the
+/// general CFG compiler and the tail-call recognizer for the prefix subset —
+/// `LoadLocal`/`LoadLocalQuiet`, `LoadConst`(int), `Move`, `StoreLocal`,
+/// `Binary`, and `Compare`. Returns `None` for any instruction outside the
+/// int/bool subset, including every `CallFunction` (each caller handles calls —
+/// or rejects them — itself).
+fn scalar_int_prefix_op(
+    kind: &InstructionKind,
+    constants: &[IrConstant],
+    local_count: u32,
+    reg_slot: impl Fn(RegId) -> u32,
+) -> Option<ScalarIntOp> {
+    match kind {
+        InstructionKind::LoadLocal { dst, local }
+        | InstructionKind::LoadLocalQuiet { dst, local } => Some(ScalarIntOp::Copy {
+            dst: reg_slot(*dst),
+            src: local.raw(),
+        }),
+        InstructionKind::LoadConst { dst, constant } => Some(ScalarIntOp::Const {
+            dst: reg_slot(*dst),
+            value: int_constant(constants, *constant)?,
+        }),
+        InstructionKind::Move { dst, src } => {
+            move_to_slot(reg_slot(*dst), src, constants, local_count)
+        }
+        InstructionKind::StoreLocal { local, src } => {
+            move_to_slot(local.raw(), src, constants, local_count)
+        }
+        InstructionKind::Binary {
+            dst,
+            op,
+            lhs: Operand::Register(lhs),
+            rhs,
+        } => {
+            let op = int_bin_op(*op)?;
+            let dst = reg_slot(*dst);
+            let lhs = reg_slot(*lhs);
+            match rhs {
+                Operand::Register(rhs) => Some(ScalarIntOp::Binary {
+                    op,
+                    dst,
+                    lhs,
+                    rhs: reg_slot(*rhs),
+                }),
+                Operand::Constant(c) => Some(ScalarIntOp::BinaryConst {
+                    op,
+                    dst,
+                    lhs,
+                    rhs: int_constant(constants, *c)?,
+                }),
+                Operand::Local(_) => None,
+            }
+        }
+        InstructionKind::Compare {
+            dst,
+            op,
+            lhs: Operand::Register(lhs),
+            rhs: Operand::Register(rhs),
+        } => Some(ScalarIntOp::Compare {
+            cond: region_compare_to_cond(ir_compare_to_region(*op)?),
+            dst: reg_slot(*dst),
+            lhs: reg_slot(*lhs),
+            rhs: reg_slot(*rhs),
+        }),
+        _ => None,
     }
 }
 
@@ -1311,83 +1425,33 @@ fn compile_scalar_int_cfg(
     let reg_slot = |r: RegId| local_count + r.raw();
 
     // Translate one instruction to its slot op. `None` means "outside the
-    // subset", which aborts the whole compile (the interpreter runs it).
+    // subset", which aborts the whole compile (the interpreter runs it). The
+    // non-call subset is shared with the tail-call recognizer via
+    // `scalar_int_prefix_op`; only the `abs` helper call is CFG-specific.
     let to_op = |kind: &InstructionKind| -> Option<ScalarIntOp> {
-        match kind {
-            InstructionKind::LoadLocal { dst, local }
-            | InstructionKind::LoadLocalQuiet { dst, local } => Some(ScalarIntOp::Copy {
+        // A call to the real builtin `abs` (confirmed by the VM bridge via
+        // `permits`) on a single by-value register argument lowers to the
+        // guarded native helper call. Any other name, arity, argument form,
+        // or an unconfirmed `abs` returns `None` so the interpreter runs it.
+        if let InstructionKind::CallFunction { dst, name, args } = kind
+            && permits.builtin_abs
+            && name.as_str() == "abs"
+        {
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            if arg.name.is_some() || arg.unpack {
+                return None;
+            }
+            let Operand::Register(arg_reg) = arg.value else {
+                return None;
+            };
+            return Some(ScalarIntOp::CallAbsI64 {
                 dst: reg_slot(*dst),
-                src: local.raw(),
-            }),
-            InstructionKind::LoadConst { dst, constant } => Some(ScalarIntOp::Const {
-                dst: reg_slot(*dst),
-                value: int_constant(constants, *constant)?,
-            }),
-            InstructionKind::Move { dst, src } => {
-                move_to_slot(reg_slot(*dst), src, constants, local_count)
-            }
-            InstructionKind::StoreLocal { local, src } => {
-                move_to_slot(local.raw(), src, constants, local_count)
-            }
-            InstructionKind::Binary {
-                dst,
-                op,
-                lhs: Operand::Register(lhs),
-                rhs,
-            } => {
-                let op = int_bin_op(*op)?;
-                let dst = reg_slot(*dst);
-                let lhs = reg_slot(*lhs);
-                match rhs {
-                    Operand::Register(rhs) => Some(ScalarIntOp::Binary {
-                        op,
-                        dst,
-                        lhs,
-                        rhs: reg_slot(*rhs),
-                    }),
-                    Operand::Constant(c) => Some(ScalarIntOp::BinaryConst {
-                        op,
-                        dst,
-                        lhs,
-                        rhs: int_constant(constants, *c)?,
-                    }),
-                    Operand::Local(_) => None,
-                }
-            }
-            InstructionKind::Compare {
-                dst,
-                op,
-                lhs: Operand::Register(lhs),
-                rhs: Operand::Register(rhs),
-            } => Some(ScalarIntOp::Compare {
-                cond: region_compare_to_cond(ir_compare_to_region(*op)?),
-                dst: reg_slot(*dst),
-                lhs: reg_slot(*lhs),
-                rhs: reg_slot(*rhs),
-            }),
-            // A call to the real builtin `abs` (confirmed by the VM bridge via
-            // `permits`) on a single by-value register argument lowers to the
-            // guarded native helper call. Any other name, arity, argument form,
-            // or an unconfirmed `abs` returns `None` so the interpreter runs it.
-            InstructionKind::CallFunction { dst, name, args }
-                if permits.builtin_abs && name.as_str() == "abs" =>
-            {
-                let [arg] = args.as_slice() else {
-                    return None;
-                };
-                if arg.name.is_some() || arg.unpack {
-                    return None;
-                }
-                let Operand::Register(arg_reg) = arg.value else {
-                    return None;
-                };
-                Some(ScalarIntOp::CallAbsI64 {
-                    dst: reg_slot(*dst),
-                    arg: reg_slot(arg_reg),
-                })
-            }
-            _ => None,
+                arg: reg_slot(arg_reg),
+            });
         }
+        scalar_int_prefix_op(kind, constants, local_count, reg_slot)
     };
 
     let mut asm = Aarch64Assembler::new();
@@ -1447,6 +1511,240 @@ fn compile_scalar_int_cfg(
         code: asm.finish(),
         result_slot,
         buffer_slots,
+        tail_call: None,
+    })
+}
+
+/// One positional argument of a native→userland tail call: how the emitted
+/// prefix produces it (guaranteed `Int`) into its fresh buffer slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TailArgSource {
+    /// Guard `src` is `Int` (side exit otherwise), then copy it to the arg slot.
+    GuardedCopy { src: u32 },
+    /// Materialize a statically-known `Int` into the arg slot.
+    Const { value: i64 },
+}
+
+/// Emit the tail-call region: guard every parameter slot as `Int`, run the
+/// argument-computing `prefix`, marshal each argument into a fresh buffer slot at
+/// `first_arg_slot + i` (guarding params as `Int` so a non-int actual argument
+/// side-exits), then return [`JIT_HELPER_STATUS_TAILCALL`] without writing a
+/// result. A guard failure anywhere takes the shared side exit (status `1`).
+///
+/// The entry parameter guards ensure the region only requests the tail call when
+/// *every* parameter is a genuine `Int` — even a parameter that never feeds an
+/// argument. That is what lets the VM materialize the caller's stack frame with
+/// the raw call arguments (they equal the interpreter's coerced `int` values), so
+/// a throwing or stack-inspecting callee observes a byte-identical backtrace.
+///
+/// Returns the machine code and the argument slots (in call order) the VM reads.
+fn emit_tailcall_region(
+    prefix: &[ScalarIntOp],
+    args: &[TailArgSource],
+    param_slots: &[u32],
+    first_arg_slot: u32,
+) -> Result<(Vec<u8>, Vec<u32>), SlotSequenceError> {
+    for op in prefix {
+        check_op_slots(*op)?;
+    }
+    for &slot in param_slots {
+        check_slot(slot)?;
+    }
+    let mut arg_slots = Vec::with_capacity(args.len());
+    for (index, arg) in args.iter().enumerate() {
+        let slot = first_arg_slot
+            .checked_add(
+                u32::try_from(index)
+                    .map_err(|_| SlotSequenceError::SlotIndexOutOfRange(first_arg_slot))?,
+            )
+            .ok_or(SlotSequenceError::SlotIndexOutOfRange(first_arg_slot))?;
+        check_slot(slot)?;
+        if let TailArgSource::GuardedCopy { src } = arg {
+            check_slot(*src)?;
+        }
+        arg_slots.push(slot);
+    }
+
+    let mut asm = Aarch64Assembler::new();
+    let deopt = asm.new_label();
+    // Guard every parameter is `Int` up front (see the note above).
+    for &slot in param_slots {
+        emit_int_guard(&mut asm, deopt, slot);
+    }
+    for op in prefix {
+        emit_op(&mut asm, deopt, *op);
+    }
+    for (arg, &slot) in args.iter().zip(arg_slots.iter()) {
+        match arg {
+            TailArgSource::GuardedCopy { src } => {
+                emit_int_guard(&mut asm, deopt, *src);
+                emit_value_copy(&mut asm, slot, *src);
+            }
+            TailArgSource::Const { value } => {
+                asm.mov_imm64(X6, *value as u64);
+                emit_store_int(&mut asm, slot, X6);
+            }
+        }
+    }
+    // Tail call requested: the arguments are in their slots and the VM performs
+    // the call. No result is written — the region returns before the call.
+    asm.movz(X0, JIT_HELPER_STATUS_TAILCALL as u16);
+    asm.ret();
+    asm.bind(deopt);
+    asm.movz(X0, 1);
+    asm.ret();
+    Ok((asm.finish(), arg_slots))
+}
+
+/// Recognize a native→userland *tail-call* leaf and lower its argument-computing
+/// prefix to native code, gated by `permits.allow_userland_tailcall`.
+///
+/// The matched shape is a single-block `int`/`bool`-returning free function
+/// (int, by-value, non-variadic, no-default parameters) whose meaningful
+/// instructions are a scalar-int prefix (`LoadLocal`, `LoadConst`(int), `Move`,
+/// `StoreLocal`, `Binary`, `Compare`) followed by a final
+/// `CallFunction { dst, name, args }` whose result register is returned
+/// unchanged — `Return(%dst)`. Because the call is the last instruction, `%dst`
+/// is used only by that `Return`: a genuine tail call.
+///
+/// The emitted region computes each positional argument into a fresh buffer slot
+/// (guarding params as `Int`, so a non-int actual argument side-exits rather than
+/// mis-marshaling), then returns
+/// [`JIT_HELPER_STATUS_TAILCALL`] and records
+/// a [`TailCallPlan`]. The VM bridge reads the argument slots and performs the
+/// call through its normal interpreter path — so behavior matches the interpreter
+/// by construction, with no native re-entry.
+///
+/// Rejected: named or spread arguments, a pure by-reference argument send
+/// (`ByRefLocationPlaceholder`), a non-register/non-int-constant argument value,
+/// a nested call or any out-of-subset prefix instruction, and any post-call work
+/// (which would need on-stack replacement — out of scope). The callee's identity
+/// (userland vs. builtin, arity, by-reference parameters, method/closure) is not
+/// checked here — `php_jit` has no function registry — but by the VM at call
+/// time, which interprets the whole leaf when the callee is out of scope.
+fn compile_scalar_int_tailcall_leaf(
+    function: &IrFunction,
+    constants: &[IrConstant],
+    permits: NativeCallPermits,
+) -> Option<CompiledScalarRegion> {
+    if !permits.allow_userland_tailcall {
+        return None;
+    }
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    if !matches!(
+        function.return_type,
+        Some(IrReturnType::Int) | Some(IrReturnType::Bool)
+    ) {
+        return None;
+    }
+    for param in &function.params {
+        if param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || param.type_ != Some(IrReturnType::Int)
+        {
+            return None;
+        }
+    }
+
+    // Single-block leaf: prefix + tail call + return. A multi-block prefix would
+    // need the general CFG lowering with a tail-call terminator — a later step.
+    let [block] = function.blocks.as_slice() else {
+        return None;
+    };
+
+    // The final meaningful instruction must be the tail call; everything before
+    // it is the argument-computing prefix.
+    let kinds = meaningful_kinds(block);
+    let (call_kind, prefix_kinds) = kinds.split_last()?;
+    let InstructionKind::CallFunction {
+        dst: call_dst,
+        name,
+        args,
+    } = call_kind
+    else {
+        return None;
+    };
+
+    // The terminator must return exactly the call's result register.
+    let TerminatorKind::Return {
+        value: Some(Operand::Register(ret_reg)),
+        by_ref_local: None,
+    } = &block.terminator.as_ref()?.kind
+    else {
+        return None;
+    };
+    if ret_reg != call_dst {
+        return None;
+    }
+
+    let local_count = function.local_count;
+    // Registers sit above locals; the fresh argument slots sit above the
+    // registers, so an argument slot never aliases a value the prefix computes.
+    let first_arg_slot = local_count.checked_add(function.register_count)?;
+    let reg_slot = |r: RegId| local_count + r.raw();
+
+    // Lower the prefix with the shared scalar-int lowering. A nested call or any
+    // out-of-subset instruction rejects the whole leaf.
+    let mut prefix = Vec::with_capacity(prefix_kinds.len());
+    for kind in prefix_kinds {
+        prefix.push(scalar_int_prefix_op(
+            kind,
+            constants,
+            local_count,
+            reg_slot,
+        )?);
+    }
+
+    // Each argument must be a plain positional value whose operand is a
+    // scalar-int register or int constant.
+    let mut arg_sources = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.name.is_some()
+            || arg.unpack
+            || arg.value_kind == IrCallArgValueKind::ByRefLocationPlaceholder
+        {
+            return None;
+        }
+        let source = match arg.value {
+            Operand::Register(reg) => TailArgSource::GuardedCopy { src: reg_slot(reg) },
+            Operand::Constant(constant) => TailArgSource::Const {
+                value: int_constant(constants, constant)?,
+            },
+            Operand::Local(_) => return None,
+        };
+        arg_sources.push(source);
+    }
+
+    let arg_count = u32::try_from(args.len()).ok()?;
+    let buffer_slots = first_arg_slot.checked_add(arg_count)?;
+
+    // Guard every parameter as `Int` at entry so the tail call is only requested
+    // when the leaf's arguments are all genuine ints (see `emit_tailcall_region`).
+    let param_slots: Vec<u32> = function
+        .params
+        .iter()
+        .map(|param| param.local.raw())
+        .collect();
+
+    let (code, arg_slots) =
+        emit_tailcall_region(&prefix, &arg_sources, &param_slots, first_arg_slot).ok()?;
+    Some(CompiledScalarRegion {
+        code,
+        // Unused on the tail-call path (the VM produces the result); slot 0 is
+        // always present, keeping the field well-formed.
+        result_slot: 0,
+        buffer_slots,
+        tail_call: Some(TailCallPlan {
+            callee_name: name.clone(),
+            arg_slots,
+        }),
     })
 }
 
@@ -1573,6 +1871,7 @@ fn compile_scalar_float_leaf(
         code,
         result_slot,
         buffer_slots,
+        tail_call: None,
     })
 }
 
@@ -1943,7 +2242,10 @@ mod tests {
     fn recognizes_builtin_abs_call_only_with_permit() {
         let function = abs_plus_one_function("abs");
         let constants = [IrConstant::Int(1)];
-        let permits = NativeCallPermits { builtin_abs: true };
+        let permits = NativeCallPermits {
+            builtin_abs: true,
+            ..NativeCallPermits::default()
+        };
 
         // Without permission the `abs` call is out of subset -> interpreter.
         assert!(compile_scalar_int_function(&function, &constants, 1).is_none());
@@ -1963,9 +2265,124 @@ mod tests {
         // matched as the builtin regardless of the permit.
         let function = abs_plus_one_function("app\\abs");
         let constants = [IrConstant::Int(1)];
-        let permits = NativeCallPermits { builtin_abs: true };
+        let permits = NativeCallPermits {
+            builtin_abs: true,
+            ..NativeCallPermits::default()
+        };
         assert!(
             compile_scalar_int_function_with_permits(&function, &constants, 1, permits).is_none()
+        );
+    }
+
+    /// `function f($a, $b): int { return g($a + $b); }` — the native→userland
+    /// tail-call shape: the prefix computes `$a + $b`, then a final
+    /// `CallFunction` whose result register is returned unchanged.
+    fn tailcall_leaf_function(call_name: &str) -> php_ir::IrFunction {
+        let span = IrSpan::default();
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        let positional = |reg: u32| IrCallArg {
+            name: None,
+            value: Operand::Register(RegId::new(reg)),
+            unpack: false,
+            value_kind: IrCallArgValueKind::Direct,
+            by_ref_local: None,
+            by_ref_dim: None,
+            by_ref_property: None,
+            by_ref_property_dim: None,
+        };
+        php_ir::IrFunction {
+            name: "f".to_string(),
+            params: vec![int_param("a", 0), int_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 4,
+            blocks: vec![BasicBlock {
+                id: BlockId::new(0),
+                instructions: vec![
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(1),
+                        local: LocalId::new(0),
+                    }),
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(2),
+                        local: LocalId::new(1),
+                    }),
+                    ins(InstructionKind::Binary {
+                        dst: RegId::new(3),
+                        op: BinaryOp::Add,
+                        lhs: Operand::Register(RegId::new(1)),
+                        rhs: Operand::Register(RegId::new(2)),
+                    }),
+                    ins(InstructionKind::CallFunction {
+                        dst: RegId::new(0),
+                        name: call_name.to_string(),
+                        args: vec![positional(3)],
+                    }),
+                ],
+                terminator: Some(Terminator {
+                    span,
+                    kind: TerminatorKind::Return {
+                        value: Some(Operand::Register(RegId::new(0))),
+                        by_ref_local: None,
+                    },
+                }),
+            }],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recognizes_userland_tailcall_shape_only_with_permit() {
+        let function = tailcall_leaf_function("classify");
+        let constants: [IrConstant; 0] = [];
+
+        // Without the permit the tail-call shape is out of every subset, so the
+        // interpreter runs it (no native lowering).
+        assert!(compile_scalar_int_function(&function, &constants, 1).is_none());
+
+        // With the permit, the recognizer lowers the argument prefix and records
+        // the plan. The callee's identity is validated later, by the VM.
+        let permits = NativeCallPermits {
+            allow_userland_tailcall: true,
+            ..NativeCallPermits::default()
+        };
+        let compiled = compile_scalar_int_function_with_permits(&function, &constants, 1, permits)
+            .expect("tail-call leaf recognized with the permit");
+        let plan = compiled
+            .tail_call
+            .as_ref()
+            .expect("a tail-call region records its plan");
+        assert_eq!(plan.callee_name, "classify");
+        // Locals $a,$b = slots 0,1; regs r0..r3 = slots 2..5; the fresh argument
+        // slot sits just above the registers at slot 6.
+        assert_eq!(plan.arg_slots, vec![6]);
+        assert_eq!(compiled.buffer_slots, 7);
+        assert!(!compiled.code.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_tail_call_shape_even_with_permit() {
+        // `return callee($x) + 1`: the returned value is the *add* result, not the
+        // call's result, so it is not a tail call. With the tail-call permit set
+        // (but no `abs` permit) it is rejected by every subset -> interpreter.
+        let function = abs_plus_one_function("classify");
+        let constants = [IrConstant::Int(1)];
+        let permits = NativeCallPermits {
+            allow_userland_tailcall: true,
+            ..NativeCallPermits::default()
+        };
+        assert!(
+            compile_scalar_int_function_with_permits(&function, &constants, 1, permits).is_none(),
+            "post-call work is not a tail call"
         );
     }
 

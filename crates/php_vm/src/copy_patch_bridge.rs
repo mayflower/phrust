@@ -35,7 +35,9 @@ use php_ir::{
     IrSpan, Operand, RegId,
 };
 #[cfg(all(unix, target_arch = "aarch64"))]
-use php_jit::{JitCValue, JitCValueTag};
+use php_jit::copy_patch::TailCallPlan;
+#[cfg(all(unix, target_arch = "aarch64"))]
+use php_jit::{JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_TAILCALL, JitCValue, JitCValueTag};
 #[cfg(all(unix, target_arch = "aarch64"))]
 use std::cell::RefCell;
 #[cfg(all(unix, target_arch = "aarch64"))]
@@ -148,6 +150,13 @@ pub fn copy_patch_leaf_enabled() -> bool {
 fn native_call_permits(unit: &CompiledUnit) -> php_jit::copy_patch::NativeCallPermits {
     php_jit::copy_patch::NativeCallPermits {
         builtin_abs: unit.lookup_function("abs").is_none(),
+        // Permit lowering the native→userland tail-call *shape*. The recognizer
+        // only produces a tail call for a `CallFunction`; the actual safety gate
+        // (the callee is a plain userland function with a matching, by-value
+        // signature) is enforced by the VM at call time, which interprets the
+        // whole leaf when the callee is out of scope. So this is unconditionally
+        // true — correctness does not depend on any registry check here.
+        allow_userland_tailcall: true,
     }
 }
 
@@ -160,6 +169,25 @@ pub struct NativeLeaf {
     code: php_jit::code_memory::CodeMemory,
     result_slot: u32,
     buffer_slots: u32,
+    /// `Some` when the leaf is a native→userland tail call: running it leaves the
+    /// arguments in the plan's buffer slots and returns
+    /// [`JIT_HELPER_STATUS_TAILCALL`], and the VM performs the userland call.
+    tail_call: Option<TailCallPlan>,
+}
+
+/// The result of running a [`NativeLeaf`] over its arguments.
+#[cfg(all(unix, target_arch = "aarch64"))]
+pub enum LeafOutcome {
+    /// The leaf computed a committed scalar result natively.
+    Value(Value),
+    /// The leaf is a tail call: it computed the positional `Int` arguments; the
+    /// VM must perform the call to `callee_name` through the interpreter path.
+    TailCall {
+        callee_name: String,
+        args: Vec<Value>,
+    },
+    /// A guard/overflow side exit or an unrepresentable value: interpret instead.
+    Fallback,
 }
 
 #[cfg(all(unix, target_arch = "aarch64"))]
@@ -190,14 +218,22 @@ impl NativeLeaf {
             code,
             result_slot: compiled.result_slot,
             buffer_slots: compiled.buffer_slots,
+            tail_call: compiled.tail_call,
         })
     }
 
     /// Invoke over positional parameter values (parameter `i` supplies buffer
-    /// slot `i`). Returns `None` on any guard/overflow side exit or an
-    /// unrepresentable result, so the caller falls back to the interpreter.
+    /// slot `i`), returning the full outcome.
+    ///
+    /// Builds and runs the flat buffer, then dispatches on the region's status:
+    /// `0` (OK) unmarshals `result_slot` to a [`LeafOutcome::Value`] (or
+    /// `Fallback` when the tag is unrepresentable); `2` — the tail-call status —
+    /// reads each argument slot (which the region guaranteed is `Int`) into a
+    /// [`LeafOutcome::TailCall`]; any other status (a guard/overflow side exit)
+    /// is [`LeafOutcome::Fallback`]. Any defensive mismatch (missing plan, a
+    /// non-`Int` argument slot) also falls back rather than misinterpreting.
     #[must_use]
-    pub fn run(&self, params: &[Value]) -> Option<Value> {
+    pub fn run_outcome(&self, params: &[Value]) -> LeafOutcome {
         let mut buffer: Vec<JitCValue> = (0..self.buffer_slots)
             .map(|slot| {
                 params
@@ -214,10 +250,48 @@ impl NativeLeaf {
                 self.code.as_ptr(),
             )
         };
-        if run(buffer.as_mut_ptr()) != 0 {
-            return None;
+        let status = run(buffer.as_mut_ptr());
+        if status == JIT_HELPER_STATUS_OK {
+            return match buffer
+                .get(self.result_slot as usize)
+                .and_then(unmarshal_result)
+            {
+                Some(value) => LeafOutcome::Value(value),
+                None => LeafOutcome::Fallback,
+            };
         }
-        unmarshal_result(buffer.get(self.result_slot as usize)?)
+        if status == JIT_HELPER_STATUS_TAILCALL
+            && let Some(plan) = self.tail_call.as_ref()
+        {
+            let mut args = Vec::with_capacity(plan.arg_slots.len());
+            for &slot in &plan.arg_slots {
+                // The region emits an `Int` guard before storing each argument,
+                // so the slot is `Int` here; treat anything else as a fallback
+                // rather than misreading a payload.
+                match buffer.get(slot as usize) {
+                    Some(value) if value.tag == JitCValueTag::Int => {
+                        args.push(Value::Int(value.payload as i64));
+                    }
+                    _ => return LeafOutcome::Fallback,
+                }
+            }
+            return LeafOutcome::TailCall {
+                callee_name: plan.callee_name.clone(),
+                args,
+            };
+        }
+        LeafOutcome::Fallback
+    }
+
+    /// Invoke over positional parameter values, returning a committed scalar
+    /// result only. A thin wrapper over [`Self::run_outcome`]: a tail call or any
+    /// side exit yields `None` so the caller falls back to the interpreter.
+    #[must_use]
+    pub fn run(&self, params: &[Value]) -> Option<Value> {
+        match self.run_outcome(params) {
+            LeafOutcome::Value(value) => Some(value),
+            LeafOutcome::TailCall { .. } | LeafOutcome::Fallback => None,
+        }
     }
 }
 

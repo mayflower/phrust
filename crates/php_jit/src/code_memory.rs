@@ -1926,4 +1926,142 @@ mod tests {
         ];
         assert_eq!(run(ne.as_mut_ptr()), 1);
     }
+
+    // The native->userland tail-call region executed end-to-end: the recognized
+    // leaf `f($a,$b): int { return g($a + $b); }` computes the argument `$a + $b`
+    // natively, leaves it in the plan's argument slot, and returns the tail-call
+    // status. A non-int marshaled argument takes the shared side exit instead.
+    #[cfg(all(unix, target_arch = "aarch64"))]
+    #[test]
+    fn executes_userland_tailcall_region() {
+        use crate::JIT_HELPER_STATUS_TAILCALL;
+        use crate::JitCValue;
+        use crate::abi::JitCValueTag;
+        use crate::copy_patch::{NativeCallPermits, compile_scalar_int_function_with_permits};
+        use php_ir::instruction::{IrCallArg, IrCallArgValueKind, TerminatorKind};
+        use php_ir::{
+            BasicBlock, BinaryOp, BlockId, FunctionFlags, InstrId, Instruction, InstructionKind,
+            IrParam, IrReturnType, IrSpan, LocalId, Operand, RegId, Terminator,
+        };
+
+        let span = IrSpan::default();
+        let int_param = |name: &str, local: u32| IrParam {
+            name: name.to_string(),
+            local: LocalId::new(local),
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Int),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        };
+        let ins = |kind| Instruction {
+            id: InstrId::new(0),
+            span,
+            kind,
+        };
+        // `function f($a, $b): int { return g($a + $b); }`.
+        let function = php_ir::IrFunction {
+            name: "f".to_string(),
+            params: vec![int_param("a", 0), int_param("b", 1)],
+            locals: vec!["a".to_string(), "b".to_string()],
+            local_count: 2,
+            register_count: 4,
+            blocks: vec![BasicBlock {
+                id: BlockId::new(0),
+                instructions: vec![
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(1),
+                        local: LocalId::new(0),
+                    }),
+                    ins(InstructionKind::LoadLocal {
+                        dst: RegId::new(2),
+                        local: LocalId::new(1),
+                    }),
+                    ins(InstructionKind::Binary {
+                        dst: RegId::new(3),
+                        op: BinaryOp::Add,
+                        lhs: Operand::Register(RegId::new(1)),
+                        rhs: Operand::Register(RegId::new(2)),
+                    }),
+                    ins(InstructionKind::CallFunction {
+                        dst: RegId::new(0),
+                        name: "g".to_string(),
+                        args: vec![IrCallArg {
+                            name: None,
+                            value: Operand::Register(RegId::new(3)),
+                            unpack: false,
+                            value_kind: IrCallArgValueKind::Direct,
+                            by_ref_local: None,
+                            by_ref_dim: None,
+                            by_ref_property: None,
+                            by_ref_property_dim: None,
+                        }],
+                    }),
+                ],
+                terminator: Some(Terminator {
+                    span,
+                    kind: TerminatorKind::Return {
+                        value: Some(Operand::Register(RegId::new(0))),
+                        by_ref_local: None,
+                    },
+                }),
+            }],
+            span,
+            flags: FunctionFlags::default(),
+            return_type: Some(IrReturnType::Int),
+            returns_by_ref: false,
+            captures: Vec::new(),
+            attributes: Vec::new(),
+        };
+
+        let permits = NativeCallPermits {
+            allow_userland_tailcall: true,
+            ..NativeCallPermits::default()
+        };
+        let compiled = compile_scalar_int_function_with_permits(&function, &[], 1, permits)
+            .expect("tail-call leaf compiles");
+        let plan = compiled
+            .tail_call
+            .as_ref()
+            .expect("records a tail-call plan");
+        assert_eq!(plan.callee_name, "g");
+        assert_eq!(plan.arg_slots, vec![6]);
+        assert_eq!(compiled.buffer_slots, 7);
+
+        let mem = CodeMemory::new(&compiled.code).expect("code memory should finalize");
+        // SAFETY: the emitted bytes are a valid `extern "C" fn(*mut JitCValue) -> i32`
+        // over a read-execute region; each buffer below has `buffer_slots` (7)
+        // live, aligned, contiguous `JitCValue`s that outlive the call.
+        let run: extern "C" fn(*mut JitCValue) -> i32 =
+            unsafe { core::mem::transmute(mem.as_ptr()) };
+
+        // Tail call requested: slot[0]=20, slot[1]=22 -> arg slot 6 holds 42.
+        let mut slots = [
+            JitCValue::int(20),
+            JitCValue::int(22),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(slots.as_mut_ptr()), JIT_HELPER_STATUS_TAILCALL);
+        assert_eq!(slots[6].tag, JitCValueTag::Int);
+        assert_eq!(slots[6].payload as i64, 42);
+
+        // A non-Int marshaled argument trips the prefix `Int` guard -> side exit;
+        // the argument slot is left untouched (still Uninitialized).
+        let mut typed = [
+            JitCValue::null(),
+            JitCValue::int(22),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+            JitCValue::uninitialized(),
+        ];
+        assert_eq!(run(typed.as_mut_ptr()), 1);
+        assert_eq!(typed[6].tag, JitCValueTag::Uninitialized);
+    }
 }

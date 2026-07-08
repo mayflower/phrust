@@ -31,6 +31,8 @@ FIXTURES = (
     FIXTURE_DIR / "scalar_leaves.php",
     FIXTURE_DIR / "inlined_calls.php",
     FIXTURE_DIR / "builtin_abs_call.php",
+    FIXTURE_DIR / "userland_tailcall.php",
+    FIXTURE_DIR / "userland_tailcall_safety.php",
 )
 
 # Version pinned by ADR 0001; a non-8.5.7 php mis-tokenizes 8.5 syntax.
