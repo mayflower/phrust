@@ -159,10 +159,22 @@ native→**builtin** and native→**userland** calls, which need a VM re-entry A
 stencil emits such a call yet. That re-entry path is the remaining keystone work
 for real WordPress code (which calls builtins and non-leaf userland functions).
 
-**(c) Mid-region deopt / OSR.** Deopt is **entry-only**: a guard/overflow side exit
-returns `1` and `NativeLeaf::run` returns `None`, so the whole call falls back to
-the interpreter from the top. `region_ir/osr.rs` computes live-slot metadata but it
-is **unwired** — there is no real resume-at-program-point.
+**(c) Mid-region deopt / OSR.** — **report-only metadata precision LANDED;
+execution-OSR deferred.** Deopt is still **entry-only** (a guard/overflow side
+exit returns `1`, `NativeLeaf::run` returns `None`, the call re-runs interpreted
+from the top — which is correct, just re-does the prefix). The safe prerequisite
+work is done: `php_vm::deopt` now computes **intra-block initialized-liveness**
+(`LiveValueSlot.initialized = Some(true)` for slots proven defined before the
+resume point, reusing `last_use.rs`'s exhaustive def/use classifier), **scalar
+alias refinement** (scalar-producing opcodes → `no_references_observed`), and
+**call-frame return-slot identity**, all guarded by verifier rules + a debug
+independent re-derivation that fails on any over-claim, with precision counters
+(`slots_initialized_known` 0→61 on a smoke fixture) and 11 fixtures. Still
+report-only — no execution/OSR/native path — and every prior hard rejection
+(try/finally, exception, generator/fiber, by-ref, include/eval) is intact.
+**Remaining:** actual resume-at-program-point execution (interpreter mid-entry),
+which is low current value (guard failures are rare in the scalar tier, so
+entry-only deopt already suffices) and belongs with a future consuming tier.
 
 **(d) Default-mode engagement.** — **LANDED** (dense-path hook). The dense
 executor's fast CALL dispatch site (`DenseFunctionPlan::Dense`) now tries the
