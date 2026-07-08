@@ -5,7 +5,8 @@ use php_runtime::api::{
     UploadRegistry, Value,
 };
 use php_vm::api::{
-    PersistentFeedbackEpochs, QuickeningSiteSnapshot, TieringStats, VmCounters, VmOptions,
+    FunctionCallSiteSnapshot, PersistentFeedbackEpochs, QuickeningSiteSnapshot, TieringStats,
+    VmCounters, VmOptions,
 };
 use std::path::PathBuf;
 
@@ -78,6 +79,9 @@ pub struct PhpExecutionOutput {
     pub counters: Option<VmCounters>,
     pub tiering_stats: Option<TieringStats>,
     pub quickening_feedback: Vec<QuickeningSiteSnapshot>,
+    /// Replay-stable monomorphic entry-unit function-call IC sites observed
+    /// by the executed request, for persistent feedback.
+    pub callsite_feedback: Vec<FunctionCallSiteSnapshot>,
     /// Final invalidation epochs of the executed request, for stamping
     /// persistent-feedback entries with their observation state. `None` when
     /// feedback collection was off or execution ended before teardown.
@@ -100,6 +104,7 @@ impl PhpExecutionOutput {
             counters: None,
             tiering_stats: None,
             quickening_feedback: Vec::new(),
+            callsite_feedback: Vec::new(),
             persistent_feedback_epochs: None,
         }
     }

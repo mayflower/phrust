@@ -4829,6 +4829,52 @@ fn negative_include_cache_preserves_missing_include_diagnostics() {
 }
 
 #[test]
+fn export_persistent_function_callsites_reports_monomorphic_entry_unit_sites() {
+    let source = "<?php function probe_tag(string $s): string { return $s . '!'; } $t = ''; for ($i = 0; $i < 64; $i++) { $t = probe_tag('x'); } echo $t;";
+    let frontend = php_semantics::analyze_source(source);
+    assert!(!frontend.has_errors());
+    let lowering = php_ir::lower_frontend_result(
+        &frontend,
+        php_ir::LoweringOptions {
+            source_path: "/tmp/phrust-callsite-export.php".to_owned(),
+            source_text: Some(source.to_owned()),
+            ..php_ir::LoweringOptions::default()
+        },
+    );
+    assert!(lowering.diagnostics.is_empty());
+    let mut lowering = lowering;
+    php_optimizer::PassPipeline::performance()
+        .run(
+            &mut lowering.unit,
+            &php_optimizer::PassContext::new(php_optimizer::OptimizationLevel::O2),
+        )
+        .expect("optimizer");
+    let vm = Vm::with_options(VmOptions {
+        collect_counters: true,
+        execution_format: ExecutionFormat::Auto,
+        quickening: QuickeningMode::On,
+        inline_caches: InlineCacheMode::On,
+        superinstructions: SuperinstructionMode::On,
+        jit: JitMode::Cranelift,
+        ..VmOptions::default()
+    });
+    let result = vm.execute(lowering.unit);
+    assert!(result.status.is_success(), "{:?}", result.status);
+    let counters = result.counters.expect("counters");
+    let sites = vm.export_persistent_function_callsites();
+    assert_eq!(
+        sites.len(),
+        1,
+        "fn_ic hits={} misses={} slots={} sites={sites:?}",
+        counters.function_call_ic_hits,
+        counters.function_call_ic_misses,
+        counters.inline_cache_function_slots,
+    );
+    assert_eq!(sites[0].lowered_name, "probe_tag");
+    assert_eq!(sites[0].arity, 1);
+}
+
+#[test]
 fn composer_map_fingerprint_counters_attribute_presence_per_request() {
     let root = std::env::temp_dir().join(format!(
         "phrust-vm-composer-{}-{}",

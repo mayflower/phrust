@@ -276,6 +276,46 @@ impl PersistentFeedbackContext {
         (text, written)
     }
 
+    /// Renders quickening sites plus monomorphic entry-unit function-call IC
+    /// sites, returning the rendered text and how many entries it contains.
+    #[must_use]
+    pub fn render_feedback_counted(
+        &self,
+        sites: &[QuickeningSiteSnapshot],
+        callsites: &[crate::inline_cache::FunctionCallSiteSnapshot],
+    ) -> (String, u64) {
+        let (mut text, mut written) = self.render_sites_counted(sites);
+        for site in callsites {
+            let _ = writeln!(
+                text,
+                "entry source={} engine={} php={} compile={} function={} ir={} \
+                 instruction={} class_epoch={} function_epoch={} autoload_epoch={} \
+                 include_epoch={} target={} state=monomorphic site=ic_function_call \
+                 ic_block={} call_name={} call_arity={} call_site_epoch={} \
+                 call_target_function={}",
+                self.source_fingerprint,
+                self.engine_version,
+                self.php_target_version,
+                self.compile_options,
+                site.function,
+                self.ir_fingerprint,
+                site.instruction,
+                self.epochs.class_table,
+                self.epochs.function_table,
+                self.epochs.autoload,
+                self.epochs.include_path,
+                self.target_arch_config,
+                site.block,
+                site.lowered_name,
+                site.arity,
+                site.epoch,
+                site.target_function,
+            );
+            written = written.saturating_add(1);
+        }
+        (text, written)
+    }
+
     fn validate_entry(
         &self,
         entry: PersistentFeedbackEntry,
@@ -544,6 +584,9 @@ pub struct PersistentFeedbackPayload {
     pub guard_failures: PersistentGuardFailureSummary,
     /// Adaptive quickening site snapshot, when the entry carries one.
     pub quickening: Option<QuickeningSiteSnapshot>,
+    /// Monomorphic entry-unit function-call IC site, when the entry carries
+    /// one (see `FunctionCallSiteSnapshot` for the persistable subset).
+    pub function_callsite: Option<crate::inline_cache::FunctionCallSiteSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +660,7 @@ fn parse_entry_line(line: &str) -> Result<PersistentFeedbackEntry, PersistentFee
             key.instruction_id,
             guard_failures.failures,
         )?,
+        function_callsite: parse_function_callsite(&fields, key.function_id, key.instruction_id)?,
     };
 
     Ok(PersistentFeedbackEntry {
@@ -780,6 +824,27 @@ fn parse_optional_branch_bias(
         .transpose()
 }
 
+/// Parses a monomorphic function-call IC site from `site=ic_function_call`
+/// entries. Any missing or malformed field rejects the entry as corrupt.
+fn parse_function_callsite(
+    fields: &BTreeMap<&str, &str>,
+    function_id: u32,
+    instruction_id: u32,
+) -> Result<Option<crate::inline_cache::FunctionCallSiteSnapshot>, PersistentFeedbackRejectReason> {
+    if fields.get("site").copied() != Some("ic_function_call") {
+        return Ok(None);
+    }
+    Ok(Some(crate::inline_cache::FunctionCallSiteSnapshot {
+        function: function_id,
+        block: parse_u64(required(fields, "ic_block")?)? as u32,
+        instruction: instruction_id,
+        lowered_name: required(fields, "call_name")?.to_owned(),
+        arity: parse_u64(required(fields, "call_arity")?)? as u32,
+        epoch: parse_u64(required(fields, "call_site_epoch")?)?,
+        target_function: parse_u64(required(fields, "call_target_function")?)? as u32,
+    }))
+}
+
 fn parse_quickening_site(
     fields: &BTreeMap<&str, &str>,
     function: u32,
@@ -800,6 +865,9 @@ fn parse_quickening_site(
             function,
             instruction,
         },
+        // Non-quickening site kinds (inline-cache callsites) are parsed by
+        // their own payload parsers.
+        "ic_function_call" => return Ok(None),
         _ => return Err(PersistentFeedbackRejectReason::Corrupt),
     };
     let (state, specialization) = match required(fields, "quickening_state")? {
@@ -1034,6 +1102,28 @@ mod tests {
             .validate_bytes(stale.as_bytes());
         assert_eq!(report.stats.entries_accepted, 0);
         assert_eq!(report.stats.rejected_stale, 1);
+    }
+
+    #[test]
+    fn function_callsite_entries_roundtrip_through_render_and_validate() {
+        let callsite = crate::inline_cache::FunctionCallSiteSnapshot {
+            function: 0,
+            block: 2,
+            instruction: 7,
+            lowered_name: "app\\helpers\\format_row".to_owned(),
+            arity: 2,
+            epoch: 5,
+            target_function: 9,
+        };
+        let (text, written) =
+            context().render_feedback_counted(&[], std::slice::from_ref(&callsite));
+        assert_eq!(written, 1);
+        assert!(text.contains("site=ic_function_call"), "{text}");
+
+        let report = context().validate_bytes(text.as_bytes());
+        assert_eq!(report.stats.entries_accepted, 1, "{:?}", report.stats);
+        let entry = &report.store.entries()[0];
+        assert_eq!(entry.payload.function_callsite.as_ref(), Some(&callsite));
     }
 
     #[test]

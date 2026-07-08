@@ -160,6 +160,25 @@ pub struct FunctionCallShape {
     pub by_ref_arguments: Vec<bool>,
 }
 
+/// Persistable snapshot of one monomorphic entry-unit function-call IC site.
+///
+/// Only engine-owned, replay-stable metadata: the callsite coordinates and
+/// target function are IR-derived (guarded by the feedback IR fingerprint),
+/// the lowered name is an interned engine name, and the epoch records the
+/// observation state. Dynamic-unit targets, builtins with implementation
+/// metadata, named arguments, and by-reference shapes carry request-local or
+/// broader guard state and are deliberately not persisted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionCallSiteSnapshot {
+    pub function: u32,
+    pub block: u32,
+    pub instruction: u32,
+    pub lowered_name: String,
+    pub arity: u32,
+    pub epoch: u64,
+    pub target_function: u32,
+}
+
 /// Guarded VM/runtime builtin implementation metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionCallBuiltinMetadata {
@@ -1034,6 +1053,68 @@ impl InlineCacheTable {
                 .then(|| slot.function_call_builtin_metadata.clone())
                 .flatten()
             })
+    }
+
+    /// Exports the entry unit's monomorphic function-call sites in the
+    /// persistable subset (see [`FunctionCallSiteSnapshot`]) for persistent
+    /// feedback. Deterministically ordered by callsite coordinates.
+    #[must_use]
+    pub fn export_persistent_function_callsites(
+        &self,
+        entry_unit_key: u64,
+    ) -> Vec<FunctionCallSiteSnapshot> {
+        let mut sites: Vec<FunctionCallSiteSnapshot> = self
+            .slots
+            .values()
+            .filter_map(|slot| {
+                if slot.kind != InlineCacheKind::FunctionCall
+                    || slot.state != InlineCacheState::Monomorphic
+                    || slot.unit_key != entry_unit_key
+                {
+                    return None;
+                }
+                // A monomorphic site stores either the legacy singleton
+                // fields or exactly one polymorphic-model entry.
+                let (name, shape, builtin_metadata, target, epoch) =
+                    match slot.function_call_polymorphic_entries.as_slice() {
+                        [] => (
+                            slot.function_call_name.as_ref()?,
+                            slot.function_call_shape.as_ref()?,
+                            slot.function_call_builtin_metadata.as_ref(),
+                            slot.function_call_target.as_ref()?,
+                            slot.epoch,
+                        ),
+                        [entry] => (
+                            &entry.lowered_name,
+                            &entry.shape,
+                            entry.builtin_metadata.as_ref(),
+                            &entry.target,
+                            entry.epoch,
+                        ),
+                        _ => return None,
+                    };
+                if builtin_metadata.is_some()
+                    || !shape.named_arguments.is_empty()
+                    || shape.by_ref_arguments.iter().any(|by_ref| *by_ref)
+                {
+                    return None;
+                }
+                let FunctionCallCacheTarget::CurrentUnit { function } = target else {
+                    return None;
+                };
+                Some(FunctionCallSiteSnapshot {
+                    function: slot.function.raw(),
+                    block: slot.block.raw(),
+                    instruction: slot.instruction.raw(),
+                    lowered_name: name.to_string(),
+                    arity: shape.arity,
+                    epoch: epoch.raw(),
+                    target_function: function.raw(),
+                })
+            })
+            .collect();
+        sites.sort_by_key(|site| (site.function, site.block, site.instruction));
+        sites
     }
 
     #[expect(

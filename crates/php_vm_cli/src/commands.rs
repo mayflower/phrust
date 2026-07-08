@@ -21,10 +21,11 @@ use php_vm::api::{
     Vm, VmOptions, VmResult,
 };
 use php_vm::experimental::{
-    BytecodeLayoutProfile, DenseBytecodeUnit, DenseOpcode, DenseOperands, JitCompileDescriptor,
-    PersistentFeedbackContext, PersistentFeedbackEpochValidation, PersistentFeedbackEpochs,
-    PersistentFeedbackLoadReport, PersistentFeedbackStats, PersistentFeedbackStore,
-    QuickeningSiteSnapshot, RegionProfile, VmCounters, plan_dependency_units,
+    BytecodeLayoutProfile, DenseBytecodeUnit, DenseOpcode, DenseOperands, FunctionCallSiteSnapshot,
+    JitCompileDescriptor, PersistentFeedbackContext, PersistentFeedbackEpochValidation,
+    PersistentFeedbackEpochs, PersistentFeedbackLoadReport, PersistentFeedbackStats,
+    PersistentFeedbackStore, QuickeningSiteSnapshot, RegionProfile, VmCounters,
+    plan_dependency_units,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1095,8 +1096,12 @@ where
         let write_context = context
             .clone()
             .with_epochs(output.persistent_feedback_epochs.unwrap_or_default());
-        entries_written =
-            store_persistent_feedback(write_path, &write_context, &output.quickening_feedback);
+        entries_written = store_persistent_feedback(
+            write_path,
+            &write_context,
+            &output.quickening_feedback,
+            &output.callsite_feedback,
+        );
     }
     if let Some(path) = run_options.persistent_feedback.stats_json.clone() {
         let mut stats = persistent_feedback.report.stats.clone();
@@ -2073,11 +2078,12 @@ fn store_persistent_feedback(
     write_path: &Path,
     context: &PersistentFeedbackContext,
     sites: &[QuickeningSiteSnapshot],
+    callsites: &[FunctionCallSiteSnapshot],
 ) -> u64 {
-    if sites.is_empty() && !write_path.exists() {
+    if sites.is_empty() && callsites.is_empty() && !write_path.exists() {
         return 0;
     }
-    let (text, written) = context.render_sites_counted(sites);
+    let (text, written) = context.render_feedback_counted(sites, callsites);
     if let Some(parent) = write_path.parent()
         && fs::create_dir_all(parent).is_err()
     {
@@ -6021,7 +6027,7 @@ mod tests {
         let stats_path = base.with_extension("json");
         std::fs::write(
             &source_path,
-            "<?php\nclass FeedbackEpochProbe {}\n$probe = new FeedbackEpochProbe();\n$sum = 0;\nfor ($i = 0; $i < 64; $i++) {\n    $sum = $sum + $i;\n}\necho $sum, \"\\n\";\n",
+            "<?php\nclass FeedbackEpochProbe {}\n$probe = new FeedbackEpochProbe();\nfunction feedback_probe_tag(string $s): string { return $s . '!'; }\n$sum = 0;\n$tag = '';\nfor ($i = 0; $i < 64; $i++) {\n    $sum = $sum + $i;\n    $tag = feedback_probe_tag('x');\n}\necho $sum, $tag, \"\\n\";\n",
         )
         .expect("write temporary PHP source");
         let _ = std::fs::remove_file(&feedback_path);
@@ -6029,21 +6035,39 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let counters_path = base.with_extension("write-counters.json");
+        let _ = std::fs::remove_file(&counters_path);
         let code = run(
             [
                 "run".to_string(),
                 "--persistent-feedback-write".to_string(),
                 feedback_path.display().to_string(),
+                "--counters-json".to_string(),
+                counters_path.display().to_string(),
                 source_path.display().to_string(),
             ],
             &mut stdout,
             &mut stderr,
         );
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"2016\n");
+        assert_eq!(stdout, b"2016x!\n");
+        let write_counters =
+            std::fs::read_to_string(&counters_path).expect("write-run counters JSON");
+        let _ = std::fs::remove_file(&counters_path);
+        let ic_lines: String = write_counters
+            .lines()
+            .filter(|line| line.contains("_call_ic") || line.contains("function_slots"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let feedback = std::fs::read_to_string(&feedback_path).expect("feedback file written");
         assert!(feedback.starts_with("phrust-persistent-feedback-v1"));
         assert!(feedback.contains("specialization=add_int_int"));
+        // The hot monomorphic userland call persists as a callsite entry.
+        assert!(
+            feedback.contains("site=ic_function_call")
+                && feedback.contains("call_name=feedback_probe_tag"),
+            "{ic_lines}\n{feedback}"
+        );
         // Entries carry the executed run's final invalidation epochs (the
         // class declaration bumped the class-table epoch), not cold-start
         // zeros.
@@ -6072,7 +6096,7 @@ mod tests {
             &mut stderr,
         );
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"2016\n");
+        assert_eq!(stdout, b"2016x!\n");
         let json = std::fs::read_to_string(&stats_path).expect("feedback JSON should be written");
         let counters =
             std::fs::read_to_string(&counters_path).expect("counters JSON should be written");
@@ -6124,7 +6148,7 @@ mod tests {
             &mut stderr,
         );
         assert_eq!(code, EXIT_SUCCESS, "{}", String::from_utf8_lossy(&stderr));
-        assert_eq!(stdout, b"2016\n");
+        assert_eq!(stdout, b"2016x!\n");
         let json = std::fs::read_to_string(&stats_path).expect("feedback JSON should be written");
         let counters =
             std::fs::read_to_string(&counters_path).expect("counters JSON should be written");

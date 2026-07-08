@@ -2185,6 +2185,10 @@ pub struct Vm {
     /// request state drops so the persistent-feedback writer can stamp entries
     /// with the true observation state instead of cold-start zeros.
     persistent_feedback_epochs: Cell<Option<crate::persistent_feedback::PersistentFeedbackEpochs>>,
+    /// IC-table unit key (`compiled_unit_cache_key`) of the last executed
+    /// entry unit, for scoping persistent callsite exports to replay-stable
+    /// (entry-unit) IC sites.
+    persistent_feedback_entry_unit_key: Cell<Option<u64>>,
     inline_caches: RefCell<InlineCacheTable>,
     jit: RefCell<JitRuntimeState>,
     tiering: RefCell<TieringState>,
@@ -2253,6 +2257,7 @@ impl Vm {
             constructor_resolution_cache: RefCell::new(ConstructorResolutionCache::default()),
             quickening: RefCell::new(QuickeningTable::default()),
             persistent_feedback_epochs: Cell::new(None),
+            persistent_feedback_entry_unit_key: Cell::new(None),
             inline_caches: RefCell::new(InlineCacheTable::default()),
             jit: RefCell::new(JitRuntimeState::default()),
             tiering: RefCell::new(tiering),
@@ -2284,6 +2289,10 @@ impl Vm {
         *self.constructor_resolution_cache.borrow_mut() = ConstructorResolutionCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         self.persistent_feedback_epochs.set(None);
+        // IC slots key units by compiled_unit_cache_key (the IR-unit address),
+        // so the entry-unit scope filter must use the same key.
+        self.persistent_feedback_entry_unit_key
+            .set(Some(compiled_unit_cache_key(&unit)));
         let mut persistent_feedback_seeded_sites = 0usize;
         if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
             persistent_feedback_seeded_sites = self
@@ -2547,6 +2556,20 @@ impl Vm {
         &self,
     ) -> Option<crate::persistent_feedback::PersistentFeedbackEpochs> {
         self.persistent_feedback_epochs.get()
+    }
+
+    /// Exports the last `execute` call's replay-stable monomorphic
+    /// function-call IC sites (entry unit only) for persistent feedback.
+    #[must_use]
+    pub fn export_persistent_function_callsites(
+        &self,
+    ) -> Vec<crate::inline_cache::FunctionCallSiteSnapshot> {
+        let Some(entry_unit_key) = self.persistent_feedback_entry_unit_key.get() else {
+            return Vec::new();
+        };
+        self.inline_caches
+            .borrow()
+            .export_persistent_function_callsites(entry_unit_key)
     }
 
     fn should_skip_adaptive_tiny_unit_setup(&self, unit: &IrUnit) -> bool {

@@ -130,9 +130,15 @@ seeded site is attributed via `persistent_feedback_seeded_guard_hits` /
 
 ## Remaining Work
 
-- persist the full accepted payload (callsite/scalar/array/object/branch/
-  include-autoload observations), not just the quickening sub-field, once the VM
-  produces those observations;
+- widen the persisted payload beyond quickening sites and **monomorphic
+  entry-unit function callsites** (which now persist as
+  `site=ic_function_call` entries: callsite coordinates, lowered name, arity,
+  observation epoch, and the IR-derived target function — see
+  `FunctionCallSiteSnapshot` for the deliberately persistable subset).
+  Method/property callsites and object-shape observations are blocked on
+  replay-stable identity: their targets carry request-local class IDs and
+  dynamic-unit indexes; scalar/array/branch observations already travel with
+  the quickening sub-field where specializations exist;
 - extend consumption from quickening to **inline-cache** templates and later
   tiers, as additional `--persistent-feedback-consume` modes (the flag and the
   seeded/dequickened attribution exist; IC seeding does not);

@@ -76,7 +76,7 @@ pub mod api {
         LoadedInclude, ResolvedIncludePath, composer_autoload_map_fingerprint,
         include_directory_version, negative_include_cache_enabled,
     };
-    pub use crate::inline_cache::InlineCacheMode;
+    pub use crate::inline_cache::{FunctionCallSiteSnapshot, InlineCacheMode};
     pub use crate::persistent_feedback::PersistentFeedbackEpochs;
     pub use crate::quickening::{QuickeningMode, QuickeningSiteKey, QuickeningSiteSnapshot};
     pub use crate::tiering::{TieringOptions, TieringStats};
@@ -133,6 +133,8 @@ pub mod experimental {
     };
     #[doc(hidden)]
     pub use crate::frame::{CallStack, Frame, RegisterFile};
+    #[doc(hidden)]
+    pub use crate::inline_cache::FunctionCallSiteSnapshot;
     #[doc(hidden)]
     pub use crate::inline_cache::{
         ClassConstantStaticPropertyCacheKind, ClassConstantStaticPropertyCacheTarget,
