@@ -289,13 +289,17 @@ impl PersistentFeedbackConsumeMode {
 /// covering both quickening and callsite-IC seeding — every seed runs behind
 /// the full runtime guard protocol); the `PHRUST_PERSISTENT_FEEDBACK_CONSUME`
 /// environment variable overrides the default and the
-/// `--persistent-feedback-consume` flag overrides both. Unrecognized values
-/// keep the default so a typo cannot silently change the consumption policy.
+/// `--persistent-feedback-consume` flag overrides both. The value is trimmed
+/// and lowercased so the kill switch cannot silently fail open on `OFF`/`No`
+/// (matching the other `PHRUST_*` gates); an explicit `quickening` narrows to
+/// quickening-only, and any unrecognized value keeps the full default so a
+/// typo cannot quietly weaken consumption.
 impl Default for PersistentFeedbackConsumeMode {
     fn default() -> Self {
-        match std::env::var("PHRUST_PERSISTENT_FEEDBACK_CONSUME").as_deref() {
-            Ok("off") | Ok("0") | Ok("false") => Self::Off,
-            Ok("quickening") => Self::Quickening,
+        let value = std::env::var("PHRUST_PERSISTENT_FEEDBACK_CONSUME");
+        match value.as_deref().map(|v| v.trim().to_ascii_lowercase()) {
+            Ok(v) if matches!(v.as_str(), "off" | "0" | "false" | "no") => Self::Off,
+            Ok(v) if v == "quickening" => Self::Quickening,
             _ => Self::QuickeningIcs,
         }
     }
@@ -964,7 +968,8 @@ pub(super) fn parse_run_args(args: &[String]) -> Result<RunOptions<'_>, String> 
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return Err(
-                        "run --persistent-feedback-consume requires off or quickening".to_string(),
+                        "run --persistent-feedback-consume requires off, quickening, or quickening-ics"
+                            .to_string(),
                     );
                 };
                 persistent_feedback.consume = parse_persistent_feedback_consume_mode(value)?;

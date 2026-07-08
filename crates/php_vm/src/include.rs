@@ -1228,17 +1228,24 @@ pub fn composer_autoload_map_fingerprint(anchor_dir: &Path) -> Option<String> {
 }
 
 fn render_composer_map_fingerprint(composer_dir: &Path) -> String {
+    // The hashed text must be a defined serialization, not incidental `{:?}`
+    // Debug output (which Rust does not guarantee stable across toolchains) —
+    // fnv1a_64 was chosen precisely so a future persistent cache can key on
+    // this fingerprint. Render each optional field with an explicit spelling.
+    fn field<T: std::fmt::Display>(value: Option<T>) -> String {
+        value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+    }
     let mut rendered = format!("{}\n", composer_dir.display());
     for name in COMPOSER_MAP_FILES {
         match include_path_file_fingerprint(&composer_dir.join(name)) {
             Ok(fingerprint) => {
                 rendered.push_str(&format!(
-                    "{name}|{}|{:?}|{}|{:?}|{:?}\n",
+                    "{name}|{}|{}|{}|{}|{}\n",
                     fingerprint.len,
-                    fingerprint.modified_unix_nanos,
-                    fingerprint.readonly,
-                    fingerprint.inode,
-                    fingerprint.device,
+                    field(fingerprint.modified_unix_nanos),
+                    u8::from(fingerprint.readonly),
+                    field(fingerprint.inode),
+                    field(fingerprint.device),
                 ));
             }
             Err(_) => rendered.push_str(&format!("{name}|absent\n")),

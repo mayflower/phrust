@@ -2013,6 +2013,20 @@ fn persistent_feedback_env_enabled() -> bool {
     )
 }
 
+/// Upper bound on a persistent-feedback sidecar read into memory. A validly
+/// warmed sidecar is far smaller; the cap stops a corrupt or tampered file
+/// from forcing an unbounded read (and, via the validator, unbounded symbol
+/// interning). An oversized file is treated as a corrupt/absent sidecar.
+const MAX_PERSISTENT_FEEDBACK_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_capped_persistent_feedback(path: &Path) -> Option<Vec<u8>> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PERSISTENT_FEEDBACK_BYTES {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
 fn prepare_persistent_feedback(
     run_options: &RunOptions<'_>,
     path: &str,
@@ -2041,10 +2055,11 @@ fn prepare_persistent_feedback(
             .map(|dir| dir.join(format!("{}.pfbk", context.source_fingerprint)))
     });
     let mut report = if let Some(feedback_path) = run_options.persistent_feedback.read.as_deref() {
-        // An explicit read path is strict: a missing file is a reported fallback.
-        match fs::read(feedback_path) {
-            Ok(bytes) => context.validate_bytes(&bytes),
-            Err(_) => PersistentFeedbackLoadReport::new(
+        // An explicit read path is strict: a missing (or oversized) file is a
+        // reported fallback.
+        match read_capped_persistent_feedback(Path::new(feedback_path)) {
+            Some(bytes) => context.validate_bytes(&bytes),
+            None => PersistentFeedbackLoadReport::new(
                 PersistentFeedbackStore::default(),
                 PersistentFeedbackStats {
                     files_considered: 1,
@@ -2056,7 +2071,7 @@ fn prepare_persistent_feedback(
         }
     } else if default_enabled
         && let Some(default_path) = default_path.as_ref()
-        && let Ok(bytes) = fs::read(default_path)
+        && let Some(bytes) = read_capped_persistent_feedback(default_path)
     {
         // The default sidecar is advisory: a missing file is a cold start.
         context.validate_bytes(&bytes)
