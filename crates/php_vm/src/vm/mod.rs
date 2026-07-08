@@ -2161,6 +2161,12 @@ pub struct Vm {
     /// class does not deep-clone the whole class definition per instantiation.
     /// Invalidated by `ExecutionState::class_table_epoch`.
     ir_class_entry_cache: RefCell<IrClassEntryCache>,
+    /// Memoized default declared-slot templates so the hot `new C(...)` path
+    /// clones a prebuilt slot vector instead of re-running the per-property
+    /// default-materialization loop on every instantiation. Invalidated by
+    /// `ExecutionState::class_table_epoch`, so a redefinition rebuilds it from
+    /// the current class entry.
+    default_slot_template_cache: RefCell<DefaultSlotTemplateCache>,
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
     include_execution_depth: Cell<u32>,
     request_profile_stack: RefCell<Vec<RequestProfileFrame>>,
@@ -2191,6 +2197,7 @@ impl Vm {
             frame_shape_flags: RefCell::new(HashMap::new()),
             runtime_class_entry_cache: RefCell::new(RuntimeClassEntryCache::default()),
             ir_class_entry_cache: RefCell::new(IrClassEntryCache::default()),
+            default_slot_template_cache: RefCell::new(DefaultSlotTemplateCache::default()),
             quickening: RefCell::new(QuickeningTable::default()),
             inline_caches: RefCell::new(InlineCacheTable::default()),
             jit: RefCell::new(JitRuntimeState::default()),
@@ -2219,6 +2226,7 @@ impl Vm {
         self.last_use_move_plans.borrow_mut().clear();
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
         *self.ir_class_entry_cache.borrow_mut() = IrClassEntryCache::default();
+        *self.default_slot_template_cache.borrow_mut() = DefaultSlotTemplateCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         if self.options.quickening.enabled() && !self.options.quickening_seed.is_empty() {
             self.quickening
@@ -4675,6 +4683,46 @@ impl Vm {
             .entries
             .insert(key, Rc::clone(&entry));
         Some(entry)
+    }
+
+    /// Returns the memoized default declared-slot template for a resolved
+    /// runtime class, building it once per (class identity, class-table epoch)
+    /// and reusing the shared `Rc` afterward. The hot `new C(...)` path clones
+    /// the template into a fresh instance (see `ObjectRef::from_layout_slots`)
+    /// instead of re-running the per-property default-materialization loop.
+    ///
+    /// The template is byte-identical to the `declared_slots`
+    /// `ObjectRef::new_with_display_name` builds for the same class shape, and
+    /// is independent of `display_name` (which only selects the debug-label
+    /// layout variant). Keying by the class-table epoch means a redefinition
+    /// (which bumps the epoch) rebuilds the template from the current entry, so
+    /// stale defaults can never leak across a redeclaration.
+    fn cached_default_slot_template(
+        &self,
+        state: &ExecutionState,
+        runtime_class: &RuntimeClassEntry,
+        display_name: &str,
+    ) -> Rc<Vec<Option<Value>>> {
+        let epoch = state.class_table_epoch;
+        let key = normalize_class_name(&runtime_class.name);
+        {
+            let mut cache = self.default_slot_template_cache.borrow_mut();
+            if cache.epoch != epoch {
+                cache.entries.clear();
+                cache.epoch = epoch;
+            } else if let Some(template) = cache.entries.get(&key) {
+                return Rc::clone(template);
+            }
+        }
+        let template = Rc::new(ObjectRef::default_declared_slots(
+            runtime_class,
+            display_name,
+        ));
+        self.default_slot_template_cache
+            .borrow_mut()
+            .entries
+            .insert(key, Rc::clone(&template));
+        template
     }
 
     fn record_counter_direct_frame(&self, layout: &str, function: &IrFunction, elided: bool) {
@@ -17097,8 +17145,16 @@ impl Vm {
                         }
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
-                        let object =
-                            ObjectRef::new_with_display_name(&runtime_class, display_class_name);
+                        let slot_template = self.cached_default_slot_template(
+                            state,
+                            &runtime_class,
+                            &display_class_name,
+                        );
+                        let object = ObjectRef::from_layout_slots(
+                            &runtime_class,
+                            display_class_name,
+                            (*slot_template).clone(),
+                        );
                         if let Some(spl_class) = spl_runtime_parent.as_deref() {
                             object.set_property(
                                 SPL_RUNTIME_CLASS_PROPERTY,
@@ -18489,8 +18545,16 @@ impl Vm {
                         };
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
-                        let object =
-                            ObjectRef::new_with_display_name(&runtime_class, display_class_name);
+                        let slot_template = self.cached_default_slot_template(
+                            state,
+                            &runtime_class,
+                            display_class_name,
+                        );
+                        let object = ObjectRef::from_layout_slots(
+                            &runtime_class,
+                            display_class_name,
+                            (*slot_template).clone(),
+                        );
                         if let Some(spl_class) = spl_runtime_parent.as_deref() {
                             object.set_property(
                                 SPL_RUNTIME_CLASS_PROPERTY,
@@ -45258,6 +45322,20 @@ struct RuntimeClassEntryCache {
 struct IrClassEntryCache {
     epoch: u64,
     entries: HashMap<String, Rc<php_ir::module::ClassEntry>>,
+}
+
+/// Cache of default declared-slot templates, keyed by normalized class name and
+/// guarded by the class-table epoch. Each template is the slot-index-aligned
+/// default vector a fresh instance starts from; cloning it into a new object
+/// skips the per-property iterate + filter + `slot_by_name` hash-lookup loop
+/// that `ObjectRef::new_with_display_name` runs. Sharing it via `Rc` is
+/// behavior-neutral within a class-table epoch (a class definition is immutable
+/// until redeclaration, which bumps the epoch and drops the cache), and the
+/// template is byte-identical to the defaults the slow path builds.
+#[derive(Clone, Debug, Default)]
+struct DefaultSlotTemplateCache {
+    epoch: u64,
+    entries: HashMap<String, Rc<Vec<Option<Value>>>>,
 }
 
 fn runtime_class_entry(
