@@ -319,9 +319,10 @@ def run_once(
     (run_dir / f"iter-{iteration}.stderr").write_text(stderr, encoding="utf-8")
     counters: dict[str, Any] = {}
     if counters_path.is_file():
-        counters = json.loads(counters_path.read_text(encoding="utf-8"))
-    if not isinstance(counters, dict):
-        raise SystemExit(f"{rel(counters_path)}: counters root is not an object")
+        loaded = json.loads(counters_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"{rel(counters_path)}: counters root is not an object")
+        counters = loaded
     for key, value in counters.items():
         if isinstance(value, int) and value < 0:
             raise SystemExit(f"{rel(counters_path)}: counter {key} is negative")
