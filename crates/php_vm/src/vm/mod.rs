@@ -6130,8 +6130,9 @@ impl Vm {
         None
     }
 
-    /// Copy-and-patch native leaf tier (default-off, behind `jit-copy-patch` +
-    /// the `PHRUST_JIT_COPY_PATCH` env gate). Runs before the dense-dispatch and
+    /// Copy-and-patch native leaf tier (behind the default-on `jit-copy-patch`
+    /// feature; disable per process via `PHRUST_JIT_COPY_PATCH=0` or per VM via
+    /// `VmOptions::copy_patch_leaf_override`). Runs before the dense-dispatch and
     /// interpreter paths: if the callee is a recognized scalar-int leaf called
     /// with plain positional value arguments, compile it once (cached), run it
     /// natively over the argument values, and return the result — otherwise
@@ -6150,7 +6151,11 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Option<VmResult> {
-        if !crate::copy_patch_bridge::copy_patch_leaf_enabled() {
+        if !self
+            .options
+            .copy_patch_leaf_override
+            .unwrap_or_else(crate::copy_patch_bridge::copy_patch_leaf_enabled)
+        {
             return None;
         }
         // Free function, plain positional value arguments only.

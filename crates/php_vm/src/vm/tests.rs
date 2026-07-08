@@ -8420,6 +8420,10 @@ fn cranelift_default_tiering_keeps_cold_function_interpreted() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            // This test proves the Cranelift tier compiles and executes; the
+            // copy-patch leaf tier would otherwise claim this scalar-int leaf
+            // before tiering ever sees it.
+            copy_patch_leaf_override: Some(false),
             ..VmOptions::default()
         },
     );
@@ -8443,6 +8447,7 @@ fn cranelift_threshold_tiering_compiles_hot_function() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             jit_threshold: 2,
             tiering: TieringOptions {
                 function_entry_threshold: 2,
@@ -8472,6 +8477,7 @@ fn cranelift_eager_tiering_compiles_first_call_for_tests() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             jit_threshold: 1,
             tiering: TieringOptions {
                 jit_eager: true,
@@ -8500,6 +8506,7 @@ fn cranelift_compile_budget_rejection_falls_back_to_interpreter() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             jit_threshold: 1,
             tiering: TieringOptions {
                 jit_eager: true,
@@ -8594,6 +8601,7 @@ fn cranelift_record_lookup_key_miss_side_exits_and_resumes_interpreter() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -9010,6 +9018,7 @@ fn cranelift_known_count_executes_for_packed_and_mixed_arrays() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -9081,6 +9090,7 @@ fn cranelift_string_concat_rejects_string_int_without_fast_hit() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -9218,6 +9228,7 @@ echo perf_jit_unstable_types(4), "\n";
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -9267,6 +9278,7 @@ echo perf_jit_unstable_types_debug(4), "\n";
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             jit_blacklist: JitBlacklistMode::Off,
             tiering: TieringOptions {
                 function_entry_threshold: 1,
@@ -9300,6 +9312,7 @@ fn cranelift_constant_return_executes_native_after_abi_check() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -9331,6 +9344,7 @@ fn cranelift_compile_cache_reuses_same_function() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 jit_eager: true,
                 function_entry_threshold: 1,
@@ -9464,6 +9478,9 @@ fn jit_on_off_output_is_identical() {
             collect_profile_spans: false,
             collect_layout_source_attribution: true,
             jit: JitMode::Cranelift,
+            // Compare interpreter vs Cranelift specifically; without this the
+            // copy-patch leaf tier claims the leaf and `jit_executed` stays 0.
+            copy_patch_leaf_override: Some(false),
             ..VmOptions::default()
         },
     );
