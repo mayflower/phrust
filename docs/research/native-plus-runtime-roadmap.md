@@ -165,7 +165,25 @@ native→**userland** and native→**stateful/context builtins**, which need the
 *unsafe* VM re-entry ABI (a context pointer + a helper that re-enters the
 interpreter). That re-entry path is the remaining keystone work for broad real
 WordPress code (non-leaf userland + heap builtins); it is the one deliberately-
-deferred piece (unsafe FFI, warrants focused/supervised implementation).
+deferred piece.
+
+*Why it is deferred (the precise blocker, not hand-waving):* a re-entry helper
+must hold a `*mut` to VM state and, inside the `blr`, reconstruct `&mut self` to
+call `execute_function`. But the region fn is invoked from `run_scalar_int_region`
+while a borrow of `self` is live up the stack — so materializing `&mut Vm` from
+the context pointer inside the helper *aliases* that live borrow, which is
+undefined behavior, not merely unproven. Making it sound requires restructuring
+the whole VM call path so **no** `&`/`&mut self` borrow is live across a native
+region call (raw-pointer threading through `execute_function` /
+`execute_bytecode_function` / the bridge, reconstructing the borrow only inside
+the helper). That is a cross-cutting change to the VM's borrow discipline plus
+mid-region resume (it converges with (c)'s deferred execution-OSR — a native
+leaf must resume *after* the call rather than re-run from entry). Two risk
+surfaces the harness here cannot cover — FFI aliasing UB (Miri cannot run the
+JIT'd machine code) and OSR-resume correctness — so it warrants design review and
+a focused, supervised implementation rather than unsupervised grinding. Every
+other roadmap item (gaps a/c/d/e/f, R1–R5, and gap-b's native→native +
+native→pure-builtin) is landed and verified.
 
 **(c) Mid-region deopt / OSR.** — **report-only metadata precision LANDED;
 execution-OSR deferred.** Deopt is still **entry-only** (a guard/overflow side
