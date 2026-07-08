@@ -152,12 +152,20 @@ rejected), so `poly → scale → fma` collapses bottom-up; a callee is inlined 
 when it reduces to a single-block, one-register-return, register-only scalar
 leaf whose body reads only its by-value int/float params (pure register
 substitution, no new local slots), with plain positional register/constant args.
-Verified against PHP 8.5.7 via the differential harness. **Still missing:**
-native→**builtin** and native→**userland** calls, which need a VM re-entry ABI
-(pass a context pointer + a helper that re-enters the interpreter) — the
-`blr`/`push_fp_lr`/`pop_fp_lr` ops and the `helpers.rs` symbol ABI exist but no
-stencil emits such a call yet. That re-entry path is the remaining keystone work
-for real WordPress code (which calls builtins and non-leaf userland functions).
+Verified against PHP 8.5.7 via the differential harness. **native→pure-builtin
+also landed:** a `ScalarIntOp::CallAbsI64` stencil emits a real `blr` into the
+pure `phrust_jit_abs_i64` helper (fp/lr save, 16-byte-aligned scratch frame,
+`x0=value`/`x1=&out`, status check → shared side exit, else store) — the first
+stencil to emit an actual call, closing the "encoder has `blr` but no stencil
+calls" gap. Safe (a normal C-ABI call to a pure `extern "C"` fn, no VM re-entry);
+the VM gates it via `NativeCallPermits` (only when `abs` resolves to the real
+builtin, never a user/namespaced shadow); `abs(INT_MIN)` side-exits so the
+interpreter yields the float — all byte-identical to PHP 8.5.7. **Still missing:**
+native→**userland** and native→**stateful/context builtins**, which need the
+*unsafe* VM re-entry ABI (a context pointer + a helper that re-enters the
+interpreter). That re-entry path is the remaining keystone work for broad real
+WordPress code (non-leaf userland + heap builtins); it is the one deliberately-
+deferred piece (unsafe FFI, warrants focused/supervised implementation).
 
 **(c) Mid-region deopt / OSR.** — **report-only metadata precision LANDED;
 execution-OSR deferred.** Deopt is still **entry-only** (a guard/overflow side
