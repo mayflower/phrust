@@ -57126,12 +57126,11 @@ fn trace_value_for_bound_param(
 ) -> Value {
     if param_is_sensitive(param) {
         trace_value_for_param(value, true)
-    } else if trace_holds_reference {
-        Value::Reference(
-            reference
-                .cloned()
-                .expect("by-ref trace argument retains its cell"),
-        )
+    } else if let Some(cell) = reference.filter(|_| trace_holds_reference) {
+        // A by-ref trace argument is expected to carry its cell; if it does
+        // not (an unexpected binder state), degrade to the value snapshot the
+        // non-reference branch produces rather than panic on the trace path.
+        Value::Reference(cell.clone())
     } else {
         value.clone()
     }
