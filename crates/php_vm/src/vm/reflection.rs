@@ -812,7 +812,7 @@ pub(super) struct InternalReflectionSignature {
 }
 
 pub(super) fn internal_function_signature(name: &str) -> InternalReflectionSignature {
-    if let Some(metadata) = php_std::generated::arginfo::function_metadata(name) {
+    if let Some(metadata) = php_std::arginfo::function_metadata_indexed(name) {
         return signature_from_params(metadata.return_type, metadata.params);
     }
     InternalReflectionSignature {

@@ -56672,7 +56672,7 @@ fn lookup_class_constant_in_state(
     constant_name: &str,
 ) -> Result<
     Option<(
-        php_ir::module::ClassEntry,
+        Arc<php_ir::module::ClassEntry>,
         php_ir::module::ClassConstantEntry,
     )>,
     String,
@@ -56698,7 +56698,7 @@ fn lookup_class_constant_in_state_inner(
     seen: &mut Vec<String>,
 ) -> Result<
     Option<(
-        php_ir::module::ClassEntry,
+        Arc<php_ir::module::ClassEntry>,
         php_ir::module::ClassConstantEntry,
     )>,
     String,
@@ -56718,7 +56718,7 @@ fn lookup_class_constant_in_state_inner(
         .cloned()
     {
         seen.pop();
-        return Ok(Some(((*class).clone(), constant)));
+        return Ok(Some((class, constant)));
     }
     if let Some(parent_name) = class.parent.as_deref() {
         let Some(parent) = lookup_class_in_state(compiled, state, parent_name) else {
@@ -57411,7 +57411,9 @@ fn class_hierarchy(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     class: &php_ir::module::ClassEntry,
-) -> Vec<php_ir::module::ClassEntry> {
+) -> Vec<Arc<php_ir::module::ClassEntry>> {
+    // Shared handles: entries are large (method/property tables) and callers
+    // only read; one clone for the starting borrow, none per ancestor.
     let mut classes = Vec::new();
     let mut current = Some(Arc::new(class.clone()));
     let mut seen = BTreeSet::new();
@@ -57424,7 +57426,7 @@ fn class_hierarchy(
             .parent
             .as_deref()
             .and_then(|parent| lookup_class_in_state(compiled, state, parent));
-        classes.push((*class).clone());
+        classes.push(class);
     }
     classes
 }
@@ -60554,7 +60556,7 @@ fn fast_builtin_stub_fallback_reason_for_spec(
 }
 
 fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
-    let Some(metadata) = php_std::generated::arginfo::function_metadata(spec.name) else {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(spec.name) else {
         return false;
     };
     if metadata.return_type != spec.return_type || metadata.params.len() != spec.params.len() {
@@ -60984,7 +60986,7 @@ fn validate_internal_builtin_args(
     if builtin_uses_custom_argument_validation(name) {
         return Ok(values);
     }
-    let Some(metadata) = php_std::generated::arginfo::function_metadata(name) else {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(name) else {
         return Ok(values);
     };
     if metadata.params.iter().any(|param| param.by_ref) {
@@ -63336,7 +63338,7 @@ fn array_callback_builtin_param_requires_reference(function: &str, index: usize)
 }
 
 fn internal_builtin_param_requires_reference(function: &str, index: usize) -> bool {
-    if let Some(metadata) = php_std::generated::arginfo::function_metadata(function)
+    if let Some(metadata) = php_std::arginfo::function_metadata_indexed(function)
         && metadata.params.get(index).is_some_and(|param| param.by_ref)
     {
         return true;
@@ -65370,7 +65372,7 @@ fn call_internal_builtin_named_args_to_positional(
         .iter()
         .find_map(|arg| arg.name.clone())
         .unwrap_or_else(|| "arg".to_owned());
-    let Some(metadata) = php_std::generated::arginfo::function_metadata(function) else {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(function) else {
         return Err(InternalBuiltinArgError::Message(format!(
             "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${first_named}"
         )));
@@ -65481,7 +65483,7 @@ fn generated_default_value_for_call(default: Option<&str>) -> Option<Value> {
 }
 
 fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static str {
-    if let Some(metadata) = php_std::generated::arginfo::function_metadata(function)
+    if let Some(metadata) = php_std::arginfo::function_metadata_indexed(function)
         && let Some(param) = metadata.params.get(index)
         && param.by_ref
     {
