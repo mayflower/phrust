@@ -1113,13 +1113,14 @@ impl IncludeLoader {
             )
             .with_context("canonical_path", canonical.display()));
         }
-        let source = fs::read_to_string(&canonical).map_err(|error| {
+        let source = fs::read(&canonical).map_err(|error| {
             include_error(
                 "E_PHP_VM_INCLUDE_READ",
                 format!("{}: {error}", canonical.display()),
             )
             .with_context("canonical_path", canonical.display())
         })?;
+        let source = php_source_from_bytes(source);
         Ok(LoadedInclude {
             canonical_path: canonical,
             source,
@@ -1197,6 +1198,13 @@ fn include_error_suggestion(code: &str) -> &'static str {
 
 fn include_error(code: &'static str, message: impl Into<String>) -> VmError {
     VmError::fatal(code, "include", message)
+}
+
+fn php_source_from_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(source) => source,
+        Err(error) => error.into_bytes().into_iter().map(char::from).collect(),
+    }
 }
 
 fn include_cache_lock_error(cache: &'static str, operation: &'static str) -> VmError {
@@ -1978,6 +1986,24 @@ mod tests {
         let fingerprint = fingerprint.expect("fingerprint for a readable temp file");
         assert!(fingerprint.inode.is_some(), "unix exposes inode");
         assert!(fingerprint.device.is_some(), "unix exposes device");
+    }
+
+    #[test]
+    fn include_loader_accepts_legacy_single_byte_support_files() {
+        let fixture = IncludeCacheFixture::new("legacy-bytes");
+        let path = fixture.root.join("legacy.inc");
+        fs::write(&path, b"<?php\n// caf\xe9\n$value = 1;\n").expect("write legacy byte source");
+        let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
+        let resolved = loader
+            .resolve_with_include_path(None, "legacy.inc", &[], Some(&fixture.root))
+            .expect("resolve include");
+
+        let loaded = loader
+            .load_resolved(resolved.canonical_path)
+            .expect("load include");
+
+        assert!(loaded.source.contains("café"), "{}", loaded.source);
+        assert!(loaded.source.contains("$value = 1;"), "{}", loaded.source);
     }
 
     #[test]
