@@ -8872,11 +8872,15 @@ fn dense_bytecode_executes_closures_and_callable_calls() {
 #[test]
 fn direct_frames_elide_argument_vectors_unless_observed() {
     // Plain calls elide the per-call argument snapshot; func_get_args
-    // bodies keep it and read the full vector including extras.
+    // bodies keep it and read the full vector including extras. The Dto
+    // property is *typed* so the constructor's assignment stays off the
+    // copy-patch property-store leaf (which executes the whole body natively
+    // with no frame at all) and keeps exercising the direct-constructor-frame
+    // path this test asserts.
     let source = "<?php \
             function plain($a, $b) { return $a + $b; } \
             function observer() { return implode(\",\", func_get_args()); } \
-            class Dto { public $v = 0; public function __construct($v) { $this->v = $v; } \
+            class Dto { public int $v = 0; public function __construct($v) { $this->v = $v; } \
                         public function get() { return $this->v; } } \
             $sum = 0; \
             for ($i = 0; $i < 5; $i++) { $sum += plain($i, 1); } \

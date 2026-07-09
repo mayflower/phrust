@@ -6648,13 +6648,16 @@ impl Vm {
     /// Copy-and-patch native leaf tier (behind the default-on `jit-copy-patch`
     /// feature; disable per process via `PHRUST_JIT_COPY_PATCH=0` or per VM via
     /// `VmOptions::copy_patch_leaf_override`). Runs before the dense-dispatch and
-    /// interpreter paths: if the callee is a recognized scalar-int leaf called
-    /// with plain positional value arguments, compile it once (cached), run it
-    /// natively over the argument values, and return the result — otherwise
-    /// `None` to fall through. Methods (`$this`), closures (captures), named
-    /// arguments, by-reference arguments, and arity mismatches are rejected here;
-    /// non-int operands and overflow take the region's side exit (also `None`),
-    /// so behavior is identical to interpreting the function.
+    /// interpreter paths: if the callee is a recognized leaf called with plain
+    /// positional value arguments, compile it once (cached), run it natively
+    /// over the argument values, and return the result — otherwise `None` to
+    /// fall through. An instance-method leaf (the `$this` property
+    /// getter/setter shapes) marshals the call's receiver into slot `0` ahead
+    /// of the declared parameters (`$this` is local `0` in method IR); the
+    /// receiver's presence must match the function's methodness. Closures
+    /// (captures), named arguments, by-reference arguments, and arity
+    /// mismatches are rejected here; guard failures take the region's side exit
+    /// (also `None`), so behavior is identical to interpreting the function.
     #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
     fn try_execute_copy_patch_leaf(
         &self,
@@ -6673,8 +6676,10 @@ impl Vm {
         {
             return None;
         }
-        // Free function, plain positional value arguments only.
-        if call.this_value.is_some() || !call.captures.is_empty() {
+        // Plain positional value arguments only; the receiver's presence must
+        // match the function's methodness (an instance-method leaf needs
+        // `$this` for slot 0, a free function must not get one).
+        if function.flags.is_method != call.this_value.is_some() || !call.captures.is_empty() {
             return None;
         }
         if call.args.len() != function.params.len() {
@@ -6694,7 +6699,15 @@ impl Vm {
             function,
             &compiled.unit().constants,
         )?;
-        let params: Vec<Value> = call.args.iter().map(|arg| arg.value.clone()).collect();
+        // Buffer slot `i` is marshaled from `params[i]`; a method's `$this`
+        // occupies local 0 in method IR, so the receiver leads and the
+        // declared parameters follow at their local indices.
+        let mut params: Vec<Value> =
+            Vec::with_capacity(call.args.len() + usize::from(call.this_value.is_some()));
+        if let Some(this) = call.this_value.as_ref() {
+            params.push(Value::Object(this.clone()));
+        }
+        params.extend(call.args.iter().map(|arg| arg.value.clone()));
         match leaf.run_outcome(&params) {
             crate::copy_patch_bridge::LeafOutcome::Value(value) => {
                 Some(VmResult::success_no_output(Some(value)))
@@ -35016,6 +35029,27 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
+        // Copy-and-patch native leaf tier for method-path calls: dense method
+        // dispatch executes bodies directly (bypassing `execute_function`), so
+        // without this hook a recognized `$this` accessor leaf would never
+        // engage on the default engine. Same placement contract as the hook in
+        // `execute_function`: before dense dispatch, fall through on `None`.
+        // The leaf is compiled against `owner` — the unit whose IR owns the
+        // function — exactly like the dense body below.
+        #[cfg(feature = "jit-copy-patch")]
+        if let Some(ir_function) = owner.unit().functions.get(function.index())
+            && let Some(result) = self.try_execute_copy_patch_leaf(
+                owner,
+                function,
+                ir_function,
+                &call,
+                output,
+                stack,
+                state,
+            )
+        {
+            return result;
+        }
         if let Some(plan) = plan {
             self.record_counter_dense_method_dispatch_attempt();
             // Bodies defined in another unit (an include) execute through

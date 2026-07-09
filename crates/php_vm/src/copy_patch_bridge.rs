@@ -40,8 +40,8 @@ use php_ir::instruction::{IrCallArg, TerminatorKind};
 use php_ir::module::{ClassEntry, ClassPropertyEntry, IrUnit, normalize_class_name};
 #[cfg(all(unix, target_arch = "aarch64"))]
 use php_ir::{
-    FunctionId, InstrId, Instruction, InstructionKind, IrConstant, IrFunction, IrReturnType,
-    IrSpan, Operand, RegId,
+    FunctionId, InstrId, Instruction, InstructionKind, IrConstant, IrFunction, IrParam,
+    IrReturnType, IrSpan, Operand, RegId,
 };
 #[cfg(all(unix, target_arch = "aarch64"))]
 use php_jit::copy_patch::{CopyPatchRuntimeHelpers, TailCallPlan};
@@ -476,6 +476,88 @@ fn native_call_permits(unit: &CompiledUnit) -> php_jit::copy_patch::NativeCallPe
     }
 }
 
+/// The resolved receiver of a property leaf: which buffer slot holds the
+/// object and which class the monomorphic guard pins.
+#[cfg(all(unix, target_arch = "aarch64"))]
+struct LeafReceiver<'a> {
+    /// VM slot (`LocalId` index) the receiver object is marshaled into: the
+    /// class-typed first parameter's local for a free function, or local `0`
+    /// (`$this`, which the VM hook marshals ahead of the declared parameters)
+    /// for an instance method.
+    local: u32,
+    /// Class the monomorphic guard pins: the parameter's declared class for a
+    /// free function, the declaring class for a method.
+    class: &'a ClassEntry,
+    /// True when the leaf is an instance method accessing `$this` — private/
+    /// protected properties *declared on the receiver class itself* are then
+    /// legally accessible.
+    is_method: bool,
+}
+
+/// Resolve a property leaf's receiver and return it with the remaining
+/// declared "value" parameters (none for a load, the assigned value for a
+/// store).
+///
+/// A free function's receiver is its first parameter, which must be by-value,
+/// non-variadic, no-default, and class-typed. An instance method's receiver is
+/// `$this` (local `0`; the VM hook marshals the call's receiver into slot `0`
+/// ahead of the declared parameters), and its class is the *declaring* class
+/// resolved from the unit's class table via `function_id` — the class whose
+/// own method table row (`origin_class` == the class) carries the function.
+/// Trait-provided methods (`origin_class` names the trait) and static methods
+/// resolve to no declaring class and reject; a subclass instance reaching the
+/// compiled leaf fails the runtime class guard and side-exits, exactly like
+/// the free-function shape.
+#[cfg(all(unix, target_arch = "aarch64"))]
+fn resolve_leaf_receiver<'a, 'f>(
+    unit: &'a IrUnit,
+    function: &'f IrFunction,
+    function_id: u32,
+) -> Option<(LeafReceiver<'a>, &'f [IrParam])> {
+    if function.flags.is_method {
+        // Instance methods only: `$this` occupies local 0.
+        if function.locals.first().map(String::as_str) != Some("this") {
+            return None;
+        }
+        let normalized_id = function_id as usize;
+        let class = unit.classes.iter().find(|class| {
+            class.methods.iter().any(|method| {
+                method.function.index() == normalized_id
+                    && !method.flags.is_static
+                    && normalize_class_name(&method.origin_class)
+                        == normalize_class_name(&class.name)
+            })
+        })?;
+        return Some((
+            LeafReceiver {
+                local: 0,
+                class,
+                is_method: true,
+            },
+            function.params.as_slice(),
+        ));
+    }
+    let (object_param, value_params) = function.params.split_first()?;
+    if object_param.by_ref || object_param.variadic || object_param.default.is_some() {
+        return None;
+    }
+    let Some(IrReturnType::Class {
+        name: class_name, ..
+    }) = object_param.type_.as_ref()
+    else {
+        return None;
+    };
+    let class = lookup_ir_class(unit, class_name)?;
+    Some((
+        LeafReceiver {
+            local: object_param.local.raw(),
+            class,
+            is_method: false,
+        },
+        value_params,
+    ))
+}
+
 /// A recognized monomorphic scalar property-load leaf: the object parameter's
 /// slot, the result slot layout, and the layout-guard metadata the helper reads.
 #[cfg(all(unix, target_arch = "aarch64"))]
@@ -491,30 +573,34 @@ struct PropertyLoadLeaf {
     metadata: php_jit::JitPropertyLoadMetadata,
 }
 
-/// Recognize `function f(SomeClass $o): T { return $o->prop; }` — a single-block
-/// free-function leaf that loads a by-value object parameter and returns one of
-/// its declared, plain (backed, public, instance, non-hooked) properties named by
-/// a compile-time constant. Builds the [`JitPropertyLoadMetadata`] the layout
+/// Recognize `function f(SomeClass $o): T { return $o->prop; }` — or the
+/// instance-method getter `function getProp(): T { return $this->prop; }` — a
+/// single-block leaf that loads its receiver object and returns one of its
+/// declared, plain (backed, instance, non-hooked) properties named by a
+/// compile-time constant. Builds the [`JitPropertyLoadMetadata`] the layout
 /// guard needs from the unit's class table (the VM owns class resolution; the
-/// bare `php_jit` copy-patch layer cannot resolve classes).
+/// bare `php_jit` copy-patch layer cannot resolve classes). See
+/// [`resolve_leaf_receiver`] for the free-function vs `$this` receiver rules.
 ///
-/// Rejected (→ `None`, so the interpreter runs it, matching the Cranelift
-/// property-load recognizer): methods/closures/generators (a leaf *method* whose
-/// receiver is `$this` is a deliberate follow-up — this admits only a
-/// free-function object parameter), a by-ref/variadic/defaulted parameter, a
-/// parameter without a class type, a void/never return, a dynamic `->$var`
-/// (lowered as `FetchDynamicProperty`, not `FetchProperty`), a null-safe `?->` or
-/// chained `$a->b->c` (extra blocks/instructions), a static property, a property
-/// with a get/set hook or whose class hierarchy has a public `__get`, and a
-/// non-public/static property. The declared class or property being absent from
-/// the unit also rejects.
+/// Rejected (→ `None`, so the interpreter runs it): closures/generators/
+/// static or trait-provided methods, a by-ref/variadic/defaulted parameter, a
+/// free-function parameter without a class type, a non-scalar/non-`mixed`
+/// return type (the native result bypasses return-site coercion), a dynamic
+/// `->$var` (lowered as `FetchDynamicProperty`, not `FetchProperty`), a
+/// null-safe `?->` or chained `$a->b->c` (extra blocks/instructions), a static
+/// property, a property with a get/set hook or whose class hierarchy has a
+/// public `__get`, and a private/protected property — unless the leaf is a
+/// method and the property is declared on the receiver class itself, where the
+/// access is legal (the runtime guard pins that exact class). The declared
+/// class or property being absent from the unit also rejects.
 #[cfg(all(unix, target_arch = "aarch64"))]
 fn recognize_property_load_leaf(
     unit: &CompiledUnit,
     function: &IrFunction,
+    function_id: u32,
 ) -> Option<PropertyLoadLeaf> {
     let flags = function.flags;
-    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+    if flags.is_top_level || flags.is_closure || flags.is_generator {
         return None;
     }
     if function.returns_by_ref || !function.captures.is_empty() {
@@ -535,25 +621,18 @@ fn recognize_property_load_leaf(
         Some(IrReturnType::Mixed) => 0,
         _ => return None,
     };
-    // Exactly one by-value, non-variadic, no-default object parameter.
-    let [param] = function.params.as_slice() else {
-        return None;
-    };
-    if param.by_ref || param.variadic || param.default.is_some() {
+    // The receiver (free-function object parameter or `$this`), with no
+    // further declared parameters for a getter.
+    let ir = unit.unit();
+    let (receiver, value_params) = resolve_leaf_receiver(ir, function, function_id)?;
+    if !value_params.is_empty() {
         return None;
     }
-    let Some(IrReturnType::Class {
-        name: class_name, ..
-    }) = param.type_.as_ref()
-    else {
-        return None;
-    };
-    let ir = unit.unit();
-    let class = lookup_ir_class(ir, class_name)?;
+    let class = receiver.class;
 
-    // Single-block leaf (ignoring `Discard` lifetime hints): load the object
-    // parameter, fetch a static-named property of that loaded register, and
-    // return exactly that value.
+    // Single-block leaf (ignoring `Discard` lifetime hints): load the receiver,
+    // fetch a static-named property of that loaded register, and return exactly
+    // that value.
     let [block] = function.blocks.as_slice() else {
         return None;
     };
@@ -577,7 +656,7 @@ fn recognize_property_load_leaf(
     else {
         return None;
     };
-    if *load_local != param.local {
+    if load_local.raw() != receiver.local {
         return None;
     }
     if object_reg != load_reg {
@@ -594,14 +673,17 @@ fn recognize_property_load_leaf(
         return None;
     }
 
-    // Resolve the declared property and guard it is a plain (backed, public,
-    // instance, non-hooked) property with no public `__get` anywhere in the
-    // hierarchy — so the load never invokes user code.
+    // Resolve the declared property and guard it is a plain (backed, instance,
+    // non-hooked) property with no public `__get` anywhere in the hierarchy —
+    // so the load never invokes user code. Non-public properties are only
+    // legal from a method of the class that declares them (the runtime guard
+    // pins that exact class, so the compile-time scope fact holds).
     let (declaring_class, property_entry) = lookup_property_in_unit(ir, class, property)?;
-    if property_entry.flags.is_static
-        || property_entry.flags.is_private
-        || property_entry.flags.is_protected
-    {
+    if property_entry.flags.is_static {
+        return None;
+    }
+    let own_scope = receiver.is_method && declaring_class.id == class.id;
+    if (property_entry.flags.is_private || property_entry.flags.is_protected) && !own_scope {
         return None;
     }
     if property_entry.hooks.get.is_some() || property_entry.hooks.set.is_some() {
@@ -616,8 +698,8 @@ fn recognize_property_load_leaf(
         .position(|entry| entry.name == property_entry.name)?;
 
     // Slot layout mirrors the single-arg builtin leaves: locals occupy their
-    // indices (so the object parameter is marshaled into `slot[param.local]`) and
-    // the result lands in a dedicated slot above locals + registers. The compiler
+    // indices (the receiver is marshaled into `slot[receiver.local]`) and the
+    // result lands in a dedicated slot above locals + registers. The compiler
     // rejects an out-of-range slot, so no bound check is needed here.
     let result_slot = function.local_count.checked_add(function.register_count)?;
     let buffer_slots = result_slot.checked_add(1)?;
@@ -632,7 +714,7 @@ fn recognize_property_load_leaf(
         expected_result_tag,
     };
     Some(PropertyLoadLeaf {
-        object_slot: param.local.raw(),
+        object_slot: receiver.local,
         result_slot,
         buffer_slots,
         metadata,
@@ -654,40 +736,45 @@ struct PropertyStoreLeaf {
     metadata: php_jit::JitPropertyStoreMetadata,
 }
 
-/// Recognize `function f(SomeClass $o, $v): void { $o->prop = $v; }` — a
-/// single-block void free-function leaf that assigns its second by-value
-/// parameter to a declared, plain, *untyped* property of its first (an
-/// object-typed parameter), named by a compile-time constant. The write-side
-/// mirror of [`recognize_property_load_leaf`]; builds the
+/// Recognize `function f(SomeClass $o, $v): void { $o->prop = $v; }` — or the
+/// instance-method setter `function setProp($v): void { $this->prop = $v; }` —
+/// a single-block void leaf that assigns its untyped by-value value parameter
+/// to a declared, plain, *untyped* property of its receiver, named by a
+/// compile-time constant. The write-side mirror of
+/// [`recognize_property_load_leaf`]; builds the
 /// [`php_jit::JitPropertyStoreMetadata`] the layout guard needs from the unit's
 /// class table (the VM owns class resolution; the bare `php_jit` copy-patch
-/// layer cannot resolve classes).
+/// layer cannot resolve classes). See [`resolve_leaf_receiver`] for the
+/// free-function vs `$this` receiver rules.
 ///
-/// Beyond the load recognizer's rejections (methods/closures/generators,
-/// by-ref/variadic/defaulted parameters, a first parameter without a class
-/// type, dynamic `->$var`, null-safe/chained accesses, static properties,
-/// hooked properties, non-public properties, absent class/property), the store
-/// additionally rejects everything that would make an assignment run user code
-/// or enforce semantics beyond a raw slot write: a *typed* declared property
-/// (assignment coerces or throws `TypeError`), a `readonly` property, an
-/// asymmetric-visibility `private(set)`/`protected(set)` property (a free
-/// function may not write it), and a public `__set` anywhere in the hierarchy
+/// Beyond the load recognizer's rejections (closures/generators/static or
+/// trait-provided methods, by-ref/variadic/defaulted parameters, a
+/// free-function receiver without a class type, dynamic `->$var`,
+/// null-safe/chained accesses, static properties, hooked properties, absent
+/// class/property), the store additionally rejects everything that would make
+/// an assignment run user code or enforce semantics beyond a raw slot write: a
+/// *typed* declared property (assignment coerces or throws `TypeError`), a
+/// `readonly` property, and a public `__set` anywhere in the hierarchy
 /// (defense in depth — the runtime storage guard already side-exits the
-/// `unset()` case that re-arms `__set`). The value parameter must be
-/// *untyped*: a typed parameter coerces (or throws `TypeError`) at bind time,
-/// and the native path marshals the raw argument, so admitting `int $v` would
-/// store `7.0` where the interpreter stores `7`. An untyped parameter passes
-/// the value through unchanged — exactly what the helper commits; it only
-/// commits marshaled `Int`/`Bool`/`Float` values and side-exits otherwise. The
-/// return type must be `void` (or undeclared with a bare `return`), so the
-/// leaf's result is exactly `null`.
+/// `unset()` case that re-arms `__set`). Private/protected and
+/// `private(set)`/`protected(set)` properties are writable only from a method
+/// of the class that declares them (the runtime guard pins that exact class);
+/// from a free function they reject. The value parameter must be *untyped*: a
+/// typed parameter coerces (or throws `TypeError`) at bind time, and the
+/// native path marshals the raw argument, so admitting `int $v` would store
+/// `7.0` where the interpreter stores `7`. An untyped parameter passes the
+/// value through unchanged — exactly what the helper commits; it only commits
+/// marshaled `Int`/`Bool`/`Float` values and side-exits otherwise. The return
+/// type must be `void` (or undeclared with a bare `return`), so the leaf's
+/// result is exactly `null`.
 #[cfg(all(unix, target_arch = "aarch64"))]
 fn recognize_property_store_leaf(
     unit: &CompiledUnit,
     function: &IrFunction,
+    function_id: u32,
 ) -> Option<PropertyStoreLeaf> {
     let flags = function.flags;
-    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+    if flags.is_top_level || flags.is_closure || flags.is_generator {
         return None;
     }
     if function.returns_by_ref || !function.captures.is_empty() {
@@ -698,33 +785,26 @@ fn recognize_property_store_leaf(
     if !matches!(function.return_type, None | Some(IrReturnType::Void)) {
         return None;
     }
-    // Exactly two by-value, non-variadic, no-default parameters; the first
-    // carries the receiver class type.
-    let [object_param, value_param] = function.params.as_slice() else {
+    // The receiver (free-function object parameter or `$this`) plus exactly
+    // one by-value, non-variadic, no-default, *untyped* value parameter (a
+    // typed parameter's bind-time coercion/`TypeError` would be skipped on the
+    // native path — see the doc).
+    let ir = unit.unit();
+    let (receiver, value_params) = resolve_leaf_receiver(ir, function, function_id)?;
+    let [value_param] = value_params else {
         return None;
     };
-    for param in [object_param, value_param] {
-        if param.by_ref || param.variadic || param.default.is_some() {
-            return None;
-        }
+    if value_param.by_ref || value_param.variadic || value_param.default.is_some() {
+        return None;
     }
-    let Some(IrReturnType::Class {
-        name: class_name, ..
-    }) = object_param.type_.as_ref()
-    else {
-        return None;
-    };
-    // The value parameter must be untyped: a typed parameter's bind-time
-    // coercion/`TypeError` would be skipped on the native path (see the doc).
     if value_param.type_.is_some() {
         return None;
     }
-    let ir = unit.unit();
-    let class = lookup_ir_class(ir, class_name)?;
+    let class = receiver.class;
 
-    // Single-block leaf (ignoring `Discard` lifetime hints): load the object
-    // parameter, load the value parameter, assign a static-named property of
-    // the loaded object from the loaded value, and return nothing.
+    // Single-block leaf (ignoring `Discard` lifetime hints): load the receiver,
+    // load the value parameter, assign a static-named property of the loaded
+    // object from the loaded value, and return nothing.
     let [block] = function.blocks.as_slice() else {
         return None;
     };
@@ -753,7 +833,7 @@ fn recognize_property_store_leaf(
     else {
         return None;
     };
-    if *object_local != object_param.local || *value_local != value_param.local {
+    if object_local.raw() != receiver.local || *value_local != value_param.local {
         return None;
     }
     if assign_object != object_reg || assign_value != value_reg {
@@ -771,21 +851,25 @@ fn recognize_property_store_leaf(
     };
 
     // Resolve the declared property and guard that a raw slot write is exactly
-    // the interpreter's semantics: plain (backed, public, instance, non-hooked)
-    // like the load, plus untyped (no coercion/`TypeError`), non-readonly,
-    // symmetric visibility (no `private(set)`/`protected(set)`), and no public
-    // `__set` in the hierarchy.
+    // the interpreter's semantics: plain (backed, instance, non-hooked) like
+    // the load, plus untyped (no coercion/`TypeError`), non-readonly, and no
+    // public `__set` in the hierarchy. Non-public or asymmetric-visibility
+    // properties are writable only from a method of the class that declares
+    // them (the runtime guard pins that exact class, so the compile-time scope
+    // fact holds).
     let (declaring_class, property_entry) = lookup_property_in_unit(ir, class, property)?;
-    if property_entry.flags.is_static
-        || property_entry.flags.is_private
-        || property_entry.flags.is_protected
+    if property_entry.flags.is_static {
+        return None;
+    }
+    let own_scope = receiver.is_method && declaring_class.id == class.id;
+    if (property_entry.flags.is_private || property_entry.flags.is_protected) && !own_scope {
+        return None;
+    }
+    if (property_entry.flags.set_is_private || property_entry.flags.set_is_protected) && !own_scope
     {
         return None;
     }
-    if property_entry.flags.is_readonly
-        || property_entry.flags.set_is_private
-        || property_entry.flags.set_is_protected
-    {
+    if property_entry.flags.is_readonly {
         return None;
     }
     if property_entry.flags.is_typed || property_entry.type_.is_some() {
@@ -802,9 +886,10 @@ fn recognize_property_store_leaf(
         .iter()
         .position(|entry| entry.name == property_entry.name)?;
 
-    // Slot layout mirrors the load leaf: locals occupy their indices (so both
-    // parameters are marshaled into `slot[param.local]`); the leaf produces no
-    // result slot, so the buffer only spans the locals + registers.
+    // Slot layout mirrors the load leaf: locals occupy their indices (the
+    // receiver is marshaled into `slot[receiver.local]`, the value into
+    // `slot[value_param.local]`); the leaf produces no result slot, so the
+    // buffer only spans the locals + registers.
     let buffer_slots = function.local_count.checked_add(function.register_count)?;
 
     let metadata = php_jit::JitPropertyStoreMetadata {
@@ -816,7 +901,7 @@ fn recognize_property_store_leaf(
         layout_version: 0,
     };
     Some(PropertyStoreLeaf {
-        object_slot: object_param.local.raw(),
+        object_slot: receiver.local,
         value_slot: value_param.local.raw(),
         buffer_slots,
         metadata,
@@ -980,11 +1065,14 @@ impl NativeLeaf {
     ) -> Option<Self> {
         // Monomorphic scalar property-load leaf, recognized in the VM (which owns
         // class/property resolution) and lowered to a guarded helper-call
-        // stencil. Tried first: its shape (a by-value object parameter returning
-        // one of its declared properties) is disjoint from every scalar-int/
-        // float/builtin subset, so it never steals another leaf, and on any
-        // mismatch it falls through to the existing recognizers unchanged.
-        if let Some(leaf) = recognize_property_load_leaf(unit, function) {
+        // stencil. Tried first: its shape (a receiver — by-value object
+        // parameter or `$this` — returning one of its declared properties) is
+        // disjoint from every scalar-int/float/builtin subset, so it never
+        // steals another leaf, and on any mismatch it falls through to the
+        // existing recognizers unchanged. `region_id` is the function's ID in
+        // the unit (see `cached_leaf`), which method recognition uses to
+        // resolve the declaring class.
+        if let Some(leaf) = recognize_property_load_leaf(unit, function, region_id) {
             // Box the metadata so its address is stable across the move into
             // `Self`; the stencil bakes in a borrowed pointer to it, and the
             // returned `NativeLeaf` owns the box, keeping the pointer valid for
@@ -1016,9 +1104,9 @@ impl NativeLeaf {
 
         // Monomorphic scalar property-*store* leaf — the void setter mirror of
         // the load above, recognized in the VM for the same reason and equally
-        // disjoint from every other subset (no other recognizer admits a
-        // two-parameter void function assigning a property).
-        if let Some(leaf) = recognize_property_store_leaf(unit, function) {
+        // disjoint from every other subset (no other recognizer admits a void
+        // function assigning a property).
+        if let Some(leaf) = recognize_property_store_leaf(unit, function, region_id) {
             // Pin the metadata exactly like the load leaf's: the stencil bakes
             // in a borrowed pointer, and the returned `NativeLeaf` owns the box
             // for every native invocation.
