@@ -39,6 +39,7 @@ FIXTURES = (
     FIXTURE_DIR / "builtin_property_store.php",
     FIXTURE_DIR / "method_property_leaves.php",
     FIXTURE_DIR / "resume_calls.php",
+    FIXTURE_DIR / "packed_array_fetch.php",
     FIXTURE_DIR / "userland_tailcall.php",
     FIXTURE_DIR / "userland_tailcall_safety.php",
 )

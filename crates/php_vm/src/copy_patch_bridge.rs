@@ -283,6 +283,47 @@ extern "C" fn copy_patch_property_load_abi(
     JIT_HELPER_STATUS_OK
 }
 
+/// C-ABI wrapper the packed-array-fetch stencil `blr`s: read element `index`
+/// of the borrowed packed-int array `Value` at `value_ptr` and write it
+/// through `out`. Delegates to `php_runtime::php_jit_array_fetch_int_slow`,
+/// the same safe facade the Cranelift tier's packed fetch uses, so both
+/// native tiers share one bounds/layout-guarded element read.
+///
+/// Read-only and non-re-entrant: it reads one packed element and never
+/// mutates, frees, or re-enters the VM. It returns a non-OK status (so the
+/// stencil side-exits to the interpreter) for a null pointer, a negative or
+/// out-of-bounds index (PHP emits the undefined-key warning and yields
+/// `null` — exactly the interpreter's job), a non-packed or non-int-element
+/// array, or a non-array value.
+///
+/// SAFETY: `value_ptr` is the `payload` of an `OpaqueArray` slot the bridge
+/// marshaled as `&Value as *const Value` into the live params/backing buffer,
+/// so it is a valid `Value` pointer for this synchronous call (see
+/// `marshal_local`). `out` is the stencil's stack out-slot, non-null and valid
+/// for the call.
+#[cfg(all(unix, target_arch = "aarch64"))]
+extern "C" fn copy_patch_array_fetch_abi(value_ptr: usize, index: i64, out: *mut i64) -> i32 {
+    if value_ptr == 0 || out.is_null() {
+        return JIT_HELPER_STATUS_FALLBACK;
+    }
+    let Ok(index) = usize::try_from(index) else {
+        return JIT_HELPER_STATUS_FALLBACK;
+    };
+    // SAFETY: a live, borrowed `Value` valid for this call (see the doc above).
+    let value = unsafe { &*(value_ptr as *const Value) };
+    let mut element = 0_i64;
+    if php_runtime::php_jit_array_fetch_int_slow(value, index, &mut element)
+        != php_runtime::PHP_JIT_ARRAY_STATUS_OK
+    {
+        return JIT_HELPER_STATUS_FALLBACK;
+    }
+    // SAFETY: `out` is non-null and valid for this synchronous call (checked).
+    unsafe {
+        *out = element;
+    }
+    JIT_HELPER_STATUS_OK
+}
+
 /// C-ABI wrapper the property-*store* stencil `blr`s: read the borrowed object
 /// `Value` at `value_ptr` and the marshaled new value at `new_value_ptr`, apply
 /// the monomorphic layout guard described by the borrowed
@@ -1196,6 +1237,7 @@ impl NativeLeaf {
         let helpers = CopyPatchRuntimeHelpers {
             array_len: copy_patch_array_len_abi as *const () as usize as u64,
             strlen: copy_patch_strlen_abi as *const () as usize as u64,
+            array_fetch: copy_patch_array_fetch_abi as *const () as usize as u64,
         };
         if let Some(compiled) =
             php_jit::copy_patch::compile_scalar_int_function_with_permits_and_helpers(
@@ -2063,6 +2105,7 @@ mod tests {
         let helpers = php_jit::copy_patch::CopyPatchRuntimeHelpers {
             array_len: super::copy_patch_array_len_abi as *const () as usize as u64,
             strlen: super::copy_patch_strlen_abi as *const () as usize as u64,
+            ..php_jit::copy_patch::CopyPatchRuntimeHelpers::default()
         };
         php_jit::copy_patch::compile_scalar_int_function_with_permits_and_helpers(
             &function,
@@ -2207,6 +2250,7 @@ mod tests {
         let helpers = php_jit::copy_patch::CopyPatchRuntimeHelpers {
             array_len: super::copy_patch_array_len_abi as *const () as usize as u64,
             strlen: super::copy_patch_strlen_abi as *const () as usize as u64,
+            ..php_jit::copy_patch::CopyPatchRuntimeHelpers::default()
         };
         php_jit::copy_patch::compile_scalar_int_function_with_permits_and_helpers(
             &function,

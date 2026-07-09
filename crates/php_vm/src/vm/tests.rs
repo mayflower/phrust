@@ -9846,6 +9846,10 @@ fn cranelift_packed_array_fetch_executes_native_and_counts_fast_hit() {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
             },
+            // The default-on copy-patch tier now compiles this packed-fetch
+            // shape too and would serve the call before Cranelift tiering
+            // fires; this test pins the *Cranelift* packed fetch.
+            copy_patch_leaf_override: Some(false),
             ..VmOptions::default()
         },
     );

@@ -328,6 +328,24 @@ pub enum ScalarIntOp {
         metadata_ptr: u64,
         helper: u64,
     },
+    /// Guarded native packed-array element read: `slot[dst] =
+    /// <array at slot[array]>[slot[index]]`. Guards `slot[array]` is an
+    /// `OpaqueArray` and `slot[index]` is an `Int`, then `blr`s the
+    /// array-fetch ABI wrapper at `fetch_helper` over the C ABI (fp/lr saved;
+    /// a 16-byte scratch frame holding the out value and the saved slot
+    /// base). The array slot's payload is a borrowed `*const Value` the VM
+    /// marshaled for the call's duration; the helper performs a *read-only*
+    /// packed-int-layout fetch (`php_jit_array_fetch_int_slow`) with no
+    /// mutation, free, or VM re-entry. Any non-OK status — negative or
+    /// out-of-bounds index (PHP warns and yields `null`), a non-packed or
+    /// non-int-element array — side-exits so the interpreter reproduces the
+    /// exact value/diagnostic.
+    CallArrayFetchI64 {
+        dst: u32,
+        array: u32,
+        index: u32,
+        fetch_helper: u64,
+    },
 }
 
 /// Which builtin function calls the copy-and-patch compiler may lower to a
@@ -407,6 +425,14 @@ pub struct CopyPatchRuntimeHelpers {
     /// status for any non-string value. `0` = unavailable → `strlen` is not
     /// lowered. Same ABI shape as `array_len`.
     pub strlen: u64,
+    /// Address of an `extern "C" fn(value_ptr: usize, index: i64, out: *mut
+    /// i64) -> i32` wrapping `php_jit_array_fetch_int_slow`: it reads element
+    /// `index` of the borrowed packed-int array `Value` at `value_ptr` and
+    /// writes it through `out`, returning a non-OK status for a negative or
+    /// out-of-bounds index (PHP emits the undefined-key warning and yields
+    /// `null` — interpreter territory), a non-packed/non-int-element array, or
+    /// a non-array value. `0` = unavailable → `$a[$i]` is not lowered.
+    pub array_fetch: u64,
 }
 
 /// A binary PHP float operation over IEEE-754 doubles. Add/Sub/Mul never fault
@@ -644,6 +670,71 @@ fn emit_call_count(asm: &mut Aarch64Assembler, deopt: Label, dst: u32, arg: u32,
     asm.cmp_imm_w(X0, JIT_HELPER_STATUS_OK as u16);
     asm.b_cond(Cond::NotEqual, call_deopt);
     // 7: OK — reload the length and slot base, free the frame, store the Int.
+    asm.ldr_x(X6, SP, 0);
+    asm.ldr_x(X0, SP, 8);
+    asm.add_imm(SP, SP, 16);
+    asm.pop_fp_lr();
+    emit_store_int(asm, dst, X6);
+    asm.b(done);
+    asm.bind(call_deopt);
+    asm.add_imm(SP, SP, 16);
+    asm.pop_fp_lr();
+    asm.b(deopt);
+    asm.bind(done);
+}
+
+/// Emit a guarded native call `slot[dst] = <packed array>[slot[index]]`
+/// through the array-fetch ABI wrapper at `helper` (an `extern "C"
+/// fn(value_ptr: usize, index: i64, out: *mut i64) -> i32`).
+///
+/// The call stencil, in order:
+///
+/// 1. Guard `slot[array]`'s tag is `OpaqueArray` and `slot[index]`'s is `Int`
+///    (side exit otherwise).
+/// 2. Read the array slot's borrowed-pointer payload and the index payload
+///    while `X0` is still the slot base.
+/// 3. Build a non-leaf frame with a 16-byte scratch ([sp+0]=out value,
+///    [sp+8]=slot base).
+/// 4. C-ABI args — `x0` = value_ptr, `x1` = index, `x2` = `&out`.
+/// 5. `blr` the helper; status in `w0`.
+/// 6. A non-OK status — negative/out-of-bounds index, non-packed layout, or a
+///    non-int element — tears the frame down and takes the shared side exit
+///    (the interpreter reproduces PHP's exact value or undefined-key warning).
+/// 7. On OK: reload the out value and slot base, free the frame, store `Int`.
+///
+/// The helper is a read-only packed-element fetch (no mutation, free, or VM
+/// re-entry); the borrowed array pointer is valid for the synchronous call per
+/// `marshal_local`'s contract.
+fn emit_array_fetch(
+    asm: &mut Aarch64Assembler,
+    deopt: Label,
+    dst: u32,
+    array: u32,
+    index: u32,
+    helper: u64,
+) {
+    // 1–2: guards + payloads while X0 is the slot base.
+    emit_array_guard(asm, deopt, array);
+    emit_int_guard(asm, deopt, index);
+    asm.ldr_x(X4, X0, payload_off(array));
+    asm.ldr_x(X5, X0, payload_off(index));
+    // 3: non-leaf frame + 16-byte scratch ([sp+0]=out, [sp+8]=slot base).
+    asm.push_fp_lr();
+    asm.sub_imm(SP, SP, 16);
+    asm.str_x(X0, SP, 8);
+    // 4: C-ABI args — x0 = value_ptr, x1 = index, x2 = &out.
+    asm.mov(X0, X4);
+    asm.mov(X1, X5);
+    asm.add_imm(X2, SP, 0);
+    // 5: call helper(value_ptr, index, &out) -> status in w0.
+    asm.mov_imm64(X9, helper);
+    asm.blr(X9);
+    // 6: on a non-OK status, tear the frame down and take the shared side exit.
+    let call_deopt = asm.new_label();
+    let done = asm.new_label();
+    asm.cmp_imm_w(X0, JIT_HELPER_STATUS_OK as u16);
+    asm.b_cond(Cond::NotEqual, call_deopt);
+    // 7: OK — reload the element and slot base, free the frame, store the Int.
     asm.ldr_x(X6, SP, 0);
     asm.ldr_x(X0, SP, 8);
     asm.add_imm(SP, SP, 16);
@@ -1204,6 +1295,14 @@ mod x86_emit {
                 asm.setcc(x::R10, self::cond(cond));
                 store_bool(asm, dst, x::R10);
             }
+            // Not stenciled on x86 yet: an unconditional side exit keeps the
+            // enum exhaustive with identical behavior (the interpreter runs
+            // the shape — both ops side-exit before any effect, and neither
+            // appears after a performed resume call). Real x86 stencils are
+            // the documented follow-up.
+            ScalarIntOp::CallPropertyStoreScalar { .. } | ScalarIntOp::CallArrayFetchI64 { .. } => {
+                asm.jmp(deopt);
+            }
         }
     }
 
@@ -1456,6 +1555,13 @@ fn check_op_slots(op: ScalarIntOp) -> Result<(), SlotSequenceError> {
             check_slot(object)?;
             check_slot(value)
         }
+        ScalarIntOp::CallArrayFetchI64 {
+            dst, array, index, ..
+        } => {
+            check_slot(dst)?;
+            check_slot(array)?;
+            check_slot(index)
+        }
     }
 }
 
@@ -1498,6 +1604,12 @@ fn emit_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarIntOp) {
             metadata_ptr,
             helper,
         } => emit_property_store(asm, deopt, object, value, metadata_ptr, helper),
+        ScalarIntOp::CallArrayFetchI64 {
+            dst,
+            array,
+            index,
+            fetch_helper,
+        } => emit_array_fetch(asm, deopt, dst, array, index, fetch_helper),
         ScalarIntOp::Binary { op, dst, lhs, rhs } => {
             emit_int_guard(asm, deopt, lhs);
             emit_int_guard(asm, deopt, rhs);
@@ -2074,7 +2186,12 @@ pub fn compile_scalar_int_function_with_permits(
     if let Some(compiled) = compile_counted_loop_function(function, constants) {
         return Some(compiled);
     }
-    if let Some(compiled) = compile_scalar_int_cfg(function, constants, permits) {
+    if let Some(compiled) = compile_scalar_int_cfg(
+        function,
+        constants,
+        permits,
+        CopyPatchRuntimeHelpers::default(),
+    ) {
         return Some(compiled);
     }
     if let Some(compiled) = compile_scalar_float_leaf(function, constants) {
@@ -2110,7 +2227,21 @@ pub fn compile_scalar_int_function_with_permits_and_helpers(
     if let Some(compiled) = compile_scalar_int_is_type_leaf(function, permits) {
         return Some(compiled);
     }
-    compile_scalar_int_function_with_permits(function, constants, region_id, permits)
+    if let Some((graph, result)) = build_scalar_int_region(function, constants, region_id)
+        && let Ok(compiled) = compile_scalar_int_region(&graph, result)
+    {
+        return Some(compiled);
+    }
+    if let Some(compiled) = compile_counted_loop_function(function, constants) {
+        return Some(compiled);
+    }
+    if let Some(compiled) = compile_scalar_int_cfg(function, constants, permits, helpers) {
+        return Some(compiled);
+    }
+    if let Some(compiled) = compile_scalar_float_leaf(function, constants) {
+        return Some(compiled);
+    }
+    compile_scalar_int_tailcall_leaf(function, constants, permits)
 }
 
 /// The structural match shared by the single-argument builtin-leaf recognizers
@@ -2830,6 +2961,7 @@ fn compile_scalar_int_cfg(
     function: &IrFunction,
     constants: &[IrConstant],
     permits: NativeCallPermits,
+    helpers: CopyPatchRuntimeHelpers,
 ) -> Option<CompiledScalarRegion> {
     let flags = function.flags;
     if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
@@ -2845,11 +2977,14 @@ fn compile_scalar_int_cfg(
         return None;
     }
     for param in &function.params {
-        if param.by_ref
-            || param.variadic
-            || param.default.is_some()
-            || param.type_ != Some(IrReturnType::Int)
-        {
+        if param.by_ref || param.variadic || param.default.is_some() {
+            return None;
+        }
+        // `array` parameters are admitted for the guarded packed-fetch op;
+        // they are only readable through it (any scalar use fails the `Int`
+        // operand guard and side-exits), and `array` declared types never
+        // coerce at bind, so the marshaled handle equals the bound value.
+        if !matches!(param.type_, Some(IrReturnType::Int | IrReturnType::Array)) {
             return None;
         }
     }
@@ -2866,6 +3001,9 @@ fn compile_scalar_int_cfg(
 
     #[cfg(target_arch = "x86_64")]
     {
+        // The packed-fetch helper is aarch64-only so far; the x86 emitter
+        // rejects `FetchDim` shapes (interpreter runs them).
+        let _ = helpers;
         let code = x86_emit::emit_cfg(function, constants, permits, result_slot)?;
         Some(CompiledScalarRegion {
             code,
@@ -2883,6 +3021,26 @@ fn compile_scalar_int_cfg(
         // non-call subset is shared with the tail-call recognizer via
         // `scalar_int_prefix_op`; only the `abs` helper call is CFG-specific.
         let to_op = |kind: &InstructionKind| -> Option<ScalarIntOp> {
+            // A register-indexed dimension read lowers to the guarded
+            // packed-int fetch helper when the VM wired its address in.
+            // `quiet` reads (null-coalescing) suppress the undefined-key
+            // warning, which the helper cannot distinguish from the loud case
+            // — rejected.
+            if let InstructionKind::FetchDim {
+                dst,
+                array: Operand::Register(array_reg),
+                key: Operand::Register(key_reg),
+                quiet: false,
+            } = kind
+                && helpers.array_fetch != 0
+            {
+                return Some(ScalarIntOp::CallArrayFetchI64 {
+                    dst: reg_slot(*dst),
+                    array: reg_slot(*array_reg),
+                    index: reg_slot(*key_reg),
+                    fetch_helper: helpers.array_fetch,
+                });
+            }
             // A call to the real builtin `abs` (confirmed by the VM bridge via
             // `permits`) on a single by-value register argument lowers to the
             // guarded native helper call. Any other name, arity, argument form,
@@ -3289,7 +3447,8 @@ fn update_proven_int(proven: &mut HashSet<u32>, op: &ScalarIntOp) {
         | ScalarIntOp::CallCountI64 { dst, .. }
         | ScalarIntOp::CallStrlenI64 { dst, .. }
         | ScalarIntOp::IsType { dst, .. }
-        | ScalarIntOp::CallPropertyLoadScalar { dst, .. } => {
+        | ScalarIntOp::CallPropertyLoadScalar { dst, .. }
+        | ScalarIntOp::CallArrayFetchI64 { dst, .. } => {
             // Bool results and helper-call results are not proven `Int` for the
             // post-call subset (helpers are conservative even though abs/count/
             // strlen do produce ints — they never appear post-call anyway).
@@ -4225,7 +4384,7 @@ mod tests {
         // emitted `blr` is exercised end-to-end in code_memory.rs).
         let helpers = CopyPatchRuntimeHelpers {
             array_len: 0x1000,
-            strlen: 0,
+            ..CopyPatchRuntimeHelpers::default()
         };
         let permits = NativeCallPermits {
             builtin_count: true,
@@ -4276,7 +4435,7 @@ mod tests {
         let function = count_leaf_function("count", Some(IrReturnType::Array));
         let helpers = CopyPatchRuntimeHelpers {
             array_len: 0x1000,
-            strlen: 0,
+            ..CopyPatchRuntimeHelpers::default()
         };
         let permits = NativeCallPermits {
             builtin_count: true,
@@ -4301,7 +4460,7 @@ mod tests {
         let function = count_leaf_function("app\\count", None);
         let helpers = CopyPatchRuntimeHelpers {
             array_len: 0x1000,
-            strlen: 0,
+            ..CopyPatchRuntimeHelpers::default()
         };
         let permits = NativeCallPermits {
             builtin_count: true,
@@ -4323,8 +4482,8 @@ mod tests {
     /// placeholder; the emitted `blr` is exercised end-to-end in code_memory.rs).
     fn strlen_helpers() -> CopyPatchRuntimeHelpers {
         CopyPatchRuntimeHelpers {
-            array_len: 0,
             strlen: 0x2000,
+            ..CopyPatchRuntimeHelpers::default()
         }
     }
 
