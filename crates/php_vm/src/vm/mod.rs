@@ -12374,14 +12374,20 @@ impl Vm {
                                 return result;
                             }
                         };
+                        // The assignment-expression result register is dead
+                        // for plain `$a[$k] = $v;` statements (nothing reads
+                        // it), so the value moves into the array slot instead
+                        // of being cloned for a store nobody observes.
+                        let mut register_value = (!move_plan
+                            .is_some_and(|plan| plan.is_dead_write(dst)))
+                        .then(|| value.clone());
                         let result = if is_globals_local(ir_function, local) {
-                            assign_globals_dim(&mut state.globals, &dims, value.clone(), append)
+                            assign_globals_dim(&mut state.globals, &dims, value, append)
                         } else {
                             let was_packed = local_array_is_packed_fast(stack, local);
                             let cow_or_reference =
                                 local_array_has_cow_or_reference_fallback(stack, local);
-                            let result =
-                                assign_dim_local(stack, local, &dims, value.clone(), append);
+                            let result = assign_dim_local(stack, local, &dims, value, append);
                             if let Ok(path) = &result {
                                 self.record_counter_map_update_slot_path(*path, &dims, append);
                             }
@@ -12420,11 +12426,12 @@ impl Vm {
                                         .unwrap_or_default(),
                                     index,
                                 );
-                                if let Err(message) = stack
-                                    .current_mut()
-                                    .expect("bytecode frame was pushed")
-                                    .registers
-                                    .set(RegId::new(dst), value)
+                                if let Some(register_value) = register_value.take()
+                                    && let Err(message) = stack
+                                        .current_mut()
+                                        .expect("bytecode frame was pushed")
+                                        .registers
+                                        .set(RegId::new(dst), register_value)
                                 {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
@@ -12447,11 +12454,12 @@ impl Vm {
                             local,
                             &dims,
                         );
-                        if let Err(message) = stack
-                            .current_mut()
-                            .expect("bytecode frame was pushed")
-                            .registers
-                            .set(RegId::new(dst), value)
+                        if let Some(register_value) = register_value.take()
+                            && let Err(message) = stack
+                                .current_mut()
+                                .expect("bytecode frame was pushed")
+                                .registers
+                                .set(RegId::new(dst), register_value)
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
