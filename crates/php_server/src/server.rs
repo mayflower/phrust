@@ -139,14 +139,16 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let engine_profile = config.engine_preset;
     let tls_acceptor = build_tls_acceptor(config.tls_cert.as_deref(), config.tls_key.as_deref())?;
     let http3_endpoint = if config.http3_enabled {
-        let cert_path = config
-            .tls_cert
-            .as_deref()
-            .expect("config validation requires TLS cert for HTTP/3");
-        let key_path = config
-            .tls_key
-            .as_deref()
-            .expect("config validation requires TLS key for HTTP/3");
+        let cert_path = config.tls_cert.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
+            )
+        })?;
+        let key_path = config.tls_key.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
+            )
+        })?;
         Some(build_http3_endpoint(cert_path, key_path, http3_listen)?)
     } else {
         None

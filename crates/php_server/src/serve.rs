@@ -345,10 +345,17 @@ pub(crate) async fn handle_parts(
     if let Some(alt_svc) = &state.http3_alt_svc
         && request_version != hyper::Version::HTTP_3
     {
-        response
-            .headers_mut()
-            .entry(header::ALT_SVC)
-            .or_insert_with(|| HeaderValue::from_str(alt_svc).expect("alt-svc is valid"));
+        match HeaderValue::from_str(alt_svc) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .entry(header::ALT_SVC)
+                    .or_insert(value);
+            }
+            Err(error) => {
+                warn!(%alt_svc, %error, "HTTP/3 Alt-Svc header value is invalid");
+            }
+        }
     }
     state.metrics.record_response(response.status());
     emit_server_debug(

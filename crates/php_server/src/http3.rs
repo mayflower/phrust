@@ -102,10 +102,8 @@ async fn handle_http3_request(
         Ok(body) => body,
         Err(Http3BodyReadError::Invalid(error)) => {
             warn!(%peer, %error, "HTTP/3 request body read failed");
-            let response = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(())
-                .expect("bad request response is valid");
+            let mut response = Response::new(());
+            *response.status_mut() = StatusCode::BAD_REQUEST;
             if let Err(error) = stream.send_response(response).await {
                 warn!(%peer, %error, "HTTP/3 bad-request response failed");
             }

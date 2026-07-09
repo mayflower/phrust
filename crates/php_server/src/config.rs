@@ -104,7 +104,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         let message = message.into();
         let mut diagnostic = DiagnosticEnvelope::new(
             "E_PHRUST_SERVER_CONFIG",
