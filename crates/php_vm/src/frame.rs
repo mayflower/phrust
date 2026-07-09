@@ -304,8 +304,8 @@ pub struct Frame {
     /// PHP-visible arguments supplied to this call after default/variadic
     /// normalization.
     pub arguments: Vec<Value>,
-    /// Backtrace-visible arguments with redaction and named variadic labels.
-    pub trace_arguments: Vec<FrameTraceArgument>,
+    /// Backtrace-visible arguments (see [`TraceArguments`]).
+    pub trace_arguments: TraceArguments,
     /// Source span of the call site that activated this frame, when known.
     pub call_span: Option<IrSpan>,
     /// Registers for the function.
@@ -340,7 +340,7 @@ impl Frame {
             called_class: None,
             declaring_class: None,
             arguments: Vec::new(),
-            trace_arguments: Vec::new(),
+            trace_arguments: TraceArguments::default(),
             call_span: None,
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
@@ -362,7 +362,7 @@ impl Frame {
             called_class: context.called_class,
             declaring_class: context.declaring_class,
             arguments: Vec::new(),
-            trace_arguments: Vec::new(),
+            trace_arguments: TraceArguments::default(),
             call_span: context.call_span,
             registers: RegisterFile::new(register_count),
             locals: LocalFile::new(local_count),
@@ -378,7 +378,7 @@ impl Frame {
         self.declaring_class = None;
         self.call_span = None;
         self.arguments.clear();
-        self.trace_arguments.clear();
+        self.trace_arguments = TraceArguments::default();
         self.registers.clear_for_reuse();
         self.locals.clear_for_reuse();
         self.reuse_eligible = false;
@@ -398,7 +398,7 @@ impl Frame {
         self.declaring_class = context.declaring_class;
         self.call_span = context.call_span;
         self.arguments.clear();
-        self.trace_arguments.clear();
+        self.trace_arguments = TraceArguments::default();
         self.registers.reset_for_function(register_count);
         self.locals.reset_for_function(local_count);
         self.reuse_eligible = false;
@@ -410,6 +410,29 @@ impl Frame {
 pub struct FrameTraceArgument {
     pub name: Option<String>,
     pub value: Value,
+}
+
+/// Backtrace-visible arguments of a frame.
+///
+/// The reference engine reports the *current* argument slot values (parameter
+/// mutations are visible in `debug_backtrace()` and exception traces), so the
+/// normal case reconstructs them lazily from the live locals when a trace is
+/// actually requested — no per-call snapshot clones. Frames whose locals never
+/// bind the call arguments (native leaf frames) carry an eager snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceArguments {
+    /// Reconstruct on demand from live locals plus the `arguments` overflow;
+    /// `arg_count` is the PHP-visible call arity (`func_num_args`), so
+    /// defaulted parameters never appear.
+    Lazy { arg_count: u32 },
+    /// Eager snapshot for frames without argument-bound locals.
+    Materialized(Vec<FrameTraceArgument>),
+}
+
+impl Default for TraceArguments {
+    fn default() -> Self {
+        Self::Lazy { arg_count: 0 }
+    }
 }
 
 /// Minimal call stack container.
@@ -547,7 +570,7 @@ impl CallStack {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallStack, Frame, FrameActivationContext, FrameTraceArgument};
+    use super::{CallStack, Frame, FrameActivationContext, FrameTraceArgument, TraceArguments};
     use php_ir::IrSpan;
     use php_ir::ids::{FileId, FunctionId, LocalId, RegId};
     use php_runtime::api::RuntimeSourceSpan;
@@ -593,10 +616,10 @@ mod tests {
                 Frame::new_with_activation_context(FunctionId::new(1), 2, 2, activation("Old", 3));
             frame.reuse_eligible = true;
             frame.arguments.push(Value::Reference(cell.clone()));
-            frame.trace_arguments.push(FrameTraceArgument {
+            frame.trace_arguments = TraceArguments::Materialized(vec![FrameTraceArgument {
                 name: Some("arg".to_owned()),
                 value: Value::Reference(cell.clone()),
-            });
+            }]);
             frame
                 .registers
                 .set(RegId::new(0), Value::Reference(cell.clone()))
@@ -627,10 +650,10 @@ mod tests {
             Frame::new_with_activation_context(FunctionId::new(1), 2, 2, activation("Old", 10));
         frame.reuse_eligible = true;
         frame.arguments.push(Value::Int(1));
-        frame.trace_arguments.push(FrameTraceArgument {
+        frame.trace_arguments = TraceArguments::Materialized(vec![FrameTraceArgument {
             name: None,
             value: Value::Int(2),
-        });
+        }]);
         frame
             .registers
             .set(RegId::new(0), Value::string("old-register"))
@@ -651,7 +674,7 @@ mod tests {
         assert_eq!(frame.declaring_class.as_deref(), Some("NewDecl"));
         assert_eq!(frame.call_span, Some(IrSpan::new(FileId::new(1), 20, 21)));
         assert!(frame.arguments.is_empty());
-        assert!(frame.trace_arguments.is_empty());
+        assert_eq!(frame.trace_arguments, TraceArguments::default());
         assert_eq!(frame.registers.len(), 1);
         assert_eq!(
             frame.registers.get(RegId::new(0)),

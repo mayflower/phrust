@@ -1474,17 +1474,9 @@ impl OpcacheState {
 }
 
 /// Request-local SOAP facade state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct SoapState {
     error_handler_enabled: bool,
-}
-
-impl Default for SoapState {
-    fn default() -> Self {
-        Self {
-            error_handler_enabled: false,
-        }
-    }
 }
 
 impl SoapState {
@@ -2172,7 +2164,7 @@ impl SysvSemaphoreState {
         };
         #[cfg(unix)]
         {
-            return semaphore.acquire(non_blocking);
+            semaphore.acquire(non_blocking)
         }
         #[cfg(not(unix))]
         {
@@ -2196,7 +2188,7 @@ impl SysvSemaphoreState {
         };
         #[cfg(unix)]
         {
-            return semaphore.release();
+            semaphore.release()
         }
         #[cfg(not(unix))]
         {
@@ -2235,7 +2227,7 @@ impl SysvSemaphore {
             if self.removed {
                 return false;
             }
-            return sysvsem_ipc_stat(self.semid).is_ok();
+            sysvsem_ipc_stat(self.semid).is_ok()
         }
         #[cfg(not(unix))]
         {

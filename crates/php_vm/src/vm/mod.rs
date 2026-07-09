@@ -45,7 +45,7 @@ use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservat
 #[cfg(feature = "jit-cranelift")]
 use crate::deopt::GuardKind;
 use crate::error::VmError;
-use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument};
+use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument, TraceArguments};
 use crate::include::{
     IncludeCacheStats, LoadedInclude, compile_loaded_include, include_path_file_fingerprint,
 };
@@ -6871,13 +6871,18 @@ impl Vm {
             },
         );
         if let Some(frame) = stack.current_mut() {
-            frame.trace_arguments.reserve(leaf_args.len());
-            for value in leaf_args.iter() {
-                frame.trace_arguments.push(FrameTraceArgument {
-                    name: None,
-                    value: value.clone(),
-                });
-            }
+            // Native leaf frames never bind arguments into locals, so the
+            // lazy trace reconstruction has no source — keep the eager
+            // snapshot here (guaranteed-int args, so the clones are cheap).
+            frame.trace_arguments = TraceArguments::Materialized(
+                leaf_args
+                    .iter()
+                    .map(|value| FrameTraceArgument {
+                        name: None,
+                        value: value.clone(),
+                    })
+                    .collect(),
+            );
             frame.arguments = leaf_args.to_vec();
         }
 
@@ -7057,13 +7062,16 @@ impl Vm {
                             },
                         );
                         if let Some(frame) = stack.current_mut() {
-                            frame.trace_arguments.reserve(params.len());
-                            for value in params.iter() {
-                                frame.trace_arguments.push(FrameTraceArgument {
-                                    name: None,
-                                    value: value.clone(),
-                                });
-                            }
+                            // Native leaf frame: see the tail-call arm above.
+                            frame.trace_arguments = TraceArguments::Materialized(
+                                params
+                                    .iter()
+                                    .map(|value| FrameTraceArgument {
+                                        name: None,
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                            );
                             frame.arguments = params.to_vec();
                         }
                         frame_pushed = true;
@@ -8254,23 +8262,16 @@ impl Vm {
                 }
             } else {
                 frame.arguments = frame_args;
-                // Build the backtrace snapshot straight into the frame's pooled
-                // vector (from the raw args, before they move into locals),
-                // rather than allocating one per call and discarding it for the
-                // tiny-frame fast path above.
-                if direct_bind {
-                    build_frame_trace_arguments_direct(
-                        &mut frame.trace_arguments,
-                        &direct_args,
-                        &ir_function.params,
-                    );
-                } else {
-                    build_frame_trace_arguments(
-                        &mut frame.trace_arguments,
-                        &prepared_args,
-                        &ir_function.params,
-                    );
-                }
+                // Backtrace arguments reconstruct lazily from the live locals
+                // (reference-engine semantics: traces show current slot
+                // values), so no per-call snapshot is built here.
+                frame.trace_arguments = TraceArguments::Lazy {
+                    arg_count: if direct_bind {
+                        direct_args.len() as u32
+                    } else {
+                        prepared_args.len() as u32
+                    },
+                };
             }
         }
         if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
@@ -8303,9 +8304,12 @@ impl Vm {
             // general path, then write it straight into the frame's locals. The
             // fast shape has no by-ref params, so there is no reference cell to
             // bind (`coerce_or_check_param_type` ignores the by-ref flag anyway).
-            for (arg_index, (param, arg)) in ir_function.params.iter().zip(direct_args).enumerate()
-            {
-                let mut value = arg.value;
+            let mut direct_args = direct_args;
+            let bound_count = direct_args.len().min(ir_function.params.len());
+            for arg_index in 0..bound_count {
+                let param = &ir_function.params[arg_index];
+                let mut value =
+                    std::mem::replace(&mut direct_args[arg_index].value, Value::Uninitialized);
                 if let Err(message) = coerce_or_check_param_type(
                     compiled,
                     state,
@@ -8318,6 +8322,32 @@ impl Vm {
                     argument_policy.call_site_strict_types,
                     call.call_span,
                 ) {
+                    // Cold: the frame's arguments are elided on this fast
+                    // path, so the lazy trace has no source for the failing
+                    // (and any later) argument — materialize the snapshot from
+                    // the already-bound locals plus the remaining raw args so
+                    // the TypeError's own trace shows the real values.
+                    direct_args[arg_index].value = value;
+                    let entries: Vec<FrameTraceArgument> = (0..direct_args.len())
+                        .map(|index| {
+                            let param = ir_function.params.get(index);
+                            let value = match param {
+                                Some(param) if index < arg_index => stack
+                                    .current()
+                                    .and_then(|frame| frame.locals.get(param.local))
+                                    .unwrap_or(Value::Null),
+                                _ => direct_args[index].value.clone(),
+                            };
+                            let sensitive = param.is_some_and(param_is_sensitive);
+                            FrameTraceArgument {
+                                name: None,
+                                value: trace_value_for_param(&value, sensitive),
+                            }
+                        })
+                        .collect();
+                    if let Some(frame) = stack.current_mut() {
+                        frame.trace_arguments = TraceArguments::Materialized(entries);
+                    }
                     let result = self.runtime_error(output, compiled, stack, message);
                     if let Some(throwable) = runtime_error_throwable(&result) {
                         tag_throwable_location(&throwable, compiled, ir_function.span);
@@ -15549,11 +15579,11 @@ impl Vm {
             }
             {
                 let frame = stack.current_mut().expect("frame was pushed");
-                // This executor keeps the backtrace snapshot for every frame
-                // (tiny frames included), so build it unconditionally, directly
-                // into the frame's pooled vector from the raw args before they
-                // move into locals.
-                build_frame_trace_arguments(&mut frame.trace_arguments, &args, &function.params);
+                // Backtrace arguments reconstruct lazily from the live
+                // locals (reference-engine semantics); nothing to build here.
+                frame.trace_arguments = TraceArguments::Lazy {
+                    arg_count: args.len() as u32,
+                };
                 if specialized_tiny_frame {
                     if !args.is_empty() {
                         self.record_counter_arg_array_avoided();
@@ -15594,7 +15624,18 @@ impl Vm {
                 bind_top_level_global_locals(function, stack, state);
                 self.record_counter_alias_state(AliasState::GlobalOrSuperglobalReference);
             }
-            for (arg_index, (param, mut arg)) in function.params.iter().zip(args).enumerate() {
+            let mut args = args;
+            let bound_count = args.len().min(function.params.len());
+            for arg_index in 0..bound_count {
+                let param = &function.params[arg_index];
+                let mut arg = std::mem::replace(
+                    &mut args[arg_index],
+                    PreparedArg {
+                        value: Value::Uninitialized,
+                        reference: None,
+                        trace_holds_reference: false,
+                    },
+                );
                 if let Err(message) = coerce_or_check_param_type(
                     compiled,
                     state,
@@ -15607,6 +15648,31 @@ impl Vm {
                     argument_policy.call_site_strict_types,
                     call.call_span,
                 ) {
+                    // Cold: materialize the trace snapshot (bound params from
+                    // locals, the failing and later ones from the raw args) so
+                    // the TypeError's trace shows the real argument values —
+                    // the lazy reconstruction has no bound local for them.
+                    args[arg_index] = arg;
+                    let entries: Vec<FrameTraceArgument> = (0..args.len())
+                        .map(|index| {
+                            let param = function.params.get(index);
+                            let value = match param {
+                                Some(param) if index < arg_index => stack
+                                    .current()
+                                    .and_then(|frame| frame.locals.get(param.local))
+                                    .unwrap_or(Value::Null),
+                                _ => args[index].value.clone(),
+                            };
+                            let sensitive = param.is_some_and(param_is_sensitive);
+                            FrameTraceArgument {
+                                name: None,
+                                value: trace_value_for_param(&value, sensitive),
+                            }
+                        })
+                        .collect();
+                    if let Some(frame) = stack.current_mut() {
+                        frame.trace_arguments = TraceArguments::Materialized(entries);
+                    }
                     let result = self.runtime_error(output, compiled, stack, message);
                     if let Some(throwable) = runtime_error_throwable(&result) {
                         tag_throwable_location(&throwable, compiled, function.span);
@@ -58601,7 +58667,7 @@ fn debug_backtrace_array(
         if !ignore_args {
             entry.insert(
                 string_key("args"),
-                Value::Array(frame_trace_args_array(frame)),
+                Value::Array(frame_trace_args_array(compiled, frame)),
             );
         }
         trace.append(Value::Array(entry));
@@ -58624,7 +58690,7 @@ fn capture_debug_print_backtrace_string(
             let args = if ignore_args {
                 String::new()
             } else {
-                format_frame_trace_args(frame)
+                format_frame_trace_args(compiled, frame)
             };
             format!(
                 "#{index} {file}({line}): {}({args})",
@@ -58705,19 +58771,105 @@ fn frame_function_display_name(compiled: &CompiledUnit, frame: &Frame) -> String
     function.name.clone()
 }
 
-fn frame_trace_args_array(frame: &Frame) -> PhpArray {
-    if frame.trace_arguments.is_empty() {
+/// Materializes a frame's backtrace arguments (see [`TraceArguments`]).
+///
+/// The lazy variant reconstructs from the live parameter locals — matching the
+/// reference engine, where traces show the *current* slot values, parameter
+/// mutations included — with the `arguments` vector supplying positional
+/// extras beyond the declared parameters. A variadic tail expands its
+/// collected array (named-argument labels preserved as string keys). Sensitive
+/// parameters redact exactly as the eager builder did. When the frame's
+/// function is not resolvable in `compiled` (foreign-unit frame), the raw
+/// `arguments` vector is the fallback, mirroring the previous empty-snapshot
+/// behavior.
+fn materialized_frame_trace_arguments(
+    compiled: &CompiledUnit,
+    frame: &Frame,
+) -> Vec<FrameTraceArgument> {
+    let arg_count = match &frame.trace_arguments {
+        TraceArguments::Materialized(entries) => return entries.clone(),
+        TraceArguments::Lazy { arg_count } => *arg_count as usize,
+    };
+    let raw_fallback = |values: &[Value]| -> Vec<FrameTraceArgument> {
+        values
+            .iter()
+            .map(|value| FrameTraceArgument {
+                name: None,
+                value: value.clone(),
+            })
+            .collect()
+    };
+    let Some(function) = compiled.unit().functions.get(frame.function.index()) else {
+        return raw_fallback(&frame.arguments);
+    };
+    // A parameter local can be unbound when the frame failed argument
+    // binding (a bind-time TypeError's own trace still shows the raw
+    // argument, as the reference engine does) — fall back to the preserved
+    // arguments vector by position.
+    let live_local = |local: LocalId, index: usize| -> Value {
+        match frame.locals.get_slot(local) {
+            Some(Slot::Value(value)) if !value.is_uninitialized() => value.clone(),
+            Some(Slot::Reference(cell)) => cell.get(),
+            _ => frame.arguments.get(index).cloned().unwrap_or(Value::Null),
+        }
+    };
+    let mut out = Vec::with_capacity(arg_count);
+    for (index, param) in function.params.iter().enumerate() {
+        if param.variadic {
+            let sensitive = param_is_sensitive(param);
+            if let Value::Array(array) = live_local(param.local, index) {
+                for (key, value) in array.iter() {
+                    let name = match key {
+                        ArrayKey::String(name) => Some(name.to_string_lossy()),
+                        ArrayKey::Int(_) => None,
+                    };
+                    out.push(FrameTraceArgument {
+                        name,
+                        value: trace_value_for_param(value, sensitive),
+                    });
+                }
+            }
+            return out;
+        }
+        if index >= arg_count {
+            return out;
+        }
+        let value = live_local(param.local, index);
+        out.push(FrameTraceArgument {
+            name: None,
+            value: trace_value_for_param(&value, param_is_sensitive(param)),
+        });
+    }
+    // Positional extras beyond the declared parameters come from the
+    // preserved arguments vector (they have no bound local).
+    for value in frame
+        .arguments
+        .iter()
+        .take(arg_count)
+        .skip(function.params.len())
+    {
+        out.push(FrameTraceArgument {
+            name: None,
+            value: value.clone(),
+        });
+    }
+    out
+}
+
+fn frame_trace_args_array(compiled: &CompiledUnit, frame: &Frame) -> PhpArray {
+    let entries = materialized_frame_trace_arguments(compiled, frame);
+    if entries.is_empty() {
         return PhpArray::from_packed(frame.arguments.clone());
     }
     let mut array = PhpArray::new();
-    for arg in &frame.trace_arguments {
+    for arg in entries {
         // By-ref parameters store the live cell; PHP-visible trace args
         // carry the current value, not the reference wrapper.
-        let value = match &arg.value {
+        let value = match arg.value {
             Value::Reference(cell) => cell.get(),
-            value => value.clone(),
+            value => value,
         };
-        if let Some(name) = &arg.name {
+        if let Some(name) = arg.name {
             array.insert(ArrayKey::String(PhpString::from(name.as_str())), value);
         } else {
             array.append(value);
@@ -58726,8 +58878,9 @@ fn frame_trace_args_array(frame: &Frame) -> PhpArray {
     array
 }
 
-fn format_frame_trace_args(frame: &Frame) -> String {
-    if frame.trace_arguments.is_empty() {
+fn format_frame_trace_args(compiled: &CompiledUnit, frame: &Frame) -> String {
+    let entries = materialized_frame_trace_arguments(compiled, frame);
+    if entries.is_empty() {
         return frame
             .arguments
             .iter()
@@ -58735,8 +58888,7 @@ fn format_frame_trace_args(frame: &Frame) -> String {
             .collect::<Vec<_>>()
             .join(", ");
     }
-    frame
-        .trace_arguments
+    entries
         .iter()
         .map(|arg| {
             let value = format_trace_arg(&arg.value);
@@ -58799,7 +58951,7 @@ fn format_trace_call(compiled: &CompiledUnit, frame: &Frame) -> String {
     {
         return "{closure}()".to_owned();
     }
-    let args = format_frame_trace_args(frame);
+    let args = format_frame_trace_args(compiled, frame);
     let name = frame_function_display_name(compiled, frame);
     format!("{name}({args})")
 }
@@ -61407,113 +61559,6 @@ fn trace_value_for_param(value: &Value, sensitive: bool) -> Value {
         sensitive_parameter_value()
     } else {
         value.clone()
-    }
-}
-
-/// Rebuilds a frame's backtrace-visible arguments in place, pushing directly
-/// into the frame's (capacity-retained) vector instead of allocating a fresh
-/// one per call. It reproduces exactly the snapshot the argument binder used to
-/// return: one entry per bound positional argument (a supplied by-ref parameter
-/// holds the live cell, `#[\SensitiveParameter]` values are redacted), a
-/// variadic tail expanded to its elements with their named labels, and extra
-/// positional arguments appended verbatim without redaction. Call it only for
-/// frames that will actually keep their trace arguments; the raw (pre-coercion)
-/// `prepared_args` must be read before they are moved into the frame's locals.
-fn build_frame_trace_arguments(
-    trace: &mut Vec<FrameTraceArgument>,
-    prepared_args: &[PreparedArg],
-    params: &[IrParam],
-) {
-    debug_assert!(trace.is_empty());
-    trace.reserve(prepared_args.len());
-    for (index, arg) in prepared_args.iter().enumerate() {
-        match params.get(index) {
-            // The variadic parameter collapses its tail into one prepared array
-            // argument; expand it back into one trace entry per element, keyed
-            // by the named-argument labels the array preserves in order. No
-            // parameters follow a variadic one.
-            Some(param) if param.variadic => {
-                let sensitive = param_is_sensitive(param);
-                if let Value::Array(array) = &arg.value {
-                    for (key, value) in array.iter() {
-                        let name = match key {
-                            ArrayKey::String(name) => Some(name.to_string_lossy()),
-                            ArrayKey::Int(_) => None,
-                        };
-                        trace.push(FrameTraceArgument {
-                            name,
-                            value: trace_value_for_param(value, sensitive),
-                        });
-                    }
-                }
-                break;
-            }
-            Some(param) => {
-                trace.push(FrameTraceArgument {
-                    name: None,
-                    value: trace_value_for_bound_param(
-                        param,
-                        &arg.value,
-                        arg.reference.as_ref(),
-                        arg.trace_holds_reference,
-                    ),
-                });
-            }
-            // Extra positional arguments beyond the declared parameters have no
-            // parameter to consult, so they are neither named nor redacted.
-            None => {
-                trace.push(FrameTraceArgument {
-                    name: None,
-                    value: arg.value.clone(),
-                });
-            }
-        }
-    }
-}
-
-/// The backtrace-visible value for one bound positional parameter: redacted for
-/// `#[\SensitiveParameter]`, the live by-ref cell when the trace must observe
-/// writes through the parameter, otherwise a value snapshot. Shared by the
-/// prepared-arguments trace builder and the dense direct-bind trace builder so
-/// both produce byte-identical entries.
-fn trace_value_for_bound_param(
-    param: &IrParam,
-    value: &Value,
-    reference: Option<&ReferenceCell>,
-    trace_holds_reference: bool,
-) -> Value {
-    if param_is_sensitive(param) {
-        trace_value_for_param(value, true)
-    } else if let Some(cell) = reference.filter(|_| trace_holds_reference) {
-        // A by-ref trace argument is expected to carry its cell; if it does
-        // not (an unexpected binder state), degrade to the value snapshot the
-        // non-reference branch produces rather than panic on the trace path.
-        Value::Reference(cell.clone())
-    } else {
-        value.clone()
-    }
-}
-
-/// Builds a frame's backtrace-visible arguments for the dense executor's
-/// direct-to-locals fast path, reading the raw (reference-resolved, pre-coercion)
-/// call arguments instead of a `Vec<PreparedArg>`. The fast shape guarantees
-/// exact arity with no by-ref, variadic, or extra positional arguments, so every
-/// argument maps to a declared parameter and produces exactly the entry
-/// `build_frame_trace_arguments` would for the equivalent prepared arguments
-/// (`reference: None`, `trace_holds_reference: false`). Read the arguments before
-/// they move into the frame's locals.
-fn build_frame_trace_arguments_direct(
-    trace: &mut Vec<FrameTraceArgument>,
-    args: &[CallArgument],
-    params: &[IrParam],
-) {
-    debug_assert!(trace.is_empty());
-    trace.reserve(args.len());
-    for (param, arg) in params.iter().zip(args) {
-        trace.push(FrameTraceArgument {
-            name: None,
-            value: trace_value_for_bound_param(param, &arg.value, None, false),
-        });
     }
 }
 
