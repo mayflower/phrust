@@ -765,7 +765,7 @@ impl RuntimeContext {
             return http_server_array(request);
         }
         let mut array = PhpArray::new();
-        for (key, value) in &self.env {
+        for (key, value) in self.env.iter() {
             insert_string(&mut array, key, value);
         }
         array.insert(string_key("argc"), Value::Int(self.argc()));

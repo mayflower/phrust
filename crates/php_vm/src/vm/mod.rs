@@ -60707,7 +60707,7 @@ fn execute_builtin_entry(
             .iter()
             .any(|(name, value)| name == "PHRUST_NET_TESTS" && value == "1"),
     );
-    context.set_env_entries(state.env.clone());
+    context.set_env_entries(state.env.as_ref().clone());
     if let php_runtime::RuntimeRequestMode::Http(request) = &runtime_context.request_mode {
         context.set_php_input(request.raw_body.to_vec());
     }
