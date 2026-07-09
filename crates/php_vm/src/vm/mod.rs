@@ -9439,8 +9439,20 @@ impl Vm {
                             .get(instruction.span.index())
                             .copied()
                             .unwrap_or_default();
-                        let suppress_undefined_warning =
-                            dense_load_local_is_pre_call_by_ref_out_param(
+                        // The lookahead scan only matters when the local is
+                        // actually undefined (it decides whether to suppress
+                        // the undefined-variable warning for a by-ref out
+                        // parameter); defined locals — the overwhelmingly
+                        // common case — skip it entirely.
+                        let local_is_defined = stack
+                            .current()
+                            .and_then(|frame| frame.locals.get_slot(LocalId::new(src.index)))
+                            .is_some_and(|slot| match slot {
+                                Slot::Value(value) => !value.is_uninitialized(),
+                                Slot::Reference(_) => true,
+                            });
+                        let suppress_undefined_warning = !local_is_defined
+                            && dense_load_local_is_pre_call_by_ref_out_param(
                                 compiled,
                                 state,
                                 dense,
@@ -52655,7 +52667,11 @@ fn resolve_static_class_name(
     state: &ExecutionState,
     stack: &CallStack,
     class_name: &str,
-) -> Result<php_ir::module::ClassEntry, String> {
+) -> Result<Arc<php_ir::module::ClassEntry>, String> {
+    // Returns a shared handle: `ClassEntry` is a large struct (method/property
+    // tables), and this resolver runs on every `Name::`/`self::`/`static::`
+    // access — deep-cloning it here was a top CPU hotspot on the WordPress
+    // request profile.
     match normalize_class_name(class_name).as_str() {
         "self" => {
             let Some(scope) = current_scope_class(compiled, stack) else {
@@ -52664,7 +52680,6 @@ fn resolve_static_class_name(
                 ));
             };
             lookup_class_in_state(compiled, state, &scope)
-                .map(|class| (*class).clone())
                 .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {scope} is not defined"))
         }
         "static" => {
@@ -52677,8 +52692,9 @@ fn resolve_static_class_name(
                 );
             };
             lookup_class_in_state(compiled, state, &called)
-                .map(|class| (*class).clone())
-                .or_else(|| current_this_called_class(compiled, state, stack, &called))
+                .or_else(|| {
+                    current_this_called_class(compiled, state, stack, &called).map(Arc::new)
+                })
                 .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {called} is not defined"))
         }
         "parent" => {
@@ -52696,7 +52712,7 @@ fn resolve_static_class_name(
             if let Some(parent) = class.parent.as_deref()
                 && let Some(parent) = internal_runtime_class_entry(&normalize_class_name(parent))
             {
-                return Ok(parent);
+                return Ok(Arc::new(parent));
             }
             let Some(parent_name) = class.parent.as_deref() else {
                 return Err(format!(
@@ -52704,18 +52720,17 @@ fn resolve_static_class_name(
                     class.name
                 ));
             };
-            lookup_class_in_state(compiled, state, parent_name)
-                .map(|class| (*class).clone())
-                .ok_or_else(|| {
-                    format!(
-                        "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
-                        class.name, parent_name
-                    )
-                })
+            lookup_class_in_state(compiled, state, parent_name).ok_or_else(|| {
+                format!(
+                    "E_PHP_VM_UNKNOWN_PARENT_CLASS: class {} extends missing class {}",
+                    class.name, parent_name
+                )
+            })
         }
         _ => lookup_class_in_state(compiled, state, class_name)
-            .map(|class| (*class).clone())
-            .or_else(|| internal_runtime_class_entry(&normalize_class_name(class_name)))
+            .or_else(|| {
+                internal_runtime_class_entry(&normalize_class_name(class_name)).map(Arc::new)
+            })
             .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined")),
     }
 }
