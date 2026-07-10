@@ -8,9 +8,9 @@ use php_bytecode_cache::{
 };
 use php_diagnostics::{DebugEvent, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase};
 use php_executor::{
-    CompiledPhpScript, EngineProfileName, PhpCompileInput, PhpExecutionError, PhpExecutionOutput,
-    PhpExecutionStatus, PhpExecutor, PhpExecutorOptions, PhpRequestExecutionInput,
-    usage_diagnostic, write_diagnostic_envelope,
+    CompiledPhpScript, EngineProfileName, ExecutorIncludeCompiler, PhpCompileInput,
+    PhpExecutionError, PhpExecutionOutput, PhpExecutionStatus, PhpExecutor, PhpExecutorOptions,
+    PhpRequestExecutionInput, usage_diagnostic, write_diagnostic_envelope,
 };
 use php_ir::{LoweringOptions, lower_frontend_result, module::IrUnit, verify_unit};
 use php_optimizer::{OptimizationLevel, OptimizationReport, PassContext, PassPipeline};
@@ -1159,6 +1159,9 @@ where
         );
         let vm = Vm::with_options(VmOptions {
             include_loader,
+            include_compiler: Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
+                OptimizationLevel::O0,
+            ))),
             runtime_context,
             // CLI runs must not hit the embedded/test step ceiling.
             max_steps: usize::MAX,

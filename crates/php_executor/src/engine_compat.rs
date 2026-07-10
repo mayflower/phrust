@@ -2,6 +2,7 @@ use crate::PhpExecutorOptions;
 use crate::diagnostics::{
     write_frontend_diagnostics, write_runtime_diagnostics, write_vm_compile_fatal_line,
 };
+use crate::include_compiler::ExecutorIncludeCompiler;
 use crate::pipeline::compile_source;
 use crate::request::{include_loader_for, runtime_context_for};
 use php_diagnostics::{DebugEvent, DiagnosticLayer, DiagnosticOutputFormat, DiagnosticPhase};
@@ -105,8 +106,12 @@ where
     )?;
     let include_loader = include_loader_for(&input)?;
     let runtime_context = runtime_context_for(&input, include_loader.as_ref());
-    let mut vm_options = PhpExecutorOptions::managed_fast_runtime().vm_options;
+    let executor_options = PhpExecutorOptions::managed_fast_runtime();
+    let mut vm_options = executor_options.vm_options;
     vm_options.include_loader = include_loader;
+    vm_options.include_compiler = Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
+        executor_options.include_optimization_level,
+    )));
     vm_options.runtime_context = runtime_context;
     vm_options.trace = input.debug;
     vm_options.trace_runtime = input.debug;
