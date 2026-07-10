@@ -1,0 +1,45 @@
+# Architecture Inventory
+
+The source-derived architecture inventory is enforced by:
+
+```bash
+nix develop -c just architecture-inventory
+```
+
+The command classifies tracked Rust files, reports production file size and
+workspace dependency edges, records native and platform dependencies, and
+counts the public module and re-export surfaces of `php_vm` and `php_runtime`.
+It also inventories module-wide Clippy allowances and narrowly identified
+source-reparsing, pointer-identity, and diagnostic-string control-flow debt.
+
+The checked limits live in
+`scripts/verify/architecture_inventory_baseline.json`. Findings are identified
+by path, category, and normalized source text rather than line number, so moving
+code does not hide debt. Removing a finding is allowed; adding one fails the
+gate until the architecture is deliberately reviewed and the baseline is
+updated.
+
+Reports are generated under `target/architecture/` and remain untracked. To
+lower the baseline after a remediation, run:
+
+```bash
+nix develop -c scripts/verify/architecture_inventory.py --write-baseline --check
+```
+
+Review the baseline diff before committing it. The command list in the report
+is derived from currently available `justfile` benchmark targets and is the
+starting point for repeatable compile, binary-size, VM, cache, compiler, server,
+application, and WordPress measurements.
+
+Capture those measurements with at least three samples per command:
+
+```bash
+nix develop -c just architecture-performance-baseline
+```
+
+The performance report records median and spread for clean package rebuilds,
+incremental root-touch rebuilds, and repository-owned runtime/application
+targets. It records peak RSS when `/usr/bin/time` supports it and classifies
+optional WordPress measurements as skipped when their prerequisites are absent.
+The report and per-run logs are written below
+`target/architecture/performance-baseline/`.

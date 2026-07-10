@@ -1,0 +1,520 @@
+{
+  "diagnostic_string_parsing_allowlist": [
+    {
+      "id": "crates/php_vm/src/include.rs:diagnostic_code_prefix_parse:0e24b9d25125:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm/src/vm/arguments.rs:diagnostic_code_prefix_parse:b821d1b33019:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:ecc50dc89547:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_target_parse:d87ea97a5782:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:51b252e1a273:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:99236549912f:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    },
+    {
+      "id": "crates/php_vm_cli/src/commands.rs:diagnostic_target_parse:c7d6758f4d23:1",
+      "reason": "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15"
+    }
+  ],
+  "generated_file_allowlist": [
+    "crates/php_std/src/generated/arginfo.rs",
+    "crates/php_std/src/generated/mod.rs"
+  ],
+  "large_file_limits": {
+    "crates/php_ir/src/lower/expressions.rs": {
+      "max_bytes": 386474,
+      "max_lines": 10797
+    },
+    "crates/php_ir/src/lower/mod.rs": {
+      "max_bytes": 214487,
+      "max_lines": 5264
+    },
+    "crates/php_jit/src/copy_patch.rs": {
+      "max_bytes": 214682,
+      "max_lines": 5497
+    },
+    "crates/php_phpt_tools/src/commands/mod.rs": {
+      "max_bytes": 239133,
+      "max_lines": 6634
+    },
+    "crates/php_runtime/src/builtins/context.rs": {
+      "max_bytes": 196336,
+      "max_lines": 6014
+    },
+    "crates/php_runtime/src/builtins/modules/core.rs": {
+      "max_bytes": 468123,
+      "max_lines": 14284
+    },
+    "crates/php_std/src/extensions.rs": {
+      "max_bytes": 272557,
+      "max_lines": 6696
+    },
+    "crates/php_vm/src/counters.rs": {
+      "max_bytes": 256988,
+      "max_lines": 7036
+    },
+    "crates/php_vm/src/vm/builtin_classes.rs": {
+      "max_bytes": 330490,
+      "max_lines": 8744
+    },
+    "crates/php_vm/src/vm/mod.rs": {
+      "max_bytes": 2818678,
+      "max_lines": 68229
+    },
+    "crates/php_vm/src/vm/spl.rs": {
+      "max_bytes": 257431,
+      "max_lines": 6915
+    },
+    "crates/php_vm_cli/src/commands.rs": {
+      "max_bytes": 250655,
+      "max_lines": 6768
+    }
+  },
+  "module_wide_allowlist": [
+    {
+      "id": "crates/php_jit/src/lib.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/context.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/context.rs:module_wide_allow:ef203e3f0a19:2",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/modules/fileinfo.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/modules/pcntl.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/modules/posix.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/modules/sodium.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/builtins/modules/sysvsem.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_runtime/src/xml_backend.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_source/src/byte_kernel.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_source/src/byte_kernel.rs:module_wide_allow:aa9eaf300242:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_source/src/byte_kernel.rs:module_wide_allow:ef203e3f0a19:2",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_source/src/byte_kernel.rs:module_wide_allow:aa9eaf300242:2",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/copy_patch_bridge.rs:module_wide_allow:ef203e3f0a19:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/builtin_classes.rs:module_wide_allow:effd818e0121:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/builtin_classes.rs:module_wide_allow:dcabf7cdb6f0:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/ext_redis.rs:module_wide_allow:effd818e0121:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/ext_redis.rs:module_wide_allow:dcabf7cdb6f0:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:module_wide_allow:dcabf7cdb6f0:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/mod.rs:module_wide_allow:effd818e0121:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/reflection.rs:module_wide_allow:effd818e0121:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/reflection.rs:module_wide_allow:dcabf7cdb6f0:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/spl.rs:module_wide_allow:effd818e0121:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    },
+    {
+      "id": "crates/php_vm/src/vm/spl.rs:module_wide_allow:dcabf7cdb6f0:1",
+      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
+    }
+  ],
+  "native_dependency_allowlist": [
+    "php_bytecode_cache:clang-sys:clang",
+    "php_bytecode_cache:curl-sys:curl",
+    "php_bytecode_cache:libsodium-sys-stable:sodium",
+    "php_bytecode_cache:libsqlite3-sys:sqlite3",
+    "php_bytecode_cache:libssh2-sys:ssh2",
+    "php_bytecode_cache:libz-sys:z",
+    "php_bytecode_cache:openssl-sys:openssl",
+    "php_bytecode_cache:wasm-bindgen-shared:wasm_bindgen",
+    "php_executor:clang-sys:clang",
+    "php_executor:curl-sys:curl",
+    "php_executor:libsodium-sys-stable:sodium",
+    "php_executor:libsqlite3-sys:sqlite3",
+    "php_executor:libssh2-sys:ssh2",
+    "php_executor:libz-sys:z",
+    "php_executor:openssl-sys:openssl",
+    "php_executor:wasm-bindgen-shared:wasm_bindgen",
+    "php_ir:clang-sys:clang",
+    "php_ir:curl-sys:curl",
+    "php_ir:libsodium-sys-stable:sodium",
+    "php_ir:libsqlite3-sys:sqlite3",
+    "php_ir:libssh2-sys:ssh2",
+    "php_ir:libz-sys:z",
+    "php_ir:openssl-sys:openssl",
+    "php_ir:wasm-bindgen-shared:wasm_bindgen",
+    "php_jit:clang-sys:clang",
+    "php_jit:curl-sys:curl",
+    "php_jit:libsodium-sys-stable:sodium",
+    "php_jit:libsqlite3-sys:sqlite3",
+    "php_jit:libssh2-sys:ssh2",
+    "php_jit:libz-sys:z",
+    "php_jit:openssl-sys:openssl",
+    "php_jit:wasm-bindgen-shared:wasm_bindgen",
+    "php_optimizer:clang-sys:clang",
+    "php_optimizer:curl-sys:curl",
+    "php_optimizer:libsodium-sys-stable:sodium",
+    "php_optimizer:libsqlite3-sys:sqlite3",
+    "php_optimizer:libssh2-sys:ssh2",
+    "php_optimizer:libz-sys:z",
+    "php_optimizer:openssl-sys:openssl",
+    "php_optimizer:wasm-bindgen-shared:wasm_bindgen",
+    "php_runtime:clang-sys:clang",
+    "php_runtime:curl-sys:curl",
+    "php_runtime:libsodium-sys-stable:sodium",
+    "php_runtime:libsqlite3-sys:sqlite3",
+    "php_runtime:libssh2-sys:ssh2",
+    "php_runtime:libz-sys:z",
+    "php_runtime:openssl-sys:openssl",
+    "php_runtime:wasm-bindgen-shared:wasm_bindgen",
+    "php_server:clang-sys:clang",
+    "php_server:curl-sys:curl",
+    "php_server:libsodium-sys-stable:sodium",
+    "php_server:libsqlite3-sys:sqlite3",
+    "php_server:libssh2-sys:ssh2",
+    "php_server:libz-sys:z",
+    "php_server:openssl-sys:openssl",
+    "php_server:ring:ring_core_0_17_14_",
+    "php_server:wasm-bindgen-shared:wasm_bindgen",
+    "php_std:clang-sys:clang",
+    "php_std:curl-sys:curl",
+    "php_std:libsodium-sys-stable:sodium",
+    "php_std:libsqlite3-sys:sqlite3",
+    "php_std:libssh2-sys:ssh2",
+    "php_std:libz-sys:z",
+    "php_std:openssl-sys:openssl",
+    "php_std:wasm-bindgen-shared:wasm_bindgen",
+    "php_vm:clang-sys:clang",
+    "php_vm:curl-sys:curl",
+    "php_vm:libsodium-sys-stable:sodium",
+    "php_vm:libsqlite3-sys:sqlite3",
+    "php_vm:libssh2-sys:ssh2",
+    "php_vm:libz-sys:z",
+    "php_vm:openssl-sys:openssl",
+    "php_vm:wasm-bindgen-shared:wasm_bindgen",
+    "php_vm_cli:clang-sys:clang",
+    "php_vm_cli:curl-sys:curl",
+    "php_vm_cli:libsodium-sys-stable:sodium",
+    "php_vm_cli:libsqlite3-sys:sqlite3",
+    "php_vm_cli:libssh2-sys:ssh2",
+    "php_vm_cli:libz-sys:z",
+    "php_vm_cli:openssl-sys:openssl",
+    "php_vm_cli:ring:ring_core_0_17_14_",
+    "php_vm_cli:wasm-bindgen-shared:wasm_bindgen"
+  ],
+  "platform_dependency_allowlist": [
+    "php_jit:libc:normal:cfg(unix)"
+  ],
+  "pointer_integer_identity_allowlist": [
+    {
+      "id": "crates/php_runtime/src/array.rs:pointer_integer_identity:ab06af0ee251:1",
+      "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
+    },
+    {
+      "id": "crates/php_runtime/src/reference.rs:pointer_integer_identity:51d079e45291:1",
+      "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
+    },
+    {
+      "id": "crates/php_runtime/src/string.rs:pointer_integer_identity:ab06af0ee251:1",
+      "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
+    },
+    {
+      "id": "crates/php_server/src/state.rs:pointer_integer_identity:09df98bf4eec:1",
+      "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
+    }
+  ],
+  "public_surface_limits": {
+    "php_runtime": {
+      "public_module_declarations": 37,
+      "public_reexport_statements": 67,
+      "root_public_module_declarations": 37,
+      "root_reexport_statements": 29
+    },
+    "php_vm": {
+      "public_module_declarations": 24,
+      "public_reexport_statements": 44,
+      "root_public_module_declarations": 24,
+      "root_reexport_statements": 18
+    }
+  },
+  "schema_version": 1,
+  "source_reparsing_allowlist": [
+    {
+      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:78cef0c961aa:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:0ed3d245c635:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:6ab18a9c126e:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:78cef0c961aa:2",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/mod.rs:source_lines:8e7799843192:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/mod.rs:source_slice:db15c3374d5d:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/mod.rs:source_slice:07a24aa3b99b:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/mod.rs:source_slice:976b86af790f:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_ir/src/lower/mod.rs:textual_split:4f653d0814a9:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:06980dc35072:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:33885ed51fb0:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:02400a9a88cf:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:02400a9a88cf:2",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:635ec670d93e:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:91ba19a42560:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:635ec670d93e:2",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:2436253b6359:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:1fd4d7bd13f4:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:85eb600c07ab:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:c65abaafb1b4:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:d5f41feedf86:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:aaed65e10605:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:b973eed13250:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:722bbd06729c:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:c4bd5f76ecb9:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:2",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:11ed5a1f7691:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:5dcdd16325f0:1",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:3",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    },
+    {
+      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:11ed5a1f7691:2",
+      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
+    }
+  ],
+  "tolerances": {
+    "default_max_file_bytes": 200000,
+    "default_max_file_lines": 5000,
+    "public_surface_growth": 0,
+    "tracked_large_file_growth_bytes": 0,
+    "tracked_large_file_growth_lines": 0
+  },
+  "vendored_file_allowlist": [
+    "third_party/rust/pcre2/src/bytes.rs",
+    "third_party/rust/pcre2/src/error.rs",
+    "third_party/rust/pcre2/src/ffi.rs",
+    "third_party/rust/pcre2/src/lib.rs",
+    "third_party/rust/pcre2/src/pool.rs",
+    "third_party/rust/tiger/benches/mod.rs",
+    "third_party/rust/tiger/src/block_api.rs",
+    "third_party/rust/tiger/src/compress.rs",
+    "third_party/rust/tiger/src/lib.rs",
+    "third_party/rust/tiger/src/tables.rs",
+    "third_party/rust/tiger/tests/mod.rs"
+  ],
+  "workspace_dependency_edges": [
+    "php_ast:php_source:normal:false",
+    "php_ast:php_syntax:normal:false",
+    "php_bytecode_cache:php_ir:normal:false",
+    "php_bytecode_cache:php_semantics:dev:false",
+    "php_bytecode_cache:php_vm:dev:false",
+    "php_diagnostics:php_source:normal:false",
+    "php_executor:php_diagnostics:normal:false",
+    "php_executor:php_ir:normal:false",
+    "php_executor:php_optimizer:normal:false",
+    "php_executor:php_runtime:normal:false",
+    "php_executor:php_semantics:normal:false",
+    "php_executor:php_source:normal:false",
+    "php_executor:php_vm:normal:false",
+    "php_frontend_cli:php_semantics:normal:false",
+    "php_ir:php_diagnostics:normal:false",
+    "php_ir:php_semantics:normal:false",
+    "php_ir:php_source:normal:false",
+    "php_ir:php_std:normal:false",
+    "php_ir:php_testkit:dev:false",
+    "php_jit:php_ir:normal:false",
+    "php_lexer:php_diagnostics:normal:false",
+    "php_lexer:php_source:normal:false",
+    "php_lexer_cli:php_lexer:normal:false",
+    "php_optimizer:php_diagnostics:normal:false",
+    "php_optimizer:php_ir:normal:false",
+    "php_parser_cli:php_syntax:normal:false",
+    "php_phpt_tools:php_testkit:normal:false",
+    "php_runtime:php_diagnostics:normal:false",
+    "php_runtime:php_lexer:normal:false",
+    "php_runtime:php_source:normal:false",
+    "php_runtime:php_syntax:normal:false",
+    "php_runtime:php_testkit:dev:false",
+    "php_semantics:php_ast:normal:false",
+    "php_semantics:php_diagnostics:normal:false",
+    "php_semantics:php_source:normal:false",
+    "php_semantics:php_syntax:normal:false",
+    "php_server:php_diagnostics:normal:false",
+    "php_server:php_executor:normal:false",
+    "php_server:php_runtime:normal:false",
+    "php_server:php_vm:normal:false",
+    "php_std:php_lexer:normal:false",
+    "php_std:php_runtime:normal:false",
+    "php_syntax:php_diagnostics:normal:false",
+    "php_syntax:php_lexer:normal:false",
+    "php_syntax:php_source:normal:false",
+    "php_vm:php_diagnostics:normal:false",
+    "php_vm:php_ir:normal:false",
+    "php_vm:php_jit:normal:true",
+    "php_vm:php_optimizer:normal:false",
+    "php_vm:php_runtime:normal:false",
+    "php_vm:php_semantics:normal:false",
+    "php_vm:php_source:normal:false",
+    "php_vm:php_std:normal:false",
+    "php_vm:php_testkit:dev:false",
+    "php_vm_cli:php_bytecode_cache:normal:false",
+    "php_vm_cli:php_diagnostics:normal:false",
+    "php_vm_cli:php_executor:normal:false",
+    "php_vm_cli:php_ir:normal:false",
+    "php_vm_cli:php_jit:normal:true",
+    "php_vm_cli:php_optimizer:normal:false",
+    "php_vm_cli:php_perf:normal:false",
+    "php_vm_cli:php_runtime:normal:false",
+    "php_vm_cli:php_semantics:normal:false",
+    "php_vm_cli:php_server:normal:false",
+    "php_vm_cli:php_source:normal:false",
+    "php_vm_cli:php_std:normal:false",
+    "php_vm_cli:php_testkit:dev:false",
+    "php_vm_cli:php_vm:normal:false"
+  ]
+}

@@ -22,6 +22,8 @@ help:
       '  just verify-phpt          PHPT tooling, manifests, and source-integrity checks' \
       '  just known-gaps           Validate checked known-gap manifests' \
       '  just source-integrity      Check module wiring and generated metadata' \
+      '  just architecture-inventory Check source-derived architecture baseline' \
+      '  just architecture-performance-baseline Capture compile/runtime architecture metrics' \
       '  just dependency-boundaries Check documented workspace dependency edges' \
       '  just panic-unwrap-policy   Check production panic/unwrap policy' \
       '  just stdlib-registry-drift Check stdlib/runtime registry drift' \
@@ -255,8 +257,15 @@ check:
 
 source-integrity:
     scripts/verify/source_integrity.py
+    scripts/verify/architecture_inventory.py --check
     scripts/verify/dependency_boundaries.py
     scripts/verify/panic_unwrap_policy.py
+
+architecture-inventory:
+    scripts/verify/architecture_inventory.py --check --verify-determinism
+
+architecture-performance-baseline *args:
+    scripts/performance/architecture_baseline.py {{args}}
 
 dependency-boundaries:
     scripts/verify/dependency_boundaries.py

@@ -19,3 +19,7 @@ php_vm = { path = "../php_vm", version = "0.0.0" }
 [[bench]]
 name = "perf_hotpaths"
 harness = false
+
+[patch.crates-io]
+pcre2 = { path = "../../third_party/rust/pcre2" }
+tiger = { path = "../../third_party/rust/tiger" }
